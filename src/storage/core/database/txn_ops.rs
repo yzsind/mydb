@@ -51,7 +51,7 @@ fn async_row_lock_signal_shard(table_id: u64, row_id: RowId) -> usize {
 /// finishes a one-element batch.
 #[must_use = "a published commit must be passed to Database::finish_deferred_commits"]
 pub(crate) struct DeferredCommit {
-    _backup_feedback:Option<crate::storage::capture::CommitSample>,
+    _backup_feedback: Option<crate::storage::capture::CommitSample>,
     txn_id: u64,
     commit_scn: u64,
     commit_unix_us: u64,
@@ -596,7 +596,7 @@ impl Database {
         }
         self.log.lock().set_physical_replica(enabled);
         if !enabled && role_changed {
-            if let Err(error)=self.invalidate_promoted_hnsw_files() {
+            if let Err(error) = self.invalidate_promoted_hnsw_files() {
                 self.log.lock().set_physical_replica(true);
                 return Err(error);
             }
@@ -608,7 +608,7 @@ impl Database {
             self.physical_replica_mode.store(true, Ordering::Release);
         }
         if role_changed {
-            self.invalidate_replicated_ivf_graphs(None);
+            self.invalidate_replicated_vector_graphs();
         }
         if !enabled {
             // Hold registration serialization before opening the write role:
@@ -670,7 +670,11 @@ impl Database {
         }
         let scan = LogManager::scan(&self.data_dir)?;
         let mut snapshots = HashMap::new();
-        for record in scan.records.records().only(&[crate::wal::WalRecordType::PrepareTxn]) {
+        for record in scan
+            .records
+            .records()
+            .only(&[crate::wal::WalRecordType::PrepareTxn])
+        {
             let record = record?;
             if let WalPayload::PrepareTxn { xid, .. } = &record.payload {
                 if missing.get(&record.txn_id) == Some(xid) {
@@ -835,7 +839,10 @@ impl Database {
     /// pairing a consistent read view with the published binlog status.
     pub(crate) fn fence_binlog_snapshot_visibility(&self) -> Result<(), QueryError> {
         self.ensure_operational()?;
-        let target = self.next_scn_atomic.load(Ordering::Acquire).saturating_sub(1);
+        let target = self
+            .next_scn_atomic
+            .load(Ordering::Acquire)
+            .saturating_sub(1);
         self.wait_for_commit_visibility(target);
         self.ensure_operational()
     }
@@ -858,7 +865,9 @@ impl Database {
         if self.is_snapshot_read_only() {
             return self.begin_read_only_txn();
         }
-        if !current_redo_enabled() && (self.capture.redo_required() || crate::repl::physical_replication_active()) {
+        if !current_redo_enabled()
+            && (self.capture.redo_required() || crate::repl::physical_replication_active())
+        {
             return Err(error(
                 crate::error::catalog::ER_INNODB_REDO_DISABLED,
                 "mydb_redo_enabled=OFF is incompatible with physical replication",
@@ -904,7 +913,9 @@ impl Database {
     /// and the in-flight-writer watermark.
     pub fn begin_dml_txn(&self) -> Result<TxnView, QueryError> {
         self.ensure_writable()?;
-        if !current_redo_enabled() && (self.capture.redo_required() || crate::repl::physical_replication_active()) {
+        if !current_redo_enabled()
+            && (self.capture.redo_required() || crate::repl::physical_replication_active())
+        {
             return Err(error(
                 crate::error::catalog::ER_INNODB_REDO_DISABLED,
                 "mydb_redo_enabled=OFF is incompatible with physical replication",
@@ -2148,7 +2159,13 @@ impl Database {
         target_unix_us: u64,
         statement_start_unix_us: u64,
     ) -> Result<TxnView, QueryError> {
-        let statement_start_unix_us=if self.is_snapshot_read_only(){self.recovery_context.target_time_us.unwrap_or(statement_start_unix_us)}else{statement_start_unix_us};
+        let statement_start_unix_us = if self.is_snapshot_read_only() {
+            self.recovery_context
+                .target_time_us
+                .unwrap_or(statement_start_unix_us)
+        } else {
+            statement_start_unix_us
+        };
         let visible_scn = self.visible_scn();
         let baseline = self.temporal_history.baseline();
         let with_baseline = |view: TxnView| {
@@ -2400,13 +2417,18 @@ impl Database {
     }
 
     pub fn set_undo_retention_ms(&self, ms: u64) -> Result<(), QueryError> {
-        let _admission=crate::storage::capture::Admission::enter(self)?;
+        let _admission = crate::storage::capture::Admission::enter(self)?;
         // Serialize concurrent SET GLOBAL operations and keep the published
         // runtime value unchanged until the matching durable baseline update
         // succeeds.
         let mut runtime = self.runtime_config_write()?;
         let old_ms = runtime.undo_retention.as_millis().min(u128::from(u64::MAX)) as u64;
-        if old_ms!=ms&&self.capture.redo_required(){return Err(error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"stop WAL protection before changing temporal history retention"));}
+        if old_ms != ms && self.capture.redo_required() {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                "stop WAL protection before changing temporal history retention",
+            ));
+        }
         if old_ms > 0 && ms == 0 {
             self.temporal_history.clear_baseline()?;
             runtime.undo_retention = Duration::ZERO;
@@ -2802,7 +2824,7 @@ impl Database {
             end_txn_redo_policy(&self.log, txn_id);
             self.table_locks_sharded.release_txn(txn_id);
             return Ok(DeferredCommit {
-                _backup_feedback:None,
+                _backup_feedback: None,
                 txn_id,
                 commit_scn: 0,
                 commit_unix_us: 0,
@@ -2816,7 +2838,7 @@ impl Database {
                 finished: false,
             });
         }
-        let backup_feedback=self.capture.commit_sample();
+        let backup_feedback = self.capture.commit_sample();
         self.prepare_pending_vector_commit(txn_id)?;
         // Reduced redo omits row images only for pages that were newly
         // allocated by this transaction. Force those data pages (plus their
@@ -2824,7 +2846,8 @@ impl Database {
         // protected in-place/index pages may remain dirty and recover via
         // their ordinary records; flushing them here is conservative but
         // keeps one simple data-before-commit fence for every storage kind.
-        if txn_reduced_redo_active(&self.log, txn_id) && (self.capture.redo_required() || crate::repl::physical_replication_active())
+        if txn_reduced_redo_active(&self.log, txn_id)
+            && (self.capture.redo_required() || crate::repl::physical_replication_active())
         {
             return Err(error(
                 crate::error::catalog::ER_INNODB_REDO_DISABLED,
@@ -3029,7 +3052,7 @@ impl Database {
         self.drain_vector_purges();
         self.notify_lock_waiters_for_rows(released);
         Ok(DeferredCommit {
-            _backup_feedback:backup_feedback,
+            _backup_feedback: backup_feedback,
             txn_id,
             commit_scn,
             commit_unix_us,
@@ -3565,7 +3588,8 @@ impl Database {
                     for (idx, (payload, keys)) in entries.into_iter().enumerate() {
                         if idx < prefix_len {
                             let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                            let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                            let lsn =
+                                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                             for key in keys {
                                 finalize.push((key, lsn));
                             }
@@ -5433,7 +5457,10 @@ impl Database {
         if self.capture.active.load(Ordering::Acquire) {
             return Ok(0);
         }
-        if undo_compaction_build_swap() || self.capture.floor().is_some() || crate::repl::physical_replication_active() {
+        if undo_compaction_build_swap()
+            || self.capture.floor().is_some()
+            || crate::repl::physical_replication_active()
+        {
             self.compact_undo_segments_build_swap(min_live_ratio_pct, batch_limit)
         } else {
             self.compact_undo_segments_in_lock(min_live_ratio_pct, batch_limit)
@@ -6796,7 +6823,10 @@ fn collect_prepared_locks(
             HeldLock::UniqueRange(range) => {
                 for key in range.keys() {
                     let key_bytes = serde_json::to_vec(&key).map_err(|err| {
-                        error(crate::error::catalog::ER_GET_ERRNO, format!("cannot encode prepared unique range: {err}"))
+                        error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            format!("cannot encode prepared unique range: {err}"),
+                        )
                     })?;
                     out.push(PreparedLockEntry::UniqueKey {
                         table_id: range.table_id,

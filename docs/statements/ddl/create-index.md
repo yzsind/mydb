@@ -22,9 +22,9 @@ Creates the supported forms of regular, unique, full-text, spatial, functional, 
 
 ## Behavior and Limitations
 
-- Vector indexes use `CREATE INDEX name ON table_name(vector_column) USING HNSW` or `USING IVF_SQ8`; metric and build/search parameters go in the index COMMENT. See [vector index configuration](../../configuration.md).
+- Vector indexes use `CREATE INDEX name ON table_name(vector_column) USING HNSW` or `USING IVF`; metric and build/search parameters go in the index COMMENT. See [vector index configuration](../../configuration.md).
 - Regular/unique indexes are persisted as B-trees; if the HASH name is only a compatibility hint, it is mapped to the implementation and produces a diagnostic.
-- FULLTEXT, SPATIAL, and HNSW/IVF_SQ8 only accept the column types and options implemented by their respective modules.
+- FULLTEXT, SPATIAL, and HNSW/IVF only accept the column types and options implemented by their respective modules.
 - Regular and unique BTREE secondary indexes are built online by default; setting `MYDB_DDL_ASYNC` is not required. Prepare and publish briefly exclude writers while allowing readers; `INSERT`, `UPDATE`, and `DELETE` are allowed during the scan, sort, bulk-load, and main incremental catch-up phases.
 - `CREATE INDEX ... ALGORITHM=INPLACE LOCK=NONE` explicitly selects the online build; `LOCK=SHARED/EXCLUSIVE` selects a blocking build. `ALGORITHM=INSTANT/COPY` returns 1846 on CREATE INDEX — use ALTER TABLE for COPY; `LOCK=NONE` on non-BTREE indexes returns 1846.
 - `ALTER TABLE ... ADD INDEX` (including adding multiple BTREE indexes and the primary key at once) uses the same path; `LOCK=NONE` allows DML during the build, and `LOCK=SHARED/EXCLUSIVE` preserves the explicit blocking behavior. Mixed ALTERs that include column changes, and special indexes, are not part of this online path.

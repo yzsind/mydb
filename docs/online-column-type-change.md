@@ -7,7 +7,7 @@ When changing a column type requires rewriting data, mydb by default uses a cons
 - Strict SQL mode and disk-based storage (Strict / Relaxed). No dependency on `MYDB_DDL_ASYNC`.
 - `MODIFY COLUMN` and `CHANGE COLUMN`, multiple columns changed in one statement, `FIRST` / `AFTER`, and character set conversion.
 - Regular tables, tables without a primary key, partitioned tables, and subpartitioned storage; partitions are re-routed using the converted values.
-- Regular/unique BTREE indexes, HNSW, and IVF_SQ8; both the in-memory and paged backends of vector indexes are supported.
+- Regular/unique BTREE indexes, HNSW, and IVF; both the in-memory and paged backends of vector indexes are supported.
 - Out-of-row data such as TEXT/BLOB is included. Conversion, generated columns, NOT NULL, CHECK, and index key computation reuse the existing general-purpose implementations; conversions or dependencies that were already unsupported still raise errors.
 
 `LOCK=DEFAULT` prefers the online path, and `LOCK=NONE` requires reads and writes to be allowed during the build; the final publication still needs a brief exclusive barrier. `LOCK=SHARED` keeps the semantics of blocking writes during the build, and `LOCK=EXCLUSIVE` uses the offline path. Supported physical column changes allow `ALGORITHM=COPY, LOCK=NONE`, which is a mydb extension.

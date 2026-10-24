@@ -27,7 +27,6 @@ struct Entry {
     value: Option<VectorValue>,
     vid: u64,
     deleted: bool,
-    code: Option<Vec<i8>>,
 }
 #[derive(Debug)]
 struct State {
@@ -37,7 +36,6 @@ struct State {
     lists: Vec<Vec<usize>>,
     list_pages: Vec<AtomicU64>,
     charge: ControlledMemoryCharge,
-    quant: Option<(f64, f64)>,
 }
 #[derive(Debug)]
 pub(crate) struct NativeIvf {
@@ -45,7 +43,6 @@ pub(crate) struct NativeIvf {
     dimension: u32,
     metric: Metric,
     params: IvfParams,
-    sq8: bool,
     file: Option<Arc<VectorIndexFile>>,
     state: RwLock<State>,
     valid: AtomicBool,
@@ -57,7 +54,6 @@ impl NativeIvf {
         dimension: u32,
         metric: Metric,
         params: IvfParams,
-        sq8: bool,
         file: Option<Arc<VectorIndexFile>>,
     ) -> Result<Self, QueryError> {
         Ok(Self {
@@ -65,7 +61,6 @@ impl NativeIvf {
             dimension,
             metric,
             params,
-            sq8,
             file,
             state: RwLock::new(State {
                 entries: Vec::new(),
@@ -77,7 +72,6 @@ impl NativeIvf {
                     ControlledMemoryCategory::StorageScratch,
                     0,
                 )?,
-                quant: None,
             }),
             valid: AtomicBool::new(true),
             pending: Mutex::new(HashSet::new()),
@@ -116,17 +110,9 @@ impl NativeIvf {
     }
     pub(crate) fn backend_name(&self) -> &'static str {
         if self.file.is_some() {
-            if self.sq8 {
-                "ivf_sq8_paged_native"
-            } else {
-                "ivf_paged_native"
-            }
+            "ivf_paged_native"
         } else {
-            if self.sq8 {
-                "ivf_sq8_native"
-            } else {
-                "ivf_native"
-            }
+            "ivf_native"
         }
     }
     pub(crate) fn begin_transaction_delta(&self, txn: u64) -> Result<(), QueryError> {
@@ -210,10 +196,6 @@ impl NativeIvf {
         } else {
             id as u64
         };
-        let code = state.quant.and_then(|q| self.encode_code(&value, q));
-        if code.is_some() {
-            state.charge.try_grow(self.dimension as usize)?;
-        }
         let value = if self.file.is_none() {
             Some(value)
         } else {
@@ -224,7 +206,6 @@ impl NativeIvf {
             value,
             vid,
             deleted: false,
-            code,
         });
         state.rows.insert(row, id);
         state.lists[list].push(id);
@@ -259,21 +240,13 @@ impl NativeIvf {
         }
         let mut params = self.params;
         params.nlist = nlist;
-        let trainer = Self::new(
-            self.datatype,
-            self.dimension,
-            self.metric,
-            params,
-            self.sq8,
-            None,
-        )?;
+        let trainer = Self::new(self.datatype, self.dimension, self.metric, params, None)?;
         for (row, value) in rows {
             trainer.insert(row, value)?;
         }
         trainer.train()?;
         let mut trained = trainer.state.write();
         let centers = std::mem::take(&mut trained.centers);
-        let quant = trained.quant;
         let mut state = self.state.write();
         state
             .charge
@@ -281,7 +254,6 @@ impl NativeIvf {
         state.lists = (0..centers.len()).map(|_| Vec::new()).collect();
         state.list_pages = (0..centers.len()).map(|_| AtomicU64::new(0)).collect();
         state.centers = centers;
-        state.quant = quant;
         Ok(())
     }
     fn train_centers(
@@ -473,60 +445,8 @@ impl NativeIvf {
         state.list_pages = (0..lists.len()).map(|_| AtomicU64::new(0)).collect();
         state.centers = centers;
         state.lists = lists;
-        if self.sq8 && self.metric != Metric::Dot {
-            let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
-            for v in &sample {
-                let norm = self.code_norm(v);
-                for i in 0..self.dimension as usize {
-                    let x = v.element(i) / norm;
-                    low = low.min(x);
-                    high = high.max(x);
-                }
-            }
-            if low.is_finite() && high.is_finite() {
-                let mid = (low + high) * 0.5;
-                let scale = if high > low {
-                    (high - low) / 254.0
-                } else {
-                    1.0
-                };
-                let bytes = state.entries.len().saturating_mul(self.dimension as usize);
-                state.charge.try_grow(bytes)?;
-                for id in 0..state.entries.len() {
-                    if !state.entries[id].deleted {
-                        let value = self.value(&state, id)?;
-                        state.entries[id].code = self.encode_code(&value, (mid, scale));
-                    }
-                }
-                state.quant = Some((mid, scale));
-            }
-        }
+
         Ok(())
-    }
-    fn code_norm(&self, value: &VectorValue) -> f64 {
-        if self.metric == Metric::Cosine {
-            (0..value.dimension as usize)
-                .map(|i| value.element(i).powi(2))
-                .sum::<f64>()
-                .sqrt()
-        } else {
-            1.0
-        }
-    }
-    fn encode_code(&self, value: &VectorValue, (mid, scale): (f64, f64)) -> Option<Vec<i8>> {
-        let norm = self.code_norm(value);
-        if norm == 0.0 || !norm.is_finite() {
-            return None;
-        }
-        let mut code = Vec::with_capacity(value.dimension as usize);
-        for i in 0..value.dimension as usize {
-            let x = (value.element(i) / norm - mid) / scale;
-            if !x.is_finite() || !(-127.0..=127.0).contains(&x) {
-                return None;
-            }
-            code.push(x.round_ties_even() as i8);
-        }
-        Some(code)
     }
     pub(crate) fn search(
         &self,
@@ -578,8 +498,6 @@ impl NativeIvf {
         if probes.is_empty() {
             probes.push(Scored { dist: 0.0, id: 0 });
         }
-        let query_code = state.quant.and_then(|q| self.encode_code(query, q));
-        let mut approximate = false;
         let mut best = BinaryHeap::new();
         best.try_reserve(candidate_limit).map_err(|_| {
             crate::storage::error(
@@ -592,29 +510,7 @@ impl NativeIvf {
                 if state.entries[id].deleted {
                     continue;
                 }
-                let distance = if let (Some(query_code), Some(code), Some((_, scale))) =
-                    (&query_code, &state.entries[id].code, state.quant)
-                {
-                    approximate = true;
-                    let sum: i64 = query_code
-                        .iter()
-                        .zip(code)
-                        .map(|(&a, &b)| {
-                            let d = a as i64 - b as i64;
-                            d * d
-                        })
-                        .sum();
-                    sum as f64
-                        * scale
-                        * scale
-                        * if self.metric == Metric::Cosine {
-                            0.5
-                        } else {
-                            1.0
-                        }
-                } else {
-                    self.score(&state, id, query)?
-                };
+                let distance = self.score(&state, id, query)?;
                 let score = Scored { dist: distance, id };
                 if best.len() < candidate_limit || best.peek().is_some_and(|worst| score < *worst) {
                     best.push(score);
@@ -632,7 +528,7 @@ impl NativeIvf {
             .collect();
         Ok(VectorSearchResult {
             candidates,
-            exact_order: !approximate,
+            exact_order: true,
             exhausted: nprobe == state.lists.len(),
         })
     }

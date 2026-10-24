@@ -427,29 +427,6 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     (1.0 - ordering_distance(a, b, Metric::Cosine)) as f32
 }
 
-/// Squared norm using exactly the cosine kernel's reduction order. Cached
-/// immutable vectors must not substitute `dot(v, v)`: its SIMD grouping differs.
-#[inline]
-pub(crate) fn cosine_norm_sq(v: &[f32]) -> f32 {
-    unsafe { cosine_parts_ptr(v.as_ptr(), v.as_ptr(), v.len()).1 }
-}
-
-/// Cosine ordering with precomputed squared norms for equal-width vectors.
-/// Selecting only the dot component lets the inlined kernel eliminate both
-/// norm reductions while preserving the original dot's floating-point order.
-#[inline]
-pub(crate) fn cosine_distance_precomputed(a: &[f32], b: &[f32], na: f32, nb: f32) -> f64 {
-    if a.len() != b.len() || !na.is_normal() || !nb.is_normal() {
-        return ordering_distance(a, b, Metric::Cosine);
-    }
-    let dot = unsafe { cosine_parts_ptr(a.as_ptr(), b.as_ptr(), a.len()).0 };
-    if dot.is_finite() {
-        (1.0 - finish_cosine(dot, na, nb)) as f64
-    } else {
-        ordering_distance(a, b, Metric::Cosine)
-    }
-}
-
 /// Ordering distance: **smaller = more similar**. Used by the HNSW graph for
 /// navigation and by the executor to rank candidates. L2 uses squared distance
 /// (sqrt-free) since it ranks identically to true L2.
@@ -784,43 +761,8 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     unsafe { dot_i8_ptr(a.as_ptr(), b.as_ptr(), n) }
 }
 
-/// Dot one query against row-major int8 vectors. On aarch64, four rows share
-/// each query load and use eight independent SDOT accumulators; other targets
-/// retain the scalar API as a correctness-preserving fallback.
-pub(crate) fn dot_i8_batch(query: &[i8], rows: &[i8], dim: usize, out: &mut [i32]) {
-    if dim == 0 {
-        out.fill(0);
-        return;
-    }
-    let count = out.len().min(rows.len() / dim);
-    let mut row = 0usize;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let has_dotprod = if cfg!(target_os = "macos") {
-            true
-        } else {
-            std::arch::is_aarch64_feature_detected!("dotprod")
-        };
-        if query.len() >= dim && has_dotprod {
-            while row + 4 <= count {
-                dot_i8_batch4_neon_dotprod(
-                    query.as_ptr(),
-                    rows.as_ptr().add(row * dim),
-                    dim,
-                    out.as_mut_ptr().add(row),
-                );
-                row += 4;
-            }
-        }
-    }
-    while row < count {
-        out[row] = dot_i8(query, &rows[row * dim..row * dim + dim]);
-        row += 1;
-    }
-}
-
-/// Dot one query against four independently located int8 rows. Unlike
-/// [`dot_i8_batch`], HNSW callers do not have contiguous candidates: graph
+/// Dot one query against four independently located int8 rows. HNSW
+/// callers do not have contiguous candidates: graph
 /// neighbours are random ordinals in the resident code arena. Sharing each
 /// query load across four SDOT streams avoids re-reading the query four times
 /// and exposes enough independent accumulators to cover random-row latency.
@@ -863,18 +805,6 @@ pub(crate) fn dot_i8_batch4_ptrs(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
         dot_i8(query, rows[2]),
         dot_i8(query, rows[3]),
     ]
-}
-
-/// Four-row SDOT kernel. Rows are contiguous with stride `n`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-#[inline]
-unsafe fn dot_i8_batch4_neon_dotprod(query: *const i8, rows: *const i8, n: usize, out: *mut i32) {
-    let r0 = rows;
-    let r1 = rows.add(n);
-    let r2 = rows.add(n * 2);
-    let r3 = rows.add(n * 3);
-    dot_i8_batch4_ptrs_neon_dotprod(query, r0, r1, r2, r3, n, out);
 }
 
 /// Four-row SDOT kernel for independently located rows.
@@ -1604,35 +1534,6 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cached_cosine_norms_match_original_bits() {
-        for dim in [0, 1, 3, 7, 8, 15, 16, 31, 67, 128, 257, 768, 1536] {
-            let a = pseudo(dim, 17);
-            let b = pseudo(dim, 93);
-            for scale in [0.0, 1e-10, 1.0, 1000.0] {
-                let b: Vec<f32> = b.iter().map(|v| v * scale).collect();
-                let expected = ordering_distance(&a, &b, Metric::Cosine);
-                let actual =
-                    cosine_distance_precomputed(&a, &b, cosine_norm_sq(&a), cosine_norm_sq(&b));
-                if expected.is_nan() {
-                    assert!(actual.is_nan());
-                } else {
-                    assert_eq!(
-                        actual.to_bits(),
-                        expected.to_bits(),
-                        "dim={dim} scale={scale}"
-                    );
-                }
-            }
-        }
-        let a = pseudo(17, 4);
-        let b = pseudo(9, 2);
-        assert_eq!(
-            cosine_distance_precomputed(&a, &b, cosine_norm_sq(&a), cosine_norm_sq(&b)).to_bits(),
-            ordering_distance(&a, &b, Metric::Cosine).to_bits(),
-        );
-    }
-
     fn pseudo(n: usize, seed: u64) -> Vec<f32> {
         // SplitMix64 → f32 in [-1, 1], deterministic.
         let mut s = seed;
@@ -1851,27 +1752,6 @@ mod tests {
                 expected
             );
             assert_eq!(super::dot_i8(&a[1..], &b[3..]), expected);
-        }
-    }
-
-    #[test]
-    fn dot_i8_batch_matches_single_row_kernel() {
-        for &dim in &[1usize, 31, 32, 33, 128, 768] {
-            let query_f = pseudo(dim, 0x1234 + dim as u64);
-            let mut query = vec![0i8; dim];
-            quantize_into(&query_f, 0.0, 127.0, &mut query);
-            let mut rows = Vec::new();
-            let mut expected = Vec::new();
-            for row in 0..9u64 {
-                let values = pseudo(dim, 0x9000 + row * 17 + dim as u64);
-                let mut codes = vec![0i8; dim];
-                quantize_into(&values, 0.0, 127.0, &mut codes);
-                expected.push(dot_i8(&query, &codes));
-                rows.extend_from_slice(&codes);
-            }
-            let mut got = vec![0i32; expected.len()];
-            dot_i8_batch(&query, &rows, dim, &mut got);
-            assert_eq!(got, expected, "batch dot dim={dim}");
         }
     }
 

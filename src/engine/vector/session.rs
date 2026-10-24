@@ -40,7 +40,7 @@ pub(crate) struct HnswSessionConfig {
     pub max_scan_tuples: u64,
     pub brute_threshold: u64,
     pub brute_filter_rows: u64,
-    /// IVF_SQ8 query-time nprobe (cells to probe). Shares this config struct
+    /// IVF query-time nprobe (cells to probe). Shares this config struct
     /// with the HNSW knobs since both are "vector session state"; the executor
     /// reads whichever applies to the index's algorithm.
     pub ivf_nprobe: u64,
@@ -107,7 +107,7 @@ pub(crate) fn effective_ef_search(
     base.max(dynamic).max(k as u64).max(1) as usize
 }
 
-/// Compute the effective `nprobe` for an IVF_SQ8 query. Resolution priority
+/// Compute the effective `nprobe` for an IVF query. Resolution priority
 /// mirrors [`effective_ef_search`]:
 ///   1. `/*+ IVF_NPROBE(n) */` HINT — wins per query.
 ///   2. session / GUC `mydb_ivf_nprobe` — when tuned away from the default.

@@ -22,7 +22,6 @@
 
 use super::hnsw::HnswIndex;
 use super::hnsw_paged::PagedHnsw;
-use super::ivf::IvfSq8Index;
 use crate::storage::RowId;
 use crate::types::QueryError;
 use crate::util::logging::log_message;
@@ -40,10 +39,6 @@ pub(crate) enum VectorGraph {
     NativeHnsw(super::native_hnsw::NativeHnsw),
     NativeIvf(super::native_ivf::NativeIvf),
     Paged(PagedHnsw),
-    /// In-memory IVF_SQ8 inverted-file index ([`IvfSq8Index`]). Rebuilt from
-    /// the heap on cold load (no snapshot in this backend). The third
-    /// `search` argument is interpreted as **nprobe** rather than ef.
-    Ivf(IvfSq8Index),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,13 +92,12 @@ pub(crate) struct VectorIndexRuntimeStats {
     pub generation: u64,
     /// Max persisted LSN across partitions (memory backend; 0 for paged).
     pub last_persisted_lsn: u64,
-    /// `"memory"`, `"paged"`, `"paged_mapped"`, `"ivf"`, `"ivf_paged"`, or
-    /// `"ivf_paged_nav"` when the governed large-index navigator is active.
+    /// Backend identity for resident, paged and native vector indexes.
     pub backend: &'static str,
-    /// IVF_SQ8: number of inverted lists (k-means centroids). 0 for HNSW /
+    /// IVF: number of inverted lists (k-means centroids). 0 for HNSW /
     /// cold IVF.
     pub nlist: u64,
-    /// IVF_SQ8: rows inserted since the last (re)train — a centroid-drift
+    /// IVF: rows inserted since the last (re)train — a centroid-drift
     /// signal suggesting when to `OPTIMIZE TABLE`. 0 for HNSW.
     pub inserts_since_train: u64,
     pub list_avg_entries: u64,
@@ -155,21 +149,7 @@ impl VectorIndexRuntimeStats {
                 self.finalized |= file.is_finalized();
             }
         }
-        if let Some(ivf) = graph.as_ivf() {
-            self.nlist = self.nlist.max(ivf.nlist() as u64);
-            self.inserts_since_train += ivf.inserts_since_train();
-            if let Some((file_bytes, sq8_nodes, list_avg, list_max, list_p95, finalized)) =
-                ivf.paged_runtime_stats()
-            {
-                self.paged_file_size_bytes += file_bytes;
-                self.tombstones_on_disk += ivf.stale_count() as u64;
-                self.sq8_covered_nodes += sq8_nodes;
-                self.list_avg_entries = self.list_avg_entries.max(list_avg);
-                self.list_max_entries = self.list_max_entries.max(list_max);
-                self.list_p95_entries = self.list_p95_entries.max(list_p95);
-                self.finalized |= finalized;
-            }
-        }
+
         if let VectorGraph::Paged(paged) = graph {
             let (nav_pages, exact_fallback, covered, file_bytes) = paged.navigation_stats();
             self.nav_pages += nav_pages;
@@ -219,7 +199,7 @@ impl VectorGraph {
         match self {
             VectorGraph::Paged(graph) => graph.refresh_query_navigation(),
             VectorGraph::NativeHnsw(g) => g.prepare_navigation(),
-            VectorGraph::Memory(_) | VectorGraph::Ivf(_) | VectorGraph::NativeIvf(_) => Ok(()),
+            VectorGraph::Memory(_) | VectorGraph::NativeIvf(_) => Ok(()),
         }
     }
 
@@ -229,7 +209,6 @@ impl VectorGraph {
             Self::NativeIvf(g) => g.invalidate(),
             Self::Memory(g) => g.invalidate(),
             Self::Paged(p) => p.invalidate(),
-            Self::Ivf(_) => {}
         }
     }
 
@@ -239,7 +218,6 @@ impl VectorGraph {
             Self::NativeIvf(g) => g.is_valid(),
             Self::Memory(g) => g.is_valid(),
             Self::Paged(p) => p.is_valid(),
-            Self::Ivf(_) => true,
         };
         if valid {
             Ok(())
@@ -257,20 +235,7 @@ impl VectorGraph {
     pub(crate) fn as_memory(&self) -> Option<&HnswIndex> {
         match self {
             VectorGraph::Memory(g) => Some(g),
-            VectorGraph::Paged(_)
-            | VectorGraph::Ivf(_)
-            | VectorGraph::NativeHnsw(_)
-            | VectorGraph::NativeIvf(_) => None,
-        }
-    }
-
-    /// Borrow the IVF backend, if this is one. Used by the retrain path
-    /// (`OPTIMIZE TABLE`) and observability in `vector_index.rs`.
-    #[allow(dead_code)] // wired by M2 retrain / M5 observability
-    pub(crate) fn as_ivf(&self) -> Option<&IvfSq8Index> {
-        match self {
-            VectorGraph::Ivf(i) => Some(i),
-            _ => None,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => None,
         }
     }
 
@@ -281,7 +246,6 @@ impl VectorGraph {
             VectorGraph::NativeIvf(g) => g.node_count(),
             VectorGraph::Memory(g) => g.node_count(),
             VectorGraph::Paged(p) => p.node_count() as usize,
-            VectorGraph::Ivf(i) => i.node_count(),
         }
     }
 
@@ -293,7 +257,6 @@ impl VectorGraph {
             VectorGraph::NativeIvf(g) => g.len(),
             VectorGraph::Memory(g) => g.len(),
             VectorGraph::Paged(p) => p.live_count(),
-            VectorGraph::Ivf(i) => i.live_count(),
         }
     }
 
@@ -304,7 +267,6 @@ impl VectorGraph {
             VectorGraph::NativeIvf(g) => g.len() == 0,
             VectorGraph::Memory(g) => g.is_empty(),
             VectorGraph::Paged(p) => p.node_count() == 0,
-            VectorGraph::Ivf(i) => i.is_empty(),
         }
     }
 
@@ -316,7 +278,6 @@ impl VectorGraph {
             VectorGraph::NativeIvf(g) => g.dim(),
             VectorGraph::Memory(g) => g.dim(),
             VectorGraph::Paged(p) => p.dim(),
-            VectorGraph::Ivf(i) => i.dim(),
         }
     }
 
@@ -333,8 +294,6 @@ impl VectorGraph {
                     "paged"
                 }
             }
-            // "ivf" (memory) or "ivf_paged" (buffer-pool + WAL).
-            VectorGraph::Ivf(i) => i.backend_name(),
         }
     }
 
@@ -343,10 +302,7 @@ impl VectorGraph {
     pub(crate) fn generation(&self) -> u64 {
         match self {
             VectorGraph::Memory(g) => g.generation(),
-            VectorGraph::Paged(_)
-            | VectorGraph::Ivf(_)
-            | VectorGraph::NativeHnsw(_)
-            | VectorGraph::NativeIvf(_) => 0,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 
@@ -356,10 +312,7 @@ impl VectorGraph {
     pub(crate) fn last_persisted_lsn(&self) -> u64 {
         match self {
             VectorGraph::Memory(g) => g.last_persisted_lsn(),
-            VectorGraph::Paged(_)
-            | VectorGraph::Ivf(_)
-            | VectorGraph::NativeHnsw(_)
-            | VectorGraph::NativeIvf(_) => 0,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 
@@ -370,7 +323,6 @@ impl VectorGraph {
             VectorGraph::NativeIvf(g) => g.stale_count(),
             VectorGraph::Memory(g) => g.stale_count(),
             VectorGraph::Paged(p) => p.stale_count(),
-            VectorGraph::Ivf(i) => i.stale_count(),
         }
     }
 
@@ -379,10 +331,7 @@ impl VectorGraph {
     pub(crate) fn dirty_count(&self) -> u32 {
         match self {
             VectorGraph::Memory(g) => g.dirty_count(),
-            VectorGraph::Paged(_)
-            | VectorGraph::Ivf(_)
-            | VectorGraph::NativeHnsw(_)
-            | VectorGraph::NativeIvf(_) => 0,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 
@@ -415,10 +364,6 @@ impl VectorGraph {
                     .map(|_| ())
                     .map_err(|e| Self::invalidate_paged(p, "insert", e))
             }
-            VectorGraph::Ivf(i) => {
-                i.insert(row_id, &super::to_f32(&vector));
-                Ok(())
-            }
         }
     }
 
@@ -445,7 +390,6 @@ impl VectorGraph {
         match self {
             VectorGraph::NativeHnsw(g) => g.begin_transaction_delta(txn_id),
             VectorGraph::NativeIvf(g) => g.begin_transaction_delta(txn_id),
-            VectorGraph::Ivf(i) => i.begin_transaction_delta(txn_id),
             VectorGraph::Paged(p) => p.begin_transaction_delta(txn_id),
             _ => Ok(()),
         }
@@ -459,7 +403,6 @@ impl VectorGraph {
         match self {
             VectorGraph::NativeHnsw(g) => g.finish_committed_delta(txn_id, commit_scn),
             VectorGraph::NativeIvf(g) => g.finish_committed_delta(txn_id, commit_scn),
-            VectorGraph::Ivf(i) => i.finish_committed_delta(txn_id),
             VectorGraph::Paged(p) => p.finish_committed_delta(txn_id, commit_scn),
             _ => Ok(()),
         }
@@ -469,7 +412,6 @@ impl VectorGraph {
         match self {
             VectorGraph::NativeIvf(g) => g.file().map_or(Ok(()), |f| f.flush()),
             VectorGraph::NativeHnsw(g) => g.file().map_or(Ok(()), |f| f.flush()),
-            VectorGraph::Ivf(i) => i.flush(),
             _ => Ok(()),
         }
     }
@@ -515,9 +457,6 @@ impl VectorGraph {
                     && ef.max(request.candidate_limit) as u64 >= p.node_count();
                 (candidates, exhausted)
             }
-            (VectorGraph::Ivf(i), VectorSearchEffort::Ivf { nprobe }) => {
-                return i.try_search_result(query, request.candidate_limit, nprobe);
-            }
             _ => {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_GET_ERRNO,
@@ -543,7 +482,6 @@ impl VectorGraph {
             VectorGraph::Paged(p) => p
                 .mark_deleted_by_row_id(row_id)
                 .map_err(|e| Self::invalidate_paged(p, "delete", e)),
-            VectorGraph::Ivf(i) => Ok(i.mark_deleted_by_row_id(row_id)),
         }
     }
 
@@ -574,9 +512,7 @@ impl VectorGraph {
             VectorGraph::Paged(p) => p
                 .live_versions(row_id)
                 .map_err(|e| Self::invalidate_paged(p, "version lookup", e)),
-            VectorGraph::Ivf(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => {
-                Ok(SmallVec::new())
-            }
+            VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => Ok(SmallVec::new()),
         }
     }
 
@@ -593,7 +529,6 @@ impl VectorGraph {
                 .map_err(|e| Self::invalidate_paged(p, "purge", e)),
             VectorGraph::NativeHnsw(g) => g.delete(row_id),
             VectorGraph::NativeIvf(g) => g.delete(row_id),
-            VectorGraph::Ivf(i) => Ok(i.mark_deleted_by_row_id(row_id)),
         }
     }
 
@@ -603,7 +538,6 @@ impl VectorGraph {
             VectorGraph::NativeIvf(g) => g.has_row(row_id),
             VectorGraph::Memory(g) => g.has_live_row_id(row_id),
             VectorGraph::Paged(p) => p.has_live_row_id(row_id).unwrap_or(false),
-            VectorGraph::Ivf(i) => i.has_live_row_id(row_id),
         }
     }
 
@@ -635,7 +569,6 @@ impl VectorGraph {
                     Self::invalidate_paged(p, "in-place update", e);
                     false
                 }),
-            VectorGraph::Ivf(i) => i.try_update_in_place(row_id, new_vector, ratio),
         }
     }
 
@@ -645,7 +578,6 @@ impl VectorGraph {
         match self {
             VectorGraph::Memory(g) => g.compact_with_threads(threads),
             VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
-            VectorGraph::Ivf(i) => i.compact(),
         }
     }
 }

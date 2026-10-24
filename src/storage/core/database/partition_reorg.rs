@@ -311,7 +311,7 @@ impl Database {
     /// and all sidecars/index files a partition can own.
     ///
     /// Discards each file's buffer-pool pages **before** unlinking (S3): the
-    /// paged backends (heap/lob/`.hvec`/`.ivf`) can hold dirty frames for a
+    /// paged backends (heap/lob/`.hvec`) can hold dirty frames for a
     /// removed partition, and a background writeback after the unlink would
     /// silently resurrect the deleted file. This matches the discard-then-unlink
     /// ordering enforced by `drop_table_vector_graphs` / `drop_table_recovery`.
@@ -357,7 +357,7 @@ impl Database {
                     })
                 })
                 .unwrap_or_else(|| stable_missing_index_id(name));
-            for ext in ["idx", "hnsw", "hvec", "ivf"] {
+            for ext in ["idx", "hnsw", "hvec"] {
                 paths.push(index_object_path_by_id(
                     &self.data_dir,
                     sid,

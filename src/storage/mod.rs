@@ -124,7 +124,7 @@ pub(crate) use core::{
     HeapHandle, IndexHandle, IndexRangeCursor, IndexRangeLease, IndexRangeReverseCursor,
     ProjectedReadPlan, RowDecodePlan, PAGE_SIZE,
 };
-pub(crate) use core::{IvfIndexFile, NodeId, VecId, VectorIndexFile};
+pub(crate) use core::{NodeId, VecId, VectorIndexFile};
 pub use mdl::{MdlDuration, MdlLockType, MdlObjectKey, MdlObjectType, MdlRequest, MetadataLockRow};
 pub use naming::{
     event_key, is_system_database, normalize_name, routine_key, split_table_name, table_key,

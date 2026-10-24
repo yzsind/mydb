@@ -34,7 +34,7 @@ VECTOR_DIM 的 BINARY 维度单位是 bit。SUBVECTOR 保留 datatype，BINARY �
 
 HNSW 原值保持原生 payload，浮点保留 SQ8 导航与越界精确回退；INT8/BINARY 使用原生距离。BINARY 更新删除重插。所有后端最终使用可见 heap 原值精排。
 
-USING IVF 为原生 payload 倒排表；IVF_SQ8 是四种数值类型的量化入口，拒绝 BINARY。数值粗量化沿用 k-means/归一化训练，中心允许 FLOAT32。Hamming 按位多数更新中心（平票零）。Jaccard 使用有界采样 k-medoids，每簇最多 32 候选、256 评估样本，候选包含旧代表。初始化按相应距离加权采样，空簇取最远样本，实际 nlist 不超过训练样本不同向量数。原生 IVF 全探测必须得到精确 TopK。
+USING IVF 为原生 payload 倒排表；数值粗量化沿用 k-means/归一化训练，中心允许 FLOAT32。Hamming 按位多数更新中心（平票零）。Jaccard 使用有界采样 k-medoids，每簇最多 32 候选、256 评估样本，候选包含旧代表。初始化按相应距离加权采样，空簇取最远样本，实际 nlist 不超过训练样本不同向量数。原生 IVF 全探测必须得到精确 TopK。
 
 元数据分别记录源类型、索引编码、metric、维度。HNSW 按最大层邻接计算准入；IVF 检查单 entry。首版不增加页外索引记录。保留 MVCC、发布前沿、构建追平、失效与重建机制。
 
@@ -65,11 +65,11 @@ binlog 额外包裹 8 字节 `MYDBVEC2`，外层仍是 MySQL LONG BLOB 的标准
 
 定维列的 datatype 和 dimension 在行布局中，heap 只保存原生 payload。大于4096字节的非FLOAT32 payload及大于8192字节的FLOAT32 payload使用既有varlen/overflow路径；其声明维度仍然固定。裸 VECTOR 的布局保存 FLOAT32 datatype，值前额外保存实际维度 u32。spill 和独立值使用上面的完整编码，与 heap 布局分开。
 
-本轮格式：catalog=61、MVCC row=8、undo binary=14、paged HNSW file/page=5/2。既有 FLOAT32 IVF_SQ8 文件布局未变化，继续为 2/2；旧库仍由 catalog 版本拒绝。格式表由现有脚本生成。
+本轮格式：catalog=62、MVCC row=8、undo binary=14、paged HNSW file/page=5/2。IVF复用原生共享分页容器；旧库仍由 catalog 版本拒绝。格式表由现有脚本生成。
 
 ### 原生分页容器
 
-FLOAT32 的既有 HNSW/IVF_SQ8 实现保留，作为性能与行为基线。新增类型及通用 IVF 使用原生容器，复用 VectorIndexFile 的共享缓存、WAL、校验和、页内 slot、邻接编辑和 mmap 撤销协议。
+FLOAT32 的既有 HNSW 实现保留，作为性能与行为基线。新增类型及通用 IVF 使用原生容器，复用 VectorIndexFile 的共享缓存、WAL、校验和、页内 slot、邻接编辑和 mmap 撤销协议。
 
 原生几何信息编码在 metadata 的 geometry u32：bit31 为 native 标记，bit30..28 为 datatype，低28位为逻辑维度。原生记录不分配 FLOAT32 原值或重复 SQ8 lane。HNSW 记录为通用节点头、原生 payload、各层邻接。IVF 使用同一容器的无邻接记录，按倒排列表分别维护当前填充页，使同一列表条目聚集在页内。
 
@@ -86,7 +86,6 @@ memory 原生节点保留紧凑 payload；paged 原生节点保留 row-id/vid �
 
 数值中心使用 FLOAT32，均值/范数使用宽中间算术；它们是内部 coarse metadata，不受 SQL 单个 FLOAT32 值的 payload 上限限制。DOT 复用既有并行数值 k-means 的 L2 粗训练；训练完成后的行分配、探测和候选评分使用负内积。COSINE 对训练方向归一化。Jaccard 始终使用真实位串和 Jaccard 距离，不替换为 Hamming。
 
-原生 IVF_SQ8 的源 payload 保持原生类型，SQ8 仅作为受控候选评分缓存；DOT 直接按原值评分。结果的 `exact_order` 明确区分 SQ8 排序和精确排序。通用 IVF 全探测的精确 TopK 契约不适用于被 SQ8 提前截断的候选集合。
 
 ## 舍入正确性
 

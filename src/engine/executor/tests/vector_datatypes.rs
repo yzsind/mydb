@@ -128,10 +128,7 @@ fn native_index_matrix(backend: &str) {
             &["L2", "COSINE", "DOT"]
         };
         for &metric in metrics {
-            for algo in ["HNSW", "IVF", "IVF_SQ8"] {
-                if binary && algo == "IVF_SQ8" {
-                    continue;
-                }
+            for algo in ["HNSW", "IVF"] {
                 let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let engine = open_test_engine(dir.path());
                 let dim = if binary { 9 } else { 4 };
@@ -505,7 +502,7 @@ fn vector_datatypes_prepared_result_domains_follow_runtime_bindings() {
 fn vector_datatypes_cosine_index_rejects_preexisting_zero_rows() {
     let _env = HnswEnv::set(&[("MYDB_HNSW_BUILD_ON_DDL", "off")]);
     for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
-        for algo in ["HNSW", "IVF", "IVF_SQ8"] {
+        for algo in ["HNSW", "IVF"] {
             let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
             let engine = open_test_engine(dir.path());
             engine
@@ -578,10 +575,7 @@ fn vector_datatypes_physical_wal_replication_and_promotion() {
             ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
         ]);
         for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
-            for algo in ["HNSW", "IVF", "IVF_SQ8"] {
-                if datatype == "BINARY" && algo == "IVF_SQ8" {
-                    continue;
-                }
+            for algo in ["HNSW", "IVF"] {
                 let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let binary = datatype == "BINARY";

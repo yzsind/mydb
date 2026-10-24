@@ -2520,7 +2520,7 @@ pub struct SessionSysVarState {
     /// `mydb_hnsw_brute_filter_rows` — estimated filter-output row
     /// count below which the planner skips HNSW. Default 1000.
     pub mydb_hnsw_brute_filter_rows: u64,
-    /// `mydb_ivf_nprobe` — number of inverted-file cells an IVF_SQ8 KNN query
+    /// `mydb_ivf_nprobe` — number of inverted-file cells an IVF KNN query
     /// probes. Query-time effort knob (the IVF analogue of `ef_search`).
     /// Per-query `/*+ IVF_NPROBE(n) */` and a per-index `NPROBE=` override
     /// this. Default 8.

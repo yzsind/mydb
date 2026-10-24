@@ -181,11 +181,6 @@ fn validate_vector_index_column(
                         "vector datatype and index metric are incompatible",
                     ));
                 }
-                if datatype == crate::vector::VectorDataType::Binary
-                    && index.vector_algo() == VectorAlgo::IvfSq8
-                {
-                    return Err(vector::vector_err("IVF_SQ8 does not support BINARY"));
-                }
 
                 if vector_storage_paged() && index.vector_algo() == VectorAlgo::Hnsw {
                     if let crate::storage::DataTypeKind::Vector {
@@ -203,22 +198,8 @@ fn validate_vector_index_column(
                         )?;
                     }
                 }
-                if vector_storage_paged() && index.vector_algo() != VectorAlgo::Hnsw {
-                    let dimension = dim.unwrap();
-                    if index.vector_algo() == VectorAlgo::Ivf
-                        || datatype != crate::vector::VectorDataType::Float32
-                    {
-                        VectorIndexFile::validate_native_ivf_layout(datatype, dimension)?;
-                    } else {
-                        let stride = if metric == vector::Metric::Dot {
-                            dimension as usize * 4
-                        } else {
-                            dimension as usize
-                        };
-                        if stride + IVF_LIST_OFF_DATA + 11 > PAGE_SIZE {
-                            return Err(vector::vector_err("IVF_SQ8 entry exceeds page capacity"));
-                        }
-                    }
+                if vector_storage_paged() && index.vector_algo() == VectorAlgo::Ivf {
+                    VectorIndexFile::validate_native_ivf_layout(datatype, dim.unwrap())?;
                 }
                 if c.nullable {
                     return Err(error(
@@ -797,7 +778,6 @@ fn prepare_create_table_schema(
         let is_spatial = index.index_type.eq_ignore_ascii_case("SPATIAL");
         let is_vector = index.index_type.eq_ignore_ascii_case("HNSW")
             || index.index_type.eq_ignore_ascii_case("VECTOR")
-            || index.index_type.eq_ignore_ascii_case("IVF_SQ8")
             || index.index_type.eq_ignore_ascii_case("IVF");
         if !index.index_type.eq_ignore_ascii_case("BTREE")
             && !index.index_type.eq_ignore_ascii_case("FULLTEXT")
@@ -815,8 +795,6 @@ fn prepare_create_table_schema(
                 &index.comment,
                 if index.index_type.eq_ignore_ascii_case("IVF") {
                     crate::storage::schema::VectorAlgo::Ivf
-                } else if index.index_type.eq_ignore_ascii_case("IVF_SQ8") {
-                    crate::storage::schema::VectorAlgo::IvfSq8
                 } else {
                     crate::storage::schema::VectorAlgo::Hnsw
                 },
@@ -8683,9 +8661,10 @@ impl Database {
                 }
             }
             for (shadow, live) in &shadow_to_live {
-                if shadow.extension().is_some_and(|ext| {
-                    matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec" | "ivf"))
-                }) && !shadow.exists()
+                if shadow
+                    .extension()
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec")))
+                    && !shadow.exists()
                 {
                     continue;
                 }

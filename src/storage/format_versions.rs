@@ -22,7 +22,8 @@
 // v58 gives sequence restarts an atomic physical counter identity.
 // v59 commits index retirement manifests in the data dictionary with DDL.
 // v60 stores sequence recovery states and stable dependencies in catalog tables.
-pub const CATALOG_VERSION: u32 = 61;
+/// v62 removes the retired quantized IVF algorithm and its page format.
+pub const CATALOG_VERSION: u32 = 62;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.
@@ -46,8 +47,6 @@ pub const OVERFLOW_VERSION: u16 = 3;
 /// v4 records the committed heap coverage frontier.
 pub const PAGED_HNSW_INDEX_VERSION: u32 = 5;
 pub const PAGED_HNSW_PAGE_VERSION: u16 = 2;
-pub const PAGED_IVF_INDEX_VERSION: u32 = 2;
-pub const PAGED_IVF_PAGE_VERSION: u16 = 2;
 pub const ZONE_MAP_VERSION: u32 = 6;
 /// Zone Map v6 uses shared-buffer-pool pages and physical redo. Page v2 adds
 /// mutable directory children, mixed record leaves and root revisions. Page
@@ -71,6 +70,6 @@ pub const IMAGE_MODE_VERSION: u32 = 2;
 
 pub fn native_replication_compatibility() -> String {
     format!(
-        "replmeta={NATIVE_REPLICATION_METADATA_VERSION};catalog={CATALOG_VERSION};wal={WAL_VERSION};heap={HEAP_PAGE_VERSION};row={MVCC_ROW_VERSION};index={INDEX_VERSION};index_page={INDEX_PAGE_VERSION};collation={COLLATION_KEY_VERSION};undo={UNDO_BINARY_VERSION};undo_ts={UNDO_TABLESPACE_VERSION};overflow={OVERFLOW_VERSION};hnsw={PAGED_HNSW_INDEX_VERSION}/{PAGED_HNSW_PAGE_VERSION};ivf={PAGED_IVF_INDEX_VERSION}/{PAGED_IVF_PAGE_VERSION};zone={ZONE_MAP_VERSION}/{PAGED_ZONE_MAP_PAGE_VERSION};clock={COMMIT_CLOCK_VERSION};page=16384;endian=little"
+        "replmeta={NATIVE_REPLICATION_METADATA_VERSION};catalog={CATALOG_VERSION};wal={WAL_VERSION};heap={HEAP_PAGE_VERSION};row={MVCC_ROW_VERSION};index={INDEX_VERSION};index_page={INDEX_PAGE_VERSION};collation={COLLATION_KEY_VERSION};undo={UNDO_BINARY_VERSION};undo_ts={UNDO_TABLESPACE_VERSION};overflow={OVERFLOW_VERSION};hnsw={PAGED_HNSW_INDEX_VERSION}/{PAGED_HNSW_PAGE_VERSION};zone={ZONE_MAP_VERSION}/{PAGED_ZONE_MAP_PAGE_VERSION};clock={COMMIT_CLOCK_VERSION};page=16384;endian=little"
     )
 }

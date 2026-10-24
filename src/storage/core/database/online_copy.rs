@@ -596,10 +596,6 @@ impl Database {
                         VectorGraph::Paged(g) => {
                             g.insert_ddl(row_id, &vector)?;
                         }
-                        VectorGraph::Ivf(g) => {
-                            g.insert(row_id, &vector);
-                            g.flush()?;
-                        }
                     }
                 }
             }
@@ -1477,7 +1473,6 @@ impl Database {
             if let Some(graph) = graph {
                 match graph.as_ref() {
                     VectorGraph::Paged(g) => g.file().flush()?,
-                    VectorGraph::Ivf(g) => g.flush()?,
                     VectorGraph::NativeHnsw(g) => {
                         if let Some(file) = g.file() {
                             file.flush()?;

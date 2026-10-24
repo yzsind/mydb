@@ -44,7 +44,6 @@ The following are the canonical paths; files are created on demand, and not ever
 │   ├── indexes/<storage_id>/<generation>/
 │   │   ├── <index_id>.idx
 │   │   ├── <index_id>.hvec
-│   │   ├── <index_id>.ivf
 │   │   └── <index_id>.hnsw
 ├── system/
 │   ├── catalog/
@@ -88,7 +87,7 @@ objects, but their lifecycles and recovery semantics differ.
 | Undo tablespace | Rollback, old snapshots, and time-travel versions | Records not past the retention boundary must not be deleted early |
 | `commit-ledger.v1` | Source of truth for commit SCN and time mapping | Repair the tail from still-retained WAL |
 | `.idx` | Persistent index | Rebuildable from the Catalog definition and the heap; constraint enforcement must still preserve semantics |
-| `.hvec` / `.ivf` / `.hnsw` | Vector candidate structures | Rebuild/degrade when not finalized, missing, or incompatible |
+| `.hvec` / `.hnsw` | Vector candidate structures | Rebuild/degrade when not finalized, missing, or incompatible |
 | `.zm` | Conservative page-pruning sidecar | Fall back to a heap scan when missing, corrupted, stale, or short of memory |
 | In-memory R-tree | Spatial candidate cache | Rebuilt from the persistent MBR BTREE |
 | `history-index.v1` | Historical old-key accelerator | Once degraded, fall back to heap/undo; correctness is unaffected |
@@ -259,7 +258,7 @@ optional summary does not authorize accepting invalid redo.
 
 ## 10. Vector Indexes
 
-Both the paged HNSW `.hvec` and the IVF_SQ8 `.ivf` use the unified 24 B page header, page LSN, CRC32, and WAL
+Paged HNSW and native IVF share the `.hvec` container and use the unified 24 B page header, page LSN, CRC32, and WAL
 physical page redo, and are managed by the buffer pool.
 
 ### 10.1 Paged HNSW
@@ -273,17 +272,17 @@ and, per layer, `count:u16 + fixed-capacity NodeId[]`. Adjacency space is reserv
 so edge updates can modify it in place. A persistent NodeId uses the high 24 bits for the page number and the low 8 bits for the slot; the runtime vid
 is `(page_id << 32) | slot`.
 
-### 10.2 IVF_SQ8
+### 10.2 Native IVF
 
-An `.ivf` file has four page kinds: meta, centroid, directory, and list. The meta stores dimension/metric, whether f32 is retained,
-trained/finalized state, nlist/nprobe, global quantization parameters, per-page ranges, and entry counts. Centroid pages store
-f32 in row-major order; each directory entry is 24 B: `head_page:u64 + tail_page:u64 + count:u64`.
+Native IVF uses the shared vector page container with typed geometry and no
+adjacency lists. Each record retains the RowId, deletion flag and native
+payload. Lists maintain separate fill-page hints to group their entries.
+Coarse centers and list membership are reconstructed from committed heap
+values on cold open; no per-row scalar-quantization codes are stored.
 
-Each list is a singly linked page chain. Starting at offset 38, a list page splits the code, norm, 6 B RowId, and tombstone
-bitmap into contiguous regions so batch distance kernels can read them sequentially. A cold-built file that is not finalized must not be published;
-upper layers discard it and rebuild from the heap.
-
-Both approximate index kinds only produce candidates; the executor performs MVCC reads on the candidates and re-ranks them with the exact f32 vectors from the heap.
+Both ANN algorithms generate candidates. The executor checks MVCC visibility
+and reranks using native heap values. Full probing (`nprobe=nlist`) of IVF
+scores every visible candidate and yields exact TopK without residual filters.
 
 ## 11. Catalog and Generation Publication
 

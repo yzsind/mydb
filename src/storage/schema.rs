@@ -2197,13 +2197,12 @@ pub struct FulltextMeta {
 pub enum VectorAlgo {
     /// HNSW graph (in-memory `HnswIndex` / paged `PagedHnsw`).
     Hnsw,
-    /// IVF + 8-bit scalar-quantized inverted table (`engine::vector::ivf`).
-    IvfSq8,
+    /// Native inverted-file index.
     Ivf,
 }
 
 /// Vector-index build parameters, parsed from the index COMMENT (not a separately
-/// persisted field). HNSW uses `m`/`ef_construction`/`default_ef_search`; IVF_SQ8 uses
+/// persisted field). HNSW uses `m`/`ef_construction`/`default_ef_search`; IVF uses
 /// `nlist`/`default_nprobe`/`kmeans_iters`/`train_sample_mult`. Both algorithms share
 /// `metric`; fields unused by one are ignored by its build/query path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2218,15 +2217,15 @@ pub struct VectorIndexMeta {
     /// "use the session / GUC default". Parsed from `EF_SEARCH=` in the index
     /// comment; planner priority is HINT > session > index default > GUC.
     pub default_ef_search: Option<u32>,
-    /// IVF_SQ8: number of inverted-list cells (k-means centroids). `None`/`0` = auto √N at build time.
+    /// IVF: number of inverted-list cells (k-means centroids). `None`/`0` = auto √N at build time.
     /// Parsed from COMMENT `NLIST=`.
     pub nlist: Option<u32>,
-    /// IVF_SQ8: per-index default number of probe cells per query. `None` = session / GUC default.
+    /// IVF: per-index default number of probe cells per query. `None` = session / GUC default.
     /// Parsed from COMMENT `NPROBE=`; priority HINT > session > index default > GUC.
     pub default_nprobe: Option<u32>,
-    /// IVF_SQ8: k-means iteration rounds (`None` = GUC default). From COMMENT `KMEANS_ITERS=`.
+    /// IVF: k-means iteration rounds (`None` = GUC default). From COMMENT `KMEANS_ITERS=`.
     pub kmeans_iters: Option<u32>,
-    /// IVF_SQ8: training sample multiplier — samples `min(N, mult·nlist)` rows for training (`None` = GUC default).
+    /// IVF: training sample multiplier — samples `min(N, mult·nlist)` rows for training (`None` = GUC default).
     /// Parsed from COMMENT `TRAIN_SAMPLE=`.
     pub train_sample_mult: Option<u32>,
 }
@@ -2709,7 +2708,7 @@ impl IndexSchema {
         self.index_type.eq_ignore_ascii_case("SPATIAL")
     }
 
-    /// Whether this is a vector index (HNSW graph or IVF_SQ8 inverted table). A vector index keeps a
+    /// Whether this is a vector index (HNSW graph or IVF inverted table). A vector index keeps a
     /// degenerate B-tree (constant key → row_id) as a row_id registry to reuse the DML/recovery
     /// infrastructure; the real ANN structure is a derived candidate generator (`engine::vector`:
     /// lazily built from heap scans, incrementally maintained, and authoritative for queries).
@@ -2717,18 +2716,15 @@ impl IndexSchema {
     pub fn is_vector(&self) -> bool {
         self.index_type.eq_ignore_ascii_case("HNSW")
             || self.index_type.eq_ignore_ascii_case("VECTOR")
-            || self.index_type.eq_ignore_ascii_case("IVF_SQ8")
             || self.index_type.eq_ignore_ascii_case("IVF")
     }
 
-    /// The vector index's concrete algorithm (HNSW graph vs IVF_SQ8 inverted table). Called only
+    /// The vector index's concrete algorithm (HNSW graph vs IVF inverted table). Called only
     /// where truly branching by algorithm (build/query routing, parameter parsing); elsewhere share [`Self::is_vector`].
     /// Returns `Hnsw` for non-vector indexes (conventional default; callers should filter via `is_vector()` first).
     pub fn vector_algo(&self) -> VectorAlgo {
         if self.index_type.eq_ignore_ascii_case("IVF") {
             VectorAlgo::Ivf
-        } else if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
-            VectorAlgo::IvfSq8
         } else {
             VectorAlgo::Hnsw
         }
@@ -6346,11 +6342,11 @@ mod tests {
     fn vector_comment_validation_is_algorithm_specific_and_bounded() {
         assert!(VectorIndexMeta::validate_from_comment(
             "NLIST=128 NPROBE=8 KMEANS_ITERS=20",
-            VectorAlgo::IvfSq8,
+            VectorAlgo::Ivf,
         )
         .is_ok());
         assert_eq!(
-            VectorIndexMeta::validate_from_comment("M=16", VectorAlgo::IvfSq8)
+            VectorIndexMeta::validate_from_comment("M=16", VectorAlgo::Ivf)
                 .unwrap_err()
                 .code(),
             1235
@@ -6363,7 +6359,7 @@ mod tests {
         );
         for comment in ["NLIST=0", "NPROBE=1048577", "KMEANS_ITERS=1001"] {
             assert_eq!(
-                VectorIndexMeta::validate_from_comment(comment, VectorAlgo::IvfSq8)
+                VectorIndexMeta::validate_from_comment(comment, VectorAlgo::Ivf)
                     .unwrap_err()
                     .code(),
                 1235,

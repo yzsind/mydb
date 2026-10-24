@@ -1,14 +1,4 @@
-//! Differential: IVF navigator graph quality — serial vs multi-threaded
-//! `link_all`. The paged IVF navigator (`ivf_paged_nav`) builds an M=8 HNSW
-//! over the table and *replaces* the geometric IVF list scan whenever its
-//! candidate pool is non-empty. Server-side differentials (doc_old/ivf-sq8-bugs-audit.md,
-//! bug 8) show the navigator returning single-digit-percent top-10 overlap with
-//! exact brute force while the plain IVF list scan scores ~90% on the same
-//! workload — and the graph quality flips nondeterministically across
-//! restarts. These tests pin the build-side half of that contract: parallel
-//! `link_all` must produce a graph whose navigation recall matches the serial
-//! build (the oracle).
-
+//! Differential HNSW graph recall for serial and parallel `link_all` builds.
 #[cfg(test)]
 mod nav_recall_tests {
     use crate::engine::vector::distance::Metric;
@@ -168,42 +158,10 @@ mod nav_recall_tests {
         let r_par = recall(&par, &vecs, 10, 10, 40);
         let r_serial = recall(&serial, &vecs, 10, 10, 40);
         eprintln!("nav recall@10 ef=40 @100kx256d: parallel={r_par:.2} serial={r_serial:.2}");
-        // The server wraps the navigator in ReadOnlyHnswIndex (frozen
-        // adjacency + vectors) and searches through that wrapper — replicate
-        // the exact production call path.
-        let frozen = crate::engine::vector::hnsw::ReadOnlyHnswIndex::new(make(threads));
-        let mut frozen_hits = 0usize;
-        let mut total = 0usize;
-        for qi in (0..vecs.len()).step_by(vecs.len() / 10) {
-            let q = &vecs[qi];
-            let got: Vec<u32> = frozen
-                .search(q, 10, 40)
-                .into_iter()
-                .map(|(r, _)| r.page_id)
-                .collect();
-            let mut truth: Vec<(f32, u32)> = vecs
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (crate::engine::vector::distance::l2_sq(q, v), i as u32))
-                .collect();
-            truth.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let top: Vec<u32> = truth.into_iter().take(10).map(|(_, i)| i).collect();
-            frozen_hits += top.iter().filter(|t| got.contains(t)).count();
-            total += 10;
-        }
-        let r_frozen = frozen_hits as f64 / total as f64;
-        eprintln!(
-            "nav recall@10 ef=40 @100kx256d: parallel={r_par:.2} serial={r_serial:.2} frozen={r_frozen:.2}"
-        );
         assert!(
             r_par >= r_serial - 0.2,
             "parallel navigator graph far worse than serial oracle \
              (parallel={r_par:.2}, serial={r_serial:.2})"
-        );
-        assert!(
-            r_frozen >= 0.5,
-            "frozen (ReadOnly) navigator path collapsed: {r_frozen:.2} \
-             — matches the server-side ivf_paged_nav recall collapse"
         );
     }
 }

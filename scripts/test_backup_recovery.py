@@ -263,7 +263,7 @@ def scenario(binary, cli, root, rows, pairs, encrypted):
               'CREATE INDEX vi ON vecs(emb) USING HNSW',
               'CREATE TABLE ivfs(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)',
               "INSERT INTO ivfs VALUES(1,'[0,0,0]'),(2,'[1,0,0]'),(3,'[2,1,0]')",
-              "CREATE INDEX ii ON ivfs(emb) USING IVF_SQ8 COMMENT 'NLIST=1 NPROBE=1'",
+              "CREATE INDEX ii ON ivfs(emb) USING IVF COMMENT 'NLIST=1 NPROBE=1'",
               'CREATE SEQUENCE backup_seq','CREATE TABLE ai(id BIGINT AUTO_INCREMENT PRIMARY KEY,v INT)',
               'INSERT INTO ai(v) VALUES(10)']:
         sql(c,q)

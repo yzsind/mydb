@@ -48,7 +48,7 @@ FLOAT32 QPS下降>5%、p99增加>10%、构建/DML下降>10%需复测修复。新
 | `native_integer_text_is_exact_and_binary_padding_is_strict` | 浮点解析会掩盖的小数、范围、超长指数、binary 填充及最大 bit 维度 |
 | `vector_datatypes_sql_storage_and_functions` | 五类型、函数、CAST、原始 payload、错误、strict 存储重启 |
 | `vector_datatypes_exact_knn_preserves_query_precision` | FLOAT16/BFLOAT16/INT8 字段与非整数 FLOAT32 查询 |
-| `vector_datatypes_native_indexes_*_matrix` | 每后端 40 个组合：datatype×metric×HNSW/IVF/IVF_SQ8，原生查询、独立 f64/bit 真值、DML 维护 |
+| `vector_datatypes_native_indexes_*_matrix` | 每后端 28 个组合：datatype×metric×HNSW/IVF，原生查询、独立 f64/bit 真值、DML 维护 |
 | `vector_datatypes_wide_binary_overflow_and_derived_domains` | 65537 bit、overflow、derived、UNION 提升和跨域拒绝、重启 |
 | `vector_datatypes_native_paged_restart_snapshot_and_mapping` | 两种 mmap 模式×四类型×两算法，真实磁盘、RR、删除、重启、物理副本角色切换 |
 | `vector_datatypes_prepared_result_domains_follow_runtime_bindings` | 字符串/二进制参数、相同文本长度的不同维度、不同 datatype、结果 metadata |
@@ -70,7 +70,7 @@ FLOAT32 配对使用原有 `hnsw_end_to_end_bench`，基线与候选的该部分
 测量脚本与结果 JSONL 位于证据目录的 `perf_runner.py`、`perf/results.jsonl`。正式结论在完成配对后填写，不把入口存在当作性能验收已通过。
 
 新增实际WAL帧复制测试 `vector_datatypes_physical_wal_replication_and_promotion`
-覆盖五datatype×HNSW/IVF/合法IVF_SQ8×memory/paged，验证DML、redo、
+覆盖五datatype×HNSW/IVF×memory/paged，验证DML、redo、
 提升、重启和datatype保持；通过与否只写入结果文档。数值粗中心另覆盖
 高于FLOAT32字段维度上限的INT8输入，以及极大/极小指数的批距离回退。
 

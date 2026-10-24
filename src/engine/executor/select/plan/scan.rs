@@ -5658,16 +5658,13 @@ pub(super) fn execute_vector_index_scan(
     }
     let hnsw_cfg = vector::session::current_config();
     // Algorithm-specific search semantics. For HNSW the `effort` argument is
-    // an `ef` candidate-pool size, which must be at least `k`. For IVF_SQ8 it
+    // an `ef` candidate-pool size, which must be at least `k`. For IVF it
     // is `nprobe` — a *cell count* that is independent of the result size; the
     // rerank fetch (`vector_rerank_fetch` below) still guarantees ≥ `k`
     // candidates, so inflating nprobe by `k` (the old `max(k)`) only
     // over-probes and silently defeats the `NPROBE=` / `mydb_ivf_nprobe`
     // tuning knob for large-`k` queries.
-    let is_ivf = matches!(
-        index.vector_algo(),
-        crate::storage::schema::VectorAlgo::IvfSq8 | crate::storage::schema::VectorAlgo::Ivf
-    );
+    let is_ivf = matches!(index.vector_algo(), crate::storage::schema::VectorAlgo::Ivf);
     // Whether the backend's candidate ordering is *exact*. HNSW re-ranks on
     // full-f32 node vectors, and IVF's Dot lists store f32 — for those, the
     // first `k` visible candidates (already in exact-distance order) ARE the

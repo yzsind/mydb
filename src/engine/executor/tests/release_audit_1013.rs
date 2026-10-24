@@ -267,7 +267,7 @@ fn audit13_load_null_defaults_and_strict_atomicity() {
 
 #[test]
 fn audit13_partition_vector_updates_commit_rollback_and_migration() {
-    for algo in ["HNSW", "IVF_SQ8"] {
+    for algo in ["HNSW", "IVF"] {
         let (_dir, engine, mut s) = setup();
         engine.execute(&format!("CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL,KEY vk USING {algo}(v)) PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(1000),PARTITION p1 VALUES LESS THAN MAXVALUE)")).unwrap();
         let rows = (0..2000)

@@ -8,7 +8,7 @@
 2. SQL 与 heap：解析、CAST、DDL/DML、布局、overflow、函数、协议、SHOW/IS；五种类型往返正确。
 3. 精确执行：类型传播、参数/缓存、批执行、LOAD DATA、spill、精确 KNN；独立参考结果一致。
 4. HNSW：原生节点、全部后端与维护生命周期；原值不常驻展开 FLOAT32。
-5. IVF：通用原生入口、数值 SQ8、二值聚类、内存及分页；全探测与精确真值一致。
+5. IVF：通用原生入口、二值聚类、内存及分页；全探测与精确真值一致。
 6. 恢复与复制：版本、WAL/undo、故障、主备提升、完整回归与性能验收、英文产品文档。
 
 ## 约束
@@ -29,7 +29,7 @@
 - 五类型文本/二进制构造、CAST、距离与切片、范数、展示、严格范围与填充验证。
 - 固定 payload 与 varlen/overflow、独立编码、批执行、spill、参数重绑定与计划签名。
 - 原生 HNSW 的 memory/paged、SQ8/精确导航、mmap/CSR、宽整数与按块浮点计算。
-- 通用 IVF、数值 SQ8、二值 k-modes/采样 k-medoids、受控样本与按列表分页填充。
+- 通用 IVF、二值 k-modes/采样 k-medoids、受控样本与按列表分页填充。
 - 构建追平、提交维护、旧快照精确完成、角色切换失效、ROW/FULL envelope 与接收端。
 - 格式升级、英文产品文档和完整边界测试。
 
@@ -121,12 +121,12 @@ INT8保持严格数学整数规则，binary检查填充；half转换采用位级
 DML/RR/重启/角色变化通过；源代码检查确认新类型没有逐行常驻FLOAT32副本。
 状态：完成。
 
-### 阶段5：原生IVF及SQ8扩展
+### 阶段5：原生IVF
 
 依赖：阶段4公共接口。新增USING IVF，源payload倒排表，数值复用并行k-means，
 binary分别使用k-modes和有界k-medoids；修正分页布局、源类型与编码元数据。
-关闭标准：HNSW28、IVF28、IVF_SQ8 24个合法类型/metric/backend组合的功能矩阵通过；
-原生IVF全探测与可见heap真值一致；SQ8候选截断与最终精排语义清楚。
+关闭标准：HNSW28、IVF28共56个合法类型/metric/backend组合的功能矩阵通过；
+原生IVF全探测与可见heap真值一致。
 状态：完成。
 
 ### 阶段6：恢复复制与验收

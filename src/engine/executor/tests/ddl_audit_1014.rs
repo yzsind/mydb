@@ -468,7 +468,7 @@ fn rename_special_indexes_retains_query_results_across_rollback_and_restart() {
         ("v TEXT,FULLTEXT KEY original(v)", "'alpha bravo'", "SELECT id FROM t WHERE MATCH(v) AGAINST('alpha' IN BOOLEAN MODE)"),
         ("v GEOMETRY NOT NULL,SPATIAL KEY original(v)", "ST_GeomFromText('POINT(1 1)')", "SELECT id FROM t FORCE INDEX(renamed) WHERE MBRContains(ST_GeomFromText('POLYGON((0 0,2 0,2 2,0 2,0 0))'),v)"),
         ("v VECTOR(3),KEY original(v) USING HNSW", "'[1,0,0]'", "SELECT id FROM t FORCE INDEX(renamed) ORDER BY DISTANCE(v,'[1,0,0]') LIMIT 1"),
-        ("v VECTOR(3),KEY original(v) USING IVF_SQ8", "'[1,0,0]'", "SELECT id FROM t FORCE INDEX(renamed) ORDER BY DISTANCE(v,'[1,0,0]') LIMIT 1"),
+        ("v VECTOR(3),KEY original(v) USING IVF", "'[1,0,0]'", "SELECT id FROM t FORCE INDEX(renamed) ORDER BY DISTANCE(v,'[1,0,0]') LIMIT 1"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let engine = open_strict_test_engine(dir.path());

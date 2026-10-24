@@ -324,8 +324,8 @@ INSERT INTO documents VALUES
     (1, STRING_TO_VECTOR('[0.1, -0.2, 0.3]')); -- the dimension must match the column declaration
 ```
 
-Vectors are contiguous little-endian `f32` arrays on disk and inside the protocol, with the
-text form `[v1,v2,...]`. Applications should construct values with
+Vectors retain native datatype payloads in heap storage and use array text
+`[v1,v2,...]` in the MySQL protocol. See [vector datatypes and indexes](vector-indexes.md). Applications should construct values with
 `STRING_TO_VECTOR`/`TO_VECTOR` and render explicitly with `VECTOR_TO_STRING`/`FROM_VECTOR`.
 See [`function/vector/README.md`](function/vector/README.md) for the function list.
 
@@ -333,21 +333,8 @@ Retrieval options include:
 
 - exact brute-force KNN such as `ORDER BY L2_DISTANCE(embedding, query) LIMIT k`;
 - `USING HNSW` indexes on single-column, non-unique, `NOT NULL` vectors;
-- `IVF_SQ8` indexes with the corresponding `nlist`/`nprobe` configuration;
+- `IVF` indexes with the corresponding `nlist`/`nprobe` configuration;
 - metrics such as `COSINE`, `L2`, and `DOT`, plus the `NO_VECTOR_INDEX` hint.
-
-The derived navigator is disabled by default to avoid the discovered high-dimensional recall
-degradation and the startup overhead caused by post-write invalidation. Only under the
-experimental setting `MYDB_IVF_NAVIGATOR=on` does the paged backend attempt, for `IVF_SQ8`
-indexes with at least 100,000 rows and a dimension of at least 256, to build an M=8 derived
-navigation graph governed by the unified memory governor. It uses
-`max(candidate count, 2*nprobe+16)` as the navigation effort and returns candidates with exact
-f32 ordering, avoiding per-query streaming of the full high-dimensional SQ8 codes of every
-probed list; `nprobe=nlist` still forces the original inverted-file full probe, preserving the
-exact escape semantics. When the derived cache has no budget or the build fails, it falls back
-to the ordinary IVF list scan; successful DML invalidates it, and DDL/`OPTIMIZE TABLE` or a
-cold load can rebuild it. `information_schema.mydb_vector_indexes.BACKEND` shows
-`ivf_paged_nav` when the navigator is active.
 
 Both vectors of a single distance computation must have the same dimension. Vectors have no
 natural total order suitable for business sorting; queries should order by the distance
@@ -367,7 +354,7 @@ function rather than rely on the internal byte order of the raw column.
 | Bit sets | `SET`/`BIT` | for high-frequency member filtering consider generated columns/a normalized association table |
 | Documents | `JSON` | generated columns, functional indexes, or MVI; do not index JSONB directly |
 | Coordinates and shapes | a concrete geometry subtype + `SRID` | single-column SPATIAL index |
-| embedding | fixed-dimension `VECTOR(n) NOT NULL` | exact scan for small data, HNSW/IVF_SQ8 for large data |
+| embedding | fixed-dimension `VECTOR(n) NOT NULL` | exact scan for small data, HNSW/IVF for large data |
 
 The type, character set, collation, unsigned attribute, and declared precision of an index key
 are all SQL semantics. Changing these attributes affects comparison order, uniqueness, or

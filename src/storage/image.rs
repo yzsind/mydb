@@ -403,7 +403,7 @@ fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
 fn classify_file(relative: &str) -> FileClass {
     match Path::new(relative).extension().and_then(|ext| ext.to_str()) {
         Some("idx") => FileClass::Index,
-        Some("zm" | "hnsw" | "hvec" | "ivf") => FileClass::Derived,
+        Some("zm" | "hnsw" | "hvec") => FileClass::Derived,
         Some("log") if relative.starts_with("system/wal/") => FileClass::RecoveryWal,
         _ => FileClass::Authoritative,
     }

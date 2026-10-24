@@ -2255,7 +2255,7 @@ mod base_backup_tests {
                 .unwrap();
             me.execute("INSERT INTO bb_vec VALUES (1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')")
                 .unwrap();
-            me.execute("CREATE INDEX ivf_v ON bb_vec(v) USING IVF_SQ8 COMMENT 'NLIST=2'")
+            me.execute("CREATE INDEX ivf_v ON bb_vec(v) USING IVF COMMENT 'NLIST=2'")
                 .unwrap();
             me.execute("CREATE TABLE bb (k INT PRIMARY KEY, v VARCHAR(64))")
                 .expect("create table");

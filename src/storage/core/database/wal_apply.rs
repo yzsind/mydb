@@ -229,15 +229,6 @@ impl Database {
             self.buffer_pool
                 .discard_pages_for_path(&self.data_dir.join(path))?;
         }
-        // Cover ordinary/compressed/FPI/CLR/file records and nested TxnBatch
-        // entries. The pre-commit unfinalized marker retires the old graph;
-        // queries fall back until the final meta-page redo permits reopening.
-        let refresh_ivf =
-            replica_payload_path(&record.payload).is_some_and(|path| path.ends_with(".ivf"));
-        if refresh_ivf {
-            self.invalidate_replicated_ivf_graphs(replica_payload_path(&record.payload));
-        }
-
         if txn_id != 0 && replica_payload_is_write(&record.payload) {
             let undo_head = match &record.payload {
                 WalPayload::UndoRecord { undo_id, .. } => Some(*undo_id),
@@ -247,7 +238,9 @@ impl Database {
         }
         if let Some(path) = replica_payload_path(&record.payload) {
             if replica_payload_is_write(&record.payload) {
-                if let Some(storage) = Self::parse_heap_table_id(path) { self.note_replicated_hnsw_heap(txn_id, storage); }
+                if let Some(storage) = Self::parse_heap_table_id(path) {
+                    self.note_replicated_hnsw_heap(txn_id, storage);
+                }
             }
             let mut tracker = self.replica_restartpoint_tracker.lock().map_err(|_| {
                 error(
@@ -272,7 +265,8 @@ impl Database {
                 for (idx, payload) in records.iter().enumerate() {
                     let logical_lsn = first_logical_lsn + idx as u64;
                     self.apply_wal_record_inner(
-                        &WalRecord { source_time_us: record.source_time_us,
+                        &WalRecord {
+                            source_time_us: record.source_time_us,
                             lsn: logical_lsn,
                             prev_txn_lsn: logical_prev_lsn,
                             txn_id,
@@ -649,12 +643,19 @@ impl Database {
                 commit_unix_us,
                 ..
             } => {
-                let schema_changed=self.applier_dd_dirty_txns.lock().get(&txn_id).is_some_and(|delta|delta.dd_touched);
-                self.vector_snapshot_floor.fetch_max(*commit_scn, Ordering::AcqRel);
+                let schema_changed = self
+                    .applier_dd_dirty_txns
+                    .lock()
+                    .get(&txn_id)
+                    .is_some_and(|delta| delta.dd_touched);
+                self.vector_snapshot_floor
+                    .fetch_max(*commit_scn, Ordering::AcqRel);
                 self.invalidate_replicated_hnsw_commit(txn_id, false);
                 self.apply_commit_txn(txn_id, *commit_scn)?;
                 self.invalidate_replicated_hnsw_commit(txn_id, true);
-                if schema_changed { self.replicated_hnsw_table_cache.write().clear(); }
+                if schema_changed {
+                    self.replicated_hnsw_table_cache.write().clear();
+                }
                 self.commit_hlc_unix_us
                     .fetch_max(*commit_unix_us, Ordering::AcqRel);
                 if *commit_unix_us != 0 && self.temporal_history.has_history_index_batch(txn_id) {
@@ -726,7 +727,9 @@ impl Database {
                 }
                 heap_redo.files.remove(path);
                 write_recovered_file(&self.data_dir, path, after)?;
-                if path=="system/undo/undo.manifest"{self.undo_lock()?.apply_source_manifest(after)?;}
+                if path == "system/undo/undo.manifest" {
+                    self.undo_lock()?.apply_source_manifest(after)?;
+                }
                 if path.starts_with("system/xa-binlog/") {
                     self.applier_dd_dirty_txns
                         .lock()
@@ -810,9 +813,6 @@ impl Database {
                     .store(*sequence_covered_lsn, Ordering::Release);
             }
         }
-        if refresh_ivf {
-            self.invalidate_replicated_ivf_graphs(replica_payload_path(&record.payload));
-        }
         Ok(())
     }
 
@@ -829,10 +829,9 @@ impl Database {
             && crate::storage::data_dictionary::is_dd_table_id(info.table_id)
     }
 
-    /// B-tree/HNSW files are rebuilt locally from logical records. IVF uses
-    /// physical page redo: IndexBatch does not encode its list mutations.
+    /// B-tree and vector indexes are rebuilt locally from committed heap data.
     fn path_is_index_file(path: &str) -> bool {
-        is_index_object_path(path) && !path.ends_with(".ivf")
+        is_index_object_path(path)
     }
 
     fn note_dd_touch_if_needed(&self, path: &str, txn_id: u64) {

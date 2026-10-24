@@ -54,7 +54,7 @@ pub(crate) struct TruncateTableIntent {
     /// Non-vector index names to wipe per storage id (`.idx` files). Vector
     /// indexes are handled by `vector_index_names` below.
     pub(crate) index_names: Vec<String>,
-    /// Vector index names to wipe per storage id (`.hnsw` / `.hvec` / `.ivf`).
+    /// Vector index names to wipe per storage id (`.hnsw` / `.hvec` ).
     /// Split out because they don't have `.idx` files and their paged frames
     /// must be evicted from the buffer pool before the unlink.
     pub(crate) vector_index_names: Vec<String>,

@@ -485,7 +485,7 @@ fn audit_r05_file_generations_and_authoritative_objects_continue_from_e() {
         "CREATE INDEX vi ON vecs(emb) USING HNSW",
         "CREATE TABLE ivfs(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)",
         "INSERT INTO ivfs VALUES(1,'[0,0,0]'),(2,'[1,0,0]')",
-        "CREATE INDEX ii ON ivfs(emb) USING IVF_SQ8 COMMENT 'NLIST=1 NPROBE=1'",
+        "CREATE INDEX ii ON ivfs(emb) USING IVF COMMENT 'NLIST=1 NPROBE=1'",
         "CREATE SEQUENCE audit_seq",
     ] { f.source.execute(sql).unwrap(); }
     let queries = [

@@ -510,7 +510,7 @@ pub(super) fn execute_load_data_with_reader(
     }
     // B1 — the fast/parallel LOAD paths write heap-only and never run the
     // `note_vector_*` maintenance hooks, so any row bulk-loaded into a table
-    // with an already-*warm* vector index (HNSW or IVF_SQ8) would be absent
+    // with an already-*warm* vector index (HNSW or IVF) would be absent
     // from KNN results until restart/OPTIMIZE. Evict the warm graphs on a
     // successful load (no file deletion — the next KNN query rebuilds from the
     // now-complete heap). Cold graphs are unaffected, and a bulk rebuild is the

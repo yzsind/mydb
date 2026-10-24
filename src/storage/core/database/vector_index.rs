@@ -27,7 +27,7 @@ use crate::engine::vector::hnsw_paged::{
     HnswBuildStats, HnswChunkBuildStats, PagedHnsw, BUILD_NODE_METADATA_BYTES,
 };
 use crate::engine::vector::{
-    self, CompactHnswBuilder, CompactHnswStats, HnswIndex, IvfParams, IvfSq8Index, VectorGraph,
+    self, CompactHnswBuilder, CompactHnswStats, HnswIndex, IvfParams, VectorGraph,
 };
 use crate::storage::schema::VectorAlgo;
 // `VectorIndexFile`, `NodeView`, `VecId` are defined in `core.rs` itself (via
@@ -175,11 +175,11 @@ fn vector_storage_paged() -> bool {
     )
 }
 
-/// Resolve IVF_SQ8 build/query parameters: index COMMENT tokens
+/// Resolve IVF build/query parameters: index COMMENT tokens
 /// (`NLIST=`/`NPROBE=`/`KMEANS_ITERS=`/`TRAIN_SAMPLE=`) take priority, then
 /// env-var build defaults (`MYDB_IVF_*`), then the built-in defaults. `nlist=0`
-/// means "auto (√N)". `nprobe_default` here is only the build-time fallback;
-/// the query path re-resolves nprobe from the live session GUC / hint.
+/// means "auto (√N)". Query-time nprobe is resolved separately from the
+/// live session, hint and per-index metadata.
 fn ivf_params_from_meta(meta: &crate::storage::schema::VectorIndexMeta) -> IvfParams {
     fn env_usize(name: &str) -> Option<usize> {
         std::env::var(name)
@@ -193,11 +193,6 @@ fn ivf_params_from_meta(meta: &crate::storage::schema::VectorIndexMeta) -> IvfPa
             .map(|n| n as usize)
             .or_else(|| env_usize("MYDB_IVF_NLIST"))
             .unwrap_or(0),
-        nprobe_default: meta
-            .default_nprobe
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_NPROBE").filter(|n| *n > 0))
-            .unwrap_or(def.nprobe_default),
         kmeans_iters: meta
             .kmeans_iters
             .map(|n| n as usize)
@@ -628,10 +623,7 @@ impl Database {
         {
             return self.vector_native_hnsw_load_or_build(table, index, storage_id);
         }
-        if index.vector_algo() == VectorAlgo::Ivf
-            || (index.vector_algo() == VectorAlgo::IvfSq8
-                && matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32))
-        {
+        if index.vector_algo() == VectorAlgo::Ivf {
             return self.vector_native_ivf_load_or_build(table, index, storage_id);
         }
         // Source HNSW page redo is not applied locally. A replica owns only
@@ -655,13 +647,6 @@ impl Database {
         }
         let paged_backend = vector_storage_paged();
         self.ensure_vector_backend_compatible(table, index, storage_id, paged_backend)?;
-        // IVF_SQ8 has its own (memory-backend) build path. It rebuilds the
-        // inverted lists from the heap on every cold load — the heap is the
-        // source of truth and the build is cached in `vector_indexes` for the
-        // process lifetime, so there is no snapshot to load or catch up.
-        if index.vector_algo() == VectorAlgo::IvfSq8 {
-            return self.vector_ivf_load_or_build(table, index, storage_id);
-        }
         if paged_backend {
             return Ok(VectorGraph::Paged(
                 self.vector_graph_paged_load_or_build(table, index, storage_id)?,
@@ -865,7 +850,6 @@ impl Database {
             dimension,
             meta.metric_enum(),
             ivf_params_from_meta(&meta),
-            index.vector_algo() == VectorAlgo::IvfSq8,
             file,
         )?;
         let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
@@ -962,324 +946,6 @@ impl Database {
             graph.replace_file(file);
         }
         Ok(VectorGraph::NativeIvf(graph))
-    }
-
-    /// IVF_SQ8 cold build: materialize every visible vector from the partition
-    /// heap into a `(RowId, vector)` batch, then train the coarse quantizer and
-    /// populate the SQ8 inverted lists. Build parameters come from the index
-    /// COMMENT (`NLIST=`/`NPROBE=`/`KMEANS_ITERS=`/`TRAIN_SAMPLE=`) with env
-    /// fallbacks. An empty heap yields an untrained (empty) index that later
-    /// DML / the next cold build populates.
-    fn vector_ivf_load_or_build(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-    ) -> Result<VectorGraph, QueryError> {
-        if vector_storage_paged() {
-            return self.vector_ivf_paged_load_or_build(table, index, storage_id);
-        }
-        let meta = index.vector_meta_for_table(table);
-        let ivf = IvfSq8Index::new(meta.metric_enum(), ivf_params_from_meta(&meta));
-        let col_idx = table.column_index(&index.columns[0])?;
-        let cols = [col_idx];
-        let mut rows: Vec<(RowId, Vec<f32>)> = Vec::new();
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(&cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        rows.push((row.row_id, vector::to_f32(bytes)));
-                    }
-                }
-                Ok(false)
-            })
-        })?;
-        ivf.build_from_rows(&rows)?;
-        Ok(VectorGraph::Ivf(ivf))
-    }
-
-    /// Paged IVF_SQ8 build/open: open (or create) the `.ivf` file — which *is*
-    /// the durable index (buffer pool + WAL) — and cold-build it from the
-    /// partition heap when it holds no finalized index yet (a fresh file, or an
-    /// interrupted/legacy build). A finalized file is trusted and used as-is,
-    /// so it survives restart on its own with no snapshot to load. Mirrors
-    /// `vector_graph_paged_load_or_build` for HNSW.
-    fn vector_ivf_paged_load_or_build(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-    ) -> Result<VectorGraph, QueryError> {
-        let col_idx = table.column_index(&index.columns[0])?;
-        let cols = [col_idx];
-        let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-        let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-        let params = ivf_params_from_meta(&index.vector_meta());
-        // Opening can fail when the persisted `.ivf` disagrees with the current
-        // dim/metric (a COMMENT metric change, a dim change) or its meta page is
-        // corrupt. The heap is the durable record, so rather than failing every
-        // KNN query with a hard 1030 (B3), discard the unusable file and reopen
-        // fresh — the `!is_finalized()` branch below then rebuilds it from the
-        // heap. Mirrors the HNSW memory path's log-and-rebuild.
-        let paged = match self.open_ivf_index_file(table, index, storage_id, dim) {
-            Ok(file) => file,
-            Err(e) => {
-                if self.is_snapshot_read_only() || self.physical_replica_mode() {
-                    return Err(e);
-                }
-                log_message(&format!(
-                    "ivf(paged): unusable .ivf at {} ({e:?}); discarding and rebuilding from heap",
-                    path.display()
-                ));
-                self.buffer_pool.discard_pages_for_path(&path)?;
-                let _ = fs::remove_file(&path);
-                self.open_ivf_index_file(table, index, storage_id, dim)?
-            }
-        };
-        let paged = if self.physical_replica_mode() {
-            crate::engine::vector::ivf_paged::PagedIvf::new_for_replica(Arc::new(paged), params)
-        } else {
-            crate::engine::vector::ivf_paged::PagedIvf::new(Arc::new(paged), params)
-        };
-        if !paged.is_finalized() {
-            if self.physical_replica_mode() {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "replicated IVF index is not finalized; wait for source replay",
-                ));
-            }
-            log_message(format!(
-                "ivf(paged): unfinalized index {}; rebuilding from heap",
-                path.display()
-            ));
-            self.ensure_writable()?;
-            drop(paged);
-            self.buffer_pool.discard_pages_for_path(&path)?;
-            let _ = fs::remove_file(&path);
-            let file = self.open_ivf_index_file(table, index, storage_id, dim)?;
-            let rebuilt = crate::engine::vector::ivf_paged::PagedIvf::new(Arc::new(file), params);
-            self.vector_ivf_paged_build_from_heap(storage_id, &cols, &rebuilt)?;
-            return Ok(VectorGraph::Ivf(IvfSq8Index::from_paged(rebuilt)));
-        }
-        self.vector_ivf_paged_build_navigator_from_heap(storage_id, &cols, &paged)?;
-        Ok(VectorGraph::Ivf(IvfSq8Index::from_paged(paged)))
-    }
-
-    /// Open (creating if absent) the `.ivf` file for one paged IVF_SQ8 index,
-    /// wiring it to the shared WAL + buffer pool. The on-disk payload layout
-    /// (SQ8 codes vs raw f32) is fixed at create time by the metric + the SME
-    /// env; a reopen adopts the file's persisted layout.
-    fn open_ivf_index_file(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-        dim: u32,
-    ) -> Result<crate::storage::IvfIndexFile, QueryError> {
-        let meta = index.vector_meta_for_table(table);
-        let metric = meta.metric_enum();
-        let stores_f32 = crate::engine::vector::ivf_paged::PagedIvf::stores_f32_for(metric);
-        let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-        self.open_ivf_index_file_at_path(path, dim, metric.as_u8(), stores_f32)
-    }
-
-    fn open_ivf_index_file_at_path(
-        &self,
-        path: PathBuf,
-        dim: u32,
-        metric: u8,
-        stores_f32: bool,
-    ) -> Result<crate::storage::IvfIndexFile, QueryError> {
-        crate::storage::IvfIndexFile::open_with_durability(
-            path,
-            self.log.clone(),
-            self.durability_mode(),
-            self.buffer_pool.clone(),
-            dim,
-            metric,
-            stores_f32,
-        )
-    }
-
-    /// Build a replacement `.ivf` beside the live file and atomically publish
-    /// it.  The old finalized index remains queryable until rename succeeds.
-    fn rebuild_paged_ivf_atomic(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-    ) -> Result<Arc<VectorGraph>, QueryError> {
-        let col_idx = table.column_index(&index.columns[0])?;
-        let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-        let meta = index.vector_meta_for_table(table);
-        let metric = meta.metric_enum();
-        let stores_f32 = crate::engine::vector::ivf_paged::PagedIvf::stores_f32_for(metric);
-        let params = ivf_params_from_meta(&meta);
-        let final_path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-        let tmp_path = final_path.with_extension("ivf.optimize.tmp");
-        let _ = self.buffer_pool.discard_pages_for_path(&tmp_path);
-        let _ = fs::remove_file(&tmp_path);
-        let replacement = crate::engine::vector::ivf_paged::PagedIvf::new(
-            Arc::new(self.open_ivf_index_file_at_path(
-                tmp_path.clone(),
-                dim,
-                metric.as_u8(),
-                stores_f32,
-            )?),
-            params,
-        );
-        self.vector_ivf_paged_build_from_heap(storage_id, &[col_idx], &replacement)?;
-        replacement.file().flush()?;
-        if self.durability_mode() == DurabilityMode::Memory {
-            // The test/in-memory durability backend has no physical pathname
-            // to rename; publishing the fully-built Arc is the atomic swap.
-            return Ok(Arc::new(VectorGraph::Ivf(IvfSq8Index::from_paged(
-                replacement,
-            ))));
-        }
-        let navigator = replacement.navigator();
-        drop(replacement);
-        self.buffer_pool.discard_pages_for_path(&tmp_path)?;
-        self.buffer_pool.discard_pages_for_path(&final_path)?;
-        fs::rename(&tmp_path, &final_path).map_err(|e| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                format!(
-                    "cannot atomically publish optimized IVF index {} -> {}: {e}",
-                    tmp_path.display(),
-                    final_path.display()
-                ),
-            )
-        })?;
-        if let Some(parent) = final_path.parent() {
-            crate::platform::fs::sync_path(parent).map_err(io_err)?;
-        }
-        let reopened = crate::engine::vector::ivf_paged::PagedIvf::new(
-            Arc::new(self.open_ivf_index_file(table, index, storage_id, dim)?),
-            params,
-        );
-        reopened.install_navigator(navigator);
-        Ok(Arc::new(VectorGraph::Ivf(IvfSq8Index::from_paged(
-            reopened,
-        ))))
-    }
-
-    /// Cold-build a paged IVF index with reserved resident metadata. Small
-    /// inputs keep the memory fast path; larger matrices and training samples
-    /// use quota-accounted read-only mappings. The heap remains the durable
-    /// record, so a scan error leaves a non-finalized, rebuildable index.
-    fn vector_ivf_paged_build_from_heap(
-        &self,
-        storage_id: u64,
-        cols: &[usize],
-        paged: &crate::engine::vector::ivf_paged::PagedIvf,
-    ) -> Result<(), QueryError> {
-        // Count without decoding vectors before reserving all resident metadata.
-        let mut count = 0usize;
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(&[], |row| {
-                if !row.header.is_deleted() {
-                    count += 1;
-                }
-                Ok(false)
-            })
-        })?;
-        let _build_gate = hnsw_build_memory_gate()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let full_bytes = count
-            .saturating_mul(paged.dim().saturating_mul(12).saturating_add(192))
-            .saturating_add(16 * 1024 * 1024);
-        if full_bytes <= hnsw_bulk_memory_budget_bytes()? as usize {
-            if let Some(_lease) =
-                HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), full_bytes)
-            {
-                let mut rows = Vec::with_capacity(count);
-                self.with_heap_read(storage_id, |heap| {
-                    heap.scan_mvcc_columns_until(cols, |row| {
-                        if !row.header.is_deleted() {
-                            if let Some(Value::Vector(bytes)) = row.values.first() {
-                                rows.push((row.row_id, vector::to_f32(bytes)));
-                            }
-                        }
-                        Ok(false)
-                    })
-                })?;
-                return paged.build_from_rows(&rows);
-            }
-        }
-        let scratch = paged.spill_build_scratch_bytes(count);
-        let lease = HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), scratch)
-            .ok_or_else(|| error(crate::error::catalog::ER_OUTOFMEMORY,
-                format!("IVF spill build cannot reserve {scratch} bytes of metadata and training scratch")))?;
-        lease.use_streaming_buffer()?;
-        let mut spill =
-            crate::engine::vector::spill_rows::VectorRowSpill::new(self.data_dir(), paged.dim())?;
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        spill.push(
-                            row.row_id,
-                            &paged.prepare_build_vector(&vector::to_f32(bytes)),
-                        )?;
-                    }
-                }
-                Ok(false)
-            })
-        })?;
-        let mapped = spill.finish()?;
-        mapped.advise_random();
-        let rows = mapped.rows();
-        if rows.len() != count {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "IVF build row count changed during scan",
-            ));
-        }
-        paged.build_from_spilled_rows(&rows, self.data_dir())?;
-        drop(rows);
-        drop(mapped);
-        drop(lease);
-        self.vector_ivf_paged_build_navigator_from_heap(storage_id, cols, paged)
-    }
-
-    /// Rebuild only the optional governed query navigator for an already
-    /// finalized `.ivf` file (for example after process restart). The durable
-    /// IVF pages are left untouched; allocation pressure merely causes the
-    /// navigator to decline publication and list scanning remains available.
-    fn vector_ivf_paged_build_navigator_from_heap(
-        &self,
-        storage_id: u64,
-        cols: &[usize],
-        paged: &crate::engine::vector::ivf_paged::PagedIvf,
-    ) -> Result<(), QueryError> {
-        if !crate::engine::vector::ivf_paged::PagedIvf::navigator_enabled() {
-            return Ok(());
-        }
-        let scratch_bytes = paged.live_count().saturating_mul(
-            std::mem::size_of::<(RowId, Vec<f32>)>()
-                .saturating_add(paged.dim().saturating_mul(std::mem::size_of::<f32>())),
-        );
-        let Some(_scratch_lease) =
-            HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), scratch_bytes)
-        else {
-            log_message("ivf(paged): navigation rebuild skipped; no governed heap-scan scratch");
-            return Ok(());
-        };
-        let mut rows: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(paged.live_count());
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        rows.push((row.row_id, vector::to_f32(bytes)));
-                    }
-                }
-                Ok(false)
-            })
-        })?;
-        paged.rebuild_navigator(&rows);
-        Ok(())
     }
 
     /// Paged-backend build/open: open (or create) the `.hvec` graph file —
@@ -2513,34 +2179,7 @@ impl Database {
             table.active_generation.max(1),
             normalize_name(&index.name),
         );
-        if self.physical_replica_mode()
-            && index.vector_algo() == VectorAlgo::IvfSq8
-            && matches!(
-                table.columns[table.column_index(&index.columns[0])?].data_type,
-                DataTypeKind::Vector {
-                    datatype: crate::vector::VectorDataType::Float32,
-                    ..
-                }
-            )
-        {
-            if !vector_storage_paged() {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,
-                    "memory IVF acceleration unavailable during physical replication; using exact heap search"));
-            }
-            if let Some(graph) = self.vector_indexes.read().get(&key) {
-                return Ok(graph.clone());
-            }
-            // Serialize publication with redo invalidation. Otherwise a build
-            // started before eviction can publish its obsolete resident state
-            // after the applier has already removed the old cache entry.
-            let mut map = self.vector_indexes.write();
-            if let Some(graph) = map.get(&key) {
-                return Ok(graph.clone());
-            }
-            let graph = Arc::new(self.vector_graph_load_or_build(table, index, storage_id)?);
-            map.insert(key, graph.clone());
-            return Ok(graph);
-        }
+
         if let Some(graph) = self.vector_indexes.read().get(&key) {
             return Ok(graph.clone());
         }
@@ -2850,20 +2489,6 @@ impl Database {
         );
         if self.vector_indexes.read().contains_key(&key) {
             return Ok(()); // already warm (e.g. a concurrent query built it)
-        }
-        if index.vector_algo() == VectorAlgo::IvfSq8
-            && vector_storage_paged()
-            && matches!(
-                table.columns[table.column_index(&index.columns[0])?].data_type,
-                DataTypeKind::Vector {
-                    datatype: crate::vector::VectorDataType::Float32,
-                    ..
-                }
-            )
-        {
-            let graph = self.rebuild_paged_ivf_atomic(table, index, storage_id)?;
-            self.vector_indexes.write().entry(key).or_insert(graph);
-            return Ok(());
         }
         self.vector_graph_build_and_publish(table, index, storage_id, key)?;
         Ok(())
@@ -3351,42 +2976,6 @@ impl Database {
                 continue;
             }
             let mut graph = self.vector_indexes.read().get(&key).cloned();
-            // A cold but finalized file still represents a durable index.
-            // Leaving it untouched would retain stale pages on both restart
-            // and replicas. Reopen it (without a heap rebuild) before commit
-            // so the ordinary delta hooks maintain it too.
-            if graph.is_none()
-                && index.vector_algo() == VectorAlgo::IvfSq8
-                && matches!(
-                    table.columns[table.column_index(&index.columns[0])?].data_type,
-                    DataTypeKind::Vector {
-                        datatype: crate::vector::VectorDataType::Float32,
-                        ..
-                    }
-                )
-                && vector_storage_paged()
-            {
-                let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-                if path.exists() {
-                    let col_idx = table.column_index(&index.columns[0])?;
-                    let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-                    let file = self.open_ivf_index_file(table, index, storage_id, dim)?;
-                    if file.is_finalized() {
-                        let paged = crate::engine::vector::ivf_paged::PagedIvf::new(
-                            Arc::new(file),
-                            ivf_params_from_meta(&index.vector_meta()),
-                        );
-                        let candidate = Arc::new(VectorGraph::Ivf(IvfSq8Index::from_paged(paged)));
-                        graph = Some(
-                            self.vector_indexes
-                                .write()
-                                .entry(key.clone())
-                                .or_insert(candidate)
-                                .clone(),
-                        );
-                    }
-                }
-            }
             // FLOAT32's finalized `.hvec` is trusted without a heap scan, so
             // commits must reach it while cold. Native files always rebuild
             // from heap and must not enter this legacy FLOAT32 open path.
@@ -3785,43 +3374,17 @@ impl Database {
         Ok(())
     }
 
-    /// Physical IVF redo replaces pages beneath resident directories. Retire
-    /// both cached and already-cloned handles; a later query reopens finalized
-    /// pages, while an incomplete delta uses the executor's exact fallback.
-    pub(crate) fn invalidate_replicated_ivf_graphs(&self, path: Option<&str>) {
-        if path.is_none() {
-            self.replicated_hnsw_table_cache.write().clear();
-            self.vector_build_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    /// Replicated heap commits retire resident accelerators, including handles
+    /// already borrowed by queries. Rebuild from the committed heap snapshot.
+    pub(crate) fn invalidate_replicated_vector_graphs(&self) {
+        self.replicated_hnsw_table_cache.write().clear();
+        self.vector_build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut graphs = self.vector_indexes.write();
+        for graph in graphs.values() {
+            graph.invalidate();
         }
-        self.vector_indexes.write().retain(|_, graph| {
-            if matches!(
-                graph.as_ref(),
-                VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
-            ) {
-                graph.invalidate();
-                return false;
-            }
-            if path.is_none() && graph.supports_versions() {
-                graph.invalidate();
-                return false;
-            }
-            if let VectorGraph::Paged(paged) = graph.as_ref() {
-                if path.is_none_or(|path| paged.file().relative_path() == path) {
-                    paged.file().disable_navigation_mapping();
-                }
-            }
-            if let VectorGraph::Ivf(IvfSq8Index::Paged(paged)) = graph.as_ref() {
-                if path.is_none_or(|path| paged.file().relative_path() == path) {
-                    paged.invalidate_replicated_pages();
-                    false
-                } else {
-                    true
-                }
-            } else {
-                !(path.is_none() && matches!(graph.as_ref(), VectorGraph::Ivf(_)))
-            }
-        });
+        graphs.clear();
     }
 
     /// Per-index tombstone hook. Mirrors `vector_graph_note_insert` for

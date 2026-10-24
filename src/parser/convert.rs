@@ -280,13 +280,9 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             }
             let columns = convert_index_columns(index_columns)?;
             let (index_type, comment) = convert_index_type_and_options(using, &index_options)?;
-            // BTREE and vector (HNSW / IVF_SQ8) indexes are creatable via
+            // BTREE and vector (HNSW / IVF) indexes are creatable via
             // CREATE INDEX; SPATIAL/FULLTEXT use dedicated keyword paths.
-            if index_type != "BTREE"
-                && index_type != "HNSW"
-                && index_type != "IVF_SQ8"
-                && index_type != "IVF"
-            {
+            if index_type != "BTREE" && index_type != "HNSW" && index_type != "IVF" {
                 return unsupported(&format!("CREATE INDEX USING {index_type}"));
             }
             let included_columns: Vec<String> = include.into_iter().map(ident_value).collect();
@@ -1269,13 +1265,9 @@ fn convert_create_table(
                     constraint.index_type,
                     &constraint.index_options,
                 )?;
-                // BTREE and vector (HNSW / IVF_SQ8) indexes are allowed as inline
+                // BTREE and vector (HNSW / IVF) indexes are allowed as inline
                 // table keys; other special index types use dedicated keyword paths.
-                if index_type != "BTREE"
-                    && index_type != "HNSW"
-                    && index_type != "IVF_SQ8"
-                    && index_type != "IVF"
-                {
+                if index_type != "BTREE" && index_type != "HNSW" && index_type != "IVF" {
                     return Ok(Statement::Unsupported {
                         kind: format!("INDEX USING {index_type}"),
                         sql: sql.to_string(),

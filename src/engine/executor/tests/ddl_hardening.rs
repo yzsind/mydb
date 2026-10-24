@@ -321,7 +321,7 @@ fn compatible_constraint_tightening_scans_without_copy() {
 
 #[test]
 fn offline_shadow_copy_preserves_vector_and_special_indexes() {
-    for kind in ["HNSW", "IVF_SQ8"] {
+    for kind in ["HNSW", "IVF"] {
         let dir = tempfile::tempdir().unwrap();
         let engine = open_strict_test_engine(dir.path());
         engine

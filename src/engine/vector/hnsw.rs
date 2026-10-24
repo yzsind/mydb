@@ -928,13 +928,6 @@ impl NodeSlab {
         unsafe { &*base.add(off) }
     }
 
-    /// Iterate all live slots `0..len`. **Caller must hold `structural` write**
-    /// so no `push` is mid-flight (an unwritten claimed slot would be UB).
-    fn iter(&self) -> impl Iterator<Item = &Node> {
-        let len = self.len();
-        (0..len as u32).map(move |id| self.get(id))
-    }
-
     /// Drop every node and free every bucket, resetting to empty. **Caller
     /// must hold `structural` write** (excludes all readers/appenders).
     fn clear_locked(&self) {
@@ -1086,7 +1079,6 @@ pub(crate) struct HnswIndex {
     /// builders do not take this mutex per node.
     resident_charge: Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
     resident_reserved_nodes: AtomicUsize,
-    frozen_navigation: Option<FrozenNavigation>,
     /// Set for the duration of a compaction rebuild. Mutations then append the
     /// node ids they touch to `compaction_log`, which the rebuild replays into
     /// its replacement before publishing it, so concurrent DML never cancels
@@ -1108,100 +1100,6 @@ pub(crate) struct HnswIndex {
 struct BuildReservation {
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
     remaining_nodes: AtomicUsize,
-}
-
-/// An owned graph with no mutation API. IVF discards this entire derived
-/// navigator on DML, so neither adjacency nor vectors need per-node latches.
-/// Neighbours are contiguous; vector payloads retain their original allocation.
-#[derive(Debug)]
-pub(crate) struct ReadOnlyHnswIndex {
-    graph: HnswIndex,
-}
-
-struct FrozenNavigation {
-    offsets: Vec<usize>,
-    neighbors: Vec<u32>,
-    upper_starts: Vec<usize>,
-    upper_offsets: Vec<usize>,
-    upper_neighbors: Vec<u32>,
-    vectors: Vec<Vec<f32>>,
-    cosine_norms: Vec<f32>,
-    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
-}
-
-impl ReadOnlyHnswIndex {
-    pub(crate) fn new(mut graph: HnswIndex) -> Self {
-        use crate::engine::executor::mem_budget::{
-            ControlledMemoryCategory, ControlledMemoryCharge,
-        };
-        let count = graph.nodes.len();
-        let (mut edges, mut upper_layers, mut upper_edges) = (0usize, 0usize, 0usize);
-        for node in graph.nodes.iter() {
-            let layers = node.neighbors.lock();
-            edges += layers.first().map_or(0, Vec::len);
-            upper_layers += layers.len().saturating_sub(1);
-            upper_edges += layers.iter().skip(1).map(Vec::len).sum::<usize>();
-        }
-        let bytes = (count + 1)
-            .saturating_mul(2)
-            .saturating_add(upper_layers + 1)
-            .saturating_mul(std::mem::size_of::<usize>())
-            .saturating_add((edges + upper_edges).saturating_mul(std::mem::size_of::<u32>()))
-            .saturating_add(count.saturating_mul(std::mem::size_of::<Vec<f32>>()))
-            .saturating_add(count.saturating_mul(std::mem::size_of::<f32>()));
-        // Reserve before allocating, including the temporary overlap with
-        // mutable adjacency. Vector payload ownership is transferred without
-        // copying or allocating another full-f32 arena.
-        if let Some(charge) =
-            ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, bytes)
-        {
-            let mut offsets = Vec::with_capacity(count + 1);
-            let mut neighbors = Vec::with_capacity(edges);
-            let mut upper_starts = Vec::with_capacity(count + 1);
-            let mut upper_offsets = Vec::with_capacity(upper_layers + 1);
-            let mut upper_neighbors = Vec::with_capacity(upper_edges);
-            let mut vectors = Vec::with_capacity(count);
-            let mut cosine_norms = Vec::with_capacity(count);
-            offsets.push(0);
-            upper_starts.push(0);
-            upper_offsets.push(0);
-            for node in graph.nodes.iter() {
-                let mut layers = node.neighbors.lock();
-                if let Some(layer) = layers.first() {
-                    neighbors.extend_from_slice(layer);
-                }
-                offsets.push(neighbors.len());
-                for layer in layers.iter().skip(1) {
-                    upper_neighbors.extend_from_slice(layer);
-                    upper_offsets.push(upper_neighbors.len());
-                }
-                upper_starts.push(upper_offsets.len() - 1);
-                *layers = Vec::new();
-                let vector = std::mem::take(&mut *node.vector.write());
-                cosine_norms.push(if graph.metric == Metric::Cosine {
-                    super::distance::cosine_norm_sq(&vector)
-                } else {
-                    0.0
-                });
-                vectors.push(vector);
-            }
-            graph.frozen_navigation = Some(FrozenNavigation {
-                offsets,
-                neighbors,
-                upper_starts,
-                upper_offsets,
-                upper_neighbors,
-                vectors,
-                cosine_norms,
-                _charge: charge,
-            });
-        }
-        Self { graph }
-    }
-
-    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f64)> {
-        self.graph.search(query, k, effort)
-    }
 }
 
 impl std::fmt::Debug for HnswIndex {
@@ -1253,7 +1151,6 @@ impl HnswIndex {
             row_index: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             resident_charge: Mutex::new(None),
             resident_reserved_nodes: AtomicUsize::new(0),
-            frozen_navigation: None,
             compacting: AtomicBool::new(false),
             compaction_log: Mutex::new(None),
             compaction_log_cap: AtomicUsize::new(0),
@@ -2060,11 +1957,7 @@ impl HnswIndex {
 
     #[inline]
     fn with_node_vector<T>(&self, id: u32, f: impl FnOnce(&[f32]) -> T) -> T {
-        if let Some(frozen) = &self.frozen_navigation {
-            f(&frozen.vectors[id as usize])
-        } else {
-            f(&self.nodes.get(id).vector.read())
-        }
+        f(&self.nodes.get(id).vector.read())
     }
 
     #[inline]
@@ -2305,23 +2198,7 @@ impl HnswIndex {
     #[inline]
     fn neighbors_into(&self, id: u32, level: usize, out: &mut Vec<u32>) {
         out.clear();
-        if let Some(frozen) = &self.frozen_navigation {
-            let i = id as usize;
-            if level == 0 {
-                out.extend_from_slice(&frozen.neighbors[frozen.offsets[i]..frozen.offsets[i + 1]]);
-            } else {
-                let start = frozen.upper_starts[i];
-                let end = frozen.upper_starts[i + 1];
-                if level - 1 < end - start {
-                    let layer = start + level - 1;
-                    out.extend_from_slice(
-                        &frozen.upper_neighbors
-                            [frozen.upper_offsets[layer]..frozen.upper_offsets[layer + 1]],
-                    );
-                }
-            }
-            return;
-        }
+
         let nbrs = self.nodes.get(id).neighbors.lock();
         if let Some(layer) = nbrs.get(level) {
             out.extend_from_slice(layer);
@@ -3403,13 +3280,6 @@ impl HnswIndex {
         });
         let exact_unchanged =
             !used_quant && self.update_epoch.load(Ordering::Acquire) == score_epoch;
-        let query_norm = (self.metric == Metric::Cosine && self.frozen_navigation.is_some())
-            .then(|| super::distance::cosine_norm_sq(query));
-        if let Some(frozen) = &self.frozen_navigation {
-            for s in found.iter().take(k) {
-                prefetch_read(frozen.vectors[s.id as usize].as_ptr().cast());
-            }
-        }
         let mut out = Vec::with_capacity(k.min(found.len()));
         for s in found {
             let node = self.node_at(s.id);
@@ -3427,13 +3297,6 @@ impl HnswIndex {
             // inactive (`s.dist` is already this exact value).
             let d = if exact_unchanged {
                 s.dist
-            } else if let (Some(frozen), Some(query_norm)) = (&self.frozen_navigation, query_norm) {
-                super::distance::cosine_distance_precomputed(
-                    query,
-                    &frozen.vectors[s.id as usize],
-                    query_norm,
-                    frozen.cosine_norms[s.id as usize],
-                )
             } else {
                 self.with_node_vector(s.id, |v| ordering_distance(query, v, self.metric))
             };
@@ -4247,32 +4110,6 @@ mod tests {
             }
         }
         assert_eq!(scratch.visited.len(), 128);
-    }
-
-    #[test]
-    fn readonly_navigation_preserves_results_and_concurrent_reads() {
-        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-            let vectors = gen_vectors(260, 67);
-            let graph = HnswIndex::new(metric, 8, 32);
-            for (i, vector) in vectors[..256].iter().enumerate() {
-                graph.append_node(rid(i as u32), vector.clone()).unwrap();
-            }
-            graph.link_all(1);
-            graph.mark_deleted_by_row_id(rid(17));
-            let queries = &vectors[256..];
-            let expected: Vec<_> = queries.iter().map(|q| graph.search(q, 20, 64)).collect();
-            let frozen = ReadOnlyHnswIndex::new(graph);
-            assert!(frozen.graph.frozen_navigation.is_some());
-            std::thread::scope(|scope| {
-                for _ in 0..4 {
-                    scope.spawn(|| {
-                        for (q, expected) in queries.iter().zip(&expected) {
-                            assert_eq!(&frozen.search(q, 20, 64), expected);
-                        }
-                    });
-                }
-            });
-        }
     }
 
     #[test]
@@ -5189,8 +5026,8 @@ mod query_preparation_regressions {
         }
         graph.link_all(4);
         assert_eq!(graph.search(&[1.0, 1.0], 256, 256).len(), 256);
-        for node in graph.nodes.iter() {
-            assert!(node.neighbors.lock()[0].len() <= graph.m0);
+        for id in 0..graph.nodes.len() as u32 {
+            assert!(graph.nodes.get(id).neighbors.lock()[0].len() <= graph.m0);
         }
     }
 }

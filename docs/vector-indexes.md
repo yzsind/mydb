@@ -37,9 +37,7 @@ CREATE INDEX signature_ivf ON embeddings(signature)
 
 HNSW and IVF require one fixed-dimension, non-null, non-unique vector column.
 Numeric indexes default to L2; BINARY indexes default to HAMMING. Unsupported
-metric/type combinations raise an error. `IVF` stores native payloads;
-`IVF_SQ8` provides scalar-quantized navigation for numeric types and rejects
-BINARY. Hamming IVF uses binary majority centers; Jaccard IVF uses sampled
+metric/type combinations raise an error. `IVF` stores native payloads and scores entries with their native datatype. Hamming IVF uses binary majority centers; Jaccard IVF uses sampled
 medoids scored with Jaccard distance.
 
 ## Distances and queries
@@ -72,7 +70,7 @@ ANN indexes generate candidates. The executor checks heap MVCC visibility,
 applies residual filters and re-ranks using visible native values. Increasing
 ef or nprobe improves coverage; re-ranking cannot recover unvisited
 neighbors. Full probing of native IVF evaluates all lists with exact native
-scores. SQ8 still has a separate candidate retention and re-ranking budget.
+scores.
 
 Eligible single-table distance ordering can use KNN truncation. JOIN,
 aggregation, DISTINCT and window queries retain their complete relational

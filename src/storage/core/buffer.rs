@@ -292,7 +292,7 @@ fn apply_buffer_file_read_advice(_file: &File) {
 /// B3 - upper bound on the number of open file handles cached by the buffer
 /// pool. The cache is never evicted except on DROP/rename, so a long-lived
 /// server that touches many files (rolling partitions, many indexes,
-/// `.hvec`/`.ivf` vector files) accumulates one held-open fd + `CachedFile`
+/// `.hvec` vector files) accumulates one held-open fd + `CachedFile`
 /// per file forever and eventually trips the `nofile` limit (EMFILE). When
 /// the cache grows past this cap a second-chance sweep closes idle handles
 /// (clock bit clear AND no pending fsync). The default is deliberately finite;
@@ -6356,23 +6356,6 @@ impl BufferPool {
         PREFETCH_SKIP_STATE.with(|c| c.set((pool_id, consec_hits, skip_budget)));
         self.enqueue_prefetch_batch(to_enqueue, window);
         self.maybe_adapt_prefetch();
-    }
-
-    /// Read-ahead for pages a foreground operator has committed to consume.
-    /// Keep queue and memory bounds, but bypass scan-origin pressure because a
-    /// dropped admission would become an immediate synchronous demand read.
-    pub(crate) fn prefetch_demand_pages(self: &Arc<Self>, keys: impl IntoIterator<Item = PageKey>) {
-        let window = self.effective_prefetch_pages.load(Ordering::Relaxed);
-        if window == 0 || self.durability == DurabilityMode::Memory {
-            return;
-        }
-        let mut to_enqueue = Vec::new();
-        for key in keys {
-            if self.lookup_frame(&key).ok().flatten().is_none() {
-                to_enqueue.push(key);
-            }
-        }
-        self.enqueue_prefetch_batch(to_enqueue, window);
     }
 
     /// Push surviving prefetch candidates onto the queue under a single

@@ -5905,7 +5905,7 @@ fn partition_online_vectors_replay_after_private_graph_build() {
         let _storage = set_part_env("MYDB_VECTOR_STORAGE", backend);
         let _brute = set_part_env("MYDB_HNSW_BRUTE_THRESHOLD", "0");
         let _filter = set_part_env("MYDB_HNSW_BRUTE_FILTER_ROWS", "0");
-        for algo in ["HNSW", "IVF_SQ8"] {
+        for algo in ["HNSW", "IVF"] {
             let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
             let engine = std::sync::Arc::new(open_partition_recovery_test_engine(dir.path()));
             engine.execute("CREATE TABLE t(id INT PRIMARY KEY, emb VECTOR(3) NOT NULL) PARTITION BY HASH(id) PARTITIONS 2").unwrap();

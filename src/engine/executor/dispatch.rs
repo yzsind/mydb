@@ -2204,7 +2204,7 @@ fn prepare_ctas_source(
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
-            "CREATE TABLE AS SELECT copies VECTOR columns and data but not vector indexes; run CREATE INDEX ... USING HNSW/IVF_SQ8 on the target",
+            "CREATE TABLE AS SELECT copies VECTOR columns and data but not vector indexes; run CREATE INDEX ... USING HNSW/IVF on the target",
         );
     }
     #[cfg(test)]

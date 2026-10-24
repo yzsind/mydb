@@ -4599,7 +4599,6 @@ include!("core/btree.rs");
 include!("core/packed_index_leaf.rs");
 include!("core/vector_page_io.rs");
 include!("core/vector_page.rs");
-include!("core/ivf_page.rs");
 include!("core/index_key_codec.rs");
 include!("core/row_codec.rs");
 include!("core/constraints.rs");

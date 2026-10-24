@@ -149,7 +149,7 @@ pub(crate) fn register_builtin_databases(catalog: &mut Catalog) {
 //         temp_tables/, temp_indexes/, sort-*/, grace-*/
 //     objects/
 //       tables/<storage_id>/<generation>.<heap|lob|zm>
-//       indexes/<storage_id>/<generation>/<index_id>.<idx|hnsw|hvec|ivf>
+//       indexes/<storage_id>/<generation>/<index_id>.<idx|hnsw|hvec>
 //
 // Every persistent table/index path is independent of schema, table and index
 // names. RENAME TABLE and RENAME INDEX are therefore catalog-only operations.

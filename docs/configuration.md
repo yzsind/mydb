@@ -653,15 +653,11 @@ project's internal engineering records (online-constraints-20260914).
 
 Stable configuration for vector retrieval comes in two layers:
 
-- `MYDB_VECTOR_STORAGE=memory|paged` selects the HNSW/IVF_SQ8 backend, default
+- `MYDB_VECTOR_STORAGE=memory|paged` selects the HNSW/IVF backend, default
   `paged`;
 - `MYDB_HNSW_*` controls graph building, `ef_search`, iterative scanning,
   candidate caps, and the brute-force scan threshold;
-- `MYDB_IVF_*` controls `nlist`, `nprobe`, k-means training, sampling, rerank,
-  and optional SME;
-- `MYDB_IVF_NAVIGATOR` is off by default; `on`/`1` enables the experimental
-  derived navigation graph. This path has high-dimensional recall degradation and
-  post-DML invalidation limitations, so the default uses IVF list scanning;
+- `MYDB_IVF_*` controls `nlist`, `nprobe`, k-means training, sampling, and candidate retention;
 - The index COMMENT can store per-index parameters, and the query hints
   `HNSW_EF` / `IVF_NPROBE` provide single-statement overrides; see
   [`hints.md`](hints.md) for the detailed precedence.

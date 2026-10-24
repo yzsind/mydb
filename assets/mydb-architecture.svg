@@ -126,7 +126,7 @@
     <text class="subhead accent" x="562" y="602">HNSW</text>
     <text class="subhead accent" x="562" y="627">Vector indexing</text>
     <text class="small" x="562" y="653">Disk-resident graph pages</text>
-    <text class="small" x="562" y="676">Native VECTOR · IVF_SQ8</text>
+    <text class="small" x="562" y="676">Native VECTOR · IVF</text>
   </g>
   <path class="flow" d="M540 716 V736"/>
 

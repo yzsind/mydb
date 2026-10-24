@@ -32,7 +32,7 @@ Ordinary persistent objects use ID/generation paths that are independent of SQL 
       <generation>.zm                     # paged Zone Map pruning structure
     indexes/<storage_id>/<generation>/
       <index_id>.idx
-      <index_id>.hvec | <index_id>.ivf    # when vector indexes exist
+      <index_id>.hvec    # when vector indexes exist
   system/catalog/
     <dd_table_id>.heap
     indexes/<dd_table_id>/<generation>/<index_id>.idx

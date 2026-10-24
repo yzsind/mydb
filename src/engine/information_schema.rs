@@ -1679,7 +1679,7 @@ const MYDB_VECTOR_INDEXES_COLUMNS: &[SystemColumn] = &[
     i64c!("DIRTY_NODES"),
     i64c!("GENERATION"),
     i64c!("LAST_PERSISTED_LSN"),
-    // Algorithm discriminator + IVF_SQ8-specific runtime stats. `ALGO` is
+    // Algorithm discriminator + IVF-specific runtime stats. `ALGO` is
     // always present; `NLIST` / `INSERTS_SINCE_TRAIN` are NULL for HNSW and for
     // cold (never-queried) IVF indexes.
     v!("ALGO"),
@@ -6857,7 +6857,6 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 opt_i64(stats.map(|st| st.last_persisted_lsn as i64)),
                 // ALGO from the catalog (available even when cold).
                 s(match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8 => "IVF_SQ8",
                     crate::storage::schema::VectorAlgo::Ivf => "IVF",
                     crate::storage::schema::VectorAlgo::Hnsw => "HNSW",
                 }),
@@ -6870,10 +6869,9 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 opt_i64(stats.map(|st| st.list_max_entries as i64)),
                 opt_i64(stats.map(|st| st.list_p95_entries as i64)),
                 match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8
-                    | crate::storage::schema::VectorAlgo::Ivf => stats
+                    crate::storage::schema::VectorAlgo::Ivf => stats
                         .map(|st| {
-                            s(if st.backend != "ivf_paged" || st.finalized {
+                            s(if st.backend != "ivf_paged_native" || st.finalized {
                                 "READY"
                             } else {
                                 "REBUILD_REQUIRED"
@@ -6883,8 +6881,7 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                     crate::storage::schema::VectorAlgo::Hnsw => Value::Null,
                 },
                 match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8
-                    | crate::storage::schema::VectorAlgo::Ivf => {
+                    crate::storage::schema::VectorAlgo::Ivf => {
                         opt_i64(stats.map(|st| st.inserts_since_train as i64))
                     }
                     crate::storage::schema::VectorAlgo::Hnsw => Value::Null,

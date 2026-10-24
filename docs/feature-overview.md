@@ -10,7 +10,7 @@ mydb is a single-node general-purpose relational database serving clients over t
 | --- | --- |
 | Client access | MySQL protocol v10, TLS/mTLS, three MySQL authentication plugins, text/binary result sets, prepared statements, read-only server-side cursors, multi-statements |
 | SQL | Common DDL/DML, complex SELECT, CTE/recursive CTE, set operations, subqueries, window functions, ROLLUP/CUBE/GROUPING SETS, views, routines, triggers, events |
-| Data and indexes | Mainstream MySQL scalar types, JSONB, GIS, `VECTOR(n)`; B-tree, FULLTEXT, SPATIAL, HNSW, IVF_SQ8 |
+| Data and indexes | Mainstream MySQL scalar types, JSONB, GIS, `VECTOR(n)`; B-tree, FULLTEXT, SPATIAL, HNSW, IVF |
 | Query execution | CBO, statistics/histograms, join order selection, Hash Join/INLJ/Adaptive Join, parallel execution, row-wise and vectorized execution, spill |
 | Transactions and storage | MVCC, WAL/redo, undo, checkpoint, buffer pool, row locks/deadlock detection, SAVEPOINT, XA 2PC, crash recovery, table-level time travel |
 | Security and administration | Accounts, roles, static/dynamic privileges, column-level privileges, password policies, system variable persistence, system schemas, logging, diagnostics, and graceful restart |
@@ -78,13 +78,13 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 | FULLTEXT | Natural-language BM25, boolean mode, ngram parser; MATCH and safe LIKE ngram pre-filtering; [immutable backup queries](backup-and-recovery.md#51-fulltext-queries) |
 | SPATIAL | Persistent MBR B-tree plus a governor-managed derived R-tree, with a final heap lookup to recheck exact predicates |
 | HNSW | Graph-based ANN, L2/COSINE/DOT, SQ8 navigation + f32 rerank, in-memory and paged backends |
-| IVF_SQ8 | k-means inverted-file ANN, nlist/nprobe, SQ8, retraining, and in-memory/paged backends |
+| IVF | native numeric/binary inverted-file ANN, nlist/nprobe, retraining, and memory/paged backends |
 
 ### 3.3 JSON, GIS, and Vector
 
 - JSON uses an internal binary JSONB, providing JSON paths, modification/query functions, JSON_VALUE, JSON_TABLE, schema validation, aggregation, and row-binlog binary JSON.
 - GIS uses `SRID + WKB`, supporting Geometry subtypes, column-level SRIDs, construction/access/measurement/MBR and exact predicates, GeoJSON/Geohash, spatial indexes, and `ST_COLLECT`. Some geographic computations, projection transforms, and polygon set operations still fail with explicit errors, so this is not complete GIS compatibility.
-- Vector supports exact brute-force KNN plus HNSW/IVF_SQ8 ANN. The planner recognizes `ORDER BY distance LIMIT k` and supports prepared parameters, partitioning, transaction deltas, rerank, and the `NO_VECTOR_INDEX` differential oracle.
+- Vector supports exact brute-force KNN plus HNSW/IVF ANN. The planner recognizes `ORDER BY distance LIMIT k` and supports prepared parameters, partitioning, transaction deltas, rerank, and the `NO_VECTOR_INDEX` differential oracle.
 
 ## 4. Query Optimization and Execution
 

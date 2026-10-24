@@ -1671,7 +1671,7 @@ impl Database {
 
     /// Physical bytes occupied by one public index. Ordinary indexes use
     /// the `.idx` page count above. Vector indexes have backend-specific
-    /// `.hnsw` / `.hvec` / `.ivf` files, so account for those files rather
+    /// `.hnsw` / `.hvec`  files, so account for those files rather
     /// than silently treating the index as absent from `INDEX_LENGTH`.
     pub(crate) fn index_storage_bytes(
         &self,

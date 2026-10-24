@@ -374,8 +374,8 @@ fn collect_files(
         if !ft.is_file() {
             continue;
         }
-        // B-tree/HNSW and legacy zone-map files are rebuilt locally.
-        // Paged Zone Maps and IVF use physical redo, so their baselines
+        // B-tree/vector indexes and legacy zone-map files are rebuilt locally.
+        // Paged Zone Maps use physical redo, so their baselines
         // must travel with the heap; incremental WAL is not a full image.
         // DD B-trees are different: v46 uses them to assemble lazy
         // descriptors before user-index validation can run, so the sharp,
@@ -1276,13 +1276,13 @@ mod tests {
     }
 
     #[test]
-    fn ivf_base_backup_keeps_physical_index_baseline() {
+    fn native_vector_base_backup_rebuilds_derived_index() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("1.ivf"), b"physical ivf baseline").unwrap();
+        std::fs::write(dir.path().join("1.hvec"), b"derived native vector index").unwrap();
         std::fs::write(dir.path().join("2.idx"), b"derived btree").unwrap();
         let mut files = Vec::new();
         collect_files(dir.path(), "objects/indexes/1/1", &mut files).unwrap();
-        assert_eq!(files.len(), 1);
+        assert!(files.is_empty());
     }
 
     #[test]

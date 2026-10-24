@@ -205,10 +205,10 @@ MyDB minimizes DDL locking and query waiting by coordinating schema versions, in
 ### Native vectors: from storage to large-scale similarity search
 
 - **Native `VECTOR(n)` type**: up to **16,383 dimensions**, with L2, cosine, dot-product and other distance and computation functions.
-- **Disk-resident graph indexes**: paged HNSW integrates graph search with disk storage — index pages participate in the buffer pool and WAL, so vector indexes can exceed memory capacity. An IVF_SQ8 path and exact scan are also provided.
+- **Disk-resident graph indexes**: paged HNSW integrates graph search with disk storage — index pages participate in the buffer pool and WAL, so vector indexes can exceed memory capacity. An IVF path and exact scan are also provided.
 - **Unified SQL**: the optimizer recognizes `ORDER BY distance LIMIT k` and supports parameterized queries; vector writes participate in transaction commit and rollback.
 
-Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. See the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF_SQ8; disk residency does not imply a complete DiskANN implementation.
+Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. See the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
 
 ### Try vector retrieval and RETURNING
 

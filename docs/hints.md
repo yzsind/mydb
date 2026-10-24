@@ -470,7 +470,7 @@ already acquired; multi-index builds share one worker budget and never
 form an outer × inner thread pool.
 
 Explicit `PARALLEL` currently supports only BTREE; FULLTEXT, SPATIAL,
-HNSW, and IVF_SQ8 return `ER_NOT_SUPPORTED_YET`. Without a hint, those
+HNSW, and IVF return `ER_NOT_SUPPORTED_YET`. Without a hint, those
 indexes keep using their existing build strategies.
 
 ## 7. Query Runtime Hints
@@ -565,7 +565,7 @@ index or a metric mismatch still cause fallback.
 
 ### 8.2 `NO_VECTOR_INDEX`
 
-Prevents the current KNN query from using HNSW or IVF_SQ8
+Prevents the current KNN query from using HNSW or IVF
 `VectorIndexScan` and runs an exact brute-force distance scan instead
 (falling back to a regular sequential scan plus sort when the dedicated
 brute path is unavailable):
@@ -582,7 +582,7 @@ checking, and differential verification of ANN versus exact results.
 
 ### 8.3 `IVF_NPROBE(n)`
 
-Overrides the number of inverted cells probed by the IVF_SQ8 query of the
+Overrides the number of inverted cells probed by the IVF query of the
 current statement:
 
 ```sql
@@ -601,7 +601,7 @@ recall and higher scan cost. The precedence is:
 3. `NPROBE=` in the index COMMENT;
 4. the built-in default of 8.
 
-This hint affects IVF_SQ8 only; HNSW remains controlled by `HNSW_EF`.
+This hint affects IVF only; HNSW remains controlled by `HNSW_EF`.
 
 ## 9. Diagnostics and Verification
 

@@ -9829,7 +9829,7 @@ fn try_knn_vector_scan(
             .any(|h| matches!(h, crate::parser::QueryHint::NoVectorIndex));
 
     // Is the vector index path usable for this query? It needs a single-column
-    // vector index (HNSW or IVF_SQ8) on `col` whose build-time metric matches,
+    // vector index (HNSW or IVF) on `col` whose build-time metric matches,
     // no explicit `/*+ NO_VECTOR_INDEX */`, and a table/filter not small enough
     // that brute-force wins. Any "no" routes to the brute-force exact path below
     // (or, if that's unavailable, to the generic seq-scan + sort).
@@ -9874,7 +9874,7 @@ fn try_knn_vector_scan(
             let fanout = index.vector_meta().m as f64 + total_rows.max(2.0).ln();
             ef * fanout * lane_cost
         }
-        crate::storage::schema::VectorAlgo::IvfSq8 | crate::storage::schema::VectorAlgo::Ivf => {
+        crate::storage::schema::VectorAlgo::Ivf => {
             let nlist = index
                 .vector_meta()
                 .nlist
@@ -9931,12 +9931,10 @@ fn try_knn_vector_scan(
 
     // Resolve the per-query search-effort hint appropriate to the index's
     // algorithm: `/*+ HNSW_EF(n) */` for an HNSW index, `/*+ IVF_NPROBE(n) */`
-    // for an IVF_SQ8 index. Either one pins the index (skips the brute gates)
+    // for an IVF index. Either one pins the index (skips the brute gates)
     // and is baked into the plan node's `ef_hint` field.
     let hint_ef = match index.map(|i| i.vector_algo()) {
-        Some(
-            crate::storage::schema::VectorAlgo::IvfSq8 | crate::storage::schema::VectorAlgo::Ivf,
-        ) => ivf_hint,
+        Some(crate::storage::schema::VectorAlgo::Ivf) => ivf_hint,
         _ => hnsw_hint,
     };
     if index.is_none() && (hnsw_hint.is_some() || ivf_hint.is_some()) {
@@ -9946,7 +9944,7 @@ fn try_knn_vector_scan(
             "the requested algorithm-specific vector hint has no compatible index; falling back to an exact scan",
         );
     }
-    // Surface (1287) a metric mismatch: a vector index (HNSW or IVF_SQ8) exists
+    // Surface (1287) a metric mismatch: a vector index (HNSW or IVF) exists
     // on this column but its build-time metric differs from the query's, so we
     // silently fall back to a non-indexed scan — a performance cliff worth
     // telling the user about.
@@ -10025,8 +10023,7 @@ fn try_knn_vector_scan(
                     let fanout = index.vector_meta().m as f64 + total_rows.max(2.0).ln();
                     ef * fanout * (dim / 8.0).max(1.0)
                 }
-                crate::storage::schema::VectorAlgo::IvfSq8
-                | crate::storage::schema::VectorAlgo::Ivf => {
+                crate::storage::schema::VectorAlgo::Ivf => {
                     let nprobe = crate::engine::vector::session::effective_nprobe(
                         &hnsw_cfg,
                         None,
@@ -10051,13 +10048,12 @@ fn try_knn_vector_scan(
     if index_usable {
         let index = index.expect("index_usable implies Some");
         // Bake the algorithm-appropriate search effort into `ef_search`: an ef
-        // candidate-pool size for HNSW, an nprobe cell count for IVF_SQ8. The
+        // candidate-pool size for HNSW, an nprobe cell count for IVF. The
         // executor re-resolves this from the live session at run time (the plan
         // cache key excludes the knob), so the baked value is only a fallback
         // for session-less internal callers.
         let ef_search = match index.vector_algo() {
-            crate::storage::schema::VectorAlgo::IvfSq8
-            | crate::storage::schema::VectorAlgo::Ivf => {
+            crate::storage::schema::VectorAlgo::Ivf => {
                 let index_default = index.vector_meta().default_nprobe.map(|v| v as u64);
                 crate::engine::vector::session::effective_nprobe(&hnsw_cfg, hint_ef, index_default)
             }
@@ -10084,8 +10080,7 @@ fn try_knn_vector_scan(
         // This display-only value never feeds the cost, so it can't perturb
         // planning.
         let display_rows = match index.vector_algo() {
-            crate::storage::schema::VectorAlgo::IvfSq8
-            | crate::storage::schema::VectorAlgo::Ivf => {
+            crate::storage::schema::VectorAlgo::Ivf => {
                 let nlist = index
                     .vector_meta()
                     .nlist

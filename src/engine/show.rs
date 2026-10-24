@@ -2308,7 +2308,7 @@ fn create_table_sql_with_auto_increment(
                 index.comment.replace('\\', "\\\\").replace('\'', "''")
             )
         };
-        // Vector indexes (HNSW / IVF_SQ8) are a mydb extension created with
+        // Vector indexes (HNSW / IVF) are a mydb extension created with
         // `USING <algo>`; echo that back so SHOW CREATE TABLE round-trips
         // through the parser instead of silently degrading to a plain B-tree
         // key on dump/restore. Non-vector B-tree keys omit USING (MySQL default).
