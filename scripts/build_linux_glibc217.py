@@ -214,7 +214,7 @@ def inside(args):
     contents = {binary: artifacts / binary for binary in ('mydb', 'mydb-backup')}
     contents.update({'LICENSE': args.source / 'LICENSE', 'build-manifest.json': args.output / 'build-manifest.json',
                      'abi.json': args.output / 'abi.json'})
-    contents.update({name: args.source / name for name in ('README.md', 'SECURITY.md', 'Cargo.lock')
+    contents.update({name: args.source / name for name in ('README.md', 'Cargo.lock')
                      if (args.source / name).is_file()})
     contents['assets/mydb-architecture.svg'] = args.source / 'assets/mydb-architecture.svg'
     contents.update({'docs/' + str(path.relative_to(args.source / 'docs')): path

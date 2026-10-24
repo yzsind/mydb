@@ -305,12 +305,10 @@ Product documentation under `docs/` is written in English. When documentation
 and behavior disagree, the source code and tests are authoritative; the
 compatibility matrices describe the documented scope.
 
-## Contributing
+## Reporting issues
 
-Build and test commands, review gates, and pull request guidelines are in
-[CONTRIBUTING.md](CONTRIBUTING.md). Issues with reproducible SQL, execution
-plans, error logs, and test conditions are the most useful reports.
-Vulnerabilities are handled per [SECURITY.md](SECURITY.md); please do not open
-public issues for them.
+Submit bug reports through [GitHub Issues](https://github.com/yzsind/mydb/issues).
+Follow the [issue reporting guide](docs/reporting-issues.md) and include the exact
+MyDB version, operating system, relevant logs, and reproducible steps and scripts.
 
 MyDB is licensed under the [Apache License 2.0](LICENSE).
