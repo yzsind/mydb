@@ -588,6 +588,8 @@ impl Database {
                 if let Some(graph) = graph {
                     let vector = vector::to_f32(&bytes);
                     match graph.as_ref() {
+                        VectorGraph::NativeHnsw(g) => g.insert(row_id, bytes)?,
+                        VectorGraph::NativeIvf(g) => g.insert(row_id, bytes)?,
                         VectorGraph::Memory(g) => {
                             g.insert(row_id, vector)?;
                         }
@@ -1476,6 +1478,16 @@ impl Database {
                 match graph.as_ref() {
                     VectorGraph::Paged(g) => g.file().flush()?,
                     VectorGraph::Ivf(g) => g.flush()?,
+                    VectorGraph::NativeHnsw(g) => {
+                        if let Some(file) = g.file() {
+                            file.flush()?;
+                        }
+                    }
+                    VectorGraph::NativeIvf(g) => {
+                        if let Some(file) = g.file() {
+                            file.flush()?;
+                        }
+                    }
                     VectorGraph::Memory(_) => {}
                 }
             }

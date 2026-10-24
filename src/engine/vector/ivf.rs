@@ -752,8 +752,14 @@ pub(super) fn nearest_centroid(
         while start + 4 <= nlist {
             let scores = distance::l2_sq_batch4(v, &centroids[start * dim..(start + 4) * dim], dim);
             for (offset, d) in scores.into_iter().enumerate() {
-                if (d as f64) < best_d {
-                    best_d = d as f64;
+                let d = if d.is_normal() {
+                    d as f64
+                } else {
+                    let c = start + offset;
+                    distance::ordering_distance(v, &centroids[c * dim..(c + 1) * dim], Metric::L2)
+                };
+                if d < best_d {
+                    best_d = d;
                     best = start + offset;
                 }
             }
@@ -795,7 +801,7 @@ pub(super) fn strided_sample(n: usize, target: usize) -> Vec<usize> {
 /// would place centroids poorly and depress recall). Deterministic (an LCG
 /// seeded from `n`, no `Math.random`) so builds stay reproducible and the paged
 /// backend remains a bit-for-bit differential oracle of the memory backend.
-pub(super) fn training_sample(n: usize, target: usize) -> Vec<usize> {
+pub(crate) fn training_sample(n: usize, target: usize) -> Vec<usize> {
     if target >= n {
         return (0..n).collect();
     }
@@ -1343,6 +1349,16 @@ mod tests {
                         );
                     }
                 }
+            }
+            // Large BFLOAT16 exponents overflow the float32 batch accumulator;
+            // tiny ones underflow. Both must retain the wide scalar ordering.
+            for scale in [1e-30f32, 1e30f32] {
+                let query = vec![scale; dim];
+                let centroids: Vec<f32> = [4.0, 3.0, 1.5, -2.0, 2.0]
+                    .into_iter()
+                    .flat_map(|x| vec![x * scale; dim])
+                    .collect();
+                assert_eq!(nearest_centroid(&centroids, 5, dim, &query, Metric::L2), 2);
             }
             let tied = vec![0.0; 5 * dim];
             assert_eq!(nearest_centroid(&tied, 5, dim, &data[0].1, Metric::L2), 0);

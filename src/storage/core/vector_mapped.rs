@@ -65,6 +65,11 @@ impl VectorIndexFile {
         {
             return Ok(false);
         }
+        if self.navigation_writers.load(Ordering::Acquire) == 0
+            && self.mapped_navigation.read().is_some()
+        {
+            return Ok(true);
+        }
         let revision = self.navigation_revision.load(Ordering::Acquire);
         let meta = self.meta();
         if !meta.finalized || meta.node_count == 0 {
@@ -112,9 +117,17 @@ impl VectorIndexFile {
         let words = (len / PAGE_SIZE).div_ceil(64);
         // A lazy checksum bitmap plus the same bounded exact-query memo used
         // by the compact path. File-backed clean pages remain OS-reclaimable.
-        let bytes = words
-            .saturating_mul(8)
-            .saturating_add(512usize.saturating_mul(meta.dim as usize * 4 + 128 * 16 + 128));
+        let bytes =
+            words.saturating_mul(8).saturating_add(
+                512usize.saturating_mul(
+                    native_geometry(meta.dim as usize)
+                        .map_or(meta.dim as usize * 4, |(datatype, dim)| {
+                            datatype.payload_len(dim)
+                        })
+                        + 128 * 16
+                        + 128,
+                ),
+            );
         let Some(charge) =
             ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, bytes)
         else {

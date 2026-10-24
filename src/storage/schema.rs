@@ -1954,7 +1954,18 @@ fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
         }
         DataTypeKind::Binary { len } => len.unwrap_or(1),
         DataTypeKind::Bit { len } => len.unwrap_or(1).div_ceil(8),
-        DataTypeKind::Vector { dim: Some(dim) } => (*dim as usize).saturating_mul(4),
+        DataTypeKind::Vector {
+            dim: Some(dim),
+            datatype,
+        } if *datatype != crate::vector::VectorDataType::Float32
+            && datatype.payload_len(*dim) > 4096 =>
+        {
+            return None
+        }
+        DataTypeKind::Vector {
+            dim: Some(dim),
+            datatype,
+        } => datatype.payload_len(*dim),
         DataTypeKind::Enum { values } => crate::storage::enum_storage_width(values.len()) as usize,
         DataTypeKind::Set { values } => crate::storage::set_storage_width(values.len()) as usize,
         DataTypeKind::Char { .. }
@@ -1964,7 +1975,7 @@ fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
         | DataTypeKind::Blob { .. }
         | DataTypeKind::Json
         | DataTypeKind::Geometry { .. }
-        | DataTypeKind::Vector { dim: None } => return None,
+        | DataTypeKind::Vector { dim: None, .. } => return None,
     })
 }
 
@@ -2188,6 +2199,7 @@ pub enum VectorAlgo {
     Hnsw,
     /// IVF + 8-bit scalar-quantized inverted table (`engine::vector::ivf`).
     IvfSq8,
+    Ivf,
 }
 
 /// Vector-index build parameters, parsed from the index COMMENT (not a separately
@@ -2386,7 +2398,7 @@ impl VectorIndexMeta {
                     | "TRAIN_SAMPLE_MULT"
                     | "SAMPLE_MULT"
             );
-            if (algo == VectorAlgo::IvfSq8 && hnsw_only) || (algo == VectorAlgo::Hnsw && ivf_only) {
+            if (algo != VectorAlgo::Hnsw && hnsw_only) || (algo == VectorAlgo::Hnsw && ivf_only) {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
                     format!("vector index COMMENT option '{key}' is not valid for {algo:?}"),
@@ -2706,13 +2718,16 @@ impl IndexSchema {
         self.index_type.eq_ignore_ascii_case("HNSW")
             || self.index_type.eq_ignore_ascii_case("VECTOR")
             || self.index_type.eq_ignore_ascii_case("IVF_SQ8")
+            || self.index_type.eq_ignore_ascii_case("IVF")
     }
 
     /// The vector index's concrete algorithm (HNSW graph vs IVF_SQ8 inverted table). Called only
     /// where truly branching by algorithm (build/query routing, parameter parsing); elsewhere share [`Self::is_vector`].
     /// Returns `Hnsw` for non-vector indexes (conventional default; callers should filter via `is_vector()` first).
     pub fn vector_algo(&self) -> VectorAlgo {
-        if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
+        if self.index_type.eq_ignore_ascii_case("IVF") {
+            VectorAlgo::Ivf
+        } else if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
             VectorAlgo::IvfSq8
         } else {
             VectorAlgo::Hnsw
@@ -2722,6 +2737,39 @@ impl IndexSchema {
     /// HNSW graph build parameters, parsed from the index COMMENT (e.g.
     /// `COMMENT 'DISTANCE=COSINE M=16 EF_CONSTRUCTION=200'`), falling back to defaults when absent.
     /// Kept in the comment rather than a dedicated catalog field, avoiding a new field on every IndexSchema literal.
+    pub(crate) fn vector_meta_for_table(&self, table: &TableSchema) -> VectorIndexMeta {
+        let mut meta = self.vector_meta();
+        let explicit = VectorIndexMeta::collapse_spaces_around_eq(&self.comment)
+            .split(|c: char| c.is_ascii_whitespace() || c == ',')
+            .any(|part| {
+                part.split_once('=').is_some_and(|(key, _)| {
+                    key.eq_ignore_ascii_case("METRIC") || key.eq_ignore_ascii_case("DISTANCE")
+                })
+            });
+        let binary = self
+            .columns
+            .first()
+            .and_then(|name| {
+                table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+            })
+            .is_some_and(|c| {
+                matches!(
+                    c.data_type,
+                    DataTypeKind::Vector {
+                        datatype: crate::vector::VectorDataType::Binary,
+                        ..
+                    }
+                )
+            });
+        if binary && !explicit {
+            meta.metric = "HAMMING".into();
+        }
+        meta
+    }
+
     pub fn vector_meta(&self) -> VectorIndexMeta {
         VectorIndexMeta::parse_from_comment(&self.comment)
     }
@@ -3033,6 +3081,7 @@ pub enum DataTypeKind {
     /// dimension accepted).
     Vector {
         dim: Option<u32>,
+        datatype: crate::vector::VectorDataType,
     },
     Enum {
         values: Vec<String>,
@@ -3090,7 +3139,10 @@ fn data_type_kind_for_column_type(
             subtype: GeometrySubtype::Geometry,
             srid: None,
         },
-        ColumnType::Vector => DataTypeKind::Vector { dim: None },
+        ColumnType::Vector => {
+            let (datatype, dim) = source.vector_type.unwrap_or_default();
+            DataTypeKind::Vector { dim, datatype }
+        }
         ColumnType::Bit { bits } => DataTypeKind::Bit {
             len: Some(bits as usize),
         },
@@ -4030,8 +4082,8 @@ fn decimal_keypart_for_value(v: &Value, precision: u8, scale: u8) -> Result<KeyP
         | Value::DateTime(_)
         | Value::Timestamp(_)
         | Value::Year(_)
-        | Value::Geometry(_)
-        | Value::Vector(_) => 0,
+        | Value::Geometry(_) => 0,
+        Value::Vector(_) => 0,
     };
     if precision > 38 {
         Ok(KeyPart::DecimalWide {
@@ -4607,6 +4659,11 @@ impl TableSchema {
             _ => None,
         };
         crate::types::ColumnSource {
+            vector_type: if let DataTypeKind::Vector { datatype, dim } = column.data_type {
+                Some((datatype, dim))
+            } else {
+                None
+            },
             collation_coercibility: Some(2),
             dynamic_parameter: false,
             wire_type,
@@ -5194,7 +5251,7 @@ impl DataTypeKind {
             // Vector is not a normal B-tree key column (it is indexed via the
             // HNSW vector index); report the declared byte width for width
             // estimation only.
-            DataTypeKind::Vector { dim } => (dim.unwrap_or(192) as usize) * 4 + 2,
+            DataTypeKind::Vector { dim, datatype } => datatype.payload_len(dim.unwrap_or(192)) + 2,
             // ENUM stores a 1- or 2-byte ordinal (1 byte when ≤255
             // members, else 2). SET stores a bitmask of ceil(N/8) bytes,
             // capped at 8. Reporting the tight width keeps CBO key-space
@@ -5263,7 +5320,7 @@ impl From<DataType> for DataTypeKind {
             DataType::Year => Self::Year,
             DataType::Json => Self::Json,
             DataType::Geometry(subtype, srid) => Self::Geometry { subtype, srid },
-            DataType::Vector(dim) => Self::Vector { dim },
+            DataType::Vector(dim, datatype) => Self::Vector { dim, datatype },
             DataType::Enum(values) => Self::Enum { values },
             DataType::Set(values) => Self::Set { values },
             // Preserve the declaration exactly until DDL validation. In
@@ -5325,7 +5382,7 @@ impl KeyPart {
             Value::Geometry(v) => Self::Bytes(v.clone()),
             // Vector keys on its internal bytes for the rare direct path
             // (vector columns are indexed via the HNSW graph).
-            Value::Vector(v) => Self::Bytes(v.clone()),
+            Value::Vector(v) => Self::Bytes(v.encode()),
             Value::Date(d) => Self::Date(*d),
             Value::Time(t) => Self::Time(*t),
             Value::DateTime(dt) => Self::DateTime(*dt),

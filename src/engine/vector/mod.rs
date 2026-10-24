@@ -21,6 +21,9 @@ pub(crate) mod hnsw_core;
 pub(crate) mod hnsw_paged;
 pub(crate) mod ivf;
 pub(crate) mod ivf_paged;
+pub(crate) mod native_hnsw;
+pub(crate) mod native_ivf;
+mod native_quant;
 pub(crate) mod session;
 pub(crate) mod spill_rows;
 pub(crate) mod sql;
@@ -37,8 +40,8 @@ mod ivf_nav_recall_tests;
 use crate::types::QueryError;
 
 pub(crate) use codec::{
-    coerce_bytes_to_internal, coerce_bytes_to_internal_owned, compare, dim, normalize_internal,
-    normalize_internal_owned, to_f32, to_text, to_text_into, validate_internal, vector_err,
+    coerce_bytes_to_internal, compare, normalize_internal, to_f32, to_text, to_text_into,
+    validate_internal, vector_err,
 };
 pub(crate) use distance::Metric;
 pub(crate) use graph::{
@@ -78,26 +81,4 @@ impl VectorError {
             Self::Unsupported(message) => crate::storage::error(crate::error::catalog::ER_NOT_SUPPORTED_YET, message),
         }
     }
-}
-
-/// Validate an internal vector against a column's declared dimension. A `None`
-/// declared dimension (`VECTOR` with no length) accepts any dimension; a
-/// `Some(d)` requires an exact match. Always rejects malformed bytes.
-pub(crate) fn validate_dimension(internal: &[u8], declared: Option<u32>) -> Result<(), QueryError> {
-    if internal.len() % 4 != 0 {
-        return Err(vector_err(
-            "invalid VECTOR value: byte length is not a multiple of 4",
-        ));
-    }
-    let actual = dim(internal);
-    if let Some(d) = declared {
-        if actual != d as usize {
-            return Err(VectorError::DimensionMismatch {
-                actual,
-                declared: d,
-            }
-            .into_query_error());
-        }
-    }
-    Ok(())
 }

@@ -276,7 +276,7 @@ fn paged_commit_markers_and_borrowed_handle_invalidation_are_coherent() {
     graph.invalidate();
     assert!(graph
         .search(
-            &[0.0, 0.0],
+            &crate::engine::vector::codec::from_f32(&[0.0, 0.0]),
             crate::engine::vector::VectorSearchRequest {
                 candidate_limit: 1,
                 rerank_limit: 1,

@@ -505,12 +505,22 @@ pub(crate) fn function_result_type(name: &str) -> ColumnType {
     if crate::engine::vector::sql::returns_vector(upper) {
         return ColumnType::Vector;
     }
+    if upper == "VECTOR_TO_BINARY" {
+        return ColumnType::Blob;
+    }
+    if upper == "VECTOR_DATATYPE" {
+        return ColumnType::VarString;
+    }
     if matches!(
         upper,
         "DISTANCE"
             | "VEC_DISTANCE"
             | "L2_DISTANCE"
             | "COSINE_DISTANCE"
+            | "HAMMING_DISTANCE"
+            | "JACCARD_DISTANCE"
+            | "VECTOR_NORM"
+            | "MAX_INNER_PRODUCT_DISTANCE"
             | "DOT_PRODUCT"
             | "INNER_PRODUCT"
     ) {

@@ -1780,7 +1780,13 @@ fn infer_view_expr_type(
             } else {
                 descriptor.column_type()
             };
-            let dt = crate::engine::executor::select::data_type_kind_for_column_type(ct);
+            let dt = if let crate::engine::expr_type::ExprTypeKind::Vector { dim, datatype } =
+                descriptor.kind
+            {
+                crate::storage::DataTypeKind::Vector { dim, datatype }
+            } else {
+                crate::engine::executor::select::data_type_kind_for_column_type(ct)
+            };
             // Expression columns in MySQL views are generally nullable (an
             // operand can be NULL); marking nullable is the safe, MySQL-aligned
             // default and avoids over-constraining downstream metadata.

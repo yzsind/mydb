@@ -300,6 +300,8 @@ pub(crate) enum Metric {
     /// `ORDER BY DISTANCE(...) LIMIT k` selects the largest dot products
     /// (pgvector's `<#>` semantics).
     Dot,
+    Hamming,
+    Jaccard,
 }
 
 impl Metric {
@@ -312,6 +314,8 @@ impl Metric {
             "DOT" | "IP" | "INNER_PRODUCT" | "DOT_PRODUCT" | "NEGATIVE_INNER_PRODUCT" => {
                 Some(Metric::Dot)
             }
+            "HAMMING" => Some(Metric::Hamming),
+            "JACCARD" => Some(Metric::Jaccard),
             _ => None,
         }
     }
@@ -322,6 +326,8 @@ impl Metric {
             Metric::L2 => "L2",
             Metric::Cosine => "COSINE",
             Metric::Dot => "DOT",
+            Metric::Hamming => "HAMMING",
+            Metric::Jaccard => "JACCARD",
         }
     }
 
@@ -332,6 +338,8 @@ impl Metric {
             Metric::L2 => 0,
             Metric::Cosine => 1,
             Metric::Dot => 2,
+            Metric::Hamming => 3,
+            Metric::Jaccard => 4,
         }
     }
 }
@@ -368,16 +376,7 @@ pub(crate) fn l2_sq_batch4(query: &[f32], rows: &[f32], dim: usize) -> [f32; 4] 
     std::array::from_fn(|j| l2_sq(query, &rows[j * dim..j * dim + n]))
 }
 
-/// True for a zero vector (`|v| == 0`). Cosine similarity is undefined for
-/// these, so the `COSINE_DISTANCE` SQL function returns NULL and cosine HNSW
-/// indexes reject them on INSERT (aligning with pgvector / MySQL 9.x, which
-/// return NaN / reject rather than treating a zero vector as "identical").
-#[inline]
-pub(crate) fn is_zero_norm(v: &[f32]) -> bool {
-    v.iter().all(|x| *x == 0.0)
-}
-
-/// Byte-form counterpart of [`is_zero_norm`] over a little-endian f32 vector.
+/// Zero detection over native little-endian FLOAT32 bytes.
 #[inline]
 pub(crate) fn is_zero_norm_bytes(v: &[u8]) -> bool {
     v.chunks_exact(4)
@@ -462,21 +461,13 @@ pub(crate) fn ordering_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
 /// Display distance: the value the `DISTANCE()` SQL function returns. Ranks
 /// identically to [`ordering_distance`] (so KNN ordering matches the projected
 /// distance) but reports true Euclidean distance for L2.
-#[inline]
-pub(crate) fn display_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
-    let score = ordering_distance(a, b, metric);
-    if metric == Metric::L2 {
-        score.sqrt()
-    } else {
-        score
-    }
-}
 
 /// Keep ordinary SIMD reductions unchanged; exceptional magnitudes use f64
 /// before subtraction/multiplication. Finite f32 vectors have finite f64 norms.
 #[inline]
 unsafe fn ordering_distance_ptr(a: *const f32, b: *const f32, n: usize, metric: Metric) -> f64 {
     match metric {
+        Metric::Hamming | Metric::Jaccard => return f64::NAN,
         Metric::L2 => {
             let value = l2_sq_ptr(a, b, n);
             if value.is_normal() {
@@ -515,6 +506,7 @@ unsafe fn wide_ordering_distance_ptr(
         let x = read_unaligned(a.add(i)) as f64;
         let y = read_unaligned(b.add(i)) as f64;
         match metric {
+            Metric::Hamming | Metric::Jaccard => return f64::NAN,
             Metric::L2 => {
                 let d = x - y;
                 l2 += d * d;
@@ -528,6 +520,7 @@ unsafe fn wide_ordering_distance_ptr(
         }
     }
     match metric {
+        Metric::Hamming | Metric::Jaccard => return f64::NAN,
         Metric::L2 => l2,
         Metric::Dot => -dot,
         Metric::Cosine => {
@@ -590,15 +583,6 @@ pub(crate) fn ordering_distance_f32_bytes(a: &[f32], b: &[u8], metric: Metric) -
 }
 
 /// Display distance directly over little-endian byte vectors — no allocation.
-#[inline]
-pub(crate) fn display_distance_bytes(a: &[u8], b: &[u8], metric: Metric) -> f64 {
-    let score = ordering_distance_bytes(a, b, metric);
-    if metric == Metric::L2 {
-        score.sqrt()
-    } else {
-        score
-    }
-}
 
 /// Dot product directly over little-endian byte vectors — no allocation.
 #[inline]
@@ -1963,5 +1947,180 @@ mod tests {
         bb.extend_from_slice(&to_bytes(&b));
         let got = ordering_distance_bytes(&ab[1..], &bb[1..], Metric::L2);
         assert!((got - want as f64).abs() <= 1e-3 * (want as f64).abs().max(1.0));
+    }
+}
+
+/// Exact scoring of native payloads, with no per-candidate allocation.
+pub(crate) fn typed_ordering_distance<
+    A: crate::vector::VectorInput + ?Sized,
+    B: crate::vector::VectorInput + ?Sized,
+>(
+    a: &A,
+    b: &B,
+    metric: Metric,
+) -> Result<f64, crate::types::QueryError> {
+    use super::codec::vector_err;
+    use crate::vector::VectorDataType as D;
+    if a.dimension() != b.dimension() {
+        return Err(vector_err("VECTOR dimension mismatch"));
+    }
+    let binary = a.datatype() == D::Binary || b.datatype() == D::Binary;
+    if binary {
+        if a.datatype() != D::Binary
+            || b.datatype() != D::Binary
+            || !matches!(metric, Metric::Hamming | Metric::Jaccard)
+        {
+            return Err(vector_err(
+                "BINARY vectors require HAMMING or JACCARD and two BINARY operands",
+            ));
+        }
+        let mut different = 0u64;
+        let mut intersection = 0u64;
+        let mut union = 0u64;
+        for (x, y) in a.payload().chunks(8).zip(b.payload().chunks(8)) {
+            let mut xb = [0; 8];
+            let mut yb = [0; 8];
+            xb[..x.len()].copy_from_slice(x);
+            yb[..y.len()].copy_from_slice(y);
+            let x = u64::from_le_bytes(xb);
+            let y = u64::from_le_bytes(yb);
+            if metric == Metric::Hamming {
+                different += (x ^ y).count_ones() as u64;
+            } else {
+                intersection += (x & y).count_ones() as u64;
+                union += (x | y).count_ones() as u64;
+            }
+        }
+        return Ok(if metric == Metric::Hamming {
+            different as f64
+        } else if union == 0 {
+            0.0
+        } else {
+            1.0 - intersection as f64 / union as f64
+        });
+    }
+    if matches!(metric, Metric::Hamming | Metric::Jaccard) {
+        return Err(vector_err("HAMMING/JACCARD require BINARY vectors"));
+    }
+    if a.datatype() == D::Float32 && b.datatype() == D::Float32 {
+        return Ok(ordering_distance_bytes(a.payload(), b.payload(), metric));
+    }
+    if a.datatype() == D::Int8 && b.datatype() == D::Int8 {
+        let (mut l2, mut dot, mut na, mut nb) = (0i64, 0i64, 0i64, 0i64);
+        for (&x, &y) in a.payload().iter().zip(b.payload()) {
+            let x = x as i8 as i64;
+            let y = y as i8 as i64;
+            match metric {
+                Metric::L2 => l2 += (x - y) * (x - y),
+                Metric::Dot => dot += x * y,
+                Metric::Cosine => {
+                    dot += x * y;
+                    na += x * x;
+                    nb += y * y;
+                }
+                _ => unreachable!(),
+            }
+        }
+        return Ok(match metric {
+            Metric::L2 => l2 as f64,
+            Metric::Dot => -(dot as f64),
+            Metric::Cosine => {
+                if na == 0 || nb == 0 {
+                    f64::NAN
+                } else {
+                    1.0 - ((dot as f64) / ((na as f64).sqrt() * (nb as f64).sqrt()))
+                        .clamp(-1.0, 1.0)
+                }
+            }
+            _ => unreachable!(),
+        });
+    }
+    let (mut sum, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    let mut left = [0.0f32; 64];
+    let mut right = [0.0f32; 64];
+    for start in (0..a.dimension() as usize).step_by(64) {
+        let length = (a.dimension() as usize - start).min(64);
+        decode_native_block(a, start, &mut left[..length]);
+        decode_native_block(b, start, &mut right[..length]);
+        let l = &left[..length];
+        let r = &right[..length];
+        match metric {
+            Metric::L2 => sum += ordering_distance(l, r, Metric::L2),
+            Metric::Dot => sum += ordering_distance(l, r, Metric::Dot),
+            Metric::Cosine => {
+                sum -= ordering_distance(l, r, Metric::Dot);
+                na -= ordering_distance(l, l, Metric::Dot);
+                nb -= ordering_distance(r, r, Metric::Dot);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(match metric {
+        Metric::L2 | Metric::Dot => sum,
+        Metric::Cosine => {
+            if na == 0.0 || nb == 0.0 {
+                f64::NAN
+            } else {
+                1.0 - (sum / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
+            }
+        }
+        _ => unreachable!(),
+    })
+}
+
+fn decode_native_block<V: crate::vector::VectorInput + ?Sized>(
+    value: &V,
+    start: usize,
+    out: &mut [f32],
+) {
+    use crate::vector::VectorDataType as D;
+    use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+    match value.datatype() {
+        D::Float16 | D::BFloat16 => {
+            let mut words = [0u16; 64];
+            for (word, bytes) in words
+                .iter_mut()
+                .zip(value.payload()[start * 2..(start + out.len()) * 2].chunks_exact(2))
+            {
+                *word = u16::from_le_bytes(bytes.try_into().unwrap());
+            }
+            let words = &words[..out.len()];
+            if value.datatype() == D::Float16 {
+                words
+                    .reinterpret_cast::<half::f16>()
+                    .convert_to_f32_slice(out);
+            } else {
+                words
+                    .reinterpret_cast::<half::bf16>()
+                    .convert_to_f32_slice(out);
+            }
+        }
+        D::Float32 => {
+            for (x, bytes) in out
+                .iter_mut()
+                .zip(value.payload()[start * 4..].chunks_exact(4))
+            {
+                *x = f32::from_le_bytes(bytes.try_into().unwrap());
+            }
+        }
+        D::Int8 => {
+            for (x, &v) in out.iter_mut().zip(&value.payload()[start..]) {
+                *x = (v as i8) as f32;
+            }
+        }
+        D::Binary => unreachable!("binary distances use packed kernels"),
+    }
+}
+
+/// Domain-independent zero detection does not underflow on floating subnormals.
+pub(crate) fn typed_is_zero(value: &crate::vector::VectorValue) -> bool {
+    use crate::vector::VectorDataType as D;
+    match value.datatype {
+        D::Float32 => is_zero_norm_bytes(&value.payload),
+        D::Float16 | D::BFloat16 => value
+            .payload
+            .chunks_exact(2)
+            .all(|v| u16::from_le_bytes(v.try_into().unwrap()) & 0x7fff == 0),
+        D::Int8 | D::Binary => value.payload.iter().all(|&v| v == 0),
     }
 }

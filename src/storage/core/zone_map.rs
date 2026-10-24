@@ -1096,9 +1096,7 @@ impl ZoneScalar {
             ZoneScalar::Float64(v) => f64::from_bits(*v).to_string(),
             ZoneScalar::Decimal(value) => value.clone(),
             ZoneScalar::Temporal(v) => v.to_string(),
-            ZoneScalar::Binary { prefix, .. } => {
-                crate::util::hex::encode_upper(prefix)
-            }
+            ZoneScalar::Binary { prefix, .. } => crate::util::hex::encode_upper(prefix),
             ZoneScalar::Text { weight, .. } => String::from_utf8_lossy(weight).into_owned(),
         }
     }
@@ -1456,10 +1454,8 @@ fn zone_scalar_owned_bytes(value: &ZoneScalar) -> usize {
 fn zone_value_owned_bytes(value: &Value) -> usize {
     match value {
         Value::String(text) | Value::Decimal(text) => text.capacity(),
-        Value::Bytes(bytes)
-        | Value::Json(bytes)
-        | Value::Geometry(bytes)
-        | Value::Vector(bytes) => bytes.capacity(),
+        Value::Bytes(bytes) | Value::Json(bytes) | Value::Geometry(bytes) => bytes.capacity(),
+        Value::Vector(bytes) => bytes.capacity(),
         _ => value.decimal_heap_bytes(),
     }
 }
@@ -4796,8 +4792,8 @@ impl ZoneMap {
                 epoch,
                 last_ms: now,
             };
-            let neutral_update =
-                !summary_changed && (incoming.stale_mutations != 0 || incoming.row_count_estimate != 0);
+            let neutral_update = !summary_changed
+                && (incoming.stale_mutations != 0 || incoming.row_count_estimate != 0);
             let (row_credit, stale_credit) = self
                 .neutral_mutations
                 .lock()
@@ -7484,9 +7480,10 @@ impl Database {
             return Ok(None);
         }
         let storage_id = info.table_id;
-        let mut load = self.zone_map_load_locks[storage_id as usize % self.zone_map_load_locks.len()]
-            .lock()
-            .map_err(|_| ZoneMap::access_error("zone-map loader lock poisoned"))?;
+        let mut load = self.zone_map_load_locks
+            [storage_id as usize % self.zone_map_load_locks.len()]
+        .lock()
+        .map_err(|_| ZoneMap::access_error("zone-map loader lock poisoned"))?;
         // Incoming physical redo can install a ready root even while local
         // pruning is OFF. The loader latch spans the complete replay.
         *load = None;
@@ -7773,7 +7770,8 @@ impl Database {
     /// DML while disabled still durably revokes the affected roots.
     pub fn set_zone_map_enabled(&self, enabled: bool) -> Result<(), QueryError> {
         let _gate = self.zone_map_gate.write();
-        self.zone_map_retirement_epoch.fetch_add(1, Ordering::AcqRel);
+        self.zone_map_retirement_epoch
+            .fetch_add(1, Ordering::AcqRel);
         self.zone_map_enabled.store(enabled, Ordering::Release);
         if let Some(cache) = crate::engine::cache::global_plan_cache() {
             cache.clear();
@@ -7827,7 +7825,8 @@ impl Database {
     pub(crate) fn forget_zone_map(&self, storage_id: u64) -> Result<(), QueryError> {
         // DDL can rename/exchange physical summaries. Advance before retiring
         // the handle so concurrent checks cannot republish a current token.
-        self.zone_map_retirement_epoch.fetch_add(1, Ordering::AcqRel);
+        self.zone_map_retirement_epoch
+            .fetch_add(1, Ordering::AcqRel);
         let map = self
             .zone_maps
             .read()
@@ -8581,7 +8580,6 @@ impl Database {
             },
         })
     }
-
 
     pub fn zone_map_cost_estimate_forced(
         &self,
@@ -10296,15 +10294,14 @@ impl Database {
                 }
             }
         }
-        let mut targets =
-            zone_map_maintenance_targets_in_range(
-                &sampled,
-                first,
-                end,
-                ratio,
-                &required_columns,
-                &membership_columns,
-            );
+        let mut targets = zone_map_maintenance_targets_in_range(
+            &sampled,
+            first,
+            end,
+            ratio,
+            &required_columns,
+            &membership_columns,
+        );
         targets.retain(|id| eligible.contains(id));
         let repaired = if targets.is_empty() {
             false
@@ -10831,15 +10828,10 @@ mod zone_map_tests {
                 &BTreeSet::new()
             )
             .is_empty());
-            assert!(zone_map_maintenance_targets_in_range(
-                &zones,
-                0,
-                1,
-                1.0,
-                &required,
-                &required
-            )
-            .contains(&0));
+            assert!(
+                zone_map_maintenance_targets_in_range(&zones, 0, 1, 1.0, &required, &required)
+                    .contains(&0)
+            );
         }
     }
 
@@ -14966,7 +14958,8 @@ mod zone_map_tests {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    db.queue_zone_map_invalidation(0, storage_id, false).unwrap();
+                    db.queue_zone_map_invalidation(0, storage_id, false)
+                        .unwrap();
                 });
             }
         });

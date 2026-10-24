@@ -14,7 +14,7 @@ VECTOR_NORM(vector)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `vector` | Yes | VECTOR, valid vector text, or encoded vector bytes | A nonempty finite-f32 vector; integer scalars and metric names are not vector values |
+| `vector` | Yes | VECTOR or valid vector text | A nonempty native vector; integer scalars and metric names are not vector values |
 
 ## Return Value
 
@@ -34,7 +34,9 @@ Result:
 
 ## Notes
 
-- Vector values must be nonempty, contain finite f32 elements, and binary vector operations require equal dimensions. Invalid encodings, dimensions or scalar integer operands return an explicit vector error. Distance metric names are case-insensitive.
+- Supports FLOAT32, FLOAT16, BFLOAT16 and INT8. BINARY raises an error.
+
+- Vectors must be nonempty, floating elements must be finite, and distance operands must have equal dimensions. Numeric datatypes may be mixed without narrowing the query. BINARY cannot be mixed with numeric vectors. Invalid encodings and scalar integer operands raise a vector error. Raw payloads require `VECTOR_FROM_BINARY`; metric names are case-insensitive.
 
 ## Related Functions
 

@@ -7,7 +7,7 @@ Parses a text representation into a vector; an alias of `STRING_TO_VECTOR`. This
 ## Syntax
 
 ```sql
-TO_VECTOR(vector)
+TO_VECTOR(text [, datatype])
 ```
 
 ## Parameters and Return Value

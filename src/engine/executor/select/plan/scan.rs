@@ -5545,25 +5545,42 @@ pub(super) fn ivf_rerank_fetch(k: usize, mult: u64) -> usize {
 pub(in crate::engine::executor::select) fn resolve_knn_query_vector(
     table: &PlanTable,
     column_index: usize,
-    baked: &[u8],
+    baked: &crate::vector::VectorValue,
     expr: &Option<Expr>,
-) -> Result<Vec<u8>, QueryError> {
+) -> Result<crate::vector::VectorValue, QueryError> {
+    let binary = matches!(
+        table.schema.columns[column_index].data_type,
+        crate::storage::DataTypeKind::Vector {
+            datatype: crate::vector::VectorDataType::Binary,
+            ..
+        }
+    );
     let bytes = if let Some(expr) = expr {
         let value = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])?;
-        crate::planner::value_to_vector_bytes(&value).ok_or_else(|| {
+        (if binary && !matches!(value, Value::Vector(_)) {
+            crate::engine::vector::codec::coerce_value(
+                value,
+                crate::vector::VectorDataType::Binary,
+                None,
+            )
+            .ok()
+        } else {
+            crate::planner::value_to_vector_bytes(&value)
+        })
+        .ok_or_else(|| {
             error(
                 crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
                 "query vector parameter is not a valid VECTOR value",
             )
         })?
     } else {
-        baked.to_vec()
+        baked.clone()
     };
-    if let Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(dim) }) =
+    if let Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(dim), .. }) =
         table.schema.columns.get(column_index).map(|c| &c.data_type)
     {
-        let actual = bytes.len() / std::mem::size_of::<f32>();
-        if bytes.len() % std::mem::size_of::<f32>() != 0 || actual != *dim as usize {
+        let actual = bytes.dimension as usize;
+        if actual != *dim as usize {
             return Err(error(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                 format!(
@@ -5577,11 +5594,22 @@ pub(in crate::engine::executor::select) fn resolve_knn_query_vector(
 }
 
 pub(in crate::engine::executor::select) fn validate_knn_query_vector(
-    bytes: &[u8],
+    bytes: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
 ) -> Result<(), QueryError> {
+    let binary = bytes.datatype == crate::vector::VectorDataType::Binary;
+    if binary
+        != matches!(
+            metric,
+            crate::engine::vector::Metric::Hamming | crate::engine::vector::Metric::Jaccard
+        )
+    {
+        return Err(crate::engine::vector::vector_err(
+            "query datatype and distance metric are incompatible",
+        ));
+    }
     if metric == crate::engine::vector::Metric::Cosine
-        && crate::engine::vector::distance::is_zero_norm_bytes(bytes)
+        && crate::engine::vector::distance::typed_is_zero(bytes)
     {
         return Err(error(
             crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
@@ -5597,7 +5625,7 @@ pub(super) fn execute_vector_index_scan(
     txn: TxnView,
     table: &PlanTable,
     index: &IndexSchema,
-    query_vector: &[u8],
+    query_vector: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
     k: usize,
     ef_search: usize,
@@ -5608,7 +5636,7 @@ pub(super) fn execute_vector_index_scan(
     if k == 0 {
         return Ok(Vec::new());
     }
-    let query = vector::to_f32(query_vector);
+    let query = query_vector;
     let col_idx = table.schema.column_index(&index.columns[0])?;
     // A recovered/sealed graph contains physical current vectors. Prepared
     // writers may instead expose older vectors (or deleted rows) through undo;
@@ -5638,7 +5666,7 @@ pub(super) fn execute_vector_index_scan(
     // tuning knob for large-`k` queries.
     let is_ivf = matches!(
         index.vector_algo(),
-        crate::storage::schema::VectorAlgo::IvfSq8
+        crate::storage::schema::VectorAlgo::IvfSq8 | crate::storage::schema::VectorAlgo::Ivf
     );
     // Whether the backend's candidate ordering is *exact*. HNSW re-ranks on
     // full-f32 node vectors, and IVF's Dot lists store f32 — for those, the
@@ -5868,10 +5896,10 @@ pub(super) fn execute_vector_index_scan(
             // candidate `Vec<f32>` decode.
             let dist = match stored.values.get(col_idx) {
                 Some(Value::Vector(bytes)) => {
-                    if bytes.len() != query_vector.len() {
+                    if bytes.dimension != query_vector.dimension {
                         continue; // dimension drift — skip defensively
                     }
-                    vector::distance::ordering_distance_bytes(query_vector, bytes, metric)
+                    vector::distance::typed_ordering_distance(query_vector, bytes, metric)?
                 }
                 _ => continue,
             };
@@ -5995,7 +6023,7 @@ pub(super) fn execute_vector_brute_scan_filtered(
     txn: TxnView,
     table: &PlanTable,
     col_idx: usize,
-    query_vector: &[u8],
+    query_vector: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
     k: usize,
     filter: &Expr,
@@ -6016,7 +6044,7 @@ pub(super) fn execute_vector_brute_scan_filtered(
         let Some(Value::Vector(bytes)) = values.get(col_idx) else {
             return Ok(());
         };
-        if bytes.len() != query_vector.len() {
+        if bytes.dimension != query_vector.dimension {
             return Ok(());
         }
         let row = stored_row_to_plan_row(table, values.to_vec())?;
@@ -6024,7 +6052,7 @@ pub(super) fn execute_vector_brute_scan_filtered(
             return Ok(());
         }
         let distance =
-            crate::engine::vector::distance::ordering_distance_bytes(query_vector, bytes, metric);
+            crate::engine::vector::distance::typed_ordering_distance(query_vector, bytes, metric)?;
         let distance = if distance.is_nan() {
             f64::NEG_INFINITY
         } else {
@@ -6077,7 +6105,7 @@ pub(super) fn execute_vector_brute_scan(
     txn: TxnView,
     table: &PlanTable,
     col_idx: usize,
-    query_vector: &[u8],
+    query_vector: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
     k: usize,
 ) -> Result<Vec<PlanRow>, QueryError> {

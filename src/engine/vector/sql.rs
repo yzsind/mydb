@@ -1,19 +1,23 @@
-//! The vector SQL function library, routed from `engine::expr` exactly like the
-//! GIS `ST_*` surface in `engine::geo::sql`. Arguments arrive already evaluated;
-//! any NULL argument short-circuits to SQL NULL (MySQL semantics).
+//! SQL vector functions with native datatypes and explicit binary construction.
+use super::{
+    codec,
+    distance::{self, Metric},
+};
+use crate::{
+    types::{QueryError, Value},
+    vector::{VectorDataType, VectorValue},
+};
+use std::borrow::Cow;
 
-use super::codec;
-use super::distance::{self, Metric};
-use crate::types::{QueryError, Value};
-
-/// Every vector function name (upper-case). `engine::expr` checks this before
-/// dispatching into [`eval`].
 const VEC_FUNCTIONS: &[&str] = &[
     "STRING_TO_VECTOR",
     "TO_VECTOR",
     "VECTOR_TO_STRING",
     "FROM_VECTOR",
     "VECTOR_DIM",
+    "VECTOR_DATATYPE",
+    "VECTOR_FROM_BINARY",
+    "VECTOR_TO_BINARY",
     "DISTANCE",
     "VEC_DISTANCE",
     "L2_DISTANCE",
@@ -24,226 +28,226 @@ const VEC_FUNCTIONS: &[&str] = &[
     "L2_NORMALIZE",
     "SUBVECTOR",
     "MAX_INNER_PRODUCT_DISTANCE",
+    "HAMMING_DISTANCE",
+    "JACCARD_DISTANCE",
 ];
-
-/// Functions whose result column type is `VECTOR` (drives
-/// `expr::function_result_type`).
-const VEC_RETURNS_VECTOR: &[&str] = &["STRING_TO_VECTOR", "TO_VECTOR", "L2_NORMALIZE", "SUBVECTOR"];
-
-/// True if `upper` (already upper-cased) names a vector function.
 pub(crate) fn is_vec_function(upper: &str) -> bool {
     VEC_FUNCTIONS.contains(&upper)
 }
-
-/// True if `upper` names a vector function that returns a `VECTOR` value.
 pub(crate) fn returns_vector(upper: &str) -> bool {
-    VEC_RETURNS_VECTOR.contains(&upper)
+    matches!(
+        upper,
+        "STRING_TO_VECTOR" | "TO_VECTOR" | "VECTOR_FROM_BINARY" | "L2_NORMALIZE" | "SUBVECTOR"
+    )
 }
 
-/// Evaluate a vector function. `upper` is the upper-cased name, `name` the
-/// original spelling (for error messages), `values` the evaluated arguments.
 pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, QueryError> {
-    // NULL propagation: any NULL argument yields NULL.
+    let (min, max) = match upper {
+        "STRING_TO_VECTOR" | "TO_VECTOR" => (1, 2),
+        "VECTOR_FROM_BINARY" | "SUBVECTOR" => (3, 3),
+        "DISTANCE" | "VEC_DISTANCE" => (2, 3),
+        "L2_DISTANCE"
+        | "COSINE_DISTANCE"
+        | "DOT_PRODUCT"
+        | "INNER_PRODUCT"
+        | "MAX_INNER_PRODUCT_DISTANCE"
+        | "HAMMING_DISTANCE"
+        | "JACCARD_DISTANCE" => (2, 2),
+        _ => (1, 1),
+    };
     if values.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
+    expect_args(name, values, min, max)?;
     match upper {
         "STRING_TO_VECTOR" | "TO_VECTOR" => {
-            expect_args(name, values, 1, 1)?;
-            let s = string_arg(&values[0], name)?;
-            Ok(Value::Vector(codec::parse_text(&s)?))
-        }
-        "VECTOR_TO_STRING" | "FROM_VECTOR" => {
-            expect_args(name, values, 1, 1)?;
-            let v = vector_bytes(&values[0], name)?;
-            Ok(Value::String(codec::to_text(&v)))
-        }
-        "VECTOR_DIM" => {
-            expect_args(name, values, 1, 1)?;
-            let v = vector_bytes(&values[0], name)?;
-            Ok(Value::Int(codec::dim(&v) as i64))
-        }
-        "DISTANCE" | "VEC_DISTANCE" => {
-            expect_args(name, values, 2, 3)?;
-            let metric = if values.len() == 3 {
-                let m = string_arg(&values[2], name)?;
-                Metric::parse(&m).ok_or_else(|| {
-                    codec::vector_err(format!(
-                        "unknown distance metric '{m}' (expected L2, COSINE, or DOT)"
-                    ))
-                })?
+            let datatype = if values.len() == 2 {
+                datatype_arg(&values[1], name)?
             } else {
-                Metric::L2
+                VectorDataType::Float32
             };
-            distance_value(name, &values[0], &values[1], metric)
+            if let Value::Vector(value) = &values[0] {
+                return codec::convert_value(value, datatype, None).map(Value::Vector);
+            }
+            Ok(Value::Vector(codec::parse_typed_text(
+                &string_arg(&values[0], name)?,
+                datatype,
+            )?))
         }
-        "L2_DISTANCE" => {
-            expect_args(name, values, 2, 2)?;
-            distance_value(name, &values[0], &values[1], Metric::L2)
-        }
-        "COSINE_DISTANCE" => {
-            expect_args(name, values, 2, 2)?;
-            distance_value(name, &values[0], &values[1], Metric::Cosine)
-        }
-        "DOT_PRODUCT" | "INNER_PRODUCT" => {
-            expect_args(name, values, 2, 2)?;
-            // Zero-alloc fast path when both operands are already vector bytes.
-            if let (Value::Vector(ba), Value::Vector(bb)) = (&values[0], &values[1]) {
-                if ba.len() != bb.len() || ba.is_empty() {
-                    return Err(codec::vector_err(format!(
-                        "{name}: vector dimension mismatch ({} vs {})",
-                        ba.len() / 4,
-                        bb.len() / 4
-                    )));
+        "VECTOR_FROM_BINARY" => {
+            let datatype = datatype_arg(&values[1], name)?;
+            let dimension = u32::try_from(int_arg(&values[2], name)?)
+                .map_err(|_| codec::vector_err("invalid VECTOR dimension"))?;
+            let payload = match &values[0] {
+                Value::Bytes(bytes) => bytes.as_slice(),
+                _ => {
+                    return Err(codec::vector_err(
+                        "VECTOR_FROM_BINARY requires a binary payload",
+                    ))
                 }
-                return Ok(Value::Double(-distance::display_distance_bytes(
-                    ba,
-                    bb,
-                    Metric::Dot,
+            };
+            codec::validate_internal(&crate::vector::VectorRef {
+                datatype,
+                dimension,
+                payload,
+            })?;
+            Ok(Value::Vector(VectorValue::new(
+                datatype,
+                dimension,
+                payload.to_vec(),
+            )))
+        }
+        "VECTOR_TO_BINARY" => Ok(Value::Bytes(
+            vector_value(&values[0], name)?.payload.clone(),
+        )),
+        "VECTOR_DATATYPE" => Ok(Value::String(
+            vector_value(&values[0], name)?.datatype.name().into(),
+        )),
+        "VECTOR_TO_STRING" | "FROM_VECTOR" => Ok(Value::String(codec::to_text(
+            vector_value(&values[0], name)?.as_ref(),
+        ))),
+        "VECTOR_DIM" => Ok(Value::Int(vector_value(&values[0], name)?.dimension as i64)),
+        "VECTOR_NORM" | "L2_NORMALIZE" => {
+            let v = vector_value(&values[0], name)?;
+            if v.datatype == VectorDataType::Binary {
+                return Err(codec::vector_err(format!(
+                    "{name} does not support BINARY vectors"
                 )));
             }
-            let (a, b) = two_vectors(name, &values[0], &values[1])?;
-            Ok(Value::Double(-distance::display_distance(
-                &a,
-                &b,
-                Metric::Dot,
-            )))
-        }
-        // pgvector `negative_inner_product` — the value the `<#>` operator
-        // orders by. Equals `-DOT_PRODUCT(a, b)`.
-        "MAX_INNER_PRODUCT_DISTANCE" => {
-            expect_args(name, values, 2, 2)?;
-            let (a, b) = two_vectors(name, &values[0], &values[1])?;
-            Ok(Value::Double(distance::display_distance(
-                &a,
-                &b,
-                Metric::Dot,
-            )))
-        }
-        // L2 norm `|v|` (pgvector `vector_norm`).
-        "VECTOR_NORM" => {
-            expect_args(name, values, 1, 1)?;
-            let b = vector_bytes(&values[0], name)?;
-            if b.is_empty() {
-                return Err(codec::vector_err(format!("{name}: empty vector")));
+            let norm = if v.datatype == VectorDataType::Float32 {
+                distance::norm_bytes(&v.payload)
+            } else {
+                (0..v.dimension as usize)
+                    .map(|i| v.element(i).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            if upper == "VECTOR_NORM" {
+                return Ok(Value::Double(norm));
             }
-            Ok(Value::Double(distance::norm_bytes(&b)))
-        }
-        // Unit vector `v / |v|` (pgvector `l2_normalize`). A zero vector has no
-        // direction, so it is returned unchanged (matching pgvector).
-        "L2_NORMALIZE" => {
-            expect_args(name, values, 1, 1)?;
-            let b = vector_bytes(&values[0], name)?;
-            if b.is_empty() {
-                return Err(codec::vector_err(format!("{name}: empty vector")));
+            if v.dimension > VectorDataType::Float32.max_dimension() {
+                return Err(codec::vector_err(
+                    "L2_NORMALIZE result exceeds FLOAT32 dimension limit",
+                ));
             }
-            let mut out = codec::to_f32(&b);
-            distance::normalize_in_place(&mut out);
-            Ok(Value::Vector(codec::from_f32(&out)))
+            let values: Vec<f32> = (0..v.dimension as usize)
+                .map(|i| {
+                    if norm == 0.0 {
+                        v.element(i) as f32
+                    } else {
+                        (v.element(i) / norm) as f32
+                    }
+                })
+                .collect();
+            Ok(Value::Vector(codec::from_f32(&values)))
         }
-        // 1-indexed slice `v[start .. start+count)` (pgvector `subvector`).
         "SUBVECTOR" => {
-            expect_args(name, values, 3, 3)?;
-            let f = codec::to_f32(&vector_bytes(&values[0], name)?);
+            let v = vector_value(&values[0], name)?;
             let start = int_arg(&values[1], name)?;
             let count = int_arg(&values[2], name)?;
-            if start < 1 || count < 1 {
-                return Err(codec::vector_err(format!(
-                    "{name}: start and count must be >= 1 (got start={start}, count={count})"
-                )));
+            if start < 1
+                || count < 1
+                || start
+                    .checked_add(count - 1)
+                    .is_none_or(|end| end > v.dimension as i64)
+            {
+                return Err(codec::vector_err(
+                    "SUBVECTOR range exceeds vector dimension",
+                ));
             }
             let begin = (start - 1) as usize;
-            let len = count as usize;
-            if begin + len > f.len() {
-                return Err(codec::vector_err(format!(
-                    "{name}: slice [{start}, {}] exceeds vector dimension {}",
-                    start + count - 1,
-                    f.len()
-                )));
+            let count = count as u32;
+            let payload = if v.datatype == VectorDataType::Binary {
+                let mut bytes = vec![0; v.datatype.payload_len(count)];
+                for i in 0..count as usize {
+                    if v.element(begin + i) != 0.0 {
+                        bytes[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                bytes
+            } else {
+                let width = v.datatype.payload_len(1);
+                v.payload[begin * width..(begin + count as usize) * width].to_vec()
+            };
+            Ok(Value::Vector(VectorValue::new(v.datatype, count, payload)))
+        }
+        _ => {
+            let explicit_binary = matches!(upper, "HAMMING_DISTANCE" | "JACCARD_DISTANCE")
+                || (matches!(upper, "DISTANCE" | "VEC_DISTANCE")
+                    && values.len() == 3
+                    && Metric::parse(&string_arg(&values[2], name)?)
+                        .is_some_and(|m| matches!(m, Metric::Hamming | Metric::Jaccard)));
+            let binary = explicit_binary
+                || matches!(&values[0], Value::Vector(v) if v.datatype == VectorDataType::Binary)
+                || matches!(&values[1], Value::Vector(v) if v.datatype == VectorDataType::Binary);
+            let a = vector_operand(&values[0], name, binary)?;
+            let b = vector_operand(&values[1], name, binary)?;
+            let metric = match upper {
+                "L2_DISTANCE" => Metric::L2,
+                "COSINE_DISTANCE" => Metric::Cosine,
+                "DOT_PRODUCT" | "INNER_PRODUCT" | "MAX_INNER_PRODUCT_DISTANCE" => Metric::Dot,
+                "HAMMING_DISTANCE" => Metric::Hamming,
+                "JACCARD_DISTANCE" => Metric::Jaccard,
+                "DISTANCE" | "VEC_DISTANCE" if values.len() == 3 => {
+                    Metric::parse(&string_arg(&values[2], name)?)
+                        .ok_or_else(|| codec::vector_err("unknown VECTOR distance metric"))?
+                }
+                "DISTANCE" | "VEC_DISTANCE" => {
+                    if binary {
+                        Metric::Hamming
+                    } else {
+                        Metric::L2
+                    }
+                }
+                _ => return Err(codec::vector_err(format!("unknown vector function {name}"))),
+            };
+            let d = distance::typed_ordering_distance(a.as_ref(), b.as_ref(), metric)?;
+            if d.is_nan() {
+                return Ok(Value::Null);
             }
-            Ok(Value::Vector(codec::from_f32(&f[begin..begin + len])))
+            Ok(Value::Double(
+                if matches!(upper, "DOT_PRODUCT" | "INNER_PRODUCT") {
+                    -d
+                } else if metric == Metric::L2 {
+                    d.sqrt()
+                } else {
+                    d
+                },
+            ))
         }
-        _ => Err(codec::vector_err(format!("unknown vector function {name}"))),
     }
 }
 
-/// `CAST(x AS VECTOR)` / `CONVERT(x, VECTOR)`. NULL is handled by the caller.
 pub(crate) fn cast_to_vector(value: &Value) -> Result<Value, QueryError> {
-    Ok(Value::Vector(vector_bytes(value, "cast")?))
+    codec::coerce_value(value.clone(), VectorDataType::Float32, None).map(Value::Vector)
 }
 
-/// Compute a ranking distance between two vector operands, validating equal
-/// dimensions.
-fn distance_value(name: &str, a: &Value, b: &Value, metric: Metric) -> Result<Value, QueryError> {
-    // Zero-alloc fast path: both operands are already in internal byte form —
-    // the overwhelmingly common case of a `VECTOR` column scored against a
-    // constant-folded query vector. A brute-force `ORDER BY DISTANCE(col, q)`
-    // hits this once per row, so skipping the two `Vec<f32>` decodes and the
-    // validating clone in `two_vectors` is the dominant brute-KNN win. Stored
-    // column values were validated on write and the constant on fold, so a
-    // re-validation here would be redundant work in the hot loop.
-    if let (Value::Vector(ba), Value::Vector(bb)) = (a, b) {
-        if ba.len() != bb.len() {
-            return Err(codec::vector_err(format!(
-                "{name}: vector dimension mismatch ({} vs {})",
-                ba.len() / 4,
-                bb.len() / 4
-            )));
-        }
-        if ba.is_empty() {
-            return Err(codec::vector_err(format!("{name}: empty vector")));
-        }
-        // Cosine similarity is undefined for a zero vector — the scalar
-        // function returns NULL rather than a fabricated distance (pgvector
-        // returns NaN; MySQL 9.x rejects). Only the explicit `DISTANCE()` /
-        // `COSINE_DISTANCE()` projection reaches here; brute-KNN ordering uses
-        // `ordering_distance_bytes` directly and is unaffected.
-        if metric == Metric::Cosine
-            && (distance::is_zero_norm_bytes(ba) || distance::is_zero_norm_bytes(bb))
-        {
-            return Ok(Value::Null);
-        }
-        return Ok(Value::Double(distance::display_distance_bytes(
-            ba, bb, metric,
-        )));
-    }
-    let (fa, fb) = two_vectors(name, a, b)?;
-    if metric == Metric::Cosine && (distance::is_zero_norm(&fa) || distance::is_zero_norm(&fb)) {
-        return Ok(Value::Null);
-    }
-    Ok(Value::Double(distance::display_distance(&fa, &fb, metric)))
+fn datatype_arg(value: &Value, name: &str) -> Result<VectorDataType, QueryError> {
+    let name = string_arg(value, name)?;
+    VectorDataType::parse(&name)
+        .ok_or_else(|| codec::vector_err(format!("unknown VECTOR datatype '{name}'")))
 }
 
-/// Decode two operands to aligned `f32` slices, requiring equal dimension.
-fn two_vectors(name: &str, a: &Value, b: &Value) -> Result<(Vec<f32>, Vec<f32>), QueryError> {
-    let ba = vector_bytes(a, name)?;
-    let bb = vector_bytes(b, name)?;
-    let fa = codec::to_f32(&ba);
-    let fb = codec::to_f32(&bb);
-    if fa.len() != fb.len() {
-        return Err(codec::vector_err(format!(
-            "{name}: vector dimension mismatch ({} vs {})",
-            fa.len(),
-            fb.len()
-        )));
-    }
-    if fa.is_empty() {
-        return Err(codec::vector_err(format!("{name}: empty vector")));
-    }
-    Ok((fa, fb))
+fn vector_value<'a>(v: &'a Value, name: &str) -> Result<Cow<'a, VectorValue>, QueryError> {
+    vector_operand(v, name, false)
 }
-
-/// Extract internal vector bytes from a value, coercing text/bytes.
-fn vector_bytes(v: &Value, name: &str) -> Result<Vec<u8>, QueryError> {
-    match v {
-        Value::Vector(b) => codec::normalize_internal(b),
-        Value::String(s) | Value::Decimal(s) => codec::coerce_bytes_to_internal(s.as_bytes()),
-        Value::Bytes(b) => codec::coerce_bytes_to_internal(b),
-        other => Err(codec::vector_err(format!(
-            "{name} expects a VECTOR argument, got {}",
-            value_type_name(other)
-        ))),
+fn vector_operand<'a>(
+    v: &'a Value,
+    name: &str,
+    binary: bool,
+) -> Result<Cow<'a, VectorValue>, QueryError> {
+    if let Value::Vector(v) = v {
+        return Ok(Cow::Borrowed(v));
     }
+    let text = string_arg(v, name)?;
+    Ok(Cow::Owned(codec::parse_typed_text(
+        &text,
+        if binary {
+            VectorDataType::Binary
+        } else {
+            VectorDataType::Float32
+        },
+    )?))
 }
 
 /// Extract a string argument (for the metric name / text-to-vector input).

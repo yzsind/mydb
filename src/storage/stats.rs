@@ -1951,10 +1951,11 @@ pub(crate) fn stats_hash_value(value: &Value) -> u64 {
         // canonical magnitude/scale. It is outside the compact TPC-H/TPC-C
         // hot lane, so keep one authoritative conversion here.
         Value::Decimal(_) => return KeyPart::from_value(value).stats_hash(),
-        Value::Bytes(bytes)
-        | Value::Json(bytes)
-        | Value::Geometry(bytes)
-        | Value::Vector(bytes) => {
+        Value::Bytes(bytes) | Value::Json(bytes) | Value::Geometry(bytes) => {
+            hasher.write_u8(4);
+            hasher.write_bytes(bytes);
+        }
+        Value::Vector(bytes) => {
             hasher.write_u8(4);
             hasher.write_bytes(bytes);
         }

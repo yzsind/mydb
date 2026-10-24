@@ -583,12 +583,12 @@ impl Database {
             .map_err(|_| std::io::Error::other("HNSW snapshot allocation failed"))?;
         file.take(length as u64).read_to_end(&mut bytes)?;
         let graph = HnswIndex::deserialize(&bytes)?;
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let column = table
             .column_index(&index.columns[0])
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let dim = match table.columns[column].data_type {
-            DataTypeKind::Vector { dim } => dim.map(|v| v as usize),
+            DataTypeKind::Vector { dim, .. } => dim.map(|v| v as usize),
             _ => None,
         };
         if !graph.matches_configuration(
@@ -622,10 +622,22 @@ impl Database {
         index: &IndexSchema,
         storage_id: u64,
     ) -> Result<VectorGraph, QueryError> {
+        let column = table.column_index(&index.columns[0])?;
+        if matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32)
+            && index.vector_algo() == VectorAlgo::Hnsw
+        {
+            return self.vector_native_hnsw_load_or_build(table, index, storage_id);
+        }
+        if index.vector_algo() == VectorAlgo::Ivf
+            || (index.vector_algo() == VectorAlgo::IvfSq8
+                && matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32))
+        {
+            return self.vector_native_ivf_load_or_build(table, index, storage_id);
+        }
         // Source HNSW page redo is not applied locally. A replica owns only
         // a revocable resident accelerator built from its committed heap view.
         if self.physical_replica_mode() && index.vector_algo() == VectorAlgo::Hnsw {
-            let meta = index.vector_meta();
+            let meta = index.vector_meta_for_table(table);
             let graph = HnswIndex::new(
                 meta.metric_enum(),
                 meta.m as usize,
@@ -655,7 +667,7 @@ impl Database {
                 self.vector_graph_paged_load_or_build(table, index, storage_id)?,
             ));
         }
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let col_idx = table.column_index(&index.columns[0])?;
         let cols = [col_idx];
 
@@ -701,6 +713,257 @@ impl Database {
         Ok(VectorGraph::Memory(graph))
     }
 
+    fn vector_native_hnsw_load_or_build(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        storage_id: u64,
+    ) -> Result<VectorGraph, QueryError> {
+        let col = table.column_index(&index.columns[0])?;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[col].data_type
+        else {
+            return Err(vector::vector_err(
+                "native HNSW requires a declared dimension",
+            ));
+        };
+        let meta = index.vector_meta_for_table(table);
+        let paged = vector_storage_paged() && !self.physical_replica_mode();
+        let final_path = self.vector_index_paged_path(table, &index.name, storage_id);
+        let mut tmp_path = final_path.clone();
+        tmp_path.set_file_name(format!(
+            "{}.native-build-{}.hvec",
+            final_path.file_stem().unwrap_or_default().to_string_lossy(),
+            self.visible_scn()
+        ));
+        let geometry = native_vector_geometry(datatype, dimension);
+        let file = if paged {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            if tmp_path.exists() {
+                fs::remove_file(&tmp_path).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                tmp_path.clone(),
+                geometry,
+                meta.metric_enum().as_u8(),
+                meta.m as u16,
+                (meta.m * 2) as u16,
+                meta.ef_construction.min(u16::MAX as u32) as u16,
+            )?);
+            file.invalidate_build(0)?;
+            file.begin_build();
+            Some(file)
+        } else {
+            None
+        };
+        let mut graph = vector::native_hnsw::NativeHnsw::new(
+            datatype,
+            dimension,
+            meta.metric_enum(),
+            meta.m as usize,
+            meta.ef_construction as usize,
+            file,
+        )?;
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let built = self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            &[col],
+            0,
+            u64::MAX,
+            |row, values| {
+                if let Some(Value::Vector(value)) = values.first() {
+                    graph.insert(row, value.clone())?;
+                }
+                Ok(false)
+            },
+        );
+        if let Err(err) = built {
+            graph.invalidate();
+            return Err(err);
+        }
+        if let Some(file) = graph.file() {
+            file.advance_coverage(txn.snapshot_scn);
+            file.finalize_build(0)?;
+        }
+        if paged && self.durability_mode() != DurabilityMode::Memory {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            self.buffer_pool.discard_pages_for_path(&final_path)?;
+            fs::rename(&tmp_path, &final_path).map_err(io_err)?;
+            if let Some(parent) = final_path.parent() {
+                crate::platform::fs::sync_path(parent).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                final_path,
+                geometry,
+                meta.metric_enum().as_u8(),
+                meta.m as u16,
+                (meta.m * 2) as u16,
+                meta.ef_construction.min(u16::MAX as u32) as u16,
+            )?);
+            graph.replace_file(file);
+        }
+        graph.prepare_navigation()?;
+        Ok(VectorGraph::NativeHnsw(graph))
+    }
+
+    fn vector_native_ivf_load_or_build(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        storage_id: u64,
+    ) -> Result<VectorGraph, QueryError> {
+        let col = table.column_index(&index.columns[0])?;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[col].data_type
+        else {
+            return Err(vector::vector_err(
+                "native IVF requires a declared dimension",
+            ));
+        };
+        let meta = index.vector_meta_for_table(table);
+        let paged = vector_storage_paged() && !self.physical_replica_mode();
+        let final_path = self.vector_index_paged_path(table, &index.name, storage_id);
+        let mut tmp_path = final_path.clone();
+        tmp_path.set_file_name(format!(
+            "{}.native-build-{}.hvec",
+            final_path.file_stem().unwrap_or_default().to_string_lossy(),
+            self.visible_scn()
+        ));
+        let geometry = native_vector_geometry(datatype, dimension);
+        let file = if paged {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            if tmp_path.exists() {
+                fs::remove_file(&tmp_path).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                tmp_path.clone(),
+                geometry,
+                meta.metric_enum().as_u8(),
+                2,
+                0,
+                1,
+            )?);
+            file.invalidate_build(0)?;
+            file.begin_build();
+            Some(file)
+        } else {
+            None
+        };
+        let mut graph = vector::native_ivf::NativeIvf::new(
+            datatype,
+            dimension,
+            meta.metric_enum(),
+            ivf_params_from_meta(&meta),
+            index.vector_algo() == VectorAlgo::IvfSq8,
+            file,
+        )?;
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let mut count = 0usize;
+        self.scan_hnsw_build_rows(table, storage_id, txn, &[col], 0, u64::MAX, |_, values| {
+            if matches!(values.first(), Some(Value::Vector(_))) {
+                count += 1;
+            }
+            Ok(false)
+        })?;
+        if count > 0 {
+            let params = ivf_params_from_meta(&meta);
+            let nlist = if params.nlist == 0 {
+                (count as f64).sqrt() as usize
+            } else {
+                params.nlist
+            }
+            .max(1)
+            .min(count);
+            let sample_count = nlist.saturating_mul(params.train_sample_mult).min(count);
+            let sample_charge =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    sample_count.saturating_mul(datatype.payload_len(dimension) + 96),
+                )?;
+            let mut ordinals = vector::ivf::training_sample(count, sample_count);
+            ordinals.sort_unstable();
+            let mut ordinals = ordinals.into_iter().peekable();
+            let mut ordinal = 0usize;
+            let mut rows = Vec::with_capacity(sample_count);
+            self.scan_hnsw_build_rows(
+                table,
+                storage_id,
+                txn,
+                &[col],
+                0,
+                u64::MAX,
+                |row, values| {
+                    if let Some(Value::Vector(value)) = values.first() {
+                        if ordinals.peek() == Some(&ordinal) {
+                            rows.push((row, value.clone()));
+                            ordinals.next();
+                        }
+                        ordinal += 1;
+                    }
+                    Ok(ordinals.peek().is_none())
+                },
+            )?;
+            graph.initialize_from_sample(rows, nlist)?;
+            drop(sample_charge);
+        }
+        let built = self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            &[col],
+            0,
+            u64::MAX,
+            |row, values| {
+                if let Some(Value::Vector(value)) = values.first() {
+                    graph.insert(row, value.clone())?;
+                }
+                Ok(false)
+            },
+        );
+        if let Err(err) = built {
+            graph.invalidate();
+            return Err(err);
+        }
+        if let Some(file) = graph.file() {
+            file.advance_coverage(txn.snapshot_scn);
+            file.finalize_build(0)?;
+        }
+        if paged && self.durability_mode() != DurabilityMode::Memory {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            self.buffer_pool.discard_pages_for_path(&final_path)?;
+            fs::rename(&tmp_path, &final_path).map_err(io_err)?;
+            if let Some(parent) = final_path.parent() {
+                crate::platform::fs::sync_path(parent).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                final_path,
+                geometry,
+                meta.metric_enum().as_u8(),
+                2,
+                0,
+                1,
+            )?);
+            graph.replace_file(file);
+        }
+        Ok(VectorGraph::NativeIvf(graph))
+    }
+
     /// IVF_SQ8 cold build: materialize every visible vector from the partition
     /// heap into a `(RowId, vector)` batch, then train the coarse quantizer and
     /// populate the SQ8 inverted lists. Build parameters come from the index
@@ -716,7 +979,7 @@ impl Database {
         if vector_storage_paged() {
             return self.vector_ivf_paged_load_or_build(table, index, storage_id);
         }
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let ivf = IvfSq8Index::new(meta.metric_enum(), ivf_params_from_meta(&meta));
         let col_idx = table.column_index(&index.columns[0])?;
         let cols = [col_idx];
@@ -813,7 +1076,7 @@ impl Database {
         storage_id: u64,
         dim: u32,
     ) -> Result<crate::storage::IvfIndexFile, QueryError> {
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let metric = meta.metric_enum();
         let stores_f32 = crate::engine::vector::ivf_paged::PagedIvf::stores_f32_for(metric);
         let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
@@ -848,7 +1111,7 @@ impl Database {
     ) -> Result<Arc<VectorGraph>, QueryError> {
         let col_idx = table.column_index(&index.columns[0])?;
         let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let metric = meta.metric_enum();
         let stores_f32 = crate::engine::vector::ivf_paged::PagedIvf::stores_f32_for(metric);
         let params = ivf_params_from_meta(&meta);
@@ -1092,7 +1355,7 @@ impl Database {
         col_idx: usize,
         storage_id: u64,
     ) -> Result<u32, QueryError> {
-        if let DataTypeKind::Vector { dim: Some(d) } = table.columns[col_idx].data_type {
+        if let DataTypeKind::Vector { dim: Some(d), .. } = table.columns[col_idx].data_type {
             return Ok(d);
         }
         let cols = [col_idx];
@@ -1130,7 +1393,7 @@ impl Database {
         storage_id: u64,
         dim: u32,
     ) -> Result<VectorIndexFile, QueryError> {
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let metric = meta.metric_enum().as_u8();
         let m = meta.m.clamp(2, u32::from(u16::MAX)) as u16;
         let m0 = (u32::from(m) * 2).min(u32::from(u16::MAX)) as u16;
@@ -1930,7 +2193,7 @@ impl Database {
         table: &TableSchema,
         txn: TxnView,
         col_idx: usize,
-        query: &[u8],
+        query: &crate::vector::VectorValue,
         metric: vector::Metric,
         k: usize,
     ) -> Result<Vec<(f64, u64, RowId)>, QueryError> {
@@ -2061,7 +2324,7 @@ impl Database {
         table: &TableSchema,
         txn: TxnView,
         cols: &[usize],
-        query: &[u8],
+        query: &crate::vector::VectorValue,
         metric: vector::Metric,
         storage_id: u64,
         page_lo: u64,
@@ -2076,7 +2339,16 @@ impl Database {
         // existing fused NEON kernels; default-off keeps the old path as a
         // differential oracle. Packing is bounded per worker and amortises one
         // SMSTART/SMSTOP over many candidates.
-        let use_sme = metric == vector::Metric::L2 && vector::distance::brute_sme_enabled();
+        let use_sme = query.datatype == crate::vector::VectorDataType::Float32
+            && matches!(
+                table.columns[col_idx].data_type,
+                DataTypeKind::Vector {
+                    datatype: crate::vector::VectorDataType::Float32,
+                    ..
+                }
+            )
+            && metric == vector::Metric::L2
+            && vector::distance::brute_sme_enabled();
         let sme_batch_rows = std::env::var("MYDB_VECTOR_BRUTE_SME_BATCH_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -2150,7 +2422,7 @@ impl Database {
                         row.has_external,
                         col_idx,
                     )? {
-                        Some(range) if range.width == query.len() => {
+                        Some(range) => {
                             let vb = &body
                                 [range.offset_in_payload..range.offset_in_payload + range.width];
                             if use_sme {
@@ -2161,16 +2433,32 @@ impl Database {
                                 }
                                 return Ok(false);
                             }
-                            vector::distance::ordering_distance_bytes(query, vb, metric)
+                            {
+                                let DataTypeKind::Vector {
+                                    dim: Some(dimension),
+                                    datatype,
+                                } = table.columns[col_idx].data_type
+                                else {
+                                    return Err(vector::vector_err("invalid vector column layout"));
+                                };
+                                let v = crate::vector::VectorRef {
+                                    datatype,
+                                    dimension,
+                                    payload: vb,
+                                };
+                                vector::distance::typed_ordering_distance(query, &v, metric)?
+                            }
                         }
                         // Dimension drift on a VECTOR(n) column is impossible
                         // for a well-formed table (write path + planner both pin
                         // the dim); skip defensively rather than scoring garbage.
-                        Some(_) => return Ok(false),
                         // NULL or dimensionless vector → NULL distance, which
                         // sorts first under ASC (NULLs-first), matching the
                         // row-based oracle.
-                        None => f64::NEG_INFINITY,
+                        None => {
+                            deferred.push(row.row_id);
+                            return Ok(false);
+                        }
                     };
                     top.push(key, storage_id, row.row_id);
                     Ok(false)
@@ -2188,8 +2476,8 @@ impl Database {
         for rid in deferred {
             if let Some(values) = self.read_row_columns(table, rid, txn, cols)? {
                 let key = match values.first() {
-                    Some(Value::Vector(b)) if b.len() == query.len() => {
-                        vector::distance::ordering_distance_bytes(query, b, metric)
+                    Some(Value::Vector(b)) if b.dimension == query.dimension => {
+                        vector::distance::typed_ordering_distance(query, b, metric)?
                     }
                     Some(Value::Vector(_)) => continue,
                     _ => f64::NEG_INFINITY,
@@ -2225,7 +2513,16 @@ impl Database {
             table.active_generation.max(1),
             normalize_name(&index.name),
         );
-        if self.physical_replica_mode() && index.vector_algo() == VectorAlgo::IvfSq8 {
+        if self.physical_replica_mode()
+            && index.vector_algo() == VectorAlgo::IvfSq8
+            && matches!(
+                table.columns[table.column_index(&index.columns[0])?].data_type,
+                DataTypeKind::Vector {
+                    datatype: crate::vector::VectorDataType::Float32,
+                    ..
+                }
+            )
+        {
             if !vector_storage_paged() {
                 return Err(error(crate::error::catalog::ER_GET_ERRNO,
                     "memory IVF acceleration unavailable during physical replication; using exact heap search"));
@@ -2306,8 +2603,7 @@ impl Database {
         if let Some(existing) = self.vector_indexes.read().get(&key) {
             return Ok(existing.clone());
         }
-        let registration = (index.vector_algo() == VectorAlgo::Hnsw)
-            .then(|| VectorBuildRegistration::begin(self, key.clone()));
+        let registration = Some(VectorBuildRegistration::begin(self, key.clone()));
         let build_epoch = self
             .vector_build_epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2368,6 +2664,18 @@ impl Database {
             paged.file().mark_delta_finalized(0)?;
             paged.refresh_query_navigation()?;
         }
+        if let VectorGraph::NativeHnsw(native) = &graph {
+            if let Some(file) = native.file() {
+                file.advance_coverage(self.visible_scn());
+                file.mark_delta_finalized(0)?;
+            }
+        }
+        if let VectorGraph::NativeIvf(native) = &graph {
+            if let Some(file) = native.file() {
+                file.advance_coverage(self.visible_scn());
+                file.mark_delta_finalized(0)?;
+            }
+        }
         if let VectorGraph::Memory(memory) = &graph {
             memory.set_background_quant(crate::engine::vector_maintenance::is_active(self));
         }
@@ -2395,7 +2703,7 @@ impl Database {
         &self,
         key: &(u64, u64, u64, String),
         row_id: RowId,
-        vector: Option<Vec<f32>>,
+        vector: Option<crate::vector::VectorValue>,
     ) {
         if self
             .vector_builds_in_flight
@@ -2411,13 +2719,13 @@ impl Database {
             let previous = delta.ops.get(&row_id).map_or(0, |(_, value)| {
                 value
                     .as_ref()
-                    .map_or(0, |v| v.capacity() * 4)
+                    .map_or(0, |v| v.capacity())
                     .saturating_mul(2)
                     .saturating_add(128)
             });
             let bytes = vector
                 .as_ref()
-                .map_or(0, |v| v.capacity() * 4)
+                .map_or(0, |v| v.capacity())
                 .saturating_mul(2)
                 .saturating_add(128);
             let increase = bytes.saturating_sub(previous);
@@ -2543,7 +2851,16 @@ impl Database {
         if self.vector_indexes.read().contains_key(&key) {
             return Ok(()); // already warm (e.g. a concurrent query built it)
         }
-        if index.vector_algo() == VectorAlgo::IvfSq8 && vector_storage_paged() {
+        if index.vector_algo() == VectorAlgo::IvfSq8
+            && vector_storage_paged()
+            && matches!(
+                table.columns[table.column_index(&index.columns[0])?].data_type,
+                DataTypeKind::Vector {
+                    datatype: crate::vector::VectorDataType::Float32,
+                    ..
+                }
+            )
+        {
             let graph = self.rebuild_paged_ivf_atomic(table, index, storage_id)?;
             self.vector_indexes.write().entry(key).or_insert(graph);
             return Ok(());
@@ -2573,11 +2890,11 @@ impl Database {
         table: &TableSchema,
         index: &IndexSchema,
         storage_id: u64,
-        query: &[f32],
+        query: &crate::vector::VectorValue,
         request: crate::engine::vector::VectorSearchRequest,
     ) -> Result<crate::engine::vector::VectorSearchResult, QueryError> {
         let graph = self.vector_graph_get_or_build_for_partition(table, index, storage_id)?;
-        if !graph.is_empty() && graph.dim() != query.len() {
+        if !graph.is_empty() && graph.dim() != query.dimension as usize {
             return Err(error(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                 format!(
@@ -2593,7 +2910,23 @@ impl Database {
                 paged.file().disable_navigation_mapping();
             }
         }
-        graph.search(query, request)
+        let result = graph.search(query, request);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is(crate::error::catalog::ER_GET_ERRNO))
+            && matches!(
+                graph.as_ref(),
+                VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+            )
+        {
+            self.evict_vector_graphs(vec![(
+                table.id,
+                storage_id,
+                table.active_generation.max(1),
+                normalize_name(&index.name),
+            )]);
+        }
+        result
     }
 
     /// Dimensionless columns still obey a fixed dimension once indexed.
@@ -2612,7 +2945,7 @@ impl Database {
             let col = table.column_index(&index.columns[0])?;
             if !matches!(
                 table.columns[col].data_type,
-                DataTypeKind::Vector { dim: None }
+                DataTypeKind::Vector { dim: None, .. }
             ) || changed.is_some_and(|cols| !cols.contains(&col))
             {
                 continue;
@@ -2678,10 +3011,10 @@ impl Database {
                 continue;
             };
             let Some(graph) = map.get(&key) else {
-                self.record_vector_build_delta(&key, row_id, Some(vector::to_f32(bytes)));
+                self.record_vector_build_delta(&key, row_id, Some(bytes.clone()));
                 continue;
             };
-            if graph.insert(row_id, vector::to_f32(bytes)).is_err() {
+            if graph.insert(row_id, bytes.clone()).is_err() {
                 failed.push(key);
             }
         }
@@ -2735,7 +3068,7 @@ impl Database {
             let Some(graph) = map.get(&key) else {
                 if changed {
                     let vector = match new_values.get(col) {
-                        Some(Value::Vector(bytes)) => Some(vector::to_f32(bytes)),
+                        Some(Value::Vector(bytes)) => Some(bytes.clone()),
                         _ => None,
                     };
                     self.record_vector_build_delta(&key, row_id, vector);
@@ -2747,7 +3080,7 @@ impl Database {
                 // the node in place (keep id + edges) and skip the re-link. Large
                 // moves return false and fall through to tombstone + re-insert.
                 if update_in_place
-                    && matches!(new_values.get(col), Some(Value::Vector(bytes)) if graph.try_update_in_place(row_id, &vector::to_f32(bytes), ratio))
+                    && matches!(new_values.get(col), Some(Value::Vector(bytes)) if graph.try_update_in_place(row_id, bytes, ratio))
                 {
                     continue;
                 }
@@ -2756,7 +3089,7 @@ impl Database {
                     // findable for snapshots that still see them.
                     graph.live_versions(row_id).and_then(|versions| {
                         if let Some(Value::Vector(bytes)) = new_values.get(col) {
-                            graph.insert(row_id, vector::to_f32(bytes))?;
+                            graph.insert(row_id, bytes.clone())?;
                         }
                         retire.retire(&key, row_id, versions);
                         Ok(())
@@ -2765,9 +3098,7 @@ impl Database {
                     graph
                         .mark_deleted_by_row_id(row_id)
                         .and_then(|_| match new_values.get(col) {
-                            Some(Value::Vector(bytes)) => {
-                                graph.insert(row_id, vector::to_f32(bytes))
-                            }
+                            Some(Value::Vector(bytes)) => graph.insert(row_id, bytes.clone()),
                             _ => Ok(()),
                         })
                 };
@@ -2781,7 +3112,7 @@ impl Database {
                 // live graph node exists instead of permanently no-oping.
                 if !graph.has_live_row_id(row_id) {
                     if let Some(Value::Vector(bytes)) = new_values.get(col) {
-                        if graph.insert(row_id, vector::to_f32(bytes)).is_err() {
+                        if graph.insert(row_id, bytes.clone()).is_err() {
                             failed.push(key.clone());
                         }
                     }
@@ -3026,6 +3357,13 @@ impl Database {
             // so the ordinary delta hooks maintain it too.
             if graph.is_none()
                 && index.vector_algo() == VectorAlgo::IvfSq8
+                && matches!(
+                    table.columns[table.column_index(&index.columns[0])?].data_type,
+                    DataTypeKind::Vector {
+                        datatype: crate::vector::VectorDataType::Float32,
+                        ..
+                    }
+                )
                 && vector_storage_paged()
             {
                 let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
@@ -3049,10 +3387,19 @@ impl Database {
                     }
                 }
             }
-            // A finalized `.hvec` is trusted on reopen without a heap scan, so
-            // commits must reach it even while it is cold. Unfinalized files
-            // are rebuilt from the heap and need no maintenance here.
-            if graph.is_none() && index.vector_algo() == VectorAlgo::Hnsw && vector_storage_paged()
+            // FLOAT32's finalized `.hvec` is trusted without a heap scan, so
+            // commits must reach it while cold. Native files always rebuild
+            // from heap and must not enter this legacy FLOAT32 open path.
+            if graph.is_none()
+                && index.vector_algo() == VectorAlgo::Hnsw
+                && vector_storage_paged()
+                && matches!(
+                    table.columns[table.column_index(&index.columns[0])?].data_type,
+                    DataTypeKind::Vector {
+                        datatype: crate::vector::VectorDataType::Float32,
+                        ..
+                    }
+                )
             {
                 let path = self.vector_index_paged_path(table, &index.name, storage_id);
                 if path.exists() {
@@ -3321,10 +3668,12 @@ impl Database {
             let Some(table) = self.table_by_id(storage_id) else {
                 return;
             };
+            // Resident native accelerators have no index-file redo. Track
+            // every vector table so heap commits also revoke those handles.
             let owner = table
                 .indexes
                 .iter()
-                .any(|i| i.is_vector() && i.vector_algo() == VectorAlgo::Hnsw)
+                .any(|i| i.is_vector())
                 .then_some(table.id);
             self.replicated_hnsw_table_cache
                 .write()
@@ -3373,7 +3722,13 @@ impl Database {
         self.vector_build_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         graphs.retain(|(table, _, _, _), graph| {
-            if tables.contains(table) && graph.supports_versions() {
+            if tables.contains(table)
+                && (graph.supports_versions()
+                    || matches!(
+                        graph.as_ref(),
+                        VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+                    ))
+            {
                 graph.invalidate();
                 false
             } else {
@@ -3440,6 +3795,13 @@ impl Database {
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.vector_indexes.write().retain(|_, graph| {
+            if matches!(
+                graph.as_ref(),
+                VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+            ) {
+                graph.invalidate();
+                return false;
+            }
             if path.is_none() && graph.supports_versions() {
                 graph.invalidate();
                 return false;
@@ -3627,6 +3989,29 @@ impl Database {
                 format!(" (p={storage_id})")
             };
             let label = format!("{}/{}/{}{}", table.database, table.name, index_name, suffix);
+            if matches!(
+                graph.as_ref(),
+                VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+            ) {
+                let key = (table_id, storage_id, generation, index_name.clone());
+                let Some(index) = table
+                    .indexes
+                    .iter()
+                    .find(|i| i.name.eq_ignore_ascii_case(&index_name))
+                else {
+                    continue;
+                };
+                self.evict_vector_graphs(vec![key.clone()]);
+                drop(graph);
+                if let Err(error) =
+                    self.vector_graph_build_and_publish(&table, index, storage_id, key)
+                {
+                    log_message(format!(
+                        "native vector maintenance rebuild failed for {label}: {error}"
+                    ));
+                }
+                continue;
+            }
             let reclaimed = match graph.as_ref() {
                 VectorGraph::Paged(paged) => match paged.repair_tombstones(&should_stop) {
                     Ok(repaired) => repaired,
@@ -4036,7 +4421,10 @@ impl<'a> VectorBuildRegistration<'a> {
         Self { db, key }
     }
 
-    fn ops_since(&self, applied: u64) -> Result<(u64, Vec<(RowId, Option<Vec<f32>>)>), QueryError> {
+    fn ops_since(
+        &self,
+        applied: u64,
+    ) -> Result<(u64, Vec<(RowId, Option<crate::vector::VectorValue>)>), QueryError> {
         let deltas = self.db.vector_build_deltas.lock();
         let Some(delta) = deltas.get(&self.key) else {
             return Ok((applied, Vec::new()));

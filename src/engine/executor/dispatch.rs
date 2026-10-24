@@ -1328,7 +1328,7 @@ fn ctas_data_type_from_kind(
         K::Year => DataType::Year,
         K::Json => DataType::Json,
         K::Geometry { subtype, srid } => DataType::Geometry(*subtype, *srid),
-        K::Vector { dim } => DataType::Vector(*dim),
+        K::Vector { dim, datatype } => DataType::Vector(*dim, *datatype),
         K::Enum { values } => DataType::Enum(values.clone()),
         K::Set { values } => DataType::Set(values.clone()),
         K::Bit { len } => DataType::Bit(*len),
@@ -1466,6 +1466,9 @@ fn type_derived_ctas_column(
         // at most nine display digits (booleans, comparisons and small DIV
         // expressions). Keep the wire tag and storage family separate.
         crate::parser::DataType::Int
+    } else if col.column_type == ColumnType::Vector {
+        let (datatype, dim) = src.vector_type.unwrap_or_default();
+        crate::parser::DataType::Vector(dim, datatype)
     } else {
         column_type_to_data_type(col.column_type, fsp, length, src.collation_id)
     };
@@ -3201,7 +3204,7 @@ fn column_type_to_data_type(
         ColumnType::Geometry => {
             DataType::Geometry(crate::storage::schema::GeometrySubtype::Geometry, None)
         }
-        ColumnType::Vector => DataType::Vector(None),
+        ColumnType::Vector => DataType::Vector(None, crate::vector::VectorDataType::Float32),
         ColumnType::Bit { bits } => DataType::Bit(Some(bits as usize)),
         ColumnType::VarString => {
             if let Some(bytes) = observed_length {

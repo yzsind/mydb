@@ -659,7 +659,7 @@ impl<'a> InsertCursor<'a> {
         // On a malformed vector literal, bail so sqlparser reproduces the exact
         // eval-time error rather than us surfacing it here.
         let bytes = crate::engine::vector::codec::parse_text(s).ok()?;
-        Some(Expr::BoundValue(crate::types::Value::Vector(bytes)))
+        Some(Expr::BoundValue(crate::types::Value::Vector(bytes.into())))
     }
 
     /// Parse one `(v, v, …)` value tuple. Caller has verified `(`.

@@ -482,7 +482,7 @@ mod tests {
             Value::Year(99),
             Value::Json(vec![1, 2]),
             Value::Geometry(vec![3, 4]),
-            Value::Vector(vec![5, 6]),
+            Value::Vector(vec![5, 6, 0, 0].into()),
         ]
     }
 

@@ -920,7 +920,8 @@ fn append_list_runtime_value(out: &mut Vec<u8>, value: &Value, collation: Option
         Value::Decimal128(..) | Value::DecimalWide(..) => {
             (10, value.to_display_string().into_bytes())
         }
-        Value::Json(value) | Value::Geometry(value) | Value::Vector(value) => (11, value.clone()),
+        Value::Json(value) | Value::Geometry(value) => (11, value.clone()),
+        Value::Vector(value) => (11, value.encode()),
     };
     out.push(tag);
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());

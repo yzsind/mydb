@@ -6176,7 +6176,10 @@ pub(super) fn data_type_kind_for_column_type(column_type: ColumnType) -> DataTyp
             subtype: crate::storage::schema::GeometrySubtype::Geometry,
             srid: None,
         },
-        ColumnType::Vector => DataTypeKind::Vector { dim: None },
+        ColumnType::Vector => DataTypeKind::Vector {
+            dim: None,
+            datatype: crate::vector::VectorDataType::Float32,
+        },
         ColumnType::Bit { bits } => DataTypeKind::Bit {
             len: Some(bits as usize),
         },
@@ -6913,10 +6916,10 @@ fn system_rows_capacity_bytes(rows: &Vec<Vec<Value>>) -> usize {
         for value in row {
             let capacity = match value {
                 Value::String(value) | Value::Decimal(value) => value.capacity(),
-                Value::Bytes(value)
-                | Value::Json(value)
-                | Value::Geometry(value)
-                | Value::Vector(value) => value.capacity(),
+                Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => {
+                    value.capacity()
+                }
+                Value::Vector(value) => value.capacity(),
                 _ => 0,
             };
             bytes = bytes.saturating_add(capacity);

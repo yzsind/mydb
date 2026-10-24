@@ -167,10 +167,13 @@ fn param_type_tag(value: &Value) -> u8 {
         Value::Int(_) | Value::UInt(_) => b'i',
         Value::Float(_) | Value::Double(_) => b'f',
         Value::Decimal(_) | Value::DecimalCompact(_, _) => b'd',
+        Value::String(text) if crate::vector::VectorDataType::parse(text).is_some() => {
+            b'A' + crate::vector::VectorDataType::parse(text).unwrap() as u8
+        }
         Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => b's',
         Value::Null => b'n',
         Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::Time(_) => b't',
-        Value::Vector(_) => b'v',
+        Value::Vector(v) => b'v' + v.datatype as u8,
         _ => b'?',
     }
 }
@@ -199,6 +202,16 @@ pub(crate) fn parameter_plan_signature(select: &Select, params: &[Value]) -> Str
             Value::Timestamp(_) => 'P',
             _ => param_type_tag(value) as char,
         });
+        let shape = match value {
+            Value::Vector(v) => Some((3, v.dimension)),
+            Value::String(s) => crate::vector::text_parameter_shape(s.as_bytes()),
+            Value::Bytes(b) => crate::vector::text_parameter_shape(b),
+            Value::SmallString(s) => crate::vector::text_parameter_shape(s.as_ref()),
+            _ => None,
+        };
+        if let Some((tag, number)) = shape {
+            let _ = write!(signature, ":v{tag}_{number};");
+        }
     }
     let runtime_bucket = |value: &Option<LimitValue>| -> Option<u64> {
         let (LimitValue::Placeholder(index) | LimitValue::OffsetCommaPlaceholder(index)) =

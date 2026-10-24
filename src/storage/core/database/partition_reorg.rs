@@ -1188,8 +1188,8 @@ impl Database {
                                                 }
                                                 Value::Bytes(value)
                                                 | Value::Json(value)
-                                                | Value::Geometry(value)
-                                                | Value::Vector(value) => value.capacity(),
+                                                | Value::Geometry(value) => value.capacity(),
+                                                Value::Vector(value) => value.capacity(),
                                                 _ => 0,
                                             })
                                             .sum::<usize>(),

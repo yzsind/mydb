@@ -204,6 +204,31 @@ fn layer_cap(level: usize, m: usize, m0: usize) -> usize {
     }
 }
 
+/// Native layout geometry packs datatype and logical dimension into the file geometry.
+/// Native records omit FLOAT32 and SQ8 lanes and keep only the source payload.
+pub(crate) fn native_vector_geometry(
+    datatype: crate::vector::VectorDataType,
+    dimension: u32,
+) -> u32 {
+    0x8000_0000 | ((datatype as u32) << 28) | dimension
+}
+
+fn native_geometry(dim: usize) -> Option<(crate::vector::VectorDataType, u32)> {
+    if dim & 0x8000_0000 == 0 {
+        return None;
+    }
+    Some((
+        crate::vector::VectorDataType::from_tag(((dim >> 28) & 7) as u8)?,
+        (dim & 0x0fff_ffff) as u32,
+    ))
+}
+
+fn vector_record_lanes(dim: usize) -> usize {
+    native_geometry(dim).map_or(dim * 5 + 4, |(datatype, dimension)| {
+        datatype.payload_len(dimension)
+    })
+}
+
 /// Fixed on-disk size of a node record with the given `top_layer`, reserving
 /// the maximum neighbour footprint so all edge edits are in-place.
 ///
@@ -213,7 +238,7 @@ fn node_record_size(top_layer: usize, dim: usize, m: usize, m0: usize) -> usize 
     // v3 persists the SQ8 navigation row next to the exact vector.  The page
     // remains the only cached object: both code and adjacency are admitted,
     // prefetched and evicted by the shared data buffer.
-    let mut size = 1 + 1 + 8 + dim * 4 + dim + 4;
+    let mut size = 10 + vector_record_lanes(dim);
     for l in 0..=top_layer {
         size += 2 + layer_cap(l, m, m0) * 4;
     }
@@ -223,7 +248,7 @@ fn node_record_size(top_layer: usize, dim: usize, m: usize, m0: usize) -> usize 
 /// Byte offset, within a node record, of layer `level`'s `count` field.
 /// The `vid` array follows immediately (`count_off + 2`).
 fn layer_count_offset(rec_off: usize, level: usize, dim: usize, m: usize, m0: usize) -> usize {
-    let mut off = rec_off + 1 + 1 + 8 + dim * 4 + dim + 4;
+    let mut off = rec_off + 10 + vector_record_lanes(dim);
     for l in 0..level {
         off += 2 + layer_cap(l, m, m0) * 4;
     }
@@ -396,6 +421,12 @@ fn decode_vector_meta(buf: &[u8]) -> Result<VectorMeta, QueryError> {
             "corrupt vector index meta page padding",
         ));
     }
+    if buf[36] > 4 {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unknown vector index metric",
+        ));
+    }
     Ok(VectorMeta {
         dim: read_u32(buf, 32),
         metric: buf[36],
@@ -539,6 +570,49 @@ fn node_page_append(
         write_u32(buf, vec_off + i * 4, v.to_bits());
     }
     write_persisted_nav_row(buf, rec_off, dim, vector, quant);
+    // All layer counts already zero (page was zeroed / region untouched);
+    // be explicit in case of slot reuse in a future cold-build path.
+    for l in 0..=top_layer {
+        let count_off = layer_count_offset(rec_off, l, dim, m, m0);
+        write_u16(buf, count_off, 0);
+    }
+    // Directory entry + watermarks.
+    write_u16(
+        buf,
+        NODE_OFF_DIRECTORY + slot_count as usize * 2,
+        rec_off as u16,
+    );
+    write_u16(buf, NODE_OFF_SLOT_COUNT, slot_count + 1);
+    write_u16(buf, NODE_OFF_HEAP_TOP, rec_off as u16);
+    Some(slot_count)
+}
+
+fn node_page_append_native(
+    buf: &mut [u8],
+    row_id: RowId,
+    top_layer: usize,
+    vector: &[u8],
+    dim: usize,
+    m: usize,
+    m0: usize,
+) -> Option<u16> {
+    let rec_size = node_record_size(top_layer, dim, m, m0);
+    // Need the record plus one new directory slot (2 bytes).
+    if node_page_free_space(buf) < rec_size + 2 {
+        return None;
+    }
+    let slot_count = read_u16(buf, NODE_OFF_SLOT_COUNT);
+    if slot_count >= NODE_ID_SLOTS_PER_PAGE {
+        return None;
+    }
+    let heap_top = read_u16(buf, NODE_OFF_HEAP_TOP) as usize;
+    let rec_off = heap_top - rec_size;
+    // Record body.
+    buf[rec_off] = REC_FLAG_INITIALIZED;
+    buf[rec_off + 1] = top_layer as u8;
+    write_u64(buf, rec_off + 2, vec_pack_row(row_id));
+    let vec_off = rec_off + 10;
+    buf[vec_off..vec_off + vector.len()].copy_from_slice(vector);
     // All layer counts already zero (page was zeroed / region untouched);
     // be explicit in case of slot reuse in a future cold-build path.
     for l in 0..=top_layer {
@@ -1453,14 +1527,21 @@ impl VectorIndexFile {
                         .then(|| {
                             if page_id == VEC_META_PAGE && read_u32(before, 0) == VEC_META_MAGIC {
                                 WalPayload::page_delta_prehashed(
-                                    relative.clone(), page_id, crate::wal::page_lsn(before),
-                                    before, &after, vector_meta_crc(before, false),
+                                    relative.clone(),
+                                    page_id,
+                                    crate::wal::page_lsn(before),
+                                    before,
+                                    &after,
+                                    vector_meta_crc(before, false),
                                     vector_meta_crc(&after, false),
                                 )
                             } else {
                                 WalPayload::page_delta(
-                                    relative.clone(), page_id, crate::wal::page_lsn(before),
-                                    before, &after,
+                                    relative.clone(),
+                                    page_id,
+                                    crate::wal::page_lsn(before),
+                                    before,
+                                    &after,
                                 )
                             }
                         })
@@ -1640,6 +1721,158 @@ impl VectorIndexFile {
         state.meta.node_count += 1;
         state.meta.nav_exact_nodes += u64::from(nav_exact);
         Ok(vid_make(new_page, slot))
+    }
+
+    pub(crate) fn append_native_node(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        top_layer: usize,
+        vector: &[u8],
+    ) -> Result<VecId, QueryError> {
+        self.append_native_node_hint(txn_id, row_id, top_layer, vector, &self.append_hint)
+    }
+    pub(crate) fn append_native_ivf_entry(
+        &self,
+        row_id: RowId,
+        vector: &[u8],
+        hint: &AtomicU64,
+    ) -> Result<VecId, QueryError> {
+        self.append_native_node_hint(0, row_id, 0, vector, hint)
+    }
+
+    fn append_native_node_hint(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        top_layer: usize,
+        vector: &[u8],
+        hint: &AtomicU64,
+    ) -> Result<VecId, QueryError> {
+        let (dim, m, m0) = (self.dim_fixed, self.m_fixed, self.m0_fixed);
+        if native_geometry(dim).is_none() || vector.len() != vector_record_lanes(dim) {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
+                format!(
+                    "vector index dimension mismatch: expected {dim}, got {}",
+                    vector.len()
+                ),
+            ));
+        }
+
+        let nav_exact = false;
+        let rec_size = node_record_size(top_layer, dim, m, m0);
+        // A node must fit in an otherwise-empty page (header + directory slot).
+        let usable = PAGE_SIZE - NODE_OFF_DIRECTORY;
+        if rec_size + 2 > usable {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector index: node record exceeds page capacity (dimension too large)",
+            ));
+        }
+        // Fast path: append into the current fill page under its latch (so
+        // concurrent appenders to the same page serialise and re-read the
+        // committed bytes rather than losing each other's writes).
+        let page_id = hint.load(Ordering::Acquire);
+        if page_id != 0 {
+            let _latch = self.page_latch(page_id);
+            let slot =
+                self.rmw_node_page(txn_id, page_id, |bytes| {
+                    match node_page_append_native(bytes, row_id, top_layer, vector, dim, m, m0) {
+                        Some(slot) => Ok((Some(slot), true)),
+                        None => Ok((None, false)),
+                    }
+                })?;
+            if let Some(slot) = slot {
+                let mut state = self.meta_state.lock();
+                state.meta.node_count += 1;
+                state.meta.nav_exact_nodes += u64::from(nav_exact);
+                return Ok(vid_make(page_id, slot));
+            }
+        }
+        // Current page is full (or none yet): serialize allocation and retry
+        // the hint because another appender may have published a fresh page
+        // while we waited.
+        let _alloc = self.append_alloc.lock();
+        let retry_page = hint.load(Ordering::Acquire);
+        if retry_page != 0 && retry_page != page_id {
+            let _latch = self.page_latch(retry_page);
+            let slot =
+                self.rmw_node_page(txn_id, retry_page, |bytes| {
+                    match node_page_append_native(bytes, row_id, top_layer, vector, dim, m, m0) {
+                        Some(slot) => Ok((Some(slot), true)),
+                        None => Ok((None, false)),
+                    }
+                })?;
+            if let Some(slot) = slot {
+                let mut state = self.meta_state.lock();
+                state.meta.node_count += 1;
+                state.meta.nav_exact_nodes += u64::from(nav_exact);
+                return Ok(vid_make(retry_page, slot));
+            }
+        }
+        // Allocate a fresh page and place
+        // the node directly into it. The new page id is exclusively ours until
+        // we publish it as the hint, so its first write needs no latch.
+        let new_page = self.alloc_node_page(txn_id)?;
+        let mut bytes = vec![0u8; PAGE_SIZE];
+        format_empty_node_page(&mut bytes);
+        let slot = node_page_append_native(&mut bytes, row_id, top_layer, vector, dim, m, m0)
+            .expect("a freshly formatted page must fit one node (checked above)");
+        self.write_page(txn_id, new_page, bytes)?;
+        hint.store(new_page, Ordering::Release);
+        let mut state = self.meta_state.lock();
+        state.meta.node_count += 1;
+        state.meta.nav_exact_nodes += u64::from(nav_exact);
+        Ok(vid_make(new_page, slot))
+    }
+
+    pub(crate) fn with_native_vector<R>(
+        &self,
+        vid: VecId,
+        f: impl FnOnce(crate::vector::VectorRef<'_>) -> Result<R, QueryError>,
+    ) -> Result<R, QueryError> {
+        let (datatype, dimension) = native_geometry(self.dim_fixed).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "not a native vector page layout",
+            )
+        })?;
+        let mapped = self.mapped_navigation.read();
+        if let Some(view) = mapped.as_ref() {
+            let (page, offset) = view.record(vid)?;
+            let start = offset + 10;
+            let end = start + datatype.payload_len(dimension);
+            return f(crate::vector::VectorRef {
+                datatype,
+                dimension,
+                payload: &page[start..end],
+            });
+        }
+        drop(mapped);
+        self.buffer_pool
+            .with_raw_page(self.page_key(vid_page(vid)), |bytes| {
+                if read_u32(bytes, 0) != VEC_NODE_MAGIC {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "invalid native vector page",
+                    ));
+                }
+                let offset = node_record_offset(bytes, vid_slot(vid))?;
+                let start = offset + 10;
+                let end = start + datatype.payload_len(dimension);
+                if bytes[offset] & REC_FLAG_INITIALIZED == 0 || end > bytes.len() {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "invalid native vector record",
+                    ));
+                }
+                f(crate::vector::VectorRef {
+                    datatype,
+                    dimension,
+                    payload: &bytes[start..end],
+                })
+            })
     }
 
     #[cfg(test)]
@@ -2032,6 +2265,13 @@ impl VectorIndexFile {
         level: usize,
         out: &mut Vec<VecId>,
     ) -> Result<bool, QueryError> {
+        if native_geometry(self.dim_fixed).is_some() {
+            let mapped = self.mapped_navigation.read();
+            if let Some(view) = mapped.as_ref() {
+                view.neighbors(vid, level, out)?;
+                return Ok(true);
+            }
+        }
         let (dim, m, m0) = (self.dim_fixed, self.m_fixed, self.m0_fixed);
         let page_id = vid_page(vid);
         if page_id == VEC_META_PAGE {
@@ -2222,6 +2462,17 @@ impl VectorIndexFile {
             self.write_meta_page(txn_id)?;
         }
         Ok(prev)
+    }
+
+    pub(crate) fn validate_native_ivf_layout(
+        datatype: crate::vector::VectorDataType,
+        dimension: u32,
+    ) -> Result<(), QueryError> {
+        let geometry = native_vector_geometry(datatype, dimension) as usize;
+        if node_record_size(0, geometry, 2, 0) + 2 > PAGE_SIZE - NODE_OFF_DIRECTORY {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,"native IVF entry exceeds page capacity; use the memory backend or a smaller dimension"));
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_hnsw_layout(dim: usize, m: usize) -> Result<(), QueryError> {
@@ -4740,8 +4991,15 @@ mod vector_page_tests {
             after[96] ^= 1;
             stamp_vector_page(&mut after, 0, seed.wrapping_add(1));
             let normal = WalPayload::page_delta("test".into(), 0, 1, &before, &after);
-            let fast = WalPayload::page_delta_prehashed("test".into(), 0, 1, &before, &after,
-                vector_meta_crc(&before, false), vector_meta_crc(&after, false));
+            let fast = WalPayload::page_delta_prehashed(
+                "test".into(),
+                0,
+                1,
+                &before,
+                &after,
+                vector_meta_crc(&before, false),
+                vector_meta_crc(&after, false),
+            );
             assert_eq!(format!("{normal:?}"), format!("{fast:?}"));
         }
         let mut corrupt = encode_vector_meta(&VectorMeta::fresh(128, 0, 16, 32, 200));

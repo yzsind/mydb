@@ -80,6 +80,7 @@ pub(super) fn vector_access_labels(
 ) -> (&'static str, &'static str) {
     match index.vector_algo() {
         crate::storage::schema::VectorAlgo::IvfSq8 => ("IVF_SQ8", "nprobe"),
+        crate::storage::schema::VectorAlgo::Ivf => ("IVF", "nprobe"),
         crate::storage::schema::VectorAlgo::Hnsw => ("HNSW", "ef_search"),
     }
 }

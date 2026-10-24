@@ -1457,10 +1457,10 @@ pub(crate) fn estimate_undo_resident_bytes(record: &UndoRecord) -> u64 {
             let heap_capacity = match value {
                 Value::Decimal(value) | Value::String(value) => value.capacity(),
                 Value::DecimalWide(_) => value.decimal_heap_bytes(),
-                Value::Bytes(value)
-                | Value::Json(value)
-                | Value::Geometry(value)
-                | Value::Vector(value) => value.capacity(),
+                Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => {
+                    value.capacity()
+                }
+                Value::Vector(value) => value.capacity(),
                 Value::SmallString(value) if value.spilled() => value.capacity(),
                 _ => 0,
             };

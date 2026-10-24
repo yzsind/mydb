@@ -2192,7 +2192,8 @@ pub(super) fn execute_plan_rows_inner(
                                // for IVF_SQ8. Both flow through the same `ef` argument — the
                                // backend (`VectorGraph::search`) interprets it per its algorithm.
             let ef = match index.vector_algo() {
-                crate::storage::schema::VectorAlgo::IvfSq8 => {
+                crate::storage::schema::VectorAlgo::IvfSq8
+                | crate::storage::schema::VectorAlgo::Ivf => {
                     let index_default = index.vector_meta().default_nprobe.map(|v| v as u64);
                     crate::engine::vector::session::effective_nprobe(&cfg, *ef_hint, index_default)
                 }

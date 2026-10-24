@@ -655,7 +655,7 @@ impl RowDecodeSink for AnalyzeColumnSink<'_, '_, '_> {
     }
 
     fn put_vector(&mut self, col: usize, bytes: &[u8]) {
-        self.put_value(col, Value::Vector(bytes.to_vec()));
+        self.put_value(col, Value::Vector(bytes.to_vec().into()));
     }
 
     fn put_value(&mut self, col: usize, value: Value) {

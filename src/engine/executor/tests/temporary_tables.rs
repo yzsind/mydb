@@ -23,7 +23,10 @@ fn temporary_create_matches_persistent_schema_validation() {
     for (suffix, definition) in [
         ("invisible_pk", "(id INT, PRIMARY KEY (id) INVISIBLE)"),
         ("wide_bit", "(b BIT(65))"),
-        ("oversized_vector", "(id INT PRIMARY KEY, emb VECTOR(4096))"),
+        (
+            "oversized_fixed_vector_row",
+            "(id INT PRIMARY KEY, a VECTOR(2048), b VECTOR(2048), c VECTOR(2048))",
+        ),
     ] {
         let persistent_name = format!("base_{suffix}");
         let temporary_name = format!("temp_{suffix}");
@@ -44,6 +47,37 @@ fn temporary_create_matches_persistent_schema_validation() {
         assert!(
             !session.has_temp_table(&temporary_name),
             "failed CREATE published temporary table {temporary_name}"
+        );
+    }
+    let payload = "00".repeat(65532);
+    for (name, temporary) in [
+        ("base_large_vector", ""),
+        ("temp_large_vector", "TEMPORARY "),
+    ] {
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("CREATE {temporary}TABLE {name}(v VECTOR(16383))"),
+            )
+            .unwrap();
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!(
+                    "INSERT INTO {name} VALUES(VECTOR_FROM_BINARY(X'{payload}','FLOAT32',16383))"
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            first_int(
+                engine
+                    .execute_with_session(
+                        &mut session,
+                        &format!("SELECT VECTOR_DIM(v) FROM {name}")
+                    )
+                    .unwrap()
+            ),
+            16383
         );
     }
 }

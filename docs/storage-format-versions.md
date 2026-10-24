@@ -5,12 +5,12 @@ The current development format is incompatible with earlier versions. If version
 
 | Format | Version |
 | --- | --- |
-| catalog / WAL | 60 / 34 |
-| heap page / MVCC row | 14 / 7 |
+| catalog / WAL | 61 / 34 |
+| heap page / MVCC row | 14 / 8 |
 | B-tree index file / page | 24 / 15 |
-| undo binary / tablespace | 13 / 1 |
+| undo binary / tablespace | 14 / 1 |
 | overflow | 3 |
-| paged HNSW index / page | 3 / 1 |
+| paged HNSW index / page | 5 / 2 |
 | paged IVF_SQ8 index / page | 2 / 2 |
 | Zone Map file / page | 6 / 3 |
 | legacy in-memory HNSW snapshot | 2 |

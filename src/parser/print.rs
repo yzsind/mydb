@@ -468,7 +468,8 @@ fn cast_sql(args: &[Expr], render: &impl Fn(&Expr) -> String, array: bool) -> Op
     };
     let target = target.to_ascii_uppercase();
     let max_extra = match target.as_str() {
-        "CHAR" | "BINARY" | "TIME" | "DATETIME" | "VECTOR" => 1,
+        "CHAR" | "BINARY" | "TIME" | "DATETIME" => 1,
+        "VECTOR" => 2,
         "DECIMAL" => 2,
         "SIGNED" | "UNSIGNED" | "FLOAT" | "DOUBLE" | "DATE" | "YEAR" | "JSON" => 0,
         _ => return None,
@@ -480,6 +481,14 @@ fn cast_sql(args: &[Expr], render: &impl Fn(&Expr) -> String, array: bool) -> Op
     if args.len() > 2 {
         out.push('(');
         for (i, arg) in args[2..].iter().enumerate() {
+            if target == "VECTOR" && i == 1 {
+                let Expr::Literal(Literal::String(datatype)) = arg else {
+                    return None;
+                };
+                let datatype = crate::vector::VectorDataType::parse(datatype)?;
+                write!(&mut out, ", {datatype}").expect("String formatting");
+                continue;
+            }
             let number = match arg {
                 Expr::Literal(Literal::Int(n)) if *n >= 0 => *n as u64,
                 Expr::Literal(Literal::UInt(n)) => *n,

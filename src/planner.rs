@@ -609,7 +609,7 @@ pub enum PhysicalPlan {
         /// queries store their final value here. Prepared / auto-param KNN
         /// queries also keep `query_vector_expr` so execution can resolve the
         /// current parameter instead of baking the first vector into the plan.
-        query_vector: Vec<u8>,
+        query_vector: crate::vector::VectorValue,
         /// Parameter-bearing query-vector expression, e.g. `?` or
         /// `STRING_TO_VECTOR(?)`, evaluated against the active parameter
         /// context at execution time.
@@ -671,7 +671,7 @@ pub enum PhysicalPlan {
         column_index: usize,
         /// Query vector in internal little-endian `f32` bytes. See
         /// `VectorIndexScan::query_vector_expr` for parameterized KNN queries.
-        query_vector: Vec<u8>,
+        query_vector: crate::vector::VectorValue,
         query_vector_expr: Option<Expr>,
         /// Canonical metric name (`"L2"` / `"COSINE"` / `"DOT"`); the executor
         /// parses it back to the crate-internal `Metric`.
@@ -9494,7 +9494,7 @@ fn vector_indexes_for_column<'a>(
         index.is_vector()
             && index.columns.len() == 1
             && index.columns[0].eq_ignore_ascii_case(&column)
-            && index.vector_meta().metric_enum() == metric
+            && index.vector_meta_for_table(table).metric_enum() == metric
     })
 }
 
@@ -9573,6 +9573,8 @@ fn match_distance_call(expr: &Expr) -> Option<(&str, &Expr, crate::engine::vecto
     } else {
         match upper.as_str() {
             "L2_DISTANCE" if args.len() == 2 => Metric::L2,
+            "HAMMING_DISTANCE" if args.len() == 2 => Metric::Hamming,
+            "JACCARD_DISTANCE" if args.len() == 2 => Metric::Jaccard,
             "COSINE_DISTANCE" if args.len() == 2 => Metric::Cosine,
             "MAX_INNER_PRODUCT_DISTANCE" if args.len() == 2 => Metric::Dot,
             "DISTANCE" | "VEC_DISTANCE" => match args.len() {
@@ -9635,13 +9637,18 @@ fn match_dot_similarity_call(expr: &Expr) -> Option<(&str, &Expr, crate::engine:
 /// Coerce a folded constant `Value` into internal vector bytes (little-endian
 /// `f32`). Accepts an existing `Value::Vector` or a `[a,b,c]` text / raw-byte
 /// form; returns `None` for anything else (the KNN path then falls back).
-pub(crate) fn value_to_vector_bytes(value: &Value) -> Option<Vec<u8>> {
+pub(crate) fn value_to_vector_bytes(value: &Value) -> Option<crate::vector::VectorValue> {
     match value {
         Value::Vector(b) => crate::engine::vector::normalize_internal(b).ok(),
         Value::String(s) | Value::Decimal(s) => {
             crate::engine::vector::coerce_bytes_to_internal(s.as_bytes()).ok()
         }
-        Value::Bytes(b) => crate::engine::vector::coerce_bytes_to_internal(b).ok(),
+        Value::Bytes(b) => crate::engine::vector::codec::coerce_value(
+            Value::Bytes(b.clone()),
+            crate::vector::VectorDataType::Float32,
+            None,
+        )
+        .ok(),
         Value::SmallString(_) => {
             crate::engine::vector::coerce_bytes_to_internal(value.to_display_string().as_bytes())
                 .ok()
@@ -9650,7 +9657,10 @@ pub(crate) fn value_to_vector_bytes(value: &Value) -> Option<Vec<u8>> {
     }
 }
 
-fn query_vector_binding(table: &PlanTable, expr: &Expr) -> Option<(Vec<u8>, Option<Expr>)> {
+fn query_vector_binding(
+    table: &PlanTable,
+    expr: &Expr,
+) -> Option<(crate::vector::VectorValue, Option<Expr>)> {
     let has_placeholder = expr_has_placeholder(expr) || !expr_is_deterministic(expr);
     let baked = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])
         .ok()
@@ -9742,7 +9752,40 @@ fn try_knn_vector_scan(
     // confirmed it carries no column reference. If it contains a placeholder,
     // keep the expression for execution-time resolution so prepared KNN plans
     // stay reusable across different query vectors.
-    let (query_vector, query_vector_expr) = query_vector_binding(table, query_const)?;
+    let (mut query_vector, query_vector_expr) = query_vector_binding(table, query_const)?;
+    let binary_column = table
+        .schema
+        .column_index(col)
+        .ok()
+        .and_then(|i| table.schema.columns.get(i))
+        .is_some_and(|c| {
+            matches!(
+                c.data_type,
+                crate::storage::schema::DataTypeKind::Vector {
+                    datatype: crate::vector::VectorDataType::Binary,
+                    ..
+                }
+            )
+        });
+    let metric = if binary_column
+        && matches!(order_expr, Expr::Function {name,args,..} if matches!(name.to_ascii_uppercase().as_str(),"DISTANCE"|"VEC_DISTANCE") && args.len()==2)
+    {
+        crate::engine::vector::Metric::Hamming
+    } else {
+        metric
+    };
+    if binary_column && !query_vector.is_empty() {
+        if let Ok(value) = crate::engine::expr::eval_expr_legacy(query_const, &table.schema, &[]) {
+            if !matches!(value, Value::Vector(_)) {
+                query_vector = crate::engine::vector::codec::coerce_value(
+                    value,
+                    crate::vector::VectorDataType::Binary,
+                    None,
+                )
+                .ok()?;
+            }
+        }
+    }
 
     // M5.1/M5.3 — session knobs (defaults when no session).
     let hnsw_cfg = crate::engine::vector::session::current_config();
@@ -9814,11 +9857,11 @@ fn try_knn_vector_scan(
         .ok()
         .and_then(|i| table.schema.columns.get(i))
         .and_then(|c| match &c.data_type {
-            crate::storage::schema::DataTypeKind::Vector { dim } => *dim,
+            crate::storage::schema::DataTypeKind::Vector { dim, .. } => *dim,
             _ => None,
         })
         .map(f64::from)
-        .unwrap_or_else(|| (query_vector.len() / 4).max(1) as f64);
+        .unwrap_or_else(|| (query_vector.dimension as usize).max(1) as f64);
     let lane_cost = (dim / 8.0).max(1.0);
     let index_cost = |index: &&IndexSchema| match index.vector_algo() {
         crate::storage::schema::VectorAlgo::Hnsw => {
@@ -9831,7 +9874,7 @@ fn try_knn_vector_scan(
             let fanout = index.vector_meta().m as f64 + total_rows.max(2.0).ln();
             ef * fanout * lane_cost
         }
-        crate::storage::schema::VectorAlgo::IvfSq8 => {
+        crate::storage::schema::VectorAlgo::IvfSq8 | crate::storage::schema::VectorAlgo::Ivf => {
             let nlist = index
                 .vector_meta()
                 .nlist
@@ -9877,7 +9920,7 @@ fn try_knn_vector_scan(
         })
         .filter(|index| {
             if ivf_hint.is_some() && hnsw_hint.is_none() {
-                index.vector_algo() == crate::storage::schema::VectorAlgo::IvfSq8
+                index.vector_algo() != crate::storage::schema::VectorAlgo::Hnsw
             } else if hnsw_hint.is_some() && ivf_hint.is_none() {
                 index.vector_algo() == crate::storage::schema::VectorAlgo::Hnsw
             } else {
@@ -9891,7 +9934,9 @@ fn try_knn_vector_scan(
     // for an IVF_SQ8 index. Either one pins the index (skips the brute gates)
     // and is baked into the plan node's `ef_hint` field.
     let hint_ef = match index.map(|i| i.vector_algo()) {
-        Some(crate::storage::schema::VectorAlgo::IvfSq8) => ivf_hint,
+        Some(
+            crate::storage::schema::VectorAlgo::IvfSq8 | crate::storage::schema::VectorAlgo::Ivf,
+        ) => ivf_hint,
         _ => hnsw_hint,
     };
     if index.is_none() && (hnsw_hint.is_some() || ivf_hint.is_some()) {
@@ -9909,7 +9954,7 @@ fn try_knn_vector_scan(
         if let Some(idx) = table.schema.iter_queryable_indexes().find(|idx| {
             idx.is_vector() && idx.columns.len() == 1 && idx.columns[0].eq_ignore_ascii_case(col)
         }) {
-            let idx_metric = idx.vector_meta().metric_enum();
+            let idx_metric = idx.vector_meta_for_table(&table.schema).metric_enum();
             if !no_vector_index_hint && idx_metric != metric {
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
@@ -9926,7 +9971,9 @@ fn try_knn_vector_scan(
         }
     }
     let index_usable = index.is_some_and(|index| {
-        if no_vector_index_hint || index.vector_meta().metric_enum() != metric {
+        if no_vector_index_hint
+            || index.vector_meta_for_table(&table.schema).metric_enum() != metric
+        {
             return false;
         }
         // Skip the small-table / selective-filter brute gates when the user
@@ -9956,11 +10003,11 @@ fn try_knn_vector_scan(
                 .ok()
                 .and_then(|i| table.schema.columns.get(i))
                 .and_then(|c| match &c.data_type {
-                    crate::storage::schema::DataTypeKind::Vector { dim } => *dim,
+                    crate::storage::schema::DataTypeKind::Vector { dim, .. } => *dim,
                     _ => None,
                 })
                 .map(|d| d as f64)
-                .unwrap_or_else(|| (query_vector.len() / 4).max(1) as f64);
+                .unwrap_or_else(|| (query_vector.dimension as usize).max(1) as f64);
             let scan_rows = filter
                 .as_ref()
                 .map(|p| estimate_filter_rows(&table.schema, p, total_rows))
@@ -9978,7 +10025,8 @@ fn try_knn_vector_scan(
                     let fanout = index.vector_meta().m as f64 + total_rows.max(2.0).ln();
                     ef * fanout * (dim / 8.0).max(1.0)
                 }
-                crate::storage::schema::VectorAlgo::IvfSq8 => {
+                crate::storage::schema::VectorAlgo::IvfSq8
+                | crate::storage::schema::VectorAlgo::Ivf => {
                     let nprobe = crate::engine::vector::session::effective_nprobe(
                         &hnsw_cfg,
                         None,
@@ -10008,7 +10056,8 @@ fn try_knn_vector_scan(
         // cache key excludes the knob), so the baked value is only a fallback
         // for session-less internal callers.
         let ef_search = match index.vector_algo() {
-            crate::storage::schema::VectorAlgo::IvfSq8 => {
+            crate::storage::schema::VectorAlgo::IvfSq8
+            | crate::storage::schema::VectorAlgo::Ivf => {
                 let index_default = index.vector_meta().default_nprobe.map(|v| v as u64);
                 crate::engine::vector::session::effective_nprobe(&hnsw_cfg, hint_ef, index_default)
             }
@@ -10035,7 +10084,8 @@ fn try_knn_vector_scan(
         // This display-only value never feeds the cost, so it can't perturb
         // planning.
         let display_rows = match index.vector_algo() {
-            crate::storage::schema::VectorAlgo::IvfSq8 => {
+            crate::storage::schema::VectorAlgo::IvfSq8
+            | crate::storage::schema::VectorAlgo::Ivf => {
                 let nlist = index
                     .vector_meta()
                     .nlist
@@ -10107,7 +10157,7 @@ fn try_brute_vector_scan(
     filter: Option<Expr>,
     possible_keys: Vec<String>,
     col: &str,
-    query_vector: Vec<u8>,
+    query_vector: crate::vector::VectorValue,
     query_vector_expr: Option<Expr>,
     metric: crate::engine::vector::Metric,
     k: usize,
@@ -10122,13 +10172,13 @@ fn try_brute_vector_scan(
     // route the row read to the right partition.
     let col_idx = table.schema.column_index(col).ok()?;
     let dim = match table.schema.columns.get(col_idx).map(|c| &c.data_type) {
-        Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(d) }) => *d as usize,
+        Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(d), .. }) => *d as usize,
         // Dimensionless `VECTOR` (variable-length LOB) and non-vector columns
         // have no fixed in-row byte slice to score zero-copy — let the generic
         // path handle (or correctly error) those.
         _ => return None,
     };
-    if dim == 0 || (query_vector_expr.is_none() && dim.saturating_mul(4) != query_vector.len()) {
+    if dim == 0 || (query_vector_expr.is_none() && dim != query_vector.dimension as usize) {
         return None;
     }
     let estimated_rows = (k as f64).min(total_rows.max(1.0));

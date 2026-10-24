@@ -1819,7 +1819,7 @@ pub enum DataType {
     /// optional column SRID constraint.
     Geometry(crate::storage::schema::GeometrySubtype, Option<u32>),
     /// `VECTOR(n)` with an optional declared dimension (`None` = unconstrained).
-    Vector(Option<u32>),
+    Vector(Option<u32>, crate::vector::VectorDataType),
     Enum(Vec<String>),
     Set(Vec<String>),
     Bit(Option<usize>),
@@ -1874,7 +1874,9 @@ impl IndexDef {
     /// Return the concrete vector algorithm encoded by the parser-level
     /// index type. Callers must first establish that this is a vector index.
     pub fn vector_algo(&self) -> crate::storage::schema::VectorAlgo {
-        if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
+        if self.index_type.eq_ignore_ascii_case("IVF") {
+            crate::storage::schema::VectorAlgo::Ivf
+        } else if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
             crate::storage::schema::VectorAlgo::IvfSq8
         } else {
             crate::storage::schema::VectorAlgo::Hnsw

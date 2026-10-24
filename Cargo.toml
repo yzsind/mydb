@@ -30,6 +30,7 @@ fast-alloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 chrono = "0.4"
 
 [dependencies]
+half = "=2.7.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["unbounded_depth"] }
 jsonschema = { version = "0.49.2", default-features = false }

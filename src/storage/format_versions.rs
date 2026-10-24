@@ -22,7 +22,7 @@
 // v58 gives sequence restarts an atomic physical counter identity.
 // v59 commits index retirement manifests in the data dictionary with DDL.
 // v60 stores sequence recovery states and stable dependencies in catalog tables.
-pub const CATALOG_VERSION: u32 = 60;
+pub const CATALOG_VERSION: u32 = 61;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.
@@ -34,18 +34,18 @@ pub const CATALOG_VERSION: u32 = 60;
 pub const WAL_VERSION: u32 = 34;
 /// v14: reduced-redo pages require an FPI before later physiological writes.
 pub const HEAP_PAGE_VERSION: u16 = 14;
-pub const MVCC_ROW_VERSION: u8 = 7;
+pub const MVCC_ROW_VERSION: u8 = 8;
 pub const INDEX_VERSION: u32 = 24;
 pub const INDEX_PAGE_VERSION: u16 = 15;
 /// Derived primary keys and Zone Map weights are part of physical replication
 /// compatibility. Development directories using older keys must be rebuilt.
 pub const COLLATION_KEY_VERSION: u32 = 2;
-pub const UNDO_BINARY_VERSION: u8 = 13;
+pub const UNDO_BINARY_VERSION: u8 = 14;
 pub const UNDO_TABLESPACE_VERSION: u32 = 1;
 pub const OVERFLOW_VERSION: u16 = 3;
 /// v4 records the committed heap coverage frontier.
-pub const PAGED_HNSW_INDEX_VERSION: u32 = 4;
-pub const PAGED_HNSW_PAGE_VERSION: u16 = 1;
+pub const PAGED_HNSW_INDEX_VERSION: u32 = 5;
+pub const PAGED_HNSW_PAGE_VERSION: u16 = 2;
 pub const PAGED_IVF_INDEX_VERSION: u32 = 2;
 pub const PAGED_IVF_PAGE_VERSION: u16 = 2;
 pub const ZONE_MAP_VERSION: u32 = 6;

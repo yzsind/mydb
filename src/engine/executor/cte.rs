@@ -2757,6 +2757,9 @@ fn union_column_needs_coercion(source: &Column, target: &Column) -> bool {
     if integer(source.column_type) && integer(target.column_type) {
         return false;
     }
+    if source.column_type == ColumnType::Vector && target.column_type == ColumnType::Vector {
+        return source.source.vector_type != target.source.vector_type;
+    }
     if source.column_type == target.column_type
         && matches!(
             target.column_type,

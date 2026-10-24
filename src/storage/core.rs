@@ -619,7 +619,7 @@ pub(crate) struct VectorPurge {
 pub(crate) struct VectorBuildDelta {
     builders: usize,
     /// `Some` is an idempotent upsert of the committed vector, `None` a delete.
-    ops: HashMap<RowId, (u64, Option<Vec<f32>>)>,
+    ops: HashMap<RowId, (u64, Option<crate::vector::VectorValue>)>,
     next_seq: u64,
     failed: bool,
     charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,

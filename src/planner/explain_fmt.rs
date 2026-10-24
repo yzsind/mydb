@@ -742,6 +742,7 @@ pub(super) fn collect_explain_rows(
             // nprobe for IVF_SQ8) so a user can confirm the KNN scan fired.
             let (algo, effort_key) = match index.vector_algo() {
                 crate::storage::schema::VectorAlgo::IvfSq8 => ("IVF_SQ8", "nprobe"),
+                crate::storage::schema::VectorAlgo::Ivf => ("IVF", "nprobe"),
                 crate::storage::schema::VectorAlgo::Hnsw => ("HNSW", "ef_search"),
             };
             let mut extra_str = format!(

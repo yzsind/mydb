@@ -4874,7 +4874,7 @@ fn binlog_table_from_schema(schema: &TableSchema) -> Result<BinlogTable, QueryEr
                 unsigned: column.unsigned,
                 enum_set_values,
                 vector_dim: match &column.data_type {
-                    DataTypeKind::Vector { dim } => Some(dim.unwrap_or(0)),
+                    DataTypeKind::Vector { dim, .. } => Some(dim.unwrap_or(0)),
                     _ => None,
                 },
                 charset,
@@ -5736,7 +5736,7 @@ fn encode_value(column: &BinlogColumn, value: &Value, out: &mut Vec<u8>) -> Resu
             // row and the replica reports ER_SLAVE_CORRUPT_EVENT (1610).
             let width = column.metadata.first().copied().unwrap_or(4).clamp(1, 4) as usize;
             let envelope_len = if column.vector_dim.is_some() {
-                crate::engine::vector::codec::VECTOR_BINLOG_MAGIC.len() + 4 + bytes.len()
+                crate::engine::vector::codec::VECTOR_BINLOG_MAGIC.len() + bytes.len()
             } else {
                 bytes.len()
             };
@@ -5751,14 +5751,8 @@ fn encode_value(column: &BinlogColumn, value: &Value, out: &mut Vec<u8>) -> Resu
             }
             let len_le = (envelope_len as u64).to_le_bytes();
             out.extend_from_slice(&len_le[..width]);
-            if let Some(declared_dim) = column.vector_dim {
-                let dim = if declared_dim == 0 {
-                    (bytes.len() / 4) as u32
-                } else {
-                    declared_dim
-                };
+            if column.vector_dim.is_some() {
                 out.extend_from_slice(crate::engine::vector::codec::VECTOR_BINLOG_MAGIC);
-                out.extend_from_slice(&dim.to_le_bytes());
             }
             out.extend_from_slice(&bytes);
         }
@@ -6377,7 +6371,8 @@ fn encode_bit_value(
 
 fn value_bytes(value: &Value) -> Cow<'_, [u8]> {
     match value {
-        Value::Bytes(bytes) | Value::Geometry(bytes) | Value::Vector(bytes) => Cow::Borrowed(bytes),
+        Value::Bytes(bytes) | Value::Geometry(bytes) => Cow::Borrowed(bytes),
+        Value::Vector(bytes) => Cow::Owned(bytes.encode()),
         Value::String(text) | Value::Decimal(text) => Cow::Borrowed(text.as_bytes()),
         Value::SmallString(bytes) => Cow::Borrowed(bytes.as_slice()),
         other => Cow::Owned(other.to_display_string().into_bytes()),
@@ -7419,7 +7414,10 @@ mod tests {
     #[test]
     fn vector_row_binlog_uses_portable_long_blob_envelope() {
         let mut table = test_table();
-        table.columns[1].data_type = DataTypeKind::Vector { dim: Some(3) };
+        table.columns[1].data_type = DataTypeKind::Vector {
+            dim: Some(3),
+            datatype: crate::vector::VectorDataType::Float32,
+        };
         assert_eq!(
             column_binlog_type(&table.columns[1].data_type),
             (MYSQL_TYPE_BLOB, vec![4])
@@ -7430,10 +7428,11 @@ mod tests {
         let mut encoded = Vec::new();
         encode_value(column, &Value::Vector(raw.clone()), &mut encoded).unwrap();
         let len = u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize;
-        assert_eq!(len, 8 + 4 + raw.len());
-        assert_eq!(&encoded[4..12], b"MYDBVEC1");
-        assert_eq!(u32::from_le_bytes(encoded[12..16].try_into().unwrap()), 3);
-        assert_eq!(&encoded[16..], raw);
+        assert_eq!(len, 8 + 12 + raw.len());
+        assert_eq!(&encoded[4..12], b"MYDBVEC2");
+        assert_eq!(&encoded[12..16], &[1, 0, 0, 0]);
+        assert_eq!(u32::from_le_bytes(encoded[16..20].try_into().unwrap()), 3);
+        assert_eq!(&encoded[24..], &raw.payload);
         assert_eq!(
             crate::engine::vector::coerce_bytes_to_internal(&encoded[4..]).unwrap(),
             raw

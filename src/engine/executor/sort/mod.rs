@@ -880,7 +880,7 @@ mod tests {
             Value::Year(0),
             Value::Json(crate::engine::json::parse_text_opt("{}").unwrap()),
             Value::Geometry(vec![0; 5]),
-            Value::Vector(vec![0; 4]),
+            Value::Vector(vec![0; 4].into()),
         ];
         for ascending in [true, false] {
             for collation_id in [None, Some(33), Some(255)] {
@@ -984,7 +984,9 @@ mod tests {
     fn topk_wide_values_enforce_budget_and_release_on_error() {
         use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
         use std::sync::Arc;
-        for constructor in [Value::Bytes, Value::Json, Value::Geometry, Value::Vector] {
+        for constructor in [Value::Bytes, Value::Json, Value::Geometry, |v: Vec<u8>| {
+            Value::Vector(v.into())
+        }] {
             let budget = Arc::new(MemBudget::new(4096));
             with_query_budget(budget.clone(), || {
                 let mut heap = BoundedTopK::new(&[SortField::mysql_order(true)], 1).unwrap();

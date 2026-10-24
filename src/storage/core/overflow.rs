@@ -176,21 +176,13 @@ fn encode_overflow_page(flags: u16, next: u64, generation: u64, payload: &[u8]) 
     buf
 }
 
-fn encode_overflow_meta_page(
-    free_head: u64,
-    page_count: u64,
-    next_generation: u64,
-) -> Vec<u8> {
+fn encode_overflow_meta_page(free_head: u64, page_count: u64, next_generation: u64) -> Vec<u8> {
     let mut buf = vec![0u8; PAGE_SIZE];
     write_u32(&mut buf, OVFL_OFF_MAGIC, OVFL_MAGIC);
     write_u16(&mut buf, OVFL_OFF_VERSION, OVFL_VERSION);
     write_u64(&mut buf, OVFL_META_FREE_HEAD, free_head);
     write_u64(&mut buf, OVFL_META_PAGE_COUNT, page_count);
-    write_u64(
-        &mut buf,
-        OVFL_META_NEXT_GENERATION,
-        next_generation,
-    );
+    write_u64(&mut buf, OVFL_META_NEXT_GENERATION, next_generation);
     buf
 }
 
@@ -603,9 +595,7 @@ impl OverflowFile {
             let next = allocated.get(i + 1).copied().unwrap_or(0);
             // The head page carries the HEAD bit + compression bit; subsequent pages get 0.
             let flags = if i == 0 {
-                OVFL_FLAG_HEAD
-                    | compressed_flag
-                    | if contiguous { OVFL_FLAG_CONTIGUOUS } else { 0 }
+                OVFL_FLAG_HEAD | compressed_flag | if contiguous { OVFL_FLAG_CONTIGUOUS } else { 0 }
             } else {
                 0
             };
@@ -660,9 +650,7 @@ impl OverflowFile {
             return Ok(());
         }
         self.ensure_initialized()?;
-        if lob.first_page_id >= self.page_count
-            || lob.last_page_id >= self.page_count
-        {
+        if lob.first_page_id >= self.page_count || lob.last_page_id >= self.page_count {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "corrupt overflow chain descriptor on free",
@@ -1406,7 +1394,9 @@ fn overflow_bytes_to_value(kind: &ColumnKind, bytes: Vec<u8>) -> Result<Value, Q
         })?),
         ColumnKind::Json => Value::Json(bytes),
         ColumnKind::Geometry => Value::Geometry(bytes),
-        ColumnKind::Vector => Value::Vector(bytes),
+        ColumnKind::Vector { dim, datatype } => {
+            Value::Vector(vector_from_storage(bytes, *datatype, *dim)?)
+        }
         _ => Value::Bytes(bytes),
     })
 }
@@ -1443,7 +1433,9 @@ impl LobMaterializer for OverflowReader {
             ColumnKind::VarString => Value::String(String::from_utf8_lossy(&bytes).into_owned()),
             ColumnKind::Json => Value::Json(bytes),
             ColumnKind::Geometry => Value::Geometry(bytes),
-            ColumnKind::Vector => Value::Vector(bytes),
+            ColumnKind::Vector { dim, datatype } => {
+                Value::Vector(vector_from_storage(bytes, *datatype, *dim)?)
+            }
             _ => Value::Bytes(bytes),
         })
     }

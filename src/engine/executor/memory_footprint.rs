@@ -50,10 +50,8 @@ impl AllocatedBytes for Value {
         match self {
             Value::Decimal(value) | Value::String(value) => value.capacity(),
             Value::DecimalWide(_) => self.decimal_heap_bytes(),
-            Value::Bytes(value)
-            | Value::Json(value)
-            | Value::Geometry(value)
-            | Value::Vector(value) => value.capacity(),
+            Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => value.capacity(),
+            Value::Vector(value) => value.capacity(),
             _ => 0,
         }
     }
@@ -86,10 +84,10 @@ impl EncodedBytes for Value {
             Value::DecimalWide(_) => 3usize.saturating_add(self.decimal_heap_bytes()),
             Value::SmallString(value) => 5usize.saturating_add(value.len()),
             Value::Decimal(value) | Value::String(value) => 5usize.saturating_add(value.len()),
-            Value::Bytes(value)
-            | Value::Json(value)
-            | Value::Geometry(value)
-            | Value::Vector(value) => 5usize.saturating_add(value.len()),
+            Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => {
+                5usize.saturating_add(value.len())
+            }
+            Value::Vector(value) => 5usize.saturating_add(value.len()),
         }
     }
 }
@@ -107,7 +105,7 @@ mod tests {
         };
         assert_eq!(value(Value::Json).allocated_bytes(), 128);
         assert_eq!(value(Value::Geometry).allocated_bytes(), 128);
-        assert_eq!(value(Value::Vector).allocated_bytes(), 128);
+        assert_eq!(value(|v| Value::Vector(v.into())).allocated_bytes(), 128);
         assert_eq!(Value::Int(1).allocated_bytes(), 0);
     }
 

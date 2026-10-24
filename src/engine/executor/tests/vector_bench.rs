@@ -646,3 +646,379 @@ fn hnsw_end_to_end_bench() {
         );
     }
 }
+
+/// Native datatype benchmark. Truth is computed from the encoded stored values;
+/// INT8 scaling and binary sign projection belong only to this data generator.
+#[test]
+#[ignore = "native datatype benchmark; run explicitly in release mode"]
+fn vector_datatypes_end_to_end_bench() {
+    use crate::engine::vector::{codec, Metric};
+    use crate::vector::VectorDataType as D;
+    let datatype =
+        D::parse(&std::env::var("VDB_DATATYPE").unwrap_or_else(|_| "FLOAT16".into())).unwrap();
+    let binary = datatype == D::Binary;
+    let query_datatype = D::parse(&std::env::var("VDB_QUERY_DATATYPE").unwrap_or_else(|_| {
+        if binary {
+            "BINARY".into()
+        } else {
+            "FLOAT32".into()
+        }
+    }))
+    .unwrap();
+    let metric = Metric::parse(&std::env::var("VDB_METRIC").unwrap_or_else(|_| {
+        if binary {
+            "HAMMING".into()
+        } else {
+            "L2".into()
+        }
+    }))
+    .unwrap();
+    let algo = std::env::var("VDB_ALGO").unwrap_or_else(|_| "HNSW".into());
+    let backend = std::env::var("VDB_BACKEND").unwrap_or_else(|_| "memory".into());
+    let n: usize = env_or("VDB_N", 10_000);
+    let dim: usize = env_or("VDB_DIM", 128);
+    let nq: usize = env_or("VDB_QUERIES", 128);
+    let k = 10usize;
+    let _env = super::vector_type::HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", backend.as_str()),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    let mut config = memory_test_storage_config();
+    config.durability = crate::storage::DurabilityMode::Relaxed;
+    config.buffer_pool_pages = env_or("VDB_BUFFER_POOL_PAGES", 65_536);
+    config.checkpoint_interval = Duration::from_secs(3600);
+    config.checkpoint_wal_bytes = 64 * 1024 * 1024 * 1024;
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine =
+        StorageQueryEngine::open_with_storage_config_without_background_workers(dir.path(), config)
+            .unwrap();
+    let distribution = std::env::var("VDB_DISTRIBUTION").unwrap_or_else(|_| "clustered".into());
+    let clusters = env_or("VDB_CLUSTERS", 32);
+    let mut ds = Dataset::generate(
+        n,
+        dim,
+        clusters,
+        nq,
+        metric == Metric::Cosine,
+        env_or("VDB_NOISE", 0.15),
+    );
+    let mut generator = Rng(0x5eed_6924);
+    for (i, row) in ds.rows.iter_mut().chain(ds.queries.iter_mut()).enumerate() {
+        match distribution.as_str() {
+            "clustered" => {}
+            "uniform" => {
+                for x in row.iter_mut() {
+                    *x = generator.next_f64() as f32 * 2.0 - 1.0;
+                }
+            }
+            "duplicates" => row.copy_from_slice(&ds.centroids[i % clusters]),
+            "extreme" => {
+                let scale = if datatype == D::BFloat16 {
+                    if i % 2 == 0 {
+                        1e30
+                    } else {
+                        1e-30
+                    }
+                } else if datatype == D::Float16 {
+                    4096.0
+                } else {
+                    1.0
+                };
+                for x in row.iter_mut() {
+                    *x *= scale;
+                }
+            }
+            "varying_norm" => {
+                let scale = 2.0f32.powi((i % 13) as i32 - 6);
+                for x in row.iter_mut() {
+                    *x *= scale;
+                }
+            }
+            "sparse" if binary => {
+                for (d, x) in row.iter_mut().enumerate() {
+                    let base = ((d as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .rotate_left((i % clusters) as u32)
+                        & 63)
+                        == 0;
+                    let flip = generator.below(1024) == 0;
+                    *x = if base ^ flip { 1.0 } else { -1.0 };
+                }
+            }
+            other => panic!("unsupported native benchmark distribution: {other}"),
+        }
+    }
+    // Generation buffers may exceed the SQL FLOAT32 dimension limit when
+    // their final target is a wider native datatype. Format those components
+    // without constructing an invalid intermediate FLOAT32 VECTOR value.
+    let generated_text = |values: &[f32]| {
+        if values.len() <= D::Float32.max_dimension() as usize {
+            return codec::to_text(&codec::from_f32(values));
+        }
+        use std::fmt::Write;
+        let mut text = String::with_capacity(values.len() * if binary { 2 } else { 48 } + 2);
+        text.push('[');
+        for (i, &value) in values.iter().enumerate() {
+            if i > 0 {
+                text.push(',');
+            }
+            if value == 0.0 {
+                text.push('0');
+            } else {
+                write!(text, "{value}").unwrap();
+            }
+        }
+        text.push(']');
+        text
+    };
+    let values = ds
+        .rows
+        .iter()
+        .map(|row| {
+            let values: Vec<f32> = row
+                .iter()
+                .map(|&v| {
+                    if binary {
+                        if v >= 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    } else if datatype == D::Int8 {
+                        (v * 16.0).round().clamp(-128.0, 127.0)
+                    } else {
+                        v
+                    }
+                })
+                .collect();
+            codec::parse_typed_text(&generated_text(&values), datatype).unwrap()
+        })
+        .collect::<Vec<_>>();
+    ds.rows.clear();
+    ds.rows.shrink_to_fit();
+    let queries = ds
+        .queries
+        .iter()
+        .map(|row| {
+            let values: Vec<f32> = row
+                .iter()
+                .map(|&v| {
+                    if binary {
+                        if v >= 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    } else if datatype == D::Int8 {
+                        if query_datatype == D::Int8 {
+                            (v * 16.0).round().clamp(-128.0, 127.0)
+                        } else {
+                            v * 16.0
+                        }
+                    } else {
+                        v
+                    }
+                })
+                .collect();
+            codec::parse_typed_text(&generated_text(&values), query_datatype).unwrap()
+        })
+        .collect::<Vec<_>>();
+    engine
+        .execute(&format!(
+            "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR({dim},{datatype}) NOT NULL)"
+        ))
+        .unwrap();
+    let wal_before = engine.database().wal_bytes_for_test();
+    let start = Instant::now();
+    let batch_rows = env_or("VDB_BATCH_ROWS", 256usize).max(1);
+    for (chunk_id, chunk) in values.chunks(batch_rows).enumerate() {
+        let rows = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                format!(
+                    "({},'{}')",
+                    chunk_id * batch_rows + i + 1,
+                    codec::to_text(v)
+                )
+            })
+            .collect::<Vec<_>>();
+        engine
+            .execute(&format!("INSERT INTO items VALUES {}", rows.join(",")))
+            .unwrap();
+    }
+    let load_s = start.elapsed().as_secs_f64();
+    let load_wal_bytes = engine.database().wal_bytes_for_test() - wal_before;
+    let controlled_before = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+    let wal_before = engine.database().wal_bytes_for_test();
+    let start = Instant::now();
+    let options = if algo == "HNSW" {
+        format!(
+            "M=16 EF_CONSTRUCTION={}",
+            env_or("VDB_EF_CONSTRUCTION", 200usize)
+        )
+    } else {
+        format!(
+            "NLIST={} KMEANS_ITERS={}",
+            env_or("VDB_NLIST", 128usize),
+            env_or("VDB_TRAIN_ITERS", 8usize)
+        )
+    };
+    engine
+        .execute(&format!(
+            "CREATE INDEX vx ON items(v) USING {algo} COMMENT 'METRIC={} {options}'",
+            metric.as_str()
+        ))
+        .unwrap();
+    let build_s = start.elapsed().as_secs_f64();
+    let build_wal_bytes = engine.database().wal_bytes_for_test() - wal_before;
+    let controlled_after = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+    let exact_rows: Vec<Vec<f32>> = if binary {
+        Vec::new()
+    } else {
+        values.iter().map(codec::to_f32).collect()
+    };
+    let reference = |row: usize, query: usize| -> f64 {
+        if binary {
+            let mut difference = 0u64;
+            let mut intersection = 0u64;
+            let mut union = 0u64;
+            for (&a, &b) in values[row].payload.iter().zip(&queries[query].payload) {
+                difference += (a ^ b).count_ones() as u64;
+                intersection += (a & b).count_ones() as u64;
+                union += (a | b).count_ones() as u64;
+            }
+            if metric == Metric::Hamming {
+                return difference as f64;
+            }
+            return if union == 0 {
+                0.0
+            } else {
+                1.0 - intersection as f64 / union as f64
+            };
+        }
+        let (mut l2, mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (i, &a) in exact_rows[row].iter().enumerate() {
+            let a = a as f64;
+            let b = queries[query].element(i);
+            l2 += (a - b) * (a - b);
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        match metric {
+            Metric::L2 => l2,
+            Metric::Dot => -dot,
+            Metric::Cosine => 1.0 - (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0),
+            _ => unreachable!(),
+        }
+    };
+    let truths = (0..nq)
+        .map(|query| {
+            let mut scores = (0..n)
+                .map(|row| (reference(row, query), row as i64 + 1))
+                .collect::<Vec<_>>();
+            scores.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            scores.truncate(k);
+            scores.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            scores
+        })
+        .collect::<Vec<_>>();
+    let effort: usize = env_or("VDB_EFFORT", if algo == "HNSW" { 256 } else { 32 });
+    let hint = if algo == "HNSW" {
+        format!("HNSW_EF({effort})")
+    } else {
+        format!("IVF_NPROBE({effort})")
+    };
+    let sqls=queries.iter().map(|query|format!("SELECT /*+ {hint} */ id FROM items ORDER BY DISTANCE(v,TO_VECTOR('{}','{}'),'{}') LIMIT {k}",codec::to_text(query),query.datatype.name(),metric.as_str())).collect::<Vec<_>>();
+    let ids_truth = truths
+        .iter()
+        .map(|scores| scores.iter().map(|(_, id)| *id).collect())
+        .collect::<Vec<Vec<i64>>>();
+    let timed = |statements: &[String], truth: &[Vec<i64>]| {
+        for sql in statements.iter().take(8) {
+            ids(&engine, sql);
+        }
+        let mut latencies = Vec::with_capacity(statements.len());
+        let mut recall_sum = 0.0;
+        let start = Instant::now();
+        for (sql, expected) in statements.iter().zip(truth) {
+            let before = Instant::now();
+            let found = ids(&engine, sql);
+            latencies.push(before.elapsed());
+            recall_sum += recall(&found, expected);
+        }
+        let qps = statements.len() as f64 / start.elapsed().as_secs_f64();
+        latencies.sort_unstable();
+        (
+            qps,
+            percentile(&latencies, 0.50),
+            percentile(&latencies, 0.95),
+            percentile(&latencies, 0.99),
+            recall_sum / statements.len() as f64,
+        )
+    };
+    let measurement = timed(&sqls, &ids_truth);
+    let exact_count = env_or("VDB_EXACT_QUERIES", 8usize).min(nq);
+    let exact_sqls: Vec<_> = sqls
+        .iter()
+        .take(exact_count)
+        .map(|sql| sql.replace(&hint, "NO_VECTOR_INDEX"))
+        .collect();
+    let exact = timed(&exact_sqls, &ids_truth[..exact_count]);
+    let mut accepted = 0usize;
+    for (q, sql) in sqls.iter().enumerate() {
+        let threshold = truths[q][k - 1].0;
+        for id in ids(&engine, sql) {
+            // Both sides use the same independent wide reference. Admit genuine
+            // ties without an absolute epsilon that could hide tiny distances.
+            if reference(id as usize - 1, q) <= threshold {
+                accepted += 1;
+            }
+        }
+    }
+    let tie_recall = accepted as f64 / (nq * k) as f64;
+    let stats = engine.database().vector_index_runtime_stats();
+    let file_bytes = stats.values().map(|s| s.paged_file_size_bytes).sum::<u64>();
+    let dml_count = 32usize.min(n);
+    let before = engine.database().wal_bytes_for_test();
+    let start = Instant::now();
+    for (i, v) in values.iter().take(dml_count).enumerate() {
+        engine
+            .execute(&format!(
+                "UPDATE items SET v='{}' WHERE id={}",
+                codec::to_text(v),
+                i + 1
+            ))
+            .unwrap();
+    }
+    let update_rps = dml_count as f64 / start.elapsed().as_secs_f64();
+    let start = Instant::now();
+    for (i, v) in values.iter().take(dml_count).enumerate() {
+        engine
+            .execute(&format!(
+                "INSERT INTO items VALUES({},'{}')",
+                n + i + 1,
+                codec::to_text(v)
+            ))
+            .unwrap();
+    }
+    let insert_rps = dml_count as f64 / start.elapsed().as_secs_f64();
+    let start = Instant::now();
+    for i in 0..dml_count {
+        engine
+            .execute(&format!("DELETE FROM items WHERE id={}", n + i + 1))
+            .unwrap();
+    }
+    let delete_rps = dml_count as f64 / start.elapsed().as_secs_f64();
+    let dml_wal_bytes = engine.database().wal_bytes_for_test() - before;
+    eprintln!(
+        "[vdb-json] {}",
+        serde_json::json!({"datatype":datatype.name(),"query_datatype":query_datatype.name(),"distribution":distribution,"algo":algo,"backend":backend,"metric":metric.as_str(),"n":n,"dim":dim,"batch_rows":batch_rows,"queries":nq,"effort":effort,"load_s":load_s,"build_s":build_s,"qps":measurement.0,"p50_ms":measurement.1,"p95_ms":measurement.2,"p99_ms":measurement.3,"recall":measurement.4,"exact_qps":exact.0,"exact_p50_ms":exact.1,"exact_p95_ms":exact.2,"exact_p99_ms":exact.3,"exact_recall":exact.4,"exact_queries":exact_count,"insert_rps":insert_rps,"update_rps":update_rps,"delete_rps":delete_rps,"load_wal_bytes":load_wal_bytes,"build_wal_bytes":build_wal_bytes,"dml_wal_bytes":dml_wal_bytes,"tie_recall":tie_recall,"payload_bytes":n*datatype.payload_len(dim as u32),"controlled_delta":controlled_after.saturating_sub(controlled_before),"file_bytes":file_bytes})
+    );
+    assert!(
+        tie_recall >= 0.95,
+        "native ANN recall below the acceptance target: {tie_recall}"
+    );
+}

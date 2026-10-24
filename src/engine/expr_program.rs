@@ -1904,6 +1904,14 @@ impl ExprCompiler {
             &resolve_placeholder,
         );
         let result_type = crate::engine::expr_type::infer_expr_type(expr, &context);
+        if matches!(
+            result_type.kind,
+            crate::engine::expr_type::ExprTypeKind::Vector { .. }
+        ) {
+            crate::engine::expr_type::validate_vector_control_flow(expr, &|branch| {
+                crate::engine::expr_type::infer_expr_type(branch, &context)
+            })?;
+        }
         let root = lower(expr, schema)?;
         let (capability, column_reference_bound) = infer_program_metadata(&root);
         Ok(ExprProgram {

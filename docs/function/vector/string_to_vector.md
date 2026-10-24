@@ -1,37 +1,27 @@
 # `STRING_TO_VECTOR`
 
-## Description
-
-Parses a text representation into a vector.
-
-## Syntax
+Parses a nonempty bracketed array into a native vector.
 
 ```sql
-STRING_TO_VECTOR(vector)
+STRING_TO_VECTOR(text [, datatype])
+TO_VECTOR(text [, datatype])
 ```
 
-## Parameters
-
-| Parameter | Required | Accepted Types | Description |
-| --- | --- | --- | --- |
-| `vector` | Yes | Vector text, UTF-8 bytes, or VECTOR | Parses bracketed numeric text such as `[1,2,3]`; VECTOR inputs are rendered then parsed |
-
-## Return Value
-
-Returns a VECTOR; returns `NULL` when any argument is `NULL`.
-
-## Examples
+Datatype is a case-insensitive string: `FLOAT32` (default), `FLOAT16`,
+`BFLOAT16`, `INT8` or `BINARY`. Floating elements must be finite after
+conversion. INT8 requires integers in [-128,127]; BINARY requires zeros and
+ones. Invalid values and dimensions raise a vector error. Any NULL argument
+returns NULL.
 
 ```sql
-SELECT VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'));
+SELECT VECTOR_DATATYPE(TO_VECTOR('[1,2.5,-3]', 'FLOAT16'));
+-- FLOAT16
+SELECT VECTOR_DIM(TO_VECTOR('[1,0,1]', 'BINARY'));
+-- 3
 ```
 
-Result: 3
+Raw payloads require `VECTOR_FROM_BINARY(payload, datatype, dimension)`.
+Numeric datatype conversion also supports `CAST(value AS VECTOR(n, datatype))`.
+Conversions between numeric and BINARY vectors are not implicit.
 
-## Notes
-
-- Vector values must be nonempty, contain finite f32 elements, and binary vector operations require equal dimensions. Invalid encodings, dimensions or scalar integer operands return an explicit vector error. Distance metric names are case-insensitive.
-
-## Related Functions
-
-[`TO_VECTOR`](to_vector.md): the alias of this function.
+See [vector datatypes and indexes](../../vector-indexes.md).

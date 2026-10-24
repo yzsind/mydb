@@ -209,23 +209,44 @@ fn encode_ivf_meta(meta: &IvfMeta) -> Vec<u8> {
 
 fn decode_ivf_meta(buf: &[u8]) -> Result<IvfMeta, QueryError> {
     if buf.len() != PAGE_SIZE {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf index meta page length"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt ivf index meta page length",
+        ));
     }
     if read_u32(buf, 0) != IVF_META_MAGIC {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf index meta page magic"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt ivf index meta page magic",
+        ));
     }
     if read_u16(buf, 4) != IVF_PAGE_VERSION {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "unsupported ivf index meta page version"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unsupported ivf index meta page version",
+        ));
     }
     let stored = read_u32(buf, 16);
     let actual = page_checksum(buf, 16);
     if stored != actual {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf index meta page checksum"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt ivf index meta page checksum",
+        ));
     }
     if read_u32(buf, IVF_META_OFF_INDEX_VERSION) != IVF_INDEX_VERSION
         || read_u32(buf, IVF_META_OFF_PAGE_SIZE) != PAGE_SIZE as u32
     {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "unsupported ivf index file version"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unsupported ivf index file version",
+        ));
+    }
+    if buf[IVF_META_OFF_METRIC] > 4 {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unknown IVF index metric",
+        ));
     }
     Ok(IvfMeta {
         dim: read_u32(buf, IVF_META_OFF_DIM),
@@ -347,9 +368,7 @@ impl IvfIndexFile {
     /// 768-d SQ8 at 21 entries/page even after adding norms.
     fn cap_for_stride(stride: usize) -> usize {
         let mut cap = ((PAGE_SIZE - IVF_LIST_OFF_DATA) / (stride + 10)).max(1);
-        while cap > 1
-            && IVF_LIST_OFF_DATA + cap * (stride + 10) + cap.div_ceil(8) > PAGE_SIZE
-        {
+        while cap > 1 && IVF_LIST_OFF_DATA + cap * (stride + 10) + cap.div_ceil(8) > PAGE_SIZE {
             cap -= 1;
         }
         cap.max(1)
@@ -374,10 +393,7 @@ impl IvfIndexFile {
         let mut file = if durability == DurabilityMode::Memory {
             None
         } else {
-            Some(
-                crate::storage::image_io::open_data_file(&path)
-                    .map_err(io_err)?,
-            )
+            Some(crate::storage::image_io::open_data_file(&path).map_err(io_err)?)
         };
         let len = file
             .as_ref()
@@ -385,10 +401,14 @@ impl IvfIndexFile {
             .transpose()?
             .unwrap_or(0);
         if len > 0 && len < PAGE_SIZE as u64 {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf index file length"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf index file length",
+            ));
         }
         if len % PAGE_SIZE as u64 != 0 {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO,
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
                 "corrupt ivf index file has a truncated trailing page",
             ));
         }
@@ -401,7 +421,8 @@ impl IvfIndexFile {
             )?;
             let meta = decode_ivf_meta(&page)?;
             if meta.dim != dim || meta.metric != metric {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
                     "ivf index parameters changed; rebuild required",
                 ));
             }
@@ -480,7 +501,10 @@ impl IvfIndexFile {
         let meta = self.meta();
         let nlist = meta.nlist as usize;
         if nlist == 0 || meta.next_page_id == 0 || meta.next_page_id < file_pages {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf meta allocator or nlist"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf meta allocator or nlist",
+            ));
         }
         let cent_per_page = (PAGE_SIZE - IVF_HEADER_BYTES) / 4;
         let expected_cent = (nlist.saturating_mul(self.dim_fixed)).div_ceil(cent_per_page) as u64;
@@ -489,12 +513,17 @@ impl IvfIndexFile {
         let range_valid = |first: u64, count: u64, expected: u64| {
             count == expected
                 && first >= 1
-                && first.checked_add(count).is_some_and(|end| end <= file_pages)
+                && first
+                    .checked_add(count)
+                    .is_some_and(|end| end <= file_pages)
         };
         if !range_valid(meta.cent_first_page, meta.cent_page_count, expected_cent)
             || !range_valid(meta.dir_first_page, meta.dir_page_count, expected_dir)
         {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf centroid/directory range"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf centroid/directory range",
+            ));
         }
         let dir = self.directory.read();
         for entry in dir.iter() {
@@ -508,7 +537,10 @@ impl IvfIndexFile {
                 || entry.head >= file_pages
                 || entry.tail >= file_pages
             {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list directory entry"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt ivf list directory entry",
+                ));
             }
         }
         Ok(())
@@ -622,7 +654,12 @@ impl IvfIndexFile {
     }
 
     pub(crate) fn list_length_stats(&self) -> (u64, u64, u64) {
-        let mut counts: Vec<u64> = self.directory.read().iter().map(|entry| entry.count).collect();
+        let mut counts: Vec<u64> = self
+            .directory
+            .read()
+            .iter()
+            .map(|entry| entry.count)
+            .collect();
         if counts.is_empty() {
             return (0, 0, 0);
         }
@@ -733,7 +770,10 @@ impl IvfIndexFile {
         'pages: for p in 0..count {
             let bytes = self.read_page_bytes(first + p)?;
             if !valid_ivf_page(&bytes, IVF_CENT_MAGIC, IVF_PAGE_KIND_CENT) {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf centroid page"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt ivf centroid page",
+                ));
             }
             for i in 0..per_page {
                 if out.len() >= total {
@@ -744,7 +784,8 @@ impl IvfIndexFile {
             }
         }
         if out.len() != total {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO,
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
                 "truncated ivf centroid page range",
             ));
         }
@@ -766,7 +807,10 @@ impl IvfIndexFile {
         'pages: for p in 0..count {
             let bytes = self.read_page_bytes(first + p)?;
             if !valid_ivf_page(&bytes, IVF_DIR_MAGIC, IVF_PAGE_KIND_DIR) {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf directory page"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt ivf directory page",
+                ));
             }
             for i in 0..per_page {
                 if dir.len() >= nlist {
@@ -781,7 +825,8 @@ impl IvfIndexFile {
             }
         }
         if dir.len() != nlist {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO,
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
                 "truncated ivf directory page range",
             ));
         }
@@ -833,12 +878,20 @@ impl IvfIndexFile {
             .read()
             .get(list_id / per_page)
             .cloned()
-            .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "ivf directory page outside latch table"))?;
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "ivf directory page outside latch table",
+                )
+            })?;
         let _dir_write = dir_latch.lock();
         let slot = list_id % per_page;
         let mut bytes = self.read_page_bytes(page_id)?;
         if !valid_ivf_page(&bytes, IVF_DIR_MAGIC, IVF_PAGE_KIND_DIR) {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf directory page"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf directory page",
+            ));
         }
         let off = IVF_HEADER_BYTES + slot * IVF_DIR_ENTRY_BYTES;
         write_u64(&mut bytes, off, entry.head);
@@ -924,7 +977,11 @@ impl IvfIndexFile {
                 if idx >= cent_values {
                     break;
                 }
-                write_u32(&mut bytes, IVF_HEADER_BYTES + i * 4, centroids[idx].to_bits());
+                write_u32(
+                    &mut bytes,
+                    IVF_HEADER_BYTES + i * 4,
+                    centroids[idx].to_bits(),
+                );
             }
             self.write_page(txn, cent_first + p, bytes)?;
         }
@@ -1001,16 +1058,26 @@ impl IvfIndexFile {
         }
         if !self.build_mode.load(Ordering::Acquire)
             || entries.len() > self.cap_per_page
-            || entries.iter().any(|(_, payload)| payload.len() != self.stride)
+            || entries
+                .iter()
+                .any(|(_, payload)| payload.len() != self.stride)
         {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "invalid ivf bulk list-page append"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "invalid ivf bulk list-page append",
+            ));
         }
         let list_latch = self
             .list_latches
             .read()
             .get(list_id)
             .cloned()
-            .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "ivf list id outside latch directory"))?;
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "ivf list id outside latch directory",
+                )
+            })?;
         let _list_write = list_latch.lock();
         let old = self.directory.read()[list_id];
         let page_id = self.alloc_page();
@@ -1027,7 +1094,10 @@ impl IvfIndexFile {
             if !valid_ivf_page(&tail, IVF_LIST_MAGIC, IVF_PAGE_KIND_LIST)
                 || read_u64(&tail, IVF_LIST_OFF_NEXT) != 0
             {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf bulk-build list tail"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt ivf bulk-build list tail",
+                ));
             }
             write_u64(&mut tail, IVF_LIST_OFF_NEXT, page_id);
             self.write_page(txn_id, old.tail, tail)?;
@@ -1043,7 +1113,10 @@ impl IvfIndexFile {
         }
         {
             let mut state = self.meta_state.lock();
-            state.meta.total_entries = state.meta.total_entries.saturating_add(entries.len() as u64);
+            state.meta.total_entries = state
+                .meta
+                .total_entries
+                .saturating_add(entries.len() as u64);
             state.meta.live_entries = state.meta.live_entries.saturating_add(entries.len() as u64);
         }
         Ok(())
@@ -1066,7 +1139,12 @@ impl IvfIndexFile {
             .read()
             .get(list_id)
             .cloned()
-            .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "ivf list id outside latch directory"))?;
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "ivf list id outside latch directory",
+                )
+            })?;
         let _list_write = list_latch.lock();
         let dir = self.directory.read()[list_id];
         let (page_id, slot) = if dir.tail == 0 {
@@ -1088,7 +1166,10 @@ impl IvfIndexFile {
                 // Starting an unlinked replacement page would make every new
                 // entry unreachable from the existing head.  Surface
                 // corruption so the upper layer can rebuild/fall back.
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list tail page"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt ivf list tail page",
+                ));
             }
         };
         // Update the resident directory + counts, then persist.
@@ -1153,7 +1234,10 @@ impl IvfIndexFile {
         // Link old tail -> new page (data page written first above).
         let mut bytes = self.read_page_bytes(old_tail)?;
         if !valid_ivf_page(&bytes, IVF_LIST_MAGIC, IVF_PAGE_KIND_LIST) {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list tail page"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf list tail page",
+            ));
         }
         write_u64(&mut bytes, IVF_LIST_OFF_NEXT, page_id);
         self.write_page(txn_id, old_tail, bytes)?;
@@ -1196,7 +1280,10 @@ impl IvfIndexFile {
     ) -> Result<bool, QueryError> {
         let mut bytes = self.read_page_bytes(page_id)?;
         if !valid_ivf_page(&bytes, IVF_LIST_MAGIC, IVF_PAGE_KIND_LIST) {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list page"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf list page",
+            ));
         }
         let cap = self.cap_per_page;
         // A stale reverse-index entry or a corrupt page could hand us a slot
@@ -1204,7 +1291,10 @@ impl IvfIndexFile {
         // so degrade to a no-op rather than panic on an out-of-bounds write.
         let count = read_u16(&bytes, IVF_LIST_OFF_COUNT) as usize;
         if count > cap {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list slot count"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf list slot count",
+            ));
         }
         if slot as usize >= count {
             return Ok(false);
@@ -1245,14 +1335,20 @@ impl IvfIndexFile {
         debug_assert_eq!(payload.len(), self.stride);
         let mut bytes = self.read_page_bytes(page_id)?;
         if !valid_ivf_page(&bytes, IVF_LIST_MAGIC, IVF_PAGE_KIND_LIST) {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list page"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf list page",
+            ));
         }
         let s = slot as usize;
         // Bounds-guard against a stale reverse-index slot / corrupt page (see
         // `set_tombstone`): degrade to a no-op rather than panic.
         let count = read_u16(&bytes, IVF_LIST_OFF_COUNT) as usize;
         if count > self.cap_per_page {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list slot count"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt ivf list slot count",
+            ));
         }
         if s >= count {
             return Ok(false);
@@ -1397,8 +1493,10 @@ impl IvfIndexFile {
         if (directory.tail != 0 && !visited.contains(&directory.tail))
             || directory.count > entries_seen
         {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO,
-                "ivf list directory chain mismatch"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "ivf list directory chain mismatch",
+            ));
         }
         Ok(())
     }
@@ -1442,10 +1540,11 @@ impl IvfIndexFile {
                 })
                 .collect()
         };
-        self.buffer_pool
-            .prefetch_demand_pages(ranges.into_iter().flat_map(|(start, end)| {
-                (start..end).map(|page_id| self.page_key(page_id))
-            }));
+        self.buffer_pool.prefetch_demand_pages(
+            ranges
+                .into_iter()
+                .flat_map(|(start, end)| (start..end).map(|page_id| self.page_key(page_id))),
+        );
     }
 
     /// Head page id for list `list_id` (0 if empty).
@@ -1473,42 +1572,60 @@ impl IvfIndexFile {
             let max_pages = self.meta_state.lock().meta.next_page_id.max(1);
             let mut visited = HashSet::new();
             let mut entries_seen = 0u64;
-                while page_id != 0 {
-                if (page_id >= max_pages && page_id >= self.meta_state.lock().meta.next_page_id.max(1))
-                || !visited.insert(page_id)
-            {
-                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list page chain"));
+            while page_id != 0 {
+                if (page_id >= max_pages
+                    && page_id >= self.meta_state.lock().meta.next_page_id.max(1))
+                    || !visited.insert(page_id)
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt ivf list page chain",
+                    ));
                 }
-                    let (next, page_entries) = self.buffer_pool.with_raw_page(self.page_key(page_id), |bytes| {
-                    if !valid_ivf_page(bytes, IVF_LIST_MAGIC, IVF_PAGE_KIND_LIST) {
-                        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list page"));
-                    }
-                    if read_u32(bytes, IVF_LIST_OFF_LISTID) as usize != list_id {
-                        return Err(error(crate::error::catalog::ER_GET_ERRNO, "ivf list chain points to wrong list"));
-                    }
-                    let count = read_u16(bytes, IVF_LIST_OFF_COUNT) as usize;
-                    if count > cap {
-                        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt ivf list slot count"));
-                    }
-                    let norms_base = IVF_LIST_OFF_DATA + cap * self.stride;
-                    let rids_base = norms_base + cap * 4;
-                    let tomb_base = rids_base + cap * 6;
-                    for i in 0..count {
-                        if bytes[tomb_base + i / 8] & (1 << (i & 7)) != 0 {
-                            continue;
-                        }
-                        let rid = read_ivf_row(bytes, rids_base + i * 6);
-                        f(rid, list_id as u32, page_id, i as u16);
-                    }
-                    Ok((read_u64(bytes, IVF_LIST_OFF_NEXT), count as u64))
-                })?;
+                let (next, page_entries) =
+                    self.buffer_pool
+                        .with_raw_page(self.page_key(page_id), |bytes| {
+                            if !valid_ivf_page(bytes, IVF_LIST_MAGIC, IVF_PAGE_KIND_LIST) {
+                                return Err(error(
+                                    crate::error::catalog::ER_GET_ERRNO,
+                                    "corrupt ivf list page",
+                                ));
+                            }
+                            if read_u32(bytes, IVF_LIST_OFF_LISTID) as usize != list_id {
+                                return Err(error(
+                                    crate::error::catalog::ER_GET_ERRNO,
+                                    "ivf list chain points to wrong list",
+                                ));
+                            }
+                            let count = read_u16(bytes, IVF_LIST_OFF_COUNT) as usize;
+                            if count > cap {
+                                return Err(error(
+                                    crate::error::catalog::ER_GET_ERRNO,
+                                    "corrupt ivf list slot count",
+                                ));
+                            }
+                            let norms_base = IVF_LIST_OFF_DATA + cap * self.stride;
+                            let rids_base = norms_base + cap * 4;
+                            let tomb_base = rids_base + cap * 6;
+                            for i in 0..count {
+                                if bytes[tomb_base + i / 8] & (1 << (i & 7)) != 0 {
+                                    continue;
+                                }
+                                let rid = read_ivf_row(bytes, rids_base + i * 6);
+                                f(rid, list_id as u32, page_id, i as u16);
+                            }
+                            Ok((read_u64(bytes, IVF_LIST_OFF_NEXT), count as u64))
+                        })?;
                 entries_seen = entries_seen.saturating_add(page_entries);
-                    page_id = next;
+                page_id = next;
             }
             if (expected.tail != 0 && !visited.contains(&expected.tail))
                 || expected.count > entries_seen
             {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "ivf list directory chain mismatch"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "ivf list directory chain mismatch",
+                ));
             }
         }
         Ok(())
@@ -1683,10 +1800,20 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let path = dir.path().join("schemas/test/indexes/v__1__ivf.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         // Build phase.
         {
             let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
@@ -1700,7 +1827,10 @@ mod ivf_page_tests {
         // Reopen phase: index served from disk, no rebuild.
         let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
         let file = open_file(&path, &log, &pool, DurabilityMode::Relaxed, dim as u32, 0);
-        assert!(file.is_finalized(), "reopened file must be trusted as finalized");
+        assert!(
+            file.is_finalized(),
+            "reopened file must be trusted as finalized"
+        );
         let ivf = PagedIvf::new(file, params(32));
         assert_eq!(ivf.live_count(), n, "counts survive reopen");
         // Query row 123: itself is its own nearest neighbour.
@@ -1722,10 +1852,20 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let path = dir.path().join("schemas/test/indexes/v__1__big.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         {
             let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
             let file = open_file(&path, &log, &pool, DurabilityMode::Relaxed, dim as u32, 0);
@@ -1743,7 +1883,11 @@ mod ivf_page_tests {
         let (mut hits, mut total) = (0usize, 0usize);
         let k = 10;
         for q in &queries {
-            let got: Vec<u32> = ivf.search(q, k * 4, 24).into_iter().map(|(r, _)| r.page_id).collect();
+            let got: Vec<u32> = ivf
+                .search(q, k * 4, 24)
+                .into_iter()
+                .map(|(r, _)| r.page_id)
+                .collect();
             for w in brute_knn(&vecs, q, k, Metric::L2) {
                 if got.contains(&w) {
                     hits += 1;
@@ -1752,7 +1896,10 @@ mod ivf_page_tests {
             total += k;
         }
         let recall = hits as f64 / total as f64;
-        assert!(recall >= 0.85, "larger-than-memory candidate recall too low: {recall}");
+        assert!(
+            recall >= 0.85,
+            "larger-than-memory candidate recall too low: {recall}"
+        );
     }
 
     #[test]
@@ -1765,13 +1912,18 @@ mod ivf_page_tests {
             .enumerate()
             .map(|(i, vector)| {
                 (
-                    RowId { page_id: i as u32, slot_id: 0 },
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
                     vector.clone(),
                 )
             })
             .collect();
         let path = dir.path().join("schemas/test/indexes/v__nav.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
         let file = open_file(&path, &log, &pool, DurabilityMode::Relaxed, dim as u32, 0);
         let ivf = PagedIvf::new(file, params(16));
@@ -1785,11 +1937,23 @@ mod ivf_page_tests {
         ivf.install_navigator_for_test(navigator);
 
         let (_, _, exact_order) = ivf.try_search_with_stats(&vecs[17], 40, 8).unwrap();
-        assert!(exact_order, "graph navigator must advertise authoritative f32 order");
+        assert!(
+            exact_order,
+            "graph navigator must advertise authoritative f32 order"
+        );
 
-        ivf.insert(RowId { page_id: 10_000, slot_id: 0 }, &vecs[18]);
+        ivf.insert(
+            RowId {
+                page_id: 10_000,
+                slot_id: 0,
+            },
+            &vecs[18],
+        );
         let (_, _, exact_order) = ivf.try_search_with_stats(&vecs[17], 40, 8).unwrap();
-        assert!(!exact_order, "pre-commit DML must invalidate the derived navigator");
+        assert!(
+            !exact_order,
+            "pre-commit DML must invalidate the derived navigator"
+        );
     }
 
     #[test]
@@ -1805,7 +1969,9 @@ mod ivf_page_tests {
         let rel = "schemas/test/indexes/v__1__crash.ivf";
         let path = dir.path().join(rel);
         {
-            let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+            let log = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            ));
             // Strict durability so page writes emit WAL records.
             let pool = BufferPool::new(
                 DEFAULT_BUFFER_POOL_PAGES,
@@ -1818,12 +1984,26 @@ mod ivf_page_tests {
             let rows: Vec<(RowId, Vec<f32>)> = base
                 .iter()
                 .enumerate()
-                .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+                .map(|(i, v)| {
+                    (
+                        RowId {
+                            page_id: i as u32,
+                            slot_id: 0,
+                        },
+                        v.clone(),
+                    )
+                })
                 .collect();
             ivf.build_from_rows(&rows).unwrap(); // finalize flushes the built pages
-            // Incremental inserts: WAL'd, left in the (unflushed) pool.
+                                                 // Incremental inserts: WAL'd, left in the (unflushed) pool.
             for (j, v) in extra.iter().enumerate() {
-                ivf.insert(RowId { page_id: (10_000 + j) as u32, slot_id: 0 }, v);
+                ivf.insert(
+                    RowId {
+                        page_id: (10_000 + j) as u32,
+                        slot_id: 0,
+                    },
+                    v,
+                );
             }
             log.lock().flush().unwrap(); // WAL durable; pool pages NOT flushed
             drop(ivf);
@@ -1832,16 +2012,24 @@ mod ivf_page_tests {
         }
         // Replay the WAL.
         let result = recover_from_wal(dir.path(), DurabilityMode::Strict).unwrap();
-        assert!(result.summary.redone_records > 0, "expected WAL redo of ivf pages");
+        assert!(
+            result.summary.redone_records > 0,
+            "expected WAL redo of ivf pages"
+        );
         // Reopen and confirm the incrementally-inserted rows are queryable.
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
         let file = open_file(&path, &log, &pool, DurabilityMode::Strict, dim as u32, 0);
         assert!(file.is_finalized());
         let ivf = PagedIvf::new(file, params(16));
         let mut found = 0;
         for (j, v) in extra.iter().enumerate() {
-            let rid = RowId { page_id: (10_000 + j) as u32, slot_id: 0 };
+            let rid = RowId {
+                page_id: (10_000 + j) as u32,
+                slot_id: 0,
+            };
             let got = ivf.search(v, 8, 16);
             if got.iter().any(|(r, _)| *r == rid) {
                 found += 1;
@@ -1939,24 +2127,43 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let path = dir.path().join("schemas/test/indexes/v__1__dml.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
         let file = open_file(&path, &log, &pool, DurabilityMode::Relaxed, dim as u32, 0);
         let ivf = PagedIvf::new(file, params(16));
         ivf.build_from_rows(&rows).unwrap();
         // DELETE row 50 → absent from its own neighbourhood.
-        let target = RowId { page_id: 50, slot_id: 0 };
+        let target = RowId {
+            page_id: 50,
+            slot_id: 0,
+        };
         assert_eq!(ivf.mark_deleted_by_row_id(target), 1);
         let got = ivf.search(&vecs[50], 20, 16);
-        assert!(!got.iter().any(|(r, _)| *r == target), "deleted row resurfaced");
+        assert!(
+            !got.iter().any(|(r, _)| *r == target),
+            "deleted row resurfaced"
+        );
         assert_eq!(ivf.live_count(), 399);
         // Re-delete is a no-op.
         assert_eq!(ivf.mark_deleted_by_row_id(target), 0);
         // UPDATE row 60 in place (tiny drift keeps it in the same cell).
-        let r60 = RowId { page_id: 60, slot_id: 0 };
+        let r60 = RowId {
+            page_id: 60,
+            slot_id: 0,
+        };
         let mut moved = vecs[60].clone();
         moved[0] += 0.01;
         let inplace = ivf.try_update_in_place(r60, &moved, 0.2);
@@ -1981,10 +2188,20 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let path = dir.path().join("schemas/test/indexes/v__1__oob.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
         let file = open_file(&path, &log, &pool, DurabilityMode::Relaxed, dim as u32, 0);
         let ivf = PagedIvf::new(file.clone(), params(8));
@@ -1993,7 +2210,7 @@ mod ivf_page_tests {
         let head = file.list_head(0);
         assert!(head != 0, "list 0 should have a head page");
         let huge_slot = u16::MAX; // far past cap_per_page
-        // Neither must panic; both must report "nothing changed".
+                                  // Neither must panic; both must report "nothing changed".
         assert_eq!(
             file.set_tombstone(0, head, huge_slot, true).unwrap(),
             false,
@@ -2017,10 +2234,20 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let path = dir.path().join("schemas/test/indexes/v__1__cycle.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, DEFAULT_BUFFER_POOL_PAGES);
         let file = open_file(&path, &log, &pool, DurabilityMode::Relaxed, dim as u32, 0);
         let ivf = PagedIvf::new(file.clone(), params(1));
@@ -2055,13 +2282,22 @@ mod ivf_page_tests {
     #[test]
     #[ignore = "perf benchmark; run explicitly with --run-ignored all --nocapture"]
     fn paged_ivf_bench_100k_768() {
-        let n: usize = std::env::var("BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
-        let dim: usize = std::env::var("BENCH_DIM").ok().and_then(|v| v.parse().ok()).unwrap_or(768);
+        let n: usize = std::env::var("BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let dim: usize = std::env::var("BENCH_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(768);
         let nlist: usize = std::env::var("BENCH_NLIST")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0); // 0 => auto (√N)
-        let nq: usize = std::env::var("BENCH_NQ").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        let nq: usize = std::env::var("BENCH_NQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
         let pool_pages: u64 = std::env::var("BENCH_POOL_PAGES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2073,12 +2309,22 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("schemas/test/indexes/v__1__bench.ivf");
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
 
         // --- cold build (normal pool, relaxed durability for speed) ---
         {
@@ -2118,7 +2364,10 @@ mod ivf_page_tests {
         // (fetch a rerank-sized pool), which is what the executor delivers, not
         // the raw SQ8-ordered top-k (which understates by the quantization
         // reorder of near-ties).
-        let rerank: usize = std::env::var("BENCH_RERANK").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let rerank: usize = std::env::var("BENCH_RERANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
         let want = k * rerank;
         let cold_started = std::time::Instant::now();
         let cold = ivf.search(&queries[0], want, 8);
@@ -2136,7 +2385,11 @@ mod ivf_page_tests {
             let t = std::time::Instant::now();
             let mut hits = 0usize;
             for (qi, q) in queries.iter().enumerate() {
-                let got: Vec<u32> = ivf.search(q, want, nprobe).into_iter().map(|(r, _)| r.page_id).collect();
+                let got: Vec<u32> = ivf
+                    .search(q, want, nprobe)
+                    .into_iter()
+                    .map(|(r, _)| r.page_id)
+                    .collect();
                 for w in &truth[qi] {
                     if got.contains(w) {
                         hits += 1;
@@ -2173,16 +2426,9 @@ mod ivf_page_tests {
             );
             let started = std::time::Instant::now();
             for i in 0..profile_iters {
-                std::hint::black_box(ivf.search(
-                    &queries[i % queries.len()],
-                    want,
-                    profile_nprobe,
-                ));
+                std::hint::black_box(ivf.search(&queries[i % queries.len()], want, profile_nprobe));
             }
-            eprintln!(
-                "[ivf-bench] profile-loop done: {:?}",
-                started.elapsed()
-            );
+            eprintln!("[ivf-bench] profile-loop done: {:?}", started.elapsed());
         }
     }
 
@@ -2242,7 +2488,11 @@ mod ivf_page_tests {
             let (mut got, _, exact) = ivf.try_search_with_stats(query, 40, 8).unwrap();
             assert!(!exact);
             for (rid, score) in &mut got {
-                *score = crate::engine::vector::distance::ordering_distance(query, &vectors[rid.page_id as usize], crate::engine::vector::Metric::L2);
+                *score = crate::engine::vector::distance::ordering_distance(
+                    query,
+                    &vectors[rid.page_id as usize],
+                    crate::engine::vector::Metric::L2,
+                );
             }
             got.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.page_id.cmp(&b.0.page_id)));
             query_time += started.elapsed();
@@ -2310,7 +2560,9 @@ mod ivf_page_tests {
     #[test]
     fn audit_bug1_search_append_race_remains_searchable() {
         let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, 4096);
         // A multi-page list preserves the append/chain-walk race. Bound the
         // work by completed searches instead of spending 20 seconds asleep
@@ -2319,7 +2571,15 @@ mod ivf_page_tests {
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let file = open_file(
             &dir.path().join("audit1.ivf"),
@@ -2352,7 +2612,13 @@ mod ivf_page_tests {
             writer_start.wait();
             while !writer_stop.load(Ordering::Relaxed) {
                 let v: Vec<f32> = (0..768).map(|_| next()).collect();
-                writer_ivf.insert(RowId { page_id: rid, slot_id: 0 }, &v);
+                writer_ivf.insert(
+                    RowId {
+                        page_id: rid,
+                        slot_id: 0,
+                    },
+                    &v,
+                );
                 rid += 1;
             }
             rid - 1_000_000
@@ -2379,11 +2645,16 @@ mod ivf_page_tests {
         });
         reader.join().unwrap();
         stop.store(true, Ordering::Relaxed);
-        assert!(writer.join().unwrap() > 0, "writer must overlap the search workload");
+        assert!(
+            writer.join().unwrap() > 0,
+            "writer must overlap the search workload"
+        );
         let race_error = first_error.lock().clone();
-        assert!(race_error.is_none(), "benign append reported corruption: {race_error:?}");
+        assert!(
+            race_error.is_none(),
+            "benign append reported corruption: {race_error:?}"
+        );
         assert!(ivf.try_search_with_stats(&vec![0.5f32; 768], 10, 1).is_ok());
-
     }
 
     /// B3 regression: finalized-file reopen prepares the reverse map before
@@ -2391,13 +2662,23 @@ mod ivf_page_tests {
     #[test]
     fn audit_bug3_reopen_prepares_reverse_map_before_dml() {
         let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, 8192);
         let vecs = gen_vectors(40_000, 768, 0xC0FFEE); // ~1905 list pages
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let path = dir.path().join("audit3.ivf");
         {
@@ -2425,7 +2706,6 @@ mod ivf_page_tests {
         eprintln!("warmed delete: first={first_delete:?}, second={second_delete:?}");
         assert!(!ivf.has_live_row_id(rows[10].0));
         assert!(!ivf.has_live_row_id(rows[11].0));
-
     }
 
     /// B5 default policy: do not pay to build a navigator which the first
@@ -2433,13 +2713,23 @@ mod ivf_page_tests {
     #[test]
     fn audit_bug5_default_build_skips_disposable_navigator() {
         let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap()));
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
         let pool = test_pool(&log, 2048);
         let vecs = gen_vectors(2_000, 32, 0xD00D);
         let rows: Vec<(RowId, Vec<f32>)> = vecs
             .iter()
             .enumerate()
-            .map(|(i, v)| (RowId { page_id: i as u32, slot_id: 0 }, v.clone()))
+            .map(|(i, v)| {
+                (
+                    RowId {
+                        page_id: i as u32,
+                        slot_id: 0,
+                    },
+                    v.clone(),
+                )
+            })
             .collect();
         let ivf = PagedIvf::new(
             open_file(
@@ -2454,9 +2744,18 @@ mod ivf_page_tests {
         );
         ivf.build_from_rows(&rows).unwrap();
         assert!(!PagedIvf::navigator_enabled());
-        assert!(!ivf.has_navigator(), "default build must skip disposable navigation graph");
+        assert!(
+            !ivf.has_navigator(),
+            "default build must skip disposable navigation graph"
+        );
 
-        ivf.insert(RowId { page_id: 500_000, slot_id: 0 }, &vec![0.5f32; 32]);
+        ivf.insert(
+            RowId {
+                page_id: 500_000,
+                slot_id: 0,
+            },
+            &vec![0.5f32; 32],
+        );
         assert!(!ivf.has_navigator(), "one insert dropped the navigator");
         ivf.try_search_with_stats(&vec![0.5f32; 32], 5, 1)
             .expect("search must still work");

@@ -1908,8 +1908,11 @@ pub(crate) fn mysql_type_name_with_attrs(
         DataTypeKind::Year => "year".to_string(),
         DataTypeKind::Json => "json".to_string(),
         DataTypeKind::Geometry { subtype, .. } => subtype.type_name().to_string(),
-        DataTypeKind::Vector { dim } => match dim {
-            Some(d) => format!("vector({d})"),
+        DataTypeKind::Vector { dim, datatype } => match dim {
+            Some(d) if *datatype == crate::vector::VectorDataType::Float32 => {
+                format!("vector({d})")
+            }
+            Some(d) => format!("vector({d},{})", datatype.name().to_ascii_lowercase()),
             None => "vector".to_string(),
         },
         DataTypeKind::Enum { values } => {

@@ -2243,6 +2243,7 @@ pub(crate) fn columns_for_table_name(table_name: &str) -> Result<Vec<Column>, Qu
                 });
             Column {
                 source: crate::types::ColumnSource {
+                    vector_type: None,
                     collation_coercibility: Some(2),
                     dynamic_parameter: false,
                     wire_type: None,
@@ -6818,14 +6819,14 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
             if !index.is_vector() {
                 continue;
             }
-            let meta = index.vector_meta();
+            let meta = index.vector_meta_for_table(&table);
             let col_name = index.columns.first().cloned().unwrap_or_default();
             let declared_dim = table
                 .columns
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(&col_name))
                 .and_then(|c| match &c.data_type {
-                    DataTypeKind::Vector { dim } => *dim,
+                    DataTypeKind::Vector { dim, .. } => *dim,
                     _ => None,
                 });
             let stats = runtime.get(&(table.id, normalize_name(&index.name)));
@@ -6857,6 +6858,7 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 // ALGO from the catalog (available even when cold).
                 s(match index.vector_algo() {
                     crate::storage::schema::VectorAlgo::IvfSq8 => "IVF_SQ8",
+                    crate::storage::schema::VectorAlgo::Ivf => "IVF",
                     crate::storage::schema::VectorAlgo::Hnsw => "HNSW",
                 }),
                 meta.nlist
@@ -6868,7 +6870,8 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 opt_i64(stats.map(|st| st.list_max_entries as i64)),
                 opt_i64(stats.map(|st| st.list_p95_entries as i64)),
                 match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8 => stats
+                    crate::storage::schema::VectorAlgo::IvfSq8
+                    | crate::storage::schema::VectorAlgo::Ivf => stats
                         .map(|st| {
                             s(if st.backend != "ivf_paged" || st.finalized {
                                 "READY"
@@ -6880,7 +6883,8 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                     crate::storage::schema::VectorAlgo::Hnsw => Value::Null,
                 },
                 match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8 => {
+                    crate::storage::schema::VectorAlgo::IvfSq8
+                    | crate::storage::schema::VectorAlgo::Ivf => {
                         opt_i64(stats.map(|st| st.inserts_since_train as i64))
                     }
                     crate::storage::schema::VectorAlgo::Hnsw => Value::Null,

@@ -890,12 +890,12 @@ fn vector_index_dropped_cleanly() {
 /// (or unset) on drop. `cargo nextest` already isolates per-test
 /// processes; this guard makes the tests safe under plain `cargo test`
 /// (shared-process parallel) too.
-struct HnswEnv {
+pub(super) struct HnswEnv {
     keys: Vec<(&'static str, Option<String>)>,
 }
 
 impl HnswEnv {
-    fn set(pairs: &[(&'static str, &str)]) -> Self {
+    pub(super) fn set(pairs: &[(&'static str, &str)]) -> Self {
         let keys = pairs
             .iter()
             .map(|(k, v)| {
@@ -4687,6 +4687,12 @@ fn source_audit_dimension_rejection(backend: &str) {
     engine
         .execute("INSERT INTO audit_dim VALUES (1, '[1,2,3]')")
         .unwrap();
+    assert!(engine
+        .execute("CREATE INDEX iv ON audit_dim(v) USING HNSW")
+        .is_err());
+    engine
+        .execute("ALTER TABLE audit_dim MODIFY v VECTOR(3) NOT NULL")
+        .unwrap();
     engine
         .execute("CREATE INDEX iv ON audit_dim(v) USING HNSW")
         .unwrap();
@@ -4818,12 +4824,20 @@ fn source_audit_b5_restart_reconciles_snapshot_vectors() {
 }
 
 #[test]
-fn source_audit_dimension_check_preserves_empty_variable_ivf_bootstrap() {
+fn source_audit_variable_vector_requires_declared_index_dimension() {
     let _env = HnswEnv::set(&[("MYDB_VECTOR_STORAGE", "memory")]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR NOT NULL)")
+        .unwrap();
+    for algo in ["HNSW", "IVF", "IVF_SQ8"] {
+        assert!(engine
+            .execute(&format!("CREATE INDEX idx_emb ON items(emb) USING {algo}"))
+            .is_err());
+    }
+    engine
+        .execute("ALTER TABLE items MODIFY emb VECTOR(2) NOT NULL")
         .unwrap();
     engine
         .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8")

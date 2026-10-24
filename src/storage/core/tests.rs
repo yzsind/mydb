@@ -23200,120 +23200,69 @@ fn m5_compression_ratio_benchmark() {
 }
 
 // ===========================================================================
-// M7: reject VECTOR(n) dimensions exceeding a row page. VectorFixed always stores
-// n*4 inline bytes and never externalizes. Previously CREATE silently accepted oversized dimensions,
-// then INSERT failed with generic 1118; now CREATE rejects them with a dimension-limit message.
+// Fixed vector lanes must fit, while larger payloads externalize.
 // ===========================================================================
 
 #[test]
-fn m7_oversized_vector_rejected_at_create_with_clear_error() {
-    std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
+fn m7_fixed_vector_lanes_reject_oversized_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
-    // VECTOR(4096) needs 16384 fixed bytes, exceeding ROW_FIT_BUDGET=16347.
+    let mut columns = vec![lob_col("id", DataType::Int, true)];
+    for name in ["a", "b", "c"] {
+        columns.push(lob_col(
+            name,
+            DataType::Vector(Some(2048), crate::vector::VectorDataType::Float32),
+            false,
+        ));
+    }
     let err = db
-        .create_table(
-            "v",
-            vec![
-                lob_col("id", DataType::Int, true),
-                lob_col("emb", DataType::Vector(Some(4096)), false),
-            ],
-            vec!["id".into()],
-            vec![],
-        )
+        .create_table("wide", columns, vec!["id".into()], vec![])
         .unwrap_err();
-    assert_eq!(
-        err.code(),
-        1118,
-        "Oversized VECTOR(n) must fail at CREATE with 1118"
-    );
-    assert!(
-        err.message().contains("VECTOR(4096)")
-            && err.message().contains("emb")
-            && err.message().contains("maximum dimension"),
-        "The error must include column, dimension, and limit: {}",
-        err.message()
-    );
-    // No table must be created.
-    assert!(
-        db.table("test.v").is_err(),
-        "An oversized VECTOR table must not be created"
-    );
+    assert_eq!(err.code(), 1118);
+    assert!(err.message().contains("fixed columns"));
+    assert!(db.table("test.wide").is_err());
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
 }
 
 #[test]
-fn m7_vector_boundary_dim_fits_and_one_over_rejected() {
-    // Test exact-fit and one-too-large boundaries for layout (id INT,emb VECTOR(n)).
+fn m7_vector_inline_and_overflow_boundaries_round_trip() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
-
-    // First request an obviously oversized dimension and parse max_dim from the error.
-    let err = db
-        .create_table(
-            "probe",
+    for dim in [2048u32, 2049, 4096, 16383] {
+        let name = format!("v{dim}");
+        db.create_table(
+            &name,
             vec![
                 lob_col("id", DataType::Int, true),
-                lob_col("emb", DataType::Vector(Some(5000)), false),
+                lob_col(
+                    "emb",
+                    DataType::Vector(Some(dim), crate::vector::VectorDataType::Float32),
+                    false,
+                ),
             ],
             vec!["id".into()],
             vec![],
-        )
-        .unwrap_err();
-    // Parse maximum dimension for this table layout is N.
-    let max_dim: u32 = err
-        .message()
-        .split("table layout is ")
-        .nth(1)
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or_else(|| panic!("The error message must expose max_dim: {}", err.message()));
-    assert!(max_dim > 0 && max_dim < 5000);
-
-    // max_dim must create successfully at the exact-fit boundary.
-    db.create_table(
-        "fit",
-        vec![
-            lob_col("id", DataType::Int, true),
-            lob_col("emb", DataType::Vector(Some(max_dim)), false),
-        ],
-        vec!["id".into()],
-        vec![],
-    )
-    .expect("max_dim must permit table creation");
-    // Also INSERT/read back to prove it actually fits rather than merely passing validation.
-    let txn = db.begin_txn().unwrap();
-    let vbytes = vec![1u8; max_dim as usize * 4];
-    db.insert_rows(
-        txn,
-        "test.fit",
-        vec![vec![Value::Int(1), Value::Vector(vbytes.clone())]],
-    )
-    .unwrap();
-    db.commit_txn(txn.txn_id).unwrap();
-    let rows = db
-        .scan_rows(
-            "test.fit",
-            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
         )
         .unwrap();
-    assert_eq!(rows[0].values[1], Value::Vector(vbytes));
-
-    // max_dim+1 must fail at the first nonfitting dimension.
-    let err2 = db
-        .create_table(
-            "over",
-            vec![
-                lob_col("id", DataType::Int, true),
-                lob_col("emb", DataType::Vector(Some(max_dim + 1)), false),
-            ],
-            vec!["id".into()],
-            vec![],
+        let bytes = vec![1u8; dim as usize * 4];
+        let txn = db.begin_txn().unwrap();
+        db.insert_rows(
+            txn,
+            &format!("test.{name}"),
+            vec![vec![Value::Int(1), Value::Vector(bytes.clone().into())]],
         )
-        .unwrap_err();
-    assert_eq!(err2.code(), 1118, "max_dim+1 must be rejected");
+        .unwrap();
+        db.commit_txn(txn.txn_id).unwrap();
+        let rows = db
+            .scan_rows(
+                &format!("test.{name}"),
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+            )
+            .unwrap();
+        assert_eq!(rows[0].values[1], Value::Vector(bytes.into()));
+    }
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
 }
@@ -23329,7 +23278,11 @@ fn m7_normal_vector_dim_still_works() {
             &format!("v{dim}"),
             vec![
                 lob_col("id", DataType::Int, true),
-                lob_col("emb", DataType::Vector(Some(dim)), false),
+                lob_col(
+                    "emb",
+                    DataType::Vector(Some(dim), crate::vector::VectorDataType::Float32),
+                    false,
+                ),
             ],
             vec!["id".into()],
             vec![],
@@ -23340,7 +23293,7 @@ fn m7_normal_vector_dim_still_works() {
         db.insert_rows(
             txn,
             &format!("test.v{dim}"),
-            vec![vec![Value::Int(1), Value::Vector(vbytes.clone())]],
+            vec![vec![Value::Int(1), Value::Vector(vbytes.clone().into())]],
         )
         .unwrap();
         db.commit_txn(txn.txn_id).unwrap();
@@ -23350,7 +23303,7 @@ fn m7_normal_vector_dim_still_works() {
                 TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
             )
             .unwrap();
-        assert_eq!(rows[0].values[1], Value::Vector(vbytes));
+        assert_eq!(rows[0].values[1], Value::Vector(vbytes.into()));
     }
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
@@ -25077,7 +25030,11 @@ fn vector_registry_spills_constant_keys_with_bounded_scratch() {
         "registry",
         vec![
             lob_col("id", DataType::Int, true),
-            lob_col("emb", DataType::Vector(Some(2)), false),
+            lob_col(
+                "emb",
+                DataType::Vector(Some(2), crate::vector::VectorDataType::Float32),
+                false,
+            ),
         ],
         vec!["id".into()],
         vec![],
@@ -25085,14 +25042,14 @@ fn vector_registry_spills_constant_keys_with_bounded_scratch() {
     .unwrap();
     let txn = db.begin_txn().unwrap();
     let rows = (0..20_000)
-        .map(|i| vec![Value::Int(i), Value::Vector(vec![0; 8])])
+        .map(|i| vec![Value::Int(i), Value::Vector(vec![0; 8].into())])
         .collect();
     db.insert_rows(txn, "test.registry", rows).unwrap();
     db.commit_txn(txn.txn_id).unwrap();
     let table = db.table("test.registry").unwrap();
     for direct in [false, true] {
         let entries = db
-            .collect_vector_registry_entries(&table, 1, 1024 * 1024, direct)
+            .collect_vector_registry_entries(&table, None, 1, 1024 * 1024, direct)
             .unwrap();
         let SortedIndexEntries::Spilled(runs) = entries else {
             panic!("registry must spill when it exceeds the scratch envelope");

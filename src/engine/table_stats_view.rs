@@ -337,7 +337,9 @@ pub(crate) fn estimate_column_width(data_type: &DataTypeKind) -> u64 {
         | DataTypeKind::Blob { .. }
         | DataTypeKind::Json
         | DataTypeKind::Geometry { .. } => 0,
-        DataTypeKind::Vector { dim } => dim.map(|dim| dim as u64 * 4).unwrap_or(0),
+        DataTypeKind::Vector { dim, datatype } => {
+            dim.map(|dim| datatype.payload_len(dim) as u64).unwrap_or(0)
+        }
         DataTypeKind::Enum { values } => values.iter().map(|v| v.len()).max().unwrap_or(0) as u64,
         DataTypeKind::Set { values } => values.iter().map(|v| v.len() + 1).sum::<usize>() as u64,
         DataTypeKind::Bit { len } => len.unwrap_or(1).div_ceil(8) as u64,

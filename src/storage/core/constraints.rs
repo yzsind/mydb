@@ -223,7 +223,7 @@ fn validate_cosine_index_vectors(table: &TableSchema, values: &[Value]) -> Resul
     }) {
         let col_idx = table.column_index(&index.columns[0])?;
         if let Some(Value::Vector(bytes)) = values.get(col_idx) {
-            if crate::engine::vector::distance::is_zero_norm_bytes(bytes) {
+            if crate::engine::vector::distance::typed_is_zero(bytes) {
                 return Err(error(
                     crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
                     format!(
@@ -3184,28 +3184,9 @@ fn coerce_value_with_unsigned(
             )?;
             Ok(Value::Geometry(bytes))
         }
-        DataTypeKind::Vector { dim } => {
-            // Coerce to canonical internal little-endian `f32` bytes, then
-            // enforce the column's declared dimension.
-            let bytes = match value {
-                Value::Vector(b) => crate::engine::vector::normalize_internal_owned(b)?,
-                Value::Bytes(b) => crate::engine::vector::coerce_bytes_to_internal_owned(b)?,
-                Value::SmallString(b) => {
-                    crate::engine::vector::coerce_bytes_to_internal(b.as_ref())?
-                }
-                Value::String(s) | Value::Decimal(s) => {
-                    crate::engine::vector::coerce_bytes_to_internal(s.as_bytes())?
-                }
-                _ => {
-                    return Err(error(
-                        crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
-                        "Cannot get a VECTOR value from the data sent to the VECTOR field",
-                    ))
-                }
-            };
-            crate::engine::vector::validate_dimension(&bytes, *dim)?;
-            Ok(Value::Vector(bytes))
-        }
+        DataTypeKind::Vector { dim, datatype } => Ok(Value::Vector(
+            crate::engine::vector::codec::coerce_value(value, *datatype, *dim)?,
+        )),
         DataTypeKind::Blob { max_len } => {
             let mut bytes = match value {
                 Value::Bytes(v) => v,

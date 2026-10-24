@@ -3371,7 +3371,7 @@ impl From<&Value> for ValueKey {
             Value::Geometry(v) => ValueKey::Bytes(KeyBytes::from_slice(v)),
             // Two equal vectors have byte-identical internal form, so
             // hashing on the raw bytes keeps GROUP BY / DISTINCT correct.
-            Value::Vector(v) => ValueKey::Bytes(KeyBytes::from_slice(v)),
+            Value::Vector(v) => ValueKey::Bytes(KeyBytes::from_slice(&v.encode())),
             // Binary temporal / decimal variants hash on their integer
             // payload. Equality between e.g. `Value::Date(d)` and a
             // legacy `Value::String("YYYY-MM-DD")` flows through the
@@ -3554,7 +3554,7 @@ pub(crate) fn write_value_inline_key(value: &Value, out: &mut InlineKeyBuf) {
         }
         Value::Json(v) => push_bytes(out, v),
         Value::Geometry(v) => push_bytes(out, v),
-        Value::Vector(v) => push_bytes(out, v),
+        Value::Vector(v) => push_bytes(out, &v.encode()),
         Value::DecimalCompact(mag, scale) => {
             push_exact_decimal(out, num_bigint::BigInt::from(*mag), *scale)
         }
@@ -4158,6 +4158,9 @@ fn eval_expr_legacy_inner(
             results,
             else_result,
         } => {
+            crate::engine::expr_type::validate_vector_control_flow(case_expr, &|branch| {
+                crate::engine::expr_type::infer_expr_type_in_table(branch, table)
+            })?;
             let result = eval_case(operand, conditions, results, else_result, |e| {
                 eval_expr_legacy(e, table, values)
             })?;
@@ -5711,7 +5714,20 @@ where
                 // CAST(x AS VECTOR): parse `[a,b,c]` text / raw bytes into the
                 // internal little-endian f32 form, pass an existing vector
                 // through (re-validated).
-                "VECTOR" => crate::engine::vector::sql::cast_to_vector(&value),
+                "VECTOR" => {
+                    if args.len() == 2 {
+                        return crate::engine::vector::sql::cast_to_vector(&value);
+                    }
+                    let dim = u32::try_from(int_value(&eval_arg(&args[2])?)?).map_err(|_| {
+                        crate::engine::vector::vector_err("invalid VECTOR dimension")
+                    })?;
+                    let datatype = crate::vector::VectorDataType::parse(
+                        &eval_arg(&args[3])?.to_display_string(),
+                    )
+                    .ok_or_else(|| crate::engine::vector::vector_err("invalid VECTOR datatype"))?;
+                    crate::engine::vector::codec::coerce_value(value, datatype, Some(dim))
+                        .map(Value::Vector)
+                }
                 // CAST(x AS YEAR): MySQL 8.0.22+. Date-like strings yield
                 // their year; bare numbers use the 2-digit expansion
                 // (1-69 → 2001-2069, 70-99 → 1970-1999). Valid range is
@@ -16511,10 +16527,8 @@ fn invalid_kdf_option_size() -> QueryError {
 
 fn aes_value_bytes_capacity(value: &Value) -> usize {
     match value {
-        Value::Bytes(bytes)
-        | Value::Json(bytes)
-        | Value::Geometry(bytes)
-        | Value::Vector(bytes) => bytes.len(),
+        Value::Bytes(bytes) | Value::Json(bytes) | Value::Geometry(bytes) => bytes.len(),
+        Value::Vector(bytes) => bytes.len(),
         Value::String(text) | Value::Decimal(text) => text.len(),
         Value::SmallString(text) => text.len(),
         // Numeric and temporal display forms are bounded well below this.
@@ -24192,14 +24206,14 @@ fn geometry_bytes_for_compare(value: &Value) -> Vec<u8> {
 /// Coerce a value to internal vector bytes for vector comparison. A
 /// `Value::Vector` is used directly; text/bytes are parsed; anything else
 /// falls back to its display bytes (deterministic).
-fn vector_bytes_for_compare(value: &Value) -> Vec<u8> {
+fn vector_bytes_for_compare(value: &Value) -> crate::vector::VectorValue {
     match value {
         Value::Vector(b) => b.clone(),
         Value::Bytes(b) => crate::engine::vector::coerce_bytes_to_internal(b).unwrap_or_default(),
         Value::String(s) => {
             crate::engine::vector::coerce_bytes_to_internal(s.as_bytes()).unwrap_or_default()
         }
-        other => other.to_display_string().into_bytes(),
+        other => other.to_display_string().into_bytes().into(),
     }
 }
 
@@ -24663,6 +24677,9 @@ pub(crate) fn coerce_result_to_expr_type(
         return Ok(value);
     }
     match result_type.kind {
+        ExprTypeKind::Vector { dim, datatype } => {
+            crate::engine::vector::codec::coerce_value(value, datatype, dim).map(Value::Vector)
+        }
         ExprTypeKind::Decimal {
             precision, scale, ..
         } => cast_to_decimal(&value, precision, scale),

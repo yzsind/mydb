@@ -97,6 +97,9 @@ impl SetOpRowPuller<'_> {
 impl SetOpBatchOperator<'_> {
     #[inline]
     pub(super) fn can_passthrough_field(source: &BatchField, target: &BatchField) -> bool {
+        if source.column_type == ColumnType::Vector && target.column_type == ColumnType::Vector {
+            return source.source.vector_type == target.source.vector_type;
+        }
         if source.column_type == target.column_type {
             return true;
         }

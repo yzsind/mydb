@@ -125,10 +125,8 @@ impl Database {
         let mut total = 0usize;
         for value in values.iter().take(codec.columns.len()) {
             let len = match value {
-                Value::Bytes(bytes)
-                | Value::Json(bytes)
-                | Value::Geometry(bytes)
-                | Value::Vector(bytes) => bytes.len(),
+                Value::Bytes(bytes) | Value::Json(bytes) | Value::Geometry(bytes) => bytes.len(),
+                Value::Vector(bytes) => bytes.len(),
                 Value::String(text) => text.len(),
                 _ => 0,
             };
@@ -175,13 +173,14 @@ impl Database {
                     | ColumnKind::VarBytes
                     | ColumnKind::Json
                     | ColumnKind::Geometry
-                    | ColumnKind::Vector
+                    | ColumnKind::Vector { .. }
             )
         };
         let lob_byte_len = |i: usize| match &values[i] {
             Value::Bytes(b) => b.len(),
             Value::String(s) => s.len(),
-            Value::Json(b) | Value::Geometry(b) | Value::Vector(b) => b.len(),
+            Value::Json(b) | Value::Geometry(b) => b.len(),
+            Value::Vector(b) => b.len(),
             _ => 0,
         };
         let mut externalized = vec![false; values.len()];
@@ -235,12 +234,14 @@ impl Database {
                     ColumnKind::VarString => value_to_string_bytes(&values[i]).into(),
                     ColumnKind::Json => json_coerce_to_jsonb(&values[i])?,
                     ColumnKind::Geometry => geometry_coerce_to_internal(&values[i])?.into(),
-                    ColumnKind::Vector => vector_coerce_to_internal(&values[i])?.into(),
+                    ColumnKind::Vector { dim, datatype } => {
+                        vector_coerce_to_internal(&values[i], datatype, dim)?.into()
+                    }
                     _ => value_to_bytes(&values[i]).into(),
                 };
                 // M5(LOB compression) — text/json/bytes/geometry are compressible; vector
                 // is already-compact f32 little-endian that lz4 cannot shrink (only adds CPU) → skip.
-                let compressible = !matches!(codec.columns[i].kind, ColumnKind::Vector);
+                let compressible = !matches!(codec.columns[i].kind, ColumnKind::Vector { .. });
                 let lob = self.with_overflow_mut(table_id, |ovf| {
                     ovf.allocate_chain_compressible(&bytes, compressible)
                 })?;
@@ -413,7 +414,9 @@ impl Database {
                     Some(ColumnKind::VarString) => value_to_string_bytes(value).into(),
                     Some(ColumnKind::Json) => json_coerce_to_jsonb(value)?,
                     Some(ColumnKind::Geometry) => geometry_coerce_to_internal(value)?.into(),
-                    Some(ColumnKind::Vector) => vector_coerce_to_internal(value)?.into(),
+                    Some(ColumnKind::Vector { dim, datatype }) => {
+                        vector_coerce_to_internal(value, *datatype, *dim)?.into()
+                    }
                     Some(ColumnKind::VarBytes) => value_to_bytes(value).into(),
                     // Column type not externalizable (theoretically never appears in
                     // before_external) — conservatively skip reuse.
@@ -638,13 +641,21 @@ impl Database {
             // Generated values are strictly increasing within this batch.
             // Prove this from the source rows and every unique index; it only
             // removes batch-local hashing, never cross-transaction locking.
-            let generated_unique_batch = rows.len() > 1 && hints.skip_row_lock
+            let generated_unique_batch = rows.len() > 1
+                && hints.skip_row_lock
                 && table.auto_increment_column_index().is_some_and(|column| {
-                    rows.iter().all(|row| matches!(row.get(column), Some(Value::Null)))
-                        && table.indexes.iter().filter(|index| index.enforces_uniqueness()).all(|index| {
-                            !index.has_expression_parts() && index.columns.len() == 1
-                                && index.columns[0].eq_ignore_ascii_case(&table.columns[column].name)
-                        })
+                    rows.iter()
+                        .all(|row| matches!(row.get(column), Some(Value::Null)))
+                        && table
+                            .indexes
+                            .iter()
+                            .filter(|index| index.enforces_uniqueness())
+                            .all(|index| {
+                                !index.has_expression_parts()
+                                    && index.columns.len() == 1
+                                    && index.columns[0]
+                                        .eq_ignore_ascii_case(&table.columns[column].name)
+                            })
                 });
             let first_insert_id = self.assign_auto_increment_values(
                 txn.txn_id,
@@ -679,7 +690,8 @@ impl Database {
             // Even a batch with distinct generated keys can race with another
             // transaction writing explicit keys. Always lock and probe storage.
             let need_unique_checks = has_unique_indexes;
-            let need_batch_unique_keys = need_unique_checks && rows.len() > 1 && !generated_unique_batch;
+            let need_batch_unique_keys =
+                need_unique_checks && rows.len() > 1 && !generated_unique_batch;
             let mut batch_unique_keys_vec: Vec<crate::util::fast_hash::AhHashSet<IndexKey>> =
                 if need_batch_unique_keys {
                     unique_indexes
@@ -748,7 +760,13 @@ impl Database {
                                 self.check_unique_constraint(&table, txn, None, index, key)?;
                             } else {
                                 for values in &prepared_rows {
-                                    self.check_unique_constraint(&table, txn, None, index, table.index_key(index, values)?)?;
+                                    self.check_unique_constraint(
+                                        &table,
+                                        txn,
+                                        None,
+                                        index,
+                                        table.index_key(index, values)?,
+                                    )?;
                                 }
                             }
                         }
@@ -816,7 +834,11 @@ impl Database {
                 )?;
             }
             self.defer_vector_insert_batch(
-                txn.txn_id, &table, table.id, &prepared_rows, &inserted,
+                txn.txn_id,
+                &table,
+                table.id,
+                &prepared_rows,
+                &inserted,
             )?;
             let row_ids = inserted;
             // Foreign-key child-side existence check runs *after* the batch
@@ -939,10 +961,10 @@ impl Database {
 
             let value_payload_capacity = |value: &Value| match value {
                 Value::Decimal(value) | Value::String(value) => value.capacity(),
-                Value::Bytes(value)
-                | Value::Json(value)
-                | Value::Geometry(value)
-                | Value::Vector(value) => value.capacity(),
+                Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => {
+                    value.capacity()
+                }
+                Value::Vector(value) => value.capacity(),
                 _ => 0,
             };
             let prepared_bytes = prepared
@@ -1084,7 +1106,11 @@ impl Database {
                 // partition, so each partition has its own graph.
                 if mode == BulkInsertMode::User {
                     self.defer_vector_insert_batch(
-                        txn.txn_id, table, storage_id, &group_values, &inserted,
+                        txn.txn_id,
+                        table,
+                        storage_id,
+                        &group_values,
+                        &inserted,
                     )?;
                 }
                 for (orig, rid) in group_orig.iter().zip(inserted.iter()) {
@@ -1306,7 +1332,11 @@ impl Database {
             )?;
             if mode == BulkInsertMode::User {
                 self.defer_vector_insert_batch(
-                    txn.txn_id, &table, table.id, &prepared_rows, &inserted,
+                    txn.txn_id,
+                    &table,
+                    table.id,
+                    &prepared_rows,
+                    &inserted,
                 )?;
             }
             row_ids.extend(inserted);
@@ -1342,7 +1372,6 @@ impl Database {
         })();
         result
     }
-
 
     pub fn insert_pre_encoded_rows_heap_only_detailed(
         &self,
@@ -1413,7 +1442,6 @@ impl Database {
         })();
         result
     }
-
 
     pub fn insert_rows_heap_only_detailed(
         &self,
@@ -1503,7 +1531,6 @@ impl Database {
         result
     }
 
-
     pub fn update_rows<F, G>(
         &self,
         txn: TxnView,
@@ -1550,7 +1577,6 @@ impl Database {
             false,
         )
     }
-
 
     fn update_rows_with_changed_columns_inner<F, G>(
         &self,
@@ -1669,10 +1695,10 @@ impl Database {
                 .collect::<Vec<_>>();
             // Row locks and unique-key locks protect this statement-local
             // overlay until the accepted batch is published or rolled back.
-            let mut released_unique_keys: Vec<crate::util::fast_hash::AhHashSet<RowId>> =
-                (0..table.indexes.len())
-                    .map(|_| Default::default())
-                    .collect();
+            let mut released_unique_keys: Vec<crate::util::fast_hash::AhHashSet<RowId>> = (0
+                ..table.indexes.len())
+                .map(|_| Default::default())
+                .collect();
             for row in rows {
                 crate::engine::cancel::check_cancelled()?;
                 if !predicate(&row.values)? {
@@ -1748,7 +1774,8 @@ impl Database {
                         if key == old_key {
                             continue;
                         }
-                        if !index.primary && key.0.iter().any(|part| matches!(part, KeyPart::Null)) {
+                        if !index.primary && key.0.iter().any(|part| matches!(part, KeyPart::Null))
+                        {
                             pending.push((set_pos, None));
                             continue;
                         }
@@ -2493,7 +2520,6 @@ impl Database {
         Ok(())
     }
 
-
     /// Origin-preserving batch UPDATE used by executor index candidates.
     /// Partition heaps allocate RowIds independently, so carrying the storage
     /// id is required to avoid both missed rows and cross-partition aliases.
@@ -2545,7 +2571,6 @@ impl Database {
             apply_updates,
         )
     }
-
 
     /// Like [`update_row_by_id_with_changed_columns`], but with MySQL
     /// no-op detection: when `noop_compare_columns` is `Some(cols)` and
@@ -3234,20 +3259,23 @@ impl Database {
                     &new_values,
                     &reuse_mask,
                 )?;
-                let write_result = self.publish_wal_before_eager_heap_write(txn.txn_id)
-                    .and_then(|_| self.with_heap_mut(storage_id, |heap| {
-                    heap.write_mvcc_ext(
-                        txn.txn_id,
-                        row_id,
-                        RowHeader {
-                            flags: 0,
-                            last_txn_id: txn.txn_id,
-                            undo_ptr: Some(undo_id),
-                        },
-                        &new_values,
-                        &new_external,
-                    )
-                }));
+                let write_result = self
+                    .publish_wal_before_eager_heap_write(txn.txn_id)
+                    .and_then(|_| {
+                        self.with_heap_mut(storage_id, |heap| {
+                            heap.write_mvcc_ext(
+                                txn.txn_id,
+                                row_id,
+                                RowHeader {
+                                    flags: 0,
+                                    last_txn_id: txn.txn_id,
+                                    undo_ptr: Some(undo_id),
+                                },
+                                &new_values,
+                                &new_external,
+                            )
+                        })
+                    });
                 if let Err(e) = write_result {
                     // BUG-2 — free only the freshly-allocated chains; the
                     // reused old chains are still owned by the live row.
@@ -3679,20 +3707,23 @@ impl Database {
             &new_values,
             effective_changed_columns,
         )?;
-        let write_result = self.publish_wal_before_eager_heap_write(txn.txn_id)
-                    .and_then(|_| self.with_heap_mut(storage_id, |heap| {
-            heap.write_mvcc_ext(
-                txn.txn_id,
-                row_id,
-                RowHeader {
-                    flags: 0,
-                    last_txn_id: txn.txn_id,
-                    undo_ptr: Some(undo_id),
-                },
-                &new_values,
-                &new_external,
-            )
-        }));
+        let write_result = self
+            .publish_wal_before_eager_heap_write(txn.txn_id)
+            .and_then(|_| {
+                self.with_heap_mut(storage_id, |heap| {
+                    heap.write_mvcc_ext(
+                        txn.txn_id,
+                        row_id,
+                        RowHeader {
+                            flags: 0,
+                            last_txn_id: txn.txn_id,
+                            undo_ptr: Some(undo_id),
+                        },
+                        &new_values,
+                        &new_external,
+                    )
+                })
+            });
         if let Err(e) = write_result {
             // BUG-2 — free only freshly-allocated chains; reused old
             // chains are still owned by the live row.
@@ -3759,7 +3790,7 @@ impl Database {
                     | ColumnKind::VarBytes
                     | ColumnKind::Json
                     | ColumnKind::Geometry
-                    | ColumnKind::Vector
+                    | ColumnKind::Vector { .. }
                     | ColumnKind::Decimal { .. }
             ) {
                 return true;
@@ -3978,9 +4009,7 @@ impl Database {
             return Ok(0);
         }
         let min_pages = lob_shrink_min_free_pages();
-        let shrunk = self.with_overflow_mut(table_id, |ovf| {
-            ovf.shrink_to_fit(min_pages)
-        })?;
+        let shrunk = self.with_overflow_mut(table_id, |ovf| ovf.shrink_to_fit(min_pages))?;
         if shrunk > 0 {
             self.dml_stats.record_lob_pages_shrunk(shrunk);
         }
@@ -4074,7 +4103,7 @@ fn table_has_externalizable_column(table: &TableSchema) -> bool {
                 | DataTypeKind::Blob { .. }
                 | DataTypeKind::Json
                 | DataTypeKind::Geometry { .. }
-                | DataTypeKind::Vector { dim: None }
+                | DataTypeKind::Vector { dim: None, .. }
         )
     })
 }

@@ -14,8 +14,8 @@ L2_DISTANCE(vector1, vector2)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `vector1` | Yes | VECTOR, valid vector text, or encoded vector bytes | The 1st argument; the first vector |
-| `vector2` | Yes | VECTOR, valid vector text, or encoded vector bytes | The 2nd argument; the second vector |
+| `vector1` | Yes | VECTOR or valid vector text | The 1st argument; the first vector |
+| `vector2` | Yes | VECTOR or valid vector text | The 2nd argument; the second vector |
 
 ## Return Value
 
@@ -31,7 +31,7 @@ Result: 5
 
 ## Notes
 
-- Vector values must be nonempty, contain finite f32 elements, and binary vector operations require equal dimensions. Invalid encodings, dimensions or scalar integer operands return an explicit vector error. Distance metric names are case-insensitive.
+- Vectors must be nonempty, floating elements must be finite, and distance operands must have equal dimensions. Numeric datatypes may be mixed without narrowing the query. BINARY cannot be mixed with numeric vectors. Invalid encodings and scalar integer operands raise a vector error. Raw payloads require `VECTOR_FROM_BINARY`; metric names are case-insensitive.
 
 ## Related Functions
 
