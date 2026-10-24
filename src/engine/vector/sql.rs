@@ -96,17 +96,29 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
                         bb.len() / 4
                     )));
                 }
-                return Ok(Value::Double(distance::dot_bytes(ba, bb) as f64));
+                return Ok(Value::Double(-distance::display_distance_bytes(
+                    ba,
+                    bb,
+                    Metric::Dot,
+                )));
             }
             let (a, b) = two_vectors(name, &values[0], &values[1])?;
-            Ok(Value::Double(distance::dot(&a, &b) as f64))
+            Ok(Value::Double(-distance::display_distance(
+                &a,
+                &b,
+                Metric::Dot,
+            )))
         }
         // pgvector `negative_inner_product` — the value the `<#>` operator
         // orders by. Equals `-DOT_PRODUCT(a, b)`.
         "MAX_INNER_PRODUCT_DISTANCE" => {
             expect_args(name, values, 2, 2)?;
             let (a, b) = two_vectors(name, &values[0], &values[1])?;
-            Ok(Value::Double(-(distance::dot(&a, &b) as f64)))
+            Ok(Value::Double(distance::display_distance(
+                &a,
+                &b,
+                Metric::Dot,
+            )))
         }
         // L2 norm `|v|` (pgvector `vector_norm`).
         "VECTOR_NORM" => {
@@ -115,7 +127,7 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
             if b.is_empty() {
                 return Err(codec::vector_err(format!("{name}: empty vector")));
             }
-            Ok(Value::Double((distance::dot_bytes(&b, &b) as f64).sqrt()))
+            Ok(Value::Double(distance::norm_bytes(&b)))
         }
         // Unit vector `v / |v|` (pgvector `l2_normalize`). A zero vector has no
         // direction, so it is returned unchanged (matching pgvector).
@@ -125,12 +137,8 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
             if b.is_empty() {
                 return Err(codec::vector_err(format!("{name}: empty vector")));
             }
-            let f = codec::to_f32(&b);
-            let norm = (distance::dot(&f, &f)).sqrt();
-            if norm == 0.0 {
-                return Ok(Value::Vector(b));
-            }
-            let out: Vec<f32> = f.iter().map(|x| x / norm).collect();
+            let mut out = codec::to_f32(&b);
+            distance::normalize_in_place(&mut out);
             Ok(Value::Vector(codec::from_f32(&out)))
         }
         // 1-indexed slice `v[start .. start+count)` (pgvector `subvector`).

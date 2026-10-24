@@ -165,6 +165,11 @@ fn validate_vector_index_column(
             .find(|c| c.name.eq_ignore_ascii_case(&index.columns[0]))
         {
             Some(c) if matches!(c.data_type, crate::storage::DataTypeKind::Vector { .. }) => {
+                if vector_storage_paged() && index.vector_algo() == VectorAlgo::Hnsw {
+                    if let crate::storage::DataTypeKind::Vector { dim: Some(dim) } = c.data_type {
+                        VectorIndexFile::validate_hnsw_layout(dim as usize, index.vector_meta().m as usize)?;
+                    }
+                }
                 if c.nullable {
                     return Err(error(
                         crate::error::catalog::ER_NOT_SUPPORTED_YET,

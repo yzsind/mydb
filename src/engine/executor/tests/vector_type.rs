@@ -3366,7 +3366,7 @@ fn vector_backend_files_follow_index_and_table_rename() {
 }
 
 #[test]
-fn join_knn_uses_left_vector_driver_and_preserves_results() {
+fn join_knn_retains_final_relational_topk_and_preserves_results() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
@@ -3389,7 +3389,7 @@ fn join_knn_uses_left_vector_driver_and_preserves_results() {
     let sql = "SELECT /*+ HNSW_EF(64) */ items.id FROM items \
                JOIN tags ON tags.item_id=items.id \
                ORDER BY L2_DISTANCE(items.emb, '[0,0]') LIMIT 5";
-    assert!(explain_mentions_vector_index(&engine, sql));
+    assert!(!explain_mentions_vector_index(&engine, sql));
     assert_eq!(id_list(&engine, sql), vec![1, 2, 3, 4, 5]);
 }
 
@@ -5324,6 +5324,9 @@ fn paged_hnsw_delta_wal_recovers_after_crash() {
             .unwrap();
         rows.extend(extra);
         rows.retain(|(id, _)| id % 5 != 0);
+        // The derived completion marker follows CommitTxn. Make that marker
+        // durable to exercise complete-delta redo rather than safe rebuild.
+        engine.database().wal_log().lock().flush().unwrap();
         // Crash: no checkpoint, no buffer-pool writeback.
         std::mem::forget(engine);
     }
@@ -5342,4 +5345,146 @@ fn paged_hnsw_delta_wal_recovers_after_crash() {
     }
     // The durable graph was replayed (tombstones included), not rebuilt.
     assert_eq!(hnsw_stats(&engine).unwrap(), (500, 400, 100));
+}
+
+#[path = "hnsw_regressions.rs"]
+mod hnsw_regressions;
+
+#[test]
+fn review_20261024_hnsw_replica_wal_dml_refreshes_warm_graph() {
+    for backend in ["memory", "paged"] {
+        for partitioned in [false, true] {
+            hnsw_replica_case(backend, partitioned);
+        }
+    }
+}
+
+fn hnsw_replica_case(backend: &str, partitioned: bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    let _env = paged_index_env();
+    let _backend = HnswEnv::set(&[("MYDB_VECTOR_STORAGE", backend)]);
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    {
+        let engine = open_strict_test_engine(source.path());
+        let partition = if partitioned {
+            " PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(2),PARTITION p1 VALUES LESS THAN MAXVALUE)"
+        } else {
+            ""
+        };
+        engine
+            .execute(&format!(
+                "CREATE TABLE items(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL){partition}"
+            ))
+            .unwrap();
+        engine
+            .execute("INSERT INTO items VALUES (1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')")
+            .unwrap();
+        engine
+            .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW")
+            .unwrap();
+    }
+    copy_tree(source.path(), target.path());
+    let mut role = crate::repl::role::RoleState::new_standalone();
+    role.demote_to_replica("127.0.0.1:1".into());
+    crate::repl::role::save(target.path(), &role).unwrap();
+    let master = open_strict_test_engine(source.path());
+    let replica = open_strict_test_engine(target.path());
+    replica.database().set_physical_replica_mode(true).unwrap();
+    let sql = "SELECT /*+ HNSW_EF(64) */ id FROM items ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1";
+    assert_eq!(id_list(&replica, sql), vec![1]);
+    // Mirror the applier's real WAL projection, without TCP timing in the test.
+    let mut next_lsn = replica.database().wal_log().lock().last_lsn() + 1;
+    for (dml, expected) in [
+        ("INSERT INTO items VALUES (4,'[0,0,0]')", 4),
+        ("UPDATE items SET emb='[40,0,0]' WHERE id=4", 1),
+        ("DELETE FROM items WHERE id=1", 2),
+    ] {
+        master.execute(dml).unwrap();
+        master.database().wal_log().lock().flush().unwrap();
+        let scan = crate::wal::LogManager::scan(source.path()).unwrap();
+        // Persist the same physical frames as the real receiver before page
+        // redo. Applying only decoded records cannot support a restart test.
+        let after = next_lsn - 1;
+        let prefixes = master
+            .database()
+            .wal_log()
+            .lock()
+            .pin_prefix_after(after, None)
+            .unwrap();
+        for prefix in prefixes {
+            let mut file = prefix.file.open().unwrap().try_clone().unwrap();
+            file.seek(SeekFrom::Start(prefix.start_offset)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(prefix.len - prefix.start_offset)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let frame = crate::wal::decode_frame_for_replication(&bytes[offset..]).unwrap();
+                if frame.header.lsn > replica.database().wal_log().lock().last_lsn() {
+                    replica
+                        .database()
+                        .wal_log()
+                        .lock()
+                        .append_replication_frame(&bytes[offset..offset + frame.frame_len], &frame)
+                        .unwrap();
+                }
+                offset += frame.frame_len;
+            }
+        }
+        replica.database().wal_log().lock().flush().unwrap();
+        for record in scan.records.iter().filter(|r| r.lsn >= next_lsn) {
+            replica.database().apply_wal_record(record).unwrap();
+        }
+        next_lsn = scan.next_lsn;
+        let mut session = SessionContext::default();
+        assert_eq!(
+            id_list_session(&replica, &mut session, sql),
+            vec![expected],
+            "replica after {dml}"
+        );
+        assert!(
+            session.warnings.is_empty(),
+            "unexpected fallback: {:?}",
+            session.warnings
+        );
+        let stats = replica.database().vector_index_runtime_stats();
+        assert_eq!(stats.len(), 1);
+        let stats = stats.values().next().unwrap();
+        assert_eq!(stats.backend, "memory");
+
+        let brute = sql.replace("HNSW_EF(64)", "NO_VECTOR_INDEX()");
+        assert_eq!(id_list(&replica, sql), id_list(&replica, &brute));
+    }
+    replica.database().set_physical_replica_mode(false).unwrap();
+    crate::repl::role::save(
+        target.path(),
+        &crate::repl::role::RoleState::new_standalone(),
+    )
+    .unwrap();
+    assert_eq!(
+        id_list(&replica, sql),
+        vec![2],
+        "promoted {backend}, partitioned={partitioned}"
+    );
+    drop(replica);
+    let promoted = open_strict_test_engine(target.path());
+    assert_eq!(
+        id_list(&promoted, sql),
+        vec![2],
+        "promoted restart {backend}, partitioned={partitioned}"
+    );
 }

@@ -9687,6 +9687,23 @@ fn try_knn_vector_scan(
     filter: Option<Expr>,
     possible_keys: Vec<String>,
 ) -> Option<PhysicalPlan> {
+    // A scan-level TopK cannot cross operators that change row multiplicity
+    // or need the complete input. Keep their final relational TopK intact.
+    if select.from.len() > 1
+        || !select.joins.is_empty()
+        || select.distinct
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || has_aggregate_select_items(&select.projection)
+        || select.having.is_some()
+        || has_window_in_projection(&select.projection)
+        || select
+            .order_by
+            .iter()
+            .any(|order| expr_has_window_function(&order.expr))
+    {
+        return None;
+    }
     // M5.5 — partitioned tables run scatter-gather over per-partition HNSW
     // graphs at execution time. The planner builds the same VectorIndexScan
     // node; the executor (see `execute_vector_index_scan`) peeks
@@ -12248,7 +12265,7 @@ fn build_index_ffs_plan(
     })
 }
 
-fn table_row_estimate(_db: &Database, table: &PlanTable) -> Result<f64, QueryError> {
+pub(crate) fn table_row_estimate(_db: &Database, table: &PlanTable) -> Result<f64, QueryError> {
     // Planning must stay non-blocking. When stats are stale, use the
     // catalog row count plus the modification counter instead of scanning
     // the heap for an exact count; execution paths that need exact rows

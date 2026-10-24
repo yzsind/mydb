@@ -561,7 +561,7 @@ impl MemoryIvf {
     /// probe (nprobe); it is clamped to `[1, nlist]`. Returns up to `k`
     /// `(RowId, ordering_distance)` ascending — an approximate superset the
     /// executor re-ranks under MVCC.
-    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f32)> {
+    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f64)> {
         let g = self.inner.read();
         if !g.trained || g.dim == 0 || query.len() != g.dim || k == 0 || g.nlist == 0 {
             return Vec::new();
@@ -581,7 +581,7 @@ impl MemoryIvf {
         // 1) Coarse search: distance from the query to every centroid, take the
         //    nprobe nearest. `nlist` is small, so a full scan + partial select
         //    is cheap relative to the list scans below.
-        let mut cent: Vec<(f32, usize)> = (0..g.nlist)
+        let mut cent: Vec<(f64, usize)> = (0..g.nlist)
             .map(|c| {
                 let cs = &g.centroids[c * g.dim..c * g.dim + g.dim];
                 (distance::ordering_distance(&q, cs, self.metric), c)
@@ -712,7 +712,7 @@ pub(super) fn probe_centroids(
     metric: Metric,
     nprobe: usize,
 ) -> Vec<usize> {
-    let mut cent: Vec<(f32, usize)> = (0..nlist)
+    let mut cent: Vec<(f64, usize)> = (0..nlist)
         .map(|c| {
             let cs = &centroids[c * dim..c * dim + dim];
             (distance::ordering_distance(q, cs, metric), c)
@@ -746,14 +746,14 @@ pub(super) fn nearest_centroid(
     metric: Metric,
 ) -> usize {
     let mut best = 0usize;
-    let mut best_d = f32::INFINITY;
+    let mut best_d = f64::INFINITY;
     let mut start = 0;
     if metric == Metric::L2 && dim >= 32 {
         while start + 4 <= nlist {
             let scores = distance::l2_sq_batch4(v, &centroids[start * dim..(start + 4) * dim], dim);
             for (offset, d) in scores.into_iter().enumerate() {
-                if d < best_d {
-                    best_d = d;
+                if (d as f64) < best_d {
+                    best_d = d as f64;
                     best = start + offset;
                 }
             }
@@ -1014,7 +1014,7 @@ pub(super) struct TopK {
 }
 
 struct HeapItem {
-    dist: f32,
+    dist: f64,
     rid: RowId,
 }
 
@@ -1045,7 +1045,8 @@ impl TopK {
     }
 
     #[inline]
-    pub(super) fn push(&mut self, dist: f32, rid: RowId) {
+    pub(super) fn push(&mut self, dist: impl Into<f64>, rid: RowId) {
+        let dist = dist.into();
         if self.heap.len() < self.k {
             self.heap.push(HeapItem { dist, rid });
         } else if let Some(mut top) = self.heap.peek_mut() {
@@ -1055,8 +1056,8 @@ impl TopK {
         }
     }
 
-    pub(super) fn into_sorted(self) -> Vec<(RowId, f32)> {
-        let mut v: Vec<(RowId, f32)> = self.heap.into_iter().map(|it| (it.rid, it.dist)).collect();
+    pub(super) fn into_sorted(self) -> Vec<(RowId, f64)> {
+        let mut v: Vec<(RowId, f64)> = self.heap.into_iter().map(|it| (it.rid, it.dist)).collect();
         v.sort_by(|a, b| a.1.total_cmp(&b.1));
         v
     }
@@ -1324,7 +1325,7 @@ mod tests {
                 for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
                     for (_, query) in &data {
                         let mut best = 0;
-                        let mut score = f32::INFINITY;
+                        let mut score = f64::INFINITY;
                         for c in 0..nlist {
                             let d = distance::ordering_distance(
                                 query,
@@ -1395,7 +1396,7 @@ mod tests {
     }
 
     fn exact_knn(data: &[(RowId, Vec<f32>)], q: &[f32], k: usize, metric: Metric) -> Vec<RowId> {
-        let mut scored: Vec<(f32, RowId)> = data
+        let mut scored: Vec<(f64, RowId)> = data
             .iter()
             .map(|(rid, v)| (distance::ordering_distance(q, v, metric), *rid))
             .collect();

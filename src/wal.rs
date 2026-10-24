@@ -4209,6 +4209,39 @@ impl WalPayload {
         before: &[u8],
         after: &[u8],
     ) -> Option<Self> {
+        Self::page_delta_with_hashes(path, page_id, base_lsn, before, after, None)
+    }
+
+    /// Identical to `page_delta`, for formats that can calculate the full-page
+    /// CRC from a shorter canonical representation. Hashes include every byte,
+    /// including the page's stored checksum and zero padding.
+    pub(crate) fn page_delta_prehashed(
+        path: String,
+        page_id: u64,
+        base_lsn: u64,
+        before: &[u8],
+        after: &[u8],
+        base_crc: u32,
+        after_crc: u32,
+    ) -> Option<Self> {
+        Self::page_delta_with_hashes(
+            path,
+            page_id,
+            base_lsn,
+            before,
+            after,
+            Some((base_crc, after_crc)),
+        )
+    }
+
+    fn page_delta_with_hashes(
+        path: String,
+        page_id: u64,
+        base_lsn: u64,
+        before: &[u8],
+        after: &[u8],
+        hashes: Option<(u32, u32)>,
+    ) -> Option<Self> {
         if before.len() != 16384 || after.len() != 16384 || base_lsn == 0 {
             return None;
         }
@@ -4217,12 +4250,14 @@ impl WalPayload {
         if compressed_after.len() > WAL_PAGE_DELTA_MAX_BYTES {
             return None;
         }
+        let (base_crc, after_crc) =
+            hashes.unwrap_or_else(|| (crc32fast::hash(before), crc32fast::hash(after)));
         Some(Self::PageDelta {
             path,
             page_id,
             base_lsn,
-            base_crc: crc32fast::hash(before),
-            after_crc: crc32fast::hash(after),
+            base_crc,
+            after_crc,
             compressed_after,
         })
     }

@@ -1554,7 +1554,7 @@ mod ivf_page_tests {
     }
 
     fn brute_knn(vecs: &[Vec<f32>], q: &[f32], k: usize, metric: Metric) -> Vec<u32> {
-        let mut scored: Vec<(f32, u32)> = vecs
+        let mut scored: Vec<(f64, u32)> = vecs
             .iter()
             .enumerate()
             .map(|(i, v)| {
@@ -2242,7 +2242,7 @@ mod ivf_page_tests {
             let (mut got, _, exact) = ivf.try_search_with_stats(query, 40, 8).unwrap();
             assert!(!exact);
             for (rid, score) in &mut got {
-                *score = crate::engine::vector::distance::l2_sq(query, &vectors[rid.page_id as usize]);
+                *score = crate::engine::vector::distance::ordering_distance(query, &vectors[rid.page_id as usize], crate::engine::vector::Metric::L2);
             }
             got.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.page_id.cmp(&b.0.page_id)));
             query_time += started.elapsed();

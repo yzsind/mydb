@@ -5613,7 +5613,7 @@ pub(super) fn execute_vector_index_scan(
     // A recovered/sealed graph contains physical current vectors. Prepared
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
-    if db.xa_status_counters().0 > 0 {
+    if db.xa_status_counters().0 > 0 || db.vector_snapshot_requires_exact(txn) {
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -5676,8 +5676,12 @@ pub(super) fn execute_vector_index_scan(
         (configured_max_scan as usize).max(k)
     };
     let mut eval_ctx = EvalQueryContext::default();
-    let mut scored: Vec<(f32, PlanRow)> = Vec::new();
-    let mut effort = base_effort;
+    let mut scored: Vec<(f64, PlanRow)> = Vec::new();
+    let mut effort = if is_ivf {
+        base_effort
+    } else {
+        base_effort.min(max_scan)
+    };
     let mut candidate_want = if is_ivf {
         ivf_rerank_fetch(k, hnsw_cfg.ivf_rerank_mult)
     } else {
@@ -5719,6 +5723,8 @@ pub(super) fn execute_vector_index_scan(
         candidate_want = k;
     }
 
+    let partition_budget = max_scan / storage_ids.len().max(1);
+
     // Candidates already heap-read and filtered, keyed by partition-qualified
     // row identity. Widening re-runs the graph search with a larger pool but
     // never re-reads or re-evaluates a row an earlier pass already judged, so
@@ -5726,13 +5732,16 @@ pub(super) fn execute_vector_index_scan(
     let mut seen: std::collections::HashSet<(u64, RowId)> = std::collections::HashSet::new();
     let mut examined = 0usize;
     let exact_fallback = loop {
+        if !is_ivf && candidate_want.saturating_mul(storage_ids.len()) > max_scan {
+            break true;
+        }
         // Exchange candidates from every partition graph. The graph *explores*
         // `want` (= ef_search) breadth for recall, but we only re-rank the top
         // `rerank_want` of those by graph distance — each re-rank is a heap
         // `read_row`, so fetching ef_search of them was the dominant fixed
         // query cost. Widening below grows the pool when too few survive
         // MVCC visibility or the residual filter.
-        let mut candidates: Vec<(u64, RowId, f32)> = Vec::new();
+        let mut candidates: Vec<(u64, RowId, f64)> = Vec::new();
         let mut all_backends_exhausted = true;
         let mut pool_saturated = false;
         for sid in &storage_ids {
@@ -5741,12 +5750,14 @@ pub(super) fn execute_vector_index_scan(
                 rerank_limit: if is_ivf {
                     candidate_want
                 } else {
-                    vector_rerank_fetch(k, effort).min(max_scan).max(k)
+                    vector_rerank_fetch(k, effort).min(partition_budget).max(k)
                 },
                 effort: if is_ivf {
                     vector::VectorSearchEffort::Ivf { nprobe: effort }
                 } else {
-                    vector::VectorSearchEffort::Hnsw { ef: effort }
+                    vector::VectorSearchEffort::Hnsw {
+                        ef: effort.min(partition_budget).max(k),
+                    }
                 },
             };
             let part_result = match db.vector_index_search_for_partition(
@@ -5819,7 +5830,7 @@ pub(super) fn execute_vector_index_scan(
                 candidates.extend(
                     txn_delta
                         .into_iter()
-                        .map(|rid| (*sid, rid, f32::NEG_INFINITY)),
+                        .map(|rid| (*sid, rid, f64::NEG_INFINITY)),
                 );
             }
         }
@@ -5827,7 +5838,12 @@ pub(super) fn execute_vector_index_scan(
         // the closest copy in stale-graph cases.
         candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
 
+        let mut budget_exhausted = false;
         for (sid, row_id, graph_dist) in candidates {
+            if examined >= max_scan {
+                budget_exhausted = true;
+                break;
+            }
             // (storage_id, row_id) is the partition-disambiguated identity.
             // A row judged by an earlier, narrower pass keeps its verdict.
             if !seen.insert((sid, row_id)) {
@@ -5891,18 +5907,34 @@ pub(super) fn execute_vector_index_scan(
                 }
             }
         }
+        if budget_exhausted {
+            break true;
+        }
         if scored.len() >= k || matches!(iterative_scan, IterativeScan::Off) {
             break false;
         }
         // Every backend proved it holds no further candidates: a short
         // result is the true answer.
         if all_backends_exhausted && !pool_saturated {
-            break false;
+            // An ANN frontier can exhaust a disconnected component, or contain
+            // multiple versions of the same row. It cannot prove heap exhaustion.
+            break !is_ivf;
         }
         // Rows exist beyond what the ANN budget may inspect. Returning a
         // short LIMIT would silently drop matching rows, so finish exactly.
         if examined >= max_scan {
             break true;
+        }
+        // Once observed filtering would require random heap reads for a
+        // substantial part of the relation, a bounded streaming TopK is cheaper.
+        // A smoothed survival estimate avoids treating one empty pool as proof
+        // that a selective predicate has no matches.
+        if !is_ivf && filter.is_some() && examined >= 64 {
+            let population = crate::planner::table_row_estimate(db, table)?;
+            let survival = (scored.len() as f64 + 2.0) / (examined as f64 + 16.0);
+            if population > 0.0 && k as f64 / survival > population * 0.25 {
+                break true;
+            }
         }
         if is_ivf {
             // First retain more candidates from the already-selected cells;
@@ -5923,11 +5955,11 @@ pub(super) fn execute_vector_index_scan(
                 break true;
             }
             let next = effort.max(candidate_want).saturating_mul(2).min(max_scan);
-            effort = effort.max(next);
+            effort = next;
             candidate_want = next.max(k);
         }
     };
-    if exact_fallback {
+    if exact_fallback || db.vector_snapshot_requires_exact(txn) {
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -5968,25 +6000,63 @@ pub(super) fn execute_vector_brute_scan_filtered(
     k: usize,
     filter: &Expr,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+    use crate::engine::vector::hnsw_core::Scored;
+    if k == 0 {
+        return Ok(Vec::new());
+    }
     let mut eval_ctx = EvalQueryContext::default();
-    let mut scored = Vec::new();
-    for stored in db.scan_rows(&table.schema.qualified_name(), txn)? {
-        let Some(Value::Vector(bytes)) = stored.values.get(col_idx) else {
-            continue;
+    let mut admitted =
+        ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, 0)?;
+    let mut best: std::collections::BinaryHeap<Scored<usize>> = std::collections::BinaryHeap::new();
+    let mut retained: Vec<Option<PlanRow>> = Vec::new();
+    let mut row_bytes: Vec<usize> = Vec::new();
+    db.scan_rows_ordered_streaming(&table.schema.qualified_name(), txn, |values| {
+        crate::engine::cancel::check_cancelled()?;
+        let Some(Value::Vector(bytes)) = values.get(col_idx) else {
+            return Ok(());
         };
         if bytes.len() != query_vector.len() {
-            continue;
+            return Ok(());
+        }
+        let row = stored_row_to_plan_row(table, values.to_vec())?;
+        if !eval_plan_bool_with_db(db, txn, filter, &row, &mut eval_ctx)? {
+            return Ok(());
         }
         let distance =
             crate::engine::vector::distance::ordering_distance_bytes(query_vector, bytes, metric);
-        let row = stored_row_to_plan_row(table, stored.values)?;
-        if eval_plan_bool_with_db(db, txn, filter, &row, &mut eval_ctx)? {
-            scored.push((distance, row));
+        let distance = if distance.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            distance
+        };
+        if best.len() < k {
+            let bytes = super::nested_loop::materialized_plan_row_charge(&row);
+            admitted.try_grow(bytes)?;
+            let slot = retained.len();
+            retained.push(Some(row));
+            row_bytes.push(bytes);
+            best.push(Scored {
+                dist: distance,
+                id: slot,
+            });
+        } else if best.peek().is_some_and(|worst| distance < worst.dist) {
+            let mut worst = best.peek_mut().expect("nonempty bounded top-k");
+            let slot = worst.id;
+            let bytes = super::nested_loop::materialized_plan_row_charge(&row);
+            admitted.try_grow(bytes.saturating_sub(row_bytes[slot]))?;
+            admitted.shrink(row_bytes[slot].saturating_sub(bytes));
+            row_bytes[slot] = bytes;
+            retained[slot] = Some(row);
+            worst.dist = distance;
         }
-    }
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    scored.truncate(k);
-    Ok(scored.into_iter().map(|(_, row)| row).collect())
+        Ok(())
+    })?;
+    Ok(best
+        .into_sorted_vec()
+        .into_iter()
+        .map(|score| retained[score.id].take().expect("retained top-k row"))
+        .collect())
 }
 
 /// Brute-force **exact** KNN over a `VECTOR(n)` column with no HNSW index

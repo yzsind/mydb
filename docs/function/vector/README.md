@@ -1,5 +1,7 @@
 # Vector Functions
 
+For HNSW query behavior, storage limits and recovery, see [Vector indexes](../../vector-indexes.md).
+
 | Function | Description |
 | --- | --- |
 | [`COSINE_DISTANCE`](cosine_distance.md) | Computes the cosine distance between two vectors. |

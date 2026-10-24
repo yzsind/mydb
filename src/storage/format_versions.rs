@@ -43,7 +43,8 @@ pub const COLLATION_KEY_VERSION: u32 = 2;
 pub const UNDO_BINARY_VERSION: u8 = 13;
 pub const UNDO_TABLESPACE_VERSION: u32 = 1;
 pub const OVERFLOW_VERSION: u16 = 3;
-pub const PAGED_HNSW_INDEX_VERSION: u32 = 3;
+/// v4 records the committed heap coverage frontier.
+pub const PAGED_HNSW_INDEX_VERSION: u32 = 4;
 pub const PAGED_HNSW_PAGE_VERSION: u16 = 1;
 pub const PAGED_IVF_INDEX_VERSION: u32 = 2;
 pub const PAGED_IVF_PAGE_VERSION: u16 = 2;

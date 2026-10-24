@@ -728,7 +728,7 @@ impl PagedIvf {
     /// approximate superset the executor re-ranks under MVCC. A read error
     /// degrades to an empty candidate set (never an error).
     #[cfg(test)]
-    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f32)> {
+    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f64)> {
         self.try_search(query, k, effort).unwrap_or_else(|e| {
             log_message(format!("ivf(paged): search failed: {e:?}"));
             Vec::new()
@@ -741,7 +741,7 @@ impl PagedIvf {
         query: &[f32],
         k: usize,
         effort: usize,
-    ) -> Result<Vec<(RowId, f32)>, QueryError> {
+    ) -> Result<Vec<(RowId, f64)>, QueryError> {
         self.ensure_searchable()?;
         self.search_inner(query, k, effort)
             .map(|(rows, _, _)| rows)
@@ -753,7 +753,7 @@ impl PagedIvf {
         query: &[f32],
         k: usize,
         effort: usize,
-    ) -> Result<(Vec<(RowId, f32)>, usize, bool), QueryError> {
+    ) -> Result<(Vec<(RowId, f64)>, usize, bool), QueryError> {
         self.ensure_searchable()?;
         self.search_inner(query, k, effort)
             .inspect_err(|_| self.needs_rebuild.store(true, Ordering::Release))
@@ -775,7 +775,7 @@ impl PagedIvf {
         query: &[f32],
         k: usize,
         effort: usize,
-    ) -> Result<(Vec<(RowId, f32)>, usize, bool), QueryError> {
+    ) -> Result<(Vec<(RowId, f64)>, usize, bool), QueryError> {
         let dim = self.file.dim();
         if !self.file.is_trained() || dim == 0 || query.len() != dim || k == 0 {
             return Ok((Vec::new(), 0, false));

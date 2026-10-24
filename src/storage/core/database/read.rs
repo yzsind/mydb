@@ -1055,7 +1055,7 @@ impl Database {
         // already pads to the latest schema, so a positional
         // `row.values.get(idx)` after that always returns a coherent
         // value (DEFAULT or otherwise).
-        let Some(row) = self.read_row(table, row_id, txn)? else {
+        let Some(row) = self.read_row_at(table, storage_id, row_id, txn)? else {
             return Ok(None);
         };
         Ok(Some(

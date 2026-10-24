@@ -595,6 +595,12 @@ impl Database {
             }
         }
         self.log.lock().set_physical_replica(enabled);
+        if !enabled && role_changed {
+            if let Err(error)=self.invalidate_promoted_hnsw_files() {
+                self.log.lock().set_physical_replica(true);
+                return Err(error);
+            }
+        }
         if enabled {
             // Publish the receiving role before draining vector readers. A
             // graph opened concurrently with invalidation must observe this

@@ -246,6 +246,9 @@ impl Database {
             self.mark_applied_txn_writer(txn_id, undo_head);
         }
         if let Some(path) = replica_payload_path(&record.payload) {
+            if replica_payload_is_write(&record.payload) {
+                if let Some(storage) = Self::parse_heap_table_id(path) { self.note_replicated_hnsw_heap(txn_id, storage); }
+            }
             let mut tracker = self.replica_restartpoint_tracker.lock().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
@@ -646,7 +649,12 @@ impl Database {
                 commit_unix_us,
                 ..
             } => {
+                let schema_changed=self.applier_dd_dirty_txns.lock().get(&txn_id).is_some_and(|delta|delta.dd_touched);
+                self.vector_snapshot_floor.fetch_max(*commit_scn, Ordering::AcqRel);
+                self.invalidate_replicated_hnsw_commit(txn_id, false);
                 self.apply_commit_txn(txn_id, *commit_scn)?;
+                self.invalidate_replicated_hnsw_commit(txn_id, true);
+                if schema_changed { self.replicated_hnsw_table_cache.write().clear(); }
                 self.commit_hlc_unix_us
                     .fetch_max(*commit_unix_us, Ordering::AcqRel);
                 if *commit_unix_us != 0 && self.temporal_history.has_history_index_batch(txn_id) {
@@ -665,6 +673,7 @@ impl Database {
                     .discard_uncommitted_history_index_batch(txn_id);
             }
             WalPayload::EndTxn => {
+                self.replicated_hnsw_dirty.lock().remove(&txn_id);
                 if self
                     .txns
                     .read()
@@ -1452,6 +1461,7 @@ impl Database {
         // Apply via the live IndexFile so concurrent SELECTs see the
         // changes immediately.
         if let Some((table_id, index_name)) = self.parse_index_table_and_name(path) {
+            self.note_replicated_hnsw(txn_id, table_id, &index_name);
             let entries = ops
                 .iter()
                 .map(|op| {

@@ -56,7 +56,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -73,8 +73,8 @@ use crate::types::QueryError;
 
 /// Whether SQ8 graph-navigation quantization is enabled. Reads
 /// `MYDB_HNSW_QUANTIZE` on every (re)build decision (cheap, runtime-toggleable
-/// from tests / benches); defaults to `true`. Only ever consulted for the L2
-/// metric — Dot/Cosine keep the exact f32 navigation path.
+/// from tests / benches); defaults to `true`. L2 and unit-normalized cosine
+/// use SQ8 navigation; Dot retains exact navigation.
 fn quant_enabled_env() -> bool {
     #[cfg(not(test))]
     {
@@ -176,6 +176,7 @@ struct QuantArena {
     /// range of every other dimension.
     mids: Vec<f32>,
     inv_scale: f32,
+    _charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
 }
 
 /// Nodes per [`CodeChunk`].
@@ -281,6 +282,32 @@ impl QuantArena {
     /// `id`, in integer SSD units (the caller scales by `scale_sq`). Exactly
     /// equal to `l2_ssd_i8(qcodes, codes_for(id))` — same integer value, one
     /// `sdot` instead of the widen-subtract-square loop.
+    /// Query and incremental-link probes share metric space and range checks.
+    fn prepare_query(&self, metric: Metric, vector: &[f32]) -> Option<(Vec<i8>, i32)> {
+        if vector.len() != self.dim {
+            return None;
+        }
+        let mut normalized = Vec::new();
+        let source = if metric == Metric::Cosine {
+            normalized.extend_from_slice(vector);
+            super::distance::normalize_in_place(&mut normalized);
+            normalized.as_slice()
+        } else {
+            vector
+        };
+        if source
+            .iter()
+            .zip(&self.mids)
+            .any(|(&x, &mid)| !x.is_finite() || ((x - mid) * self.inv_scale).abs() > 127.5)
+        {
+            return None;
+        }
+        let mut codes = vec![0; self.dim];
+        self.quantize(source, &mut codes);
+        let norm = super::distance::ssq_i8(&codes);
+        Some((codes, norm))
+    }
+
     #[inline]
     fn ssd_from_query(&self, qcodes: &[i8], qnorm: i32, id: u32) -> i32 {
         qnorm + self.norm(id) - 2 * dot_i8(qcodes, self.codes_for(id))
@@ -320,18 +347,14 @@ impl CompactHnswStats {
             self.valid = false;
             return;
         }
-        let inv_norm = if self.metric == Metric::Cosine {
-            let ssq = vector.iter().map(|x| x * x).sum::<f32>();
-            if ssq > 0.0 {
-                ssq.sqrt().recip()
-            } else {
-                1.0
-            }
+        let norm = if self.metric == Metric::Cosine {
+            super::distance::norm(vector)
         } else {
             1.0
         };
+        let inv_norm = if norm > 0.0 { norm.recip() } else { 1.0 };
         for &x in vector {
-            let x = x * inv_norm;
+            let x = (x as f64 * inv_norm) as f32;
             if !x.is_finite() {
                 self.valid = false;
                 return;
@@ -366,7 +389,7 @@ impl CompactHnswStats {
         if !self.quantizable() {
             return None;
         }
-        let mid = (self.vmax + self.vmin) * 0.5;
+        let mid = (self.vmax as f64 * 0.5 + self.vmin as f64 * 0.5) as f32;
         let inv_scale = 254.0 / (self.vmax - self.vmin);
         let scale_sq = inv_scale.recip().powi(2);
         let dist_mul = if self.metric == Metric::Cosine {
@@ -374,7 +397,8 @@ impl CompactHnswStats {
         } else {
             scale_sq
         };
-        Some((mid, inv_scale, dist_mul))
+        (mid.is_finite() && inv_scale.is_normal() && dist_mul.is_normal())
+            .then_some((mid, inv_scale, dist_mul))
     }
 
     /// Conservative capacity envelope. Exact f32 vectors are absent.
@@ -386,7 +410,8 @@ impl CompactHnswStats {
         // The 2× edge allowance covers deferred reverse edges and Vec growth.
         let per_node = 256usize
             .saturating_add(m0.saturating_mul(std::mem::size_of::<u32>() * 2))
-            .saturating_add(m.saturating_mul(std::mem::size_of::<u32>() * 2));
+            .saturating_add(m.saturating_mul(std::mem::size_of::<u32>() * 2))
+            .saturating_add(m0.saturating_mul(std::mem::size_of::<f64>() * 2));
         let topology = self.rows.saturating_mul(per_node);
         let scratch = threads
             .max(1)
@@ -447,13 +472,7 @@ impl CompactHnswBuilder {
         let src = if self.stats.metric == Metric::Cosine {
             self.normalized.clear();
             self.normalized.extend_from_slice(vector);
-            let ssq = self.normalized.iter().map(|x| x * x).sum::<f32>();
-            if ssq > 0.0 {
-                let inv = ssq.sqrt().recip();
-                for x in &mut self.normalized {
-                    *x *= inv;
-                }
-            }
+            super::distance::normalize_in_place(&mut self.normalized);
             self.normalized.as_slice()
         } else {
             vector
@@ -477,6 +496,7 @@ impl CompactHnswBuilder {
             self.scale_sq
         };
         *self.graph.quant.write() = Some(Arc::new(QuantArena {
+            _charge: None,
             update_epoch: 0,
             chunks: std::mem::replace(&mut self.codes, ArenaCodesBuilder::new(0)).finish(),
             n: self.stats.rows,
@@ -616,7 +636,7 @@ pub(crate) struct BuildAux {
     /// float scan rather than an O(m) arena-fetch recomputation. By convention
     /// `ndist[id]` is only ever touched while holding `neighbors[id]`'s lock, so
     /// its own mutex is always effectively uncontended.
-    ndist: Vec<Mutex<Vec<Vec<f32>>>>,
+    ndist: Vec<Mutex<Vec<Vec<f64>>>>,
     /// Extra navigable headroom kept above `m` during the link (the list is
     /// capped at `m + nav_slack` closest, not `m`). A little headroom keeps the
     /// during-build navigation scaffolding richer — closer to the soft-cap path's
@@ -995,6 +1015,7 @@ struct Topology {
 
 /// An in-memory HNSW graph over `f32` vectors keyed by `RowId`.
 pub(crate) struct HnswIndex {
+    valid: AtomicBool,
     metric: Metric,
     m: usize,
     m0: usize,
@@ -1040,12 +1061,14 @@ pub(crate) struct HnswIndex {
     /// deserialisation recomputes it from the node flags so the runtime stat
     /// doesn't need its own version bump.
     stale_count: AtomicU32,
-    /// Published SQ8 navigation arena (L2 only), or `None` when quantization is
+    /// Published SQ8 navigation arena (L2/cosine), or `None` when quantization is
     /// disabled / not yet built / degenerate. Read-cloned (cheap `Arc`) at the
     /// top of each search; rebuilt lazily when enough new nodes have accrued.
     quant: RwLock<Option<Arc<QuantArena>>>,
     /// Serialises arena (re)builds so concurrent searches don't each rebuild.
     quant_build: Mutex<()>,
+    quant_async: AtomicBool,
+    quant_refresh_requested: AtomicBool,
     update_epoch: AtomicU64,
     mutation_epoch: AtomicU64,
     /// Maps `pack_row(row_id)` → every node id appended for that key. An UPDATE
@@ -1069,7 +1092,9 @@ pub(crate) struct HnswIndex {
     /// its replacement before publishing it, so concurrent DML never cancels
     /// or is lost by compaction.
     compacting: AtomicBool,
-    compaction_log: Mutex<Option<Vec<u32>>>,
+    compaction_log: Mutex<Option<HashSet<u32>>>,
+    compaction_log_cap: AtomicUsize,
+    compaction_cancelled: AtomicBool,
     /// Next node version handle (see `Node::seq`).
     next_seq: AtomicU64,
     /// Topology-only graph built from SQ8 codes (paged cold build): nodes
@@ -1174,7 +1199,7 @@ impl ReadOnlyHnswIndex {
         Self { graph }
     }
 
-    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f32)> {
+    pub(crate) fn search(&self, query: &[f32], k: usize, effort: usize) -> Vec<(RowId, f64)> {
         self.graph.search(query, k, effort)
     }
 }
@@ -1200,6 +1225,7 @@ impl HnswIndex {
     pub(crate) fn new(metric: Metric, m: usize, ef_construction: usize) -> Self {
         let m = m.max(2);
         HnswIndex {
+            valid: AtomicBool::new(true),
             metric,
             m,
             m0: m * 2,
@@ -1220,6 +1246,8 @@ impl HnswIndex {
             stale_count: AtomicU32::new(0),
             quant: RwLock::new(None),
             quant_build: Mutex::new(()),
+            quant_async: AtomicBool::new(false),
+            quant_refresh_requested: AtomicBool::new(false),
             update_epoch: AtomicU64::new(0),
             mutation_epoch: AtomicU64::new(0),
             row_index: std::array::from_fn(|_| Mutex::new(HashMap::new())),
@@ -1228,6 +1256,8 @@ impl HnswIndex {
             frozen_navigation: None,
             compacting: AtomicBool::new(false),
             compaction_log: Mutex::new(None),
+            compaction_log_cap: AtomicUsize::new(0),
+            compaction_cancelled: AtomicBool::new(false),
             next_seq: AtomicU64::new(0),
             codes_only: false,
             build_reservation: None,
@@ -1344,6 +1374,26 @@ impl HnswIndex {
     /// by tests and by the M7 observability layer (TBD); kept here as the
     /// authoritative reader for the atomic.
     #[allow(dead_code)]
+    pub(crate) fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+    }
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn matches_configuration(
+        &self,
+        metric: Metric,
+        m: usize,
+        ef: usize,
+        dim: Option<usize>,
+    ) -> bool {
+        self.metric == metric
+            && self.m == m.max(2)
+            && self.ef_construction == ef.max(m.max(2))
+            && dim.is_none_or(|dim| self.dim() == 0 || self.dim() == dim)
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -1692,7 +1742,7 @@ impl HnswIndex {
         };
         // `ordering_distance` for L2 is *squared* L2, so the `drift ≤ ratio·d_nn`
         // test in distance units becomes `drift_sq ≤ ratio²·d_nn_sq`.
-        let ratio_sq = ratio * ratio;
+        let ratio_sq = (ratio as f64).powi(2);
         let mut eligible = Vec::with_capacity(ids.len());
         for &id in &ids {
             let node = self.nodes.get(id);
@@ -1702,7 +1752,7 @@ impl HnswIndex {
             }
             let drift_sq = ordering_distance(&current, new_vector, self.metric);
             // Nearest live neighbour distance at layer 0, from the current vector.
-            let mut d_nn_sq = f32::INFINITY;
+            let mut d_nn_sq = f64::INFINITY;
             {
                 let nbrs = node.neighbors.lock();
                 if let Some(layer0) = nbrs.first() {
@@ -1775,6 +1825,7 @@ impl HnswIndex {
         {
             return 0;
         }
+        let mut workspace_charge;
         struct Reset<'a>(&'a HnswIndex);
         impl Drop for Reset<'_> {
             fn drop(&mut self) {
@@ -1785,8 +1836,22 @@ impl HnswIndex {
         let _reset = Reset(self);
         let snapshot_len = {
             let _mutation = self.mutation_gate.write();
-            *self.compaction_log.lock() = Some(Vec::new());
-            self.nodes.len()
+            let count = self.nodes.len();
+            let capacity = count.saturating_mul(2).saturating_add(1024);
+            workspace_charge =
+                match crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    capacity
+                        .saturating_mul(40)
+                        .saturating_add(count.saturating_mul(4)),
+                ) {
+                    Some(charge) => charge,
+                    None => return 0,
+                };
+            self.compaction_log_cap.store(capacity, Ordering::Release);
+            self.compaction_cancelled.store(false, Ordering::Release);
+            *self.compaction_log.lock() = Some(HashSet::new());
+            count
         };
         let replacement = HnswIndex::new(self.metric, self.m, self.ef_construction);
         // Old node id -> replacement id; `u32::MAX` marks a node with no live
@@ -1809,33 +1874,47 @@ impl HnswIndex {
         }
         replacement.link_all(threads);
         after_rebuild();
-        let replay = |remap: &mut Vec<u32>, applied: &mut usize| -> Result<(), QueryError> {
-            let batch = match self.compaction_log.lock().as_ref() {
-                Some(log) => log[*applied..].to_vec(),
-                None => Vec::new(),
-            };
-            *applied += batch.len();
+        let replay = |remap: &mut Vec<u32>| -> Result<usize, QueryError> {
+            if self.compaction_cancelled.load(Ordering::Acquire) {
+                return Err(crate::storage::error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "HNSW compaction delta exceeded its admitted capacity",
+                ));
+            }
+            let batch: Vec<u32> = self
+                .compaction_log
+                .lock()
+                .as_mut()
+                .map(|log| log.drain().collect())
+                .unwrap_or_default();
+            let count = batch.len();
             for id in batch {
                 self.replay_compaction_touch(&replacement, remap, id)?;
             }
-            Ok(())
+            Ok(count)
         };
-        // Catch up without blocking DML, then replay the final tail under the
-        // exclusive gate.
-        let mut applied = 0;
-        loop {
-            let before = applied;
-            if replay(&mut remap, &mut applied).is_err() {
-                return 0;
-            }
-            if applied == before {
-                break;
+        // Coalesce repeated touches by id and bound catch-up rounds. Aborting
+        // leaves the original graph intact when sustained writers outrun us.
+        for _ in 0..8 {
+            match replay(&mut remap) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return 0,
             }
         }
         let _mutation = self.mutation_gate.write();
-        if replay(&mut remap, &mut applied).is_err() {
+        if self
+            .compaction_log
+            .lock()
+            .as_ref()
+            .is_some_and(|log| log.len() > 4096)
+        {
             return 0;
         }
+        if replay(&mut remap).is_err() {
+            return 0;
+        }
+        let _ = &mut workspace_charge;
         // Tombstones made during the rebuild were replayed and survive.
         let dropped = self
             .stale_count
@@ -1845,7 +1924,10 @@ impl HnswIndex {
             let _old_structural = self.structural.write();
             let _new_structural = replacement.structural.write();
             self.nodes.swap_locked(&replacement.nodes);
-            self.update_epoch.store(0, Ordering::Release);
+            self.update_epoch.store(
+                replacement.update_epoch.load(Ordering::Acquire),
+                Ordering::Release,
+            );
             self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
             std::mem::swap(
                 &mut *self.topology.lock(),
@@ -1995,13 +2077,13 @@ impl HnswIndex {
     /// Distance from a search probe to node `id` — a lock-free slab index.
     /// Uses the SQ8 arena when active and `id` is covered, else exact f32.
     #[inline]
-    fn probe_dist(&self, probe: &Probe, id: u32) -> f32 {
+    fn probe_dist(&self, probe: &Probe, id: u32) -> f64 {
         if let Some((arena, qcodes, qnorm)) = probe.quant {
             if self.quant_covers(arena, id) {
                 // Norm-decomposed integer SSD (one `sdot`), scaled back to ~real
                 // squared-L2 so it ranks the same as (and compares with) the
                 // exact f32 fallback. Bit-identical to the widen-subtract SSD.
-                return arena.ssd_from_query(qcodes, qnorm, id) as f32 * arena.dist_mul;
+                return arena.ssd_from_query(qcodes, qnorm, id) as f64 * (arena.dist_mul as f64);
             }
         }
         self.with_node_vector(id, |v| ordering_distance(probe.query, v, self.metric))
@@ -2013,6 +2095,26 @@ impl HnswIndex {
     /// degenerate. The caller must hold `structural` shared so the slab can't be
     /// freed mid-scan.
     fn ensure_quant(&self) -> Option<Arc<QuantArena>> {
+        self.ensure_quant_mode(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_background_quant(&self) {
+        self.set_background_quant(true);
+    }
+
+    pub(crate) fn set_background_quant(&self, active: bool) {
+        self.quant_async.store(active, Ordering::Release);
+    }
+
+    pub(crate) fn refresh_requested_quant(&self) {
+        if self.quant_refresh_requested.swap(false, Ordering::AcqRel) {
+            let _guard = self.structural.read();
+            self.ensure_quant_mode(true);
+        }
+    }
+
+    fn ensure_quant_mode(&self, background: bool) -> Option<Arc<QuantArena>> {
         // L2 uses the SSD identity directly; Cosine reuses it by quantizing
         // unit-normalized vectors (so the integer SSD ranks by cosine). Dot has
         // no scale-invariant normalization trick, so it stays on exact f32.
@@ -2042,6 +2144,10 @@ impl HnswIndex {
                 }
             }
         }
+        if !background && self.quant_async.load(Ordering::Acquire) {
+            self.quant_refresh_requested.store(true, Ordering::Release);
+            return self.quant.read().clone();
+        }
         // (Re)build under the build mutex; re-check in case a peer just built it.
         let Some(_b) = self.quant_build.try_lock() else {
             // One reader refreshes; peers retain the old codes plus exact
@@ -2061,6 +2167,20 @@ impl HnswIndex {
         if len == 0 {
             return None;
         }
+        let arena_charge = if self.build_reservation.is_some() {
+            None
+        } else {
+            let bytes = len
+                .saturating_mul(dim.saturating_add(4))
+                .saturating_add(ARENA_CHUNK.saturating_mul(dim.saturating_add(4)))
+                .saturating_add(dim.saturating_mul(24));
+            Some(
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
+                    bytes,
+                )?,
+            )
+        };
         // Materialise node `id`'s arena row into `buf` — the raw vector for L2,
         // unit-normalized for Cosine — and return its used width. A zero vector
         // (no direction) is left un-normalized; the executor's exact f32 re-rank
@@ -2073,12 +2193,7 @@ impl HnswIndex {
                 w
             });
             if normalize {
-                let norm = super::distance::dot(buf, buf).sqrt();
-                if norm > 0.0 {
-                    for x in buf.iter_mut() {
-                        *x /= norm;
-                    }
-                }
+                super::distance::normalize_in_place(buf);
             }
             w
         };
@@ -2113,6 +2228,7 @@ impl HnswIndex {
                         codes.push(|row| old.quantize(&buf[..w], &mut row[..w]));
                     }
                     let arena = Arc::new(QuantArena {
+                        _charge: arena_charge,
                         update_epoch,
                         chunks: codes.finish(),
                         n: len,
@@ -2149,7 +2265,7 @@ impl HnswIndex {
             if !lo.is_finite() || !hi.is_finite() {
                 return None;
             }
-            *mid = (lo + hi) * 0.5;
+            *mid = (lo as f64 * 0.5 + hi as f64 * 0.5) as f32;
             widest = widest.max(hi - lo);
         }
         if !(widest > 0.0) || !widest.is_finite() {
@@ -2163,7 +2279,11 @@ impl HnswIndex {
             codes.push(|row| quantize_centered_into(&buf[..w], &mids, inv_scale, &mut row[..w]));
         }
         let scale_sq = scale * scale;
+        if !scale_sq.is_normal() || !inv_scale.is_normal() || mids.iter().any(|m| !m.is_finite()) {
+            return None;
+        }
         let arena = Arc::new(QuantArena {
+            _charge: arena_charge,
             update_epoch,
             chunks: codes.finish(),
             n: len,
@@ -2303,7 +2423,7 @@ impl HnswIndex {
                 .results
                 .peek()
                 .map(|s| s.dist)
-                .unwrap_or(f32::INFINITY);
+                .unwrap_or(f64::INFINITY);
             if c.dist > furthest && scratch.results.len() >= ef {
                 break;
             }
@@ -2328,7 +2448,7 @@ impl HnswIndex {
                 probe.prefetch(nb);
             }
             for group in nbr_buf.chunks(4) {
-                let distances: [f32; 4] = if BATCH && group.len() == 4 {
+                let distances: [f64; 4] = if BATCH && group.len() == 4 {
                     if let Some((arena, qcodes, qnorm)) = probe.quant {
                         if group.iter().all(|&id| self.quant_covers(arena, id)) {
                             let dots = dot_i8_batch4_ptrs(
@@ -2341,7 +2461,8 @@ impl HnswIndex {
                                 ],
                             );
                             std::array::from_fn(|i| {
-                                (qnorm + arena.norm(group[i]) - 2 * dots[i]) as f32 * arena.dist_mul
+                                (qnorm + arena.norm(group[i]) - 2 * dots[i]) as f64
+                                    * (arena.dist_mul as f64)
                             })
                         } else {
                             std::array::from_fn(|i| self.probe_dist(probe, group[i]))
@@ -2368,7 +2489,7 @@ impl HnswIndex {
                             .results
                             .peek()
                             .map(|x| x.dist)
-                            .unwrap_or(f32::INFINITY);
+                            .unwrap_or(f64::INFINITY);
                         if d >= furthest {
                             continue;
                         }
@@ -2399,18 +2520,18 @@ impl HnswIndex {
 
     /// Neighbour-selection heuristic (Algorithm 4): keep a candidate only if it
     /// is closer to the query than to any already-selected neighbour, which
-    /// spreads connections out and improves graph navigability. Falls back to
-    /// nearest-fill if the heuristic leaves us short of `m`.
+    /// spreads connections out and improves graph navigability. Rejected
+    /// redundant edges are not refilled merely to reach the degree bound.
     /// Node-to-node distance for the build heuristic. Uses the SQ8 arena when it
     /// covers both nodes (contiguous int8 codes, 4× less traffic) and falls back
     /// to exact f32 otherwise. The arena scales its integer SSD back to ~real
     /// squared-L2, so a quantized `node_dist` and the f32 query distances stored
     /// in `Scored.dist` are on the same scale and compare correctly.
     #[inline]
-    fn build_node_dist(&self, arena: Option<&QuantArena>, a: u32, b: u32) -> f32 {
+    fn build_node_dist(&self, arena: Option<&QuantArena>, a: u32, b: u32) -> f64 {
         if let Some(ar) = arena {
             if self.quant_covers(ar, a) && self.quant_covers(ar, b) {
-                return l2_ssd_i8(ar.codes_for(a), ar.codes_for(b)) as f32 * ar.scale_sq;
+                return l2_ssd_i8(ar.codes_for(a), ar.codes_for(b)) as f64 * (ar.scale_sq as f64);
             }
         }
         let va = self.nodes.get(a).vector.read();
@@ -2585,7 +2706,7 @@ impl HnswIndex {
         nb: u32,
         level: usize,
         m: usize,
-        dist: f32,
+        dist: f64,
         aux: &BuildAux,
     ) {
         if id == nb {
@@ -2615,7 +2736,7 @@ impl HnswIndex {
                     dl.push(dist);
                     if layer.len() > m + aux.nav_slack {
                         let mut worst_i = 0usize;
-                        let mut worst_d = f32::NEG_INFINITY;
+                        let mut worst_d = f64::NEG_INFINITY;
                         for (i, &d) in dl.iter().enumerate() {
                             if d > worst_d {
                                 worst_d = d;
@@ -2660,7 +2781,12 @@ impl HnswIndex {
     fn note_compaction_touch(&self, id: u32) {
         if self.compacting.load(Ordering::Acquire) {
             if let Some(log) = self.compaction_log.lock().as_mut() {
-                log.push(id);
+                if log.contains(&id) || log.len() < self.compaction_log_cap.load(Ordering::Acquire)
+                {
+                    log.insert(id);
+                } else {
+                    self.compaction_cancelled.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -2845,21 +2971,21 @@ impl HnswIndex {
         // arena-covered candidates with the cheap int8 `sdot`; the rare tail
         // candidate (another just-appended node) still falls back to f32 inside
         // `probe_dist` / `build_node_dist`, so distances stay correct.
-        let owned_q: Option<(Vec<i8>, i32)> = match arena.as_ref() {
-            Some(a) if (id as usize) >= a.n => {
-                let w = a.dim.min(node_vec.len());
-                let mut q = vec![0i8; a.dim];
-                a.quantize(&node_vec[..w], &mut q[..w]);
-                let qnorm = super::distance::ssq_i8(&q);
-                Some((q, qnorm))
-            }
-            _ => None,
-        };
+        let stored_query = arena.as_ref().is_some_and(|a| self.quant_covers(a, id));
+        let owned_q = arena
+            .as_ref()
+            .filter(|_| !stored_query)
+            .and_then(|a| a.prepare_query(self.metric, &node_vec));
         let probe = Probe {
             query: &node_vec,
-            quant: arena.as_ref().map(|a| match &owned_q {
-                Some((q, qn)) => (a.as_ref(), q.as_slice(), *qn),
-                None => (a.as_ref(), a.codes_for(id), a.norm(id)),
+            quant: arena.as_ref().and_then(|a| {
+                if stored_query {
+                    Some((a.as_ref(), a.codes_for(id), a.norm(id)))
+                } else {
+                    owned_q
+                        .as_ref()
+                        .map(|(q, n)| (a.as_ref(), q.as_slice(), *n))
+                }
             }),
         };
 
@@ -3073,6 +3199,63 @@ impl HnswIndex {
                 eprintln!("[hnsw] PhaseD final prune: {:?} (n={len})", t_d.elapsed());
             }
         }
+        self.repair_build_connectivity();
+    }
+
+    /// Repair only disconnected cold graphs. Ordinary connected graphs keep
+    /// every selected edge. One spare slot per node bounds the repair degree.
+    fn repair_build_connectivity(&self) {
+        let count = self.nodes.len();
+        let Some(entry) = self.topology.lock().entry_point else {
+            return;
+        };
+        let Some(_charge) =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                count.saturating_mul(5),
+            )
+        else {
+            return;
+        };
+        let mut seen = vec![false; count];
+        let mut stack = Vec::new();
+        let visit = |root: u32, seen: &mut [bool], stack: &mut Vec<u32>| {
+            seen[root as usize] = true;
+            stack.push(root);
+            while let Some(id) = stack.pop() {
+                let neighbors = self.nodes.get(id).neighbors.lock();
+                for &next in &neighbors[0] {
+                    if !seen[next as usize] {
+                        seen[next as usize] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+        };
+        visit(entry, &mut seen, &mut stack);
+        if seen.iter().all(|&v| v) {
+            return;
+        }
+        let arena = self.quant.read().clone();
+        for id in 0..count as u32 {
+            let mut neighbors = self.nodes.get(id).neighbors.lock();
+            neighbors[0] = self.prune_select(
+                id,
+                &neighbors[0],
+                self.m0 - 1,
+                self.selection_arena(arena.as_deref()),
+            );
+        }
+        seen.fill(false);
+        visit(entry, &mut seen, &mut stack);
+        let mut anchor = entry;
+        for id in 0..count as u32 {
+            if !seen[id as usize] {
+                self.nodes.get(anchor).neighbors.lock()[0].push(id);
+                visit(id, &mut seen, &mut stack);
+                anchor = id;
+            }
+        }
     }
 
     /// Phase D for the deferred-diversity build: for every node, merge its
@@ -3164,7 +3347,7 @@ impl HnswIndex {
     /// k-nearest-neighbour search. Returns up to `k` `(row_id, ordering_dist)`
     /// pairs ascending by distance, skipping tombstoned nodes. `ef_search` is
     /// the dynamic candidate-list size at layer 0 (clamped to ≥ k).
-    pub(crate) fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(RowId, f32)> {
+    pub(crate) fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(RowId, f64)> {
         if k == 0 {
             return Vec::new();
         }
@@ -3186,7 +3369,7 @@ impl HnswIndex {
         if self.nodes.len() == 0 {
             return Vec::new();
         }
-        let ef = ef_search.max(k);
+        let ef = ef_search.max(k).min(self.nodes.len()).max(1);
         // Build/refresh the SQ8 navigation arena (L2 only; no-op otherwise) and
         // quantize the query once. Both outlive the search closure below. The
         // `_structural` read guard above keeps the slab alive across the build.
@@ -3194,26 +3377,9 @@ impl HnswIndex {
         // Quantize the query once and precompute ‖q‖² so each probe is a single
         // `sdot`. `qcodes` is full-width (`a.dim`), zero-padded past the query
         // length, matching how node codes are laid out.
-        let qcodes: Option<(Vec<i8>, i32)> = arena.as_ref().map(|a| {
-            let w = a.dim.min(query.len());
-            let mut q = vec![0i8; a.dim];
-            // Cosine navigates in unit space, so quantize the normalized query to
-            // match the unit-normalized node codes in the arena.
-            if self.metric == Metric::Cosine {
-                let mut qn: Vec<f32> = query[..w].to_vec();
-                let norm = super::distance::dot(&qn, &qn).sqrt();
-                if norm > 0.0 {
-                    for x in qn.iter_mut() {
-                        *x /= norm;
-                    }
-                }
-                a.quantize(&qn, &mut q[..w]);
-            } else {
-                a.quantize(&query[..w], &mut q[..w]);
-            }
-            let qnorm = super::distance::ssq_i8(&q);
-            (q, qnorm)
-        });
+        let qcodes = arena
+            .as_ref()
+            .and_then(|a| a.prepare_query(self.metric, query));
         let probe = Probe {
             query,
             quant: match (arena.as_ref(), qcodes.as_ref()) {
@@ -3221,6 +3387,8 @@ impl HnswIndex {
                 _ => None,
             },
         };
+        let score_epoch = self.update_epoch.load(Ordering::Acquire);
+        let used_quant = probe.quant.is_some();
         let found = SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             // Descend the upper layers greedily (ef = 1).
@@ -3233,6 +3401,8 @@ impl HnswIndex {
             // Full search at layer 0.
             self.search_layer(&probe, &[cur], ef, 0, true, &mut scratch)
         });
+        let exact_unchanged =
+            !used_quant && self.update_epoch.load(Ordering::Acquire) == score_epoch;
         let query_norm = (self.metric == Metric::Cosine && self.frozen_navigation.is_some())
             .then(|| super::distance::cosine_norm_sq(query));
         if let Some(frozen) = &self.frozen_navigation {
@@ -3240,7 +3410,7 @@ impl HnswIndex {
                 prefetch_read(frozen.vectors[s.id as usize].as_ptr().cast());
             }
         }
-        let mut out = Vec::with_capacity(k);
+        let mut out = Vec::with_capacity(k.min(found.len()));
         for s in found {
             let node = self.node_at(s.id);
             if node.deleted.load(Ordering::Acquire) {
@@ -3255,8 +3425,9 @@ impl HnswIndex {
             // returned candidate (`read_row` was ~19% of a low-ef query). Costs
             // `ef` in-memory f32 distances. Cheap no-op when SQ8 is
             // inactive (`s.dist` is already this exact value).
-            let d = if let (Some(frozen), Some(query_norm)) = (&self.frozen_navigation, query_norm)
-            {
+            let d = if exact_unchanged {
+                s.dist
+            } else if let (Some(frozen), Some(query_norm)) = (&self.frozen_navigation, query_norm) {
                 super::distance::cosine_distance_precomputed(
                     query,
                     &frozen.vectors[s.id as usize],
@@ -3267,12 +3438,17 @@ impl HnswIndex {
                 self.with_node_vector(s.id, |v| ordering_distance(query, v, self.metric))
             };
             out.push((node.row_id, d));
-            if arena.is_none() && out.len() >= k {
+            if exact_unchanged && out.len() >= k {
                 break;
             }
         }
-        out.sort_by(|a, b| a.1.total_cmp(&b.1));
-        out.truncate(k);
+        let cmp =
+            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if out.len() > k {
+            out.select_nth_unstable_by(k, cmp);
+            out.truncate(k);
+        }
+        out.sort_unstable_by(cmp);
         out
     }
 
@@ -3414,7 +3590,7 @@ impl HnswIndex {
             _ => return Err(err()),
         };
         let dim = r.u32()? as usize;
-        let m = (r.u32()? as usize).max(2);
+        let m = r.u32()? as usize;
         let ef_construction = r.u32()? as usize;
         let entry_raw = r.i64()?;
         let max_level = r.u32()? as usize;
@@ -3424,19 +3600,36 @@ impl HnswIndex {
         let node_count = r.u32()? as usize;
         let generation = r.u64()?;
         let last_persisted_lsn = r.u64()?;
-        let slab = NodeSlab::new();
+        let minimum_record = dim.saturating_mul(4).saturating_add(14);
+        if dim > super::codec::MAX_DIM
+            || (node_count > 0 && dim == 0)
+            || m < 2
+            || ef_construction < m
+            || node_count > data.len().saturating_sub(r.pos) / minimum_record
+        {
+            return Err(err());
+        }
+        let index = HnswIndex::new(metric, m, ef_construction);
+        index.dim.store(dim, Ordering::Release);
+        index.generation.store(generation, Ordering::Release);
+        index
+            .last_persisted_lsn
+            .store(last_persisted_lsn, Ordering::Release);
         let mut live = 0usize;
         let mut stale = 0u32;
-        let row_index: [Mutex<HashMap<u64, Vec<u32>>>; ROW_INDEX_SHARDS] =
-            std::array::from_fn(|_| {
-                Mutex::new(HashMap::with_capacity(node_count / ROW_INDEX_SHARDS + 1))
-            });
         for _ in 0..node_count {
+            index
+                .reserve_resident_node(dim)
+                .map_err(|error| io::Error::other(error.to_string()))?;
             let row_id = unpack_row(r.u64()?);
             let deleted = r.u8()? != 0;
             let mut vector = Vec::with_capacity(dim);
             for _ in 0..dim {
-                vector.push(r.f32()?);
+                let value = r.f32()?;
+                if !value.is_finite() {
+                    return Err(err());
+                }
+                vector.push(value);
             }
             let level_count = r.u8()? as usize;
             if level_count == 0 || level_count > super::hnsw_paged::VEC_MAX_LAYER + 1 {
@@ -3445,6 +3638,9 @@ impl HnswIndex {
             let mut neighbors = Vec::with_capacity(level_count);
             for _ in 0..level_count {
                 let n = r.u32()? as usize;
+                if n > node_count || n > r.buf.len().saturating_sub(r.pos) / 4 {
+                    return Err(err());
+                }
                 let mut adj = Vec::with_capacity(n);
                 for _ in 0..n {
                     let nb = r.u32()?;
@@ -3460,7 +3656,8 @@ impl HnswIndex {
             } else {
                 live += 1;
             }
-            let id = slab
+            let id = index
+                .nodes
                 .push_with(|id| Node {
                     update_epoch: AtomicU64::new(0),
                     seq: id as u64,
@@ -3471,55 +3668,33 @@ impl HnswIndex {
                 })
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let key = pack_row(row_id);
-            row_index[row_index_shard(key)]
+            index.row_index[row_index_shard(key)]
                 .lock()
                 .entry(key)
                 .or_default()
                 .push(id);
         }
-        let entry_point = if entry_raw < 0 || entry_raw as usize >= slab.len() {
-            None
-        } else {
-            Some(entry_raw as u32)
-        };
-        let index = HnswIndex {
-            metric,
-            m,
-            m0: m * 2,
-            ef_construction: ef_construction.max(m),
-            ml: 1.0 / (m as f64).ln(),
-            dim: AtomicUsize::new(dim),
-            topology: Mutex::new(Topology {
-                entry_point,
-                max_level,
-            }),
-            nodes: slab,
-            structural: RwLock::new(()),
-            mutation_gate: RwLock::new(()),
-            live: AtomicUsize::new(live),
-            generation: AtomicU64::new(generation),
-            last_persisted_lsn: AtomicU64::new(last_persisted_lsn),
-            dirty_count: AtomicU32::new(0),
-            stale_count: AtomicU32::new(stale),
-            quant: RwLock::new(None),
-            quant_build: Mutex::new(()),
-            update_epoch: AtomicU64::new(0),
-            mutation_epoch: AtomicU64::new(0),
-            row_index,
-            resident_charge: Mutex::new(None),
-            resident_reserved_nodes: AtomicUsize::new(0),
-            frozen_navigation: None,
-            compacting: AtomicBool::new(false),
-            compaction_log: Mutex::new(None),
-            next_seq: AtomicU64::new(node_count as u64),
-            codes_only: false,
-            build_reservation: None,
-        };
-        if node_count > 0 {
-            index
-                .reserve_resident_node(dim)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        if r.pos != data.len()
+            || entry_raw < -1
+            || (entry_raw >= 0 && entry_raw as usize >= node_count)
+        {
+            return Err(err());
         }
+        let entry_point = (entry_raw >= 0).then_some(entry_raw as u32);
+        if let Some(entry) = entry_point {
+            if index.nodes.get(entry).neighbors.lock().len() != max_level + 1 {
+                return Err(err());
+            }
+        } else if live > 0 || max_level != 0 {
+            return Err(err());
+        }
+        *index.topology.lock() = Topology {
+            entry_point,
+            max_level,
+        };
+        index.live.store(live, Ordering::Release);
+        index.stale_count.store(stale, Ordering::Release);
+        index.next_seq.store(node_count as u64, Ordering::Release);
         Ok(index)
     }
 }
@@ -3596,7 +3771,7 @@ mod tests {
     }
 
     fn brute_force(vectors: &[Vec<f32>], query: &[f32], k: usize, metric: Metric) -> Vec<usize> {
-        let mut scored: Vec<(f32, usize)> = vectors
+        let mut scored: Vec<(f64, usize)> = vectors
             .iter()
             .enumerate()
             .map(|(i, v)| (ordering_distance(query, v, metric), i))
@@ -3637,6 +3812,7 @@ mod tests {
         let dim = 3;
         let code = |id: usize, j: usize| ((id * 7 + j) % 251) as i8;
         let arena = |chunks: Vec<Arc<CodeChunk>>, n: usize| QuantArena {
+            _charge: None,
             update_epoch: 0,
             chunks,
             n,
@@ -4907,5 +5083,194 @@ mod source_audit_tests {
             .unwrap();
         assert_eq!(graph.search(&[-100.0, -200.0], 1, 32)[0], (row(1), 0.0));
         assert_eq!(graph.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod review_20261024 {
+    use super::*;
+
+    #[test]
+    fn review_compaction_must_preserve_update_epoch() {
+        let graph = HnswIndex::new(Metric::L2, 16, 200);
+        for i in 0..100u32 {
+            let v = if i == 0 { 0.0 } else { 10.0 + i as f32 };
+            graph
+                .insert(
+                    RowId {
+                        page_id: i,
+                        slot_id: 0,
+                    },
+                    vec![v, 0.0],
+                )
+                .unwrap();
+        }
+        graph.search(&[0.0, 0.0], 1, 64);
+        graph.mark_deleted_by_row_id(RowId {
+            page_id: 99,
+            slot_id: 0,
+        });
+        assert!(
+            graph.compact_with_rebuild_hook(1, || {
+                assert!(graph.try_update_in_place(
+                    RowId {
+                        page_id: 0,
+                        slot_id: 0
+                    },
+                    &[2.0, 0.0],
+                    0.5
+                ));
+            }) > 0
+        );
+        let _guard = graph.structural.read();
+        let arena = graph.quant.read().clone().unwrap();
+        let node_epoch = graph.nodes.get(0).update_epoch.load(Ordering::Acquire);
+        eprintln!(
+            "global_epoch={} arena_epoch={} node_epoch={}",
+            graph.update_epoch.load(Ordering::Acquire),
+            arena.update_epoch,
+            node_epoch
+        );
+        assert!(
+            !graph.quant_covers(&arena, 0),
+            "a replayed vector update must invalidate pre-update SQ8 codes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_preparation_regressions {
+    use super::*;
+
+    #[test]
+    fn cosine_probe_is_scale_invariant_and_l2_range_drift_uses_exact_navigation() {
+        for metric in [Metric::Cosine, Metric::L2] {
+            let graph = HnswIndex::new(metric, 16, 200);
+            for (id, vector) in [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+                .into_iter()
+                .enumerate()
+            {
+                graph
+                    .insert(
+                        RowId {
+                            page_id: id as u32,
+                            slot_id: 0,
+                        },
+                        vector.to_vec(),
+                    )
+                    .unwrap();
+            }
+            let _guard = graph.structural.read();
+            let arena = graph.ensure_quant().unwrap();
+            if metric == Metric::Cosine {
+                assert_eq!(
+                    arena.prepare_query(metric, &[0.6, 0.8]),
+                    arena.prepare_query(metric, &[6.0, 8.0])
+                );
+            } else {
+                assert!(arena.prepare_query(metric, &[1000.0, 1000.0]).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn disconnected_duplicate_cold_graph_is_repaired_without_exceeding_degree() {
+        let graph = HnswIndex::new(Metric::L2, 16, 200);
+        for id in 0..256 {
+            graph
+                .append_node(
+                    RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    vec![1.0, 1.0],
+                )
+                .unwrap();
+        }
+        graph.link_all(4);
+        assert_eq!(graph.search(&[1.0, 1.0], 256, 256).len(), 256);
+        for node in graph.nodes.iter() {
+            assert!(node.neighbors.lock()[0].len() <= graph.m0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod asynchronous_quant_regressions {
+    use super::*;
+    #[test]
+    fn published_queries_request_refresh_without_building_the_arena() {
+        let graph = HnswIndex::new(Metric::L2, 16, 200);
+        for id in 0..128 {
+            graph
+                .insert(
+                    RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    vec![id as f32, 1.0],
+                )
+                .unwrap();
+        }
+        graph.enable_background_quant();
+        assert_eq!(graph.search(&[0.0, 1.0], 1, 64)[0].0.page_id, 0);
+        assert!(graph.quant.read().is_none());
+        assert!(graph.quant_refresh_requested.load(Ordering::Acquire));
+        graph.refresh_requested_quant();
+        assert!(graph.quant.read().is_some());
+        assert_eq!(graph.search(&[0.0, 1.0], 1, 64)[0].0.page_id, 0);
+        graph.set_background_quant(false);
+        for id in 128..160 {
+            graph
+                .insert(
+                    RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    vec![id as f32, 1.0],
+                )
+                .unwrap();
+        }
+        graph.search(&[0.0, 1.0], 1, 64);
+        assert_eq!(
+            graph.quant.read().as_ref().unwrap().n,
+            160,
+            "stopped maintenance must restore synchronous refresh"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_validation_regressions {
+    use super::*;
+    #[test]
+    fn valid_crc_does_not_authorize_unbounded_or_nonfinite_snapshot_fields() {
+        let graph = HnswIndex::new(Metric::L2, 16, 200);
+        graph
+            .insert(
+                RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                },
+                vec![1.0, 2.0],
+            )
+            .unwrap();
+        let snapshot = graph.serialize();
+        for (offset, value) in [
+            (7, u32::MAX),
+            (31, u32::MAX),
+            (60, f32::NAN.to_bits()),
+            (69, u32::MAX),
+        ] {
+            let mut bytes = snapshot.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            let end = bytes.len() - 4;
+            let checksum = crc32(&bytes[..end]);
+            bytes[end..].copy_from_slice(&checksum.to_le_bytes());
+            assert!(
+                HnswIndex::deserialize(&bytes).is_err(),
+                "malformed field at {offset}"
+            );
+        }
     }
 }

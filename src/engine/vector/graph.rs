@@ -54,16 +54,16 @@ pub(crate) enum VectorSearchEffort {
 pub(crate) struct VectorSearchRequest {
     pub candidate_limit: usize,
     /// Preserve the exact re-rank pool independently from the number of rows
-    /// returned to the executor. The slab backend truncates SQ8 candidates
-    /// before exact scoring; the paged backend already scores the full ef.
+    /// returned to the executor. Both HNSW backends score their explored
+    /// candidate pool before returning its nearest retained rows.
     pub rerank_limit: usize,
     pub effort: VectorSearchEffort,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct VectorSearchResult {
-    pub candidates: Vec<(RowId, f32)>,
-    /// Candidate distances are authoritative f32 ordering distances. With no
+    pub candidates: Vec<(RowId, f64)>,
+    /// Candidate distances order the stored vectors, including wide arithmetic. With no
     /// residual filter the executor may stop after the first k MVCC-visible
     /// rows instead of heap-reading the complete rerank pool.
     pub exact_order: bool,
@@ -206,6 +206,30 @@ impl VectorGraph {
         }
     }
 
+    pub(crate) fn invalidate(&self) {
+        match self {
+            Self::Memory(g) => g.invalidate(),
+            Self::Paged(p) => p.invalidate(),
+            Self::Ivf(_) => {}
+        }
+    }
+
+    fn ensure_valid(&self) -> Result<(), QueryError> {
+        let valid = match self {
+            Self::Memory(g) => g.is_valid(),
+            Self::Paged(p) => p.is_valid(),
+            Self::Ivf(_) => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector index handle was invalidated; rebuild required",
+            ))
+        }
+    }
+
     /// Borrow the in-memory backend, if this is one. Used by the snapshot
     /// persistence path, which only applies to the memory backend (the paged
     /// file is already durable via WAL).
@@ -322,8 +346,9 @@ impl VectorGraph {
     /// graph, so the next access rebuilds it from the heap instead of trusting
     /// a file that silently lacks a committed row.
     pub(crate) fn insert(&self, row_id: RowId, vector: Vec<f32>) -> Result<(), QueryError> {
+        self.ensure_valid()?;
         match self {
-            VectorGraph::Memory(g) => g.insert(row_id, vector),
+            VectorGraph::Memory(g) => g.insert(row_id, vector).inspect_err(|_| g.invalidate()),
             VectorGraph::Paged(p) => {
                 #[cfg(test)]
                 if FAIL_PAGED_WRITES_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
@@ -364,13 +389,19 @@ impl VectorGraph {
     pub(crate) fn begin_transaction_delta(&self, txn_id: u64) -> Result<(), QueryError> {
         match self {
             VectorGraph::Ivf(i) => i.begin_transaction_delta(txn_id),
+            VectorGraph::Paged(p) => p.begin_transaction_delta(txn_id),
             _ => Ok(()),
         }
     }
 
-    pub(crate) fn finish_committed_delta(&self, txn_id: u64) -> Result<(), QueryError> {
+    pub(crate) fn finish_committed_delta(
+        &self,
+        txn_id: u64,
+        commit_scn: u64,
+    ) -> Result<(), QueryError> {
         match self {
             VectorGraph::Ivf(i) => i.finish_committed_delta(txn_id),
+            VectorGraph::Paged(p) => p.finish_committed_delta(txn_id, commit_scn),
             _ => Ok(()),
         }
     }
@@ -390,6 +421,7 @@ impl VectorGraph {
         query: &[f32],
         request: VectorSearchRequest,
     ) -> Result<VectorSearchResult, QueryError> {
+        self.ensure_valid()?;
         // A short result proves exhaustion only if widening `ef` cannot reach
         // more live nodes. The slab search keeps tombstones out of its result
         // pool, so it stops early only after draining its reachable frontier.
@@ -420,6 +452,7 @@ impl VectorGraph {
                 ));
             }
         };
+        self.ensure_valid()?;
         Ok(VectorSearchResult {
             candidates,
             exact_order: true,
@@ -443,6 +476,7 @@ impl VectorGraph {
         log_message(format!(
             "hnsw(paged): {action} failed; index will be rebuilt from the heap: {err:?}"
         ));
+        graph.invalidate();
         if let Err(meta_err) = graph.file().invalidate_build(0) {
             log_message(format!(
                 "hnsw(paged): could not invalidate index after failed {action}: {meta_err:?}"
@@ -509,9 +543,7 @@ impl VectorGraph {
             VectorGraph::Paged(p) => p
                 .try_update_in_place(row_id, new_vector, ratio)
                 .unwrap_or_else(|e| {
-                    log_message(format!(
-                        "hnsw(paged): in-place update failed (re-link): {e:?}"
-                    ));
+                    Self::invalidate_paged(p, "in-place update", e);
                     false
                 }),
             VectorGraph::Ivf(i) => i.try_update_in_place(row_id, new_vector, ratio),

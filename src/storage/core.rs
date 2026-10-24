@@ -619,7 +619,10 @@ pub(crate) struct VectorPurge {
 pub(crate) struct VectorBuildDelta {
     builders: usize,
     /// `Some` is an idempotent upsert of the committed vector, `None` a delete.
-    ops: Vec<(RowId, Option<Vec<f32>>)>,
+    ops: HashMap<RowId, (u64, Option<Vec<f32>>)>,
+    next_seq: u64,
+    failed: bool,
+    charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
 }
 
 #[derive(Debug, Clone)]
@@ -1063,6 +1066,15 @@ pub struct Database {
     vector_build_deltas: parking_lot::Mutex<HashMap<(u64, u64, u64, String), VectorBuildDelta>>,
     /// Registered builds; lets DML skip the registry lock when none run.
     vector_builds_in_flight: AtomicUsize,
+    /// Highest SCN whose graph position or cold image may supersede older views.
+    vector_snapshot_floor: AtomicU64,
+    vector_build_epoch: AtomicU64,
+    replicated_hnsw_table_cache: parking_lot::RwLock<HashMap<u64, Option<u64>>>,
+    replicated_hnsw_dirty: parking_lot::Mutex<HashMap<u64, std::collections::HashSet<u64>>>,
+    /// One owner per cold index; waiting readers share its published graph.
+    vector_build_locks: parking_lot::Mutex<
+        HashMap<(u64, u64, u64, String), std::sync::Weak<parking_lot::Mutex<()>>>,
+    >,
     /// Graph keys whose last build failed memory admission, with the time.
     vector_build_backoff: parking_lot::Mutex<HashMap<(u64, u64, u64, String), std::time::Instant>>,
     /// Superseded HNSW node versions (DELETE / re-linked UPDATE) that some
