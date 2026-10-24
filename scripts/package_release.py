@@ -68,7 +68,7 @@ def main():
         for name in ["mydb", "mydb-backup"]:
             executable = name + (".exe" if os.name == "nt" else "")
             shutil.copy2(target / executable, payload / executable)
-        for name in ["LICENSE", "README.md", "Cargo.lock", "SECURITY.md",
+        for name in ["LICENSE", "README.md", "Cargo.lock",
                      "assets/mydb-architecture.svg"]:
             output = payload / name
             output.parent.mkdir(parents=True, exist_ok=True)

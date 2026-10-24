@@ -8,6 +8,7 @@ execution, and storage documentation.
 | Document | Contents |
 | --- | --- |
 | [Project README](../README.md) | Product overview, quick start, and build instructions |
+| [Reporting Issues](reporting-issues.md) | Required environment details, logs, reproduction steps, scripts, and an issue template |
 | [Feature Overview](feature-overview.md) | Product capabilities and limitations |
 | [Performance Comparison](performance-comparison.md) | MyDB vs. MySQL measurements, test conditions, and interpretation |
 | [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Compatibility matrix, supported boundaries, and explicit differences |

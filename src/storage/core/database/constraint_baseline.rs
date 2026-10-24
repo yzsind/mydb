@@ -36,13 +36,13 @@ impl ConstraintFkBaseline {
         )?;
         let mut record_writer =
             crate::engine::executor::spill_quota::TrackedSpillWriter::from_raw_file(
-                records.try_clone().map_err(io_err)?,
+                std::fs::File::try_clone(&records).map_err(io_err)?,
                 tmp.charger(),
                 64 * 1024,
             )?;
         let mut offset_writer =
             crate::engine::executor::spill_quota::TrackedSpillWriter::from_raw_file(
-                offsets.try_clone().map_err(io_err)?,
+                std::fs::File::try_clone(&offsets).map_err(io_err)?,
                 tmp.charger(),
                 64 * 1024,
             )?;

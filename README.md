@@ -1,12 +1,14 @@
 <div align="center">
 
+<img src="assets/logo/mydb-whale.png" alt="MyDB whale logo with layered database storage" width="256" height="256">
+
 # MyDB
 
 **A high-performance database, compatible with MySQL**
 
 Let agents manage data flexibly — transactions, analytics, and vector search in a single database.
 
-[Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
+[Download](https://github.com/yzsind/mydb/releases/tag/v1.0.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
 </div>
 
@@ -14,7 +16,7 @@ Let agents manage data flexibly — transactions, analytics, and vector search i
 
 MyDB is a general-purpose database built in Rust, designed around three directions: **AI agents, high-performance hybrid transactional/analytical processing (HTAP), and MySQL compatibility**. Through a familiar SQL interface, applications and agents can manage business data, evolve table schemas, run real-time analytics, and search similar vectors — without copying data across systems or maintaining multiple interfaces.
 
-MyDB is under development toward its first product release: the 1.0.0 public-preview candidate (not yet published) is intended for feature validation and controlled-environment evaluation, is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
+MyDB 1.0.0 is a public-preview release intended for feature validation and controlled-environment evaluation. It is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
 
 | Core capability | What it gives you |
 | --- | --- |
@@ -40,6 +42,39 @@ the [detailed comparison](docs/performance-comparison.md) for all results, test
 conditions, and limitations.
 
 ## Quick Start
+
+Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from the
+[1.0.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.0.0), which also
+includes SHA256 checksums and platform validation details.
+
+### Run a downloaded binary
+
+Download the package for your platform, extract it, and open a terminal in the
+directory containing the executable. On macOS or Linux, start it with:
+
+```bash
+chmod +x ./mydb
+./mydb --data-dir ./data
+```
+
+On Windows, run the equivalent command in PowerShell:
+
+```powershell
+.\mydb.exe --data-dir ./data
+```
+
+The server listens locally on port `8738` and stores data in `./data`. No Rust
+toolchain or config file is needed. With a MySQL 8.0 client installed, connect
+from another terminal:
+
+```bash
+mysql -h127.0.0.1 -P8738 -uroot -proot  test
+```
+
+A fresh data directory includes the `test` database and the local `root` account
+with password `root`. Run `SELECT 1;` to check the connection. Enter `quit` to
+exit the client, then press **Ctrl+C** in the server terminal to stop it. Restart
+with the same data directory to reopen your data.
 
 ### Build and connect
 
@@ -140,17 +175,10 @@ configuration, cross-architecture builds, and connecting from the host.
 
 ### Platforms and distribution
 
-macOS arm64 is the development and regression platform. Linux x86_64 source
-builds also produce a portable archive targeting glibc 2.17+ via
-`scripts/build_linux_glibc217.py` (host-native builds inherit the build host's
-libc). Source builds additionally work on macOS Intel, Linux aarch64 (with
-`linux/arm64` Dockerfile support), and Windows 11 foreground operation on local
-NTFS. The unpublished 1.0.0 candidate ships a native arm64 archive plus a
-portable archive and locally verified `linux/amd64` image for x86_64; other
-platforms are outside this candidate. See [hardware and OS
-requirements](docs/hardware-and-os-requirements.md) for detailed OS verification
-and Windows limitations, and [backup platform
-requirements](docs/backup-and-recovery.md) for atomic-rename support.
+Supported operating systems: macOS (arm64 and Intel) and Linux (x86_64 and
+aarch64), plus Windows 11 for foreground operation on local NTFS. See
+[hardware and OS requirements](docs/hardware-and-os-requirements.md) for
+verification details, Windows limitations, and distribution scope.
 
 ## Architecture
 
@@ -274,18 +302,15 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 | [SQL statements](docs/statements/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
 | [Configuration guide](docs/configuration.md) / [Config template](mydb.cnf.example) | Startup options, environment variables, and runtime settings |
 | [Storage format](docs/storage-format.md) | Data directory, pages, indexes, logs, and recovery |
-| Testing | [MTR-lite regressions](tests/mydb-test/UPSTREAM.md), [fuzz](tests/fuzz/README.md), [Jepsen](tests/jepsen/README.md) |
 
 Product documentation under `docs/` is written in English. When documentation
 and behavior disagree, the source code and tests are authoritative; the
 compatibility matrices describe the documented scope.
 
-## Contributing
+## Reporting issues
 
-Build and test commands, review gates, and pull request guidelines are in
-[CONTRIBUTING.md](CONTRIBUTING.md). Issues with reproducible SQL, execution
-plans, error logs, and test conditions are the most useful reports.
-Vulnerabilities are handled per [SECURITY.md](SECURITY.md); please do not open
-public issues for them.
+Submit bug reports through [GitHub Issues](https://github.com/yzsind/mydb/issues).
+Follow the [issue reporting guide](docs/reporting-issues.md) and include the exact
+MyDB version, operating system, relevant logs, and reproducible steps and scripts.
 
 MyDB is licensed under the [Apache License 2.0](LICENSE).

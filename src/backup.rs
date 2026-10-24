@@ -1692,7 +1692,7 @@ fn atomic_replace_with_sync(
 
 fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
     write_with_sync(path, bytes, |file| {
-        crate::platform::fs::sync_file_at(file, path)
+        crate::platform::fs::sync_standard_file_at(file, path)
     })
 }
 
@@ -1702,6 +1702,9 @@ fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
 /// platforms without an ordering-only primitive keep their existing fsync.
 fn write_ordered(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
     write_with_sync(path, bytes, |file| {
+        #[cfg(windows)]
+        return crate::platform::fs::sync_standard_file_at(file, path);
+        #[cfg(not(windows))]
         crate::platform::fs::sync_before_atomic_rename_at(file, path)
     })
 }
@@ -1709,7 +1712,7 @@ fn write_ordered(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
 fn write_with_sync(
     path: &Path,
     bytes: &[u8],
-    sync: impl FnOnce(&File) -> std::io::Result<()>,
+    sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), QueryError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| io_err("create file parent", err))?;
