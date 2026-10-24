@@ -41,7 +41,7 @@ ecb = { version = "0.1", features = ["alloc"] }
 sqlparser = "0.61.0"
 # Bound recursive scalar evaluation before entering large debug stack frames.
 stacker = "0.1.24"
-tokio = { version = "1", features = ["macros", "net", "fs", "rt-multi-thread", "io-util", "signal", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["macros", "net", "fs", "rt-multi-thread", "io-util", "signal", "sync", "time"] }
 chrono = "0.4"
 # tokio-rustls = "0.26.4"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }

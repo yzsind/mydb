@@ -5,8 +5,8 @@
 #
 # The corpus (`tests/mydb-test/triage/{t,upstream}/`) is git-ignored: it holds
 # un-adapted GPL-licensed upstream files used only as a local compatibility
-# oracle. Only hand-adapted, triaged files get promoted (with provenance) into
-# the committed `tests/mydb-test/t/imported/` suite.
+# oracle. Adapted cases and their recorded expectations also stay in the
+# git-ignored `tests/mydb-test/t/` and `tests/mydb-test/r/` local suite.
 #
 # Usage:
 #   scripts/mtr_import.sh [suite/]name ...

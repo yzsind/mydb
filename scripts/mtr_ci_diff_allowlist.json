@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "entries": [
+    {
+      "file": "main/type_float.test",
+      "statement_index": 0,
+      "fingerprint": "sha256:6f25a9fcb99e0d800779d62a32dfdefa10c58409b24a4d632cd2f2860b2b3e82",
+      "reason": "Audited statement results agree after normalization; remaining differences concern floating-point rendering, SHOW CREATE, warnings, statement echoes and column labels.",
+      "scope": "non_semantic_output",
+      "risk": "Low: values, error codes, SQLSTATE, warning codes and DDL/DML effects remain part of the comparison.",
+      "capability": "triage/presentation-surface"
+    },
+    {
+      "file": "main/type_enum.test",
+      "statement_index": 0,
+      "fingerprint": "sha256:57a65ad6a630b620613550a23d0578e1d612f0a193903c9b010afc341097e68c",
+      "reason": "Audited ENUM values, ordinal-zero diagnostics, ordering, indexes and DDL effects agree; remaining differences concern labels, SHOW/EXPLAIN, echoes and diagnostic wording.",
+      "scope": "non_semantic_output",
+      "risk": "Low: values, error codes, SQLSTATE and side effects remain part of the comparison.",
+      "capability": "triage/presentation-surface"
+    },
+    {
+      "file": "main/type_set.test",
+      "statement_index": 0,
+      "fingerprint": "sha256:13c78ed602a5cac596eeb9304dfcfa139d55e5ae9c150961347378f74ed2daa3",
+      "reason": "Audited SET ordering, collation, numeric conversions and warning codes agree; remaining differences concern SHOW CREATE, diagnostic wording and source-charset echoes.",
+      "scope": "non_semantic_output",
+      "risk": "Low: values, error codes, SQLSTATE, warning codes and side effects remain part of the comparison.",
+      "capability": "triage/presentation-surface"
+    },
+    {
+      "file": "main/type_year.test",
+      "statement_index": 0,
+      "fingerprint": "sha256:9f6d58d6b880259aaa87d6fdec52cba2be0c5558f33e2e05f6f5b6773319e558",
+      "reason": "Audited YEAR conversions, comparisons, aggregates and diagnostic codes agree; remaining differences concern SHOW CREATE, diagnostic wording and statement echoes.",
+      "scope": "non_semantic_output",
+      "risk": "Low: values, error codes, SQLSTATE, warning codes and side effects remain part of the comparison.",
+      "capability": "triage/presentation-surface"
+    }
+  ]
+}

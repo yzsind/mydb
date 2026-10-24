@@ -11,7 +11,7 @@
 //! design doc. Regenerate after adding/adapting a `.test`:
 //!
 //! ```bash
-//! MYDB_MTR_RECORD=1 cargo nextest run mtr
+//! MYDB_MTR_RECORD=1 cargo nextest run --run-ignored only mtr_suite
 //! ```
 //!
 //! ## Supported mysqltest subset (M1)
@@ -57,6 +57,7 @@ enum FileOutcome {
 }
 
 #[test]
+#[ignore = "requires the local MySQL-derived corpus, which is excluded from the repository"]
 fn mtr_suite() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let test_root = Path::new(manifest).join("tests/mydb-test");
@@ -100,10 +101,10 @@ fn mtr_suite() {
         eprintln!("  SKIP {s}");
     }
 
-    // Files under tests/mydb-test/t are curated regression assets. Silently accepting
-    // a harness-level SKIP here would turn an unsupported directive or missing
-    // symbol into a false-green CI run. Only the git-ignored triage corpus may
-    // skip while capabilities are still being implemented.
+    // The explicitly enabled local curated suite must finish every file.
+    // Accepting a harness-level SKIP would hide an unsupported directive or
+    // missing symbol. Only the triage corpus may skip while capabilities are
+    // still being implemented. Both corpora remain excluded from Git.
     if !skipped.is_empty() || !failures.is_empty() {
         let skipped_detail = skipped
             .iter()
@@ -147,7 +148,9 @@ fn mtr_triage() {
     let triage_root = test_root.join("triage");
     let t_root = triage_root.join("t");
     let upstream_root = triage_root.join("upstream");
-    let allowlist_path = triage_root.join("diff_allowlist.json");
+    let allowlist_path = std::env::var_os("MYDB_MTR_TRIAGE_ALLOWLIST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| triage_root.join("diff_allowlist.json"));
     let allowlist = load_triage_diff_allowlist(&allowlist_path);
     if !t_root.exists() {
         eprintln!(

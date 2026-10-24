@@ -597,6 +597,21 @@ mod tests {
                 stream.write_all(part).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            // Keep the connection alive and drain ACKs until the receiver
+            // rejects the WAL body. Closing with unread ACKs sends a TCP RST
+            // on Linux and can discard the final bytes before they are read.
+            let mut ack_count = 0;
+            loop {
+                match protocol::read_frame_async(&mut stream).await {
+                    Ok(Message::ReplicaAck(ack)) => {
+                        assert_eq!(ack.applied_lsn, 0);
+                        ack_count += 1;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    other => panic!("expected ACK or receiver close, got {other:?}"),
+                }
+            }
+            assert!(ack_count > 0, "the frame must span at least one ACK tick");
         });
 
         let dir = tempfile::tempdir().unwrap();
