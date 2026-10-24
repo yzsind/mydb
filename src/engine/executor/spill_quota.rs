@@ -470,13 +470,13 @@ struct SpillFileLease {
 /// Raw positioned-I/O consumers retain the directory until their final shared
 /// descriptor closes, just like the SQL codec readers and writers.
 pub(crate) struct LeasedSpillFile {
-    file: File,
+    file: crate::platform::file::File,
     _lease: SpillFileLease,
 }
 
 impl std::ops::Deref for LeasedSpillFile {
-    type Target = File;
-    fn deref(&self) -> &File {
+    type Target = crate::platform::file::File;
+    fn deref(&self) -> &Self::Target {
         &self.file
     }
 }
@@ -553,7 +553,10 @@ pub(crate) fn retry_orphan_cleanup() {
 }
 
 impl SpillCharger {
-    pub(crate) fn lease_file(&self, file: File) -> Result<LeasedSpillFile, QueryError> {
+    pub(crate) fn lease_file(
+        &self,
+        file: crate::platform::file::File,
+    ) -> Result<LeasedSpillFile, QueryError> {
         let lease = self.acquire_file()?;
         SPILL_FILE_OPENS.fetch_add(1, Ordering::Relaxed);
         Ok(LeasedSpillFile {
@@ -2532,6 +2535,8 @@ mod tests {
 
     #[test]
     fn shared_raw_file_retains_quota_until_the_last_worker_closes_it() {
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
         let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let before = global_spilled_bytes();
         let dir =
@@ -2539,7 +2544,7 @@ mod tests {
                 .unwrap();
         let path = dir.path().to_path_buf();
         let charger = dir.charger();
-        let file = OpenOptions::new()
+        let file = crate::platform::file::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
@@ -2549,6 +2554,11 @@ mod tests {
         let reservation = charger.reserve_write(8, 8).unwrap();
         let mut raw: &File = &file;
         raw.write_all(b"raw-data").unwrap();
+        file.write_all_at(b"RAW", 0).unwrap();
+        let mut bytes = [0; 8];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"RAW-data");
+        assert_eq!(raw.stream_position().unwrap(), 8);
         drop(reservation);
         let mirror = file.clone();
         drop(dir);
