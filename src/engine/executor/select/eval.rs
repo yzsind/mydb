@@ -4744,7 +4744,7 @@ fn bind_outer_placeholder_collations(
     if collated.is_empty() {
         return;
     }
-    let mut rewrite = |expr: &mut Expr| {
+    let rewrite = |expr: &mut Expr| {
         crate::parser::visit::rewrite_value_expr(expr, |node| match node {
             Expr::Placeholder(index) => {
                 if let Some(wrapped) = collated.get(index) {

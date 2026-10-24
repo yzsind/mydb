@@ -6,7 +6,7 @@
 
 Let agents manage data flexibly — transactions, analytics, and vector search in a single database.
 
-[Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
+[Download](https://github.com/yzsind/mydb/releases/tag/v1.0.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
 </div>
 
@@ -14,7 +14,7 @@ Let agents manage data flexibly — transactions, analytics, and vector search i
 
 MyDB is a general-purpose database built in Rust, designed around three directions: **AI agents, high-performance hybrid transactional/analytical processing (HTAP), and MySQL compatibility**. Through a familiar SQL interface, applications and agents can manage business data, evolve table schemas, run real-time analytics, and search similar vectors — without copying data across systems or maintaining multiple interfaces.
 
-MyDB is under development toward its first product release: the 1.0.0 public-preview candidate (not yet published) is intended for feature validation and controlled-environment evaluation, is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
+MyDB 1.0.0 is a public-preview release intended for feature validation and controlled-environment evaluation. It is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
 
 | Core capability | What it gives you |
 | --- | --- |
@@ -40,6 +40,10 @@ the [detailed comparison](docs/performance-comparison.md) for all results, test
 conditions, and limitations.
 
 ## Quick Start
+
+Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from the
+[1.0.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.0.0), which also
+includes SHA256 checksums and platform validation details.
 
 ### Build and connect
 
