@@ -1,0 +1,1015 @@
+host_summary	host	varchar	varchar(255)	YES	255	255			
+host_summary	statements	decimal	decimal(64,0)	YES			64	0	
+host_summary	statement_latency	varchar	varchar(11)	YES	11	33			
+host_summary	statement_avg_latency	varchar	varchar(11)	YES	11	33			
+host_summary	table_scans	decimal	decimal(65,0)	YES			65	0	
+host_summary	file_ios	decimal	decimal(64,0)	YES			64	0	
+host_summary	file_io_latency	varchar	varchar(11)	YES	11	33			
+host_summary	current_connections	decimal	decimal(41,0)	YES			41	0	
+host_summary	total_connections	decimal	decimal(41,0)	YES			41	0	
+host_summary	unique_users	bigint	bigint	NO			19	0	
+host_summary	current_memory	varchar	varchar(11)	YES	11	33			
+host_summary	total_memory_allocated	varchar	varchar(11)	YES	11	33			
+host_summary_by_file_io	host	varchar	varchar(255)	YES	255	255			
+host_summary_by_file_io	ios	decimal	decimal(42,0)	YES			42	0	
+host_summary_by_file_io	io_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_file_io_type	host	varchar	varchar(255)	YES	255	255			
+host_summary_by_file_io_type	event_name	varchar	varchar(128)	NO	128	512			
+host_summary_by_file_io_type	total	bigint	bigint unsigned	NO			20	0	
+host_summary_by_file_io_type	total_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_file_io_type	max_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_stages	host	varchar	varchar(255)	YES	255	255			
+host_summary_by_stages	event_name	varchar	varchar(128)	NO	128	512			
+host_summary_by_stages	total	bigint	bigint unsigned	NO			20	0	
+host_summary_by_stages	total_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_stages	avg_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_latency	host	varchar	varchar(255)	YES	255	255			
+host_summary_by_statement_latency	total	decimal	decimal(42,0)	YES			42	0	
+host_summary_by_statement_latency	total_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_latency	max_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_latency	lock_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_latency	cpu_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_latency	rows_sent	decimal	decimal(42,0)	YES			42	0	
+host_summary_by_statement_latency	rows_examined	decimal	decimal(42,0)	YES			42	0	
+host_summary_by_statement_latency	rows_affected	decimal	decimal(42,0)	YES			42	0	
+host_summary_by_statement_latency	full_scans	decimal	decimal(43,0)	YES			43	0	
+host_summary_by_statement_type	host	varchar	varchar(255)	YES	255	255			
+host_summary_by_statement_type	statement	varchar	varchar(128)	YES	128	512			
+host_summary_by_statement_type	total	bigint	bigint unsigned	NO			20	0	
+host_summary_by_statement_type	total_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_type	max_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_type	lock_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_type	cpu_latency	varchar	varchar(11)	YES	11	33			
+host_summary_by_statement_type	rows_sent	bigint	bigint unsigned	NO			20	0	
+host_summary_by_statement_type	rows_examined	bigint	bigint unsigned	NO			20	0	
+host_summary_by_statement_type	rows_affected	bigint	bigint unsigned	NO			20	0	
+host_summary_by_statement_type	full_scans	bigint	bigint unsigned	NO			20	0	
+innodb_buffer_stats_by_schema	object_schema	text	text	YES	65535	65535			
+innodb_buffer_stats_by_schema	allocated	varchar	varchar(11)	YES	11	33			
+innodb_buffer_stats_by_schema	data	varchar	varchar(11)	YES	11	33			
+innodb_buffer_stats_by_schema	pages	bigint	bigint	NO			19	0	
+innodb_buffer_stats_by_schema	pages_hashed	bigint	bigint	NO			19	0	
+innodb_buffer_stats_by_schema	pages_old	bigint	bigint	NO			19	0	
+innodb_buffer_stats_by_schema	rows_cached	decimal	decimal(45,0)	YES			45	0	
+innodb_buffer_stats_by_table	object_schema	text	text	YES	65535	65535			
+innodb_buffer_stats_by_table	object_name	text	text	YES	65535	65535			
+innodb_buffer_stats_by_table	allocated	varchar	varchar(11)	YES	11	33			
+innodb_buffer_stats_by_table	data	varchar	varchar(11)	YES	11	33			
+innodb_buffer_stats_by_table	pages	bigint	bigint	NO			19	0	
+innodb_buffer_stats_by_table	pages_hashed	bigint	bigint	NO			19	0	
+innodb_buffer_stats_by_table	pages_old	bigint	bigint	NO			19	0	
+innodb_buffer_stats_by_table	rows_cached	decimal	decimal(45,0)	YES			45	0	
+innodb_lock_waits	wait_started	datetime	datetime	YES					0
+innodb_lock_waits	wait_age	time	time	YES					0
+innodb_lock_waits	wait_age_secs	bigint	bigint	YES			19	0	
+innodb_lock_waits	locked_table	mediumtext	mediumtext	YES	16777215	16777215			
+innodb_lock_waits	locked_table_schema	varchar	varchar(64)	YES	64	256			
+innodb_lock_waits	locked_table_name	varchar	varchar(64)	YES	64	256			
+innodb_lock_waits	locked_table_partition	varchar	varchar(64)	YES	64	256			
+innodb_lock_waits	locked_table_subpartition	varchar	varchar(64)	YES	64	256			
+innodb_lock_waits	locked_index	varchar	varchar(64)	YES	64	256			
+innodb_lock_waits	locked_type	varchar	varchar(32)	NO	32	128			
+innodb_lock_waits	waiting_trx_id	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	waiting_trx_started	datetime	datetime	NO					0
+innodb_lock_waits	waiting_trx_age	time	time	YES					0
+innodb_lock_waits	waiting_trx_rows_locked	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	waiting_trx_rows_modified	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	waiting_pid	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	waiting_query	longtext	longtext	YES	4294967295	4294967295			
+innodb_lock_waits	waiting_lock_id	varchar	varchar(128)	NO	128	512			
+innodb_lock_waits	waiting_lock_mode	varchar	varchar(32)	NO	32	128			
+innodb_lock_waits	blocking_trx_id	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	blocking_pid	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	blocking_query	longtext	longtext	YES	4294967295	4294967295			
+innodb_lock_waits	blocking_lock_id	varchar	varchar(128)	NO	128	512			
+innodb_lock_waits	blocking_lock_mode	varchar	varchar(32)	NO	32	128			
+innodb_lock_waits	blocking_trx_started	datetime	datetime	NO					0
+innodb_lock_waits	blocking_trx_age	time	time	YES					0
+innodb_lock_waits	blocking_trx_rows_locked	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	blocking_trx_rows_modified	bigint	bigint unsigned	NO			20	0	
+innodb_lock_waits	sql_kill_blocking_query	varchar	varchar(33)	NO	33	132			
+innodb_lock_waits	sql_kill_blocking_connection	varchar	varchar(27)	NO	27	108			
+io_by_thread_by_latency	user	varchar	varchar(288)	YES	288	1152			
+io_by_thread_by_latency	total	decimal	decimal(42,0)	YES			42	0	
+io_by_thread_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+io_by_thread_by_latency	min_latency	varchar	varchar(11)	YES	11	33			
+io_by_thread_by_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+io_by_thread_by_latency	max_latency	varchar	varchar(11)	YES	11	33			
+io_by_thread_by_latency	thread_id	bigint	bigint unsigned	NO			20	0	
+io_by_thread_by_latency	processlist_id	bigint	bigint unsigned	YES			20	0	
+io_global_by_file_by_bytes	file	varchar	varchar(512)	YES	512	2048			
+io_global_by_file_by_bytes	count_read	bigint	bigint unsigned	NO			20	0	
+io_global_by_file_by_bytes	total_read	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_bytes	avg_read	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_bytes	count_write	bigint	bigint unsigned	NO			20	0	
+io_global_by_file_by_bytes	total_written	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_bytes	avg_write	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_bytes	total	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_bytes	write_pct	decimal	decimal(26,2)	NO			26	2	
+io_global_by_file_by_latency	file	varchar	varchar(512)	YES	512	2048			
+io_global_by_file_by_latency	total	bigint	bigint unsigned	NO			20	0	
+io_global_by_file_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_latency	count_read	bigint	bigint unsigned	NO			20	0	
+io_global_by_file_by_latency	read_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_latency	count_write	bigint	bigint unsigned	NO			20	0	
+io_global_by_file_by_latency	write_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_file_by_latency	count_misc	bigint	bigint unsigned	NO			20	0	
+io_global_by_file_by_latency	misc_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	event_name	varchar	varchar(128)	YES	128	512			
+io_global_by_wait_by_bytes	total	bigint	bigint unsigned	NO			20	0	
+io_global_by_wait_by_bytes	total_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	min_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	avg_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	max_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	count_read	bigint	bigint unsigned	NO			20	0	
+io_global_by_wait_by_bytes	total_read	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	avg_read	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	count_write	bigint	bigint unsigned	NO			20	0	
+io_global_by_wait_by_bytes	total_written	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	avg_written	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_bytes	total_requested	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	event_name	varchar	varchar(128)	YES	128	512			
+io_global_by_wait_by_latency	total	bigint	bigint unsigned	NO			20	0	
+io_global_by_wait_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	max_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	read_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	write_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	misc_latency	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	count_read	bigint	bigint unsigned	NO			20	0	
+io_global_by_wait_by_latency	total_read	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	avg_read	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	count_write	bigint	bigint unsigned	NO			20	0	
+io_global_by_wait_by_latency	total_written	varchar	varchar(11)	YES	11	33			
+io_global_by_wait_by_latency	avg_written	varchar	varchar(11)	YES	11	33			
+latest_file_io	thread	varchar	varchar(317)	YES	317	1268			
+latest_file_io	file	varchar	varchar(512)	YES	512	2048			
+latest_file_io	latency	varchar	varchar(11)	YES	11	33			
+latest_file_io	operation	varchar	varchar(32)	NO	32	128			
+latest_file_io	requested	varchar	varchar(11)	YES	11	33			
+memory_by_host_by_current_bytes	host	varchar	varchar(255)	YES	255	255			
+memory_by_host_by_current_bytes	current_count_used	decimal	decimal(41,0)	YES			41	0	
+memory_by_host_by_current_bytes	current_allocated	varchar	varchar(11)	YES	11	33			
+memory_by_host_by_current_bytes	current_avg_alloc	varchar	varchar(11)	YES	11	33			
+memory_by_host_by_current_bytes	current_max_alloc	varchar	varchar(11)	YES	11	33			
+memory_by_host_by_current_bytes	total_allocated	varchar	varchar(11)	YES	11	33			
+memory_by_thread_by_current_bytes	thread_id	bigint	bigint unsigned	NO			20	0	
+memory_by_thread_by_current_bytes	user	varchar	varchar(288)	YES	288	1152			
+memory_by_thread_by_current_bytes	current_count_used	decimal	decimal(41,0)	YES			41	0	
+memory_by_thread_by_current_bytes	current_allocated	varchar	varchar(11)	YES	11	33			
+memory_by_thread_by_current_bytes	current_avg_alloc	varchar	varchar(11)	YES	11	33			
+memory_by_thread_by_current_bytes	current_max_alloc	varchar	varchar(11)	YES	11	33			
+memory_by_thread_by_current_bytes	total_allocated	varchar	varchar(11)	YES	11	33			
+memory_by_user_by_current_bytes	user	varchar	varchar(32)	YES	32	128			
+memory_by_user_by_current_bytes	current_count_used	decimal	decimal(41,0)	YES			41	0	
+memory_by_user_by_current_bytes	current_allocated	varchar	varchar(11)	YES	11	33			
+memory_by_user_by_current_bytes	current_avg_alloc	varchar	varchar(11)	YES	11	33			
+memory_by_user_by_current_bytes	current_max_alloc	varchar	varchar(11)	YES	11	33			
+memory_by_user_by_current_bytes	total_allocated	varchar	varchar(11)	YES	11	33			
+memory_global_by_current_bytes	event_name	varchar	varchar(128)	NO	128	512			
+memory_global_by_current_bytes	current_count	bigint	bigint	NO			19	0	
+memory_global_by_current_bytes	current_alloc	varchar	varchar(11)	YES	11	33			
+memory_global_by_current_bytes	current_avg_alloc	varchar	varchar(11)	YES	11	33			
+memory_global_by_current_bytes	high_count	bigint	bigint	NO			19	0	
+memory_global_by_current_bytes	high_alloc	varchar	varchar(11)	YES	11	33			
+memory_global_by_current_bytes	high_avg_alloc	varchar	varchar(11)	YES	11	33			
+memory_global_total	total_allocated	varchar	varchar(11)	YES	11	33			
+metrics	Variable_name	varchar	varchar(193)	NO	193	772			
+metrics	Variable_value	text	text	YES	65535	65535			
+metrics	Type	varchar	varchar(210)	NO	210	630			
+metrics	Enabled	varchar	varchar(7)	NO	7	28			
+processlist	thd_id	bigint	bigint unsigned	NO			20	0	
+processlist	conn_id	bigint	bigint unsigned	YES			20	0	
+processlist	user	varchar	varchar(288)	YES	288	1152			
+processlist	db	varchar	varchar(64)	YES	64	256			
+processlist	command	varchar	varchar(16)	YES	16	64			
+processlist	state	varchar	varchar(64)	YES	64	256			
+processlist	time	bigint	bigint	YES			19	0	
+processlist	current_statement	longtext	longtext	YES	4294967295	4294967295			
+processlist	execution_engine	enum	enum('PRIMARY','SECONDARY')	YES	9	36			
+processlist	statement_latency	varchar	varchar(11)	YES	11	33			
+processlist	progress	decimal	decimal(26,2)	YES			26	2	
+processlist	lock_latency	varchar	varchar(11)	YES	11	33			
+processlist	cpu_latency	varchar	varchar(11)	YES	11	33			
+processlist	rows_examined	bigint	bigint unsigned	YES			20	0	
+processlist	rows_sent	bigint	bigint unsigned	YES			20	0	
+processlist	rows_affected	bigint	bigint unsigned	YES			20	0	
+processlist	tmp_tables	bigint	bigint unsigned	YES			20	0	
+processlist	tmp_disk_tables	bigint	bigint unsigned	YES			20	0	
+processlist	full_scan	varchar	varchar(3)	NO	3	12			
+processlist	last_statement	longtext	longtext	YES	4294967295	4294967295			
+processlist	last_statement_latency	varchar	varchar(11)	YES	11	33			
+processlist	current_memory	varchar	varchar(11)	YES	11	33			
+processlist	last_wait	varchar	varchar(128)	YES	128	512			
+processlist	last_wait_latency	varchar	varchar(13)	YES	13	52			
+processlist	source	varchar	varchar(64)	YES	64	256			
+processlist	trx_latency	varchar	varchar(11)	YES	11	33			
+processlist	trx_state	enum	enum('ACTIVE','COMMITTED','ROLLED BACK')	YES	11	44			
+processlist	trx_autocommit	enum	enum('YES','NO')	YES	3	12			
+processlist	pid	varchar	varchar(1024)	YES	1024	4096			
+processlist	program_name	varchar	varchar(1024)	YES	1024	4096			
+ps_check_lost_instrumentation	variable_name	varchar	varchar(64)	NO	64	256			
+ps_check_lost_instrumentation	variable_value	varchar	varchar(1024)	YES	1024	4096			
+schema_auto_increment_columns	table_schema	varchar	varchar(64)	YES	64	192			
+schema_auto_increment_columns	table_name	varchar	varchar(64)	YES	64	192			
+schema_auto_increment_columns	column_name	varchar	varchar(64)	YES	64	192			
+schema_auto_increment_columns	data_type	longtext	longtext	YES	4294967295	4294967295			
+schema_auto_increment_columns	column_type	mediumtext	mediumtext	NO	16777215	16777215			
+schema_auto_increment_columns	is_signed	int	int	NO			10	0	
+schema_auto_increment_columns	is_unsigned	int	int	NO			10	0	
+schema_auto_increment_columns	max_value	bigint	bigint unsigned	YES			20	0	
+schema_auto_increment_columns	auto_increment	bigint	bigint unsigned	YES			20	0	
+schema_auto_increment_columns	auto_increment_ratio	decimal	decimal(25,4) unsigned	YES			25	4	
+schema_index_statistics	table_schema	varchar	varchar(64)	YES	64	256			
+schema_index_statistics	table_name	varchar	varchar(64)	YES	64	256			
+schema_index_statistics	index_name	varchar	varchar(64)	YES	64	256			
+schema_index_statistics	rows_selected	bigint	bigint unsigned	NO			20	0	
+schema_index_statistics	select_latency	varchar	varchar(11)	YES	11	33			
+schema_index_statistics	rows_inserted	bigint	bigint unsigned	NO			20	0	
+schema_index_statistics	insert_latency	varchar	varchar(11)	YES	11	33			
+schema_index_statistics	rows_updated	bigint	bigint unsigned	NO			20	0	
+schema_index_statistics	update_latency	varchar	varchar(11)	YES	11	33			
+schema_index_statistics	rows_deleted	bigint	bigint unsigned	NO			20	0	
+schema_index_statistics	delete_latency	varchar	varchar(11)	YES	11	33			
+schema_object_overview	db	varchar	varchar(64)	YES	64	192			
+schema_object_overview	object_type	varchar	varchar(19)	YES	19	57			
+schema_object_overview	count	bigint	bigint	NO			19	0	
+schema_redundant_indexes	table_schema	varchar	varchar(64)	YES	64	192			
+schema_redundant_indexes	table_name	varchar	varchar(64)	YES	64	192			
+schema_redundant_indexes	redundant_index_name	varchar	varchar(64)	YES	64	192			
+schema_redundant_indexes	redundant_index_columns	text	text	YES	65535	65535			
+schema_redundant_indexes	redundant_index_non_unique	int	int	YES			10	0	
+schema_redundant_indexes	dominant_index_name	varchar	varchar(64)	YES	64	192			
+schema_redundant_indexes	dominant_index_columns	text	text	YES	65535	65535			
+schema_redundant_indexes	dominant_index_non_unique	int	int	YES			10	0	
+schema_redundant_indexes	subpart_exists	int	int	NO			10	0	
+schema_redundant_indexes	sql_drop_index	varchar	varchar(223)	YES	223	669			
+schema_table_lock_waits	object_schema	varchar	varchar(64)	YES	64	256			
+schema_table_lock_waits	object_name	varchar	varchar(64)	YES	64	256			
+schema_table_lock_waits	waiting_thread_id	bigint	bigint unsigned	NO			20	0	
+schema_table_lock_waits	waiting_pid	bigint	bigint unsigned	YES			20	0	
+schema_table_lock_waits	waiting_account	text	text	YES	65535	65535			
+schema_table_lock_waits	waiting_lock_type	varchar	varchar(32)	NO	32	128			
+schema_table_lock_waits	waiting_lock_duration	varchar	varchar(32)	NO	32	128			
+schema_table_lock_waits	waiting_query	longtext	longtext	YES	4294967295	4294967295			
+schema_table_lock_waits	waiting_query_secs	bigint	bigint	YES			19	0	
+schema_table_lock_waits	waiting_query_rows_affected	bigint	bigint unsigned	YES			20	0	
+schema_table_lock_waits	waiting_query_rows_examined	bigint	bigint unsigned	YES			20	0	
+schema_table_lock_waits	blocking_thread_id	bigint	bigint unsigned	NO			20	0	
+schema_table_lock_waits	blocking_pid	bigint	bigint unsigned	YES			20	0	
+schema_table_lock_waits	blocking_account	text	text	YES	65535	65535			
+schema_table_lock_waits	blocking_lock_type	varchar	varchar(32)	NO	32	128			
+schema_table_lock_waits	blocking_lock_duration	varchar	varchar(32)	NO	32	128			
+schema_table_lock_waits	sql_kill_blocking_query	varchar	varchar(31)	YES	31	124			
+schema_table_lock_waits	sql_kill_blocking_connection	varchar	varchar(25)	YES	25	100			
+schema_table_statistics	table_schema	varchar	varchar(64)	YES	64	256			
+schema_table_statistics	table_name	varchar	varchar(64)	YES	64	256			
+schema_table_statistics	total_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	rows_fetched	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics	fetch_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	rows_inserted	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics	insert_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	rows_updated	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics	update_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	rows_deleted	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics	delete_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	io_read_requests	decimal	decimal(42,0)	YES			42	0	
+schema_table_statistics	io_read	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	io_read_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	io_write_requests	decimal	decimal(42,0)	YES			42	0	
+schema_table_statistics	io_write	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	io_write_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics	io_misc_requests	decimal	decimal(42,0)	YES			42	0	
+schema_table_statistics	io_misc_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	table_schema	varchar	varchar(64)	YES	64	256			
+schema_table_statistics_with_buffer	table_name	varchar	varchar(64)	YES	64	256			
+schema_table_statistics_with_buffer	rows_fetched	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics_with_buffer	fetch_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	rows_inserted	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics_with_buffer	insert_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	rows_updated	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics_with_buffer	update_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	rows_deleted	bigint	bigint unsigned	NO			20	0	
+schema_table_statistics_with_buffer	delete_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	io_read_requests	decimal	decimal(42,0)	YES			42	0	
+schema_table_statistics_with_buffer	io_read	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	io_read_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	io_write_requests	decimal	decimal(42,0)	YES			42	0	
+schema_table_statistics_with_buffer	io_write	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	io_write_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	io_misc_requests	decimal	decimal(42,0)	YES			42	0	
+schema_table_statistics_with_buffer	io_misc_latency	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	innodb_buffer_allocated	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	innodb_buffer_data	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	innodb_buffer_free	varchar	varchar(11)	YES	11	33			
+schema_table_statistics_with_buffer	innodb_buffer_pages	bigint	bigint	YES			19	0	
+schema_table_statistics_with_buffer	innodb_buffer_pages_hashed	bigint	bigint	YES			19	0	
+schema_table_statistics_with_buffer	innodb_buffer_pages_old	bigint	bigint	YES			19	0	
+schema_table_statistics_with_buffer	innodb_buffer_rows_cached	decimal	decimal(45,0)	YES			45	0	
+schema_tables_with_full_table_scans	object_schema	varchar	varchar(64)	YES	64	256			
+schema_tables_with_full_table_scans	object_name	varchar	varchar(64)	YES	64	256			
+schema_tables_with_full_table_scans	rows_full_scanned	bigint	bigint unsigned	NO			20	0	
+schema_tables_with_full_table_scans	latency	varchar	varchar(11)	YES	11	33			
+schema_unused_indexes	object_schema	varchar	varchar(64)	YES	64	256			
+schema_unused_indexes	object_name	varchar	varchar(64)	YES	64	256			
+schema_unused_indexes	index_name	varchar	varchar(64)	YES	64	256			
+session	thd_id	bigint	bigint unsigned	NO			20	0	
+session	conn_id	bigint	bigint unsigned	YES			20	0	
+session	user	varchar	varchar(288)	YES	288	1152			
+session	db	varchar	varchar(64)	YES	64	256			
+session	command	varchar	varchar(16)	YES	16	64			
+session	state	varchar	varchar(64)	YES	64	256			
+session	time	bigint	bigint	YES			19	0	
+session	current_statement	longtext	longtext	YES	4294967295	4294967295			
+session	execution_engine	enum	enum('PRIMARY','SECONDARY')	YES	9	36			
+session	statement_latency	varchar	varchar(11)	YES	11	33			
+session	progress	decimal	decimal(26,2)	YES			26	2	
+session	lock_latency	varchar	varchar(11)	YES	11	33			
+session	cpu_latency	varchar	varchar(11)	YES	11	33			
+session	rows_examined	bigint	bigint unsigned	YES			20	0	
+session	rows_sent	bigint	bigint unsigned	YES			20	0	
+session	rows_affected	bigint	bigint unsigned	YES			20	0	
+session	tmp_tables	bigint	bigint unsigned	YES			20	0	
+session	tmp_disk_tables	bigint	bigint unsigned	YES			20	0	
+session	full_scan	varchar	varchar(3)	NO	3	12			
+session	last_statement	longtext	longtext	YES	4294967295	4294967295			
+session	last_statement_latency	varchar	varchar(11)	YES	11	33			
+session	current_memory	varchar	varchar(11)	YES	11	33			
+session	last_wait	varchar	varchar(128)	YES	128	512			
+session	last_wait_latency	varchar	varchar(13)	YES	13	52			
+session	source	varchar	varchar(64)	YES	64	256			
+session	trx_latency	varchar	varchar(11)	YES	11	33			
+session	trx_state	enum	enum('ACTIVE','COMMITTED','ROLLED BACK')	YES	11	44			
+session	trx_autocommit	enum	enum('YES','NO')	YES	3	12			
+session	pid	varchar	varchar(1024)	YES	1024	4096			
+session	program_name	varchar	varchar(1024)	YES	1024	4096			
+session_ssl_status	thread_id	bigint	bigint unsigned	NO			20	0	
+session_ssl_status	ssl_version	varchar	varchar(1024)	YES	1024	4096			
+session_ssl_status	ssl_cipher	varchar	varchar(1024)	YES	1024	4096			
+session_ssl_status	ssl_sessions_reused	varchar	varchar(1024)	YES	1024	4096			
+statement_analysis	query	longtext	longtext	YES	4294967295	4294967295			
+statement_analysis	db	varchar	varchar(64)	YES	64	256			
+statement_analysis	full_scan	varchar	varchar(1)	NO	1	4			
+statement_analysis	exec_count	bigint	bigint unsigned	NO			20	0	
+statement_analysis	err_count	bigint	bigint unsigned	NO			20	0	
+statement_analysis	warn_count	bigint	bigint unsigned	NO			20	0	
+statement_analysis	total_latency	varchar	varchar(11)	YES	11	33			
+statement_analysis	max_latency	varchar	varchar(11)	YES	11	33			
+statement_analysis	avg_latency	varchar	varchar(11)	YES	11	33			
+statement_analysis	lock_latency	varchar	varchar(11)	YES	11	33			
+statement_analysis	cpu_latency	varchar	varchar(11)	YES	11	33			
+statement_analysis	rows_sent	bigint	bigint unsigned	NO			20	0	
+statement_analysis	rows_sent_avg	decimal	decimal(21,0)	NO			21	0	
+statement_analysis	rows_examined	bigint	bigint unsigned	NO			20	0	
+statement_analysis	rows_examined_avg	decimal	decimal(21,0)	NO			21	0	
+statement_analysis	rows_affected	bigint	bigint unsigned	NO			20	0	
+statement_analysis	rows_affected_avg	decimal	decimal(21,0)	NO			21	0	
+statement_analysis	tmp_tables	bigint	bigint unsigned	NO			20	0	
+statement_analysis	tmp_disk_tables	bigint	bigint unsigned	NO			20	0	
+statement_analysis	rows_sorted	bigint	bigint unsigned	NO			20	0	
+statement_analysis	sort_merge_passes	bigint	bigint unsigned	NO			20	0	
+statement_analysis	max_controlled_memory	varchar	varchar(11)	YES	11	33			
+statement_analysis	max_total_memory	varchar	varchar(11)	YES	11	33			
+statement_analysis	digest	varchar	varchar(64)	YES	64	256			
+statement_analysis	first_seen	timestamp	timestamp(6)	NO					6
+statement_analysis	last_seen	timestamp	timestamp(6)	NO					6
+statements_with_errors_or_warnings	query	longtext	longtext	YES	4294967295	4294967295			
+statements_with_errors_or_warnings	db	varchar	varchar(64)	YES	64	256			
+statements_with_errors_or_warnings	exec_count	bigint	bigint unsigned	NO			20	0	
+statements_with_errors_or_warnings	errors	bigint	bigint unsigned	NO			20	0	
+statements_with_errors_or_warnings	error_pct	decimal	decimal(27,4)	NO			27	4	
+statements_with_errors_or_warnings	warnings	bigint	bigint unsigned	NO			20	0	
+statements_with_errors_or_warnings	warning_pct	decimal	decimal(27,4)	NO			27	4	
+statements_with_errors_or_warnings	first_seen	timestamp	timestamp(6)	NO					6
+statements_with_errors_or_warnings	last_seen	timestamp	timestamp(6)	NO					6
+statements_with_errors_or_warnings	digest	varchar	varchar(64)	YES	64	256			
+statements_with_full_table_scans	query	longtext	longtext	YES	4294967295	4294967295			
+statements_with_full_table_scans	db	varchar	varchar(64)	YES	64	256			
+statements_with_full_table_scans	exec_count	bigint	bigint unsigned	NO			20	0	
+statements_with_full_table_scans	total_latency	varchar	varchar(11)	YES	11	33			
+statements_with_full_table_scans	no_index_used_count	bigint	bigint unsigned	NO			20	0	
+statements_with_full_table_scans	no_good_index_used_count	bigint	bigint unsigned	NO			20	0	
+statements_with_full_table_scans	no_index_used_pct	decimal	decimal(24,0)	NO			24	0	
+statements_with_full_table_scans	rows_sent	bigint	bigint unsigned	NO			20	0	
+statements_with_full_table_scans	rows_examined	bigint	bigint unsigned	NO			20	0	
+statements_with_full_table_scans	rows_sent_avg	decimal	decimal(21,0)	YES			21	0	
+statements_with_full_table_scans	rows_examined_avg	decimal	decimal(21,0)	YES			21	0	
+statements_with_full_table_scans	first_seen	timestamp	timestamp(6)	NO					6
+statements_with_full_table_scans	last_seen	timestamp	timestamp(6)	NO					6
+statements_with_full_table_scans	digest	varchar	varchar(64)	YES	64	256			
+statements_with_runtimes_in_95th_percentile	query	longtext	longtext	YES	4294967295	4294967295			
+statements_with_runtimes_in_95th_percentile	db	varchar	varchar(64)	YES	64	256			
+statements_with_runtimes_in_95th_percentile	full_scan	varchar	varchar(1)	NO	1	4			
+statements_with_runtimes_in_95th_percentile	exec_count	bigint	bigint unsigned	NO			20	0	
+statements_with_runtimes_in_95th_percentile	err_count	bigint	bigint unsigned	NO			20	0	
+statements_with_runtimes_in_95th_percentile	warn_count	bigint	bigint unsigned	NO			20	0	
+statements_with_runtimes_in_95th_percentile	total_latency	varchar	varchar(11)	YES	11	33			
+statements_with_runtimes_in_95th_percentile	max_latency	varchar	varchar(11)	YES	11	33			
+statements_with_runtimes_in_95th_percentile	avg_latency	varchar	varchar(11)	YES	11	33			
+statements_with_runtimes_in_95th_percentile	rows_sent	bigint	bigint unsigned	NO			20	0	
+statements_with_runtimes_in_95th_percentile	rows_sent_avg	decimal	decimal(21,0)	NO			21	0	
+statements_with_runtimes_in_95th_percentile	rows_examined	bigint	bigint unsigned	NO			20	0	
+statements_with_runtimes_in_95th_percentile	rows_examined_avg	decimal	decimal(21,0)	NO			21	0	
+statements_with_runtimes_in_95th_percentile	first_seen	timestamp	timestamp(6)	NO					6
+statements_with_runtimes_in_95th_percentile	last_seen	timestamp	timestamp(6)	NO					6
+statements_with_runtimes_in_95th_percentile	digest	varchar	varchar(64)	YES	64	256			
+statements_with_sorting	query	longtext	longtext	YES	4294967295	4294967295			
+statements_with_sorting	db	varchar	varchar(64)	YES	64	256			
+statements_with_sorting	exec_count	bigint	bigint unsigned	NO			20	0	
+statements_with_sorting	total_latency	varchar	varchar(11)	YES	11	33			
+statements_with_sorting	sort_merge_passes	bigint	bigint unsigned	NO			20	0	
+statements_with_sorting	avg_sort_merges	decimal	decimal(21,0)	NO			21	0	
+statements_with_sorting	sorts_using_scans	bigint	bigint unsigned	NO			20	0	
+statements_with_sorting	sort_using_range	bigint	bigint unsigned	NO			20	0	
+statements_with_sorting	rows_sorted	bigint	bigint unsigned	NO			20	0	
+statements_with_sorting	avg_rows_sorted	decimal	decimal(21,0)	NO			21	0	
+statements_with_sorting	first_seen	timestamp	timestamp(6)	NO					6
+statements_with_sorting	last_seen	timestamp	timestamp(6)	NO					6
+statements_with_sorting	digest	varchar	varchar(64)	YES	64	256			
+statements_with_temp_tables	query	longtext	longtext	YES	4294967295	4294967295			
+statements_with_temp_tables	db	varchar	varchar(64)	YES	64	256			
+statements_with_temp_tables	exec_count	bigint	bigint unsigned	NO			20	0	
+statements_with_temp_tables	total_latency	varchar	varchar(11)	YES	11	33			
+statements_with_temp_tables	memory_tmp_tables	bigint	bigint unsigned	NO			20	0	
+statements_with_temp_tables	disk_tmp_tables	bigint	bigint unsigned	NO			20	0	
+statements_with_temp_tables	avg_tmp_tables_per_query	decimal	decimal(21,0)	NO			21	0	
+statements_with_temp_tables	tmp_tables_to_disk_pct	decimal	decimal(24,0)	NO			24	0	
+statements_with_temp_tables	first_seen	timestamp	timestamp(6)	NO					6
+statements_with_temp_tables	last_seen	timestamp	timestamp(6)	NO					6
+statements_with_temp_tables	digest	varchar	varchar(64)	YES	64	256			
+user_summary	user	varchar	varchar(32)	YES	32	128			
+user_summary	statements	decimal	decimal(64,0)	YES			64	0	
+user_summary	statement_latency	varchar	varchar(11)	YES	11	33			
+user_summary	statement_avg_latency	varchar	varchar(11)	YES	11	33			
+user_summary	table_scans	decimal	decimal(65,0)	YES			65	0	
+user_summary	file_ios	decimal	decimal(64,0)	YES			64	0	
+user_summary	file_io_latency	varchar	varchar(11)	YES	11	33			
+user_summary	current_connections	decimal	decimal(41,0)	YES			41	0	
+user_summary	total_connections	decimal	decimal(41,0)	YES			41	0	
+user_summary	unique_hosts	bigint	bigint	NO			19	0	
+user_summary	current_memory	varchar	varchar(11)	YES	11	33			
+user_summary	total_memory_allocated	varchar	varchar(11)	YES	11	33			
+user_summary_by_file_io	user	varchar	varchar(32)	YES	32	128			
+user_summary_by_file_io	ios	decimal	decimal(42,0)	YES			42	0	
+user_summary_by_file_io	io_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_file_io_type	user	varchar	varchar(32)	YES	32	128			
+user_summary_by_file_io_type	event_name	varchar	varchar(128)	NO	128	512			
+user_summary_by_file_io_type	total	bigint	bigint unsigned	NO			20	0	
+user_summary_by_file_io_type	latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_file_io_type	max_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_stages	user	varchar	varchar(32)	YES	32	128			
+user_summary_by_stages	event_name	varchar	varchar(128)	NO	128	512			
+user_summary_by_stages	total	bigint	bigint unsigned	NO			20	0	
+user_summary_by_stages	total_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_stages	avg_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_latency	user	varchar	varchar(32)	YES	32	128			
+user_summary_by_statement_latency	total	decimal	decimal(42,0)	YES			42	0	
+user_summary_by_statement_latency	total_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_latency	max_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_latency	lock_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_latency	cpu_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_latency	rows_sent	decimal	decimal(42,0)	YES			42	0	
+user_summary_by_statement_latency	rows_examined	decimal	decimal(42,0)	YES			42	0	
+user_summary_by_statement_latency	rows_affected	decimal	decimal(42,0)	YES			42	0	
+user_summary_by_statement_latency	full_scans	decimal	decimal(43,0)	YES			43	0	
+user_summary_by_statement_type	user	varchar	varchar(32)	YES	32	128			
+user_summary_by_statement_type	statement	varchar	varchar(128)	YES	128	512			
+user_summary_by_statement_type	total	bigint	bigint unsigned	NO			20	0	
+user_summary_by_statement_type	total_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_type	max_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_type	lock_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_type	cpu_latency	varchar	varchar(11)	YES	11	33			
+user_summary_by_statement_type	rows_sent	bigint	bigint unsigned	NO			20	0	
+user_summary_by_statement_type	rows_examined	bigint	bigint unsigned	NO			20	0	
+user_summary_by_statement_type	rows_affected	bigint	bigint unsigned	NO			20	0	
+user_summary_by_statement_type	full_scans	bigint	bigint unsigned	NO			20	0	
+version	sys_version	varchar	varchar(5)	NO	5	20			
+version	mysql_version	varchar	varchar(6)	NO	6	18			
+wait_classes_global_by_avg_latency	event_class	varchar	varchar(128)	YES	128	512			
+wait_classes_global_by_avg_latency	total	decimal	decimal(42,0)	YES			42	0	
+wait_classes_global_by_avg_latency	total_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_avg_latency	min_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_avg_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_avg_latency	max_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_latency	event_class	varchar	varchar(128)	YES	128	512			
+wait_classes_global_by_latency	total	decimal	decimal(42,0)	YES			42	0	
+wait_classes_global_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_latency	min_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+wait_classes_global_by_latency	max_latency	varchar	varchar(11)	YES	11	33			
+waits_by_host_by_latency	host	varchar	varchar(255)	YES	255	255			
+waits_by_host_by_latency	event	varchar	varchar(128)	NO	128	512			
+waits_by_host_by_latency	total	bigint	bigint unsigned	NO			20	0	
+waits_by_host_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+waits_by_host_by_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+waits_by_host_by_latency	max_latency	varchar	varchar(11)	YES	11	33			
+waits_by_user_by_latency	user	varchar	varchar(32)	YES	32	128			
+waits_by_user_by_latency	event	varchar	varchar(128)	NO	128	512			
+waits_by_user_by_latency	total	bigint	bigint unsigned	NO			20	0	
+waits_by_user_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+waits_by_user_by_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+waits_by_user_by_latency	max_latency	varchar	varchar(11)	YES	11	33			
+waits_global_by_latency	events	varchar	varchar(128)	NO	128	512			
+waits_global_by_latency	total	bigint	bigint unsigned	NO			20	0	
+waits_global_by_latency	total_latency	varchar	varchar(11)	YES	11	33			
+waits_global_by_latency	avg_latency	varchar	varchar(11)	YES	11	33			
+waits_global_by_latency	max_latency	varchar	varchar(11)	YES	11	33			
+x$host_summary	host	varchar	varchar(255)	YES	255	255			
+x$host_summary	statements	decimal	decimal(64,0)	YES			64	0	
+x$host_summary	statement_latency	decimal	decimal(64,0)	YES			64	0	
+x$host_summary	statement_avg_latency	decimal	decimal(65,4)	YES			65	4	
+x$host_summary	table_scans	decimal	decimal(65,0)	YES			65	0	
+x$host_summary	file_ios	decimal	decimal(64,0)	YES			64	0	
+x$host_summary	file_io_latency	decimal	decimal(64,0)	YES			64	0	
+x$host_summary	current_connections	decimal	decimal(41,0)	YES			41	0	
+x$host_summary	total_connections	decimal	decimal(41,0)	YES			41	0	
+x$host_summary	unique_users	bigint	bigint	NO			19	0	
+x$host_summary	current_memory	decimal	decimal(63,0)	YES			63	0	
+x$host_summary	total_memory_allocated	decimal	decimal(64,0)	YES			64	0	
+x$host_summary_by_file_io	host	varchar	varchar(255)	YES	255	255			
+x$host_summary_by_file_io	ios	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_file_io	io_latency	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_file_io_type	host	varchar	varchar(255)	YES	255	255			
+x$host_summary_by_file_io_type	event_name	varchar	varchar(128)	NO	128	512			
+x$host_summary_by_file_io_type	total	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_file_io_type	total_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_file_io_type	max_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_stages	host	varchar	varchar(255)	YES	255	255			
+x$host_summary_by_stages	event_name	varchar	varchar(128)	NO	128	512			
+x$host_summary_by_stages	total	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_stages	total_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_stages	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_latency	host	varchar	varchar(255)	YES	255	255			
+x$host_summary_by_statement_latency	total	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	total_latency	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	max_latency	bigint	bigint unsigned	YES			20	0	
+x$host_summary_by_statement_latency	lock_latency	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	cpu_latency	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	rows_sent	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	rows_examined	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	rows_affected	decimal	decimal(42,0)	YES			42	0	
+x$host_summary_by_statement_latency	full_scans	decimal	decimal(43,0)	YES			43	0	
+x$host_summary_by_statement_type	host	varchar	varchar(255)	YES	255	255			
+x$host_summary_by_statement_type	statement	varchar	varchar(128)	YES	128	512			
+x$host_summary_by_statement_type	total	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	total_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	max_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	lock_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	cpu_latency	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	rows_sent	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	rows_examined	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	rows_affected	bigint	bigint unsigned	NO			20	0	
+x$host_summary_by_statement_type	full_scans	bigint	bigint unsigned	NO			20	0	
+x$innodb_buffer_stats_by_schema	object_schema	text	text	YES	65535	65535			
+x$innodb_buffer_stats_by_schema	allocated	decimal	decimal(44,0)	YES			44	0	
+x$innodb_buffer_stats_by_schema	data	decimal	decimal(44,0)	YES			44	0	
+x$innodb_buffer_stats_by_schema	pages	bigint	bigint	NO			19	0	
+x$innodb_buffer_stats_by_schema	pages_hashed	bigint	bigint	NO			19	0	
+x$innodb_buffer_stats_by_schema	pages_old	bigint	bigint	NO			19	0	
+x$innodb_buffer_stats_by_schema	rows_cached	decimal	decimal(45,0)	NO			45	0	
+x$innodb_buffer_stats_by_table	object_schema	text	text	YES	65535	65535			
+x$innodb_buffer_stats_by_table	object_name	text	text	YES	65535	65535			
+x$innodb_buffer_stats_by_table	allocated	decimal	decimal(44,0)	YES			44	0	
+x$innodb_buffer_stats_by_table	data	decimal	decimal(44,0)	YES			44	0	
+x$innodb_buffer_stats_by_table	pages	bigint	bigint	NO			19	0	
+x$innodb_buffer_stats_by_table	pages_hashed	bigint	bigint	NO			19	0	
+x$innodb_buffer_stats_by_table	pages_old	bigint	bigint	NO			19	0	
+x$innodb_buffer_stats_by_table	rows_cached	decimal	decimal(45,0)	NO			45	0	
+x$innodb_lock_waits	wait_started	datetime	datetime	YES					0
+x$innodb_lock_waits	wait_age	time	time	YES					0
+x$innodb_lock_waits	wait_age_secs	bigint	bigint	YES			19	0	
+x$innodb_lock_waits	locked_table	mediumtext	mediumtext	YES	16777215	16777215			
+x$innodb_lock_waits	locked_table_schema	varchar	varchar(64)	YES	64	256			
+x$innodb_lock_waits	locked_table_name	varchar	varchar(64)	YES	64	256			
+x$innodb_lock_waits	locked_table_partition	varchar	varchar(64)	YES	64	256			
+x$innodb_lock_waits	locked_table_subpartition	varchar	varchar(64)	YES	64	256			
+x$innodb_lock_waits	locked_index	varchar	varchar(64)	YES	64	256			
+x$innodb_lock_waits	locked_type	varchar	varchar(32)	NO	32	128			
+x$innodb_lock_waits	waiting_trx_id	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	waiting_trx_started	datetime	datetime	NO					0
+x$innodb_lock_waits	waiting_trx_age	time	time	YES					0
+x$innodb_lock_waits	waiting_trx_rows_locked	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	waiting_trx_rows_modified	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	waiting_pid	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	waiting_query	varchar	varchar(1024)	YES	1024	3072			
+x$innodb_lock_waits	waiting_lock_id	varchar	varchar(128)	NO	128	512			
+x$innodb_lock_waits	waiting_lock_mode	varchar	varchar(32)	NO	32	128			
+x$innodb_lock_waits	blocking_trx_id	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	blocking_pid	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	blocking_query	varchar	varchar(1024)	YES	1024	3072			
+x$innodb_lock_waits	blocking_lock_id	varchar	varchar(128)	NO	128	512			
+x$innodb_lock_waits	blocking_lock_mode	varchar	varchar(32)	NO	32	128			
+x$innodb_lock_waits	blocking_trx_started	datetime	datetime	NO					0
+x$innodb_lock_waits	blocking_trx_age	time	time	YES					0
+x$innodb_lock_waits	blocking_trx_rows_locked	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	blocking_trx_rows_modified	bigint	bigint unsigned	NO			20	0	
+x$innodb_lock_waits	sql_kill_blocking_query	varchar	varchar(33)	NO	33	132			
+x$innodb_lock_waits	sql_kill_blocking_connection	varchar	varchar(27)	NO	27	108			
+x$io_by_thread_by_latency	user	varchar	varchar(288)	YES	288	1152			
+x$io_by_thread_by_latency	total	decimal	decimal(42,0)	YES			42	0	
+x$io_by_thread_by_latency	total_latency	decimal	decimal(42,0)	YES			42	0	
+x$io_by_thread_by_latency	min_latency	bigint	bigint unsigned	YES			20	0	
+x$io_by_thread_by_latency	avg_latency	decimal	decimal(24,4)	YES			24	4	
+x$io_by_thread_by_latency	max_latency	bigint	bigint unsigned	YES			20	0	
+x$io_by_thread_by_latency	thread_id	bigint	bigint unsigned	NO			20	0	
+x$io_by_thread_by_latency	processlist_id	bigint	bigint unsigned	YES			20	0	
+x$io_global_by_file_by_bytes	file	varchar	varchar(512)	NO	512	2048			
+x$io_global_by_file_by_bytes	count_read	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_bytes	total_read	bigint	bigint	NO			19	0	
+x$io_global_by_file_by_bytes	avg_read	decimal	decimal(23,4)	NO			23	4	
+x$io_global_by_file_by_bytes	count_write	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_bytes	total_written	bigint	bigint	NO			19	0	
+x$io_global_by_file_by_bytes	avg_write	decimal	decimal(23,4)	NO			23	4	
+x$io_global_by_file_by_bytes	total	bigint	bigint	NO			19	0	
+x$io_global_by_file_by_bytes	write_pct	decimal	decimal(26,2)	NO			26	2	
+x$io_global_by_file_by_latency	file	varchar	varchar(512)	NO	512	2048			
+x$io_global_by_file_by_latency	total	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	total_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	count_read	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	read_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	count_write	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	write_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	count_misc	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_file_by_latency	misc_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	event_name	varchar	varchar(128)	YES	128	512			
+x$io_global_by_wait_by_bytes	total	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	total_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	min_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	max_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	count_read	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	total_read	bigint	bigint	NO			19	0	
+x$io_global_by_wait_by_bytes	avg_read	decimal	decimal(23,4)	NO			23	4	
+x$io_global_by_wait_by_bytes	count_write	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_bytes	total_written	bigint	bigint	NO			19	0	
+x$io_global_by_wait_by_bytes	avg_written	decimal	decimal(23,4)	NO			23	4	
+x$io_global_by_wait_by_bytes	total_requested	bigint	bigint	NO			19	0	
+x$io_global_by_wait_by_latency	event_name	varchar	varchar(128)	YES	128	512			
+x$io_global_by_wait_by_latency	total	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	total_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	max_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	read_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	write_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	misc_latency	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	count_read	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	total_read	bigint	bigint	NO			19	0	
+x$io_global_by_wait_by_latency	avg_read	decimal	decimal(23,4)	NO			23	4	
+x$io_global_by_wait_by_latency	count_write	bigint	bigint unsigned	NO			20	0	
+x$io_global_by_wait_by_latency	total_written	bigint	bigint	NO			19	0	
+x$io_global_by_wait_by_latency	avg_written	decimal	decimal(23,4)	NO			23	4	
+x$latest_file_io	thread	varchar	varchar(317)	YES	317	1268			
+x$latest_file_io	file	varchar	varchar(512)	YES	512	2048			
+x$latest_file_io	latency	bigint	bigint unsigned	YES			20	0	
+x$latest_file_io	operation	varchar	varchar(32)	NO	32	128			
+x$latest_file_io	requested	bigint	bigint	YES			19	0	
+x$memory_by_host_by_current_bytes	host	varchar	varchar(255)	YES	255	255			
+x$memory_by_host_by_current_bytes	current_count_used	decimal	decimal(41,0)	YES			41	0	
+x$memory_by_host_by_current_bytes	current_allocated	decimal	decimal(41,0)	YES			41	0	
+x$memory_by_host_by_current_bytes	current_avg_alloc	decimal	decimal(45,4)	NO			45	4	
+x$memory_by_host_by_current_bytes	current_max_alloc	bigint	bigint	YES			19	0	
+x$memory_by_host_by_current_bytes	total_allocated	decimal	decimal(42,0)	YES			42	0	
+x$memory_by_thread_by_current_bytes	thread_id	bigint	bigint unsigned	NO			20	0	
+x$memory_by_thread_by_current_bytes	user	varchar	varchar(288)	YES	288	1152			
+x$memory_by_thread_by_current_bytes	current_count_used	decimal	decimal(41,0)	YES			41	0	
+x$memory_by_thread_by_current_bytes	current_allocated	decimal	decimal(41,0)	YES			41	0	
+x$memory_by_thread_by_current_bytes	current_avg_alloc	decimal	decimal(45,4)	NO			45	4	
+x$memory_by_thread_by_current_bytes	current_max_alloc	bigint	bigint	YES			19	0	
+x$memory_by_thread_by_current_bytes	total_allocated	decimal	decimal(42,0)	YES			42	0	
+x$memory_by_user_by_current_bytes	user	varchar	varchar(32)	YES	32	128			
+x$memory_by_user_by_current_bytes	current_count_used	decimal	decimal(41,0)	YES			41	0	
+x$memory_by_user_by_current_bytes	current_allocated	decimal	decimal(41,0)	YES			41	0	
+x$memory_by_user_by_current_bytes	current_avg_alloc	decimal	decimal(45,4)	NO			45	4	
+x$memory_by_user_by_current_bytes	current_max_alloc	bigint	bigint	YES			19	0	
+x$memory_by_user_by_current_bytes	total_allocated	decimal	decimal(42,0)	YES			42	0	
+x$memory_global_by_current_bytes	event_name	varchar	varchar(128)	NO	128	512			
+x$memory_global_by_current_bytes	current_count	bigint	bigint	NO			19	0	
+x$memory_global_by_current_bytes	current_alloc	bigint	bigint	NO			19	0	
+x$memory_global_by_current_bytes	current_avg_alloc	decimal	decimal(23,4)	NO			23	4	
+x$memory_global_by_current_bytes	high_count	bigint	bigint	NO			19	0	
+x$memory_global_by_current_bytes	high_alloc	bigint	bigint	NO			19	0	
+x$memory_global_by_current_bytes	high_avg_alloc	decimal	decimal(23,4)	NO			23	4	
+x$memory_global_total	total_allocated	decimal	decimal(41,0)	YES			41	0	
+x$processlist	thd_id	bigint	bigint unsigned	NO			20	0	
+x$processlist	conn_id	bigint	bigint unsigned	YES			20	0	
+x$processlist	user	varchar	varchar(288)	YES	288	1152			
+x$processlist	db	varchar	varchar(64)	YES	64	256			
+x$processlist	command	varchar	varchar(16)	YES	16	64			
+x$processlist	state	varchar	varchar(64)	YES	64	256			
+x$processlist	time	bigint	bigint	YES			19	0	
+x$processlist	current_statement	longtext	longtext	YES	4294967295	4294967295			
+x$processlist	execution_engine	enum	enum('PRIMARY','SECONDARY')	YES	9	36			
+x$processlist	statement_latency	bigint	bigint unsigned	YES			20	0	
+x$processlist	progress	decimal	decimal(26,2)	YES			26	2	
+x$processlist	lock_latency	bigint	bigint unsigned	YES			20	0	
+x$processlist	cpu_latency	bigint	bigint unsigned	YES			20	0	
+x$processlist	rows_examined	bigint	bigint unsigned	YES			20	0	
+x$processlist	rows_sent	bigint	bigint unsigned	YES			20	0	
+x$processlist	rows_affected	bigint	bigint unsigned	YES			20	0	
+x$processlist	tmp_tables	bigint	bigint unsigned	YES			20	0	
+x$processlist	tmp_disk_tables	bigint	bigint unsigned	YES			20	0	
+x$processlist	full_scan	varchar	varchar(3)	NO	3	12			
+x$processlist	last_statement	longtext	longtext	YES	4294967295	4294967295			
+x$processlist	last_statement_latency	bigint	bigint unsigned	YES			20	0	
+x$processlist	current_memory	decimal	decimal(41,0)	YES			41	0	
+x$processlist	last_wait	varchar	varchar(128)	YES	128	512			
+x$processlist	last_wait_latency	varchar	varchar(20)	YES	20	80			
+x$processlist	source	varchar	varchar(64)	YES	64	256			
+x$processlist	trx_latency	bigint	bigint unsigned	YES			20	0	
+x$processlist	trx_state	enum	enum('ACTIVE','COMMITTED','ROLLED BACK')	YES	11	44			
+x$processlist	trx_autocommit	enum	enum('YES','NO')	YES	3	12			
+x$processlist	pid	varchar	varchar(1024)	YES	1024	4096			
+x$processlist	program_name	varchar	varchar(1024)	YES	1024	4096			
+x$ps_digest_95th_percentile_by_avg_us	avg_us	decimal	decimal(21,0)	YES			21	0	
+x$ps_digest_95th_percentile_by_avg_us	percentile	decimal	decimal(46,4)	NO			46	4	
+x$ps_digest_avg_latency_distribution	cnt	bigint	bigint	NO			19	0	
+x$ps_digest_avg_latency_distribution	avg_us	decimal	decimal(21,0)	YES			21	0	
+x$ps_schema_table_statistics_io	table_schema	varchar	varchar(64)	YES	64	256			
+x$ps_schema_table_statistics_io	table_name	varchar	varchar(64)	YES	64	256			
+x$ps_schema_table_statistics_io	count_read	decimal	decimal(42,0)	YES			42	0	
+x$ps_schema_table_statistics_io	sum_number_of_bytes_read	decimal	decimal(41,0)	YES			41	0	
+x$ps_schema_table_statistics_io	sum_timer_read	decimal	decimal(42,0)	YES			42	0	
+x$ps_schema_table_statistics_io	count_write	decimal	decimal(42,0)	YES			42	0	
+x$ps_schema_table_statistics_io	sum_number_of_bytes_write	decimal	decimal(41,0)	YES			41	0	
+x$ps_schema_table_statistics_io	sum_timer_write	decimal	decimal(42,0)	YES			42	0	
+x$ps_schema_table_statistics_io	count_misc	decimal	decimal(42,0)	YES			42	0	
+x$ps_schema_table_statistics_io	sum_timer_misc	decimal	decimal(42,0)	YES			42	0	
+x$schema_flattened_keys	table_schema	varchar	varchar(64)	YES	64	192			
+x$schema_flattened_keys	table_name	varchar	varchar(64)	YES	64	192			
+x$schema_flattened_keys	index_name	varchar	varchar(64)	YES	64	192			
+x$schema_flattened_keys	non_unique	int	int	YES			10	0	
+x$schema_flattened_keys	subpart_exists	bigint	bigint	YES			19	0	
+x$schema_flattened_keys	index_columns	text	text	YES	65535	65535			
+x$schema_index_statistics	table_schema	varchar	varchar(64)	YES	64	256			
+x$schema_index_statistics	table_name	varchar	varchar(64)	YES	64	256			
+x$schema_index_statistics	index_name	varchar	varchar(64)	YES	64	256			
+x$schema_index_statistics	rows_selected	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	select_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	rows_inserted	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	insert_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	rows_updated	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	update_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	rows_deleted	bigint	bigint unsigned	NO			20	0	
+x$schema_index_statistics	delete_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_lock_waits	object_schema	varchar	varchar(64)	YES	64	256			
+x$schema_table_lock_waits	object_name	varchar	varchar(64)	YES	64	256			
+x$schema_table_lock_waits	waiting_thread_id	bigint	bigint unsigned	NO			20	0	
+x$schema_table_lock_waits	waiting_pid	bigint	bigint unsigned	YES			20	0	
+x$schema_table_lock_waits	waiting_account	text	text	YES	65535	65535			
+x$schema_table_lock_waits	waiting_lock_type	varchar	varchar(32)	NO	32	128			
+x$schema_table_lock_waits	waiting_lock_duration	varchar	varchar(32)	NO	32	128			
+x$schema_table_lock_waits	waiting_query	longtext	longtext	YES	4294967295	4294967295			
+x$schema_table_lock_waits	waiting_query_secs	bigint	bigint	YES			19	0	
+x$schema_table_lock_waits	waiting_query_rows_affected	bigint	bigint unsigned	YES			20	0	
+x$schema_table_lock_waits	waiting_query_rows_examined	bigint	bigint unsigned	YES			20	0	
+x$schema_table_lock_waits	blocking_thread_id	bigint	bigint unsigned	NO			20	0	
+x$schema_table_lock_waits	blocking_pid	bigint	bigint unsigned	YES			20	0	
+x$schema_table_lock_waits	blocking_account	text	text	YES	65535	65535			
+x$schema_table_lock_waits	blocking_lock_type	varchar	varchar(32)	NO	32	128			
+x$schema_table_lock_waits	blocking_lock_duration	varchar	varchar(32)	NO	32	128			
+x$schema_table_lock_waits	sql_kill_blocking_query	varchar	varchar(31)	YES	31	124			
+x$schema_table_lock_waits	sql_kill_blocking_connection	varchar	varchar(25)	YES	25	100			
+x$schema_table_statistics	table_schema	varchar	varchar(64)	YES	64	256			
+x$schema_table_statistics	table_name	varchar	varchar(64)	YES	64	256			
+x$schema_table_statistics	total_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	rows_fetched	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	fetch_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	rows_inserted	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	insert_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	rows_updated	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	update_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	rows_deleted	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	delete_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics	io_read_requests	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics	io_read	decimal	decimal(41,0)	YES			41	0	
+x$schema_table_statistics	io_read_latency	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics	io_write_requests	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics	io_write	decimal	decimal(41,0)	YES			41	0	
+x$schema_table_statistics	io_write_latency	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics	io_misc_requests	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics	io_misc_latency	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	table_schema	varchar	varchar(64)	YES	64	256			
+x$schema_table_statistics_with_buffer	table_name	varchar	varchar(64)	YES	64	256			
+x$schema_table_statistics_with_buffer	rows_fetched	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	fetch_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	rows_inserted	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	insert_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	rows_updated	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	update_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	rows_deleted	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	delete_latency	bigint	bigint unsigned	NO			20	0	
+x$schema_table_statistics_with_buffer	io_read_requests	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	io_read	decimal	decimal(41,0)	YES			41	0	
+x$schema_table_statistics_with_buffer	io_read_latency	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	io_write_requests	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	io_write	decimal	decimal(41,0)	YES			41	0	
+x$schema_table_statistics_with_buffer	io_write_latency	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	io_misc_requests	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	io_misc_latency	decimal	decimal(42,0)	YES			42	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_allocated	decimal	decimal(44,0)	YES			44	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_data	decimal	decimal(44,0)	YES			44	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_free	decimal	decimal(45,0)	YES			45	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_pages	bigint	bigint	YES			19	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_pages_hashed	bigint	bigint	YES			19	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_pages_old	bigint	bigint	YES			19	0	
+x$schema_table_statistics_with_buffer	innodb_buffer_rows_cached	decimal	decimal(45,0)	YES			45	0	
+x$schema_tables_with_full_table_scans	object_schema	varchar	varchar(64)	YES	64	256			
+x$schema_tables_with_full_table_scans	object_name	varchar	varchar(64)	YES	64	256			
+x$schema_tables_with_full_table_scans	rows_full_scanned	bigint	bigint unsigned	NO			20	0	
+x$schema_tables_with_full_table_scans	latency	bigint	bigint unsigned	NO			20	0	
+x$session	thd_id	bigint	bigint unsigned	NO			20	0	
+x$session	conn_id	bigint	bigint unsigned	YES			20	0	
+x$session	user	varchar	varchar(288)	YES	288	1152			
+x$session	db	varchar	varchar(64)	YES	64	256			
+x$session	command	varchar	varchar(16)	YES	16	64			
+x$session	state	varchar	varchar(64)	YES	64	256			
+x$session	time	bigint	bigint	YES			19	0	
+x$session	current_statement	longtext	longtext	YES	4294967295	4294967295			
+x$session	execution_engine	enum	enum('PRIMARY','SECONDARY')	YES	9	36			
+x$session	statement_latency	bigint	bigint unsigned	YES			20	0	
+x$session	progress	decimal	decimal(26,2)	YES			26	2	
+x$session	lock_latency	bigint	bigint unsigned	YES			20	0	
+x$session	cpu_latency	bigint	bigint unsigned	YES			20	0	
+x$session	rows_examined	bigint	bigint unsigned	YES			20	0	
+x$session	rows_sent	bigint	bigint unsigned	YES			20	0	
+x$session	rows_affected	bigint	bigint unsigned	YES			20	0	
+x$session	tmp_tables	bigint	bigint unsigned	YES			20	0	
+x$session	tmp_disk_tables	bigint	bigint unsigned	YES			20	0	
+x$session	full_scan	varchar	varchar(3)	NO	3	12			
+x$session	last_statement	longtext	longtext	YES	4294967295	4294967295			
+x$session	last_statement_latency	bigint	bigint unsigned	YES			20	0	
+x$session	current_memory	decimal	decimal(41,0)	YES			41	0	
+x$session	last_wait	varchar	varchar(128)	YES	128	512			
+x$session	last_wait_latency	varchar	varchar(20)	YES	20	80			
+x$session	source	varchar	varchar(64)	YES	64	256			
+x$session	trx_latency	bigint	bigint unsigned	YES			20	0	
+x$session	trx_state	enum	enum('ACTIVE','COMMITTED','ROLLED BACK')	YES	11	44			
+x$session	trx_autocommit	enum	enum('YES','NO')	YES	3	12			
+x$session	pid	varchar	varchar(1024)	YES	1024	4096			
+x$session	program_name	varchar	varchar(1024)	YES	1024	4096			
+x$statement_analysis	query	longtext	longtext	YES	4294967295	4294967295			
+x$statement_analysis	db	varchar	varchar(64)	YES	64	256			
+x$statement_analysis	full_scan	varchar	varchar(1)	NO	1	4			
+x$statement_analysis	exec_count	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	exec_secondary_count	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	err_count	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	warn_count	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	total_latency	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	max_latency	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	lock_latency	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	cpu_latency	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	rows_sent	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	rows_sent_avg	decimal	decimal(21,0)	NO			21	0	
+x$statement_analysis	rows_examined	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	rows_examined_avg	decimal	decimal(21,0)	NO			21	0	
+x$statement_analysis	rows_affected	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	rows_affected_avg	decimal	decimal(21,0)	NO			21	0	
+x$statement_analysis	tmp_tables	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	tmp_disk_tables	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	rows_sorted	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	sort_merge_passes	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	max_controlled_memory	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	max_total_memory	bigint	bigint unsigned	NO			20	0	
+x$statement_analysis	digest	varchar	varchar(64)	YES	64	256			
+x$statement_analysis	first_seen	timestamp	timestamp(6)	NO					6
+x$statement_analysis	last_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_errors_or_warnings	query	longtext	longtext	YES	4294967295	4294967295			
+x$statements_with_errors_or_warnings	db	varchar	varchar(64)	YES	64	256			
+x$statements_with_errors_or_warnings	exec_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_errors_or_warnings	errors	bigint	bigint unsigned	NO			20	0	
+x$statements_with_errors_or_warnings	error_pct	decimal	decimal(27,4)	NO			27	4	
+x$statements_with_errors_or_warnings	warnings	bigint	bigint unsigned	NO			20	0	
+x$statements_with_errors_or_warnings	warning_pct	decimal	decimal(27,4)	NO			27	4	
+x$statements_with_errors_or_warnings	first_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_errors_or_warnings	last_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_errors_or_warnings	digest	varchar	varchar(64)	YES	64	256			
+x$statements_with_full_table_scans	query	longtext	longtext	YES	4294967295	4294967295			
+x$statements_with_full_table_scans	db	varchar	varchar(64)	YES	64	256			
+x$statements_with_full_table_scans	exec_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_full_table_scans	total_latency	bigint	bigint unsigned	NO			20	0	
+x$statements_with_full_table_scans	no_index_used_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_full_table_scans	no_good_index_used_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_full_table_scans	no_index_used_pct	decimal	decimal(24,0)	NO			24	0	
+x$statements_with_full_table_scans	rows_sent	bigint	bigint unsigned	NO			20	0	
+x$statements_with_full_table_scans	rows_examined	bigint	bigint unsigned	NO			20	0	
+x$statements_with_full_table_scans	rows_sent_avg	decimal	decimal(21,0)	YES			21	0	
+x$statements_with_full_table_scans	rows_examined_avg	decimal	decimal(21,0)	YES			21	0	
+x$statements_with_full_table_scans	first_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_full_table_scans	last_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_full_table_scans	digest	varchar	varchar(64)	YES	64	256			
+x$statements_with_runtimes_in_95th_percentile	query	longtext	longtext	YES	4294967295	4294967295			
+x$statements_with_runtimes_in_95th_percentile	db	varchar	varchar(64)	YES	64	256			
+x$statements_with_runtimes_in_95th_percentile	full_scan	varchar	varchar(1)	NO	1	4			
+x$statements_with_runtimes_in_95th_percentile	exec_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	err_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	warn_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	total_latency	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	max_latency	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	rows_sent	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	rows_sent_avg	decimal	decimal(21,0)	NO			21	0	
+x$statements_with_runtimes_in_95th_percentile	rows_examined	bigint	bigint unsigned	NO			20	0	
+x$statements_with_runtimes_in_95th_percentile	rows_examined_avg	decimal	decimal(21,0)	NO			21	0	
+x$statements_with_runtimes_in_95th_percentile	first_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_runtimes_in_95th_percentile	last_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_runtimes_in_95th_percentile	digest	varchar	varchar(64)	YES	64	256			
+x$statements_with_sorting	query	longtext	longtext	YES	4294967295	4294967295			
+x$statements_with_sorting	db	varchar	varchar(64)	YES	64	256			
+x$statements_with_sorting	exec_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_sorting	total_latency	bigint	bigint unsigned	NO			20	0	
+x$statements_with_sorting	sort_merge_passes	bigint	bigint unsigned	NO			20	0	
+x$statements_with_sorting	avg_sort_merges	decimal	decimal(21,0)	NO			21	0	
+x$statements_with_sorting	sorts_using_scans	bigint	bigint unsigned	NO			20	0	
+x$statements_with_sorting	sort_using_range	bigint	bigint unsigned	NO			20	0	
+x$statements_with_sorting	rows_sorted	bigint	bigint unsigned	NO			20	0	
+x$statements_with_sorting	avg_rows_sorted	decimal	decimal(21,0)	NO			21	0	
+x$statements_with_sorting	first_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_sorting	last_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_sorting	digest	varchar	varchar(64)	YES	64	256			
+x$statements_with_temp_tables	query	longtext	longtext	YES	4294967295	4294967295			
+x$statements_with_temp_tables	db	varchar	varchar(64)	YES	64	256			
+x$statements_with_temp_tables	exec_count	bigint	bigint unsigned	NO			20	0	
+x$statements_with_temp_tables	total_latency	bigint	bigint unsigned	NO			20	0	
+x$statements_with_temp_tables	memory_tmp_tables	bigint	bigint unsigned	NO			20	0	
+x$statements_with_temp_tables	disk_tmp_tables	bigint	bigint unsigned	NO			20	0	
+x$statements_with_temp_tables	avg_tmp_tables_per_query	decimal	decimal(21,0)	NO			21	0	
+x$statements_with_temp_tables	tmp_tables_to_disk_pct	decimal	decimal(24,0)	NO			24	0	
+x$statements_with_temp_tables	first_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_temp_tables	last_seen	timestamp	timestamp(6)	NO					6
+x$statements_with_temp_tables	digest	varchar	varchar(64)	YES	64	256			
+x$user_summary	user	varchar	varchar(32)	YES	32	128			
+x$user_summary	statements	decimal	decimal(64,0)	YES			64	0	
+x$user_summary	statement_latency	decimal	decimal(64,0)	YES			64	0	
+x$user_summary	statement_avg_latency	decimal	decimal(65,4)	NO			65	4	
+x$user_summary	table_scans	decimal	decimal(65,0)	YES			65	0	
+x$user_summary	file_ios	decimal	decimal(64,0)	YES			64	0	
+x$user_summary	file_io_latency	decimal	decimal(64,0)	YES			64	0	
+x$user_summary	current_connections	decimal	decimal(41,0)	YES			41	0	
+x$user_summary	total_connections	decimal	decimal(41,0)	YES			41	0	
+x$user_summary	unique_hosts	bigint	bigint	NO			19	0	
+x$user_summary	current_memory	decimal	decimal(63,0)	YES			63	0	
+x$user_summary	total_memory_allocated	decimal	decimal(64,0)	YES			64	0	
+x$user_summary_by_file_io	user	varchar	varchar(32)	YES	32	128			
+x$user_summary_by_file_io	ios	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_file_io	io_latency	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_file_io_type	user	varchar	varchar(32)	YES	32	128			
+x$user_summary_by_file_io_type	event_name	varchar	varchar(128)	NO	128	512			
+x$user_summary_by_file_io_type	total	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_file_io_type	latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_file_io_type	max_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_stages	user	varchar	varchar(32)	YES	32	128			
+x$user_summary_by_stages	event_name	varchar	varchar(128)	NO	128	512			
+x$user_summary_by_stages	total	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_stages	total_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_stages	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_latency	user	varchar	varchar(32)	YES	32	128			
+x$user_summary_by_statement_latency	total	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	total_latency	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	max_latency	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	lock_latency	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	cpu_latency	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	rows_sent	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	rows_examined	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	rows_affected	decimal	decimal(42,0)	YES			42	0	
+x$user_summary_by_statement_latency	full_scans	decimal	decimal(43,0)	YES			43	0	
+x$user_summary_by_statement_type	user	varchar	varchar(32)	YES	32	128			
+x$user_summary_by_statement_type	statement	varchar	varchar(128)	YES	128	512			
+x$user_summary_by_statement_type	total	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	total_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	max_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	lock_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	cpu_latency	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	rows_sent	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	rows_examined	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	rows_affected	bigint	bigint unsigned	NO			20	0	
+x$user_summary_by_statement_type	full_scans	bigint	bigint unsigned	NO			20	0	
+x$wait_classes_global_by_avg_latency	event_class	varchar	varchar(128)	YES	128	512			
+x$wait_classes_global_by_avg_latency	total	decimal	decimal(42,0)	YES			42	0	
+x$wait_classes_global_by_avg_latency	total_latency	decimal	decimal(42,0)	YES			42	0	
+x$wait_classes_global_by_avg_latency	min_latency	bigint	bigint unsigned	YES			20	0	
+x$wait_classes_global_by_avg_latency	avg_latency	decimal	decimal(46,4)	NO			46	4	
+x$wait_classes_global_by_avg_latency	max_latency	bigint	bigint unsigned	YES			20	0	
+x$wait_classes_global_by_latency	event_class	varchar	varchar(128)	YES	128	512			
+x$wait_classes_global_by_latency	total	decimal	decimal(42,0)	YES			42	0	
+x$wait_classes_global_by_latency	total_latency	decimal	decimal(42,0)	YES			42	0	
+x$wait_classes_global_by_latency	min_latency	bigint	bigint unsigned	YES			20	0	
+x$wait_classes_global_by_latency	avg_latency	decimal	decimal(46,4)	NO			46	4	
+x$wait_classes_global_by_latency	max_latency	bigint	bigint unsigned	YES			20	0	
+x$waits_by_host_by_latency	host	varchar	varchar(255)	YES	255	255			
+x$waits_by_host_by_latency	event	varchar	varchar(128)	NO	128	512			
+x$waits_by_host_by_latency	total	bigint	bigint unsigned	NO			20	0	
+x$waits_by_host_by_latency	total_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_by_host_by_latency	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_by_host_by_latency	max_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_by_user_by_latency	user	varchar	varchar(32)	YES	32	128			
+x$waits_by_user_by_latency	event	varchar	varchar(128)	NO	128	512			
+x$waits_by_user_by_latency	total	bigint	bigint unsigned	NO			20	0	
+x$waits_by_user_by_latency	total_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_by_user_by_latency	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_by_user_by_latency	max_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_global_by_latency	events	varchar	varchar(128)	NO	128	512			
+x$waits_global_by_latency	total	bigint	bigint unsigned	NO			20	0	
+x$waits_global_by_latency	total_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_global_by_latency	avg_latency	bigint	bigint unsigned	NO			20	0	
+x$waits_global_by_latency	max_latency	bigint	bigint unsigned	NO			20	0	

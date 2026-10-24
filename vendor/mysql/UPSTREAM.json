@@ -1,0 +1,10 @@
+{
+  "name": "mysql",
+  "version": "28.0.4",
+  "crate_sha256": "ca3de8a73b7c70f76dbcdd4b6abc9b53bbb6c4f7bd6c79d8e8a7ea2157c02487",
+  "registry": "registry+https://github.com/rust-lang/crates.io-index",
+  "repository": "https://github.com/blackbeam/rust-mysql-simple",
+  "patches": [
+    "Replace rustls-pemfile with rustls::pki_types::pem::PemObject; preserve TLS trust and client identity behavior."
+  ]
+}

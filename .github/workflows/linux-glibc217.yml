@@ -1,0 +1,58 @@
+name: Linux glibc 2.17 release contract
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/mydb/linux-glibc217
+          key: glibc217-rust195-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'scripts/build_linux_glibc217.py') }}
+      - name: Check ABI gate regressions
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_elf_abi.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
+      - name: Build against the pinned glibc baseline and archive tests
+        run: |
+          python3 scripts/build_linux_glibc217.py \
+            --toolchain "$(rustc --print sysroot)" --test-archive --jobs 4
+      - name: Install protocol test dependencies
+        run: |
+          python3 -m venv /tmp/mydb/protocol-venv
+          /tmp/mydb/protocol-venv/bin/pip install 'PyMySQL==1.1.2' 'cryptography==50.0.2'
+          /tmp/mydb/protocol-venv/bin/python scripts/test_linux_compat.py
+      - name: Verify CentOS 7, 8, and 9 runtime contracts
+        run: |
+          /tmp/mydb/protocol-venv/bin/python scripts/verify_linux_compat.py \
+            --build /tmp/mydb/linux-glibc217 \
+            --output /tmp/mydb/centos-runtime --images centos7,centos8,centos9 --full-tests
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-glibc217-release-and-evidence
+          path: |
+            /tmp/mydb/linux-glibc217/bin
+            /tmp/mydb/linux-glibc217/abi.json
+            /tmp/mydb/linux-glibc217/build-manifest.json
+            /tmp/mydb/linux-glibc217/tests.tar.zst
+            /tmp/mydb/linux-glibc217/nextest-runtime.toml
+            /tmp/mydb/linux-glibc217/tools/cargo-nextest
+            /tmp/mydb/linux-glibc217/mydb-*-x86-linux.tar.gz
+            /tmp/mydb/linux-glibc217/SHA256SUMS
+            /tmp/mydb/centos-runtime/*/result.json
+            /tmp/mydb/centos-runtime/*/loader.log
+            /tmp/mydb/centos-runtime/*/*.py.log
+            /tmp/mydb/centos-runtime/*/nextest.log

@@ -1,0 +1,45 @@
+name: Deep safety
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  thread-sanitizer:
+    name: ThreadSanitizer concurrency paths
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+      - run: scripts/run_tsan_btree.sh
+
+  decoder-fuzz:
+    name: ASan decoder fuzz smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+      - run: cargo fuzz build --fuzz-dir tests/fuzz
+      - run: cargo fuzz run --fuzz-dir tests/fuzz mysql_packet -- -runs=1000
+      - run: cargo fuzz run --fuzz-dir tests/fuzz row_codec -- -runs=1000
+      - run: cargo fuzz run --fuzz-dir tests/fuzz jsonb -- -runs=1000
+      - run: cargo fuzz run --fuzz-dir tests/fuzz wal_frame -- -runs=1000
+      - run: cargo fuzz run --fuzz-dir tests/fuzz expression_differential -- -runs=1000
+      - run: cargo fuzz run --fuzz-dir tests/fuzz native_repl_protocol -- -runs=1000

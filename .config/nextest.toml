@@ -1,0 +1,53 @@
+nextest-version = { required = "0.9.98" }
+experimental = ["setup-scripts"]
+
+[scripts.setup.mydb-test-seed]
+command = "cargo test --quiet --lib -- --ignored --exact test_seed_setup::prepare_nextest_seed"
+slow-timeout = "30s"
+
+# Bound persistence-heavy fixtures as a group so their fsync/page-cleaner
+# traffic cannot saturate the filesystem used by the short SQL fixtures.
+[test-groups.persistence]
+max-threads = 8
+
+[profile.default]
+# SQL/spill fixtures also create many files and internally parallel workers.
+# Bound process fan-out to reduce filesystem/CPU contention on the ten-core
+# test host; internally-concurrent recovery/FK cases reserve extra slots.
+test-threads = 16
+
+[[profile.default.scripts]]
+filter = "all()"
+setup = "mydb-test-seed"
+
+# Start the known long-running stress/recovery cases first so they overlap the
+# thousands of short parser/executor tests instead of forming a serial tail.
+[[profile.default.overrides]]
+filter = 'test(/(clean_checkpoint_wal_collapse_recovers_on_reopen|btree_concurrent_reads_do_not_descend_into_freed_merge_pages|buffer_pool_dirty_oldest_heap_stays_bounded_under_reflush|parallel_redo_matches_serial_redo|oversized_build_falls_back_to_materialized|wide_dd_descriptors_survive_repeated_drop_recreate_purge_and_reopen|star_join_order_prefers_sparse_dimension_over_dense_date_domain)/)'
+priority = 100
+
+[[profile.default.overrides]]
+filter = 'test(/(fk_reference_lock_avoids_payment_style_deadlock|concurrent_composite_pk_insert_batches_commit_and_recover_consistently|wal_redo_recovers_(committed_index_batch|index_meta_page)_without_page_fallback|concurrent_batch_inserts_allocate_distinct_auto_increment_ranges)/)'
+priority = 100
+threads-required = 5
+
+# Overlap expensive semantic/stress fixtures with the short parser cases;
+# do not leave their serial build/scan work at the end of the run.
+[[profile.default.overrides]]
+filter = 'test(/(audit_bug1_search_append_race_remains_searchable|partition_check_spills_and_maintenance_releases_memory|high_ndv_count_topn_single_scan_matches_full_aggregate|integer_count_topk_|stats_proven_count_topk_is_exact_for_string_and_integer_keys|online_type_copy_vector_generations_allow_tail_writes|optimize_online_reclaims_heap_indexes_lob_and_reopens|online_type_copy_matches_exclusive_across_types|online_fk_parallel_ranges_match_serial_and_respect_memory_budget|partition_online_reorg_replays_cross_leaf_writes_and_rollback|audit_bug7_memory_compact_preserves_concurrent_search_results|mixed_primitive_and_string_dictionaries_align_exactly_across_workers|composite_constant_frequency_caps_correlated_estimates|selective_composite_join_considers_multi_lookup_inner)/)'
+priority = 90
+
+[[profile.default.overrides]]
+filter = 'test(/storage::core::vector_page_tests::/)'
+priority = 80
+
+# Each per-function compatibility test opens an isolated engine. Limit the
+# category-wide fan-out so hundreds of simultaneous temp databases do not
+# exhaust macOS file/I/O resources under nextest.
+[[profile.default.overrides]]
+filter = 'test(/engine::executor::tests::function_compat::/)'
+threads-required = 2
+
+[[profile.default.overrides]]
+filter = 'test(/(^(storage|backup|repl)::|engine::executor::(load_data::tests|tests::(online_ddl|optimize_online|ddl_hardening|partitioning|vector_type|metadata_audit|xa))::)/)'
+test-group = 'persistence'

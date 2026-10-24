@@ -1,0 +1,36 @@
+use super::*;
+
+const FIXTURE: &str = include_str!("fixtures/aggregate-window.json");
+
+function_fixture_test!(any_value, "ANY_VALUE", FIXTURE);
+function_fixture_test!(avg, "AVG", FIXTURE);
+function_fixture_test!(bit_and, "BIT_AND", FIXTURE);
+function_fixture_test!(bit_or, "BIT_OR", FIXTURE);
+function_fixture_test!(bit_xor, "BIT_XOR", FIXTURE);
+function_fixture_test!(count, "COUNT", FIXTURE);
+function_fixture_test!(cume_dist, "CUME_DIST", FIXTURE);
+function_fixture_test!(dense_rank, "DENSE_RANK", FIXTURE);
+function_fixture_test!(first_value, "FIRST_VALUE", FIXTURE);
+function_fixture_test!(group_concat, "GROUP_CONCAT", FIXTURE);
+function_fixture_test!(grouping, "GROUPING", FIXTURE);
+function_fixture_test!(json_arrayagg, "JSON_ARRAYAGG", FIXTURE);
+function_fixture_test!(json_objectagg, "JSON_OBJECTAGG", FIXTURE);
+function_fixture_test!(lag, "LAG", FIXTURE);
+function_fixture_test!(last_value, "LAST_VALUE", FIXTURE);
+function_fixture_test!(lead, "LEAD", FIXTURE);
+function_fixture_test!(max, "MAX", FIXTURE);
+function_fixture_test!(min, "MIN", FIXTURE);
+function_fixture_test!(nth_value, "NTH_VALUE", FIXTURE);
+function_fixture_test!(ntile, "NTILE", FIXTURE);
+function_fixture_test!(percent_rank, "PERCENT_RANK", FIXTURE);
+function_fixture_test!(rank, "RANK", FIXTURE);
+function_fixture_test!(row_number, "ROW_NUMBER", FIXTURE);
+function_fixture_test!(st_collect, "ST_COLLECT", FIXTURE);
+function_fixture_test!(std, "STD", FIXTURE);
+function_fixture_test!(stddev, "STDDEV", FIXTURE);
+function_fixture_test!(stddev_pop, "STDDEV_POP", FIXTURE);
+function_fixture_test!(stddev_samp, "STDDEV_SAMP", FIXTURE);
+function_fixture_test!(sum, "SUM", FIXTURE);
+function_fixture_test!(var_pop, "VAR_POP", FIXTURE);
+function_fixture_test!(var_samp, "VAR_SAMP", FIXTURE);
+function_fixture_test!(variance, "VARIANCE", FIXTURE);

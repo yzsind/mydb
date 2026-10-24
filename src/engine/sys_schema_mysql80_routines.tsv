@@ -1,0 +1,48 @@
+create_synonym_db	PROCEDURE			NO	MODIFIES SQL DATA
+diagnostics	PROCEDURE			NO	READS SQL DATA
+execute_prepared_stmt	PROCEDURE			NO	READS SQL DATA
+extract_schema_from_file_name	FUNCTION	varchar	varchar(64)	YES	NO SQL
+extract_table_from_file_name	FUNCTION	varchar	varchar(64)	YES	NO SQL
+format_bytes	FUNCTION	text	text	YES	NO SQL
+format_path	FUNCTION	varchar	varchar(512)	YES	NO SQL
+format_statement	FUNCTION	longtext	longtext	YES	NO SQL
+format_time	FUNCTION	text	text	YES	NO SQL
+list_add	FUNCTION	text	text	YES	CONTAINS SQL
+list_drop	FUNCTION	text	text	YES	CONTAINS SQL
+ps_is_account_enabled	FUNCTION	enum	enum('YES','NO')	YES	READS SQL DATA
+ps_is_consumer_enabled	FUNCTION	enum	enum('YES','NO')	YES	READS SQL DATA
+ps_is_instrument_default_enabled	FUNCTION	enum	enum('YES','NO')	YES	READS SQL DATA
+ps_is_instrument_default_timed	FUNCTION	enum	enum('YES','NO')	YES	READS SQL DATA
+ps_is_thread_instrumented	FUNCTION	enum	enum('YES','NO','UNKNOWN')	NO	READS SQL DATA
+ps_setup_disable_background_threads	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_disable_consumer	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_disable_instrument	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_disable_thread	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_enable_background_threads	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_enable_consumer	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_enable_instrument	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_enable_thread	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_reload_saved	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_reset_to_default	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_save	PROCEDURE			NO	MODIFIES SQL DATA
+ps_setup_show_disabled	PROCEDURE			NO	READS SQL DATA
+ps_setup_show_disabled_consumers	PROCEDURE			YES	READS SQL DATA
+ps_setup_show_disabled_instruments	PROCEDURE			YES	READS SQL DATA
+ps_setup_show_enabled	PROCEDURE			YES	READS SQL DATA
+ps_setup_show_enabled_consumers	PROCEDURE			YES	READS SQL DATA
+ps_setup_show_enabled_instruments	PROCEDURE			YES	READS SQL DATA
+ps_statement_avg_latency_histogram	PROCEDURE			NO	READS SQL DATA
+ps_thread_account	FUNCTION	text	text	NO	READS SQL DATA
+ps_thread_id	FUNCTION	bigint	bigint unsigned	NO	READS SQL DATA
+ps_thread_stack	FUNCTION	longtext	longtext	NO	READS SQL DATA
+ps_thread_trx_info	FUNCTION	longtext	longtext	NO	READS SQL DATA
+ps_trace_statement_digest	PROCEDURE			NO	MODIFIES SQL DATA
+ps_trace_thread	PROCEDURE			NO	MODIFIES SQL DATA
+ps_truncate_all_tables	PROCEDURE			YES	MODIFIES SQL DATA
+quote_identifier	FUNCTION	text	text	YES	NO SQL
+statement_performance_analyzer	PROCEDURE			NO	CONTAINS SQL
+sys_get_config	FUNCTION	varchar	varchar(128)	YES	READS SQL DATA
+table_exists	PROCEDURE			NO	CONTAINS SQL
+version_major	FUNCTION	tinyint	tinyint unsigned	NO	NO SQL
+version_minor	FUNCTION	tinyint	tinyint unsigned	NO	NO SQL
+version_patch	FUNCTION	tinyint	tinyint unsigned	NO	NO SQL

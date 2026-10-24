@@ -1,0 +1,9 @@
+USE tpch;
+ANALYZE TABLE region;
+ANALYZE TABLE nation;
+ANALYZE TABLE supplier;
+ANALYZE TABLE customer;
+ANALYZE TABLE part;
+ANALYZE TABLE partsupp;
+ANALYZE TABLE orders;
+ANALYZE TABLE lineitem;

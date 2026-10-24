@@ -1,0 +1,152 @@
+[
+  {
+    "name": "asn1-rs-impl",
+    "version": "0.2.0",
+    "repository": "https://github.com/rusticata/asn1-rs.git",
+    "commit": "a20e5f7319c896737ad0f2557037817b91ad854f",
+    "files": [
+      {
+        "path": "asn1-rs-impl-0.2.0/LICENSE-APACHE",
+        "upstream_path": "LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/rusticata/asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      },
+      {
+        "path": "asn1-rs-impl-0.2.0/LICENSE-MIT",
+        "upstream_path": "LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/rusticata/asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-MIT",
+        "sha256": "a5c61b93b6ee1d104af9920cf020ff3c7efe818e31fe562c72261847a728f513"
+      }
+    ]
+  },
+  {
+    "name": "geo",
+    "version": "0.31.0",
+    "repository": "https://github.com/georust/geo",
+    "commit": "daf0515b0317b93480020a8cfb1dc7b46a4526ad",
+    "files": [
+      {
+        "path": "geo-0.31.0/LICENSE-APACHE",
+        "upstream_path": "LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/georust/geo/daf0515b0317b93480020a8cfb1dc7b46a4526ad/LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      },
+      {
+        "path": "geo-0.31.0/LICENSE-MIT",
+        "upstream_path": "LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/georust/geo/daf0515b0317b93480020a8cfb1dc7b46a4526ad/LICENSE-MIT",
+        "sha256": "2f8267b247fd81e9555a2e196e119a5b341bcae21011cd93985c312f1312f727"
+      }
+    ]
+  },
+  {
+    "name": "i_overlay",
+    "version": "4.0.7",
+    "repository": "https://github.com/iShape-Rust/iOverlay",
+    "commit": "a071220dfc6095edb82426b880a4019db3ea67b5",
+    "files": [
+      {
+        "path": "i_overlay-4.0.7/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/iShape-Rust/iOverlay/a071220dfc6095edb82426b880a4019db3ea67b5/LICENSE",
+        "sha256": "260cc580f53a756821a0f35475e2cd6da790f8fed0efc058252fe1bed8f2689e"
+      }
+    ]
+  },
+  {
+    "name": "jsonschema-regex",
+    "version": "0.49.2",
+    "repository": "https://github.com/Stranger6667/jsonschema",
+    "commit": "d85e5f2cb537167fc1fce71c0eca759ba79319ea",
+    "files": [
+      {
+        "path": "jsonschema-regex-0.49.2/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/Stranger6667/jsonschema/d85e5f2cb537167fc1fce71c0eca759ba79319ea/LICENSE",
+        "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+      }
+    ]
+  },
+  {
+    "name": "jsonschema-value",
+    "version": "0.49.2",
+    "repository": "https://github.com/Stranger6667/jsonschema",
+    "commit": "d85e5f2cb537167fc1fce71c0eca759ba79319ea",
+    "files": [
+      {
+        "path": "jsonschema-value-0.49.2/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/Stranger6667/jsonschema/d85e5f2cb537167fc1fce71c0eca759ba79319ea/LICENSE",
+        "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+      }
+    ]
+  },
+  {
+    "name": "rstar",
+    "version": "0.12.2",
+    "repository": "https://github.com/georust/rstar",
+    "commit": "c8c5bf9e41468281d030869d409e3f67f1aaf5b7",
+    "files": [
+      {
+        "path": "rstar-0.12.2/LICENSE-APACHE",
+        "upstream_path": "LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/georust/rstar/c8c5bf9e41468281d030869d409e3f67f1aaf5b7/LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      },
+      {
+        "path": "rstar-0.12.2/LICENSE-MIT",
+        "upstream_path": "LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/georust/rstar/c8c5bf9e41468281d030869d409e3f67f1aaf5b7/LICENSE-MIT",
+        "sha256": "9b3a76c27bac8f3e0ff2d1f64f65941c50310ae3ff69318cea230bd4a36822c5"
+      }
+    ]
+  },
+  {
+    "name": "uuid-simd",
+    "version": "0.8.0",
+    "repository": "https://github.com/Nugine/simd",
+    "commit": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+    "files": [
+      {
+        "path": "uuid-simd-0.8.0/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+        "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+      }
+    ]
+  },
+  {
+    "name": "vsimd",
+    "version": "0.8.0",
+    "repository": "https://github.com/Nugine/simd",
+    "commit": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+    "files": [
+      {
+        "path": "vsimd-0.8.0/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+        "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+      }
+    ]
+  },
+  {
+    "name": "yasna",
+    "version": "0.5.2",
+    "repository": "https://github.com/qnighy/yasna.rs",
+    "commit": "b7e65f9a4c317494cce2d18ea02b3d6eaaea7985",
+    "files": [
+      {
+        "path": "yasna-0.5.2/LICENSE-APACHE",
+        "upstream_path": "LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/qnighy/yasna.rs/b7e65f9a4c317494cce2d18ea02b3d6eaaea7985/LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      },
+      {
+        "path": "yasna-0.5.2/LICENSE-MIT",
+        "upstream_path": "LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/qnighy/yasna.rs/b7e65f9a4c317494cce2d18ea02b3d6eaaea7985/LICENSE-MIT",
+        "sha256": "2a7df90e60fd5512b8bca35d3ce90e068f21c52d962855053fd1d9e2e7ca0f16"
+      }
+    ]
+  }
+]

@@ -1,0 +1,1812 @@
+{
+  "schema_version": 1,
+  "mysql_version": "8.0.46",
+  "category": "vector",
+  "functions": [
+    {
+      "name": "COSINE_DISTANCE",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT COSINE_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "COSINE_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+                "type": "DOUBLE",
+                "length": 22,
+                "decimals": 31,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Double"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'DOUBLE', 'length': 22, 'decimals': 31, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT COSINE_DISTANCE(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT COSINE_DISTANCE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "DISTANCE",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+                "type": "DOUBLE",
+                "length": 22,
+                "decimals": 31,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Double"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'DOUBLE', 'length': 22, 'decimals': 31, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT DISTANCE(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT DISTANCE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "DOT_PRODUCT",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT DOT_PRODUCT(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "5"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "5"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "DOT_PRODUCT(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+                "type": "DOUBLE",
+                "length": 22,
+                "decimals": 31,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Double"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'DOUBLE', 'length': 22, 'decimals': 31, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT DOT_PRODUCT(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT DOT_PRODUCT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "FROM_VECTOR",
+      "oracle_class": "mydb_extension",
+      "profile": "alias",
+      "canonical": "VECTOR_TO_STRING",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT FROM_VECTOR(STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1,2]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1,2]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "FROM_VECTOR(STRING_TO_VECTOR('[1,2]'))",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT FROM_VECTOR(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT FROM_VECTOR()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "INNER_PRODUCT",
+      "oracle_class": "mydb_extension",
+      "profile": "alias",
+      "canonical": "DOT_PRODUCT",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT INNER_PRODUCT(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "5"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "5"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INNER_PRODUCT(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+                "type": "DOUBLE",
+                "length": 22,
+                "decimals": 31,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Double"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'DOUBLE', 'length': 22, 'decimals': 31, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT INNER_PRODUCT(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT INNER_PRODUCT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "L2_DISTANCE",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT L2_DISTANCE(STRING_TO_VECTOR('[0,0]'), STRING_TO_VECTOR('[3,4]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "5"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "5"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "L2_DISTANCE(STRING_TO_VECTOR('[0,0]'), STRING_TO_VECTOR('[3,4]'))",
+                "type": "DOUBLE",
+                "length": 22,
+                "decimals": 31,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Double"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'DOUBLE', 'length': 22, 'decimals': 31, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT L2_DISTANCE(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT L2_DISTANCE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "L2_NORMALIZE",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT L2_NORMALIZE(STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[0.4472136,0.8944272]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[0.4472136,0.8944272]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "L2_NORMALIZE(STRING_TO_VECTOR('[1,2]'))",
+                "type": "VECTOR",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Vector"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'VECTOR', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT L2_NORMALIZE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT L2_NORMALIZE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "MAX_INNER_PRODUCT_DISTANCE",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT MAX_INNER_PRODUCT_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "-5"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "-5"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "MAX_INNER_PRODUCT_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT MAX_INNER_PRODUCT_DISTANCE(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT MAX_INNER_PRODUCT_DISTANCE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "STRING_TO_VECTOR",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))",
+                "type": "LONG",
+                "length": 11,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Long"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'LONG', 'length': 11, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT STRING_TO_VECTOR(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT STRING_TO_VECTOR()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "SUBVECTOR",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT SUBVECTOR(STRING_TO_VECTOR('[1,2]'), 1, 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1,2]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1,2]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "SUBVECTOR(STRING_TO_VECTOR('[1,2]'), 1, 2)",
+                "type": "VECTOR",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Vector"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'VECTOR', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT SUBVECTOR(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT SUBVECTOR()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "TO_VECTOR",
+      "oracle_class": "mydb_extension",
+      "profile": "alias",
+      "canonical": "STRING_TO_VECTOR",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_DIM(TO_VECTOR('[1,2,3]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "VECTOR_DIM(TO_VECTOR('[1,2,3]'))",
+                "type": "LONG",
+                "length": 11,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Long"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'LONG', 'length': 11, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT TO_VECTOR(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT TO_VECTOR()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "VECTOR_DIM",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))",
+                "type": "LONG",
+                "length": 11,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Long"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'LONG', 'length': 11, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_DIM(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_DIM()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "VECTOR_NORM",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_NORM(STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "2.23606797749979"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2.23606797749979"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "VECTOR_NORM(STRING_TO_VECTOR('[1,2]'))",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_NORM(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_NORM()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "VECTOR_TO_STRING",
+      "oracle_class": "mydb_extension",
+      "profile": "vector",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_TO_STRING(STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1,2]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1,2]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "VECTOR_TO_STRING(STRING_TO_VECTOR('[1,2]'))",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_TO_STRING(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT VECTOR_TO_STRING()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    },
+    {
+      "name": "VEC_DISTANCE",
+      "oracle_class": "mydb_extension",
+      "profile": "alias",
+      "canonical": "DISTANCE",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT VEC_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "VEC_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'))",
+                "type": "DOUBLE",
+                "length": 22,
+                "decimals": 31,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Double"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[{'type': 'DOUBLE', 'length': 22, 'decimals': 31, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT VEC_DISTANCE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT VEC_DISTANCE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+.DS_Store
+AGENTS.md
+CLAUDE.md
+target/
+output/
+outputs/
+data/
+logs/
+# Local development plans, test procedures, and acceptance records.
+/docs-internal/
+# Machine-local benchmarks, profiling tools, and private experiment drivers.
+/scripts-internal/
+/tests/
+docs/benchmark-results/
+docs/benchmarks/
+docs/performance
+docs/validation
+artifacts/
+*.log
+__pycache__/
+.venv-vector-bench/
+*.pyc
+*.pem
+*.key
+*.crt
+.zcodeignore

@@ -1,0 +1,1530 @@
+{
+  "counts": {
+    "mydb_native": 13,
+    "mysql80_community": 76,
+    "mysql_legacy_compat": 3,
+    "mysql_optional_plugin_compat": 7
+  },
+  "description": "Per-object information_schema compatibility matrix. Extra legacy, optional-plugin and mydb-native views do not weaken the 76-table supported core gate.",
+  "oracle_mysql_baseline": "8.0.46 Community",
+  "surfaces": [
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "SCHEMATA",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "TABLES",
+      "producer": "real_producer",
+      "pushdown": [
+        "TABLE_SCHEMA",
+        "TABLE_NAME"
+      ],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "COLUMNS",
+      "producer": "real_producer",
+      "pushdown": [
+        "TABLE_SCHEMA",
+        "TABLE_NAME",
+        "COLUMN_NAME"
+      ],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "STATISTICS",
+      "producer": "real_producer",
+      "pushdown": [
+        "TABLE_SCHEMA",
+        "TABLE_NAME"
+      ],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "TABLE_CONSTRAINTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "KEY_COLUMN_USAGE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "VIEWS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "VIEW_TABLE_USAGE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "VIEW_ROUTINE_USAGE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "CHARACTER_SETS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "COLLATIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "COLLATION_CHARACTER_SET_APPLICABILITY",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "ENGINES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "PROCESSLIST",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "self_or_process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "ROUTINES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "TRIGGERS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "PARTITIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "REFERENTIAL_CONSTRAINTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "PARAMETERS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "EVENTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "USER_PRIVILEGES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "SCHEMA_PRIVILEGES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "TABLE_PRIVILEGES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "COLUMN_PRIVILEGES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "APPLICABLE_ROLES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "ADMINISTRABLE_ROLE_AUTHORIZATIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "ENABLED_ROLES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "ROLE_TABLE_GRANTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "ROLE_COLUMN_GRANTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "ROLE_ROUTINE_GRANTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "COLUMN_STATISTICS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "KEYWORDS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "CHECK_CONSTRAINTS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "PLUGINS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "OPTIMIZER_TRACE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "PROFILING",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "the server reports profiling support as disabled",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "FILES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "ST_SPATIAL_REFERENCE_SYSTEMS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "ST_GEOMETRY_COLUMNS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "ST_UNITS_OF_MEASURE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "SCHEMATA_EXTENSIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "TABLES_EXTENSIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "COLUMNS_EXTENSIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "data_dictionary_catalog",
+      "object": "TABLE_CONSTRAINTS_EXTENSIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "auth_catalog",
+      "object": "USER_ATTRIBUTES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "current_account_and_roles"
+    },
+    {
+      "compatibility_class": "mysql_legacy_compat",
+      "data_source": "node_runtime",
+      "object": "global_variables",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql_legacy_compat",
+      "data_source": "node_runtime",
+      "object": "session_variables",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_sequences",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_ddl_jobs",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "node_runtime",
+      "object": "mydb_xa_recover",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "node_runtime",
+      "object": "mydb_cursors",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "self_or_process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "node_runtime",
+      "object": "mydb_caches",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "node_runtime",
+      "object": "mydb_plan_cache",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "node_runtime",
+      "object": "mydb_memory_advisor",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_vector_indexes",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "node_runtime",
+      "object": "mydb_undo_history",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_temporal_history",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_stats_health",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_zone_maps",
+      "producer": "real_producer",
+      "pushdown": [
+        "TABLE_SCHEMA",
+        "TABLE_NAME",
+        "COLUMN_NAME"
+      ],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "mydb_zone_map_storage",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "ndb_transid_mysql_connection_map",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the NDB engine",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "INNODB_BUFFER_PAGE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "INNODB_BUFFER_PAGE_LRU",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "INNODB_BUFFER_POOL_STATS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "INNODB_CACHED_INDEXES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_CMP",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement InnoDB page compression",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_CMP_RESET",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement InnoDB page compression",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_CMPMEM",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement InnoDB page compression",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_CMPMEM_RESET",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement InnoDB page compression",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_CMP_PER_INDEX",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement InnoDB page compression",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_CMP_PER_INDEX_RESET",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement InnoDB page compression",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_COLUMNS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_DATAFILES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_FIELDS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_FOREIGN",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_FOREIGN_COLS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_FT_BEING_DELETED",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "full-text deletion is synchronous and has no pending queue",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_FT_CONFIG",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "static_mysql80_catalog",
+      "object": "INNODB_FT_DEFAULT_STOPWORD",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "deterministic_static",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "public_static"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_FT_DELETED",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "full-text deletion is synchronous and has no deleted queue",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_FT_INDEX_CACHE",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb has no separate InnoDB full-text cache",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_FT_INDEX_TABLE",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_INDEXES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "INNODB_METRICS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "unsupported_subsystem",
+      "object": "INNODB_SESSION_TEMP_TABLESPACES",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb has no physical per-session temporary tablespace",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_TABLES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_TABLESPACES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_TABLESPACES_BRIEF",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_TABLESTATS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_TEMP_TABLE_INFO",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "node_runtime",
+      "object": "INNODB_TRX",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql_legacy_compat",
+      "data_source": "node_runtime",
+      "object": "innodb_lock_waits",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql80_community",
+      "data_source": "storage_catalog_mapping",
+      "object": "INNODB_VIRTUAL",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "derived_physical",
+      "schema": "information_schema",
+      "shape": "mysql80_46_exact",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "process"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "tp_thread_group_state",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the MySQL Enterprise Thread Pool plugin",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "tp_thread_group_stats",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the MySQL Enterprise Thread Pool plugin",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "tp_thread_state",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the MySQL Enterprise Thread Pool plugin",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "connection_control_failed_login_attempts",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the Connection Control plugin",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "mysql_firewall_users",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the MySQL Enterprise Firewall plugin",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mysql_optional_plugin_compat",
+      "data_source": "unsupported_subsystem",
+      "object": "mysql_firewall_whitelist",
+      "producer": "honest_empty",
+      "pushdown": [],
+      "reason": "mydb does not implement the MySQL Enterprise Firewall plugin",
+      "replication_semantics": "not_applicable",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "honest_empty_shape"
+      ],
+      "visibility": "object_policy"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,261 @@
+[package]
+name = "mydb"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A general-purpose MySQL-protocol-compatible database written in Rust, with WAL, MVCC, B-tree indexes, and a query planner."
+license = "Apache-2.0"
+repository = "https://github.com/yzsind/mydb"
+readme = "README.md"
+keywords = ["database", "mysql", "htap", "sql", "vector"]
+categories = ["database-implementations"]
+default-run = "mydb"
+autobins = false
+
+[features]
+default = ["tls", "fast-alloc", "mysql-replica"]
+tools = ["mysql-client"]
+mysql-client = ["dep:mysql", "dep:mysql_common"]
+mysql-replica = ["mysql-client", "zstd-compression"]
+tls = []
+zstd-compression = ["dep:zstd"]
+fuzzing = []
+# Default fast global allocator (mimalloc), reducing malloc/free CPU on the
+# high-churn OLTP path. To use the platform fallback allocator while keeping
+# TLS and MySQL replica support:
+#   cargo build --no-default-features --features tls,mysql-replica
+fast-alloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+
+[build-dependencies]
+chrono = "0.4"
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["unbounded_depth"] }
+jsonschema = { version = "0.49.2", default-features = false }
+base64 = "0.22"
+flate2 = "1"
+aes = "0.8"
+aes-gcm = "0.10"
+ecb = { version = "0.1", features = ["alloc"] }
+sqlparser = "0.61.0"
+# Bound recursive scalar evaluation before entering large debug stack frames.
+stacker = "0.1.24"
+tokio = { version = "1", features = ["macros", "net", "fs", "rt-multi-thread", "io-util", "signal", "sync", "time"] }
+chrono = "0.4"
+# tokio-rustls = "0.26.4"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+rcgen = "0.14.7"
+x509-parser = "0.16"
+libc = "0.2"
+regex = "1"
+rand = "0.8"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+openssl = { version = "0.10.81", features = ["vendored"] }
+crc32fast = "1"
+# Pure-Rust LZ4 with no C bindings and no unsafe. safe-encode/safe-decode
+# disable its unsafe paths, honoring this repository's no-unsafe constraint.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
+lru = "0.18.2"
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+arc-swap = "1"
+# Fast allocator, enabled by default via `fast-alloc`. Optional dependencies
+# allow builds without the non-Rust allocator using --no-default-features.
+mimalloc = { version = "0.1", optional = true }
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
+ahash = "0.8"
+smallvec = { version = "1", features = ["serde"] }
+memchr = "2"
+simdutf8 = "0.1"
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+hashbrown = "0.14"
+crossbeam-deque = "0.8"
+itoa = "1"
+ryu = "1"
+encoding_rs = "0.8"
+unicode-normalization = "0.1"
+mysql = { version = "28.0.4", path = "vendor/mysql", default-features = false, features = ["minimal-rust", "binlog", "rustls-tls-ring"], optional = true }
+mysql_common = { version = "0.37", default-features = false, features = ["binlog"], optional = true }
+zstd = { version = "0.13", optional = true }
+imbl = { version = "7.0.1", features = ["serde"] }
+geo = { version = "0.31", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+jiff-tzdb = "0.1.9"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "mydb"
+path = "src/main.rs"
+
+[[bin]]
+name = "mydb-test-seed"
+path = "src/bin/test_seed.rs"
+test = false
+required-features = ["tools"]
+
+[[bin]]
+name = "mydb-backup"
+path = "src/bin/mydb_backup.rs"
+test = false
+required-features = ["tools"]
+
+[[bin]]
+name = "error_catalog_gen"
+path = "src/bin/error_catalog_gen.rs"
+test = false
+required-features = ["tools"]
+
+[[bin]]
+name = "cbo_calibrate"
+path = "src/bin/cbo_calibrate.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "sql_bench"
+path = "src/bin/sql_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "connect_bench"
+path = "src/bin/connect_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "storage_baseline"
+path = "src/bin/storage_baseline.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "decimal_sum_simd_bench"
+path = "src/bin/decimal_sum_simd_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "vec_filter_simd_demo"
+path = "src/bin/vec_filter_simd_demo.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "hash_bench"
+path = "src/bin/hash_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "auth_stress"
+path = "src/bin/auth_stress.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "auth_bench"
+path = "src/bin/auth_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "hashmap_container_bench"
+path = "src/bin/hashmap_container_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "smallvec_vec_bench"
+path = "src/bin/smallvec_vec_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "cache_line_bench"
+path = "src/bin/cache_line_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "undo_stress"
+path = "src/bin/undo_stress.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "index_compact_bench"
+path = "src/bin/index_compact_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "index_range_fetch_bench"
+path = "src/bin/index_range_fetch_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "dml_bench"
+path = "src/bin/dml_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "time_travel_bench"
+path = "src/bin/time_travel_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "parse_bench"
+path = "src/bin/parse_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "prepare_bench"
+path = "src/bin/prepare_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "sort_microbench"
+path = "src/bin/sort_microbench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "executor_microbench"
+path = "src/bin/executor_microbench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "partition_bench"
+path = "src/bin/partition_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "mydb-replica-diff"
+path = "src/bin/replica_diff.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "vector_search_bench"
+path = "src/bin/vector_search_bench.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "ft_bench"
+path = "src/bin/ft_bench.rs"
+required-features = ["tools"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 0
+incremental = true
+
+[profile.test]
+opt-level = 0
+debug = 0
+incremental = true
+codegen-units = 16
+
+[profile.release]
+lto = false
+codegen-units = 16
+incremental = true
+
+
+[profile.profiling]
+inherits = "release"
+debug = true

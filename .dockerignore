@@ -1,0 +1,24 @@
+# Keep the build context deliberately small. The Dockerfile only needs the
+# server sources, build metadata, the embedded MySQL fixtures, and runtime
+# packaging files.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!build.rs
+!LICENSE
+!src/
+!src/**
+!vendor/
+!vendor/**
+!assets/
+assets/*
+!assets/mysql80/
+!assets/mysql80/**
+!assets/third-party-licenses/
+!assets/third-party-licenses/**
+!scripts/
+scripts/*
+!scripts/release_licenses.py
+!docker/
+!docker/**

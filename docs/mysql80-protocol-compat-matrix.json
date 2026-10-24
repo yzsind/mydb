@@ -1,0 +1,49 @@
+{
+  "baseline": "MySQL Community Server 8.0.46",
+  "reviewed_at": "2026-08-21",
+  "scope": "classic protocol and MySQL replication source protocol",
+  "capabilities": {
+    "CLIENT_FOUND_ROWS": "compatible",
+    "CLIENT_INTERACTIVE": "compatible",
+    "CLIENT_MULTI_STATEMENTS": "compatible_and_runtime_toggleable",
+    "CLIENT_MULTI_RESULTS": "compatible",
+    "CLIENT_PS_MULTI_RESULTS": "compatible",
+    "CLIENT_SESSION_TRACK": "partial_gtid_and_transaction_channels_off_only",
+    "CLIENT_OPTIONAL_RESULTSET_METADATA": "compatible",
+    "CLIENT_QUERY_ATTRIBUTES": "compatible_typed_statement_scope",
+    "CLIENT_COMPRESS": "compatible",
+    "CLIENT_ZSTD_COMPRESSION_ALGORITHM": "feature_gated",
+    "CLIENT_MULTI_FACTOR_AUTHENTICATION": "not_advertised_not_supported"
+  },
+  "commands": {
+    "COM_QUERY": "compatible",
+    "COM_INIT_DB": "compatible",
+    "COM_FIELD_LIST": "compatible_deprecated",
+    "COM_PING": "compatible",
+    "COM_CHANGE_USER": "compatible_tls_or_rsa_full_auth",
+    "COM_RESET_CONNECTION": "compatible",
+    "COM_STATISTICS": "compatible_shape_mydb_metrics",
+    "COM_PROCESS_INFO": "compatible_deprecated",
+    "COM_REFRESH": "partial_thread_cache_bit_returns_1235",
+    "COM_DEBUG": "compatible_bounded_mydb_diagnostic",
+    "COM_SET_OPTION": "compatible",
+    "COM_STMT_PREPARE": "compatible_single_statement_only",
+    "COM_STMT_EXECUTE": "compatible",
+    "COM_STMT_SEND_LONG_DATA": "compatible_governed",
+    "COM_STMT_CLOSE": "compatible",
+    "COM_STMT_RESET": "compatible",
+    "COM_STMT_FETCH": "compatible_read_only_cursor",
+    "COM_REGISTER_SLAVE": "compatible_strict_parser",
+    "COM_BINLOG_DUMP": "compatible_row_full_source",
+    "COM_BINLOG_DUMP_GTID": "compatible_row_full_source",
+    "COM_SHUTDOWN_0x08": "mydb_extension"
+  },
+  "remaining_out_of_scope": [
+    "X Protocol",
+    "Clone protocol",
+    "Group Replication stream",
+    "STATEMENT or MIXED binlog",
+    "MINIMAL or NOBLOB row image",
+    "multi-threaded replica apply"
+  ]
+}

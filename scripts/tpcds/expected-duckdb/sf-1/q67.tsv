@@ -1,0 +1,100 @@
+Books	arts	amalgmaxi #11	NULL	NULL	NULL	NULL	NULL	1275710.62	38
+Books	arts	amalgmaxi #2	NULL	NULL	NULL	NULL	NULL	739986.74	96
+Books	arts	amalgmaxi #3	NULL	NULL	NULL	NULL	NULL	846526.67	83
+Books	arts	amalgmaxi #5	NULL	NULL	NULL	NULL	NULL	892163.44	75
+Books	arts	amalgmaxi #9	NULL	NULL	NULL	NULL	NULL	784088.28	93
+Books	arts	NULL	NULL	NULL	NULL	NULL	NULL	5152541.83	16
+Books	business	importomaxi #11	NULL	NULL	NULL	NULL	NULL	803895.25	89
+Books	business	importomaxi #2	NULL	NULL	NULL	NULL	NULL	886733.40	79
+Books	business	importomaxi #5	NULL	NULL	NULL	NULL	NULL	822517.36	86
+Books	business	importomaxi #8	NULL	NULL	NULL	NULL	NULL	1170869.32	48
+Books	business	importomaxi #9	NULL	NULL	NULL	NULL	NULL	1237656.05	44
+Books	business	NULL	NULL	NULL	NULL	NULL	NULL	5531106.96	14
+Books	computers	exportimaxi #11	NULL	NULL	NULL	NULL	NULL	827450.45	85
+Books	computers	exportimaxi #2	NULL	NULL	NULL	NULL	NULL	1480317.89	26
+Books	computers	exportimaxi #3	NULL	NULL	NULL	NULL	NULL	775036.55	94
+Books	computers	exportimaxi #5	NULL	NULL	NULL	NULL	NULL	1019305.36	61
+Books	computers	exportimaxi #8	NULL	NULL	NULL	NULL	NULL	1286140.76	35
+Books	computers	exportimaxi #9	NULL	NULL	NULL	NULL	NULL	1261357.45	41
+Books	computers	NULL	NULL	NULL	NULL	NULL	NULL	6649608.46	6
+Books	cooking	amalgunivamalg #11	NULL	NULL	NULL	NULL	NULL	951921.81	68
+Books	cooking	amalgunivamalg #3	NULL	NULL	NULL	NULL	NULL	1038422.01	58
+Books	cooking	amalgunivamalg #5	NULL	NULL	NULL	NULL	NULL	1346246.61	34
+Books	cooking	amalgunivamalg #8	NULL	NULL	NULL	NULL	NULL	970703.87	65
+Books	cooking	amalgunivamalg #9	NULL	NULL	NULL	NULL	NULL	890276.25	77
+Books	cooking	NULL	NULL	NULL	NULL	NULL	NULL	5666179.13	12
+Books	entertainments	edu packmaxi #2	NULL	NULL	NULL	NULL	NULL	949689.03	69
+Books	entertainments	edu packmaxi #3	NULL	NULL	NULL	NULL	NULL	1364177.81	33
+Books	entertainments	edu packmaxi #5	NULL	NULL	NULL	NULL	NULL	876856.82	80
+Books	entertainments	edu packmaxi #8	NULL	NULL	NULL	NULL	NULL	953232.95	67
+Books	entertainments	NULL	NULL	NULL	NULL	NULL	NULL	5465329.88	15
+Books	fiction	scholarunivamalg #11	NULL	NULL	NULL	NULL	NULL	1276450.30	37
+Books	fiction	scholarunivamalg #2	NULL	NULL	NULL	NULL	NULL	1772979.31	20
+Books	fiction	scholarunivamalg #3	NULL	NULL	NULL	NULL	NULL	1077026.47	54
+Books	fiction	scholarunivamalg #8	NULL	NULL	NULL	NULL	NULL	1371457.60	32
+Books	fiction	scholarunivamalg #9	NULL	NULL	NULL	NULL	NULL	1204560.05	46
+Books	fiction	NULL	NULL	NULL	NULL	NULL	NULL	7357061.89	4
+Books	history	scholarmaxi #11	NULL	NULL	NULL	NULL	NULL	959864.33	66
+Books	history	scholarmaxi #2	NULL	NULL	NULL	NULL	NULL	1674549.42	23
+Books	history	scholarmaxi #3	NULL	NULL	NULL	NULL	NULL	1115385.94	51
+Books	history	scholarmaxi #5	NULL	NULL	NULL	NULL	NULL	1034246.54	59
+Books	history	scholarmaxi #8	NULL	NULL	NULL	NULL	NULL	1121282.38	50
+Books	history	scholarmaxi #9	NULL	NULL	NULL	NULL	NULL	1980186.86	18
+Books	history	NULL	NULL	NULL	NULL	NULL	NULL	7885515.47	2
+Books	home repair	importounivamalg #2	NULL	NULL	NULL	NULL	NULL	1685494.92	22
+Books	home repair	importounivamalg #3	NULL	NULL	NULL	NULL	NULL	1247628.37	43
+Books	home repair	importounivamalg #5	NULL	NULL	NULL	NULL	NULL	1100849.70	53
+Books	home repair	importounivamalg #8	NULL	NULL	NULL	NULL	NULL	1726495.94	21
+Books	home repair	importounivamalg #9	NULL	NULL	NULL	NULL	NULL	1069305.91	55
+Books	home repair	NULL	NULL	NULL	NULL	NULL	NULL	7392889.82	3
+Books	mystery	corpunivamalg #2	NULL	NULL	NULL	NULL	NULL	795832.11	90
+Books	mystery	corpunivamalg #3	NULL	NULL	NULL	NULL	NULL	1010422.61	62
+Books	mystery	corpunivamalg #5	NULL	NULL	NULL	NULL	NULL	722123.34	98
+Books	mystery	corpunivamalg #8	NULL	NULL	NULL	NULL	NULL	791171.71	91
+Books	mystery	NULL	NULL	NULL	NULL	NULL	NULL	4486195.15	17
+Books	parenting	corpmaxi #11	NULL	NULL	NULL	NULL	NULL	768259.32	95
+Books	parenting	corpmaxi #2	NULL	NULL	NULL	NULL	NULL	971967.93	64
+Books	parenting	corpmaxi #3	NULL	NULL	NULL	NULL	NULL	661642.98	100
+Books	parenting	corpmaxi #5	NULL	NULL	NULL	NULL	NULL	1474616.05	27
+Books	parenting	corpmaxi #8	NULL	NULL	NULL	NULL	NULL	810752.35	88
+Books	parenting	corpmaxi #9	NULL	NULL	NULL	NULL	NULL	926870.65	73
+Books	parenting	NULL	NULL	NULL	NULL	NULL	NULL	5614109.28	13
+Books	reference	brandmaxi #11	NULL	NULL	NULL	NULL	NULL	1269358.69	40
+Books	reference	brandmaxi #2	NULL	NULL	NULL	NULL	NULL	1004222.53	63
+Books	reference	brandmaxi #3	NULL	NULL	NULL	NULL	NULL	1114535.06	52
+Books	reference	brandmaxi #5	NULL	NULL	NULL	NULL	NULL	847753.24	81
+Books	reference	brandmaxi #8	NULL	NULL	NULL	NULL	NULL	1515232.11	25
+Books	reference	brandmaxi #9	NULL	NULL	NULL	NULL	NULL	736983.46	97
+Books	reference	NULL	NULL	NULL	NULL	NULL	NULL	6488085.09	7
+Books	romance	namelessmaxi #11	NULL	NULL	NULL	NULL	NULL	1452175.26	30
+Books	romance	namelessmaxi #2	NULL	NULL	NULL	NULL	NULL	1272325.50	39
+Books	romance	namelessmaxi #3	NULL	NULL	NULL	NULL	NULL	1775640.85	19
+Books	romance	namelessmaxi #5	NULL	NULL	NULL	NULL	NULL	847608.68	82
+Books	romance	namelessmaxi #8	NULL	NULL	NULL	NULL	NULL	887810.61	78
+Books	romance	namelessmaxi #9	NULL	NULL	NULL	NULL	NULL	933258.52	71
+Books	romance	NULL	NULL	NULL	NULL	NULL	NULL	7168819.42	5
+Books	science	maximaxi #11	NULL	NULL	NULL	NULL	NULL	1414002.85	31
+Books	science	maximaxi #2	NULL	NULL	NULL	NULL	NULL	890889.87	76
+Books	science	maximaxi #3	NULL	NULL	NULL	NULL	NULL	949119.52	70
+Books	science	maximaxi #8	NULL	NULL	NULL	NULL	NULL	1186820.79	47
+Books	science	maximaxi #9	NULL	NULL	NULL	NULL	NULL	1049065.84	57
+Books	science	NULL	NULL	NULL	NULL	NULL	NULL	6283431.32	9
+Books	self-help	exportiunivamalg #2	NULL	NULL	NULL	NULL	NULL	1280727.06	36
+Books	self-help	exportiunivamalg #3	NULL	NULL	NULL	NULL	NULL	678465.31	99
+Books	self-help	exportiunivamalg #5	NULL	NULL	NULL	NULL	NULL	912665.12	74
+Books	self-help	exportiunivamalg #8	NULL	NULL	NULL	NULL	NULL	788781.06	92
+Books	self-help	exportiunivamalg #9	NULL	NULL	NULL	NULL	NULL	1453381.71	29
+Books	self-help	NULL	NULL	NULL	NULL	NULL	NULL	5712218.99	11
+Books	sports	edu packunivamalg #11	NULL	NULL	NULL	NULL	NULL	1621472.78	24
+Books	sports	edu packunivamalg #5	NULL	NULL	NULL	NULL	NULL	1258013.09	42
+Books	sports	edu packunivamalg #8	NULL	NULL	NULL	NULL	NULL	1233341.73	45
+Books	sports	edu packunivamalg #9	NULL	NULL	NULL	NULL	NULL	930474.95	72
+Books	sports	NULL	NULL	NULL	NULL	NULL	NULL	6086087.42	10
+Books	travel	univunivamalg #11	NULL	NULL	NULL	NULL	NULL	811639.58	87
+Books	travel	univunivamalg #2	NULL	NULL	NULL	NULL	NULL	1055630.57	56
+Books	travel	univunivamalg #3	NULL	NULL	NULL	NULL	NULL	1023571.72	60
+Books	travel	univunivamalg #5	NULL	NULL	NULL	NULL	NULL	1153768.85	49
+Books	travel	univunivamalg #8	NULL	NULL	NULL	NULL	NULL	1472247.69	28
+Books	travel	univunivamalg #9	NULL	NULL	NULL	NULL	NULL	840778.37	84
+Books	travel	NULL	NULL	NULL	NULL	NULL	NULL	6357636.78	8
+Books	NULL	NULL	NULL	NULL	NULL	NULL	NULL	99401813.54	1

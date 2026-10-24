@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1128" viewBox="0 0 1080 1128" role="img" aria-labelledby="title description">
+  <title id="title">MyDB technical architecture</title>
+  <desc id="description">Ten modules: protocol, SQL engine, unified memory management, storage engine, transaction management, backup and recovery, primary-replica high availability, session management, users and security, and metadata. SQL, storage, and transactions form the central execution path. Session, security, and metadata services support that path; unified memory management spans SQL and storage. A consistent green highlight identifies MyDB strengths: the optimizer, parallel and vectorized executor, heap tables, automatic Zone Map smart indexing, disk-resident HNSW vector indexes, online DDL toward lock-free operation, unified memory management, and directly queryable backups. DDL publication still coordinates locks. Native primary-replica switching is controlled manually and requires fencing, with no automatic leader election.</desc>
+  <defs>
+    <style>
+      svg { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; }
+      text { fill: #172e43; }
+      .canvas { fill: #ffffff; }
+      .panel { fill: #f2f5f8; }
+      .tile { fill: #ffffff; }
+      .feature { fill: #e1f3ef; }
+      .brand { font-size: 34px; font-weight: 700; letter-spacing: -1px; }
+      .subtitle { font-size: 20px; fill: #52697d; }
+      .heading { font-size: 23px; font-weight: 650; }
+      .subhead { font-size: 20px; font-weight: 600; }
+      .detail { font-size: 18px; fill: #52697d; }
+      .small { font-size: 17px; fill: #52697d; }
+      .accent { fill: #006d63; }
+      .eyebrow { font-size: 14px; letter-spacing: 1.6px; font-weight: 650; fill: #52697d; }
+      .rule { stroke: #d5dfe8; stroke-width: 1; }
+      .feature-rule { stroke: #bbdcd3; stroke-width: 1; }
+      .flow { fill: none; stroke: #8197aa; stroke-width: 1.6; marker-end: url(#arrow); }
+      .support { fill: none; stroke: #a2b2c0; stroke-width: 1.3; stroke-dasharray: 3 4; }
+      .arrowhead { fill: none; stroke: #8197aa; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+      @media (prefers-color-scheme: dark) {
+        text { fill: #eaf2f8; }
+        .canvas { fill: #101b26; }
+        .panel { fill: #1b2b3a; }
+        .tile { fill: #243747; }
+        .feature { fill: #123e3b; }
+        .subtitle, .detail, .small, .eyebrow { fill: #b4c5d4; }
+        .accent { fill: #7addc6; }
+        .rule { stroke: #364d60; }
+        .feature-rule { stroke: #2d6258; }
+        .flow, .arrowhead { stroke: #90a9bd; }
+        .support { stroke: #647f94; }
+      }
+    </style>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path class="arrowhead" d="M1 1 L7 4 L1 7"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1080" height="1128" rx="20"/>
+  <text class="brand" x="36" y="56">MyDB</text>
+  <text class="subtitle" x="156" y="55">Technical architecture</text>
+  <rect class="feature" x="852" y="27" width="192" height="36" rx="8"/>
+  <text class="subhead accent" x="948" y="51" text-anchor="middle">OPEN SOURCE</text>
+  <text class="subtitle" x="36" y="87">One engine for transactions, analytics, and vector search.</text>
+
+  <!-- Protocol entry point -->
+  <g data-module="protocol">
+    <rect class="panel" x="36" y="116" width="1008" height="88" rx="12"/>
+    <text class="heading" x="60" y="151">MySQL protocol</text>
+    <text class="detail" x="60" y="180">Classic protocol · Prepared statements · Binary results · Cursors</text>
+    <text class="small" x="1020" y="151" text-anchor="end">Applications · AI agents</text>
+  </g>
+  <path class="flow" d="M540 208 V228"/>
+
+  <!-- Shared control services -->
+  <g data-module="sessions">
+    <rect class="panel" x="36" y="236" width="208" height="176" rx="12"/>
+    <text class="heading" x="56" y="272">Sessions</text>
+    <text class="detail" x="56" y="309">Connection lifecycle</text>
+    <text class="detail" x="56" y="337">Session variables</text>
+    <text class="detail" x="56" y="365">Parameters &amp; cursors</text>
+    <text class="detail" x="56" y="393">Cancellation</text>
+  </g>
+  <g data-module="security">
+    <rect class="panel" x="36" y="432" width="208" height="202" rx="12"/>
+    <text class="heading" x="56" y="468">Users &amp; security</text>
+    <text class="detail" x="56" y="505">Authentication</text>
+    <text class="detail" x="56" y="533">Privileges &amp; roles</text>
+    <text class="detail" x="56" y="561">TLS encryption</text>
+    <text class="detail" x="56" y="589">Password policies</text>
+    <text class="detail" x="56" y="617">Audit logging</text>
+  </g>
+  <g data-module="metadata">
+    <rect class="panel" x="36" y="654" width="208" height="222" rx="12"/>
+    <text class="heading" x="56" y="690">Metadata</text>
+    <text class="detail" x="56" y="727">Catalog &amp; schemas</text>
+    <text class="detail" x="56" y="755">Schema versions</text>
+    <text class="detail" x="56" y="783">Statistics &amp; ANALYZE</text>
+    <text class="detail" x="56" y="811">System views</text>
+    <text class="detail" x="56" y="839">Object definitions</text>
+  </g>
+  <path class="support" d="M246 324 H259 M246 533 H259 M246 765 H259"/>
+
+  <!-- SQL and DDL -->
+  <g data-module="sql-engine">
+    <rect class="panel" x="264" y="236" width="552" height="222" rx="12"/>
+    <text class="heading" x="288" y="272">SQL engine</text>
+    <rect class="tile" x="284" y="291" width="148" height="80" rx="8"/>
+    <text class="subhead" x="298" y="318">Parse</text>
+    <text class="small" x="298" y="342">AST · Semantics</text>
+    <text class="small" x="298" y="362">Type checking</text>
+    <path class="flow" d="M437 329 H455"/>
+    <rect class="feature" x="464" y="291" width="148" height="80" rx="8"/>
+    <text class="subhead accent" x="478" y="318">Optimizer</text>
+    <text class="small" x="478" y="342">CBO · Rewrites</text>
+    <text class="small" x="478" y="362">Plan cache</text>
+    <path class="flow" d="M617 329 H635"/>
+    <rect class="feature" x="644" y="291" width="152" height="80" rx="8"/>
+    <text class="subhead accent" x="658" y="318">Executor</text>
+    <text class="small" x="658" y="342">Row · Vectorized</text>
+    <text class="small" x="658" y="362">Parallel · SIMD</text>
+    <rect class="feature" x="284" y="385" width="512" height="55" rx="8"/>
+    <text class="subhead accent" x="300" y="408">Online DDL / lock-free design*</text>
+    <text class="small" x="300" y="430">Concurrent index builds · Versioned schema changes</text>
+  </g>
+  <path class="flow" d="M540 462 V482"/>
+
+  <!-- Native storage and distinguishing access paths -->
+  <g data-module="storage-engine">
+    <rect class="panel" x="264" y="490" width="552" height="222" rx="12"/>
+    <text class="heading" x="288" y="526">Storage engine</text>
+    <rect class="feature" x="284" y="539" width="512" height="28" rx="6"/>
+    <text class="subhead accent" x="300" y="560">Heap tables</text>
+    <text class="small" x="452" y="559">B-tree · LOB · Full-text · Spatial</text>
+    <rect class="feature" x="284" y="573" width="250" height="116" rx="8"/>
+    <text class="subhead accent" x="300" y="602">Zone Map</text>
+    <text class="subhead accent" x="300" y="627">Smart indexing</text>
+    <text class="small" x="300" y="653">Automatic block statistics</text>
+    <text class="small" x="300" y="676">Conservative scan pruning</text>
+    <rect class="feature" x="546" y="573" width="250" height="116" rx="8"/>
+    <text class="subhead accent" x="562" y="602">HNSW</text>
+    <text class="subhead accent" x="562" y="627">Vector indexing</text>
+    <text class="small" x="562" y="653">Disk-resident graph pages</text>
+    <text class="small" x="562" y="676">Native VECTOR · IVF_SQ8</text>
+  </g>
+  <path class="flow" d="M540 716 V736"/>
+
+  <!-- Transaction services underlie every native data access. -->
+  <g data-module="transactions">
+    <rect class="panel" x="264" y="744" width="552" height="132" rx="12"/>
+    <text class="heading" x="288" y="781">Transaction management</text>
+    <text class="detail" x="288" y="816">MVCC · Snapshots / SCN · Undo · Row / table locks</text>
+    <text class="detail" x="288" y="846">WAL · Group commit · Savepoints · XA · Default RC</text>
+  </g>
+
+  <!-- Unified memory is cross-cutting, rather than one execution stage. -->
+  <g data-module="unified-memory">
+    <rect class="feature" x="836" y="236" width="208" height="640" rx="12"/>
+    <text class="heading accent" x="856" y="272">Unified</text>
+    <text class="heading accent" x="856" y="301">memory</text>
+    <text class="heading accent" x="856" y="330">management</text>
+    <text class="small" x="856" y="368">Across SQL &amp; storage</text>
+    <path class="feature-rule" d="M856 391 H1024"/>
+    <text class="subhead accent" x="856" y="425">Budget</text>
+    <text class="detail" x="856" y="455">Global accounting</text>
+    <text class="detail" x="856" y="483">Query work areas</text>
+    <path class="feature-rule" d="M856 507 H1024"/>
+    <text class="subhead accent" x="856" y="541">Cache</text>
+    <text class="detail" x="856" y="571">Buffer pool</text>
+    <text class="detail" x="856" y="599">Plan &amp; data caches</text>
+    <path class="feature-rule" d="M856 623 H1024"/>
+    <text class="subhead accent" x="856" y="657">Reclaim &amp; spill</text>
+    <text class="detail" x="856" y="687">Coordinated eviction</text>
+    <text class="detail" x="856" y="715">Sort / hash join spill</text>
+    <rect class="tile" x="852" y="759" width="176" height="93" rx="8"/>
+    <text class="small accent" x="866" y="788">One memory budget</text>
+    <text class="small" x="866" y="815">Admission · Grants</text>
+    <text class="small" x="866" y="838">Pressure control</text>
+  </g>
+  <path class="support" d="M821 347 H831 M821 601 H831 M821 810 H831"/>
+
+  <!-- Independent protection and availability capabilities -->
+  <path class="flow" d="M540 880 V892 H282 V900"/>
+  <path class="flow" d="M540 892 H798 V900"/>
+  <g data-module="backup-recovery">
+    <rect class="panel" x="36" y="908" width="494" height="140" rx="12"/>
+    <text class="heading" x="60" y="938">Backup &amp; recovery</text>
+    <text class="detail" x="60" y="966">Online physical backup · WAL archiving · PITR</text>
+    <text class="small" x="60" y="987">Checkpoint · Crash recovery</text>
+    <rect class="feature" x="56" y="999" width="454" height="35" rx="8"/>
+    <text class="subhead accent" x="70" y="1023">Query backups directly</text>
+  </g>
+  <g data-module="primary-replica-ha">
+    <rect class="panel" x="550" y="908" width="494" height="140" rx="12"/>
+    <text class="heading" x="574" y="944">Primary / replica HA</text>
+    <text class="detail" x="574" y="978">Native WAL replication · Async / semi-sync</text>
+    <text class="detail" x="574" y="1006">Controlled switchover · Fenced promotion**</text>
+  </g>
+
+  <text class="small" x="36" y="1080">* Lock-free is a design direction; DDL publication still coordinates locks.</text>
+  <text class="small" x="36" y="1107">** Operator-controlled role changes; no automatic leader election.</text>
+</svg>
