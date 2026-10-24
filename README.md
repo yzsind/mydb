@@ -45,6 +45,35 @@ Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from t
 [1.0.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.0.0), which also
 includes SHA256 checksums and platform validation details.
 
+### Run a downloaded binary
+
+Download the package for your platform, extract it, and open a terminal in the
+directory containing the executable. On macOS or Linux, start it with:
+
+```bash
+chmod +x ./mydb
+./mydb --data-dir ./data
+```
+
+On Windows, run the equivalent command in PowerShell:
+
+```powershell
+.\mydb.exe --data-dir ./data
+```
+
+The server listens locally on port `8738` and stores data in `./data`. No Rust
+toolchain or config file is needed. With a MySQL 8.0 client installed, connect
+from another terminal:
+
+```bash
+mysql -h127.0.0.1 -P8738 -uroot -proot  test
+```
+
+A fresh data directory includes the `test` database and the local `root` account
+with password `root`. Run `SELECT 1;` to check the connection. Enter `quit` to
+exit the client, then press **Ctrl+C** in the server terminal to stop it. Restart
+with the same data directory to reopen your data.
+
 ### Build and connect
 
 Install Rust 1.95 or newer, a native C toolchain, Perl, and a MySQL 8.0 client;
@@ -271,7 +300,6 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 | [SQL statements](docs/statements/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
 | [Configuration guide](docs/configuration.md) / [Config template](mydb.cnf.example) | Startup options, environment variables, and runtime settings |
 | [Storage format](docs/storage-format.md) | Data directory, pages, indexes, logs, and recovery |
-| Testing | [MTR-lite regressions](tests/mydb-test/UPSTREAM.md), [fuzz](tests/fuzz/README.md), [Jepsen](tests/jepsen/README.md) |
 
 Product documentation under `docs/` is written in English. When documentation
 and behavior disagree, the source code and tests are authoritative; the
