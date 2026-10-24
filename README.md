@@ -140,17 +140,10 @@ configuration, cross-architecture builds, and connecting from the host.
 
 ### Platforms and distribution
 
-macOS arm64 is the development and regression platform. Linux x86_64 source
-builds also produce a portable archive targeting glibc 2.17+ via
-`scripts/build_linux_glibc217.py` (host-native builds inherit the build host's
-libc). Source builds additionally work on macOS Intel, Linux aarch64 (with
-`linux/arm64` Dockerfile support), and Windows 11 foreground operation on local
-NTFS. The unpublished 1.0.0 candidate ships a native arm64 archive plus a
-portable archive and locally verified `linux/amd64` image for x86_64; other
-platforms are outside this candidate. See [hardware and OS
-requirements](docs/hardware-and-os-requirements.md) for detailed OS verification
-and Windows limitations, and [backup platform
-requirements](docs/backup-and-recovery.md) for atomic-rename support.
+Supported operating systems: macOS (arm64 and Intel) and Linux (x86_64 and
+aarch64), plus Windows 11 for foreground operation on local NTFS. See
+[hardware and OS requirements](docs/hardware-and-os-requirements.md) for
+verification details, Windows limitations, and distribution scope.
 
 ## Architecture
 
