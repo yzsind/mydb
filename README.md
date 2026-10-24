@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo/mydb-whale.png" alt="MyDB whale logo with layered database storage" width="280">
+
 # MyDB
 
 **A high-performance database, compatible with MySQL**
