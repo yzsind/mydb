@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo/mydb-whale.png" alt="MyDB whale logo with layered database storage" width="64" height="64">
+<img src="assets/logo/mydb-whale.png" alt="MyDB whale logo with layered database storage" width="256" height="256">
 
 # MyDB
 
