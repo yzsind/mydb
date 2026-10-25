@@ -23,6 +23,7 @@ use std::{
 
 #[derive(Debug)]
 struct Entry {
+    exception: bool,
     row: RowId,
     value: Option<VectorValue>,
     vid: u64,
@@ -30,6 +31,8 @@ struct Entry {
 }
 #[derive(Debug)]
 struct State {
+    exceptions: usize,
+    incremental_exceptions: usize,
     entries: Vec<Entry>,
     rows: HashMap<RowId, usize>,
     centers: Vec<VectorValue>,
@@ -47,6 +50,13 @@ pub(crate) struct NativeIvf {
     state: RwLock<State>,
     valid: AtomicBool,
     pending: Mutex<HashSet<u64>>,
+    quantizer: Option<Arc<super::quantization::Quantizer>>,
+    quantization_requested: bool,
+    retrain: AtomicBool,
+    generation: u64,
+    candidates_returned: std::sync::atomic::AtomicU64,
+    heap_reranks: std::sync::atomic::AtomicU64,
+    exact_fallbacks: std::sync::atomic::AtomicU64,
 }
 impl NativeIvf {
     pub(crate) fn new(
@@ -63,22 +73,72 @@ impl NativeIvf {
             params,
             file,
             state: RwLock::new(State {
+                exceptions: 0,
+                incremental_exceptions: 0,
                 entries: Vec::new(),
                 rows: HashMap::new(),
                 centers: Vec::new(),
                 lists: vec![Vec::new()],
                 list_pages: vec![AtomicU64::new(0)],
-                charge: ControlledMemoryCharge::try_new(
+                charge: ControlledMemoryCharge::try_new_recoverable(
                     ControlledMemoryCategory::StorageScratch,
                     0,
                 )?,
             }),
             valid: AtomicBool::new(true),
             pending: Mutex::new(HashSet::new()),
+            quantizer: None,
+            quantization_requested: false,
+            retrain: AtomicBool::new(false),
+            generation: 0,
+            candidates_returned: std::sync::atomic::AtomicU64::new(0),
+            heap_reranks: std::sync::atomic::AtomicU64::new(0),
+            exact_fallbacks: std::sync::atomic::AtomicU64::new(0),
         })
     }
     pub(crate) fn file(&self) -> Option<&Arc<VectorIndexFile>> {
         self.file.as_ref()
+    }
+    pub(crate) fn set_quantizer(
+        &mut self,
+        requested: bool,
+        quantizer: Option<Arc<super::quantization::Quantizer>>,
+        generation: u64,
+    ) {
+        self.quantization_requested = requested;
+        self.generation = if quantizer.is_some() { generation } else { 0 };
+        self.quantizer = quantizer;
+    }
+    pub(crate) fn query_stats(&self) -> (u64, u64, u64, u64) {
+        (
+            self.generation,
+            self.candidates_returned.load(Ordering::Relaxed),
+            self.heap_reranks.load(Ordering::Relaxed),
+            self.exact_fallbacks.load(Ordering::Relaxed),
+        )
+    }
+    pub(crate) fn record_query_stats(&self, candidates: u64, heap: u64, fallback: bool) {
+        if !self.quantization_requested {
+            return;
+        }
+        self.candidates_returned
+            .fetch_add(candidates, Ordering::Relaxed);
+        self.heap_reranks.fetch_add(heap, Ordering::Relaxed);
+        self.exact_fallbacks
+            .fetch_add(u64::from(fallback), Ordering::Relaxed);
+    }
+    pub(crate) fn quantization_pending(&self) -> bool {
+        self.quantization_requested && self.quantizer.is_none()
+    }
+    pub(crate) fn quantization_stats(&self) -> (usize, usize, usize) {
+        let state = self.state.read();
+        (
+            self.quantizer.as_ref().map_or(0, |q| q.bytes()),
+            self.quantizer
+                .as_ref()
+                .map_or(0, |q| q.record_len() * state.entries.len()),
+            state.exceptions,
+        )
     }
     pub(crate) fn replace_file(&mut self, file: Arc<VectorIndexFile>) {
         self.file = Some(file);
@@ -91,6 +151,7 @@ impl NativeIvf {
     }
     pub(crate) fn is_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
+            && (self.quantizer.is_none() || !self.retrain.load(Ordering::Acquire))
     }
     pub(crate) fn dim(&self) -> usize {
         self.dimension as usize
@@ -135,6 +196,16 @@ impl NativeIvf {
     }
     fn value(&self, state: &State, id: usize) -> Result<VectorValue, QueryError> {
         let e = &state.entries[id];
+        if let Some(q) = &self.quantizer {
+            if let Some(v) = &e.value {
+                return q.value_payload(&v.payload, self.file.as_ref());
+            }
+            return self
+                .file
+                .as_ref()
+                .unwrap()
+                .with_native_vector(e.vid, |v| q.value_payload(v.payload, self.file.as_ref()));
+        }
         if let Some(v) = &e.value {
             return Ok(v.clone());
         }
@@ -146,8 +217,22 @@ impl NativeIvf {
             ))
         })
     }
-    fn score(&self, state: &State, id: usize, query: &VectorValue) -> Result<f64, QueryError> {
+    fn score(
+        &self,
+        state: &State,
+        id: usize,
+        query: &VectorValue,
+        prepared: Option<&super::quantization::QuantQuery>,
+    ) -> Result<f64, QueryError> {
         let e = &state.entries[id];
+        if let Some(q) = &self.quantizer {
+            if let Some(v) = &e.value {
+                return q.score_payload(&v.payload, self.file.as_ref(), query, prepared);
+            }
+            return self.file.as_ref().unwrap().with_native_vector(e.vid, |v| {
+                q.score_payload(v.payload, self.file.as_ref(), query, prepared)
+            });
+        }
         if let Some(v) = &e.value {
             return typed_ordering_distance(query, v, self.metric);
         }
@@ -171,6 +256,9 @@ impl NativeIvf {
         Ok(best.1)
     }
     pub(crate) fn insert(&self, row: RowId, value: VectorValue) -> Result<(), QueryError> {
+        if self.quantization_pending() {
+            return Err(codec::vector_err("quantizer training is pending"));
+        }
         codec::validate_internal(&value)?;
         if self.metric == Metric::Cosine && super::distance::typed_is_zero(&value) {
             return Err(codec::vector_err("COSINE indexes reject zero vectors"));
@@ -187,21 +275,35 @@ impl NativeIvf {
         } else {
             Self::nearest(&state.centers, &value, self.metric)?
         };
+        let value = self
+            .quantizer
+            .as_ref()
+            .map(|q| q.store(&value, self.file.as_ref()))
+            .transpose()?
+            .unwrap_or(value);
         state
             .charge
-            .try_grow(128 + if self.file.is_none() { value.len() } else { 0 })?;
+            .try_grow_recoverable(128 + if self.file.is_none() { value.len() } else { 0 })?;
         let id = state.entries.len();
         let vid = if let Some(f) = &self.file {
             f.append_native_ivf_entry(row, &value.payload, &state.list_pages[list])?
         } else {
             id as u64
         };
+        let exception = self.quantizer.is_some() && value.payload.first() == Some(&1);
         let value = if self.file.is_none() {
             Some(value)
         } else {
             None
         };
+        if exception {
+            state.exceptions += 1;
+            if state.entries.len() >= self.quantizer.as_ref().unwrap().trained_rows() {
+                state.incremental_exceptions += 1;
+            }
+        }
         state.entries.push(Entry {
+            exception,
             row,
             value,
             vid,
@@ -209,11 +311,24 @@ impl NativeIvf {
         });
         state.rows.insert(row, id);
         state.lists[list].push(id);
+        if let Some(q) = &self.quantizer {
+            let exceptions = state.incremental_exceptions;
+            let limit = 64usize.max(state.rows.len().div_ceil(20));
+            if (matches!(q.name(), "sq8" | "sq4") && exceptions >= limit)
+                || (matches!(q.name(), "pq" | "bq")
+                    && state.entries.len() >= q.trained_rows() + 256usize.max(q.trained_rows() / 4))
+            {
+                self.retrain.store(true, Ordering::Release);
+            }
+        }
         Ok(())
     }
     fn delete_locked(&self, state: &mut State, id: usize) -> Result<(), QueryError> {
         if let Some(f) = &self.file {
             f.set_tombstone(0, state.entries[id].vid, true)?;
+        }
+        if state.entries[id].exception {
+            state.exceptions = state.exceptions.saturating_sub(1);
         }
         state.entries[id].deleted = true;
         state.rows.remove(&state.entries[id].row);
@@ -250,7 +365,7 @@ impl NativeIvf {
         let mut state = self.state.write();
         state
             .charge
-            .try_grow(centers.iter().map(|v| v.len() + 96).sum())?;
+            .try_grow_recoverable(centers.iter().map(|v| v.len() + 96).sum())?;
         state.lists = (0..centers.len()).map(|_| Vec::new()).collect();
         state.list_pages = (0..centers.len()).map(|_| AtomicU64::new(0)).collect();
         state.centers = centers;
@@ -264,7 +379,7 @@ impl NativeIvf {
         if self.datatype != VectorDataType::Binary {
             let dim = self.dimension as usize;
             // Decode only the bounded training sample. Row entries remain native payloads.
-            let _scratch = ControlledMemoryCharge::try_new(
+            let _scratch = ControlledMemoryCharge::try_new_recoverable(
                 ControlledMemoryCategory::StorageScratch,
                 sample
                     .len()
@@ -419,7 +534,7 @@ impl NativeIvf {
         let count = requested
             .saturating_mul(self.params.train_sample_mult)
             .min(live.len());
-        let _scratch = ControlledMemoryCharge::try_new(
+        let _scratch = ControlledMemoryCharge::try_new_recoverable(
             ControlledMemoryCategory::StorageScratch,
             count
                 .saturating_mul(self.datatype.payload_len(self.dimension).saturating_mul(2) + 64)
@@ -435,7 +550,7 @@ impl NativeIvf {
         let centers = self.train_centers(&sample, nlist)?;
         state
             .charge
-            .try_grow(centers.iter().map(|v| v.len() + 64).sum())?;
+            .try_grow_recoverable(centers.iter().map(|v| v.len() + 64).sum())?;
         let mut lists = vec![Vec::new(); nlist];
         for id in live {
             let v = self.value(&state, id)?;
@@ -453,8 +568,11 @@ impl NativeIvf {
         query: &VectorValue,
         request: VectorSearchRequest,
     ) -> Result<VectorSearchResult, QueryError> {
-        if !self.is_valid() {
-            return Err(codec::vector_err("native IVF requires rebuild"));
+        if !self.is_valid() || self.quantization_pending() {
+            return Err(crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "native IVF requires quantizer training or rebuild",
+            ));
         }
         if let Some(file) = &self.file {
             file.prepare_navigation_mapping()?;
@@ -471,7 +589,7 @@ impl NativeIvf {
             });
         }
         let nprobe = nprobe.max(1).min(state.lists.len());
-        let _scratch = ControlledMemoryCharge::try_new(
+        let _scratch = ControlledMemoryCharge::try_new_recoverable(
             ControlledMemoryCategory::StorageScratch,
             candidate_limit
                 .saturating_mul(64)
@@ -498,6 +616,11 @@ impl NativeIvf {
         if probes.is_empty() {
             probes.push(Scored { dist: 0.0, id: 0 });
         }
+        let prepared = self
+            .quantizer
+            .as_ref()
+            .map(|q| q.prepare(query))
+            .transpose()?;
         let mut best = BinaryHeap::new();
         best.try_reserve(candidate_limit).map_err(|_| {
             crate::storage::error(
@@ -510,7 +633,7 @@ impl NativeIvf {
                 if state.entries[id].deleted {
                     continue;
                 }
-                let distance = self.score(&state, id, query)?;
+                let distance = self.score(&state, id, query, prepared.as_ref())?;
                 let score = Scored { dist: distance, id };
                 if best.len() < candidate_limit || best.peek().is_some_and(|worst| score < *worst) {
                     best.push(score);
@@ -528,7 +651,7 @@ impl NativeIvf {
             .collect();
         Ok(VectorSearchResult {
             candidates,
-            exact_order: true,
+            exact_order: self.quantizer.is_none(),
             exhausted: nprobe == state.lists.len(),
         })
     }

@@ -113,3 +113,6 @@ pub(crate) fn fuzz_fast_path_differential(sql: &str, bits: u16) {
         }
     }
 }
+
+mod vector_options;
+use vector_options::{apply_vector_options, strip_vector_options};

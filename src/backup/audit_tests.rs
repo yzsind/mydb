@@ -482,10 +482,10 @@ fn audit_r05_file_generations_and_authoritative_objects_continue_from_e() {
         "INSERT INTO docs VALUES(1,'backup database')",
         "CREATE TABLE vecs(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)",
         "INSERT INTO vecs VALUES(1,'[0,0,0]'),(2,'[1,0,0]')",
-        "CREATE INDEX vi ON vecs(emb) USING HNSW",
+        "CREATE INDEX vi ON vecs(emb) USING HNSW WITH (quantization=sq4)",
         "CREATE TABLE ivfs(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)",
         "INSERT INTO ivfs VALUES(1,'[0,0,0]'),(2,'[1,0,0]')",
-        "CREATE INDEX ii ON ivfs(emb) USING IVF COMMENT 'NLIST=1 NPROBE=1'",
+        "CREATE INDEX ii ON ivfs(emb) USING IVF WITH (nlist=1, nprobe=1, quantization=bq)",
         "CREATE SEQUENCE audit_seq",
     ] { f.source.execute(sql).unwrap(); }
     let queries = [

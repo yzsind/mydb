@@ -19,6 +19,7 @@ pub(crate) mod snapshot;
 mod stats;
 pub(crate) mod temp_quota;
 mod temporal;
+pub mod vector_config;
 pub use recovery_context::DatabaseOpenMode;
 mod txn;
 pub(crate) use txn::{metadata_wait_timeout, MetadataWaitTimeoutGuard};

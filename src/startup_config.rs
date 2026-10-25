@@ -1074,6 +1074,11 @@ pub fn bootstrap(args: &[String]) -> Result<StartupConfig, ConfigError> {
         None => Vec::new(),
     };
     let env = snapshot_environment()?;
+    if std::env::var_os("MYDB_HNSW_QUANTIZE").is_some() {
+        return Err(ConfigError::new(
+            "MYDB_HNSW_QUANTIZE was removed; use WITH (quantization=sq8) on each vector index",
+        ));
+    }
     let mut resolved = resolve_fixed_entries(&entries, &env).map_err(|err| match &config_path {
         Some(path) => ConfigError::new(format!("{}: {err}", path.display())),
         None => err,

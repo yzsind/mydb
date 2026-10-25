@@ -1008,6 +1008,7 @@ struct Topology {
 
 /// An in-memory HNSW graph over `f32` vectors keyed by `RowId`.
 pub(crate) struct HnswIndex {
+    navigation_quant_enabled: bool,
     valid: AtomicBool,
     metric: Metric,
     m: usize,
@@ -1120,9 +1121,14 @@ impl std::fmt::Debug for HnswIndex {
 }
 
 impl HnswIndex {
+    pub(crate) fn without_navigation_quantization(mut self) -> Self {
+        self.navigation_quant_enabled = false;
+        self
+    }
     pub(crate) fn new(metric: Metric, m: usize, ef_construction: usize) -> Self {
         let m = m.max(2);
         HnswIndex {
+            navigation_quant_enabled: true,
             valid: AtomicBool::new(true),
             metric,
             m,
@@ -1750,7 +1756,8 @@ impl HnswIndex {
             *self.compaction_log.lock() = Some(HashSet::new());
             count
         };
-        let replacement = HnswIndex::new(self.metric, self.m, self.ef_construction);
+        let mut replacement = HnswIndex::new(self.metric, self.m, self.ef_construction);
+        replacement.navigation_quant_enabled = self.navigation_quant_enabled;
         // Old node id -> replacement id; `u32::MAX` marks a node with no live
         // counterpart (tombstoned at snapshot, or appended later and not yet
         // replayed).
@@ -2011,7 +2018,10 @@ impl HnswIndex {
         // L2 uses the SSD identity directly; Cosine reuses it by quantizing
         // unit-normalized vectors (so the integer SSD ranks by cosine). Dot has
         // no scale-invariant normalization trick, so it stays on exact f32.
-        if matches!(self.metric, Metric::Dot) || !quant_enabled_env() {
+        if !self.navigation_quant_enabled
+            || matches!(self.metric, Metric::Dot)
+            || !quant_enabled_env()
+        {
             return None;
         }
         let normalize = self.metric == Metric::Cosine;

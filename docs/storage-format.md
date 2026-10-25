@@ -278,11 +278,33 @@ Native IVF uses the shared vector page container with typed geometry and no
 adjacency lists. Each record retains the RowId, deletion flag and native
 payload. Lists maintain separate fill-page hints to group their entries.
 Coarse centers and list membership are reconstructed from committed heap
-values on cold open; no per-row scalar-quantization codes are stored.
+values on cold open. WITH quantization replaces native payloads with compressed
+codes using the shared layout described below.
 
 Both ANN algorithms generate candidates. The executor checks MVCC visibility
-and reranks using native heap values. Full probing (`nprobe=nlist`) of IVF
-scores every visible candidate and yields exact TopK without residual filters.
+and reranks using native heap values. Full probing (`nprobe=nlist`) of unquantized IVF scores every visible candidate
+with native values. A quantized IVF candidate pool remains approximate even
+when all lists are probed.
+
+### 10.3 Quantized payloads and overflow
+
+Container version 6 / page version 3 adds a model-chain head at meta offset
+144 and a quantizer generation at offset 152. Quantized records use native
+INT8 geometry whose dimension is the fixed encoded-record byte length. Each
+payload starts with a one-byte kind and an eight-byte overflow reference,
+followed by the configured SQ8, SQ4, PQ or BQ code. Normal records contain no
+full-precision vector. Exceptions reference a versioned native vector value
+in the same container. The Data Dictionary stores the independent, typed
+vector_config in mysql.indexes.
+
+Model and exception overflow chains use zero-slot vector pages. The ordinary
+header, page version and CRC32 remain authoritative; offset 32 stores the
+next page, offset 40 the chunk length, and offset 48 starts the chunk. References
+must descend within the allocated page high-water mark, preventing cycles.
+These pages use the same buffer-pool and redo policy as ordinary vector pages.
+A build publishes its model, codes and coverage frontier together. Native
+indexes reconstruct from committed heap data on cold open rather than trusting
+an incomplete or mismatched model generation.
 
 ## 11. Catalog and Generation Publication
 

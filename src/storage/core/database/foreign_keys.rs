@@ -628,6 +628,7 @@ fn fk_build_one(
                     index_type: "BTREE".to_string(),
                     visible: true,
                     comment: String::new(),
+                    vector: None,
                     fulltext: None,
                 };
                 (idx_name, Some(index))

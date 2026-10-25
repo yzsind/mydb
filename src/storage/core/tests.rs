@@ -854,6 +854,7 @@ fn rename_index_preserves_stable_physical_path() {
             index_type: "BTREE".into(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -2075,6 +2076,7 @@ fn spatial_index_rtree_search_over_durable_btree() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -2291,6 +2293,7 @@ fn char_rows_store_compact_and_read_compact() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -2940,6 +2943,7 @@ fn add_index_bulk_builds_large_table_without_dirty_index_cache() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -3069,6 +3073,7 @@ fn fulltext_backfill_builds_inverted_index() {
             index_type: "FULLTEXT".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -3164,6 +3169,7 @@ fn fulltext_insert_delete_maintains_inverted_index() {
             index_type: "FULLTEXT".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -3285,6 +3291,7 @@ fn fulltext_postings_carry_payload_stats() {
             index_type: "FULLTEXT".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -3465,6 +3472,7 @@ fn batched_add_index_encoded_keys_keep_lookup_semantics() {
         index_type: "BTREE".into(),
         visible: true,
         comment: String::new(),
+        vector: None,
         fulltext: None,
     };
     db.add_indexes(
@@ -3575,6 +3583,7 @@ fn offline_add_index_respects_existing_table_ix_lock() {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             },
         )
@@ -3652,6 +3661,7 @@ fn add_primary_key_on_empty_table_persists_rebuilt_index_meta() {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             },
         )
@@ -3899,6 +3909,7 @@ fn analyze_table_keeps_small_table_stats_exact() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -3993,6 +4004,7 @@ fn drop_index_removes_index_stats_without_refreshing_table_stats() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -4088,6 +4100,7 @@ fn analyze_table_large_high_cardinality_stats_are_bounded_and_stable() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -4258,6 +4271,7 @@ fn analyze_table_sampled_pages_estimate_stats_for_large_tables() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -9562,6 +9576,7 @@ fn rollback_persists_restored_heap_and_indexes_before_end_txn() {
                 visible: true,
                 comment: String::new(),
                 fulltext_parser: String::new(),
+                vector_options: None,
             }],
         )
         .unwrap();
@@ -9656,6 +9671,7 @@ fn create_concurrent_index_update_table(db: &Database, rows: i64) {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -10637,6 +10653,7 @@ fn rollback_to_savepoint_rebuilds_indexes_after_secondary_update() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -10744,6 +10761,7 @@ fn rollback_to_savepoint_removes_batch_inserted_rows_and_indexes() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -11017,6 +11035,7 @@ fn concurrent_composite_pk_insert_batches_commit_and_recover_consistently() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         };
         db.create_table(
             "lineitem_shape",
@@ -11286,6 +11305,7 @@ fn batch_index_entry_lookup_matches_scalar_prefix_and_exact_paths() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -11461,6 +11481,7 @@ fn routed_batch_lookup_matches_scalar_for_leaf_spanning_prefixes() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -14569,6 +14590,7 @@ fn read_committed_dml_serializes_delete_insert_pairs() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -15225,6 +15247,7 @@ fn unique_key_wait_participates_in_deadlock_detection() {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
     .unwrap();
@@ -15741,6 +15764,7 @@ fn btree_forward_range_cursor_matches_full_range_across_chunks() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -15838,6 +15862,7 @@ fn range_cursor_row_id_and_leaf_walkers_match_entries_oracle() {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             },
         )
@@ -16078,6 +16103,7 @@ fn analyze_computes_index_heap_order_correlation() {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             },
         )
@@ -19091,6 +19117,7 @@ fn v10_add_index_offline_bulk_dense_small_int_key_smoke() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -19181,6 +19208,7 @@ fn v10_add_index_offline_bulk_150k_rows_small_int_key() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )
@@ -23675,6 +23703,7 @@ fn rebuild_indexes_encoded_path_is_stable() {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         }
     }
@@ -25362,6 +25391,7 @@ fn fulltext_unicode_prefix_generic_matches_fast_path() {
             index_type: "FULLTEXT".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )

@@ -1863,6 +1863,7 @@ pub struct IndexDef {
     /// Always empty for non-FULLTEXT indexes. Extracted from SQL by [`strip_fulltext_parsers`] and
     /// injected by [`apply_fulltext_parsers`] after conversion.
     pub fulltext_parser: String,
+    pub vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
 }
 
 impl IndexDef {
@@ -1914,6 +1915,7 @@ pub struct CreateIndex {
     /// is extracted by [`strip_fulltext_parsers`] and injected by [`apply_fulltext_parsers`],
     /// aligned with the inline / ALTER [`IndexDef::fulltext_parser`].
     pub fulltext_parser: String,
+    pub vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

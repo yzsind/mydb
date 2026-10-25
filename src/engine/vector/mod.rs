@@ -11,7 +11,6 @@ pub(crate) mod hnsw_paged;
 pub(crate) mod ivf;
 pub(crate) mod native_hnsw;
 pub(crate) mod native_ivf;
-mod native_quant;
 pub(crate) mod session;
 pub(crate) mod spill_rows;
 pub(crate) mod sql;
@@ -67,3 +66,5 @@ impl VectorError {
         }
     }
 }
+
+pub(crate) mod quantization;

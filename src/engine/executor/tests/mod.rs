@@ -432,6 +432,7 @@ mod update_delta;
 mod vec_routing;
 mod vector_bench;
 mod vector_datatypes;
+mod vector_quantization;
 mod vector_type;
 mod work_area;
 mod xa;

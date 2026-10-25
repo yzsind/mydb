@@ -1618,7 +1618,8 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
 
         let prescan = prescan_keywords(sql, head_kw);
 
-        let (sql, update_modifiers) = rewrite_sql_with(canonical_sql, strip_update_modifiers);
+        let (sql, vector_options) = try_rewrite_sql_with(canonical_sql, strip_vector_options)?;
+        let (sql, update_modifiers) = rewrite_sql_with(sql, strip_update_modifiers);
         let (sql, delete_modifiers) = rewrite_sql_with(sql, strip_delete_modifiers);
         let sql = rewrite_sql(sql, strip_delete_target_wildcards);
         let (sql, create_table_pct_override) = try_rewrite_sql_with(sql, |sql| {
@@ -1704,6 +1705,7 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
             create_zone_options,
             inline_index_visibility,
             inline_index_includes,
+            vector_options,
         };
         let sql = try_rewrite_sql(sql, rewrite_mysql_right_nested_join_groups)?;
         let dialect = MydbDialect::default();

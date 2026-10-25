@@ -148,6 +148,20 @@ fn validate_supported_index_type(index: &IndexSchema) -> Result<(), QueryError> 
     Ok(())
 }
 
+fn resolve_vector_config(columns: &[ColumnSchema], index: &mut IndexSchema) -> Result<(), QueryError> {
+    if !index.is_vector() { return Ok(()); }
+    let algo = index.vector_algo();
+    if index.vector.is_none() {
+        index.vector = crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, None, &index.comment)?;
+    }
+    if let Some(column) = index.columns.first().and_then(|name| columns.iter().find(|c|c.name.eq_ignore_ascii_case(name))) {
+        if let DataTypeKind::Vector {datatype,dim: Some(dimension)} = column.data_type {
+            index.vector.as_mut().unwrap().resolve(datatype,dimension,algo)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_vector_index_column(
     table: &TableSchema,
     index: &IndexSchema,
@@ -173,6 +187,7 @@ fn validate_vector_index_column(
                         "a vector index requires a fixed dimension",
                     ));
                 }
+                if let Some(mut config)=index.vector.clone(){config.resolve(datatype,dim.unwrap(),index.vector_algo())?;}
                 let metric = index.vector_meta_for_table(table).metric_enum();
                 if (datatype == crate::vector::VectorDataType::Binary)
                     != matches!(metric, vector::Metric::Hamming | vector::Metric::Jaccard)
@@ -189,7 +204,9 @@ fn validate_vector_index_column(
                     } = c.data_type
                     {
                         VectorIndexFile::validate_hnsw_layout(
-                            if datatype == crate::vector::VectorDataType::Float32 {
+                            if let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) {
+                                native_vector_geometry(crate::vector::VectorDataType::Int8,(config.quantization.code_len(dim)+9) as u32) as usize
+                            } else if datatype == crate::vector::VectorDataType::Float32 {
                                 dim as usize
                             } else {
                                 native_vector_geometry(datatype, dim) as usize
@@ -199,7 +216,9 @@ fn validate_vector_index_column(
                     }
                 }
                 if vector_storage_paged() && index.vector_algo() == VectorAlgo::Ivf {
-                    VectorIndexFile::validate_native_ivf_layout(datatype, dim.unwrap())?;
+                    if let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) {
+                        VectorIndexFile::validate_native_ivf_layout(crate::vector::VectorDataType::Int8,(config.quantization.code_len(dim.unwrap())+9) as u32)?;
+                    } else {VectorIndexFile::validate_native_ivf_layout(datatype, dim.unwrap())?;}
                 }
                 if c.nullable {
                     return Err(error(
@@ -675,6 +694,7 @@ fn prepare_create_table_schema(
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         });
     }
@@ -791,14 +811,7 @@ fn prepare_create_table_schema(
         }
 
         if is_vector {
-            crate::storage::schema::VectorIndexMeta::validate_from_comment(
-                &index.comment,
-                if index.index_type.eq_ignore_ascii_case("IVF") {
-                    crate::storage::schema::VectorAlgo::Ivf
-                } else {
-                    crate::storage::schema::VectorAlgo::Hnsw
-                },
-            )?;
+            crate::storage::vector_config::VectorIndexConfig::validate_comment(&index.comment)?;
             if columns.len() != 1 || index.unique {
                 return Err(error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -1013,6 +1026,7 @@ fn prepare_create_table_schema(
             primary,
             included_columns,
             state: crate::storage::IndexState::Public,
+            vector: crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, index.vector_options.as_ref(), &index.comment)?,
             index_type: index.index_type,
             visible: index.visible,
             comment: index.comment,
@@ -1097,6 +1111,8 @@ impl PreparedCreateTableSchema {
             pctused: self.pctused.unwrap_or(0).min(50),
             mysql_table_options,
         };
+        for index in &mut table.indexes { resolve_vector_config(&table.columns, index)?; }
+        for index in &table.indexes { validate_vector_index_column(&table, index)?; }
         table.check_constraints =
             build_check_constraints_for_table(&table, self.check_defs, None, None)?;
         for (column_name, comment) in self.column_comments {
@@ -2171,6 +2187,7 @@ impl Database {
         validate_index_column_names(&table, &index)?;
         validate_index_prefix_columns(&table, &index, &index.column_prefix_lengths)?;
         index.validate_multi_valued_definition()?;
+        resolve_vector_config(&table.columns, &mut index)?;
         validate_vector_index_column(&table, &index)?;
         if index.primary && table.indexes.iter().any(|existing| existing.primary) {
             return Err(error(
@@ -4170,10 +4187,7 @@ impl Database {
             &index.comment,
         )?;
         if index.is_vector() {
-            crate::storage::schema::VectorIndexMeta::validate_from_comment(
-                &index.comment,
-                index.vector_algo(),
-            )?;
+            crate::storage::vector_config::VectorIndexConfig::validate_comment(&index.comment)?;
         }
         index.column_prefix_lengths =
             normalized_index_prefix_lengths(index.column_prefix_lengths, index.columns.len());
@@ -4213,6 +4227,7 @@ impl Database {
                     format!("duplicate index '{}'", index.name),
                 ));
             }
+            resolve_vector_config(&table.columns, &mut index)?;
             validate_add_index_definition(table, &index)?;
             if !index.included_columns.is_empty() {
                 if index.unique {
@@ -4304,6 +4319,7 @@ impl Database {
                 ));
             }
             table.next_index_id = table.next_index_id.max(index.index_id.saturating_add(1));
+            resolve_vector_config(&table.columns, &mut index)?;
             validate_add_index_definition(table, &index)?;
             if index.primary
                 && (table.indexes.iter().any(|existing| existing.primary)
@@ -6617,18 +6633,18 @@ impl Database {
         pos: usize,
         new: &ColumnSchema,
     ) -> Result<(), QueryError> {
-        if table.indexes.iter().any(|index| {
-            index.is_vector()
-                && index
-                    .columns
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&table.columns[pos].name))
-        }) && (new.nullable || !matches!(new.data_type, DataTypeKind::Vector { .. }))
-        {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "a vector index column must remain VECTOR and NOT NULL; drop the index first",
-            ));
+        let affected=|index:&IndexSchema|index.is_vector() && index.columns.iter().any(|name|name.eq_ignore_ascii_case(&table.columns[pos].name));
+        if !table.indexes.iter().any(affected){return Ok(());}
+        if new.nullable || !matches!(new.data_type,DataTypeKind::Vector{..}) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,"a vector index column must remain VECTOR and NOT NULL; drop the index first"));
+        }
+        // Validate before COPY allocates or publishes any shadow generation.
+        // CHANGE COLUMN renames keys later; preserve their current name here.
+        let mut prospective=table.clone();
+        prospective.columns[pos]=new.clone();
+        prospective.columns[pos].name=table.columns[pos].name.clone();
+        for index in prospective.indexes.iter().filter(|index|affected(index)) {
+            validate_vector_index_column(&prospective,index)?;
         }
         Ok(())
     }
@@ -10791,6 +10807,7 @@ impl Database {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             });
             table_id = updated.id;

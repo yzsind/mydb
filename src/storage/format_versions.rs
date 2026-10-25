@@ -23,7 +23,8 @@
 // v59 commits index retirement manifests in the data dictionary with DDL.
 // v60 stores sequence recovery states and stable dependencies in catalog tables.
 /// v62 removes the retired quantized IVF algorithm and its page format.
-pub const CATALOG_VERSION: u32 = 62;
+/// v63 persists vector WITH configuration independently from index comments.
+pub const CATALOG_VERSION: u32 = 63;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.
@@ -45,8 +46,8 @@ pub const UNDO_BINARY_VERSION: u8 = 14;
 pub const UNDO_TABLESPACE_VERSION: u32 = 1;
 pub const OVERFLOW_VERSION: u16 = 3;
 /// v4 records the committed heap coverage frontier.
-pub const PAGED_HNSW_INDEX_VERSION: u32 = 5;
-pub const PAGED_HNSW_PAGE_VERSION: u16 = 2;
+pub const PAGED_HNSW_INDEX_VERSION: u32 = 6;
+pub const PAGED_HNSW_PAGE_VERSION: u16 = 3;
 pub const ZONE_MAP_VERSION: u32 = 6;
 /// Zone Map v6 uses shared-buffer-pool pages and physical redo. Page v2 adds
 /// mutable directory children, mixed record leaves and root revisions. Page

@@ -750,6 +750,14 @@ pub(super) fn collect_explain_rows(
                 k,
                 ef_search
             );
+            extra_str.push_str(&format!(
+                " quantization={} rerank_pool={}",
+                index
+                    .vector
+                    .as_ref()
+                    .map_or("none", |v| v.quantization.name()),
+                crate::engine::vector::session::explained_rerank_pool(index, *k, *ef_search)
+            ));
             if let Some(note) = hint_note {
                 append_extra(&mut extra_str, note);
             }

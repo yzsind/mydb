@@ -181,29 +181,8 @@ fn vector_storage_paged() -> bool {
 /// means "auto (√N)". Query-time nprobe is resolved separately from the
 /// live session, hint and per-index metadata.
 fn ivf_params_from_meta(meta: &crate::storage::schema::VectorIndexMeta) -> IvfParams {
-    fn env_usize(name: &str) -> Option<usize> {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-    }
-    let def = IvfParams::default();
-    IvfParams {
-        nlist: meta
-            .nlist
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_NLIST"))
-            .unwrap_or(0),
-        kmeans_iters: meta
-            .kmeans_iters
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_KMEANS_ITERS").filter(|n| *n > 0))
-            .unwrap_or(def.kmeans_iters),
-        train_sample_mult: meta
-            .train_sample_mult
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_TRAIN_SAMPLE").filter(|n| *n > 0))
-            .unwrap_or(def.train_sample_mult),
-    }
+    let def=IvfParams::default();
+    IvfParams {nlist:meta.nlist.unwrap_or(0) as usize,kmeans_iters:meta.kmeans_iters.map_or(def.kmeans_iters,|v|v as usize),train_sample_mult:meta.train_sample_mult.map_or(def.train_sample_mult,|v|v as usize)}
 }
 
 /// Soft-cap (12.5%) on dirty nodes before the opportunistic checkpoint
@@ -577,7 +556,7 @@ impl Database {
             .try_reserve_exact(length)
             .map_err(|_| std::io::Error::other("HNSW snapshot allocation failed"))?;
         file.take(length as u64).read_to_end(&mut bytes)?;
-        let graph = HnswIndex::deserialize(&bytes)?;
+        let graph = HnswIndex::deserialize(&bytes)?.without_navigation_quantization();
         let meta = index.vector_meta_for_table(table);
         let column = table
             .column_index(&index.columns[0])
@@ -618,7 +597,8 @@ impl Database {
         storage_id: u64,
     ) -> Result<VectorGraph, QueryError> {
         let column = table.column_index(&index.columns[0])?;
-        if matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32)
+        if (matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32)
+            || index.vector.as_ref().is_some_and(|v|v.quantization.enabled()))
             && index.vector_algo() == VectorAlgo::Hnsw
         {
             return self.vector_native_hnsw_load_or_build(table, index, storage_id);
@@ -634,7 +614,7 @@ impl Database {
                 meta.metric_enum(),
                 meta.m as usize,
                 meta.ef_construction as usize,
-            );
+            ).without_navigation_quantization();
             let col = table.column_index(&index.columns[0])?;
             self.vector_graph_populate_from_heap(
                 table,
@@ -663,7 +643,7 @@ impl Database {
                     meta.metric_enum(),
                     meta.m as usize,
                     meta.ef_construction as usize,
-                ),
+                ).without_navigation_quantization(),
                 Err(e) => {
                     log_message(&format!(
                         "hnsw: corrupt or unreadable {}/{}/{} (sid={}) — falling back to rebuild: {}",
@@ -673,7 +653,7 @@ impl Database {
                         meta.metric_enum(),
                         meta.m as usize,
                         meta.ef_construction as usize,
-                    )
+                    ).without_navigation_quantization()
                 }
             }
         } else {
@@ -681,7 +661,7 @@ impl Database {
                 meta.metric_enum(),
                 meta.m as usize,
                 meta.ef_construction as usize,
-            )
+            ).without_navigation_quantization()
         };
 
         // M4: parallel cold-build path. `HnswIndex::insert` is `&self` under
@@ -696,6 +676,14 @@ impl Database {
         self.vector_graph_populate_from_heap(table, storage_id, &cols, &graph, threads)?;
 
         Ok(VectorGraph::Memory(graph))
+    }
+
+    fn train_vector_quantizer(&self,table:&TableSchema,index:&IndexSchema,storage_id:u64,txn:TxnView,col:usize)->Result<Option<Arc<vector::quantization::Quantizer>>,QueryError>{
+        let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) else{return Ok(None);};
+        let DataTypeKind::Vector{datatype,dim:Some(dimension)}=table.columns[col].data_type else{return Err(vector::vector_err("quantization requires fixed-dimension VECTOR"));};
+        let mut trainer=vector::quantization::Trainer::new(config.quantization.clone(),datatype,dimension,index.vector_meta_for_table(table).metric_enum())?;
+        self.scan_hnsw_build_rows(table,storage_id,txn,&[col],0,u64::MAX,|_,values|{if let Some(Value::Vector(v))=values.first(){trainer.observe(v)?;}Ok(false)})?;
+        trainer.finish()
     }
 
     fn vector_native_hnsw_load_or_build(
@@ -723,7 +711,16 @@ impl Database {
             final_path.file_stem().unwrap_or_default().to_string_lossy(),
             self.visible_scn()
         ));
-        let geometry = native_vector_geometry(datatype, dimension);
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let requested=index.vector.as_ref().is_some_and(|v|v.quantization.enabled());
+        let quantizer=self.train_vector_quantizer(table,index,storage_id,txn,col)?;
+        let record_bytes=index.vector.as_ref().filter(|v|v.quantization.enabled()).map(|v|v.quantization.code_len(dimension)+9);
+        let geometry = record_bytes.map_or_else(||native_vector_geometry(datatype, dimension),|n|native_vector_geometry(crate::vector::VectorDataType::Int8,n as u32));
         let file = if paged {
             self.buffer_pool.discard_pages_for_path(&tmp_path)?;
             if tmp_path.exists() {
@@ -751,13 +748,29 @@ impl Database {
             meta.ef_construction as usize,
             file,
         )?;
-        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
-        if table.row_generation_txn_id != 0 {
-            txn.txn_id = table.row_generation_txn_id;
+        graph.set_quantizer(requested,quantizer.clone(),txn.snapshot_scn.max(1));
+        if let (Some(q),Some(file))=(&quantizer,graph.file()) {
+            let _model_scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,q.bytes().saturating_mul(8).saturating_add(4096))?;
+            let data=q.serialize(index.vector.as_ref())?;
+            file.write_quantization_model(&data,txn.snapshot_scn.max(1))?;
         }
-        self.vector_snapshot_floor
-            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
-        let built = self.scan_hnsw_build_rows(
+        let mut used_parallel=false;
+        if let Some(q)=&quantizer {
+            let rows=q.trained_rows();let threads=hnsw_build_threads();
+            let scratch=rows.saturating_mul((dimension as usize).saturating_mul(4).saturating_add(4096+meta.m as usize*256)).saturating_add(threads*1024*1024);
+            if rows>=2048 && threads>1 && scratch as u64<=hnsw_bulk_memory_budget_bytes()? {
+                let _gate=hnsw_build_memory_gate().lock().unwrap_or_else(|e|e.into_inner());
+                if let Some(mut lease)=HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(),scratch) {
+                    let topology=HnswIndex::new(meta.metric_enum(),meta.m as usize,meta.ef_construction as usize).without_navigation_quantization().with_build_reservation(lease.take_charge(),rows);
+                    self.vector_graph_append_from_heap(table,txn,storage_id,&[col],&topology,threads)?;
+                    topology.link_all(threads);
+                    graph.import_build_topology(&topology)?;
+                    used_parallel=true;
+                }
+            }
+        }
+        let built=if used_parallel {Ok(())}else {
+            self.scan_hnsw_build_rows(
             table,
             storage_id,
             txn,
@@ -766,11 +779,12 @@ impl Database {
             u64::MAX,
             |row, values| {
                 if let Some(Value::Vector(value)) = values.first() {
-                    graph.insert(row, value.clone())?;
+                    if !graph.quantization_pending() {graph.insert(row, value.clone())?;}
                 }
                 Ok(false)
             },
-        );
+        )
+        };
         if let Err(err) = built {
             graph.invalidate();
             return Err(err);
@@ -825,7 +839,16 @@ impl Database {
             final_path.file_stem().unwrap_or_default().to_string_lossy(),
             self.visible_scn()
         ));
-        let geometry = native_vector_geometry(datatype, dimension);
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let requested=index.vector.as_ref().is_some_and(|v|v.quantization.enabled());
+        let quantizer=self.train_vector_quantizer(table,index,storage_id,txn,col)?;
+        let record_bytes=index.vector.as_ref().filter(|v|v.quantization.enabled()).map(|v|v.quantization.code_len(dimension)+9);
+        let geometry = record_bytes.map_or_else(||native_vector_geometry(datatype, dimension),|n|native_vector_geometry(crate::vector::VectorDataType::Int8,n as u32));
         let file = if paged {
             self.buffer_pool.discard_pages_for_path(&tmp_path)?;
             if tmp_path.exists() {
@@ -852,12 +875,12 @@ impl Database {
             ivf_params_from_meta(&meta),
             file,
         )?;
-        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
-        if table.row_generation_txn_id != 0 {
-            txn.txn_id = table.row_generation_txn_id;
+        graph.set_quantizer(requested,quantizer.clone(),txn.snapshot_scn.max(1));
+        if let (Some(q),Some(file))=(&quantizer,graph.file()) {
+            let _model_scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,q.bytes().saturating_mul(8).saturating_add(4096))?;
+            let data=q.serialize(index.vector.as_ref())?;
+            file.write_quantization_model(&data,txn.snapshot_scn.max(1))?;
         }
-        self.vector_snapshot_floor
-            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
         let mut count = 0usize;
         self.scan_hnsw_build_rows(table, storage_id, txn, &[col], 0, u64::MAX, |_, values| {
             if matches!(values.first(), Some(Value::Vector(_))) {
@@ -915,7 +938,7 @@ impl Database {
             u64::MAX,
             |row, values| {
                 if let Some(Value::Vector(value)) = values.first() {
-                    graph.insert(row, value.clone())?;
+                    if !graph.quantization_pending() {graph.insert(row, value.clone())?;}
                 }
                 Ok(false)
             },
@@ -985,7 +1008,7 @@ impl Database {
         if self.physical_replica_mode() {
             file.disable_navigation_mapping();
         }
-        let paged = PagedHnsw::new(Arc::new(file));
+        let paged = PagedHnsw::new(Arc::new(file)).without_navigation_quantization();
         // Build when the file has no finalized graph yet: either a freshly
         // created `.hvec`, or an interrupted/legacy build (non-finalized). A
         // finalized file — even an empty one, or one extended only by
@@ -1002,7 +1025,7 @@ impl Database {
             self.buffer_pool.discard_pages_for_path(&path)?;
             let _ = fs::remove_file(&path);
             let file = self.open_vector_index_file(table, index, storage_id, dim)?;
-            let rebuilt = PagedHnsw::new(Arc::new(file));
+            let rebuilt = PagedHnsw::new(Arc::new(file)).without_navigation_quantization();
             self.vector_graph_paged_build_from_heap(table, storage_id, &cols, &rebuilt)?;
             return Ok(rebuilt);
         }
@@ -1193,7 +1216,7 @@ impl Database {
             full_bytes,
             compact_bytes,
             budget,
-            stats.quantization_params().is_some(),
+            false,
         );
         let mut build_mode = match preferred {
             HnswColdBuildMode::FullMemory if full_bytes > budget => {
@@ -1214,7 +1237,7 @@ impl Database {
                         crate::error::catalog::ER_OUTOFMEMORY,
                         "HNSW full-memory build cannot reserve memory within MYDB_MEMORY_TARGET",
                     ));
-                } else if stats.quantization_params().is_some() && compact_bytes <= budget {
+                } else if false && compact_bytes <= budget {
                     lease =
                         HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), compact_bytes);
                     if lease.is_some() {
@@ -1265,7 +1288,7 @@ impl Database {
         };
         match build_mode {
             HnswColdBuildMode::FullMemory => {
-                let graph = HnswIndex::new(metric, m, ef_construction).with_build_reservation(
+                let graph = HnswIndex::new(metric, m, ef_construction).without_navigation_quantization().with_build_reservation(
                     lease.as_mut().expect("admitted full build").take_charge(),
                     stats.rows(),
                 );
@@ -2180,8 +2203,10 @@ impl Database {
             normalize_name(&index.name),
         );
 
-        if let Some(graph) = self.vector_indexes.read().get(&key) {
-            return Ok(graph.clone());
+        let cached=self.vector_indexes.read().get(&key).cloned();
+        if let Some(graph)=cached {
+            if graph.ensure_valid().is_ok() {return Ok(graph);}
+            self.evict_vector_graphs(vec![key.clone()]);
         }
         // A build that just failed memory admission would fail again: report
         // it immediately (callers fall back to an exact scan) instead of
@@ -2239,8 +2264,10 @@ impl Database {
             crate::engine::cancel::check_cancelled()?;
         };
         crate::engine::cancel::check_cancelled()?;
-        if let Some(existing) = self.vector_indexes.read().get(&key) {
-            return Ok(existing.clone());
+        let cached=self.vector_indexes.read().get(&key).cloned();
+        if let Some(existing)=cached {
+            if existing.ensure_valid().is_ok() {return Ok(existing);}
+            self.evict_vector_graphs(vec![key.clone()]);
         }
         let registration = Some(VectorBuildRegistration::begin(self, key.clone()));
         let build_epoch = self
@@ -2536,7 +2563,8 @@ impl Database {
             }
         }
         let result = graph.search(query, request);
-        if result
+        if let Ok(r)=&result {graph.record_query_stats(r.candidates.len() as u64,0,false);}
+        if !graph.quantization_pending() && result
             .as_ref()
             .is_err_and(|error| error.is(crate::error::catalog::ER_GET_ERRNO))
             && matches!(
@@ -2980,6 +3008,7 @@ impl Database {
             // commits must reach it while cold. Native files always rebuild
             // from heap and must not enter this legacy FLOAT32 open path.
             if graph.is_none()
+                && !index.vector.as_ref().is_some_and(|v|v.quantization.enabled())
                 && index.vector_algo() == VectorAlgo::Hnsw
                 && vector_storage_paged()
                 && matches!(
@@ -2997,7 +3026,7 @@ impl Database {
                     let file = self.open_vector_index_file(table, index, storage_id, dim)?;
                     if file.is_finalized() && file.meta().query_ready {
                         let candidate =
-                            Arc::new(VectorGraph::Paged(PagedHnsw::new(Arc::new(file))));
+                            Arc::new(VectorGraph::Paged(PagedHnsw::new(Arc::new(file)).without_navigation_quantization()));
                         graph = Some(
                             self.vector_indexes
                                 .write()
@@ -3227,6 +3256,11 @@ impl Database {
     /// section. Cold (never-queried) indexes don't appear — the view joins this
     /// against the catalog and reports them as `LOADED = 0`. Takes only the
     /// `vector_indexes` read lock; never builds a graph.
+    pub(crate) fn record_vector_query_work(&self,table:&TableSchema,index:&IndexSchema,storage_id:u64,heap:u64,fallback:bool){
+        let key=(table.id,storage_id,table.active_generation.max(1),normalize_name(&index.name));
+        if let Some(graph)=self.vector_indexes.read().get(&key){graph.record_query_stats(0,heap,fallback);}
+    }
+
     pub(crate) fn vector_index_runtime_stats(
         &self,
     ) -> HashMap<(u64, String), vector::VectorIndexRuntimeStats> {
@@ -3525,19 +3559,18 @@ impl Database {
             if let VectorGraph::Memory(memory) = graph.as_ref() {
                 memory.refresh_requested_quant();
             }
-            if compact_disabled {
-                continue;
-            }
+            let force_rebuild=matches!(graph.as_ref(),VectorGraph::NativeHnsw(_)|VectorGraph::NativeIvf(_)) && graph.ensure_valid().is_err();
+            if compact_disabled && !force_rebuild {continue;}
             let total = graph.node_count() as u64;
             let reclaimable = match graph.as_ref() {
                 VectorGraph::Paged(paged) => paged.unrepaired_tombstones(),
                 _ => u64::from(graph.stale_count()),
             };
-            if reclaimable == 0 || total == 0 {
+            if !force_rebuild && (reclaimable == 0 || total == 0) {
                 continue;
             }
             let ratio = reclaimable as f64 / total as f64;
-            if ratio < ratio_gate && reclaimable < absolute_gate {
+            if !force_rebuild && ratio < ratio_gate && reclaimable < absolute_gate {
                 continue;
             }
             let Some(table) = self.table_by_id(table_id) else {

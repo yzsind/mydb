@@ -48,7 +48,7 @@ pub(crate) use crate::storage::format_versions::PAGED_HNSW_INDEX_VERSION as VEC_
 pub(crate) use crate::storage::format_versions::PAGED_HNSW_PAGE_VERSION as VEC_PAGE_VERSION;
 /// Meta page id.
 const VEC_META_PAGE: u64 = 0;
-const VEC_META_USED_BYTES: usize = 144;
+const VEC_META_USED_BYTES: usize = 160;
 
 // Meta pages have a short fixed prefix followed by zero padding. CRC extension
 // by this fixed suffix is affine over GF(2); cache its basis instead of hashing
@@ -319,6 +319,8 @@ pub(crate) struct VectorMeta {
     pub nav_inv_scale: f32,
     pub nav_dist_mul: f32,
     pub nav_exact_nodes: u64,
+    pub quant_model_head: u64,
+    pub quant_generation: u64,
 }
 
 impl VectorMeta {
@@ -344,6 +346,8 @@ impl VectorMeta {
             nav_inv_scale: 1.0,
             nav_dist_mul: 1.0,
             nav_exact_nodes: 0,
+            quant_model_head: 0,
+            quant_generation: 0,
         }
     }
 }
@@ -377,6 +381,8 @@ fn encode_vector_meta(meta: &VectorMeta) -> Vec<u8> {
     write_u32(&mut buf, 124, meta.nav_dist_mul.to_bits());
     write_u64(&mut buf, 128, meta.nav_exact_nodes);
     write_u64(&mut buf, 136, meta.coverage_scn);
+    write_u64(&mut buf, 144, meta.quant_model_head);
+    write_u64(&mut buf, 152, meta.quant_generation);
     let checksum = vector_meta_crc(&buf, true);
     write_u32(&mut buf, 16, checksum);
     buf
@@ -447,6 +453,8 @@ fn decode_vector_meta(buf: &[u8]) -> Result<VectorMeta, QueryError> {
         nav_inv_scale: f32::from_bits(read_u32(buf, 120)),
         nav_dist_mul: f32::from_bits(read_u32(buf, 124)),
         nav_exact_nodes: read_u64(buf, 128),
+        quant_model_head: read_u64(buf, 144),
+        quant_generation: read_u64(buf, 152),
     })
 }
 
@@ -5119,3 +5127,53 @@ pub(crate) fn source_audit_vector_file() -> (tempfile::TempDir, Arc<VectorIndexF
 }
 
 include!("vector_mapped.rs");
+
+impl VectorIndexFile {
+    /// Overflow chains share the vector container, checksums, buffer pool and
+    /// redo policy. Zero-slot pages are never interpreted as graph nodes.
+    pub(crate) fn append_quantization_blob(&self, data: &[u8]) -> Result<u64, QueryError> {
+        let _write = self.navigation_write();
+        let _scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,PAGE_SIZE*3)?;
+        let mut next = 0u64;
+        for chunk in data.rchunks(PAGE_SIZE - 48) {
+            let page_id = self.alloc_node_page(0)?;
+            let mut page = vec![0; PAGE_SIZE];
+            format_empty_node_page(&mut page);
+            write_u16(&mut page, NODE_OFF_HEAP_TOP, NODE_OFF_DIRECTORY as u16);
+            write_u64(&mut page, 32, next);
+            write_u32(&mut page, 40, chunk.len() as u32);
+            page[48..48 + chunk.len()].copy_from_slice(chunk);
+            stamp_vector_page(&mut page,page_id,0);
+            self.write_page(0, page_id, page)?;
+            next = page_id;
+        }
+        Ok(next)
+    }
+    pub(crate) fn read_quantization_blob(&self, mut head: u64, max_bytes:usize) -> Result<Vec<u8>, QueryError> {
+        let _scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,max_bytes.saturating_add(PAGE_SIZE*2))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(max_bytes).map_err(|_|error(crate::error::catalog::ER_OUTOFMEMORY,"quantizer overflow allocation failed"))?;
+        let mut pages = 0;
+        let limit = self.meta().node_next_page_id;
+        while head != 0 {
+            pages += 1;
+            if head >= limit || pages >= limit { return Err(error(crate::error::catalog::ER_GET_ERRNO, "invalid quantizer overflow chain")); }
+            let page = self.read_page_bytes(head)?;
+            let len = read_u32(&page, 40) as usize;
+            if read_u32(&page,0)!=VEC_NODE_MAGIC || read_u16(&page,4)!=VEC_PAGE_VERSION || read_u16(&page,NODE_OFF_SLOT_COUNT)!=0 || len>PAGE_SIZE-48 || len>max_bytes.saturating_sub(out.len()) || read_u32(&page,16)!=page_checksum(&page,16) {
+                return Err(error(crate::error::catalog::ER_GET_ERRNO,"corrupt quantizer overflow page"));
+            }
+            out.try_reserve(len).map_err(|_| error(crate::error::catalog::ER_OUTOFMEMORY,"quantizer overflow allocation failed"))?;
+            out.extend_from_slice(&page[48..48+len]);
+            let next=read_u64(&page,32);
+            if next>=head && next!=0 {return Err(error(crate::error::catalog::ER_GET_ERRNO,"cyclic quantizer overflow chain"));}
+            head=next;
+        }
+        Ok(out)
+    }
+    pub(crate) fn write_quantization_model(&self, data: &[u8], generation: u64) -> Result<(), QueryError> {
+        let head=self.append_quantization_blob(data)?;
+        {let mut state=self.meta_state.lock();state.meta.quant_model_head=head;state.meta.quant_generation=generation;}
+        self.write_meta_page(0)
+    }
+}

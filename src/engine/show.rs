@@ -2313,7 +2313,11 @@ fn create_table_sql_with_auto_increment(
         // through the parser instead of silently degrading to a plain B-tree
         // key on dump/restore. Non-vector B-tree keys omit USING (MySQL default).
         let using_suffix = if index.is_vector() {
-            format!(" USING {}", index.index_type.to_ascii_uppercase())
+            format!(
+                " USING {}{}",
+                index.index_type.to_ascii_uppercase(),
+                index.vector.as_ref().map(|v| v.sql()).unwrap_or_default()
+            )
         } else {
             String::new()
         };
@@ -4043,13 +4047,25 @@ fn hnsw_status_rows(db: &Database) -> Vec<(String, String)> {
     use crate::storage::naming::normalize_name;
     let runtime = db.vector_index_runtime_stats();
     let mut indexes: Vec<(String, String)> = Vec::new();
-    for table in db.catalog().tables.values() {
+    for header in db.catalog().tables.values() {
+        let table = if header.columns.is_empty() {
+            match db.table(&header.qualified_name()) {
+                Ok(table) => table,
+                Err(_) => continue,
+            }
+        } else {
+            header.clone()
+        };
         for index in table.iter_public_indexes() {
             if !index.is_vector() {
                 continue;
             }
             let meta = index.vector_meta();
             let label = format!("hnsw.{}.{}.{}", table.database, table.name, index.name);
+            let quant = index
+                .vector
+                .as_ref()
+                .map_or("none", |v| v.quantization.name());
             let value = match runtime.get(&(table.id, normalize_name(&index.name))) {
                 Some(st) => {
                     let build = st.last_build_mode.map_or_else(String::new, |mode| {
@@ -4095,6 +4111,7 @@ fn hnsw_status_rows(db: &Database) -> Vec<(String, String)> {
                     meta.metric, meta.m, meta.ef_construction,
                 ),
             };
+            let value=format!("{value} quantization={quant}{}",runtime.get(&(table.id,normalize_name(&index.name))).map(|st|format!(" quantizer_bytes={} compressed_bytes={} exceptions={} candidates={} heap_reranks={} exact_fallbacks={}",st.quantizer_bytes,st.compressed_bytes,st.quantization_exceptions,st.candidates_returned,st.heap_reranks,st.exact_fallbacks)).unwrap_or_default());
             indexes.push((label, value));
         }
     }

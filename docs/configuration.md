@@ -366,11 +366,10 @@ cold-scan policy. At runtime it can be adjusted with
 that start afterwards.
 
 Cold builds of paged HNSW default to `MYDB_HNSW_BULK_MODE=auto`, choosing among
-`full-memory → compact-sq8 → chunked-paged` based on the actual visible row
-count, dimensionality, adjacency capacity, and worker scratch. `compact-sq8`
-keeps only the build-time SQ8 navigation codes and topology; the final exact f32
-vectors are written sequentially from the heap into `.hvec`; it is never
-published as a query graph. The available build controls are:
+`full-memory → chunked-paged` for unquantized FLOAT32 indexes, based on the
+actual visible row count, dimensionality, adjacency capacity, and worker
+scratch. Quantized HNSW shares the parallel topology builder when its temporary
+construction graph is admitted; only compressed payloads survive publication. The available build controls are:
 
 - `MYDB_HNSW_BULK_MODE=auto|memory|chunked`; `stream` is a compatibility alias
   for `chunked`. `memory` forces the full in-memory graph but still may not cross
@@ -651,16 +650,21 @@ progress and cancellation use `information_schema.mydb_ddl_jobs` /
 `CANCEL DDL JOB`. Design and verification background is archived in the
 project's internal engineering records (online-constraints-20260914).
 
-Stable configuration for vector retrieval comes in two layers:
+Vector retrieval separates persisted index configuration from query-time settings:
 
 - `MYDB_VECTOR_STORAGE=memory|paged` selects the HNSW/IVF backend, default
   `paged`;
 - `MYDB_HNSW_*` controls graph building, `ef_search`, iterative scanning,
   candidate caps, and the brute-force scan threshold;
 - `MYDB_IVF_*` controls `nlist`, `nprobe`, k-means training, sampling, and candidate retention;
-- The index COMMENT can store per-index parameters, and the query hints
-  `HNSW_EF` / `IVF_NPROBE` provide single-statement overrides; see
-  [`hints.md`](hints.md) for the detailed precedence.
+- `USING HNSW|IVF WITH (...)` stores validated index configuration independently
+  from COMMENT. Build defaults are captured when the index is created.
+  `quantization=none` is the default; `sq8`, `sq4`, `pq`, and `bq` are explicit
+  per-index choices. `MYDB_HNSW_QUANTIZE` has been removed and causes a startup
+  error. See [vector indexes](vector-indexes.md) for parameters and limitations.
+- Query hints `HNSW_EF` / `IVF_NPROBE` override explicitly set session values,
+  which override index defaults. Explicit `mydb_hnsw_rerank_mult` /
+  `mydb_ivf_rerank_mult` session values override the index `rerank_mult`.
 
 Zone Map is an optional skip-scan structure enabled by default for persistent
 user tables; temporary and system tables do not enable it. Table creation or

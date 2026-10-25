@@ -448,7 +448,7 @@ fn dot_index_supports_pgvector_and_max_inner_product_ordering() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(2) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_dot ON items(emb) USING HNSW COMMENT 'METRIC=DOT'")
+        .execute("CREATE INDEX idx_dot ON items(emb) USING HNSW WITH (metric=dot)")
         .unwrap();
     engine
         .execute(
@@ -681,7 +681,7 @@ fn hnsw_inline_index_with_cosine_metric() {
     engine
         .execute(
             "CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(2) NOT NULL, \
-             INDEX idx_emb (emb) USING HNSW COMMENT 'DISTANCE=COSINE')",
+             INDEX idx_emb (emb) USING HNSW WITH (metric=cosine))",
         )
         .unwrap();
     // Vectors at distinct angles; cosine ranks by direction, not magnitude.
@@ -2911,7 +2911,7 @@ fn paged_hnsw_missing_stats_after_restart_uses_physical_row_estimate() {
             .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(6) NOT NULL)")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW COMMENT 'EF_SEARCH=1'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (ef_search=1)")
             .unwrap();
         // The fixture stays well beyond the configured non-zero brute
         // crossover, proving physical page estimates keep the index eligible.
@@ -2975,7 +2975,7 @@ fn ivf_corrupt_native_file_rebuilds_from_heap() {
             .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(8) NOT NULL)")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=8'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=8)")
             .unwrap();
         bulk_insert_vectors(&engine, &vectors);
         // Build + finalize the paged `.hvec` (first query).
@@ -3040,7 +3040,7 @@ fn paged_ivf_rebuilds_after_restart() {
             .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(16) NOT NULL)")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=12'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=12)")
             .unwrap();
         bulk_insert_vectors(&engine, &vectors);
         // Build the paged inverted file (first query) before restart.
@@ -3134,7 +3134,7 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
     engine
         .execute(
             "CREATE INDEX idx_emb ON items(emb) USING HNSW \
-             COMMENT 'DISTANCE=COSINE M=24 EF_CONSTRUCTION=120 EF_SEARCH=80'",
+             WITH (metric=cosine, m=24, ef_construction=120, ef_search=80)",
         )
         .unwrap();
 
@@ -3205,7 +3205,7 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
 }
 
 #[test]
-fn vector_comment_validation_show_create_roundtrip_and_json_explain() {
+fn vector_with_validation_show_create_roundtrip_and_json_explain() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
@@ -3221,13 +3221,13 @@ fn vector_comment_validation_show_create_roundtrip_and_json_explain() {
         .execute_with_session(
             &mut session,
             "CREATE INDEX idx_emb ON items(emb) USING HNSW \
-             COMMENT 'METRIC=COSINE M=20 EF_CONSTRUCTION=96 EF_SEARCH=48 FUTURE_OPT=1'",
+             WITH (metric=cosine, m=20, ef_construction=96, ef_search=48) COMMENT 'FUTURE_OPT=1'",
         )
         .unwrap();
-    assert!(session.warnings.iter().any(|w| w.code() == 1287));
+    assert!(session.warnings.is_empty());
     let create = rows(&engine, "SHOW CREATE TABLE items")[0][1].to_display_string();
     assert!(create.contains("USING HNSW"), "{create}");
-    assert!(create.contains("METRIC=COSINE"), "{create}");
+    assert!(create.contains("metric=cosine"), "{create}");
     // Recreate from SHOW CREATE and verify parsed parameters survive.
     let copy = create.replacen("`items`", "`items_copy`", 1);
     engine.execute(&copy).unwrap();
@@ -3435,7 +3435,7 @@ fn cosine_index_rejects_zero_rows_and_zero_knn_query() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW COMMENT 'DISTANCE=COSINE'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
 
     let err = engine
@@ -3503,7 +3503,7 @@ fn hnsw_metric_mismatch_warns_1287() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW COMMENT 'DISTANCE=COSINE'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
     for i in 0..8 {
         engine
@@ -3578,7 +3578,7 @@ fn per_index_default_ef_search_drives_plan() {
     engine
         .execute(
             "CREATE INDEX idx_emb ON items(emb) USING HNSW \
-             COMMENT 'DISTANCE=L2 EF_SEARCH=200'",
+             WITH (metric=l2, ef_search=200)",
         )
         .unwrap();
     for i in 0..20 {
@@ -3988,7 +3988,7 @@ fn ivf_knn_matches_bruteforce_full_probe() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(6) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'METRIC=L2 NLIST=5'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (metric=l2, nlist=5)")
         .unwrap();
 
     // Small n so a generous nprobe makes the candidate pool cover every row —
@@ -4028,7 +4028,7 @@ fn ivf_explain_shows_algo_and_nprobe() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=4 NPROBE=3'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=4, nprobe=3)")
         .unwrap();
     for i in 0..40 {
         let v = gen_vectors(1, 4, 0x100 + i as u64)[0].clone();
@@ -4070,10 +4070,10 @@ fn knn_planner_enumerates_same_column_vector_indexes_and_honors_algorithm_hint()
     // The first catalog index deliberately has the wrong metric; the old
     // first-index-only planner missed the later compatible IVF index.
     engine
-        .execute("CREATE INDEX idx_cos ON items(emb) USING HNSW COMMENT 'METRIC=COSINE'")
+        .execute("CREATE INDEX idx_cos ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_l2 ON items(emb) USING IVF COMMENT 'METRIC=L2 NLIST=4'")
+        .execute("CREATE INDEX idx_l2 ON items(emb) USING IVF WITH (metric=l2, nlist=4)")
         .unwrap();
     let explain = rows(
         &engine,
@@ -4096,7 +4096,7 @@ fn ivf_show_create_round_trips() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'METRIC=COSINE NLIST=16'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (metric=cosine, nlist=16)")
         .unwrap();
     let show =
         |e: &StorageQueryEngine| rows(e, "SHOW CREATE TABLE items")[0][1].to_display_string();
@@ -4123,7 +4123,7 @@ fn ivf_insert_and_delete_visible() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=4'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=4)")
         .unwrap();
     for i in 0..40 {
         let v = gen_vectors(1, 4, 0x900 + i as u64)[0].clone();
@@ -4200,7 +4200,7 @@ fn ivf_update_moves_vector_in_knn() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=4'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=4)")
         .unwrap();
     for i in 0..40 {
         let v = gen_vectors(1, 4, 0xA00 + i as u64)[0].clone();
@@ -4241,7 +4241,7 @@ fn ivf_transaction_delta_is_read_your_writes_and_rollback_safe() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=3 NPROBE=3'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=3, nprobe=3)")
         .unwrap();
     engine
         .execute("INSERT INTO items VALUES (1,'[1,0,0]'),(2,'[2,0,0]'),(3,'[3,0,0]')")
@@ -4338,7 +4338,7 @@ fn ivf_optimize_retrains_and_stays_correct() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(5) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=6'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=6)")
         .unwrap();
     let n = 60;
     let mut vectors = gen_vectors(n, 5, 0xB0B0_1234);
@@ -4394,7 +4394,7 @@ fn ivf_information_schema_reports_algo_and_nlist() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=5'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=5)")
         .unwrap();
     let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
     // ALGO is available even when cold.
@@ -4549,7 +4549,7 @@ fn ivf_physical_replica_reopens_invalidated_warm_graph() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=3'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=3)")
         .unwrap();
     engine
         .execute("INSERT INTO items VALUES (1,'[1,0,0]'),(2,'[2,0,0]')")
@@ -4590,7 +4590,7 @@ fn ivf_replica_wal_dml_refreshes_warm_directory() {
             .execute("INSERT INTO items VALUES (1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF COMMENT 'NLIST=2'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=2)")
             .unwrap();
     }
     copy_tree(source.path(), target.path());
@@ -5494,6 +5494,6 @@ fn vector_indexes_reject_retired_algorithm_in_all_ddl_forms() {
         0
     );
     engine
-        .execute("CREATE INDEX native ON retired_algorithm(v) USING IVF COMMENT 'NLIST=1'")
+        .execute("CREATE INDEX native ON retired_algorithm(v) USING IVF WITH (nlist=1)")
         .unwrap();
 }

@@ -996,6 +996,18 @@ pub(crate) fn register(reg: &mut Registry) {
         1_000,
     );
 
+    register_session_uint64(
+        reg,
+        "mydb_hnsw_rerank_mult",
+        |s| s.sysvars.mydb_hnsw_rerank_mult,
+        |s, n| {
+            s.sysvars.mydb_hnsw_rerank_mult = n.clamp(1, 1024);
+            s.sysvars.mydb_hnsw_rerank_mult_explicit = true;
+        },
+        "HNSW exact heap-rerank candidate multiplier vs LIMIT k.",
+        4,
+    );
+
     // IVF query-time knob: number of inverted-file cells probed per KNN
     // query (the IVF analogue of HNSW `ef_search`). pgvector-style dot-form
     // alias `ivf.nprobe` for muscle memory / tooling parity.
@@ -1015,7 +1027,10 @@ pub(crate) fn register(reg: &mut Registry) {
         reg,
         "mydb_ivf_rerank_mult",
         |s| s.sysvars.mydb_ivf_rerank_mult,
-        |s, n| s.sysvars.mydb_ivf_rerank_mult = n.max(1),
+        |s, n| {
+            s.sysvars.mydb_ivf_rerank_mult = n.clamp(1, 1024);
+            s.sysvars.mydb_ivf_rerank_mult_explicit = true;
+        },
         "IVF exact heap-rerank candidate multiplier vs LIMIT k.",
         4,
     );

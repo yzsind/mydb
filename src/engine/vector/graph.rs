@@ -121,6 +121,13 @@ pub(crate) struct VectorIndexRuntimeStats {
     pub last_build_cache_hits: u64,
     pub last_build_cache_misses: u64,
     pub last_build_chunks: u64,
+    pub quantization_pending: bool,
+    pub quantizer_bytes: u64,
+    pub compressed_bytes: u64,
+    pub quantization_exceptions: u64,
+    pub candidates_returned: u64,
+    pub heap_reranks: u64,
+    pub exact_fallbacks: u64,
 }
 
 impl VectorIndexRuntimeStats {
@@ -136,6 +143,17 @@ impl VectorIndexRuntimeStats {
         self.last_persisted_lsn = self.last_persisted_lsn.max(graph.last_persisted_lsn());
         self.backend = graph.backend_name();
         if let VectorGraph::NativeHnsw(hnsw) = graph {
+            let (model, codes, exceptions) = hnsw.quantization_stats();
+            self.quantization_pending |= hnsw.quantization_pending();
+            self.quantizer_bytes += model as u64;
+            self.compressed_bytes += codes as u64;
+            self.quantization_exceptions += exceptions as u64;
+            let (generation, candidates, heap, fallbacks) = hnsw.query_stats();
+            self.generation = self.generation.max(generation);
+            self.candidates_returned += candidates;
+            self.heap_reranks += heap;
+            self.exact_fallbacks += fallbacks;
+
             if let Some(file) = hnsw.file() {
                 self.paged_file_size_bytes += file.file_size_bytes();
                 self.tombstones_on_disk += hnsw.stale_count() as u64;
@@ -143,6 +161,17 @@ impl VectorIndexRuntimeStats {
             }
         }
         if let VectorGraph::NativeIvf(ivf) = graph {
+            let (model, codes, exceptions) = ivf.quantization_stats();
+            self.quantization_pending |= ivf.quantization_pending();
+            self.quantizer_bytes += model as u64;
+            self.compressed_bytes += codes as u64;
+            self.quantization_exceptions += exceptions as u64;
+            let (generation, candidates, heap, fallbacks) = ivf.query_stats();
+            self.generation = self.generation.max(generation);
+            self.candidates_returned += candidates;
+            self.heap_reranks += heap;
+            self.exact_fallbacks += fallbacks;
+
             self.nlist = self.nlist.max(ivf.nlist() as u64);
             if let Some(file) = ivf.file() {
                 self.paged_file_size_bytes += file.file_size_bytes();
@@ -212,7 +241,21 @@ impl VectorGraph {
         }
     }
 
-    fn ensure_valid(&self) -> Result<(), QueryError> {
+    pub(crate) fn quantization_pending(&self) -> bool {
+        match self {
+            Self::NativeHnsw(g) => g.quantization_pending(),
+            Self::NativeIvf(g) => g.quantization_pending(),
+            _ => false,
+        }
+    }
+    pub(crate) fn record_query_stats(&self, candidates: u64, heap: u64, fallback: bool) {
+        match self {
+            Self::NativeHnsw(g) => g.record_query_stats(candidates, heap, fallback),
+            Self::NativeIvf(g) => g.record_query_stats(candidates, heap, fallback),
+            _ => {}
+        }
+    }
+    pub(crate) fn ensure_valid(&self) -> Result<(), QueryError> {
         let valid = match self {
             Self::NativeHnsw(g) => g.is_valid(),
             Self::NativeIvf(g) => g.is_valid(),

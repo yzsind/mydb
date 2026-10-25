@@ -198,7 +198,7 @@ fn finite_extremes_have_valid_distances_and_index_ordering() {
         );
         assert_eq!(id_list(&engine,"SELECT /*+ HNSW_EF(18446744073709551615) */ id FROM items ORDER BY DISTANCE(emb,'[0,0]') LIMIT 1"),[3]);
         engine
-            .execute("CREATE INDEX hd ON items(emb) USING HNSW COMMENT 'METRIC=DOT'")
+            .execute("CREATE INDEX hd ON items(emb) USING HNSW WITH (metric=dot)")
             .unwrap();
         assert_eq!(
             id_list(
@@ -210,7 +210,7 @@ fn finite_extremes_have_valid_distances_and_index_ordering() {
         for sql in [
             "CREATE TABLE directions(id INT PRIMARY KEY,emb VECTOR(2) NOT NULL)",
             "INSERT INTO directions VALUES(1,'[1e30,0]'),(2,'[0,1e-30]'),(3,'[-1e30,0]')",
-            "CREATE INDEX hc ON directions(emb) USING HNSW COMMENT 'METRIC=COSINE'",
+            "CREATE INDEX hc ON directions(emb) USING HNSW WITH (metric=cosine)",
         ] {
             engine.execute(sql).unwrap();
         }

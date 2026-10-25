@@ -2735,6 +2735,7 @@ fn create_index_schema_from_parts(
     visible: bool,
     comment: String,
     fulltext_parser: String,
+    vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
     defer_expressions: bool,
 ) -> Result<IndexSchema, QueryError> {
     let column_directions: Vec<crate::storage::IndexColumnDirection> = column_descending
@@ -2832,6 +2833,11 @@ fn create_index_schema_from_parts(
         crate::storage::fulltext::snapshot_tokenizer_config_into(&mut meta);
         meta
     });
+    let vector = crate::storage::vector_config::VectorIndexConfig::from_options(
+        &index_type,
+        vector_options.as_ref(),
+        &comment,
+    )?;
     Ok(IndexSchema {
         readable_from_scn: 0,
         index_id: 0,
@@ -2847,6 +2853,7 @@ fn create_index_schema_from_parts(
         index_type,
         visible,
         comment,
+        vector,
         fulltext,
     })
 }
@@ -2878,6 +2885,7 @@ fn execute_create_temp_index(
         visible,
         comment,
         fulltext_parser,
+        vector_options,
         ..
     } = stmt;
     let index = create_index_schema_from_parts(
@@ -2896,6 +2904,7 @@ fn execute_create_temp_index(
         visible,
         comment,
         fulltext_parser,
+        vector_options,
         false,
     )
     .map_err(|err| {
@@ -3010,6 +3019,7 @@ fn execute_temp_alter_table(
                         index.visible,
                         index.comment,
                         index.fulltext_parser,
+                        index.vector_options,
                         false,
                     )?;
                     db.add_temp_index(&temp.internal_key, index_schema)?;
@@ -7843,6 +7853,7 @@ pub(super) fn execute_qualified_statement(
                                 index.visible,
                                 index.comment.clone(),
                                 index.fulltext_parser.clone(),
+                                index.vector_options.clone(),
                                 false,
                             )?;
                             db.validate_add_index_existing_rows(&table_name, &schema)?;
@@ -7903,6 +7914,7 @@ pub(super) fn execute_qualified_statement(
                         index.visible,
                         index.comment.clone(),
                         index.fulltext_parser.clone(),
+                        index.vector_options.clone(),
                         true,
                     )?);
                 }
@@ -7993,6 +8005,11 @@ pub(super) fn execute_qualified_statement(
                         primary,
                         included_columns: index.included_columns,
                         state: crate::storage::IndexState::Public,
+                        vector: crate::storage::vector_config::VectorIndexConfig::from_options(
+                            &index.index_type,
+                            index.vector_options.as_ref(),
+                            &index.comment,
+                        )?,
                         index_type: index.index_type,
                         visible: index.visible,
                         comment: index.comment,
@@ -8181,7 +8198,8 @@ pub(super) fn execute_qualified_statement(
                                         primary,
                                         included_columns: index.included_columns,
                                         state: crate::storage::IndexState::Public,
-                                        index_type: index.index_type,
+                                        vector: crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, index.vector_options.as_ref(), &index.comment)?,
+                        index_type: index.index_type,
                                         visible: index.visible,
                                         comment: index.comment,
                                         fulltext,
@@ -8593,6 +8611,7 @@ pub(super) fn execute_qualified_statement(
                 visible,
                 comment,
                 fulltext_parser,
+                vector_options,
                 query_hints,
                 hint_warnings: _,
             } = stmt;
@@ -8641,6 +8660,11 @@ pub(super) fn execute_qualified_statement(
                     primary: false,
                     included_columns,
                     state: crate::storage::IndexState::Public,
+                    vector: crate::storage::vector_config::VectorIndexConfig::from_options(
+                        &index_type,
+                        vector_options.as_ref(),
+                        &comment,
+                    )?,
                     index_type,
                     visible,
                     comment,

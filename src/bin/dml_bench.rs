@@ -292,6 +292,7 @@ fn sec_index(name: &str, cols: &[&str]) -> IndexDef {
         visible: true,
         comment: String::new(),
         fulltext_parser: String::new(),
+        vector_options: None,
     }
 }
 

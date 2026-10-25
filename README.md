@@ -229,7 +229,7 @@ INSERT INTO agent_notes VALUES
 RETURNING id;
 
 CREATE INDEX idx_agent_notes_embedding ON agent_notes (embedding)
-USING HNSW COMMENT 'METRIC=L2';
+USING HNSW WITH (metric=l2);
 
 SELECT id, content,
        L2_DISTANCE(embedding, STRING_TO_VECTOR('[1,0,0]')) AS distance

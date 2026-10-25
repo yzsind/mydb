@@ -282,7 +282,7 @@ fn dml_in_lookup_vector_delete_commit_rollback_and_restart() {
             .execute("INSERT INTO t VALUES (1,'[1,0,0]'),(2,'[2,0,0]'),(3,'[3,0,0]'),(4,'[4,0,0]')")
             .unwrap();
         let options = if algorithm == "IVF" {
-            " COMMENT 'NLIST=2 NPROBE=2'"
+            " WITH (nlist=2, nprobe=2)"
         } else {
             ""
         };

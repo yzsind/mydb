@@ -332,11 +332,7 @@ fn hnsw_end_to_end_bench() {
         "[vb] load                             {:.2}s",
         t.elapsed().as_secs_f64()
     );
-    let metric = if cosine {
-        " COMMENT 'DISTANCE=COSINE'"
-    } else {
-        ""
-    };
+    let metric = if cosine { " WITH (metric=cosine)" } else { "" };
     let t = Instant::now();
     engine
         .execute(&format!(
@@ -855,19 +851,19 @@ fn vector_datatypes_end_to_end_bench() {
     let start = Instant::now();
     let options = if algo == "HNSW" {
         format!(
-            "M=16 EF_CONSTRUCTION={}",
+            "m=16, ef_construction={}",
             env_or("VDB_EF_CONSTRUCTION", 200usize)
         )
     } else {
         format!(
-            "NLIST={} KMEANS_ITERS={}",
+            "nlist={}, kmeans_iters={}",
             env_or("VDB_NLIST", 128usize),
             env_or("VDB_TRAIN_ITERS", 8usize)
         )
     };
     engine
         .execute(&format!(
-            "CREATE INDEX vx ON items(v) USING {algo} COMMENT 'METRIC={} {options}'",
+            "CREATE INDEX vx ON items(v) USING {algo} WITH (metric={}, {options})",
             metric.as_str()
         ))
         .unwrap();

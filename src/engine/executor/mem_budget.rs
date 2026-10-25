@@ -967,10 +967,15 @@ impl ControlledMemoryCharge {
     }
 
     pub(crate) fn try_grow(&mut self, extra: usize) -> Result<(), QueryError> {
+        self.try_grow_recoverable(extra).map_err(terminal_oom)
+    }
+
+    /// Derived indexes may release failed accelerator state and execute an exact scan.
+    pub(crate) fn try_grow_recoverable(&mut self, extra: usize) -> Result<(), QueryError> {
         if extra == 0 {
             return Ok(());
         }
-        charge_controlled(self.category, extra).map_err(terminal_oom)?;
+        charge_controlled(self.category, extra)?;
         self.bytes = self.bytes.saturating_add(extra);
         Ok(())
     }

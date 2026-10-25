@@ -18,6 +18,7 @@ pub(super) enum Extension {
     ReturningTarget(String),
     IndexInclude(usize),
     IndexVisibility,
+    VectorOptions(usize),
 }
 
 #[derive(Default)]

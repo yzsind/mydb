@@ -314,6 +314,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
                 // The FULLTEXT keyword is stripped in [`strip_create_index_fulltext`];
                 // here we convert as a plain index first; the parser name is injected later by [`apply_fulltext_parsers`].
                 fulltext_parser: String::new(),
+                vector_options: None,
             }))
         }
         SqlStatement::Analyze(analyze) => convert_analyze(sql, analyze),
@@ -1169,6 +1170,7 @@ fn convert_create_table(
                 visible: true,
                 comment: String::new(),
                 fulltext_parser: String::new(),
+                vector_options: None,
             });
         }
         columns.push(column);
@@ -1219,6 +1221,7 @@ fn convert_create_table(
                         visible: true,
                         comment,
                         fulltext_parser: String::new(),
+                        vector_options: None,
                     });
                 } else {
                     primary_key = columns.names;
@@ -1257,6 +1260,7 @@ fn convert_create_table(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::Index(constraint) => {
@@ -1286,6 +1290,7 @@ fn convert_create_table(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::Check(constraint) => {
@@ -1316,6 +1321,7 @@ fn convert_create_table(
                     visible: true,
                     comment: String::new(),
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::FulltextOrSpatial(constraint) => {
@@ -1345,6 +1351,7 @@ fn convert_create_table(
                     visible: true,
                     comment: String::new(),
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::ForeignKey(fk) => {
@@ -1605,6 +1612,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             }
             TableConstraint::PrimaryKey(constraint) => {
@@ -1640,6 +1648,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             }
             TableConstraint::Index(constraint) => {
@@ -1661,6 +1670,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             }
             TableConstraint::Check(constraint) => {
@@ -1715,6 +1725,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment: String::new(),
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             } // NB: `TableConstraint` is matched exhaustively — a new
               // sqlparser variant will surface as a compile error here rather

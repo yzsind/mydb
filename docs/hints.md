@@ -555,7 +555,7 @@ The precedence of the base value is:
 1. `HNSW_EF(n)`;
 2. the session `mydb_hnsw_ef_search` when explicitly set away from the
    built-in default;
-3. `EF_SEARCH=` in the index COMMENT;
+3. `ef_search` in the index WITH options;
 4. the built-in default of 64.
 
 An explicit `HNSW_EF(n)` also skips the "small table / low filtered row
@@ -598,7 +598,7 @@ recall and higher scan cost. The precedence is:
 
 1. `IVF_NPROBE(n)`;
 2. the session `mydb_ivf_nprobe` when explicitly set;
-3. `NPROBE=` in the index COMMENT;
+3. `nprobe` in the index WITH options;
 4. the built-in default of 8.
 
 This hint affects IVF only; HNSW remains controlled by `HNSW_EF`.

@@ -769,6 +769,18 @@ pub(crate) fn convert_value(
     Ok(VectorValue::new(datatype, value.dimension, payload))
 }
 
+/// Recreate a native build row from the lossless FLOAT32 construction buffer.
+pub(crate) fn from_build_f32(
+    values: &[f32],
+    datatype: VectorDataType,
+) -> Result<VectorValue, QueryError> {
+    let mut payload = Vec::with_capacity(datatype.payload_len(values.len() as u32));
+    for (i, &v) in values.iter().enumerate() {
+        append_number(&mut payload, i as u32, datatype, v as f64)?;
+    }
+    Ok(VectorValue::new(datatype, values.len() as u32, payload))
+}
+
 pub(crate) fn coerce_value(
     value: crate::types::Value,
     datatype: VectorDataType,

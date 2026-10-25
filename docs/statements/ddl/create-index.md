@@ -14,15 +14,17 @@ Creates the supported forms of regular, unique, full-text, spatial, functional, 
                    'ON' <qualified-name>
                    '(' <index-key> { ',' <index-key> } ')'
                    [ 'INCLUDE' '(' <identifier-list> ')' ]
-                   [ 'VISIBLE' | 'INVISIBLE' ]
+                   [ 'USING' ( 'BTREE' | 'HASH' | 'HNSW' | 'IVF' ) ]
+                   [ 'WITH' '(' <name> '=' <value> { ',' <name> '=' <value> } ')' ]
                    { <index-option> }
+                   [ 'VISIBLE' | 'INVISIBLE' ]
                    [ 'ALGORITHM' [ '=' ] ( 'DEFAULT' | 'INPLACE' ) ]
                    [ 'LOCK' [ '=' ] ( 'DEFAULT' | 'NONE' | 'SHARED' | 'EXCLUSIVE' ) ]
 ```
 
 ## Behavior and Limitations
 
-- Vector indexes use `CREATE INDEX name ON table_name(vector_column) USING HNSW` or `USING IVF`; metric and build/search parameters go in the index COMMENT. See [vector index configuration](../../configuration.md).
+- Vector indexes use `CREATE INDEX name ON table_name(vector_column) USING HNSW` or `USING IVF`; metric, build/search parameters, and quantization use `WITH (...)`, immediately after `USING`. The same options apply to inline `CREATE TABLE` indexes and `ALTER TABLE ... ADD INDEX`. COMMENT is descriptive text. See [vector indexes](../../vector-indexes.md).
 - Regular/unique indexes are persisted as B-trees; if the HASH name is only a compatibility hint, it is mapped to the implementation and produces a diagnostic.
 - FULLTEXT, SPATIAL, and HNSW/IVF only accept the column types and options implemented by their respective modules.
 - Regular and unique BTREE secondary indexes are built online by default; setting `MYDB_DDL_ASYNC` is not required. Prepare and publish briefly exclude writers while allowing readers; `INSERT`, `UPDATE`, and `DELETE` are allowed during the scan, sort, bulk-load, and main incremental catch-up phases.

@@ -24,6 +24,7 @@ use std::{
 
 #[derive(Debug)]
 struct Node {
+    exception: bool,
     row: RowId,
     group: usize,
     level: usize,
@@ -31,7 +32,6 @@ struct Node {
     vid: u64,
     value: Option<VectorValue>,
     links: Vec<Vec<usize>>,
-    code: Option<Vec<i8>>,
 }
 #[derive(Debug)]
 struct NativeCsr {
@@ -49,6 +49,8 @@ struct NavigationGroup {
 }
 #[derive(Debug)]
 struct State {
+    exceptions: usize,
+    incremental_exceptions: usize,
     nodes: Vec<Node>,
     groups: Vec<NavigationGroup>,
     group_heads: HashMap<u64, usize>,
@@ -56,7 +58,6 @@ struct State {
     by_vid: HashMap<u64, usize>,
     entry: Option<usize>,
     charge: ControlledMemoryCharge,
-    quant: Option<super::native_quant::NativeQuant>,
     csr: Option<NativeCsr>,
 }
 #[derive(Debug)]
@@ -70,6 +71,13 @@ pub(crate) struct NativeHnsw {
     state: RwLock<State>,
     valid: AtomicBool,
     pending: Mutex<HashSet<u64>>,
+    quantizer: Option<Arc<super::quantization::Quantizer>>,
+    quantization_requested: bool,
+    retrain: AtomicBool,
+    generation: u64,
+    candidates_returned: std::sync::atomic::AtomicU64,
+    heap_reranks: std::sync::atomic::AtomicU64,
+    exact_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 impl NativeHnsw {
@@ -89,22 +97,152 @@ impl NativeHnsw {
             ef_construction,
             file,
             state: RwLock::new(State {
+                exceptions: 0,
+                incremental_exceptions: 0,
                 nodes: Vec::new(),
                 groups: Vec::new(),
                 group_heads: HashMap::new(),
                 rows: HashMap::new(),
                 by_vid: HashMap::new(),
                 entry: None,
-                quant: None,
                 csr: None,
-                charge: ControlledMemoryCharge::try_new(
+                charge: ControlledMemoryCharge::try_new_recoverable(
                     ControlledMemoryCategory::StorageScratch,
                     0,
                 )?,
             }),
             valid: AtomicBool::new(true),
             pending: Mutex::new(HashSet::new()),
+            quantizer: None,
+            quantization_requested: false,
+            retrain: AtomicBool::new(false),
+            generation: 0,
+            candidates_returned: std::sync::atomic::AtomicU64::new(0),
+            heap_reranks: std::sync::atomic::AtomicU64::new(0),
+            exact_fallbacks: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+    pub(crate) fn set_quantizer(
+        &mut self,
+        requested: bool,
+        quantizer: Option<Arc<super::quantization::Quantizer>>,
+        generation: u64,
+    ) {
+        self.quantization_requested = requested;
+        self.generation = if quantizer.is_some() { generation } else { 0 };
+        self.quantizer = quantizer;
+    }
+    pub(crate) fn query_stats(&self) -> (u64, u64, u64, u64) {
+        (
+            self.generation,
+            self.candidates_returned.load(Ordering::Relaxed),
+            self.heap_reranks.load(Ordering::Relaxed),
+            self.exact_fallbacks.load(Ordering::Relaxed),
+        )
+    }
+    pub(crate) fn record_query_stats(&self, candidates: u64, heap: u64, fallback: bool) {
+        if !self.quantization_requested {
+            return;
+        }
+        self.candidates_returned
+            .fetch_add(candidates, Ordering::Relaxed);
+        self.heap_reranks.fetch_add(heap, Ordering::Relaxed);
+        self.exact_fallbacks
+            .fetch_add(u64::from(fallback), Ordering::Relaxed);
+    }
+    pub(crate) fn quantization_pending(&self) -> bool {
+        self.quantization_requested && self.quantizer.is_none()
+    }
+    pub(crate) fn quantization_stats(&self) -> (usize, usize, usize) {
+        let state = self.state.read();
+        (
+            self.quantizer.as_ref().map_or(0, |q| q.bytes()),
+            self.quantizer
+                .as_ref()
+                .map_or(0, |q| q.record_len() * state.nodes.len()),
+            state.exceptions,
+        )
+    }
+    /// Transcribe an admitted parallel construction graph, retaining only compressed payloads.
+    pub(crate) fn import_build_topology(
+        &self,
+        topology: &super::hnsw::HnswIndex,
+    ) -> Result<(), QueryError> {
+        let q = self
+            .quantizer
+            .as_ref()
+            .ok_or_else(|| codec::vector_err("compressed builder requires a trained model"))?;
+        let mut state = self.state.write();
+        let mut vector = Vec::new();
+        let mut links = Vec::new();
+        for id in 0..topology.build_node_count() {
+            crate::engine::cancel::check_cancelled()?;
+            let row = topology.copy_build_node_into(id, &mut vector, &mut links);
+            let value = q.store(
+                &codec::from_build_f32(&vector, self.datatype)?,
+                self.file.as_ref(),
+            )?;
+            let level = links.len().saturating_sub(1);
+            state.charge.try_grow_recoverable(
+                704 + if self.file.is_none() {
+                    value.len() + (level + 1) * (self.m * 2 * 8 + 24)
+                } else {
+                    0
+                },
+            )?;
+            let vid = if let Some(file) = &self.file {
+                file.append_native_node(0, row, level, &value.payload)?
+            } else {
+                id as u64
+            };
+            let exception = value.payload[0] == 1;
+            if exception {
+                state.exceptions += 1;
+            }
+            state.nodes.push(Node {
+                exception,
+                row,
+                group: id,
+                level,
+                deleted: false,
+                vid,
+                value: if self.file.is_none() {
+                    Some(value)
+                } else {
+                    None
+                },
+                links: if self.file.is_none() {
+                    vec![Vec::new(); level + 1]
+                } else {
+                    Vec::new()
+                },
+            });
+            state.groups.push(NavigationGroup {
+                representative: id,
+                members: vec![id],
+                next_collision: None,
+            });
+            state.rows.insert(row, id);
+            state.by_vid.insert(vid, id);
+        }
+        for id in 0..topology.build_node_count() {
+            topology.copy_build_links_into(id, &mut links);
+            for (level, neighbors) in links.iter().enumerate() {
+                self.set_links(
+                    &mut state,
+                    id,
+                    level,
+                    neighbors.iter().map(|&n| n as usize).collect(),
+                )?;
+            }
+        }
+        if let Some((entry, level)) = topology.build_entry() {
+            state.entry = Some(entry as usize);
+            if let Some(file) = &self.file {
+                file.set_entry(0, state.nodes[entry as usize].vid, level as u32)?;
+            }
+        }
+        Ok(())
     }
     pub(crate) fn replace_file(&mut self, file: Arc<VectorIndexFile>) {
         self.file = Some(file);
@@ -120,6 +258,7 @@ impl NativeHnsw {
     }
     pub(crate) fn is_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
+            && (self.quantizer.is_none() || !self.retrain.load(Ordering::Acquire))
     }
     pub(crate) fn dim(&self) -> usize {
         self.dimension as usize
@@ -160,7 +299,6 @@ impl NativeHnsw {
         Ok(())
     }
     pub(crate) fn prepare_navigation(&self) -> Result<(), QueryError> {
-        use super::native_quant::NativeQuant;
         if let Some(file) = &self.file {
             if file.prepare_navigation_mapping()? {
                 if self.state.read().csr.is_some() {
@@ -170,40 +308,6 @@ impl NativeHnsw {
                 self.prepare_csr()?;
             }
         }
-        if !matches!(
-            self.datatype,
-            VectorDataType::Float16 | VectorDataType::BFloat16
-        ) || self.metric == Metric::Dot
-            || !hnsw_core::quant_enabled_uncached()
-        {
-            return Ok(());
-        }
-        if self.state.read().quant.is_some() {
-            return Ok(());
-        }
-        let mut state = self.state.write();
-        if state.quant.is_some() || state.nodes.is_empty() {
-            return Ok(());
-        }
-        let bytes = state.groups.len().saturating_mul(self.dimension as usize);
-        if !state.charge.try_grow_optional(bytes) {
-            return Ok(());
-        }
-        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
-        for group in &state.groups {
-            let value = self.value(&state, group.representative)?;
-            NativeQuant::observe(&value, self.metric, &mut low, &mut high);
-        }
-        let Some(quant) = NativeQuant::bounds(low, high, self.metric) else {
-            state.charge.shrink(bytes);
-            return Ok(());
-        };
-        for group in 0..state.groups.len() {
-            let id = state.groups[group].representative;
-            let value = self.value(&state, id)?;
-            state.nodes[id].code = quant.encode(&value);
-        }
-        state.quant = Some(quant);
         Ok(())
     }
     fn prepare_csr(&self) -> Result<(), QueryError> {
@@ -270,20 +374,28 @@ impl NativeHnsw {
         state: &State,
         id: usize,
         query: &VectorValue,
-        query_code: Option<&[i8]>,
+        query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<f64, QueryError> {
-        if let (Some(query), Some(code), Some(quant)) =
-            (query_code, state.nodes[id].code.as_deref(), state.quant)
-        {
-            return Ok(quant.score(query, code));
+        if let Some(quant) = &self.quantizer {
+            let node = &state.nodes[id];
+            if let Some(value) = &node.value {
+                return quant.score_payload(&value.payload, self.file.as_ref(), query, query_code);
+            }
+            return self
+                .file
+                .as_ref()
+                .unwrap()
+                .with_native_vector(node.vid, |value| {
+                    quant.score_payload(value.payload, self.file.as_ref(), query, query_code)
+                });
         }
         self.score(state, id, query)
     }
     fn score(&self, state: &State, id: usize, query: &VectorValue) -> Result<f64, QueryError> {
-        let node = state
-            .nodes
-            .get(id)
-            .ok_or_else(|| codec::vector_err("invalid native HNSW neighbor"))?;
+        if self.quantizer.is_some() {
+            return self.navigation_score(state, id, query, None);
+        }
+        let node = &state.nodes[id];
         match (&node.value, &self.file) {
             (Some(value), _) => typed_ordering_distance(query, value, self.metric),
             (_, Some(file)) => file.with_native_vector(node.vid, |value| {
@@ -292,8 +404,41 @@ impl NativeHnsw {
             _ => Err(codec::vector_err("missing native HNSW payload")),
         }
     }
+    fn node_probe(
+        &self,
+        state: &State,
+        id: usize,
+    ) -> Result<(VectorValue, Option<super::quantization::QuantQuery>), QueryError> {
+        let Some(q) = &self.quantizer else {
+            return Ok((self.value(state, id)?, None));
+        };
+        let node = &state.nodes[id];
+        let prepared = if let Some(value) = &node.value {
+            q.prepare_payload(&value.payload, self.file.as_ref())?
+        } else {
+            self.file
+                .as_ref()
+                .unwrap()
+                .with_native_vector(node.vid, |value| {
+                    q.prepare_payload(value.payload, self.file.as_ref())
+                })?
+        };
+        Ok((VectorValue::default(), Some(prepared)))
+    }
     fn value(&self, state: &State, id: usize) -> Result<VectorValue, QueryError> {
         let node = &state.nodes[id];
+        if let Some(quant) = &self.quantizer {
+            if let Some(value) = &node.value {
+                return quant.value_payload(&value.payload, self.file.as_ref());
+            }
+            return self
+                .file
+                .as_ref()
+                .unwrap()
+                .with_native_vector(node.vid, |v| {
+                    quant.value_payload(v.payload, self.file.as_ref())
+                });
+        }
         if let Some(value) = &node.value {
             return Ok(value.clone());
         }
@@ -356,7 +501,7 @@ impl NativeHnsw {
         query: &VectorValue,
         mut entry: usize,
         level: usize,
-        query_code: Option<&[i8]>,
+        query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<usize, QueryError> {
         let mut best = self.navigation_score(state, entry, query, query_code)?;
         loop {
@@ -381,15 +526,17 @@ impl NativeHnsw {
         entries: &[usize],
         ef: usize,
         level: usize,
-        query_code: Option<&[i8]>,
+        query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<Vec<Scored<usize>>, QueryError> {
         let ef = ef.max(1).min(state.nodes.len());
         let mut todo = BinaryHeap::new();
         let mut best = BinaryHeap::new();
         let mut seen = HashSet::new();
         let mut admitted = ef;
-        let mut extra =
-            ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, 0)?;
+        let mut extra = ControlledMemoryCharge::try_new_recoverable(
+            ControlledMemoryCategory::StorageScratch,
+            0,
+        )?;
         seen.try_reserve(ef).map_err(|_| {
             crate::storage::error(
                 crate::error::catalog::ER_OUTOFMEMORY,
@@ -432,7 +579,8 @@ impl NativeHnsw {
                 }
                 if seen.len() >= admitted {
                     let next = admitted.saturating_mul(2).max(64).min(state.nodes.len());
-                    extra.try_grow(next.saturating_sub(admitted).saturating_mul(128))?;
+                    extra
+                        .try_grow_recoverable(next.saturating_sub(admitted).saturating_mul(128))?;
                     admitted = next;
                 }
                 seen.try_reserve(1).map_err(|_| {
@@ -472,16 +620,23 @@ impl NativeHnsw {
         candidates: &[Scored<usize>],
         maximum: usize,
     ) -> Result<Vec<usize>, QueryError> {
-        let mut cached: Option<(usize, VectorValue)> = None;
+        let mut cached: Option<(usize, VectorValue, Option<super::quantization::QuantQuery>)> =
+            None;
         let selected = hnsw_core::select_diverse_by(
             candidates.iter().copied(),
             maximum,
             |candidate, previous| {
-                if cached.as_ref().is_none_or(|(id, _)| *id != candidate.id) {
-                    cached = Some((candidate.id, self.value(state, candidate.id)?));
+                if cached.as_ref().is_none_or(|(id, _, _)| *id != candidate.id) {
+                    let (value, prepared) = self.node_probe(state, candidate.id)?;
+                    cached = Some((candidate.id, value, prepared));
                 }
                 Ok::<_, QueryError>(
-                    self.score(state, previous.id, &cached.as_ref().unwrap().1)? < candidate.dist,
+                    self.navigation_score(
+                        state,
+                        previous.id,
+                        &cached.as_ref().unwrap().1,
+                        cached.as_ref().unwrap().2.as_ref(),
+                    )? < candidate.dist,
                 )
             },
         )?;
@@ -556,7 +711,7 @@ impl NativeHnsw {
     ) -> Result<(), QueryError> {
         state
             .charge
-            .try_grow(512 + if self.file.is_none() { value.len() } else { 0 })?;
+            .try_grow_recoverable(512 + if self.file.is_none() { value.len() } else { 0 })?;
         state
             .nodes
             .try_reserve(1)
@@ -572,6 +727,7 @@ impl NativeHnsw {
             id as u64
         };
         state.nodes.push(Node {
+            exception: false,
             row,
             group,
             level: 0,
@@ -583,7 +739,6 @@ impl NativeHnsw {
                 None
             },
             links: Vec::new(),
-            code: None,
         });
         state.by_vid.insert(vid, id);
         state.groups[group].members.push(id);
@@ -591,6 +746,9 @@ impl NativeHnsw {
         Ok(())
     }
     pub(crate) fn insert(&self, row: RowId, value: VectorValue) -> Result<(), QueryError> {
+        if self.quantization_pending() {
+            return Err(codec::vector_err("quantizer training is pending"));
+        }
         codec::validate_internal(&value)?;
         if self.metric == Metric::Cosine && super::distance::typed_is_zero(&value) {
             return Err(codec::vector_err("COSINE indexes reject zero vectors"));
@@ -604,7 +762,11 @@ impl NativeHnsw {
             self.delete_locked(&mut state, old)?;
         }
         let hash = self.coordinate_hash(&state, &value);
-        let mut matching = state.group_heads.get(&hash).copied();
+        let mut matching = if self.quantizer.is_some() {
+            None
+        } else {
+            state.group_heads.get(&hash).copied()
+        };
         while let Some(group) = matching {
             if self.coordinate_equal(&state, state.groups[group].representative, &value)? {
                 return self.insert_member(&mut state, group, row, value);
@@ -622,42 +784,65 @@ impl NativeHnsw {
             + if self.file.is_some() {
                 0
             } else {
-                value.len() + (level + 1) * (self.m * 2 * 8 + 24)
+                self.quantizer
+                    .as_ref()
+                    .map_or(value.len(), |q| q.record_len())
+                    + (level + 1) * (self.m * 2 * 8 + 24)
             };
-        state.charge.try_grow(bytes)?;
+        state.charge.try_grow_recoverable(bytes)?;
         state
             .nodes
             .try_reserve(1)
             .map_err(|_| codec::vector_err("native HNSW node allocation failed"))?;
+        let prepared = self
+            .quantizer
+            .as_ref()
+            .map(|q| q.prepare(&value))
+            .transpose()?;
         let mut entry = state.entry;
         if let Some(mut current) = entry {
             for layer in ((level + 1)..=state.nodes[current].level).rev() {
-                current = self.greedy(&state, &value, current, layer, None)?;
+                current = self.greedy(&state, &value, current, layer, prepared.as_ref())?;
             }
             entry = Some(current);
         }
+        let encoded = self
+            .quantizer
+            .as_ref()
+            .map(|q| q.store(&value, self.file.as_ref()))
+            .transpose()?;
+        let payload = encoded.as_ref().unwrap_or(&value);
+        if self.file.is_none() && self.quantizer.is_some() {
+            state.charge.try_grow_recoverable(
+                payload
+                    .len()
+                    .saturating_sub(self.quantizer.as_ref().unwrap().record_len()),
+            )?;
+        }
         let vid = if let Some(file) = &self.file {
-            file.append_native_node(0, row, level, &value.payload)?
+            file.append_native_node(0, row, level, &payload.payload)?
         } else {
             id as u64
         };
         let stored = if self.file.is_some() {
             None
         } else {
-            Some(value.clone())
+            Some(payload.clone())
         };
-        let code = state.quant.and_then(|q| q.encode(&value));
-        if code.is_some() {
-            state.charge.try_grow(self.dimension as usize)?;
+        if self.quantizer.is_some() && payload.payload.first() == Some(&1) {
+            state.exceptions += 1;
+            if state.nodes.len() >= self.quantizer.as_ref().unwrap().trained_rows() {
+                state.incremental_exceptions += 1;
+            }
         }
         state.nodes.push(Node {
+            exception: self.quantizer.is_some() && payload.payload.first() == Some(&1),
             row,
             group,
             level,
             deleted: false,
             vid,
             value: stored,
-            code,
             links: if self.file.is_none() {
                 vec![Vec::new(); level + 1]
             } else {
@@ -689,7 +874,7 @@ impl NativeHnsw {
                     &[current],
                     self.ef_construction,
                     layer,
-                    None,
+                    prepared.as_ref(),
                 )?;
                 let capacity = if layer == 0 { self.m * 2 } else { self.m };
                 let chosen = self.select(&state, &candidates, capacity)?;
@@ -700,12 +885,17 @@ impl NativeHnsw {
                         links.push(id);
                     }
                     if links.len() > capacity {
-                        let center = self.value(&state, neighbor)?;
+                        let (center, center_query) = self.node_probe(&state, neighbor)?;
                         let mut scores = links
                             .iter()
                             .map(|&id| {
                                 Ok(Scored {
-                                    dist: self.score(&state, id, &center)?,
+                                    dist: self.navigation_score(
+                                        &state,
+                                        id,
+                                        &center,
+                                        center_query.as_ref(),
+                                    )?,
                                     id,
                                 })
                             })
@@ -727,6 +917,16 @@ impl NativeHnsw {
             }
         }
         state.rows.insert(row, id);
+        if let Some(q) = &self.quantizer {
+            let exceptions = state.incremental_exceptions;
+            let limit = 64usize.max(state.rows.len().div_ceil(20));
+            if (matches!(q.name(), "sq8" | "sq4") && exceptions >= limit)
+                || (matches!(q.name(), "pq" | "bq")
+                    && state.nodes.len() >= q.trained_rows() + 256usize.max(q.trained_rows() / 4))
+            {
+                self.retrain.store(true, Ordering::Release);
+            }
+        }
         Ok(())
     }
     fn delete_locked(&self, state: &mut State, id: usize) -> Result<(), QueryError> {
@@ -735,6 +935,9 @@ impl NativeHnsw {
         }
         if let Some(file) = &self.file {
             file.set_tombstone(0, state.nodes[id].vid, true)?;
+        }
+        if state.nodes[id].exception {
+            state.exceptions = state.exceptions.saturating_sub(1);
         }
         state.nodes[id].deleted = true;
         state.rows.remove(&state.nodes[id].row);
@@ -756,8 +959,11 @@ impl NativeHnsw {
         query: &VectorValue,
         request: VectorSearchRequest,
     ) -> Result<VectorSearchResult, QueryError> {
-        if !self.is_valid() {
-            return Err(codec::vector_err("native HNSW requires rebuild"));
+        if !self.is_valid() || self.quantization_pending() {
+            return Err(crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "native HNSW requires quantizer training or rebuild",
+            ));
         }
         self.prepare_navigation()?;
         let state = self.state.read();
@@ -774,7 +980,7 @@ impl NativeHnsw {
             .max(request.rerank_limit)
             .max(request.candidate_limit)
             .min(state.groups.len());
-        let _scratch = ControlledMemoryCharge::try_new(
+        let _scratch = ControlledMemoryCharge::try_new_recoverable(
             ControlledMemoryCategory::StorageScratch,
             ef.saturating_mul(128)
                 .saturating_add(self.dimension as usize)
@@ -785,17 +991,15 @@ impl NativeHnsw {
                         .saturating_mul(std::mem::size_of::<(RowId, f64)>()),
                 ),
         )?;
-        let query_code = state.quant.and_then(|q| q.encode(query));
+        let query_code = self
+            .quantizer
+            .as_ref()
+            .map(|q| q.prepare(query))
+            .transpose()?;
         for layer in (1..=state.nodes[entry].level).rev() {
-            entry = self.greedy(&state, query, entry, layer, query_code.as_deref())?;
+            entry = self.greedy(&state, query, entry, layer, query_code.as_ref())?;
         }
-        let mut pool = self.layer(&state, query, &[entry], ef, 0, query_code.as_deref())?;
-        if query_code.is_some() {
-            for score in &mut pool {
-                score.dist = self.score(&state, score.id, query)?;
-            }
-            pool.sort_unstable();
-        }
+        let pool = self.layer(&state, query, &[entry], ef, 0, query_code.as_ref())?;
         let exhausted = ef >= state.groups.len();
         let limit = request.candidate_limit.min(state.rows.len());
         let mut candidates = Vec::new();
@@ -815,7 +1019,7 @@ impl NativeHnsw {
         }
         Ok(VectorSearchResult {
             candidates,
-            exact_order: true,
+            exact_order: self.quantizer.is_none(),
             exhausted,
         })
     }

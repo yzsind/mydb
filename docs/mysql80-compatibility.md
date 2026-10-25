@@ -873,8 +873,9 @@ synchronization state, filtered by SELECT/UPDATE privileges on each sequence.
 
 - **`VECTOR(n, datatype)`** type: FLOAT32 (default), FLOAT16, BFLOAT16, INT8 and BINARY with native payload storage.
 - **Distance functions**: L2 / COSINE / DOT / HAMMING / JACCARD + the pgvector infix operators `<->` / `<#>` (`<=>` conflicts with NULL-safe-eq and is deliberately omitted).
-- **HNSW**: `CREATE INDEX … USING HNSW`, with COMMENT support for METRIC/M/EF_CONSTRUCTION/EF_SEARCH; floating L2/COSINE may use SQ8 navigation, followed by native-value reranking.
-- **IVF**: `CREATE INDEX … USING IVF`, with COMMENT support for METRIC/NLIST/NPROBE/KMEANS_ITERS/TRAIN_SAMPLE; queries probe by centroid and inverted list, and `OPTIMIZE TABLE` can retrain.
+- **HNSW**: `CREATE INDEX … USING HNSW`, with `WITH (metric=..., m=..., ef_construction=..., ef_search=..., quantization=...)`; compressed candidates are re-ranked using visible native heap values.
+- **IVF**: `CREATE INDEX … USING IVF`, with `WITH (metric=..., nlist=..., nprobe=..., kmeans_iters=..., train_sample=..., quantization=...)`; queries probe by centroid and inverted list, and `OPTIMIZE TABLE` can retrain.
+- **Quantization**: `none` (default), SQ8, SQ4, PQ, and scaled centered BQ for numeric L2/COSINE/DOT. BINARY indexes reject quantization. COMMENT is descriptive text and former parameter syntax is rejected.
 - **Queries**: `ORDER BY DISTANCE(...) LIMIT k` goes through the unified `VectorIndexScan`; no index, small tables, or `NO_VECTOR_INDEX` take the exact `VectorBruteScan` (partitioned tables included).
 - **Parameterized KNN**: prepared / auto-param; the plan cache keys the query-vector expression instead of hard-coding the first vector.
 - **Transactions and boundaries**: transaction deltas provide read-your-writes; shared vector index changes follow commit, rollback, savepoint, and XA boundaries. Invalid vector values report 50001 and dimension mismatches report 50002; cosine indexes reject zero vectors. LIMIT/OFFSET and visibility rules apply to both exact and approximate paths, but ANN candidate selection does not guarantee the same nearest-neighbor rows or recall as a brute-force scan.

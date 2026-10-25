@@ -17,9 +17,18 @@ pub(super) fn random_level(ordinal: u64, ml: f64, max_layer: usize) -> usize {
 }
 
 pub(super) fn quant_enabled_uncached() -> bool {
-    match std::env::var("MYDB_HNSW_QUANTIZE") {
-        Ok(v) => !matches!(v.as_str(), "0" | "off" | "OFF" | "false" | "FALSE"),
-        Err(_) => true,
+    // Low-level differential tests retain the old diagnostic override. SQL
+    // indexes select explicit per-index payloads and disable this legacy cache.
+    #[cfg(test)]
+    {
+        match std::env::var("MYDB_HNSW_QUANTIZE") {
+            Ok(v) => !matches!(v.as_str(), "0" | "off" | "OFF" | "false" | "FALSE"),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        true
     }
 }
 

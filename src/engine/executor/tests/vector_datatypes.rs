@@ -150,11 +150,11 @@ fn native_index_matrix(backend: &str) {
                     .execute(&format!("INSERT INTO items VALUES {}", values.join(",")))
                     .unwrap();
                 let options = if algo == "HNSW" {
-                    "M=4 EF_CONSTRUCTION=64"
+                    "m=4, ef_construction=64"
                 } else {
-                    "NLIST=4 KMEANS_ITERS=2"
+                    "nlist=4, kmeans_iters=2"
                 };
-                engine.execute(&format!("CREATE INDEX vx ON items(v) USING {algo} COMMENT 'METRIC={metric} {options}'")).unwrap();
+                engine.execute(&format!("CREATE INDEX vx ON items(v) USING {algo} WITH (metric={metric}, {options})")).unwrap();
                 let db = engine.database();
                 let table = db.table("test.items").unwrap();
                 let index = table.indexes.iter().find(|i| i.name == "vx").unwrap();
@@ -375,13 +375,13 @@ fn vector_datatypes_native_paged_restart_snapshot_and_mapping() {
                         .unwrap();
                 }
                 let options = if algo == "HNSW" {
-                    "M=4 EF_CONSTRUCTION=64"
+                    "m=4, ef_construction=64"
                 } else {
-                    "NLIST=4 KMEANS_ITERS=2"
+                    "nlist=4, kmeans_iters=2"
                 };
                 engine
                     .execute(&format!(
-                        "CREATE INDEX vx ON items(v) USING {algo} COMMENT '{options}'"
+                        "CREATE INDEX vx ON items(v) USING {algo} WITH ({options})"
                     ))
                     .unwrap();
                 let query = if binary {
@@ -516,7 +516,7 @@ fn vector_datatypes_cosine_index_rejects_preexisting_zero_rows() {
             assert!(
                 engine
                     .execute(&format!(
-                        "CREATE INDEX vx ON items(v) USING {algo} COMMENT 'METRIC=COSINE'"
+                        "CREATE INDEX vx ON items(v) USING {algo} WITH (metric=cosine)"
                     ))
                     .is_err(),
                 "{datatype}/{algo}"
@@ -548,13 +548,32 @@ fn vector_datatypes_ivf_numeric_centers_allow_wide_native_dimensions() {
             .unwrap();
     }
     engine
-        .execute("CREATE INDEX vx ON wide_native(v) USING IVF COMMENT 'NLIST=2 KMEANS_ITERS=2'")
+        .execute("CREATE INDEX vx ON wide_native(v) USING IVF WITH (nlist=2, kmeans_iters=2)")
         .unwrap();
     assert_eq!(scalar(&engine, &format!("SELECT /*+ IVF_NPROBE(2) */ id FROM wide_native ORDER BY DISTANCE(v,TO_VECTOR('{}','INT8')) LIMIT 1", text("127"))), "3");
 }
 
 #[test]
 fn vector_datatypes_physical_wal_replication_and_promotion() {
+    physical_vector_replication_matrix(None);
+}
+#[test]
+fn vector_quantization_sq8_physical_replication() {
+    physical_vector_replication_matrix(Some("sq8"));
+}
+#[test]
+fn vector_quantization_sq4_physical_replication() {
+    physical_vector_replication_matrix(Some("sq4"));
+}
+#[test]
+fn vector_quantization_pq_physical_replication() {
+    physical_vector_replication_matrix(Some("pq"));
+}
+#[test]
+fn vector_quantization_bq_physical_replication() {
+    physical_vector_replication_matrix(Some("bq"));
+}
+fn physical_vector_replication_matrix(quantization: Option<&str>) {
     use std::io::{Read, Seek, SeekFrom};
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
@@ -575,6 +594,9 @@ fn vector_datatypes_physical_wal_replication_and_promotion() {
             ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
         ]);
         for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
+            if datatype == "BINARY" && quantization.is_some() {
+                continue;
+            }
             for algo in ["HNSW", "IVF"] {
                 let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
@@ -606,13 +628,25 @@ fn vector_datatypes_physical_wal_replication_and_promotion() {
                         .execute(&format!("INSERT INTO items VALUES {rows}"))
                         .unwrap();
                     let options = if algo == "HNSW" {
-                        "M=4 EF_CONSTRUCTION=64"
+                        "m=4, ef_construction=64"
                     } else {
-                        "NLIST=2 KMEANS_ITERS=2"
+                        "nlist=2, kmeans_iters=2"
                     };
+                    let quant_options = quantization
+                        .map(|q| {
+                            format!(
+                                ",quantization={q},rerank_mult=32{}",
+                                if q == "pq" {
+                                    ",pq_bits=4,pq_train_samples=127,pq_iterations=3"
+                                } else {
+                                    ""
+                                }
+                            )
+                        })
+                        .unwrap_or_default();
                     engine
                         .execute(&format!(
-                            "CREATE INDEX vx ON items(v) USING {algo} COMMENT '{options}'"
+                            "CREATE INDEX vx ON items(v) USING {algo} WITH ({options}{quant_options})"
                         ))
                         .unwrap();
                 }
@@ -818,7 +852,7 @@ fn vector_datatypes_duplicate_hnsw_postings_survive_mutations_and_restart() {
                     .execute(&format!("INSERT INTO dup VALUES {values}"))
                     .unwrap();
                 engine
-                .execute(&format!("CREATE INDEX vx ON dup(v) USING HNSW COMMENT 'METRIC={metric} M=4 EF_CONSTRUCTION=64'"))
+                .execute(&format!("CREATE INDEX vx ON dup(v) USING HNSW WITH (metric={metric}, m=4, ef_construction=64)"))
                 .unwrap();
                 let query =
                     codec::parse_typed_text("[0,1]", VectorDataType::parse(datatype).unwrap())

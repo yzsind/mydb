@@ -1698,6 +1698,15 @@ const MYDB_VECTOR_INDEXES_COLUMNS: &[SystemColumn] = &[
     i64c!("DEFAULT_NPROBE"),
     i64c!("KMEANS_ITERS"),
     i64c!("TRAIN_SAMPLE_MULT"),
+    v!("QUANTIZATION"),
+    vn!("QUANTIZATION_STATE"),
+    i64c!("QUANTIZER_BYTES"),
+    i64c!("COMPRESSED_BYTES"),
+    i64c!("QUANTIZATION_EXCEPTIONS"),
+    i64c!("RERANK_MULT"),
+    i64c!("CANDIDATES_RETURNED"),
+    i64c!("HEAP_RERANKS"),
+    i64c!("EXACT_FALLBACKS"),
 ];
 
 /// Per-table statistics freshness. Lets a DBA see, at a glance, which
@@ -2486,7 +2495,7 @@ fn rows(
         ("information_schema", "mydb_caches") => Ok(mydb_caches_rows(db)),
         ("information_schema", "mydb_plan_cache") => Ok(mydb_plan_cache_rows(db)),
         ("information_schema", "mydb_memory_advisor") => Ok(mydb_memory_advisor_rows(db)),
-        ("information_schema", "mydb_vector_indexes") => Ok(mydb_vector_indexes_rows(db)),
+        ("information_schema", "mydb_vector_indexes") => Ok(mydb_vector_indexes_rows(db, request)),
         ("information_schema", "mydb_undo_history") => Ok(mydb_undo_history_rows(db)),
         ("information_schema", "mydb_temporal_history") => {
             Ok(mydb_temporal_history_rows(db))
@@ -6805,15 +6814,16 @@ fn mydb_plan_cache_rows(db: &Database) -> Vec<Vec<Value>> {
 
 /// One row per HNSW vector index in the catalog, joining static catalog
 /// metadata against any warm runtime graph. See `MYDB_VECTOR_INDEXES_COLUMNS`.
-fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
+fn mydb_vector_indexes_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
     use crate::storage::naming::normalize_name;
     use crate::storage::schema::DataTypeKind;
     let visibility = Visibility::compute(db);
     let runtime = db.vector_index_runtime_stats();
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for table in db.catalog().tables.values() {
+    let catalog = db.catalog();
+    visit_requested_table_descriptors(db, &catalog, request, |table| {
         if !visibility.table_visible(&table.database, &table.name) {
-            continue;
+            return;
         }
         for index in table.iter_public_indexes() {
             if !index.is_vector() {
@@ -6900,9 +6910,29 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 meta.train_sample_mult
                     .map(|v| Value::Int(v as i64))
                     .unwrap_or(Value::Null),
+                s(index
+                    .vector
+                    .as_ref()
+                    .map_or("none", |v| v.quantization.name())),
+                stats
+                    .map(|st| {
+                        s(if st.quantization_pending {
+                            "PENDING_TRAINING"
+                        } else {
+                            "READY"
+                        })
+                    })
+                    .unwrap_or(Value::Null),
+                opt_i64(stats.map(|st| st.quantizer_bytes as i64)),
+                opt_i64(stats.map(|st| st.compressed_bytes as i64)),
+                opt_i64(stats.map(|st| st.quantization_exceptions as i64)),
+                Value::Int(index.vector.as_ref().map_or(4, |v| v.rerank_mult) as i64),
+                opt_i64(stats.map(|st| st.candidates_returned as i64)),
+                opt_i64(stats.map(|st| st.heap_reranks as i64)),
+                opt_i64(stats.map(|st| st.exact_fallbacks as i64)),
             ]);
         }
-    }
+    });
     rows
 }
 

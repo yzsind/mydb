@@ -1135,6 +1135,7 @@ impl TableSchema {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         };
         let mut indexes = Vec::new();
@@ -2158,9 +2159,10 @@ pub struct IndexSchema {
     pub visible: bool,
     #[serde(default)]
     pub comment: String,
-    /// Metadata (tokenizer configuration) for a FULLTEXT index. `None` means a non-fulltext
-    /// index. A purely additive `Option`; `#[serde(default)]` lets old catalogs deserialize
-    /// smoothly to `None` without bumping `CATALOG_VERSION`.
+    /// Complete vector index configuration, independent from the user comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<crate::storage::vector_config::VectorIndexConfig>,
+    /// Persisted FULLTEXT tokenizer settings, independent from vector options.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulltext: Option<FulltextMeta>,
 }
@@ -2201,10 +2203,9 @@ pub enum VectorAlgo {
     Ivf,
 }
 
-/// Vector-index build parameters, parsed from the index COMMENT (not a separately
-/// persisted field). HNSW uses `m`/`ef_construction`/`default_ef_search`; IVF uses
-/// `nlist`/`default_nprobe`/`kmeans_iters`/`train_sample_mult`. Both algorithms share
-/// `metric`; fields unused by one are ignored by its build/query path.
+/// Resolved build/planner view of the persisted typed VectorIndexConfig.
+/// SQL comments are independent descriptive text. Algorithm-specific options
+/// are validated before this common read-only view is constructed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorIndexMeta {
     /// Distance metric name: "L2" | "COSINE" | "DOT".
@@ -2214,19 +2215,18 @@ pub struct VectorIndexMeta {
     /// Dynamic candidate-list size during construction.
     pub ef_construction: u32,
     /// Per-index default query-time `ef_search` (pgvector-style). `None` means
-    /// "use the session / GUC default". Parsed from `EF_SEARCH=` in the index
-    /// comment; planner priority is HINT > session > index default > GUC.
+    /// "use the session default". Priority is hint > explicit session > index > default.
     pub default_ef_search: Option<u32>,
     /// IVF: number of inverted-list cells (k-means centroids). `None`/`0` = auto √N at build time.
-    /// Parsed from COMMENT `NLIST=`.
+    /// Resolved from WITH nlist at index creation.
     pub nlist: Option<u32>,
     /// IVF: per-index default number of probe cells per query. `None` = session / GUC default.
-    /// Parsed from COMMENT `NPROBE=`; priority HINT > session > index default > GUC.
+    /// Priority is hint > explicit session > index default > system default.
     pub default_nprobe: Option<u32>,
-    /// IVF: k-means iteration rounds (`None` = GUC default). From COMMENT `KMEANS_ITERS=`.
+    /// IVF: k-means iteration rounds (`None` = GUC default). Captured at index creation.
     pub kmeans_iters: Option<u32>,
     /// IVF: training sample multiplier — samples `min(N, mult·nlist)` rows for training (`None` = GUC default).
-    /// Parsed from COMMENT `TRAIN_SAMPLE=`.
+    /// Captured at index creation.
     pub train_sample_mult: Option<u32>,
 }
 
@@ -2246,199 +2246,6 @@ impl Default for VectorIndexMeta {
 }
 
 impl VectorIndexMeta {
-    /// Collapse ` ` / `\t` immediately around every `=` so `KEY = VAL`,
-    /// `KEY =VAL`, and `KEY= VAL` all tokenize the same as `KEY=VAL`. Without
-    /// this the whitespace tokenizer below turns `NLIST = 512` into three
-    /// value-less tokens (`NLIST`, `=`, `512`) and **silently drops the
-    /// parameter** — a natural `COMMENT 'NLIST = 512, NPROBE = 16'` would revert
-    /// every knob to its default with no error (C3).
-    fn collapse_spaces_around_eq(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '=' {
-                while matches!(out.chars().last(), Some(' ') | Some('\t')) {
-                    out.pop();
-                }
-                out.push('=');
-                while matches!(chars.peek(), Some(' ') | Some('\t')) {
-                    chars.next();
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    /// Parse `DISTANCE=.. M=.. EF_CONSTRUCTION=..` tokens from an index comment.
-    /// Unknown / malformed tokens are ignored; missing keys keep their default.
-    pub fn parse_from_comment(comment: &str) -> Self {
-        let mut meta = VectorIndexMeta::default();
-        let normalized = Self::collapse_spaces_around_eq(comment);
-        for tok in normalized.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-            let Some((k, v)) = tok.split_once('=') else {
-                continue;
-            };
-            match k.trim().to_ascii_uppercase().as_str() {
-                "DISTANCE" | "METRIC" => {
-                    if let Some(m) = crate::engine::vector::Metric::parse(v) {
-                        meta.metric = m.as_str().to_string();
-                    }
-                }
-                "M" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 2 {
-                            meta.m = n;
-                        }
-                    }
-                }
-                "EF_CONSTRUCTION" | "EFCONSTRUCTION" | "EF_CONSTRUCT" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.ef_construction = n;
-                        }
-                    }
-                }
-                "EF_SEARCH" | "EFSEARCH" | "DEFAULT_EF_SEARCH" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.default_ef_search = Some(n);
-                        }
-                    }
-                }
-                "NLIST" | "LISTS" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.nlist = Some(n);
-                        }
-                    }
-                }
-                "NPROBE" | "PROBES" | "DEFAULT_NPROBE" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.default_nprobe = Some(n);
-                        }
-                    }
-                }
-                "KMEANS_ITERS" | "KMEANS_ITER" | "ITERS" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.kmeans_iters = Some(n);
-                        }
-                    }
-                }
-                "TRAIN_SAMPLE" | "TRAIN_SAMPLE_MULT" | "SAMPLE_MULT" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.train_sample_mult = Some(n);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        meta
-    }
-
-    /// DDL-time strict validation. Free-form words remain legal index-comment
-    /// prose, but every `KEY=value` token must be recognized and valid.
-    pub(crate) fn validate_from_comment(
-        comment: &str,
-        algo: VectorAlgo,
-    ) -> Result<Self, crate::types::QueryError> {
-        let normalized = Self::collapse_spaces_around_eq(comment);
-        for tok in normalized.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-            let Some((key, value)) = tok.split_once('=') else {
-                continue;
-            };
-            let key = key.trim().to_ascii_uppercase();
-            let value = value.trim();
-            let numeric = matches!(
-                key.as_str(),
-                "M" | "EF_CONSTRUCTION"
-                    | "EFCONSTRUCTION"
-                    | "EF_CONSTRUCT"
-                    | "EF_SEARCH"
-                    | "EFSEARCH"
-                    | "DEFAULT_EF_SEARCH"
-                    | "NLIST"
-                    | "LISTS"
-                    | "NPROBE"
-                    | "PROBES"
-                    | "DEFAULT_NPROBE"
-                    | "KMEANS_ITERS"
-                    | "KMEANS_ITER"
-                    | "ITERS"
-                    | "TRAIN_SAMPLE"
-                    | "TRAIN_SAMPLE_MULT"
-                    | "SAMPLE_MULT"
-            );
-            let hnsw_only = matches!(
-                key.as_str(),
-                "M" | "EF_CONSTRUCTION"
-                    | "EFCONSTRUCTION"
-                    | "EF_CONSTRUCT"
-                    | "EF_SEARCH"
-                    | "EFSEARCH"
-                    | "DEFAULT_EF_SEARCH"
-            );
-            let ivf_only = matches!(
-                key.as_str(),
-                "NLIST"
-                    | "LISTS"
-                    | "NPROBE"
-                    | "PROBES"
-                    | "DEFAULT_NPROBE"
-                    | "KMEANS_ITERS"
-                    | "KMEANS_ITER"
-                    | "ITERS"
-                    | "TRAIN_SAMPLE"
-                    | "TRAIN_SAMPLE_MULT"
-                    | "SAMPLE_MULT"
-            );
-            if (algo != VectorAlgo::Hnsw && hnsw_only) || (algo == VectorAlgo::Hnsw && ivf_only) {
-                return Err(crate::storage::error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!("vector index COMMENT option '{key}' is not valid for {algo:?}"),
-                ));
-            }
-            if matches!(key.as_str(), "DISTANCE" | "METRIC") {
-                if crate::engine::vector::Metric::parse(value).is_none() {
-                    return Err(crate::storage::error(
-                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                        format!("invalid vector index {key} value '{value}'"),
-                    ));
-                }
-            } else if numeric {
-                let parsed = value.parse::<u32>().ok().filter(|n| match key.as_str() {
-                    "M" => (2..=1024).contains(n),
-                    "NLIST" | "LISTS" | "NPROBE" | "PROBES" | "DEFAULT_NPROBE" => {
-                        (1..=1_048_576).contains(n)
-                    }
-                    "KMEANS_ITERS" | "KMEANS_ITER" | "ITERS" => (1..=1000).contains(n),
-                    "TRAIN_SAMPLE" | "TRAIN_SAMPLE_MULT" | "SAMPLE_MULT" => {
-                        (1..=65_536).contains(n)
-                    }
-                    _ => (1..=1_000_000).contains(n),
-                });
-                if parsed.is_none() {
-                    return Err(crate::storage::error(
-                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                        format!("invalid vector index {key} value '{value}'"),
-                    ));
-                }
-            } else {
-                crate::engine::api::push_statement_warning(
-                    crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
-                    format!("unknown vector index COMMENT option '{key}' was ignored"),
-                );
-            }
-        }
-        Ok(Self::parse_from_comment(comment))
-    }
-
     /// Resolve the metric name to the [`crate::engine::vector::Metric`] enum.
     /// `pub(crate)` (not `pub`) so this public struct doesn't leak the
     /// crate-internal `Metric` type through its signature.
@@ -2730,18 +2537,10 @@ impl IndexSchema {
         }
     }
 
-    /// HNSW graph build parameters, parsed from the index COMMENT (e.g.
-    /// `COMMENT 'DISTANCE=COSINE M=16 EF_CONSTRUCTION=200'`), falling back to defaults when absent.
-    /// Kept in the comment rather than a dedicated catalog field, avoiding a new field on every IndexSchema literal.
+    /// Resolve the persisted configuration against a column's native datatype.
     pub(crate) fn vector_meta_for_table(&self, table: &TableSchema) -> VectorIndexMeta {
         let mut meta = self.vector_meta();
-        let explicit = VectorIndexMeta::collapse_spaces_around_eq(&self.comment)
-            .split(|c: char| c.is_ascii_whitespace() || c == ',')
-            .any(|part| {
-                part.split_once('=').is_some_and(|(key, _)| {
-                    key.eq_ignore_ascii_case("METRIC") || key.eq_ignore_ascii_case("DISTANCE")
-                })
-            });
+        let explicit = self.vector.as_ref().is_some_and(|v| v.metric.is_some());
         let binary = self
             .columns
             .first()
@@ -2767,7 +2566,7 @@ impl IndexSchema {
     }
 
     pub fn vector_meta(&self) -> VectorIndexMeta {
-        VectorIndexMeta::parse_from_comment(&self.comment)
+        self.vector.as_ref().map(|v| v.meta()).unwrap_or_default()
     }
 
     /// All columns physically encoded into each index entry's key, in
@@ -6309,63 +6108,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vector_comment_tolerates_spaces_around_eq() {
-        // C3: `KEY = VAL` (spaces around `=`) must parse the same as `KEY=VAL`.
-        // Regression: the whitespace tokenizer used to split `NLIST = 512` into
-        // three value-less tokens and silently drop every parameter.
-        let m = VectorIndexMeta::parse_from_comment("METRIC = COSINE, NLIST = 512, NPROBE = 16");
-        assert_eq!(m.metric.to_ascii_uppercase(), "COSINE");
-        assert_eq!(m.nlist, Some(512));
-        assert_eq!(m.default_nprobe, Some(16));
-        // Mixed spacing variants all resolve identically.
+    fn vector_comment_configuration_is_rejected() {
+        use crate::storage::vector_config::VectorIndexConfig;
         for c in [
-            "NLIST=512 NPROBE=16",
-            "NLIST =512 NPROBE= 16",
-            "NLIST = 512   NPROBE = 16",
-            "NLIST\t=\t512,NPROBE\t=\t16",
+            "M=16",
+            "NLIST = 32",
+            "DISTANCE=COSINE",
+            "EFSEARCH=64",
+            "QUANTIZATION=sq8",
         ] {
-            let mm = VectorIndexMeta::parse_from_comment(c);
-            assert_eq!(mm.nlist, Some(512), "nlist for {c:?}");
-            assert_eq!(mm.default_nprobe, Some(16), "nprobe for {c:?}");
-        }
-        // KMEANS_ITERS / TRAIN_SAMPLE also honour spacing.
-        let k = VectorIndexMeta::parse_from_comment("KMEANS_ITERS = 20, TRAIN_SAMPLE = 128");
-        assert_eq!(k.kmeans_iters, Some(20));
-        assert_eq!(k.train_sample_mult, Some(128));
-        // Malformed / overflowing numerics still fall back (documented behavior).
-        let bad = VectorIndexMeta::parse_from_comment("NLIST = abc, NPROBE = 99999999999");
-        assert_eq!(bad.nlist, None);
-        assert_eq!(bad.default_nprobe, None);
-    }
-
-    #[test]
-    fn vector_comment_validation_is_algorithm_specific_and_bounded() {
-        assert!(VectorIndexMeta::validate_from_comment(
-            "NLIST=128 NPROBE=8 KMEANS_ITERS=20",
-            VectorAlgo::Ivf,
-        )
-        .is_ok());
-        assert_eq!(
-            VectorIndexMeta::validate_from_comment("M=16", VectorAlgo::Ivf)
+            assert!(VectorIndexConfig::validate_comment(c)
                 .unwrap_err()
-                .code(),
-            1235
-        );
-        assert_eq!(
-            VectorIndexMeta::validate_from_comment("NLIST=16", VectorAlgo::Hnsw)
-                .unwrap_err()
-                .code(),
-            1235
-        );
-        for comment in ["NLIST=0", "NPROBE=1048577", "KMEANS_ITERS=1001"] {
-            assert_eq!(
-                VectorIndexMeta::validate_from_comment(comment, VectorAlgo::Ivf)
-                    .unwrap_err()
-                    .code(),
-                1235,
-                "{comment} must be rejected"
-            );
+                .message()
+                .contains("WITH"));
         }
+        assert!(VectorIndexConfig::validate_comment("Embedding index; owner=search").is_ok());
     }
 
     fn legacy_table_json() -> &'static str {

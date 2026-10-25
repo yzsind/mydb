@@ -5518,23 +5518,6 @@ pub(super) fn execute_spatial_scan(
 /// random heap read each); the true top-k almost always sits within the
 /// approximate top `k·mult`, so we cap reads there. `MYDB_HNSW_RERANK_MULT`
 /// (default 4) tunes the safety margin; floored at 32 and never above `want`.
-pub(super) fn vector_rerank_fetch(k: usize, want: usize) -> usize {
-    #[cfg(not(test))]
-    static MULT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let resolve = || {
-        crate::util::env::var("MYDB_HNSW_RERANK_MULT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|m| *m > 0)
-            .unwrap_or(4)
-    };
-    #[cfg(not(test))]
-    let mult = *MULT.get_or_init(resolve);
-    #[cfg(test)]
-    let mult = resolve();
-    want.min(k.saturating_mul(mult).max(32)).max(k)
-}
-
 /// IVF scans (`nprobe`) and exact-rerank pool size are independent controls.
 /// Reusing the HNSW helper capped the pool by nprobe, yielding only
 /// `max(k,nprobe)` candidates instead of the documented `k * multiplier`.
@@ -5665,6 +5648,16 @@ pub(super) fn execute_vector_index_scan(
     // over-probes and silently defeats the `NPROBE=` / `mydb_ivf_nprobe`
     // tuning knob for large-`k` queries.
     let is_ivf = matches!(index.vector_algo(), crate::storage::schema::VectorAlgo::Ivf);
+    let quantized = index
+        .vector
+        .as_ref()
+        .is_some_and(|v| v.quantization.enabled());
+    let rerank_mult = vector::session::effective_rerank_mult(&hnsw_cfg, index);
+    let rerank_fetch = |want: usize| {
+        want.min(k.saturating_mul(rerank_mult as usize).max(32))
+            .max(k)
+    };
+
     // Whether the backend's candidate ordering is *exact*. HNSW re-ranks on
     // full-f32 node vectors, and IVF's Dot lists store f32 — for those, the
     // first `k` visible candidates (already in exact-distance order) ARE the
@@ -5708,9 +5701,9 @@ pub(super) fn execute_vector_index_scan(
         base_effort.min(max_scan)
     };
     let mut candidate_want = if is_ivf {
-        ivf_rerank_fetch(k, hnsw_cfg.ivf_rerank_mult)
+        ivf_rerank_fetch(k, rerank_mult).max(if quantized { 32 } else { k })
     } else {
-        vector_rerank_fetch(k, effort)
+        rerank_fetch(effort)
     }
     .min(max_scan)
     .max(k);
@@ -5738,6 +5731,7 @@ pub(super) fn execute_vector_index_scan(
     // require reordering by their heap values. Invisible rows are handled by
     // the existing candidate-limit widening loop below.
     if !is_ivf
+        && !quantized
         && filter.is_none()
         && !matches!(iterative_scan, IterativeScan::Off)
         && storage_ids.iter().all(|sid| {
@@ -5775,7 +5769,7 @@ pub(super) fn execute_vector_index_scan(
                 rerank_limit: if is_ivf {
                     candidate_want
                 } else {
-                    vector_rerank_fetch(k, effort).min(partition_budget).max(k)
+                    rerank_fetch(effort).min(partition_budget).max(k)
                 },
                 effort: if is_ivf {
                     vector::VectorSearchEffort::Ivf { nprobe: effort }
@@ -5804,6 +5798,15 @@ pub(super) fn execute_vector_index_scan(
                         && !index_error.is(crate::error::catalog::ER_OUTOFMEMORY)
                     {
                         return Err(index_error);
+                    }
+                    if quantized {
+                        db.record_vector_query_work(
+                            &table.schema,
+                            index,
+                            *sid,
+                            examined as u64,
+                            true,
+                        );
                     }
                     crate::engine::api::push_statement_warning(
                         crate::error::ConditionLevel::Warning,
@@ -5984,6 +5987,17 @@ pub(super) fn execute_vector_index_scan(
             candidate_want = next.max(k);
         }
     };
+    if quantized {
+        if let Some(&sid) = storage_ids.first() {
+            db.record_vector_query_work(
+                &table.schema,
+                index,
+                sid,
+                examined as u64,
+                exact_fallback || db.vector_snapshot_requires_exact(txn),
+            );
+        }
+    }
     if exact_fallback || db.vector_snapshot_requires_exact(txn) {
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(

@@ -46,6 +46,9 @@ pub(crate) struct HnswSessionConfig {
     pub ivf_nprobe: u64,
     pub ivf_nprobe_explicit: bool,
     pub ivf_rerank_mult: u64,
+    pub ivf_rerank_mult_explicit: bool,
+    pub hnsw_rerank_mult: u64,
+    pub hnsw_rerank_mult_explicit: bool,
     pub ivf_iterative_scan: IterativeScan,
     pub ivf_max_scan_tuples: u64,
 }
@@ -65,6 +68,9 @@ impl Default for HnswSessionConfig {
             ivf_nprobe: DEFAULT_IVF_NPROBE,
             ivf_nprobe_explicit: false,
             ivf_rerank_mult: 4,
+            ivf_rerank_mult_explicit: false,
+            hnsw_rerank_mult: 4,
+            hnsw_rerank_mult_explicit: false,
             ivf_iterative_scan: IterativeScan::StrictOrder,
             ivf_max_scan_tuples: 20_000,
         }
@@ -158,4 +164,45 @@ mod tests {
         assert_eq!(effective_nprobe(&cfg, None, Some(32)), 8);
         assert_eq!(effective_nprobe(&cfg, Some(3), Some(32)), 3);
     }
+}
+
+pub(crate) fn effective_rerank_mult(
+    cfg: &HnswSessionConfig,
+    index: &crate::storage::IndexSchema,
+) -> u64 {
+    let ivf = index.vector_algo() == crate::storage::schema::VectorAlgo::Ivf;
+    if ivf && cfg.ivf_rerank_mult_explicit {
+        cfg.ivf_rerank_mult
+    } else if !ivf && cfg.hnsw_rerank_mult_explicit {
+        cfg.hnsw_rerank_mult
+    } else {
+        index.vector.as_ref().map_or(4, |v| v.rerank_mult as u64)
+    }
+}
+pub(crate) fn explained_rerank_pool(
+    index: &crate::storage::IndexSchema,
+    k: usize,
+    effort: usize,
+) -> usize {
+    let cfg = current_config();
+    let ivf = index.vector_algo() == crate::storage::schema::VectorAlgo::Ivf;
+    let quant = index
+        .vector
+        .as_ref()
+        .is_some_and(|v| v.quantization.enabled());
+    let mut pool = k
+        .saturating_mul(effective_rerank_mult(&cfg, index) as usize)
+        .max(if quant || !ivf { 32 } else { k });
+    if !ivf {
+        pool = pool.min(effort.max(k));
+    }
+    let max = if ivf {
+        cfg.ivf_max_scan_tuples
+    } else {
+        cfg.max_scan_tuples
+    };
+    if max > 0 {
+        pool = pool.min(max as usize);
+    }
+    pool.max(k)
 }

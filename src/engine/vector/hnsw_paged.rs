@@ -1925,6 +1925,7 @@ impl RowLookup {
 /// Paged HNSW graph over one `.hvec` file.
 #[derive(Debug)]
 pub(crate) struct PagedHnsw {
+    navigation_quant_enabled: bool,
     valid: AtomicBool,
     pending_commits: parking_lot::Mutex<std::collections::HashSet<u64>>,
     file: Arc<VectorIndexFile>,
@@ -1976,6 +1977,10 @@ pub(crate) struct PagedHnsw {
 impl PagedHnsw {
     /// Wrap an open vector index file, reading its parameters from the meta
     /// page.
+    pub(crate) fn without_navigation_quantization(mut self) -> Self {
+        self.navigation_quant_enabled = false;
+        self
+    }
     pub(crate) fn new(file: Arc<VectorIndexFile>) -> Self {
         let meta = file.meta();
         let m = (meta.m as usize).max(2);
@@ -1998,6 +2003,7 @@ impl PagedHnsw {
         let query_nav_epoch = Arc::new(AtomicU64::new(0));
         let finalized = meta.finalized;
         let this = Self {
+            navigation_quant_enabled: true,
             valid: AtomicBool::new(true),
             pending_commits: parking_lot::Mutex::new(std::collections::HashSet::new()),
             file,
@@ -2087,14 +2093,15 @@ impl PagedHnsw {
     ) -> Result<(), QueryError> {
         self.invalidate_query_navigation();
         self.file.set_navigation_quantization(
-            (self.metric != Metric::Dot && paged_quant_enabled())
-                .then_some(params)
-                .flatten(),
+            (self.metric != Metric::Dot
+                && (self.navigation_quant_enabled && paged_quant_enabled()))
+            .then_some(params)
+            .flatten(),
         )
     }
 
     fn ensure_navigation_quantization(&self, vector: &[f32]) -> Result<(), QueryError> {
-        if self.metric == Metric::Dot || !paged_quant_enabled() {
+        if self.metric == Metric::Dot || !(self.navigation_quant_enabled && paged_quant_enabled()) {
             return Ok(());
         }
         let count = self.file.node_count();
@@ -2420,7 +2427,7 @@ impl PagedHnsw {
     pub(crate) fn refresh_query_navigation(&self) -> Result<(), QueryError> {
         let _gate = self.navigation_gate.write();
         if self.metric != Metric::Dot
-            && paged_quant_enabled()
+            && (self.navigation_quant_enabled && paged_quant_enabled())
             && (self.file.navigation_quantization().is_none()
                 || self.file.meta().nav_exact_nodes != 0)
         {
@@ -3872,7 +3879,10 @@ impl PagedHnsw {
         // The caller retains the original f32 rows through linking. Only the
         // exact fallback needs a second f32 arena; SQ8 owns one byte per value.
         std::mem::size_of::<f32>()
-            + if calibrated && paged_quant_enabled() && self.metric != Metric::Dot {
+            + if calibrated
+                && (self.navigation_quant_enabled && paged_quant_enabled())
+                && self.metric != Metric::Dot
+            {
                 1
             } else {
                 4
@@ -3886,8 +3896,9 @@ impl PagedHnsw {
         quantization: Option<(f32, f32, f32)>,
         expected_rows: usize,
     ) -> Result<PagedHnswBuildSession, QueryError> {
-        let quantization =
-            quantization.filter(|_| paged_quant_enabled() && self.metric != Metric::Dot);
+        let quantization = quantization.filter(|_| {
+            (self.navigation_quant_enabled && paged_quant_enabled()) && self.metric != Metric::Dot
+        });
         if quantization.is_some() {
             self.file.set_navigation_quantization(quantization)?;
         }
