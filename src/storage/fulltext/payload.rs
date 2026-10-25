@@ -40,6 +40,21 @@ pub struct FtPayload {
     pub positions: Vec<u32>,
 }
 
+/// Reject unrepresentable documents before any posting reaches an index.
+#[inline]
+pub(crate) fn validate_document_extent(
+    doc_len: u64,
+    last_position: Option<u64>,
+) -> Result<(), crate::types::QueryError> {
+    if doc_len > u64::from(u32::MAX)
+        || last_position.is_some_and(|position| position > u64::from(u32::MAX))
+    {
+        return Err(crate::error::catalog::ER_DATA_OUT_OF_RANGE
+            .error("FULLTEXT document length or token position exceeds the 32-bit index format"));
+    }
+    Ok(())
+}
+
 impl FtPayload {
     /// Encode as the `Bytes` key segment. With `with_positions=false`, only `doc_len`/`tf` are written.
     pub fn encode(&self, with_positions: bool) -> Vec<u8> {
@@ -274,6 +289,23 @@ fn parse_env_u32(key: &str, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_extent_accepts_last_representable_position_and_length() {
+        assert!(validate_document_extent(u64::from(u32::MAX), Some(u64::from(u32::MAX))).is_ok());
+        assert_eq!(
+            validate_document_extent(u64::from(u32::MAX) + 1, None)
+                .unwrap_err()
+                .code(),
+            1690
+        );
+        assert_eq!(
+            validate_document_extent(1, Some(u64::from(u32::MAX) + 1))
+                .unwrap_err()
+                .code(),
+            1690
+        );
+    }
 
     fn roundtrip(p: &FtPayload, with_positions: bool) -> FtPayload {
         FtPayload::decode(&p.encode(with_positions), with_positions).unwrap()

@@ -41,23 +41,27 @@ fn fulltext_build_pending(
         smallvec::SmallVec<[u32; 2]>,
         ahash::RandomState,
     >::with_capacity_and_hasher(16, ahash::RandomState::new());
-    let mut doc_len = 0u32;
-    let mut next_pos = 0u32;
+    let mut doc_len = 0u64;
+    let mut next_pos = 0u64;
     for (column, text) in texts.iter().enumerate() {
         let Some(text) = text else { continue };
         if column > 0 {
-            next_pos = next_pos.saturating_add(cfg.position_gap);
+            next_pos = next_pos.saturating_add(u64::from(cfg.position_gap));
         }
+        let previous_len = doc_len;
         tokenizer.visit_tokens(text, &mut |token| {
-            positions.entry(token).or_default().push(next_pos);
+            positions.entry(token).or_default().push(next_pos as u32);
             next_pos = next_pos.saturating_add(1);
             doc_len = doc_len.saturating_add(1);
         });
+        let last_position =
+            (cfg.positions && doc_len != previous_len).then(|| next_pos.saturating_sub(1));
+        crate::storage::fulltext::payload::validate_document_extent(doc_len, last_position)?;
     }
     let mut payload = Vec::new();
     for (token, positions) in positions {
         payload.clear();
-        crate::storage::fulltext::payload::write_varint(&mut payload, u64::from(doc_len));
+        crate::storage::fulltext::payload::write_varint(&mut payload, doc_len);
         crate::storage::fulltext::payload::write_varint(&mut payload, positions.len() as u64);
         if cfg.positions {
             let mut previous = 0u32;
@@ -529,6 +533,51 @@ mod fulltext_build_tests {
                     actual.sort();
                     expected.sort();
                     assert_eq!(actual, expected, "{parser}/{stored_positions}: {values:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fulltext_encoded_position_limits_match_dml_before_emitting_records() {
+        let (_dir, engine) = fixture();
+        let table = engine.database().table("ft_fixture").unwrap();
+        for stored_positions in [false, true] {
+            for gap in [u32::MAX - 1, u32::MAX] {
+                let mut index = table
+                    .indexes
+                    .iter()
+                    .find(|index| index.is_fulltext())
+                    .unwrap()
+                    .clone();
+                let meta = index.fulltext.as_mut().unwrap();
+                meta.position_gap = Some(gap);
+                meta.positions = Some(stored_positions);
+                let tokenizer = crate::storage::fulltext::build_tokenizer_from_meta(meta);
+                let cfg = crate::storage::fulltext::payload::config_from_meta(meta);
+                let program = fulltext_build_program(&index);
+                for text in ["beta", "beta beta"] {
+                    let values = vec![Value::String("alpha".into()), Value::String(text.into())];
+                    let mut actual = Vec::new();
+                    let result =
+                        fulltext_build_pending(tokenizer.as_ref(), &cfg, &values, |pending| {
+                            actual.push(program.materialize_key(
+                                &program.attach_row_id(pending, RowId::new(1, 2)),
+                            )?);
+                            Ok(())
+                        });
+                    let expected = table.fulltext_index_keys(&index, &values);
+                    if stored_positions && (gap == u32::MAX || text == "beta beta") {
+                        assert_eq!(result.unwrap_err().code(), 1690);
+                        assert_eq!(expected.unwrap_err().code(), 1690);
+                        assert!(actual.is_empty());
+                    } else {
+                        result.unwrap();
+                        let mut expected = expected.unwrap();
+                        actual.sort();
+                        expected.sort();
+                        assert_eq!(actual, expected);
+                    }
                 }
             }
         }

@@ -115,6 +115,11 @@ is at least one. Indexes without stored positions verify phrases against
 visible row text. `MYDB_FT_BM25_K1` and `MYDB_FT_BM25_B` configure process-wide
 ranking parameters, defaulting to 1.2 and 0.75.
 
+Document lengths and stored token positions use unsigned 32-bit fields.
+Writes and index builds return error 1690 when a document exceeds these
+limits, including through a large inter-column gap. They do not saturate or
+wrap positions into an invalid posting or a cross-column phrase match.
+
 ## Execution paths and limits
 
 Ordinary nonpartitioned queries scan B-tree inverted postings. Membership-only

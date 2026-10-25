@@ -4509,7 +4509,12 @@ pub(super) fn positions_phrase_match(per_token: &[&[u32]]) -> bool {
     };
     'start: for &p0 in first.iter() {
         for (i, positions) in per_token.iter().enumerate().skip(1) {
-            let want = p0.wrapping_add(i as u32);
+            let Some(want) = u32::try_from(i)
+                .ok()
+                .and_then(|offset| p0.checked_add(offset))
+            else {
+                continue 'start;
+            };
             if positions.binary_search(&want).is_err() {
                 continue 'start;
             }
@@ -4550,9 +4555,9 @@ pub(super) fn fulltext_row_contains_phrase(
 ///
 /// Fast path (2026-07): uses `Database::fulltext_scan_token` which decodes
 /// payloads inline off B-tree leaves. NL never needs positions, so the
-/// scan skips the tf-many position varints per posting AND avoids
-/// cloning the `String` token / `Vec<u8>` payload per entry that the
-/// generic `prefix_index_entries` path pays. For `df ≈ 22k` hot queries
+/// scan validates the complete payload without retaining positions and
+/// avoids cloning the `String` token / `Vec<u8>` payload per entry that
+/// the generic `prefix_index_entries` path pays. For `df ≈ 22k` hot queries
 /// this eliminates ~44k allocations per token.
 ///
 /// `need_scoring=false` fast-fastest path: when the caller only needs the
@@ -4593,8 +4598,8 @@ pub(super) fn fulltext_natural_language_candidates(
             });
         } else {
             // Row-id-only fast path: NL union with `need_score=false`
-            // needs only the row-id set. Skips payload decode entirely,
-            // which halves per-posting work again for `df ≈ 22k` tokens.
+            // needs only the row-id set. Validate payload integrity without
+            // retaining scoring records or a positions arena.
             let ids = source.scan_ids(&token)?;
             if ids.is_empty() {
                 continue;

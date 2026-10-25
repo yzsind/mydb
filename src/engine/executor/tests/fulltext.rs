@@ -216,6 +216,116 @@ fn fulltext_payload_settings_are_part_of_the_persisted_index_definition() {
 }
 
 #[test]
+fn fulltext_position_limits_reject_writes_and_backfill_without_corruption() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_ft_engine(dir.path());
+    for backfill in [false, true] {
+        let name = if backfill {
+            "limit_build"
+        } else {
+            "limit_write"
+        };
+        engine
+            .execute(&format!(
+                "CREATE TABLE {name}(id INT PRIMARY KEY,a TEXT,b TEXT,FULLTEXT KEY ft(a,b))"
+            ))
+            .unwrap();
+        let table = engine.database().table(name).unwrap();
+        let mut index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_fulltext())
+            .unwrap()
+            .clone();
+        index.index_id = 0;
+        let meta = index.fulltext.as_mut().unwrap();
+        meta.position_gap = Some(u32::MAX - 1);
+        meta.positions = Some(true);
+        engine.execute(&format!("DROP INDEX ft ON {name}")).unwrap();
+        if backfill {
+            engine
+                .execute(&format!("INSERT INTO {name} VALUES(1,'alpha','beta beta')"))
+                .unwrap();
+            let error = engine
+                .database()
+                .add_index(name, index.clone())
+                .unwrap_err();
+            assert_eq!(error.code(), 1690, "{error}");
+            assert!(!engine
+                .database()
+                .table(name)
+                .unwrap()
+                .indexes
+                .iter()
+                .any(|index| index.is_fulltext()));
+            engine
+                .execute(&format!("UPDATE {name} SET b='beta' WHERE id=1"))
+                .unwrap();
+            engine.database().add_index(name, index).unwrap();
+        } else {
+            engine.database().add_index(name, index).unwrap();
+            engine
+                .execute(&format!("INSERT INTO {name} VALUES(1,'alpha','beta')"))
+                .unwrap();
+            let error = engine
+                .execute(&format!("UPDATE {name} SET b='beta beta' WHERE id=1"))
+                .unwrap_err();
+            assert_eq!(error.code(), 1690, "{error}");
+            assert_eq!(
+                rows_to_strings(exec_set(
+                    &engine,
+                    &format!("SELECT b FROM {name} WHERE id=1")
+                )),
+                vec![vec!["beta"]]
+            );
+            let error = engine
+                .execute(&format!("INSERT INTO {name} VALUES(2,'alpha','beta beta')"))
+                .unwrap_err();
+            assert_eq!(error.code(), 1690, "{error}");
+            assert_eq!(
+                first_col(exec_set(
+                    &engine,
+                    &format!("SELECT id FROM {name} ORDER BY id")
+                )),
+                vec!["1"]
+            );
+        }
+        assert!(first_col(exec_set(
+            &engine,
+            &format!(
+                "SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('\"beta alpha\"' IN BOOLEAN MODE)"
+            )
+        ))
+        .is_empty());
+        assert_eq!(
+            first_col(exec_set(
+                &engine,
+                &format!("SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('beta')")
+            )),
+            vec!["1"]
+        );
+    }
+    drop(engine);
+    let engine = open_strict_ft_engine(dir.path());
+    for name in ["limit_write", "limit_build"] {
+        assert_eq!(
+            first_col(exec_set(
+                &engine,
+                &format!("SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('beta')")
+            )),
+            vec!["1"]
+        );
+        assert!(first_col(exec_set(
+            &engine,
+            &format!(
+                "SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('\"beta alpha\"' IN BOOLEAN MODE)"
+            )
+        ))
+        .is_empty());
+    }
+}
+
+#[test]
 fn fulltext_shared_phrase_postings_match_with_and_without_positions_after_restart() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     {

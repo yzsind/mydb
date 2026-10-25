@@ -3465,9 +3465,9 @@ impl Database {
     /// (a `String` clone of the already-known token + a `Vec<u8>` clone of
     /// the payload bytes per posting).
     ///
-    /// `want_positions` gates position decoding: NL scoring / prefix
-    /// membership only need `(doc_len, tf)`; phrase adjacency needs
-    /// positions too.
+    /// `want_positions` gates retention in the positions arena. NL scoring
+    /// and prefix membership retain only `(doc_len, tf)`; all paths still
+    /// validate the complete payload. Phrase adjacency retains positions too.
     ///
     /// Pending index-repair fallback: when in-flight DDL/DML has staged
     /// repair entries this defers to the generic materialising path
