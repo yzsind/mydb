@@ -838,6 +838,46 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn hybrid_rrf_replica_reads_online_fulltext_vector_updates() {
+        let (master, _master_dir, service) = build_master_engine().await;
+        let (replica, _replica_dir, shutdown, join) = spawn_replica(service.bind_addr()).await;
+        let writer = Arc::clone(&master);
+        tokio::task::spawn_blocking(move || {
+            writer.execute("CREATE TABLE hybrid_docs(id INT PRIMARY KEY,body TEXT,v VECTOR(2) NOT NULL,FULLTEXT KEY ft(body))").unwrap();
+            writer.execute("INSERT INTO hybrid_docs VALUES(1,'database guide','[1,0]'),(2,'database database','[0,1]')").unwrap();
+            writer.execute("CREATE INDEX hv ON hybrid_docs(v) USING HNSW").unwrap();
+        }).await.unwrap();
+        let sql = "SELECT id,match_count FROM ((SELECT id FROM hybrid_docs WHERE MATCH(body) AGAINST('database') ORDER BY MATCH(body) AGAINST('database') DESC,id LIMIT 2) RRF (SELECT /*+ HNSW_EF(32) */ id FROM hybrid_docs ORDER BY L2_DISTANCE(v,TO_VECTOR('[1,0]')),id LIMIT 2)) h ORDER BY id";
+        let expected = vec![
+            vec![Value::Int(1), Value::UInt(2)],
+            vec![Value::Int(2), Value::UInt(2)],
+        ];
+        assert_eq!(
+            poll_select_exact(&replica, sql, &expected, 10_000).await,
+            expected
+        );
+        let writer = Arc::clone(&master);
+        tokio::task::spawn_blocking(move || {
+            writer
+                .execute("DELETE FROM hybrid_docs WHERE id=1")
+                .unwrap();
+            writer
+                .execute("UPDATE hybrid_docs SET body='unrelated text',v='[2,2]' WHERE id=2")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let expected = vec![vec![Value::Int(2), Value::UInt(1)]];
+        assert_eq!(
+            poll_select_exact(&replica, sql, &expected, 10_000).await,
+            expected
+        );
+        shutdown.notify_one();
+        join.await.unwrap();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn online_primary_key_publication_materializes_before_replica_reads() {
         let (source, _source_dir, service) = build_master_engine().await;
         let (replica, _replica_dir, shutdown, join) = spawn_replica(service.bind_addr()).await;

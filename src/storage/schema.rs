@@ -2192,6 +2192,13 @@ pub struct FulltextMeta {
     /// Whether default stopword filtering is enabled. `None` uses the global default (legacy-index compat).
     #[serde(default)]
     pub use_stopwords: Option<bool>,
+    /// Whether posting keys contain positions. Persisted so key reconstruction
+    /// remains byte-identical after process defaults change.
+    #[serde(default)]
+    pub positions: Option<bool>,
+    /// Nonzero position gap between indexed columns. Part of the key format.
+    #[serde(default)]
+    pub position_gap: Option<u32>,
 }
 
 /// The concrete nearest-neighbor algorithm of a vector index. A type-safe view over the string `index_type`.
@@ -4713,7 +4720,7 @@ impl TableSchema {
     /// Generate all inverted keys of one row for a FULLTEXT index: take each indexed column's
     /// text, tokenize it, and encode every distinct token as `IndexKey::from([KeyPart::String(token), KeyPart::Bytes(payload)])`,
     /// where the payload is encoded by [`crate::storage::fulltext::payload::FtPayload`] with the token's
-    /// per-row `doc_len` / `tf` / positions (see `docs/fulltext-posting-format-upgrade-design.md`).
+    /// per-row `doc_len` / `tf` / positions.
     /// Multi-column FULLTEXT merges all columns' tokens (natural-language mode does not distinguish
     /// source columns); a position gap is inserted between columns to prevent cross-column phrase hits.
     ///
@@ -4726,7 +4733,7 @@ impl TableSchema {
         index: &IndexSchema,
         values: &[Value],
     ) -> Result<Vec<IndexKey>, QueryError> {
-        use crate::storage::fulltext::payload::{config as ft_config, FtPayload};
+        use crate::storage::fulltext::payload::{config_from_meta, FtPayload};
         // Build tokenizer from the index's persisted meta so DML maintenance
         // and query search always agree on the tokenization rules — even
         // across restarts that change MYDB_FT_* env. Falls back to a default
@@ -4734,7 +4741,7 @@ impl TableSchema {
         let default_meta = crate::storage::schema::FulltextMeta::default();
         let meta = index.fulltext.as_ref().unwrap_or(&default_meta);
         let tokenizer = crate::storage::fulltext::build_tokenizer_from_meta(meta);
-        let cfg = ft_config();
+        let cfg = config_from_meta(meta);
         // token -> its position list in this row (ascending, with inter-column gaps). doc_len is the total token count.
         let mut positions_by_token: std::collections::HashMap<String, Vec<u32>> =
             std::collections::HashMap::new();
@@ -4742,13 +4749,13 @@ impl TableSchema {
         let mut next_pos: u32 = 0;
         for (col_ord, col_name) in index.columns.iter().enumerate() {
             let idx = self.column_index(col_name)?;
-            let text: String = match values.get(idx) {
-                Some(Value::String(s)) => s.clone(),
+            let text: std::borrow::Cow<'_, str> = match values.get(idx) {
+                Some(Value::String(s)) => std::borrow::Cow::Borrowed(s),
                 Some(Value::SmallString(b)) => {
-                    unsafe { std::str::from_utf8_unchecked(b) }.to_string()
+                    std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(b) })
                 }
                 Some(Value::Null) | None => continue,
-                Some(other) => other.to_display_string(),
+                Some(other) => std::borrow::Cow::Owned(other.to_display_string()),
             };
             if col_ord > 0 {
                 // Leave a gap between columns: tokens in different columns are not adjacent, so phrases never match across columns.

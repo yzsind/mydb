@@ -55,10 +55,10 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
         | "JACCARD_DISTANCE" => (2, 2),
         _ => (1, 1),
     };
+    expect_args(name, values, min, max)?;
     if values.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
-    expect_args(name, values, min, max)?;
     match upper {
         "STRING_TO_VECTOR" | "TO_VECTOR" => {
             let datatype = if values.len() == 2 {
@@ -254,6 +254,9 @@ fn vector_operand<'a>(
 fn string_arg(v: &Value, name: &str) -> Result<String, QueryError> {
     match v {
         Value::String(s) | Value::Decimal(s) => Ok(s.clone()),
+        Value::SmallString(s) => Ok(std::str::from_utf8(s.as_slice())
+            .map_err(|_| codec::vector_err(format!("{name} expects valid UTF-8")))?
+            .to_owned()),
         Value::Bytes(b) => Ok(String::from_utf8_lossy(b).into_owned()),
         Value::Vector(b) => Ok(codec::to_text(b)),
         other => Err(codec::vector_err(format!(
@@ -272,6 +275,12 @@ fn int_arg(v: &Value, name: &str) -> Result<i64, QueryError> {
         Value::String(s) | Value::Decimal(s) => s.trim().parse::<i64>().map_err(|_| {
             codec::vector_err(format!("{name} expects an integer argument, got '{s}'"))
         }),
+        Value::SmallString(_) => {
+            let text = crate::types::value_str(v).expect("inline string");
+            text.trim().parse::<i64>().map_err(|_| {
+                codec::vector_err(format!("{name} expects an integer argument, got '{text}'"))
+            })
+        }
         other => Err(codec::vector_err(format!(
             "{name} expects an integer argument, got {}",
             value_type_name(other)
@@ -303,7 +312,7 @@ fn value_type_name(v: &Value) -> &'static str {
         | Value::DecimalCompact(..)
         | Value::Decimal128(..)
         | Value::DecimalWide(..) => "decimal",
-        Value::String(_) => "string",
+        Value::String(_) | Value::SmallString(_) => "string",
         Value::Bytes(_) => "bytes",
         Value::Json(_) => "json",
         Value::Geometry(_) => "geometry",
@@ -318,6 +327,66 @@ mod tests {
 
     fn v(values: &[f32]) -> Value {
         Value::Vector(codec::from_f32(values))
+    }
+
+    #[test]
+    fn vector_functions_accept_inline_string_arguments() {
+        let inline = |text: &str| {
+            Value::SmallString(crate::types::SmallStringBuf::from_slice(text.as_bytes()))
+        };
+        for function in ["TO_VECTOR", "STRING_TO_VECTOR"] {
+            assert_eq!(
+                eval(function, function, &[inline("[3,4]"), inline("FLOAT16")]).unwrap(),
+                Value::Vector(codec::parse_typed_text("[3,4]", VectorDataType::Float16).unwrap())
+            );
+        }
+        assert_eq!(
+            eval(
+                "DISTANCE",
+                "DISTANCE",
+                &[inline("[3,4]"), v(&[0.0, 0.0]), inline("L2")]
+            )
+            .unwrap(),
+            Value::Double(5.0)
+        );
+        assert_eq!(
+            eval(
+                "SUBVECTOR",
+                "SUBVECTOR",
+                &[v(&[3.0, 4.0]), inline("2"), inline("1")]
+            )
+            .unwrap(),
+            v(&[4.0])
+        );
+    }
+
+    #[test]
+    fn vector_functions_validate_arity_before_null_propagation() {
+        for &function in VEC_FUNCTIONS {
+            let valid = match function {
+                "VECTOR_FROM_BINARY" | "SUBVECTOR" => 3,
+                "DISTANCE"
+                | "VEC_DISTANCE"
+                | "L2_DISTANCE"
+                | "COSINE_DISTANCE"
+                | "DOT_PRODUCT"
+                | "INNER_PRODUCT"
+                | "MAX_INNER_PRODUCT_DISTANCE"
+                | "HAMMING_DISTANCE"
+                | "JACCARD_DISTANCE" => 2,
+                _ => 1,
+            };
+            assert_eq!(
+                eval(function, function, &vec![Value::Null; valid]).unwrap(),
+                Value::Null
+            );
+            for count in [0, 4] {
+                assert!(
+                    eval(function, function, &vec![Value::Null; count]).is_err(),
+                    "{function}/{count}"
+                );
+            }
+        }
     }
 
     #[test]

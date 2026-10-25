@@ -511,8 +511,9 @@ impl Database {
                 })?;
             }
         }
+        self.log_private_copy_vector_mutation(target, txn.txn_id, location.storage_id, location.row_id, None)?;
         for index in target.indexes.iter().filter(|index| index.is_vector()) {
-            self.vector_graph_mark_deleted(target, index, location.row_id, location.storage_id);
+            self.vector_graph_mark_deleted(target, index, location.row_id, location.storage_id)?;
         }
         let refs = self.read_row_external_refs(location.storage_id, location.row_id)?;
         self.with_heap_read(location.storage_id, |heap| {
@@ -573,6 +574,12 @@ impl Database {
                 file.insert_deferred(txn.txn_id, key, row_id)
             })?;
         }
+        let mut journal_values = vec![Value::Null; target.columns.len()];
+        for (name, value) in &vector_values {
+            let index = target.indexes.iter().find(|index| index.name == *name).ok_or_else(vector::persistence::corrupt)?;
+            journal_values[target.column_index(&index.columns[0])?] = value.clone().unwrap_or(Value::Null);
+        }
+        self.log_private_copy_vector_mutation(target, txn.txn_id, storage_id, row_id, Some(&journal_values))?;
         for (name, value) in vector_values {
             if let Some(Value::Vector(bytes)) = value {
                 let graph = self
@@ -597,6 +604,7 @@ impl Database {
                             g.insert_ddl(row_id, &vector)?;
                         }
                     }
+                    self.note_vector_snapshot_change(&graph);
                 }
             }
         }
@@ -1084,6 +1092,11 @@ impl Database {
                     if is_reorg && attempt == 0 {
                         self.pause_ddl_backfill_for_test();
                     }
+                    #[cfg(test)]
+                    if attempt == 0 {
+                        let hook = self.online_copy_publish_test_hook.lock().unwrap().take();
+                        if let Some(hook) = hook { hook.pause(); }
+                    }
                     let started = Instant::now();
                     if let Some(layout) = &rewrite {
                         self.acquire_alter_execution_mdl_checked(
@@ -1475,11 +1488,13 @@ impl Database {
                     VectorGraph::Paged(g) => g.file().flush()?,
                     VectorGraph::NativeHnsw(g) => {
                         if let Some(file) = g.file() {
+                            file.flush_meta(0)?;
                             file.flush()?;
                         }
                     }
                     VectorGraph::NativeIvf(g) => {
                         if let Some(file) = g.file() {
+                            file.flush_meta(0)?;
                             file.flush()?;
                         }
                     }

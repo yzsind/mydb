@@ -254,6 +254,7 @@ impl Database {
                 }
             }
             self.ensure_writable()?;
+            self.persist_vector_purge_ledger()?;
             crate::engine::auth::validate_password_length(
                 &crate::engine::auth::default_auth_plugin(),
                 &crate::util::env::var("MYDB_ROOT_PASSWORD").unwrap_or_else(|_| "root".into()),
@@ -1091,8 +1092,10 @@ impl Database {
         let index = self.index_handle(table_id, index_name)?;
         let index = index.read();
         index.ensure_healthy()?;
-        let result = f(&index);
-        result
+        match f(&index) {
+            Err(err) if err.is(crate::error::catalog::ER_INDEX_CORRUPT) => Err(index.fence_persistent_corruption(err)),
+            result => result,
+        }
     }
 
     /// Leaf-range workers already own a shared handle lease. A queued DDL
@@ -1684,8 +1687,11 @@ impl Database {
                 .index_page_count(storage_id, &index.name)
                 .saturating_mul(PAGE_SIZE as u64);
         }
-        self.vector_file_paths(table, &index.name, storage_id)
-            .iter()
+        let paths = match self.owned_vector_files(table, index, storage_id) {
+            Ok(paths) => paths,
+            Err(err) => { self.quarantine_mvcc(format!("vector size accounting failed: {err:?}")); return 0; }
+        };
+        paths.iter()
             .filter_map(|path| fs::metadata(path).ok())
             .map(|meta| meta.len())
             .fold(0u64, u64::saturating_add)

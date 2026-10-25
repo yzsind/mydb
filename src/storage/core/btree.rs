@@ -2553,6 +2553,11 @@ impl BulkIndexPageWriter {
 
 impl IndexFile {
     fn check_rebuild_marker(path: &Path) -> Result<(), QueryError> {
+        if path.with_extension("idx.corrupt").try_exists().map_err(io_err)? {
+            return Err(error(crate::error::catalog::ER_INDEX_CORRUPT,
+                format!("index is fenced after persistent corruption: {}", path.display())));
+        }
+
         if path
             .with_extension("idx.failed")
             .try_exists()
@@ -2575,12 +2580,43 @@ impl IndexFile {
         Ok(())
     }
 
+    pub(super) fn persist_planned_rebuild_marker(path: &Path) -> Result<(), QueryError> {
+        let mut marker = File::create(path.with_extension("idx.failed")).map_err(io_err)?;
+        marker.write_all(b"planned logical redo rebuild").map_err(io_err)?;
+        marker.sync_all().map_err(io_err)?;
+        if let Some(parent) = path.parent() { crate::platform::fs::sync_path(parent).map_err(io_err)?; }
+        Ok(())
+    }
+
     fn mark_requires_rebuild(&self) -> Result<(), QueryError> {
         self.failed.store(true, Ordering::Release);
         if self.durability != DurabilityMode::Memory {
             Self::persist_rebuild_marker(&self.path)?;
         }
         Ok(())
+    }
+
+    fn fence_persistent_corruption(&self, err: QueryError) -> QueryError {
+        self.failed.store(true, Ordering::Release);
+        if self.durability == DurabilityMode::Memory || crate::storage::image_io::immutable_path(&self.path) {
+            return err;
+        }
+        let marker = self.path.with_extension("idx.corrupt");
+        let persist = (|| -> std::io::Result<()> {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+                Ok(mut file) => {
+                    std::io::Write::write_all(&mut file, err.message().as_bytes())?;
+                    file.sync_all()?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+            crate::platform::fs::sync_path(marker.parent().expect("index directory"))
+        })();
+        match persist {
+            Ok(()) => err,
+            Err(persist_err) => err.map_message(|message| format!("{message}; failed to persist index corruption fence: {persist_err}")),
+        }
     }
 
     fn ensure_healthy(&self) -> Result<(), QueryError> {
@@ -6807,7 +6843,7 @@ impl IndexFile {
     /// row-id-sorted stream must sort post-scan).
     pub(crate) fn fulltext_scan_token<F>(&self, token: &str, mut visit: F) -> Result<(), QueryError>
     where
-        F: FnMut(RowId, &[u8]),
+        F: FnMut(RowId, &[u8]) -> Result<(), QueryError>,
     {
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
@@ -6835,7 +6871,7 @@ impl IndexFile {
                             Some(KeyPart::Bytes(b)) => b.as_slice(),
                             _ => &[][..],
                         };
-                        visit(entry.row_id, payload);
+                        visit(entry.row_id, payload)?;
                     }
                     _ => return Ok(()),
                 }
@@ -6861,7 +6897,7 @@ impl IndexFile {
         mut visit: F,
     ) -> Result<(), QueryError>
     where
-        F: FnMut(&str, RowId, &[u8]),
+        F: FnMut(&str, RowId, &[u8]) -> Result<(), QueryError>,
     {
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
@@ -6909,7 +6945,7 @@ impl IndexFile {
                     Some(KeyPart::Bytes(b)) => b.as_slice(),
                     _ => &[][..],
                 };
-                visit(token, entry.row_id, payload);
+                visit(token, entry.row_id, payload)?;
             }
             let Some(next_leaf) = leaf.next_leaf else {
                 return Ok(());

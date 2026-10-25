@@ -313,6 +313,7 @@ mod hash_join_null_scatter;
 mod hash_join_prefilter_outer;
 mod hash_join_streaming_residual;
 mod hash_join_work_area;
+mod hybrid_search;
 mod in_subquery_semi;
 mod index_merge;
 mod index_range_fetch_optimization;

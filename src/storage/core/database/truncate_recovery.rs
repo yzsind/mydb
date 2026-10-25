@@ -192,7 +192,9 @@ impl Database {
             // empty) heap.
             if !intent.vector_index_names.is_empty() {
                 if let Some(table) = self.table_by_id(intent.table_id) {
-                    self.drop_table_vector_graphs(&table);
+                    self.drop_table_vector_graphs(&table)?;
+                    let names = table.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+                    self.warm_vector_graphs_after_ddl(&table, &names)?;
                 }
             }
             // Publish a new AUTO_INCREMENT version so pre-TRUNCATE redo can

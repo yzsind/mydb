@@ -1554,7 +1554,7 @@ impl MydbReplManager {
         // it builds from the now-stable post-promote catalog/heap.
         self.engine
             .database_for_replication()
-            .warm_all_vector_graphs();
+            .warm_all_vector_graphs()?;
         Ok(QueryResponse::Ok)
     }
     fn finish_pending_promotion(&self) -> Result<(), QueryError> {
@@ -1593,6 +1593,7 @@ impl MydbReplManager {
         // has a durable owner, and before any client can write on that owner.
         db.set_physical_replica_mode(false)?;
         db.prepare_sequence_promotion()?;
+        db.warm_all_vector_graphs()?;
         db.checkpoint()?;
         {
             let mut state = self.role_state.lock().unwrap();

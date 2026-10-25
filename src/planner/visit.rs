@@ -10,6 +10,7 @@ macro_rules! define_children {
         pub(crate) fn $name(plan: & $($mutable)* PhysicalPlan) -> $children<'_> {
             let mut out = $children::new();
             match plan {
+                PhysicalPlan::RrfFusion { inputs, .. } => out.extend(& $($mutable)* *inputs),
                 PhysicalPlan::NullExtend { input, .. }
                 | PhysicalPlan::Projection { input, .. }
                 | PhysicalPlan::Filter { input, .. }

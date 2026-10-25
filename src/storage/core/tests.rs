@@ -3329,7 +3329,7 @@ fn fulltext_postings_carry_payload_stats() {
             .unwrap();
         assert_eq!(entries.len(), 1, "one posting per (token,row) for {token}");
         match entries[0].0 .0.get(1) {
-            Some(KeyPart::Bytes(bytes)) => FtPayload::decode(bytes),
+            Some(KeyPart::Bytes(bytes)) => FtPayload::decode(bytes, true).unwrap(),
             other => panic!("expected Bytes payload part, got {other:?}"),
         }
     };
@@ -4614,7 +4614,7 @@ fn drop_table_recovery_completes_committed_drop() {
             .get("test.t")
             .cloned()
             .unwrap();
-        let intent = db.build_drop_table_intent(&table);
+        let intent = db.build_drop_table_intent(&table).unwrap();
         db.write_drop_table_intent(&intent).unwrap();
         {
             let mut catalog = db.catalog_write().unwrap();
@@ -4656,7 +4656,7 @@ fn drop_table_recovery_rolls_back_uncommitted_drop() {
             .get("test.t")
             .cloned()
             .unwrap();
-        let intent = db.build_drop_table_intent(&table);
+        let intent = db.build_drop_table_intent(&table).unwrap();
         db.write_drop_table_intent(&intent).unwrap();
     }
 
@@ -12972,7 +12972,7 @@ fn ddl_audit_stale_truncate_cleanup_cannot_remove_new_rows() {
         let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
         simple_pk_table(&db, "t");
         let old = db.table("test.t").unwrap();
-        let retired = db.build_drop_table_intent(&old);
+        let retired = db.build_drop_table_intent(&old).unwrap();
         let legacy_wipe = db.build_truncate_table_intent(&old);
         db.truncate_table("test.t").unwrap();
         assert_ne!(db.table("test.t").unwrap().id, old.id);
@@ -13734,7 +13734,7 @@ fn parallel_redo_matches_serial_redo() {
 ///   cargo test --lib --release v7_idx_file_size_savings -- \
 ///     --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "manual legacy index-format size estimate; not a current-format correctness regression"]
 fn v7_idx_file_size_savings() {
     let dir = tempfile::tempdir().unwrap();
     let index_path = t_index_path(dir.path(), "t", 1, "PRIMARY", "idx");
@@ -14642,6 +14642,15 @@ fn read_committed_dml_serializes_delete_insert_pairs() {
 
 #[test]
 fn strict_group_commit_batches_concurrent_commits_and_recovers() {
+    assert_strict_group_commit_and_recovery(false);
+}
+
+#[test]
+fn strict_group_commit_preflushed_commits_recover_without_new_batch() {
+    assert_strict_group_commit_and_recovery(true);
+}
+
+fn assert_strict_group_commit_and_recovery(preflushed: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(
         Database::open_with_config(
@@ -14716,36 +14725,66 @@ fn strict_group_commit_batches_concurrent_commits_and_recovers() {
                 vec![vec![Value::Int(id), Value::Int(id * 10)]],
             )
             .unwrap();
+            let mut deferred = preflushed.then(|| db.commit_txn_deferred(txn.txn_id).unwrap());
             inserts_done.wait();
             start_commit.wait();
-            db.commit_txn(txn.txn_id).unwrap();
+            if let Some(commit) = deferred.as_mut() {
+                db.finish_deferred_commits(&mut [commit]).unwrap();
+            } else {
+                db.commit_txn(txn.txn_id).unwrap();
+            }
+            let durable_at_ack = db.log.lock().durable_lsn();
+            (txn.txn_id, durable_at_ack)
         }));
     }
     inserts_done.wait();
+    if preflushed {
+        // A checkpoint or data-page writeback can make commit WAL durable
+        // before its owner reaches the group-commit registration point.
+        db.flush_dirty_data().unwrap();
+    }
     // Bootstrap, DDL and DML writeback may synchronize WAL independently.
     // Measure only the released concurrent commit phase.
     let before = db.storage_status();
     start_commit.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    let acknowledgements = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
 
     let status = db.storage_status();
     assert!(
         status.group_commit_batches - before.group_commit_batches < 8,
         "{status:?}"
     );
-    // Every one of the 8 concurrent committers is accounted for: either it
-    // rode in a realized batch (`group_commit_waiters`) or it was released for
-    // free by an earlier leader's flushed high-water
-    // (`group_commit_high_water_released`, the M1 optimization).
-    assert!(
-        status.group_commit_waiters - before.group_commit_waiters
-            + status.group_commit_high_water_released
-            - before.group_commit_high_water_released
-            >= 8,
-        "{status:?}"
-    );
+    // Already-durable committers return before registering as waiters. Their
+    // durability must be checked against WAL, not inferred from queue stats.
+    if preflushed {
+        assert_eq!(status.group_commit_batches, before.group_commit_batches);
+        assert_eq!(status.group_commit_waiters, before.group_commit_waiters);
+        assert_eq!(
+            status.group_commit_high_water_released,
+            before.group_commit_high_water_released
+        );
+    }
+    let scan = {
+        let _wal = db.log.lock();
+        LogManager::scan_with_mode(dir.path(), crate::wal::WalReadMode::ReadOnly).unwrap()
+    };
+    for (txn_id, durable_at_ack) in acknowledgements {
+        let commit = scan
+            .records
+            .iter()
+            .find(|record| {
+                record.txn_id == txn_id && matches!(&record.payload, WalPayload::CommitTxn { .. })
+            })
+            .unwrap_or_else(|| panic!("missing commit WAL for acknowledged transaction {txn_id}"));
+        assert!(
+            commit.lsn <= durable_at_ack,
+            "transaction {txn_id} acknowledged LSN {} above durable LSN {durable_at_ack}",
+            commit.lsn
+        );
+    }
     assert!(status.wal_syncs - before.wal_syncs < 8, "{status:?}");
     drop(db);
 
@@ -14760,9 +14799,12 @@ fn strict_group_commit_batches_concurrent_commits_and_recovers() {
         Value::Int(value) => value,
         _ => 0,
     });
-    assert_eq!(rows.len(), 8);
-    assert_eq!(rows[0].values, vec![Value::Int(1), Value::Int(10)]);
-    assert_eq!(rows[7].values, vec![Value::Int(8), Value::Int(80)]);
+    assert_eq!(
+        rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+        (1..=8)
+            .map(|id| vec![Value::Int(id), Value::Int(id * 10)])
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -19132,7 +19174,7 @@ fn v10_add_index_offline_bulk_dense_small_int_key_smoke() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "large correctness regression: offline index build on 150000 rows with dense duplicate keys"]
 fn v10_add_index_offline_bulk_150k_rows_small_int_key() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
@@ -21278,7 +21320,7 @@ fn lob_reuse_chain_survives_midupdate_failure() {
 /// overflow write volume using M6 write-amplification counters.
 /// `cargo nextest run -- --ignored lob_reuse_write_amplification_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual write-amplification comparison over 200 updates beside a 1 MiB BLOB"]
 fn lob_reuse_write_amplification_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     const ITERS: u64 = 200;
@@ -21627,7 +21669,7 @@ fn m2_lob_column_substring_left_and_right_semantics() {
 /// SUBSTRING LEFT(100) uses one page versus the full chain.
 /// `cargo nextest run --run-ignored ignored-only m2_partial_materialization_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual partial versus full LOB materialization measurement on a 7 MiB BLOB"]
 fn m2_partial_materialization_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     const BLOB_BYTES: usize = 7 * 1024 * 1024; // 7 MiB is about 449 pages, below the column's 8M limit.
@@ -22085,7 +22127,7 @@ fn m3_shrink_survives_reopen_recovery() {
 /// compare .lob file sizes before and after shrinking.
 /// `cargo nextest run --run-ignored ignored-only m3_shrink_space_reclaim_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual LOB space-reclamation measurement after large insert and delete churn"]
 fn m3_shrink_space_reclaim_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     std::env::set_var("MYDB_LOB_SHRINK_MIN_FREE_PAGES", "1");
@@ -22486,7 +22528,7 @@ fn m4_prefetch_default_on_reads_byte_correct() {
 /// versus scattered pages, prefetch on/off, page continuity, and WAL byte volume.
 /// `cargo nextest run --run-ignored ignored-only m4_sequential_read_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual sequential LOB read, extent, prefetch, and WAL measurement"]
 fn m4_sequential_read_benchmark() {
     use std::time::Instant;
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
@@ -23164,7 +23206,7 @@ fn m5_compression_survives_reopen_recovery() {
 /// `cargo nextest run --run-ignored ignored-only m5_compression_ratio_benchmark`
 /// Run each mode in a separate process with MYDB_LOB_COMPRESSION=lz4 or off.
 #[test]
-#[ignore]
+#[ignore = "manual LOB compression and WAL measurement; run lz4 and off modes in separate processes"]
 fn m5_compression_ratio_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     std::env::set_var("MYDB_LOB_COMPRESS_MIN_BYTES", "256");
@@ -26472,7 +26514,7 @@ fn audit14_replayed_lob_cache_retirement_prevents_promotion_truncation() {
     let lob = external.allocate_chain_compressible(&bytes, false).unwrap();
     db.flush_dirty_data().unwrap();
     let relative = crate::storage::naming::wal_relative_object_path(&db.overflow_path(id));
-    db.invalidate_buffer_pool_path(&relative);
+    db.invalidate_buffer_pool_path(&relative).unwrap();
     let next = db
         .with_overflow_mut(id, |file| {
             file.allocate_chain_compressible(b"promoted write", false)
@@ -26848,4 +26890,67 @@ fn memory_catalog_seed_matches_heap_loading_and_remains_private() {
                 .is(crate::error::catalog::ER_NO_SUCH_TABLE));
         },
     );
+}
+
+#[test]
+fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
+    use crate::engine::StorageQueryEngine;
+    for sql in [
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha')",
+        "SELECT MATCH(body) AGAINST('alpha') FROM docs",
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('alp*' IN BOOLEAN MODE)",
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('\"alpha beta\"' IN BOOLEAN MODE)",
+    ] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        {
+            let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(),
+                test_storage_config(DurabilityMode::Strict, true),
+            )
+            .unwrap();
+            engine
+                .execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+                .unwrap();
+            engine
+                .execute("INSERT INTO docs VALUES(1,'alpha beta')")
+                .unwrap();
+            let db = engine.database();
+            let table = db.table("test.docs").unwrap();
+            db.with_index_mut(table.id, "ft", |index| {
+                let entries = index.entries()?;
+                for (key, row) in entries {
+                    if key.0.first() == Some(&KeyPart::String("alpha".into())) {
+                        index.delete_deferred(0, key, row)?;
+                        index.insert_deferred(
+                            0,
+                            IndexKey::from(vec![
+                                KeyPart::String("alpha".into()),
+                                KeyPart::Bytes(vec![2, 1]),
+                            ]),
+                            row,
+                        )?;
+                    }
+                }
+                index.flush()
+            })
+            .unwrap();
+            let err = engine.execute(sql).unwrap_err();
+            assert!(
+                err.is(crate::error::catalog::ER_INDEX_CORRUPT),
+                "{sql}: {err:?}"
+            );
+            let path = db.index_path_for_table_schema(&table, table.id, "ft");
+            assert!(path.with_extension("idx.corrupt").exists());
+            assert!(engine
+                .execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('beta')")
+                .is_err());
+        }
+        let err = Database::open_with_config(
+            dir.path(),
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .err()
+        .expect("startup must preserve the corruption fence");
+        assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
+    }
 }

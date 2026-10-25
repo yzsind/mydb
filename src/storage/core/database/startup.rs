@@ -295,6 +295,7 @@ impl Database {
         // than the logical table id alone.
         let mut tasks: Vec<(usize, u64, PathBuf)> = Vec::new();
         let mut index_counts = vec![0usize; tables.len()];
+        let mut important_paths = Vec::new();
         for row in self.catalog_rows_for_selector(
             crate::storage::data_dictionary::DD_INDEXES,
             CatalogRowSelector::All,
@@ -320,7 +321,28 @@ impl Database {
                         "idx",
                     ),
                 ));
+                if crate::storage::data_dictionary::index_is_fulltext(&row) {
+                    important_paths.push(tasks.last().unwrap().2.clone());
+                }
                 index_counts[position] += 1;
+            }
+        }
+        for (_, _, path) in &tasks {
+            if path.with_extension("idx.corrupt").try_exists().map_err(io_err)? {
+                return Err(error(crate::error::catalog::ER_INDEX_CORRUPT,
+                    format!("persistent index corruption requires explicit repair: {}", path.display())));
+            }
+        }
+        for path in important_paths {
+            let marker = path.with_extension("idx.failed");
+            let planned = match fs::read(&marker) {
+                Ok(bytes) => bytes == b"planned logical redo rebuild",
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => return Err(io_err(err)),
+            };
+            if !planned {
+                validation.validate(path.clone()).map_err(|err| err.map_message(|message|
+                    format!("important FULLTEXT index validation failed ({}): {message}", path.display())))?;
             }
         }
         let failed_markers = tasks
@@ -618,11 +640,10 @@ impl Database {
         for table in self.user_table_snapshots()? {
             self.rebuild_indexes(&table)?;
             self.rebuild_zone_map_for_table(&table)?;
-            self.drop_table_vector_graphs(&table);
             for index in &table.indexes {
                 if index.is_vector() {
                     for storage_id in table.storage_ids() {
-                        self.vector_graph_build_on_ddl_one(&table, index, storage_id)?;
+                        self.vector_graph_get_or_build_for_partition(&table, index, storage_id)?;
                     }
                 }
             }
@@ -753,69 +774,10 @@ impl Database {
                 "injected XA vector completion interruption",
             ));
         }
-        let ids = intents.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
-        for id in ids {
-            let Some(table) = self.table_by_id(id) else {
-                continue;
-            };
-            self.evict_table_vector_graphs(table.id);
-            for index in table.indexes.iter().filter(|index| index.is_vector()) {
-                for sid in table.storage_ids() {
-                    for ext in ["hnsw", "hvec"] {
-                        let path = self.vector_index_paged_path_ext(&table, &index.name, sid, ext);
-                        self.buffer_pool.discard_pages_for_path(&path)?;
-                        match fs::remove_file(&path) {
-                            Ok(()) => {}
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(err) => return Err(io_err(err)),
-                        }
-                    }
-                    self.vector_graph_build_on_ddl_one(&table, index, sid)?;
-                    let key = (
-                        table.id,
-                        sid,
-                        table.active_generation.max(1),
-                        normalize_name(&index.name),
-                    );
-                    let graph = self
-                        .vector_indexes
-                        .read()
-                        .get(&key)
-                        .cloned()
-                        .ok_or_else(|| {
-                            error(
-                                crate::error::catalog::ER_GET_ERRNO,
-                                "rebuilt vector graph is missing",
-                            )
-                        })?;
-                    graph.flush_paged_ivf()?;
-                    self.vector_graph_persist_one(
-                        &table,
-                        &index.name,
-                        sid,
-                        &graph,
-                        self.log.lock().next_lsn().saturating_sub(1),
-                    )
-                    .map_err(io_err)?;
-                }
-            }
-        }
+        // Live completion already applied the index journal in commit_txn;
+        // startup completes it before processing these intents. Persist that
+        // result without replaying the same native mutations a second time.
         self.checkpoint()?;
-        // Checkpoint persists paged graphs; sync directory entries as well
-        // before removing the durable intent, including slab snapshot renames.
-        for (id, _) in intents {
-            if let Some(table) = self.table_by_id(*id) {
-                for sid in table.storage_ids() {
-                    for index in table.indexes.iter().filter(|index| index.is_vector()) {
-                        let path =
-                            self.vector_index_paged_path_ext(&table, &index.name, sid, "hvec");
-                        if let Some(parent) = path.parent() {
-                            crate::platform::fs::sync_path(parent).map_err(io_err)?;
-                        }
-                    }
-                }
-            }
-        }
         for (_, path) in intents {
             fs::remove_file(path).map_err(io_err)?;
         }

@@ -1381,6 +1381,8 @@ impl Database {
             ));
         }
         let key = table_key(&database, &table_only);
+        let _role = self.zone_map_gate.read_recursive();
+        self.ensure_statistics_writable()?;
         self.refresh_table_stats(&key, true)?;
         self.commit_catalog_txn()
     }
@@ -1393,6 +1395,8 @@ impl Database {
         columns: &[String],
         buckets: usize,
     ) -> Result<Vec<String>, QueryError> {
+        let _role = self.zone_map_gate.read_recursive();
+        self.ensure_statistics_writable()?;
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
         if is_system_database(&database) {
             return Err(error(
@@ -1543,6 +1547,8 @@ impl Database {
         table_name: &str,
         columns: &[String],
     ) -> Result<Vec<String>, QueryError> {
+        let _role = self.zone_map_gate.read_recursive();
+        self.ensure_statistics_writable()?;
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
         if is_system_database(&database) {
             return Err(error(
@@ -1617,6 +1623,12 @@ impl Database {
         &self,
         table_names: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), QueryError> {
+        // Hold the role barrier through the catalog commit, not only the scan.
+        let _role = self.zone_map_gate.read_recursive();
+        self.ensure_operational()?;
+        if self.physical_replica_mode() || self.is_snapshot_read_only() {
+            return Ok(());
+        }
         let mut refreshed = false;
         let mut seen = HashSet::new();
         for name in table_names {

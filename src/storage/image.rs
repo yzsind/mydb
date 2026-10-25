@@ -42,6 +42,7 @@ fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
 pub enum FileClass {
     Authoritative,
     Index,
+    VectorIndex,
     Derived,
     RecoveryWal,
 }
@@ -391,6 +392,8 @@ fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
                 | "system/history-index.v1"
                 | "system/tablespaces.json"
                 | "system/zone-map-checkpoint.manifest"
+                | "system/vector-purges.v1"
+                | "system/vector-maintenance.jobs"
         );
     if !allowed {
         return Err(backup_err(format!(
@@ -403,7 +406,8 @@ fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
 fn classify_file(relative: &str) -> FileClass {
     match Path::new(relative).extension().and_then(|ext| ext.to_str()) {
         Some("idx") => FileClass::Index,
-        Some("zm" | "hnsw" | "hvec") => FileClass::Derived,
+        Some("hnsw" | "hvec" | "vmanifest" | "vpub") => FileClass::VectorIndex,
+        Some("zm") => FileClass::Derived,
         Some("log") if relative.starts_with("system/wal/") => FileClass::RecoveryWal,
         _ => FileClass::Authoritative,
     }
@@ -425,7 +429,12 @@ pub(crate) fn validate_open(path: &Path) -> Result<(), QueryError> {
     let mut contracts = BTreeMap::new();
     for contract in &seal.object_replay_contracts {
         if contract.version != 1
-            || !["SOURCE_PHYSICAL", "REBUILD_FROM_AUTHORITY"].contains(&contract.mode.as_str())
+            || ![
+                "SOURCE_PHYSICAL",
+                "SOURCE_INDEX_JOURNAL",
+                "REBUILD_FROM_AUTHORITY",
+            ]
+            .contains(&contract.mode.as_str())
             || contracts
                 .insert(contract.path.as_str(), contract.mode.as_str())
                 .is_some()

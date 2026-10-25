@@ -551,7 +551,7 @@
             "column"
           ],
           "setup": [],
-          "sql": "SELECT INNER_PRODUCT(NULL)",
+          "sql": "SELECT INNER_PRODUCT(NULL, STRING_TO_VECTOR('[1,2]'))",
           "cleanup": [],
           "expected": {
             "status": "ok",
@@ -600,6 +600,22 @@
           "comparison": "status_only",
           "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
           "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        },
+        {
+          "id": "invalid_arity_with_null",
+          "tags": [
+            "invalid",
+            "wrong_arity",
+            "null"
+          ],
+          "setup": [],
+          "sql": "SELECT INNER_PRODUCT(NULL)",
+          "cleanup": [],
+          "expected": {
             "status": "error",
             "errno": 50001,
             "sqlstate": "22018"
@@ -1752,7 +1768,7 @@
             "column"
           ],
           "setup": [],
-          "sql": "SELECT VEC_DISTANCE(NULL)",
+          "sql": "SELECT VEC_DISTANCE(NULL, STRING_TO_VECTOR('[1,2]'))",
           "cleanup": [],
           "expected": {
             "status": "ok",
@@ -1801,6 +1817,22 @@
           "comparison": "status_only",
           "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
           "mydb_probe": {
+            "status": "error",
+            "errno": 50001,
+            "sqlstate": "22018"
+          }
+        },
+        {
+          "id": "invalid_arity_with_null",
+          "tags": [
+            "invalid",
+            "wrong_arity",
+            "null"
+          ],
+          "setup": [],
+          "sql": "SELECT VEC_DISTANCE(NULL)",
+          "cleanup": [],
+          "expected": {
             "status": "error",
             "errno": 50001,
             "sqlstate": "22018"

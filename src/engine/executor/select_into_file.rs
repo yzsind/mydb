@@ -231,6 +231,11 @@ fn collect_set_var_hints<'q>(
                 }
             }
         }
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_set_var_hints(&branch.query, settings)?;
+            }
+        }
         crate::parser::QueryRef::SetOperation(set) => {
             collect_set_var_hints(&set.left, settings)?;
             collect_set_var_hints(&set.right, settings)?;

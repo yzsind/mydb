@@ -7,10 +7,9 @@
 //! vectors are all stored in `.hvec`; a governed optional layer-0 SQ8/CSR
 //! image removes buffer-pool bookkeeping from the query hot loop. Finalized
 //! files can instead use a revocable direct mapping, avoiding reconstruction
-//! of that image on reopen. Mutable pages remain the correctness fallback. Correctness ultimately
-//! rests on the executor re-checking
-//! heap-row MVCC visibility for returned candidates — the graph is a
-//! best-effort candidate generator, exactly as the in-memory version.
+//! of that image on reopen. Mutable pages remain available when a navigation projection is absent.
+//! The persistent graph must remain complete and healthy. The executor also
+//! re-checks heap-row MVCC visibility for returned candidates.
 
 use crate::platform::file::{File, OpenOptions};
 use std::cmp::Reverse;
@@ -81,7 +80,7 @@ use crate::storage::{NodeId, RowId, VecId, VectorIndexFile};
 use crate::types::QueryError;
 
 /// DDL/system transaction id used for every paged-graph WAL write. The graph
-/// is derived data with **no logical undo** (redo-only full-page images),
+/// uses redo-only physical records; user changes are deferred until commit,
 /// so its physical-redo records are never tied to a user transaction's
 /// rollback — they belong to the system, exactly like B-tree DDL writes.
 const VEC_DDL_TXN: u64 = 0;
@@ -849,7 +848,7 @@ impl BuildAdjStore {
         // A process killed before Drop leaves only this deterministic sidecar.
         // The next rebuild removes it before creating a fresh store.
         // Memory-durability tests and freshly-created schemas may not have
-        // materialized the derived-index directory because the `.hvec` itself
+        // materialized the index directory because the `.hvec` itself
         // has no physical backing there. The sidecar is a real file, so it
         // must establish that internal parent before using create_new.
         if let Some(parent) = path.parent() {
@@ -1947,6 +1946,10 @@ pub(crate) struct PagedHnsw {
     /// on it — a stale entry only costs recall, since the executor re-checks
     /// heap MVCC for every candidate — so a missing entry is always safe.
     row_index: parking_lot::RwLock<Option<RowLookup>>,
+    restored_retirements: parking_lot::RwLock<(
+        std::collections::HashSet<VecId>,
+        Option<ControlledMemoryCharge>,
+    )>,
     /// Live tombstone count, durably seeded from the vector-file meta page and
     /// maintained alongside each physical tombstone mutation.
     tombstones: AtomicU64,
@@ -2017,6 +2020,10 @@ impl PagedHnsw {
             reverse_latches: std::array::from_fn(|_| parking_lot::Mutex::new(())),
             next_calibration: AtomicU64::new(64),
             row_index: parking_lot::RwLock::new(None),
+            restored_retirements: parking_lot::RwLock::new((
+                std::collections::HashSet::new(),
+                None,
+            )),
             tombstones: AtomicU64::new(meta.tombstone_count),
             repaired_tombstones: AtomicU64::new(0),
             build_cache_max_entries,
@@ -2582,7 +2589,9 @@ impl PagedHnsw {
     /// Live (non-tombstoned) node count.
     #[allow(dead_code)] // used by VectorGraph::len (test-facing stats).
     pub(crate) fn live_count(&self) -> usize {
-        (self.node_count() as usize).saturating_sub(self.stale_count() as usize)
+        (self.node_count() as usize)
+            .saturating_sub(self.stale_count() as usize)
+            .saturating_sub(self.restored_retirements.read().0.len())
     }
 
     /// Ensure the `row_id -> vids` reverse index (and tombstone count) is
@@ -2651,6 +2660,39 @@ impl PagedHnsw {
     /// nodes newly marked deleted. Best-effort recall maintenance: a failure
     /// to find/mark a node never affects correctness (MVCC recheck filters
     /// invisible rows anyway).
+    pub(crate) fn install_retirement_mask(
+        &self,
+        row: RowId,
+        versions: &[u64],
+    ) -> Result<(), QueryError> {
+        let live = self.live_versions(row)?;
+        let _gate = self.navigation_gate.write();
+        let mut mask = self.restored_retirements.write();
+        if mask.1.is_none() {
+            mask.1 = Some(ControlledMemoryCharge::try_new_recoverable(
+                ControlledMemoryCategory::DerivedCache,
+                0,
+            )?);
+        }
+        for vid in live {
+            if versions.contains(&vid) && !mask.0.contains(&vid) {
+                mask.1
+                    .as_mut()
+                    .expect("mask charge")
+                    .try_grow_recoverable(64)?;
+                mask.0.try_reserve(1).map_err(|_| {
+                    crate::storage::error(
+                        crate::error::catalog::ER_OUTOFMEMORY,
+                        "vector retirement mask allocation failed",
+                    )
+                })?;
+                mask.0.insert(vid);
+            }
+        }
+        self.invalidate_query_topology();
+        Ok(())
+    }
+
     pub(crate) fn mark_deleted_by_row_id(&self, row_id: RowId) -> Result<u32, QueryError> {
         self.mark_deleted_with(
             row_id,
@@ -2928,9 +2970,9 @@ impl PagedHnsw {
     /// Crash-safe and reader-safe without a structure lock: each overwrite is one
     /// WAL'd `rmw_node_page` that swaps the page atomically under the per-page
     /// latch + buffer-pool frame lock, so a concurrent search sees either the old
-    /// or the new page, never a torn vector. Best-effort like every paged
-    /// maintenance hook — a read/write error degrades to "not updated in place"
-    /// (the caller re-links, or the next search re-checks heap MVCC anyway).
+    /// or the new page, never a torn vector. Read/write errors propagate to
+    /// the caller and fence maintenance; they cannot become a normal re-link
+    /// decision or be hidden by MVCC filtering.
     pub(crate) fn try_update_in_place(
         &self,
         row_id: RowId,
@@ -3846,6 +3888,8 @@ impl PagedHnsw {
         let ordinal = self.file.node_count();
         let level = self.random_level(ordinal);
         let id = self.file.append_node(txn_id, row_id, level, vector)?;
+        #[cfg(test)]
+        self.file.crash_point_for_test(5)?;
         // Cached and uncached incremental paths must use the same distance
         // rule. Only a wholly representable graph uses SQ8 pair scoring; an
         // out-of-calibration row keeps the exact maintenance path.
@@ -4082,6 +4126,7 @@ impl PagedHnsw {
     }
 
     /// Whether the underlying file holds a finalized (fully-built) graph.
+    #[cfg(test)]
     pub(crate) fn is_finalized(&self) -> bool {
         self.file.is_finalized()
     }
@@ -4334,6 +4379,7 @@ impl PagedHnsw {
         ef_search: usize,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
         let _gate = self.navigation_gate.read();
+        let retired = self.restored_retirements.read();
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -4342,15 +4388,48 @@ impl PagedHnsw {
             None => return Ok(Vec::new()),
         };
         let ef = ef_search.max(k).min(self.node_count() as usize).max(1);
-        if let Some(result) = self
-            .file
-            .with_navigation_mapping(|mapping| mapping.search(query, k, ef))
-        {
-            return result;
+        if ef == self.node_count() as usize {
+            // Full-width effort must also cover components unreachable from
+            // the greedy layer-0 entry, including mapped/cached navigation.
+            let mut vids = Vec::with_capacity(ef);
+            self.file.for_each_node(|vid, _, deleted| {
+                if !deleted && !retired.0.contains(&vid) {
+                    vids.push(vid);
+                }
+            })?;
+            self.file.prefetch_nodes(&vids);
+            let mut out = Vec::with_capacity(vids.len());
+            for vid in vids {
+                crate::engine::cancel::check_cancelled()?;
+                if let Some((row_id, false, distance)) =
+                    self.file
+                        .read_vector_meta_distance(vid, query, self.metric)?
+                {
+                    out.push((row_id, distance));
+                }
+            }
+            let cmp = |a: &(RowId, f64), b: &(RowId, f64)| {
+                a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+            };
+            if out.len() > k {
+                out.select_nth_unstable_by(k, cmp);
+                out.truncate(k);
+            }
+            out.sort_unstable_by(cmp);
+            return Ok(out);
+        }
+        if retired.0.is_empty() {
+            if let Some(result) = self
+                .file
+                .with_navigation_mapping(|mapping| mapping.search(query, k, ef))
+            {
+                return result;
+            }
         }
         let navigation = self.query_nav.read().clone();
         let arena = navigation.clone().filter(|arena| {
-            arena.epoch == self.query_nav_epoch.load(Ordering::Acquire)
+            retired.0.is_empty()
+                && arena.epoch == self.query_nav_epoch.load(Ordering::Acquire)
                 && arena.vids.len() == self.file.node_count() as usize
                 && arena.dim == query.len()
         });
@@ -4406,7 +4485,7 @@ impl PagedHnsw {
                 else {
                     continue;
                 };
-                if !deleted {
+                if !deleted && !retired.0.contains(&vid) {
                     out.push((row_id, distance));
                 }
             }
@@ -4443,7 +4522,7 @@ impl PagedHnsw {
             else {
                 continue;
             };
-            if deleted {
+            if deleted || retired.0.contains(&vid) {
                 continue;
             }
             out.push((row_id, distance));

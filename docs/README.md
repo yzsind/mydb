@@ -14,6 +14,7 @@ execution, and storage documentation.
 | [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Compatibility matrix, supported boundaries, and explicit differences |
 | [Data Types](data-types.md) | Declaration, ranges, conversion, comparison, and indexing semantics |
 | [Vector Datatypes and Indexes](vector-indexes.md) | Native vector types, HNSW/IVF, WITH options, quantization, query tuning, training, and recovery |
+| [Hybrid Search](hybrid-search.md) | RRF/weighted RRF, typed identities, branch windows, SQL composition, explanations, and Agent/RAG examples |
 | [Operators and Expressions](operators-and-expressions.md) | Precedence, NULL handling, and evaluation semantics |
 | [SQL Syntax Capabilities](sql-parser-capabilities.md) | Supported syntax and explicit rejections |
 | [Time Travel Queries](mysql80-compatibility.md#time-travel-queries) | Historical query semantics and support boundaries |

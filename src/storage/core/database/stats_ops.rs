@@ -1129,6 +1129,19 @@ impl Database {
         Ok(())
     }
 
+    /// Reject explicit persistent statistics writes before changing live state.
+    fn ensure_statistics_writable(&self) -> Result<(), QueryError> {
+        self.ensure_operational()?;
+        self.ensure_writable()?;
+        if self.physical_replica_mode() {
+            return Err(error(
+                crate::error::catalog::ER_OPTION_PREVENTS_STATEMENT,
+                "persistent optimizer statistics are read-only on a physical replica",
+            ));
+        }
+        Ok(())
+    }
+
     /// Recompute a table's optimizer statistics.
     ///
     /// `is_explicit_analyze` controls the optional side effects:
@@ -1156,6 +1169,13 @@ impl Database {
     /// independently so a concurrent DROP / ANALYZE racing one table only
     /// skips that table rather than aborting the whole pass.
     pub fn auto_analyze_stale_tables(&self, ratio: f64) -> Result<u64, QueryError> {
+        let _role = self.zone_map_gate.read_recursive();
+        self.ensure_operational()?;
+        if self.physical_replica_mode() || self.is_snapshot_read_only() {
+            // Optimizer statistics belong to the source dictionary. Reads use
+            // those statistics and conservative estimates without publishing.
+            return Ok(0);
+        }
         // Phase 1: collect stale candidate keys under a read lock.
         let candidates: Vec<String> = {
             let catalog = self.catalog_read()?;
@@ -1235,6 +1255,12 @@ impl Database {
         // Keep a fused stats/zone scan in one switch generation. Ordinary
         // statistics still run when zone maps are disabled.
         let _zone_operation = self.zone_map_gate.read_recursive();
+        if self.physical_replica_mode() || self.is_snapshot_read_only() {
+            if is_explicit_analyze {
+                self.ensure_statistics_writable()?;
+            }
+            return Ok(false);
+        }
         let table = self
             .catalog_read()?
             .tables
@@ -1408,6 +1434,8 @@ impl Database {
         table: &TableSchema,
         storage_ids: &[u64],
     ) -> Result<(), QueryError> {
+        let _role = self.zone_map_gate.read_recursive();
+        self.ensure_statistics_writable()?;
         let population_barrier = AnalyzePopulationBarrier::try_new(self, table);
         let baseline_aligned = population_barrier.is_some();
         let live_baseline = self.table_live_row_delta(table.id);

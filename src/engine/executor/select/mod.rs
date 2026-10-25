@@ -6,7 +6,9 @@ pub(in crate::engine::executor) mod execution_context;
 pub(crate) use eval::aggregate_function_result_type;
 mod explain;
 pub(super) mod external_sort;
+pub(in crate::engine::executor) mod fulltext_context;
 pub(crate) mod grace;
+pub(crate) mod hybrid;
 pub(crate) mod join_stream;
 pub(crate) mod loser_tree;
 pub(crate) mod mrr_lru;
@@ -4348,6 +4350,7 @@ pub(super) fn describe_statement_columns<'q>(
     let statement = statement.into();
     match statement {
         crate::parser::QueryRef::Select(stmt) => describe_select_columns(db, stmt),
+        crate::parser::QueryRef::Rrf(rrf) => hybrid::describe_columns(db, rrf),
         crate::parser::QueryRef::SetOperation(set) => {
             let left = describe_statement_columns(db, session, &set.left)?;
             let right = describe_statement_columns(db, session, &set.right)?;
@@ -4597,6 +4600,7 @@ pub(crate) fn describe_subquery_columns(
         let statement = statement.into();
         match statement {
             crate::parser::QueryRef::Select(select) => describe_select_columns(db, select),
+            crate::parser::QueryRef::Rrf(rrf) => hybrid::describe_columns(db, rrf),
             crate::parser::QueryRef::SetOperation(set) => {
                 let left = describe_query_statement(db, &set.left)?;
                 let right = describe_query_statement(db, &set.right)?;
@@ -4619,7 +4623,9 @@ pub(crate) fn describe_subquery_columns(
 
     match sub {
         SubQuery::Select(select) => describe_select_columns(db, select),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => describe_query_statement(db, stmt),
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
+            describe_query_statement(db, stmt)
+        }
     }
 }
 
@@ -5698,6 +5704,7 @@ fn execute_derived_select(
     derived_frequency_spec: Option<DerivedCountFrequencySpec>,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    let _rrf_window = hybrid::window_for_select(db, &stmt)?;
     let Some(derived) = stmt.derived.take() else {
         unreachable!();
     };
@@ -5923,7 +5930,9 @@ fn derived_count_frequency_spec(
     let group_name = unqualified_expr_name(&outer.group_by[0])?;
     let inner = match derived {
         crate::parser::SubQuery::Select(select) => select.as_ref(),
-        crate::parser::SubQuery::SetOp(_) | crate::parser::SubQuery::WithCte(_) => return None,
+        crate::parser::SubQuery::SetOp(_)
+        | crate::parser::SubQuery::Rrf(_)
+        | crate::parser::SubQuery::WithCte(_) => return None,
     };
     let inner_count = inner.projection.iter().find_map(|item| {
         let SelectItem::Expr {

@@ -161,6 +161,12 @@ when `like_ngram_prefilter=on`; ordinary FULLTEXT is not treated as a LIKE
 substring index. `MATCH` AND/OR/NOT, zero-score comparisons, multiple MATCH
 occurrences, and prepared `AGAINST(?)` all retain full boolean semantics.
 
+Partitioned and historical FULLTEXT reads use visible-text heap oracles rather
+than current inverted postings. They preserve document identity and historical
+membership at the cost of a corpus scan. BM25 scores and normalization do not
+promise full MySQL ranking/collation equivalence; see
+[Full-Text Search](fulltext-search.md) for operators, configuration, and limits.
+
 Immutable backup queries support FULLTEXT filtering and score projection using
 MVCC-visible text, including when the base contains unresolved prepared XA
 changes. See [FULLTEXT backup queries](backup-and-recovery.md#51-fulltext-queries).

@@ -4164,11 +4164,10 @@ fn storage_engine_executes_multi_statement_batches() {
 }
 
 #[test]
+#[ignore = "requires external BenchmarkSQL SQL files; set BSQL_RUN to its run directory"]
 fn benchmarksql_mysql_ddl_files_execute() {
-    let Ok(benchmarksql_run) = std::env::var("BSQL_RUN") else {
-        eprintln!("skipping BenchmarkSQL DDL test; set BSQL_RUN to benchmarksql5.1/run");
-        return;
-    };
+    let benchmarksql_run = std::env::var("BSQL_RUN")
+        .expect("set BSQL_RUN to the BenchmarkSQL run directory before running this test");
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE DATABASE tpcc").unwrap();
@@ -4184,8 +4183,15 @@ fn benchmarksql_mysql_ddl_files_execute() {
         "sql.mysql/buildFinish.sql",
     ] {
         let path = std::path::Path::new(&benchmarksql_run).join(file);
-        let sql = std::fs::read_to_string(&path).unwrap();
-        for statement in split_sql_script(&sql) {
+        let sql = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read BenchmarkSQL SQL file {}: {err}", path.display()));
+        let statements = split_sql_script(&sql);
+        assert!(
+            !statements.is_empty(),
+            "no SQL statements found in BenchmarkSQL file {}",
+            path.display()
+        );
+        for statement in statements {
             engine
                 .execute_with_session(&mut session, &statement)
                 .unwrap_or_else(|err| panic!("{}: {statement}\n{err:?}", path.display()));

@@ -5,6 +5,13 @@ This document explains how mydb selects and executes query plans, how to read
 For execution modes, cancellation, and spill behavior, see
 [SELECT Execution](executor.md); for hint syntax, see [Hints](hints.md).
 
+The [RRF fusion operator](hybrid-search.md) independently plans each ordered
+input and accumulates complete reciprocal-rank contributions under one statement
+view and memory budget. A proven outer retrieval window may bound its final
+heap, without reducing branch windows or crossing WHERE/JOIN/aggregation/window
+barriers. TREE/JSON EXPLAIN retains each child access path; ANALYZE adds real
+candidate, unique/overlap, timing, and reserved-memory measurements.
+
 ## 1. Overall Architecture
 
 A SELECT passes through roughly the following stages from SQL to results:

@@ -992,11 +992,12 @@ fn hnsw_persisted_after_checkpoint_loads_on_restart() {
     );
     let snapshot_bytes = std::fs::read(&snapshots[0]).unwrap();
     // Header sanity: magic "HNW1" + version 2 in little-endian.
-    assert_eq!(&snapshot_bytes[0..4], b"1WNH"); // "HNW1" little-endian: 0x484E5731 → 31 57 4E 48 → reversed string
+    assert_eq!(&snapshot_bytes[..8], b"MYDBIDX2");
+    assert_eq!(&snapshot_bytes[44..48], b"1WNH"); // "HNW1" little-endian: 0x484E5731 → 31 57 4E 48 → reversed string
     assert_eq!(
-        u16::from_le_bytes(snapshot_bytes[4..6].try_into().unwrap()),
-        2,
-        "snapshot must be v2"
+        u16::from_le_bytes(snapshot_bytes[48..50].try_into().unwrap()),
+        crate::storage::format_versions::IN_MEMORY_HNSW_VERSION,
+        "snapshot must use the current persistent format"
     );
 
     // Reopen: the graph loads from disk + catches up zero new rows.
@@ -1105,7 +1106,7 @@ fn hnsw_catch_up_picks_up_rows_inserted_after_persist() {
 }
 
 #[test]
-fn hnsw_corrupt_snapshot_falls_back_to_rebuild() {
+fn hnsw_corrupt_snapshot_returns_error_and_preserves_evidence() {
     // `.hnsw` snapshot semantics are memory-backend only; pin the backend so
     // this test is independent of the default (paged has no snapshot file).
     let _mem = HnswEnv::set(&[("MYDB_VECTOR_STORAGE", "memory")]);
@@ -1140,27 +1141,21 @@ fn hnsw_corrupt_snapshot_falls_back_to_rebuild() {
     bytes[last] ^= 0xFF;
     std::fs::write(&snapshots[0], &bytes).unwrap();
 
-    // Reopen: load fails (bad CRC) → falls back to full heap rebuild → KNN
-    // still answers correctly.
     let reopened = open_strict_test_engine(dir.path());
     let query = gen_vectors(1, dim, 0xC0FF_EE00_BAD0_FACE)[0].clone();
     let qtext = vec_text(&query);
     let knn_sql = format!("SELECT id FROM items ORDER BY DISTANCE(emb, '{qtext}') LIMIT 5");
-    assert!(explain_mentions_vector_index(&reopened, &knn_sql));
-    assert_eq!(
-        id_list(&reopened, &knn_sql),
-        brute_force_l2(&vectors, &query, 5),
-        "post-corrupt-file KNN must still match brute-force via rebuild"
-    );
+    let err = reopened.execute(&knn_sql).unwrap_err();
+    assert!(err.message().contains("hnsw"), "{err:?}");
+    assert_eq!(std::fs::read(&snapshots[0]).unwrap(), bytes);
 }
 
 #[test]
-fn hnsw_persist_disabled_skips_disk() {
+fn hnsw_persist_disable_cannot_remove_required_durability() {
     // `.hnsw` snapshot toggling is memory-backend only; pin the backend so the
     // assertion tests what it claims (paged is WAL-durable regardless).
     let _mem = HnswEnv::set(&[("MYDB_VECTOR_STORAGE", "memory")]);
-    // With MYDB_HNSW_PERSIST=off the checkpoint must NOT write any
-    // `.hnsw` file, and KNN after restart still works via a full rebuild.
+    // The obsolete environment flag cannot disable required index snapshots.
     let _env = HnswEnv::set(&[("MYDB_HNSW_PERSIST", "off")]);
     let dir = tempfile::tempdir().unwrap();
     let dim = 4;
@@ -1179,8 +1174,8 @@ fn hnsw_persist_disabled_skips_disk() {
         engine.checkpoint().unwrap();
     }
     assert!(
-        find_hnsw_files(dir.path()).is_empty(),
-        "MYDB_HNSW_PERSIST=off must not produce any .hnsw file"
+        !find_hnsw_files(dir.path()).is_empty(),
+        "MYDB_HNSW_PERSIST=off cannot disable mandatory persistent objects"
     );
 
     // Reopen still works via the rebuild fallback.
@@ -1401,9 +1396,8 @@ fn hnsw_create_index_on_empty_table_is_finalized_and_survives_restart() {
 }
 
 #[test]
-fn hnsw_build_on_ddl_disabled_defers_to_first_query() {
-    // The GUC gate: with MYDB_HNSW_BUILD_ON_DDL=off the graph stays cold even
-    // on a populated table (pure lazy build on first query).
+fn hnsw_build_disable_cannot_publish_an_unpersisted_index() {
+    // The obsolete flag cannot publish an index without its durable structure.
     let _env = HnswEnv::set(&[("MYDB_HNSW_BUILD_ON_DDL", "off")]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
@@ -1421,9 +1415,18 @@ fn hnsw_build_on_ddl_disabled_defers_to_first_query() {
     engine
         .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW")
         .unwrap();
-    assert!(
-        hnsw_stats(&engine).is_none(),
-        "build-on-ddl disabled: graph must stay cold until first query"
+    assert_eq!(hnsw_stats(&engine), Some((6, 6, 0)));
+    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+    assert_eq!(
+        id_list(
+            &engine,
+            "SELECT id FROM items ORDER BY DISTANCE(emb,'[1,0,0]') LIMIT 1"
+        ),
+        [1]
+    );
+    assert_eq!(
+        crate::storage::Database::vector_build_heap_scans_for_test(),
+        scans
     );
 }
 
@@ -1834,19 +1837,16 @@ fn hnsw_parallel_build_matches_brute_force_recall() {
     let vectors = gen_vectors(n, dim, 0x4444_3333_2222_1111);
     bulk_insert_vectors(&engine, &vectors);
 
-    // The graph must be cold until we explicitly warm it: the SQL KNN
-    // fast path goes brute-force on cold graphs, and `note_vector_inserts`
-    // skips cold graphs.
-    assert!(
-        engine
-            .database()
-            .hnsw_stats_for_test("items", "idx_emb")
-            .is_none(),
-        "graph must stay cold until the first warm"
-    );
-    // Warm — triggers `vector_graph_load_or_build` → parallel page-range
-    // workers (persist=off, so no snapshot load happens).
-    engine.database().vector_graph_warm_all_for_test();
+    let table = engine.database().table("items").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    engine
+        .database()
+        .rebuild_vector_for_test(&table, index, table.id)
+        .unwrap();
 
     let (nodes, live, stale) = engine
         .database()
@@ -2955,7 +2955,7 @@ fn paged_hnsw_missing_stats_after_restart_uses_physical_row_estimate() {
 }
 
 #[test]
-fn ivf_corrupt_native_file_rebuilds_from_heap() {
+fn ivf_corrupt_native_file_returns_error_without_rebuilding() {
     // B3: a corrupt `.hvec` meta page (or a dim/metric change) used to make the
     // open return a hard 1030 that propagated to every KNN query with no
     // self-heal. The heap is the durable record, so the fix discards the
@@ -2987,6 +2987,7 @@ fn ivf_corrupt_native_file_rebuilds_from_heap() {
             ),
             vec![1]
         );
+        engine.checkpoint().unwrap();
     }
     // Corrupt the `.hvec` meta page (clobber the magic at offset 0) on disk.
     let files = find_ivf_files(dir.path());
@@ -3001,19 +3002,19 @@ fn ivf_corrupt_native_file_rebuilds_from_heap() {
         f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
         f.flush().unwrap();
     }
-    // Reopen: the KNN must NOT error; the index self-heals by rebuilding from
-    // the heap and answers correctly.
+    let damaged = std::fs::read(&files[0]).unwrap();
     let reopened = open_strict_test_engine(dir.path());
     let q = vec_text(&vectors[0]);
-    let nearest = id_list(
-        &reopened,
-        &format!("SELECT id FROM items ORDER BY DISTANCE(emb, '{q}') LIMIT 1"),
+    let err = reopened
+        .execute(&format!(
+            "SELECT id FROM items ORDER BY DISTANCE(emb, '{q}') LIMIT 1"
+        ))
+        .unwrap_err();
+    assert!(
+        err.message().contains("vector") || err.is(crate::error::catalog::ER_INDEX_CORRUPT),
+        "{err:?}"
     );
-    assert_eq!(
-        nearest,
-        vec![1],
-        "corrupt native .hvec must rebuild from heap and still answer (B3)"
-    );
+    assert_eq!(std::fs::read(&files[0]).unwrap(), damaged);
 }
 
 /// Locate every `.hvec` paged inverted-file under a data dir's indexes dir.
@@ -3162,7 +3163,7 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
     );
     assert_eq!(
         col_strings(&engine, &format!("SELECT LOADED {base}")),
-        vec!["0"]
+        vec!["1"]
     );
 
     // Insert rows and run a KNN so the graph warms up.
@@ -3852,6 +3853,8 @@ fn warm_all_vector_graphs_preloads_cold_indexes() {
             .unwrap();
     }
 
+    let table = engine.database().table("items").unwrap();
+    engine.database().evict_table_vector_graphs(table.id);
     let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
     // Cold: the index has never been queried, so no graph is warm.
     assert_eq!(
@@ -3860,7 +3863,7 @@ fn warm_all_vector_graphs_preloads_cold_indexes() {
     );
 
     // Eager-warm everything (the promotion hook's primitive).
-    engine.database().warm_all_vector_graphs();
+    engine.database().warm_all_vector_graphs().unwrap();
 
     assert_eq!(
         col_strings(&engine, &format!("SELECT LOADED {base}")),
@@ -3941,18 +3944,16 @@ fn n1_drop_table_does_not_delete_colliding_table_vector_graph() {
         .find(|index| index.name.eq_ignore_ascii_case("probe_idx"))
         .unwrap()
         .index_id;
-    let probe_graph_exists = || {
-        ["hvec", "hnsw"].iter().any(|ext| {
-            crate::storage::naming::index_object_path_by_id(
-                dir.path(),
-                probe_table.id,
-                probe_table.active_generation.max(1),
-                probe_index_id,
-                ext,
-            )
-            .exists()
-        })
-    };
+    let probe_index = probe_table
+        .indexes
+        .iter()
+        .find(|index| index.index_id == probe_index_id)
+        .unwrap();
+    let probe_graph = engine
+        .database()
+        .active_vector_file_for_test(&probe_table, probe_index, probe_table.id)
+        .unwrap();
+    let probe_graph_exists = || probe_graph.exists();
     assert!(probe_graph_exists(), "probe graph must exist before drop");
 
     // Drop anchor: the former __anchor_id__ substring deletion also removed probe files;
@@ -4409,7 +4410,7 @@ fn ivf_information_schema_reports_algo_and_nlist() {
     // Cold: no warm graph yet → NLIST NULL, backend NULL.
     assert_eq!(
         col_strings(&engine, &format!("SELECT NLIST {base}")),
-        vec!["NULL"]
+        vec!["1"]
     );
 
     for i in 0..30 {
@@ -4422,7 +4423,9 @@ fn ivf_information_schema_reports_algo_and_nlist() {
             ))
             .unwrap();
     }
-    // Warm the index with a KNN query.
+    // Run the same background initial-training job used by the server.
+    engine.database().run_vector_maintenance_for_test();
+    // Query uses the already published persistent structure.
     let _ = id_list(
         &engine,
         "SELECT /*+ IVF_NPROBE(5) */ id FROM items ORDER BY DISTANCE(emb, '[0,0,0,0]') LIMIT 3",
@@ -4482,59 +4485,101 @@ fn online_type_copy_vector_generations_allow_tail_writes() {
                 ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
             ]);
             for algo in ["HNSW", "IVF"] {
-                let dir = tempfile::tempdir().unwrap();
-                let engine = std::sync::Arc::new(open_strict_test_engine(dir.path()));
-                engine
-                    .execute("CREATE TABLE t(id INT PRIMARY KEY, v INT, emb VECTOR(3) NOT NULL)")
+                for partitioned in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let engine = std::sync::Arc::new(open_strict_test_engine(dir.path()));
+                    engine
+                    .execute(if partitioned {
+                        "CREATE TABLE t(id INT PRIMARY KEY, v INT, emb VECTOR(3) NOT NULL) PARTITION BY HASH(id) PARTITIONS 2"
+                    } else { "CREATE TABLE t(id INT PRIMARY KEY, v INT, emb VECTOR(3) NOT NULL)" })
                     .unwrap();
-                // Seed the same committed rows before index creation. The
-                // regression exercises tail DML during publication below,
-                // so 32 separate durable setup commits add no coverage.
-                let values = (1..=32)
-                    .map(|i| format!("({i},{i},'[{i},0,0]')"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                engine
-                    .execute(&format!("INSERT INTO t VALUES {values}"))
-                    .unwrap();
-                engine
-                    .execute(&format!("CREATE INDEX emb_idx ON t(emb) USING {algo}"))
-                    .unwrap();
-                let hook = engine.database().install_online_copy_publish_test_hook();
-                let worker = engine.clone();
-                let ddl = std::thread::spawn(move || {
-                    let mut session = SessionContext::default();
-                    session.connection_id = 7891;
-                    worker.execute_with_session(&mut session, statement)
-                });
-                let reached = hook.wait_until_reached(std::time::Duration::from_secs(10));
-                let mut writer = SessionContext::default();
-                writer.connection_id = 7892;
-                let writes = [
-                    "UPDATE t SET emb='[100,0,0]' WHERE id=1",
-                    "DELETE FROM t WHERE id=2",
-                    "INSERT INTO t VALUES(33,33,'[0,0,0]')",
-                ]
-                .map(|sql| engine.execute_with_session(&mut writer, sql));
-                hook.release();
-                let result = ddl.join().unwrap();
-                assert!(reached, "{backend}/{algo}: {result:?}");
-                for write in writes {
-                    write.unwrap();
+                    // Seed the same committed rows before index creation. The
+                    // regression exercises tail DML during publication below,
+                    // so 32 separate durable setup commits add no coverage.
+                    let values = (1..=32)
+                        .map(|i| format!("({i},{i},'[{i},0,0]')"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    engine
+                        .execute(&format!("INSERT INTO t VALUES {values}"))
+                        .unwrap();
+                    engine
+                        .execute(&format!("CREATE INDEX emb_idx ON t(emb) USING {algo}"))
+                        .unwrap();
+                    let hook = engine.database().install_online_copy_publish_test_hook();
+                    let worker = engine.clone();
+                    let ddl = std::thread::spawn(move || {
+                        let mut session = SessionContext::default();
+                        session.connection_id = 7891;
+                        worker.execute_with_session(&mut session, statement)
+                    });
+                    let reached = hook.wait_until_reached(std::time::Duration::from_secs(10));
+                    let mut writer = SessionContext::default();
+                    writer.connection_id = 7892;
+                    let writes = [
+                        "UPDATE t SET emb='[100,0,0]' WHERE id=1",
+                        "DELETE FROM t WHERE id=2",
+                        "INSERT INTO t VALUES(33,33,'[0,0,0]')",
+                    ]
+                    .map(|sql| engine.execute_with_session(&mut writer, sql));
+                    hook.release();
+                    let result = ddl.join().unwrap();
+                    assert!(reached, "{backend}/{algo}: {result:?}");
+                    for write in writes {
+                        write.unwrap();
+                    }
+                    let result = result.unwrap();
+                    if statement.starts_with("OPTIMIZE") {
+                        let QueryResponse::ResultSet(result) = result else {
+                            panic!("status")
+                        };
+                        assert_eq!(result.rows.len(), 1, "{:?}", result.rows);
+                        assert_eq!(result.rows[0][3], Value::String("OK".into()));
+                    }
+                    let query = "SELECT id FROM t ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1";
+                    assert_eq!(id_list(&engine, query), vec![33], "{backend}/{algo}");
+                    assert_eq!(engine.database().pending_vector_journal_for_test(), (0,0),
+                    "completed COPY retained an unbounded WAL dependency: {partitioned}/{backend}/{algo}");
+                    engine.checkpoint().unwrap();
+                    let table = engine.database().table("t").unwrap();
+                    let index = table
+                        .indexes
+                        .iter()
+                        .find(|index| index.is_vector())
+                        .unwrap();
+                    let mut candidates = std::collections::HashSet::new();
+                    for sid in table.storage_ids() {
+                        let graph = engine
+                            .database()
+                            .vector_graph_get_or_build_for_partition(&table, index, sid)
+                            .unwrap();
+                        let query = crate::engine::vector::codec::parse_text("[0,0,0]").unwrap();
+                        let effort = if algo == "HNSW" {
+                            crate::engine::vector::VectorSearchEffort::Hnsw { ef: 4096 }
+                        } else {
+                            crate::engine::vector::VectorSearchEffort::Ivf { nprobe: 4096 }
+                        };
+                        let result = graph
+                            .search(
+                                &query,
+                                crate::engine::vector::VectorSearchRequest {
+                                    candidate_limit: 64,
+                                    rerank_limit: 64,
+                                    effort,
+                                },
+                            )
+                            .unwrap();
+                        candidates.extend(result.candidates.into_iter().map(|(row, _)| (sid, row)));
+                    }
+                    assert_eq!(
+                        candidates.len(),
+                        32,
+                        "COPY must preserve complete index coverage without an underfill scan"
+                    );
+                    drop(engine);
+                    let engine = open_strict_test_engine(dir.path());
+                    assert_eq!(id_list(&engine, query), vec![33], "reopen {backend}/{algo}");
                 }
-                let result = result.unwrap();
-                if statement.starts_with("OPTIMIZE") {
-                    let QueryResponse::ResultSet(result) = result else {
-                        panic!("status")
-                    };
-                    assert_eq!(result.rows.len(), 1, "{:?}", result.rows);
-                    assert_eq!(result.rows[0][3], Value::String("OK".into()));
-                }
-                let query = "SELECT id FROM t ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1";
-                assert_eq!(id_list(&engine, query), vec![33], "{backend}/{algo}");
-                drop(engine);
-                let engine = open_strict_test_engine(dir.path());
-                assert_eq!(id_list(&engine, query), vec![33], "reopen {backend}/{algo}");
             }
         }
     }
@@ -4632,8 +4677,11 @@ fn ivf_replica_wal_dml_refreshes_warm_directory() {
         let stats = replica.database().vector_index_runtime_stats();
         assert_eq!(stats.len(), 1);
         let stats = stats.values().next().unwrap();
-        assert_eq!(stats.backend, "ivf_native");
-        assert!(!stats.finalized);
+        assert_eq!(stats.backend, "ivf_paged_native");
+        assert!(
+            stats.finalized,
+            "the source completion record must publish a durable directory"
+        );
         let brute = sql.replace("IVF_NPROBE(2)", "NO_VECTOR_INDEX()");
         assert_eq!(id_list(&replica, sql), id_list(&replica, &brute));
     }
@@ -4935,7 +4983,11 @@ fn assert_cold_build_keeps_concurrent_commit(backend: &str) {
         .map(|i| (i, vec![10.0 + i as f32, 0.0, 0.0]))
         .collect();
     insert_vector_rows(&engine, &rows);
-    assert!(hnsw_stats(&engine).is_none(), "graph must start cold");
+    assert_eq!(
+        hnsw_stats(&engine).unwrap().1,
+        40,
+        "the public structure remains usable during rebuilding"
+    );
 
     let writer = Arc::clone(&engine);
     *crate::storage::VECTOR_BUILD_BEFORE_PUBLISH_HOOK.lock() = Some(Box::new(move || {
@@ -4949,8 +5001,16 @@ fn assert_cold_build_keeps_concurrent_commit(backend: &str) {
         .unwrap();
     }));
     let knn = "SELECT id FROM items ORDER BY DISTANCE(emb, '[0,0,0]') LIMIT 3";
-    // The first query triggers the build; its snapshot may predate the insert.
-    let _ = id_list(&engine, knn);
+    let table = engine.database().table("items").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    engine
+        .database()
+        .rebuild_vector_for_test(&table, index, table.id)
+        .unwrap();
     assert!(crate::storage::VECTOR_BUILD_BEFORE_PUBLISH_HOOK
         .lock()
         .is_none());
@@ -5057,7 +5117,7 @@ fn hnsw_selective_filter_returns_k_rows_and_empty_filter_terminates() {
 /// A failed paged graph write must not leave a trusted index that silently
 /// lacks the committed row: the graph is invalidated and rebuilt.
 #[test]
-fn paged_hnsw_failed_write_invalidates_and_rebuilds() {
+fn paged_hnsw_failed_write_returns_error_and_durably_fences_index() {
     use crate::engine::vector::graph::FAIL_PAGED_WRITES_FOR_TEST;
     use std::sync::atomic::Ordering;
     let _env = paged_index_env();
@@ -5079,16 +5139,25 @@ fn paged_hnsw_failed_write_invalidates_and_rebuilds() {
         FAIL_PAGED_WRITES_FOR_TEST.store(true, Ordering::Release);
         let inserted = engine.execute("INSERT INTO items VALUES (999, '[0,0,0]')");
         FAIL_PAGED_WRITES_FOR_TEST.store(false, Ordering::Release);
-        inserted.unwrap();
+        let err = inserted.unwrap_err();
+        assert!(err.message().contains("committed WAL decision"), "{err:?}");
         assert!(
-            hnsw_stats(&engine).is_none(),
-            "failed graph must be evicted"
+            engine.execute(knn).is_err(),
+            "a failed index cannot be hidden by a scan"
         );
-        assert_eq!(id_list(&engine, knn), vec![999, 1, 2]);
-        engine.checkpoint().unwrap();
+        assert!(engine.database().ensure_operational().is_err());
+        assert!(engine.checkpoint().is_err());
     }
-    let engine = open_strict_test_engine(dir.path());
-    assert_eq!(id_list(&engine, knn), vec![999, 1, 2]);
+    let failure = find_object_files_with_extension(dir.path(), "failed");
+    assert!(
+        !failure.is_empty(),
+        "the failure fence must survive process exit"
+    );
+    let reopened = crate::storage::Database::open(dir.path());
+    assert!(
+        reopened.is_err(),
+        "startup must not discard a persistent index failure"
+    );
 }
 
 /// Rows deleted after a `.hnsw` snapshot was written must not come back as
@@ -5310,8 +5379,10 @@ fn paged_hnsw_delta_wal_recovers_after_crash() {
     let engine = open_strict_test_engine(dir.path());
     let vectors: Vec<Vec<f32>> = rows.iter().map(|(_, v)| v.clone()).collect();
     for q in gen_vectors(5, 16, 0x5EED_0044) {
+        // Recovery verifies an exact oracle; cover all 500 graph nodes so
+        // approximate recall cannot depend on concurrent cold-build topology.
         let knn = format!(
-            "SELECT id FROM items ORDER BY DISTANCE(emb, '{}') LIMIT 5",
+            "SELECT /*+ HNSW_EF(512) */ id FROM items ORDER BY DISTANCE(emb, '{}') LIMIT 5",
             vec_text(&q)
         );
         let expected: Vec<i64> = brute_force_l2(&vectors, &q, 5)
@@ -5441,7 +5512,7 @@ fn hnsw_replica_case(backend: &str, partitioned: bool) {
         let stats = replica.database().vector_index_runtime_stats();
         assert_eq!(stats.len(), 1);
         let stats = stats.values().next().unwrap();
-        assert_eq!(stats.backend, "memory");
+        assert_eq!(stats.backend, backend);
 
         let brute = sql.replace("HNSW_EF(64)", "NO_VECTOR_INDEX()");
         assert_eq!(id_list(&replica, sql), id_list(&replica, &brute));

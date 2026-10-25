@@ -36,6 +36,10 @@ mydb supports two hint syntaxes:
 
 The currently effective `/*+ ... */` hints include:
 
+RRF ranking constants, weights, and explanation mode are semantic options in
+the node's `WITH(...)` clause, not optimizer hints. HNSW/IVF hints inside each
+branch affect only that retrieval query. See [hybrid search](hybrid-search.md).
+
 | Category | Hints |
 |---|---|
 | Scan/Index | `INDEX`/`USE_INDEX`, `NO_INDEX`, `INDEX_MERGE`, `NO_INDEX_MERGE`, `FULL_SCAN`, `INDEX_FFS` |

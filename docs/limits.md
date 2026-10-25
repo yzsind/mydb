@@ -450,6 +450,21 @@ rather than silently clamped. See [vector datatypes and indexes](vector-indexes.
 for the complete option table, datatype/metric combinations, and PQ training
 fallback behavior.
 
+### Hybrid rank fusion
+
+| Item | Value |
+| --- | --- |
+| RRF branches per node | 2–8; explicit ORDER BY and LIMIT on every branch |
+| RANK_CONSTANT | Exact integer, 0–4,294,967,295; default 60 |
+| Weights | One finite nonnegative value per branch; at least one positive; finite maximum score |
+| Candidate and output windows | No implicit 1,000-row cap; shared memory and statement limits apply |
+| Branch OFFSET | Absent or zero; ordinary outer OFFSET supported |
+| Fusion spill | Not supported; budget exhaustion fails the statement |
+
+Fusion identity domains, unsupported inputs, and application window policies
+are described in [hybrid search](hybrid-search.md). The example Python client
+has its own bounded request limits, independent of the SQL engine.
+
 ### JSON
 
 - Document nesting depth ≤ **100**.

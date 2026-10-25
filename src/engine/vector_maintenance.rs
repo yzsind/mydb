@@ -76,10 +76,15 @@ impl VectorMaintenanceHandle {
                 let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     db.maintain_vector_indexes(|| worker_shutdown.is_requested())
                 }));
-                if round.is_err() {
-                    crate::util::logging::log_message(
-                        "vector index maintenance panicked; retry next pass",
-                    );
+                match round {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => crate::util::logging::log_message(format!(
+                        "vector index maintenance failed: {err:?}"
+                    )),
+                    Err(_) => {
+                        db.fail_vector_maintenance_worker();
+                        break;
+                    }
                 }
             }
         });

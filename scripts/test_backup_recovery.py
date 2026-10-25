@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import statistics
@@ -145,8 +146,19 @@ def rejected(c, text):
         return
     raise AssertionError(f'accepted unsupported/write SQL: {text}')
 
+def wal_format_version():
+    """Use the same canonical version as the source WAL writer."""
+    source = ROOT / 'src/storage/format_versions.rs'
+    match = re.search(r'^pub const WAL_VERSION:\s*u32\s*=\s*(\d+)\s*;',
+                      source.read_text(), re.MULTILINE)
+    if match is None:
+        raise ValueError(f'cannot read WAL_VERSION from {source}')
+    return int(match.group(1))
+
+
 def source_commits_after(data_dir, end_lsn):
     """Independent bounded decoder for the protected source WAL suffix."""
+    expected_version = wal_format_version()
     commits={}; spans=[]
     for path in sorted((data_dir/'system'/'wal').glob('wal-*')):
         if not (path.name.endswith('.log') or path.name.endswith('.log.pending')):
@@ -155,7 +167,10 @@ def source_commits_after(data_dir, end_lsn):
             header=f.read(40)
             if len(header)!=40 or header[:8]!=b'MYDBWAL1':
                 continue
-            assert struct.unpack_from('<I',header,8)[0]==34
+            version = struct.unpack_from('<I', header, 8)[0]
+            if version != expected_version:
+                raise ValueError(f'{path}: unsupported source WAL version {version}; '
+                                 f'expected {expected_version}')
             while True:
                 frame=f.read(48)
                 if not frame or frame[:4]==b'\0'*4:

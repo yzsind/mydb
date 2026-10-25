@@ -1,10 +1,9 @@
 //! In-memory HNSW (Hierarchical Navigable Small World) graph for approximate
 //! nearest-neighbour search, with a self-describing, CRC32-checked on-disk form.
 //!
-//! Like the spatial R-tree (`storage/core/rtree.rs`), a vector index is
-//! *derived data*: the persisted `.hnsw` file is an optimisation, and a
-//! missing / stale / corrupt file is rebuilt from a heap scan at open time.
-//! The graph therefore lives entirely outside the buffer-pool / WAL machinery.
+//! The graph is an important persistent object. Immutable snapshots and
+//! committed index WAL provide recovery without scanning the heap. Missing or
+//! corrupt snapshots are errors; memory residency does not weaken durability.
 //!
 //! The graph is a **candidate generator**, not the source of truth. Each node
 //! carries a `RowId` and a copy of its vector; [`HnswIndex::search`] returns the
@@ -21,7 +20,7 @@
 //! nearest neighbor search using Hierarchical Navigable Small World graphs."
 //! Layer assignment uses a deterministic SplitMix64 PRNG seeded by node index,
 //! so rebuilding from the same insertion order reproduces the same graph
-//! (important for "derived, reproducible" crash recovery).
+//! during an explicit reconstruction; recovery preserves persisted topology.
 //!
 //! ## Concurrency (M3, 2026-06)
 //!
@@ -1043,12 +1042,10 @@ pub(crate) struct HnswIndex {
     /// Lets observers tell a freshly-loaded graph from one that has been
     /// rewritten in-memory.
     generation: AtomicU64,
-    /// WAL LSN that the persisted snapshot reflects (the `end_lsn` of the
-    /// checkpoint that wrote it). 0 means "never persisted". Used by
-    /// startup catch-up to decide which heap rows post-date the snapshot.
+    /// Conservative WAL coverage of the persisted snapshot. Startup replays
+    /// committed index mutations whose decision follows this position.
     last_persisted_lsn: AtomicU64,
-    /// Nodes inserted since the last `mark_persisted` call. Drives the
-    /// dirty-ratio gate for opportunistic checkpoint persistence.
+    /// Nodes inserted since the last snapshot, used for dirty-state tracking.
     dirty_count: AtomicU32,
     /// Tombstoned node count. Drives the stale-ratio gate for opportunistic
     /// compaction at checkpoint. Not persisted to the `.hnsw` file:
@@ -1090,6 +1087,7 @@ pub(crate) struct HnswIndex {
     compaction_cancelled: AtomicBool,
     /// Next node version handle (see `Node::seq`).
     next_seq: AtomicU64,
+    identity_lineage: AtomicU64,
     /// Topology-only graph built from SQ8 codes (paged cold build): nodes
     /// carry no exact vectors, so edge selection must use the codes.
     codes_only: bool,
@@ -1162,6 +1160,7 @@ impl HnswIndex {
             compaction_log_cap: AtomicUsize::new(0),
             compaction_cancelled: AtomicBool::new(false),
             next_seq: AtomicU64::new(0),
+            identity_lineage: AtomicU64::new(0),
             codes_only: false,
             build_reservation: None,
         }
@@ -1301,16 +1300,20 @@ impl HnswIndex {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// WAL LSN that the persisted snapshot reflects (the `end_lsn` of the
-    /// checkpoint that wrote it). 0 if never persisted in this process's
-    /// lifetime AND the graph was not loaded from disk. Consumed by tests
-    /// and the future M7 observability surface.
+    /// Stable identity of the persisted graph structure.
     #[allow(dead_code)]
+    pub(crate) fn lineage(&self) -> u64 {
+        self.identity_lineage.load(Ordering::Acquire)
+    }
+    pub(crate) fn set_lineage(&self, lineage: u64) {
+        self.identity_lineage.store(lineage, Ordering::Release);
+    }
+
     pub(crate) fn last_persisted_lsn(&self) -> u64 {
         self.last_persisted_lsn.load(Ordering::Acquire)
     }
 
-    /// Inserts since the last `mark_persisted`. Drives the dirty-ratio gate.
+    /// Inserts since the last `mark_persisted`.
     pub(crate) fn dirty_count(&self) -> u32 {
         self.dirty_count.load(Ordering::Acquire)
     }
@@ -1374,26 +1377,49 @@ impl HnswIndex {
         marks: Option<&[AtomicBool]>,
     ) -> Result<(), QueryError> {
         let unchanged = {
+            let _mutation = self.mutation_gate.read();
             let _g = self.structural.read();
             let key = pack_row(row_id);
-            let index = self.row_index[row_index_shard(key)].lock();
-            index.get(&key).and_then(|ids| {
-                ids.iter().copied().find(|&id| {
-                    let node = self.nodes.get(id);
-                    !node.deleted.load(Ordering::Acquire) && *node.vector.read() == vector
-                })
-            })
-        };
-        match unchanged {
-            Some(id) => {
-                if let Some(mark) = marks.and_then(|marks| marks.get(id as usize)) {
+            let ids = self.row_index[row_index_shard(key)]
+                .lock()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let latest = ids
+                .iter()
+                .copied()
+                .filter(|&id| !self.nodes.get(id).deleted.load(Ordering::Acquire))
+                .max_by_key(|&id| self.nodes.get(id).seq);
+            if let Some(keep) = latest.filter(|&id| *self.nodes.get(id).vector.read() == vector) {
+                let mut retired = 0;
+                for id in ids.into_iter().filter(|&id| id != keep) {
+                    if self
+                        .nodes
+                        .get(id)
+                        .deleted
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        retired += 1;
+                        self.note_compaction_touch(id);
+                    }
+                }
+                if retired != 0 {
+                    self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+                    self.live.fetch_sub(retired as usize, Ordering::AcqRel);
+                    self.stale_count.fetch_add(retired, Ordering::AcqRel);
+                }
+                if let Some(mark) = marks.and_then(|marks| marks.get(keep as usize)) {
                     mark.store(true, Ordering::Release);
                 }
+                true
+            } else {
+                false
             }
-            None => {
-                self.mark_deleted_by_row_id(row_id);
-                self.insert(row_id, vector)?;
-            }
+        };
+        if !unchanged {
+            self.mark_deleted_by_row_id(row_id);
+            self.insert(row_id, vector)?;
         }
         Ok(())
     }
@@ -3256,7 +3282,31 @@ impl HnswIndex {
         if self.nodes.len() == 0 {
             return Vec::new();
         }
-        let ef = ef_search.max(k).min(self.nodes.len()).max(1);
+        let node_count = self.nodes.len();
+        let ef = ef_search.max(k).min(node_count).max(1);
+        let cmp =
+            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if ef == node_count {
+            // Greedy descent can enter a directed component that cannot reach
+            // every node, even when the cold-build entry can. Exhaustive effort
+            // scores the slab directly, covering such components and avoiding
+            // graph/quantization work without changing bounded ANN searches.
+            let mut out = Vec::with_capacity(node_count);
+            for id in 0..node_count as u32 {
+                let node = self.node_at(id);
+                if !node.deleted.load(Ordering::Acquire) {
+                    let distance =
+                        self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                    out.push((node.row_id, distance));
+                }
+            }
+            if out.len() > k {
+                out.select_nth_unstable_by(k, cmp);
+                out.truncate(k);
+            }
+            out.sort_unstable_by(cmp);
+            return out;
+        }
         // Build/refresh the SQ8 navigation arena (L2 only; no-op otherwise) and
         // quantize the query once. Both outlive the search closure below. The
         // `_structural` read guard above keeps the slab alive across the build.
@@ -3315,8 +3365,6 @@ impl HnswIndex {
                 break;
             }
         }
-        let cmp =
-            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
         if out.len() > k {
             out.select_nth_unstable_by(k, cmp);
             out.truncate(k);
@@ -3329,7 +3377,7 @@ impl HnswIndex {
     //
     // Self-describing, CRC32-checked `.hnsw` format (M1, 2026-06):
     //   [0..4]   HNSW_MAGIC u32         "HNW1"
-    //   [4..6]   HNSW_VERSION u16       2 — v1 is rejected on load
+    //   [4..6]   HNSW_VERSION u16       3 — older versions are rejected
     //   [6]      metric u8              0=L2, 1=Cosine, 2=Dot
     //   [7..11]  dim u32
     //   [11..15] m u32
@@ -3339,13 +3387,13 @@ impl HnswIndex {
     //   [31..35] node_count u32
     //   [35..43] generation u64         monotonic per `mark_persisted`
     //   [43..51] last_persisted_lsn u64 WAL LSN this snapshot reflects
-    //   [51..]   per-node records       (row_id, deleted, vector, neighbours)
+    //   [51..59] structure lineage u64
+    //   [59..67] next node sequence u64
+    //   [67..]   per-node records       (row_id, sequence, deleted, vector, neighbours)
     //   [..-4]   CRC32                  IEEE polynomial over everything above
     //
-    // The graph is derived data: a missing / stale / corrupt file falls
-    // back to a full heap-scan rebuild. The header epilogue (generation +
-    // last_persisted_lsn) lets the loader run an incremental catch-up
-    // instead — see `Database::vector_graph_load_or_build`.
+    // Missing or corrupt files are errors. The coverage position selects
+    // committed index WAL for incremental catch-up without consulting heap.
 
     #[cfg(test)]
     pub(crate) fn serialize(&self) -> Vec<u8> {
@@ -3355,14 +3403,20 @@ impl HnswIndex {
         out
     }
 
-    /// Stream the snapshot node by node. Only `structural` is held (shared),
-    /// so searches and DML proceed throughout and no second graph-sized copy
-    /// is materialised. The node set is the initialized prefix observed after
-    /// the entry point; edges to nodes appended later are omitted, which keeps
-    /// the file self-consistent. Per-node state is read under that node's
-    /// latches; cross-node drift is harmless because a loaded snapshot is
-    /// reconciled against the heap.
+    /// Stream under the mutation barrier without a second graph-sized copy.
+    /// Searches may proceed; topology, payloads and version handles describe
+    /// one coherent state. Later commits are recovered from index WAL.
+    #[cfg(test)]
     pub(crate) fn serialize_into(&self, out: impl io::Write) -> io::Result<()> {
+        self.serialize_into_at(out, self.last_persisted_lsn())
+    }
+
+    pub(crate) fn serialize_into_at(
+        &self,
+        out: impl io::Write,
+        covered_lsn: u64,
+    ) -> io::Result<()> {
+        let _mutation = self.mutation_gate.write();
         struct CrcWriter<W> {
             inner: W,
             crc: crc32fast::Hasher,
@@ -3398,18 +3452,16 @@ impl HnswIndex {
         header.extend_from_slice(&(max_level as u32).to_le_bytes());
         header.extend_from_slice(&(node_count as u32).to_le_bytes());
         header.extend_from_slice(&self.generation.load(Ordering::Acquire).to_le_bytes());
-        header.extend_from_slice(
-            &self
-                .last_persisted_lsn
-                .load(Ordering::Acquire)
-                .to_le_bytes(),
-        );
+        header.extend_from_slice(&covered_lsn.to_le_bytes());
+        header.extend_from_slice(&self.next_seq.load(Ordering::Acquire).to_le_bytes());
+        header.extend_from_slice(&self.lineage().to_le_bytes());
         w.put(&header)?;
         let mut record = Vec::new();
         for id in 0..node_count as u32 {
             let node = self.nodes.get(id);
             record.clear();
             record.extend_from_slice(&pack_row(node.row_id).to_le_bytes());
+            record.extend_from_slice(&node.seq.to_le_bytes());
             record.push(node.deleted.load(Ordering::Acquire) as u8);
             for v in node.vector.read().iter() {
                 record.extend_from_slice(&v.to_le_bytes());
@@ -3473,7 +3525,9 @@ impl HnswIndex {
         let node_count = r.u32()? as usize;
         let generation = r.u64()?;
         let last_persisted_lsn = r.u64()?;
-        let minimum_record = dim.saturating_mul(4).saturating_add(14);
+        let next_seq = r.u64()?;
+        let lineage = r.u64()?;
+        let minimum_record = dim.saturating_mul(4).saturating_add(22);
         if dim > super::codec::MAX_DIM
             || (node_count > 0 && dim == 0)
             || m < 2
@@ -3484,10 +3538,19 @@ impl HnswIndex {
         }
         let index = HnswIndex::new(metric, m, ef_construction);
         index.dim.store(dim, Ordering::Release);
+        index.set_lineage(lineage);
         index.generation.store(generation, Ordering::Release);
         index
             .last_persisted_lsn
             .store(last_persisted_lsn, Ordering::Release);
+        let _version_scratch =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                node_count.saturating_mul(64),
+            )
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let mut seen_seq = HashSet::new();
+        seen_seq.try_reserve(node_count).map_err(io::Error::other)?;
         let mut live = 0usize;
         let mut stale = 0u32;
         for _ in 0..node_count {
@@ -3495,6 +3558,10 @@ impl HnswIndex {
                 .reserve_resident_node(dim)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             let row_id = unpack_row(r.u64()?);
+            let seq = r.u64()?;
+            if seq >= next_seq || !seen_seq.insert(seq) {
+                return Err(err());
+            }
             let deleted = r.u8()? != 0;
             let mut vector = Vec::with_capacity(dim);
             for _ in 0..dim {
@@ -3531,9 +3598,9 @@ impl HnswIndex {
             }
             let id = index
                 .nodes
-                .push_with(|id| Node {
+                .push_with(|_| Node {
                     update_epoch: AtomicU64::new(0),
-                    seq: id as u64,
+                    seq,
                     row_id,
                     vector: RwLock::new(vector),
                     neighbors: Mutex::new(neighbors),
@@ -3567,7 +3634,7 @@ impl HnswIndex {
         };
         index.live.store(live, Ordering::Release);
         index.stale_count.store(stale, Ordering::Release);
-        index.next_seq.store(node_count as u64, Ordering::Release);
+        index.next_seq.store(next_seq, Ordering::Release);
         Ok(index)
     }
 }
@@ -4058,7 +4125,7 @@ mod tests {
     ///        -- --ignored --nocapture`
     /// Tunables: `BENCH_DIM` (768), `BENCH_THREADS` (avail cores), `BENCH_SIZES`.
     #[test]
-    #[ignore]
+    #[ignore = "manual high-dimensional HNSW build timing; run explicitly in release mode"]
     fn build_time_crossover_bench() {
         let dim: usize = std::env::var("BENCH_DIM")
             .ok()
@@ -4334,15 +4401,15 @@ mod tests {
             bytes[data_len..].copy_from_slice(&crc.to_le_bytes());
         };
 
-        // Header is 51 bytes. Walk the variable-size node records and replace
+        // Header is 67 bytes, including retirement sequence identity. Walk the variable-size node records and replace
         // the first real neighbour with node_count (one past the valid range).
         let mut bad_neighbor = original.clone();
         let dim = index.dim();
         let node_count = index.node_count();
-        let mut pos = 51usize;
+        let mut pos = 67usize;
         let mut changed = false;
         for _ in 0..node_count {
-            pos += 8 + 1 + dim * 4;
+            pos += 16 + 1 + dim * 4;
             let levels = bad_neighbor[pos] as usize;
             pos += 1;
             for _ in 0..levels {
@@ -4361,7 +4428,7 @@ mod tests {
         assert!(HnswIndex::deserialize(&bad_neighbor).is_err());
 
         let mut bad_levels = original;
-        let first_level_count = 51 + 8 + 1 + dim * 4;
+        let first_level_count = 67 + 16 + 1 + dim * 4;
         bad_levels[first_level_count] = 33;
         rewrite_crc(&mut bad_levels);
         assert!(HnswIndex::deserialize(&bad_levels).is_err());
@@ -5043,6 +5110,10 @@ mod query_preparation_regressions {
 }
 
 #[cfg(test)]
+#[path = "hnsw_quality_tests.rs"]
+mod quality_tests;
+
+#[cfg(test)]
 mod asynchronous_quant_regressions {
     use super::*;
     #[test]
@@ -5106,8 +5177,8 @@ mod snapshot_validation_regressions {
         for (offset, value) in [
             (7, u32::MAX),
             (31, u32::MAX),
-            (60, f32::NAN.to_bits()),
-            (69, u32::MAX),
+            (84, f32::NAN.to_bits()),
+            (93, u32::MAX),
         ] {
             let mut bytes = snapshot.clone();
             bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

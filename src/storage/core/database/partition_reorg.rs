@@ -357,7 +357,7 @@ impl Database {
                     })
                 })
                 .unwrap_or_else(|| stable_missing_index_id(name));
-            for ext in ["idx", "hnsw", "hvec"] {
+            for ext in ["idx"] {
                 paths.push(index_object_path_by_id(
                     &self.data_dir,
                     sid,
@@ -366,6 +366,17 @@ impl Database {
                     ext,
                 ));
             }
+        }
+        for name in index_names {
+            let index_id = journal.index_ids.get(name).copied().or_else(|| table.as_ref().and_then(|table|
+                table.indexes.iter().find(|index| index.name.eq_ignore_ascii_case(name)).map(|index| index.index_id)))
+                .unwrap_or_else(|| stable_missing_index_id(name));
+            paths.extend(self.owned_vector_files_parts(sid, generation, index_id)?);
+        }
+        if self.durability_mode() != DurabilityMode::Memory {
+            let mut last = 0;
+            for path in &paths { last = self.append_wal(0, WalPayload::FileDelete { path: self.relative_path(path), before: Vec::new() })?; }
+            crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         }
         let mut directories = std::collections::BTreeSet::new();
         for path in paths {

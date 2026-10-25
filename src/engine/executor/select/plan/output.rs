@@ -797,6 +797,16 @@ pub(in crate::engine::executor::select) fn collect_plan_fields(
             out.extend(null_extended_table_fields(table));
         }
 
+        PhysicalPlan::RrfFusion { columns, .. } => {
+            out.extend(columns.iter().map(|column| ColMeta {
+                table: "$rrf".into(),
+                alias: None,
+                column: column.name.clone(),
+                column_type: column.column_type,
+                source: column.source.clone(),
+                invisible: false,
+            }));
+        }
         PhysicalPlan::SetOp { left, .. } => collect_plan_fields(left, out),
         PhysicalPlan::RecursiveUnion { anchor, .. } => collect_plan_fields(anchor, out),
         PhysicalPlan::ValuesScan { columns, .. } => {

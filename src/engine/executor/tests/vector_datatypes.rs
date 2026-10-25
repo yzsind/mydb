@@ -3,6 +3,9 @@ use super::support::query_rows;
 use super::vector_type::HnswEnv;
 use super::*;
 
+#[path = "vector_quality.rs"]
+mod quality;
+
 fn scalar(engine: &StorageQueryEngine, sql: &str) -> String {
     query_rows(engine, sql)[0][0].to_display_string()
 }
@@ -598,6 +601,7 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
                 continue;
             }
             for algo in ["HNSW", "IVF"] {
+                eprintln!("replication case {backend}/{datatype}/{algo}/{quantization:?}");
                 let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let binary = datatype == "BINARY";
@@ -672,6 +676,7 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
                     (format!("UPDATE items SET v='{zero}' WHERE id=127"), "127"),
                     ("DELETE FROM items WHERE id=1".into(), "127"),
                 ] {
+                    eprintln!("replication DML {dml}");
                     master.execute(&dml).unwrap_or_else(|err| {
                         panic!("{backend}/{datatype}/{algo}: {dml}: {err:?}")
                     });
@@ -897,6 +902,1651 @@ fn vector_datatypes_duplicate_hnsw_postings_survive_mutations_and_restart() {
                 let engine = open_strict_test_engine(dir.path());
                 check(&engine);
             }
+        }
+    }
+}
+
+#[test]
+fn every_vector_backend_loads_persistent_structure_without_heap_builds() {
+    for backend in ["memory", "paged"] {
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+            ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+        ]);
+        let mut cases = Vec::new();
+        for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
+            for algorithm in ["HNSW", "IVF"] {
+                cases.push((datatype, algorithm, "none"));
+            }
+        }
+        for quantization in ["sq8", "sq4", "pq", "bq"] {
+            for algorithm in ["HNSW", "IVF"] {
+                cases.push(("FLOAT32", algorithm, quantization));
+            }
+        }
+        for (datatype, algorithm, quantization) in cases {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let query = if datatype == "BINARY" {
+                "[1,0,0,0]"
+            } else {
+                "[1,2,3,4]"
+            };
+            let sql = format!("SELECT id FROM items ORDER BY DISTANCE(v, '{query}') LIMIT 1");
+            let scans;
+            let expected;
+            {
+                let engine = open_strict_test_engine(dir.path());
+                engine
+                    .execute(&format!(
+                        "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                    ))
+                    .unwrap();
+                for id in 1..=32 {
+                    let value = if datatype == "BINARY" {
+                        format!(
+                            "[{},{},{},{}]",
+                            id & 1,
+                            (id >> 1) & 1,
+                            (id >> 2) & 1,
+                            (id >> 3) & 1
+                        )
+                    } else {
+                        format!("[{id},{},{},{}]", id + 1, id + 2, id + 3)
+                    };
+                    engine
+                        .execute(&format!("INSERT INTO items VALUES({id},'{value}')"))
+                        .unwrap();
+                }
+                let options = if algorithm == "HNSW" {
+                    "m=4,ef_construction=32,ef_search=64"
+                } else {
+                    "nlist=4,nprobe=4"
+                };
+                let quant = if quantization == "pq" {
+                    "quantization=pq,pq_m=2,pq_bits=4"
+                } else {
+                    ""
+                };
+                let quant = if quantization == "none" {
+                    String::new()
+                } else if quant.is_empty() {
+                    format!(",quantization={quantization}")
+                } else {
+                    format!(",{quant}")
+                };
+                engine
+                    .execute(&format!(
+                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options}{quant})"
+                    ))
+                    .unwrap();
+                expected = query_rows(&engine, &sql);
+                assert!(!expected.is_empty());
+                engine.checkpoint().unwrap();
+                scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            }
+            let engine = open_strict_test_engine(dir.path());
+            assert_eq!(
+                query_rows(&engine, &sql),
+                expected,
+                "{backend}/{datatype}/{algorithm}/{quantization}"
+            );
+            assert_eq!(
+                crate::storage::Database::vector_build_heap_scans_for_test(),
+                scans,
+                "normal restart rebuilt {backend}/{datatype}/{algorithm}/{quantization}"
+            );
+            assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
+        }
+    }
+}
+
+#[test]
+fn vector_index_crash_replays_committed_deltas_without_heap_builds() {
+    const NAME: &str = "engine::executor::tests::vector_datatypes::vector_index_crash_replays_committed_deltas_without_heap_builds";
+    if let Ok(root) = std::env::var("MYDB_VECTOR_CRASH_CHILD") {
+        let backend = std::env::var("MYDB_VECTOR_CRASH_BACKEND").unwrap();
+        let datatype = std::env::var("MYDB_VECTOR_CRASH_DATATYPE").unwrap();
+        let algorithm = std::env::var("MYDB_VECTOR_CRASH_ALGORITHM").unwrap();
+        let quantization = std::env::var("MYDB_VECTOR_CRASH_QUANTIZATION").unwrap();
+        let phase = std::env::var("MYDB_VECTOR_CRASH_PHASE")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", &backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+            ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+        ]);
+        let engine = open_strict_test_engine(std::path::Path::new(&root));
+        engine
+            .execute(&format!(
+                "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+            ))
+            .unwrap();
+        for id in 1..=32 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO items VALUES({id},'[{id},{},{},{}]')",
+                    id + 1,
+                    id + 2,
+                    id + 3
+                ))
+                .unwrap();
+        }
+        let algorithm_options = if algorithm == "HNSW" {
+            "m=4,ef_construction=32,ef_search=128"
+        } else {
+            "nlist=4,nprobe=4"
+        };
+        let quant = if quantization == "pq" {
+            ",quantization=pq,pq_m=2,pq_bits=4".to_owned()
+        } else {
+            format!(",quantization={quantization}")
+        };
+        engine
+            .execute(&format!(
+                "CREATE INDEX vx ON items(v) USING {algorithm} WITH({algorithm_options}{quant})"
+            ))
+            .unwrap();
+        engine.checkpoint().unwrap();
+        let mut writer = SessionContext::default();
+        engine.execute_with_session(&mut writer, "BEGIN").unwrap();
+        engine
+            .execute_with_session(
+                &mut writer,
+                "UPDATE items SET v='[-100,-100,-100,-100]' WHERE id=1",
+            )
+            .unwrap();
+        engine
+            .execute_with_session(&mut writer, "DELETE FROM items WHERE id=2")
+            .unwrap();
+        engine
+            .execute_with_session(&mut writer, "INSERT INTO items VALUES(999,'[0,0,0,0]')")
+            .unwrap();
+        engine.database().set_vector_crash_phase_for_test(phase);
+        engine.execute_with_session(&mut writer, "COMMIT").unwrap();
+        assert_eq!(phase, 3);
+        std::fs::write(
+            std::path::Path::new(&root).join("acknowledged"),
+            b"INSERT returned success",
+        )
+        .unwrap();
+        std::process::exit(86);
+    }
+    for backend in ["memory", "paged"] {
+        for (datatype, algorithm, quantization) in [
+            ("FLOAT32", "HNSW", "none"),
+            ("FLOAT16", "HNSW", "none"),
+            ("BFLOAT16", "IVF", "none"),
+            ("INT8", "IVF", "none"),
+            ("FLOAT32", "HNSW", "sq8"),
+            ("FLOAT32", "IVF", "pq"),
+        ] {
+            for phase in [1, 2, 3, 4, 5, 6] {
+                if backend == "memory" && (phase == 4 || phase == 5) {
+                    continue;
+                }
+                eprintln!("crash case {backend}/{datatype}/{algorithm}/{quantization}/{phase}");
+                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env("MYDB_VECTOR_CRASH_CHILD", dir.path())
+                    .env("MYDB_VECTOR_CRASH_BACKEND", backend)
+                    .env("MYDB_VECTOR_CRASH_DATATYPE", datatype)
+                    .env("MYDB_VECTOR_CRASH_ALGORITHM", algorithm)
+                    .env("MYDB_VECTOR_CRASH_QUANTIZATION", quantization)
+                    .env("MYDB_VECTOR_CRASH_PHASE", phase.to_string())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    status.status.code(),
+                    Some(86),
+                    "{backend}/{datatype}/{algorithm}/{quantization}/phase={phase}: {}",
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                if phase == 3 {
+                    assert!(dir.path().join("acknowledged").exists());
+                }
+                let _env = HnswEnv::set(&[
+                    ("MYDB_VECTOR_STORAGE", backend),
+                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+                    ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+                ]);
+                let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+                let engine = open_strict_test_engine(dir.path());
+                let table = engine.database().table("items").unwrap();
+                let index = table
+                    .indexes
+                    .iter()
+                    .find(|index| index.is_vector())
+                    .unwrap();
+                let graph = engine
+                    .database()
+                    .vector_graph_get_or_build(&table, index)
+                    .unwrap();
+                assert_eq!(graph.len(),32,"index cardinality after {backend}/{datatype}/{algorithm}/{quantization}/{phase}");
+                let query = crate::engine::vector::codec::parse_text("[0,0,0,0]").unwrap();
+                let effort = if algorithm == "HNSW" {
+                    crate::engine::vector::VectorSearchEffort::Hnsw { ef: 4096 }
+                } else {
+                    crate::engine::vector::VectorSearchEffort::Ivf { nprobe: 4096 }
+                };
+                let candidates = graph
+                    .search(
+                        &query,
+                        crate::engine::vector::VectorSearchRequest {
+                            candidate_limit: 64,
+                            rerank_limit: 64,
+                            effort,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    candidates
+                        .candidates
+                        .iter()
+                        .map(|(row, _)| *row)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                    32,
+                    "raw index coverage must be complete without an executor underfill fallback"
+                );
+                assert_eq!(
+                    scalar(
+                        &engine,
+                        "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+                    ),
+                    if phase == 6 { "1" } else { "999" },
+                    "{backend}/{datatype}/{algorithm}/{quantization}/phase={phase}"
+                );
+                let tail = "id,DISTANCE(v,'[0,0,0,0]') AS d FROM items ORDER BY d,id LIMIT 32";
+                assert_eq!(query_rows(&engine, &format!("SELECT {tail}")),
+                    query_rows(&engine, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}")),
+                    "index contents differ after {backend}/{datatype}/{algorithm}/{quantization}/phase={phase}");
+                assert_eq!(
+                    scalar(&engine, "SELECT COUNT(*) FROM items WHERE id=2"),
+                    if phase == 6 { "1" } else { "0" }
+                );
+                if phase == 6 {
+                    assert_eq!(
+                        scalar(&engine, "SELECT COUNT(*) FROM items WHERE id=999"),
+                        "0"
+                    );
+                }
+                assert_eq!(
+                    crate::storage::Database::vector_build_heap_scans_for_test(),
+                    scans
+                );
+                assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn hnsw_retirements_survive_checkpoint_with_old_reader_and_process_exit() {
+    const NAME: &str = "engine::executor::tests::vector_datatypes::hnsw_retirements_survive_checkpoint_with_old_reader_and_process_exit";
+    if let Ok(root) = std::env::var("MYDB_RETIREMENT_CRASH_CHILD") {
+        let backend = std::env::var("MYDB_RETIREMENT_CRASH_BACKEND").unwrap();
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", &backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        let engine = open_strict_test_engine(std::path::Path::new(&root));
+        engine
+            .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+            .unwrap();
+        for id in 1..=40 {
+            engine
+                .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+                .unwrap();
+        }
+        engine
+            .execute(
+                "CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32,ef_search=128)",
+            )
+            .unwrap();
+        engine
+            .execute("DELETE FROM items WHERE id>=10 AND id<=20")
+            .unwrap();
+        engine.database().maintain_vector_indexes(|| false).unwrap();
+        let mut reader = SessionContext::default();
+        engine
+            .execute_with_session(
+                &mut reader,
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            )
+            .unwrap();
+        engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+        engine
+            .execute_with_session(&mut reader, "SELECT id FROM items WHERE id=1")
+            .unwrap();
+        engine.execute("DELETE FROM items WHERE id=1").unwrap();
+        engine
+            .execute("UPDATE items SET v='[100,100,100,100]' WHERE id=2")
+            .unwrap();
+        engine
+            .execute("INSERT INTO items VALUES(999,'[0,0,0,0]')")
+            .unwrap();
+        assert!(engine.database().pending_vector_retirements_for_test() >= 2);
+        engine.checkpoint().unwrap();
+        assert!(engine.database().pending_vector_retirements_for_test() >= 2);
+        std::process::exit(86);
+    }
+    for backend in ["memory", "paged"] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("MYDB_RETIREMENT_CRASH_CHILD", dir.path())
+            .env("MYDB_RETIREMENT_CRASH_BACKEND", backend)
+            .output()
+            .unwrap();
+        assert_eq!(
+            status.status.code(),
+            Some(86),
+            "{backend}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        let engine = open_strict_test_engine(dir.path());
+        assert_eq!(engine.database().pending_vector_retirements_for_test(), 0);
+        let table = engine.database().table("test.items").unwrap();
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.name == "vx")
+            .unwrap();
+        let graph = engine
+            .database()
+            .vector_graph_get_or_build_for_partition(&table, index, table.id)
+            .unwrap();
+        assert_eq!(
+            graph.len(),
+            29,
+            "old physical node versions were not retired: {backend}"
+        );
+        assert_eq!(
+            scalar(
+                &engine,
+                "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+            ),
+            "999"
+        );
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans
+        );
+    }
+}
+
+#[test]
+fn vector_checkpoint_publication_failures_preserve_wal_and_committed_results() {
+    for backend in ["memory", "paged"] {
+        for (datatype, algorithm, quantization) in [
+            ("FLOAT32", "HNSW", "none"),
+            ("FLOAT16", "HNSW", "none"),
+            ("INT8", "IVF", "none"),
+            ("FLOAT32", "HNSW", "sq8"),
+            ("BFLOAT16", "IVF", "sq4"),
+            ("FLOAT32", "IVF", "pq"),
+        ] {
+            for stage in if backend == "memory" {
+                vec![1, 2, 3, 4, 5]
+            } else {
+                vec![6]
+            } {
+                let _env = HnswEnv::set(&[
+                    ("MYDB_VECTOR_STORAGE", backend),
+                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+                    ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+                ]);
+                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let engine = open_strict_test_engine(dir.path());
+                engine
+                    .execute(&format!(
+                        "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                    ))
+                    .unwrap();
+                for id in 1..=20 {
+                    engine
+                        .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+                        .unwrap();
+                }
+                let params = if algorithm == "HNSW" {
+                    "m=4,ef_construction=32"
+                } else {
+                    "nlist=2,nprobe=2"
+                };
+                let quant = if quantization == "pq" {
+                    "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+                } else {
+                    format!("quantization={quantization}")
+                };
+                engine
+                    .execute(&format!(
+                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({params},{quant})"
+                    ))
+                    .unwrap();
+                engine.checkpoint().unwrap();
+                engine
+                    .execute("UPDATE items SET v='[0,0,0,0]' WHERE id=20")
+                    .unwrap();
+                let ends = |root: &std::path::Path| {
+                    crate::wal::LogManager::scan(root)
+                        .unwrap()
+                        .records
+                        .iter()
+                        .filter(|r| {
+                            matches!(r.payload, crate::wal::WalPayload::CheckpointEnd { .. })
+                        })
+                        .count()
+                };
+                let before = ends(dir.path());
+                engine
+                    .database()
+                    .inject_vector_persist_failure_for_test(stage);
+                let err = engine.checkpoint().unwrap_err();
+                assert!(
+                    err.message()
+                        .contains("injected vector persistence failure"),
+                    "{backend}/{datatype}/{algorithm}/{stage}: {err:?}"
+                );
+                assert_eq!(
+                    ends(dir.path()),
+                    before,
+                    "a failed publication emitted CheckpointEnd"
+                );
+                drop(engine);
+                let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+                let reopened = open_strict_test_engine(dir.path());
+                let sql = "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1";
+                assert_eq!(
+                    scalar(&reopened, sql),
+                    "20",
+                    "{backend}/{datatype}/{algorithm}/{stage}"
+                );
+                assert_eq!(
+                    crate::storage::Database::vector_build_heap_scans_for_test(),
+                    scans
+                );
+                assert!(query_rows(&reopened, "SHOW WARNINGS").is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_vector_decision_after_snapshot_recovers_all_persistent_backends() {
+    for durability in [
+        crate::storage::DurabilityMode::Strict,
+        crate::storage::DurabilityMode::Relaxed,
+    ] {
+        for backend in ["memory", "paged"] {
+            for (datatype, algorithm, quantization) in [
+                ("FLOAT32", "HNSW", "none"),
+                ("FLOAT16", "HNSW", "none"),
+                ("INT8", "IVF", "none"),
+                ("FLOAT32", "HNSW", "sq4"),
+                ("FLOAT32", "IVF", "sq8"),
+                ("FLOAT32", "HNSW", "bq"),
+                ("FLOAT32", "IVF", "pq"),
+            ] {
+                let _env = HnswEnv::set(&[
+                    ("MYDB_VECTOR_STORAGE", backend),
+                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+                    ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+                ]);
+                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let open = || {
+                    let mut config = memory_test_storage_config();
+                    config.durability = durability;
+                    config.buffer_pool_pages = 2048;
+                    StorageQueryEngine::open_with_storage_config_without_background_workers(
+                        dir.path(),
+                        config,
+                    )
+                    .unwrap()
+                };
+                let engine = open();
+                engine
+                    .execute(&format!(
+                        "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                    ))
+                    .unwrap();
+                for id in 1..=20 {
+                    engine
+                        .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+                        .unwrap();
+                }
+                let params = if algorithm == "HNSW" {
+                    "m=4,ef_construction=32,ef_search=128"
+                } else {
+                    "nlist=2,nprobe=2"
+                };
+                let quant = if quantization == "pq" {
+                    "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+                } else {
+                    format!("quantization={quantization}")
+                };
+                engine
+                    .execute(&format!(
+                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({params},{quant})"
+                    ))
+                    .unwrap();
+                let mut session = SessionContext::default();
+                for sql in [
+                    "XA START 'decision-after-snapshot'",
+                    "INSERT INTO items VALUES(999,'[0,0,0,0]')",
+                    "XA END 'decision-after-snapshot'",
+                    "XA PREPARE 'decision-after-snapshot'",
+                ] {
+                    engine.execute_with_session(&mut session, sql).unwrap();
+                }
+                engine.checkpoint().unwrap();
+                drop(engine);
+                let recovered = open();
+                let count_batches = || {
+                    crate::wal::LogManager::scan(dir.path())
+                        .unwrap()
+                        .records
+                        .iter()
+                        .filter(|r| {
+                            matches!(r.payload, crate::wal::WalPayload::VectorIndexBatch { .. })
+                        })
+                        .count()
+                };
+                let before = count_batches();
+                recovered.database().test_interrupt_vector_completion();
+                let err = recovered
+                    .execute("XA COMMIT 'decision-after-snapshot'")
+                    .unwrap_err();
+                assert!(
+                    err.message()
+                        .contains("injected XA vector completion interruption"),
+                    "{err:?}"
+                );
+                assert_eq!(
+                    count_batches(),
+                    before,
+                    "a PREPARED immutable journal must not be re-logged at COMMIT"
+                );
+                // Relaxed durability explicitly forces the WAL boundary before
+                // simulating a process loss; it promises no per-COMMIT fsync.
+                recovered.database().wal_log().lock().flush().unwrap();
+                drop(recovered);
+                let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+                let reopened = open();
+                assert_eq!(
+                    scalar(
+                        &reopened,
+                        "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+                    ),
+                    "999",
+                    "{durability:?}/{backend}/{datatype}/{algorithm}/{quantization}"
+                );
+                assert_eq!(
+                    crate::storage::Database::vector_build_heap_scans_for_test(),
+                    scans
+                );
+                assert!(query_rows(&reopened, "SHOW WARNINGS").is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_source_images_survive_partial_transfer_restartpoints_without_heap_builds() {
+    use std::io::{Read, Seek, SeekFrom};
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let dest = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    fn project(
+        master: &StorageQueryEngine,
+        replica: &StorageQueryEngine,
+        source: &std::path::Path,
+        after: u64,
+        through: u64,
+    ) {
+        for prefix in master
+            .database()
+            .wal_log()
+            .lock()
+            .pin_prefix_after(after, None)
+            .unwrap()
+        {
+            let mut file = prefix.file.open().unwrap().try_clone().unwrap();
+            file.seek(SeekFrom::Start(prefix.start_offset)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(prefix.len - prefix.start_offset)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let frame = crate::wal::decode_frame_for_replication(&bytes[offset..]).unwrap();
+                if frame.header.lsn <= through
+                    && frame.header.lsn > replica.database().wal_log().lock().last_lsn()
+                {
+                    replica
+                        .database()
+                        .wal_log()
+                        .lock()
+                        .append_replication_frame(&bytes[offset..offset + frame.frame_len], &frame)
+                        .unwrap();
+                }
+                offset += frame.frame_len;
+            }
+        }
+        replica.database().wal_log().lock().flush().unwrap();
+        let scan = crate::wal::LogManager::scan(source).unwrap();
+        for record in scan
+            .records
+            .iter()
+            .filter(|record| record.lsn > after && record.lsn <= through)
+        {
+            replica.database().apply_wal_record(record).unwrap();
+        }
+    }
+    for backend in ["memory", "paged"] {
+        for algorithm in ["HNSW", "IVF"] {
+            let _env = HnswEnv::set(&[
+                ("MYDB_VECTOR_STORAGE", backend),
+                ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+                ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+            ]);
+            let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            {
+                let engine = open_strict_test_engine(source.path());
+                engine
+                    .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(2048) NOT NULL)")
+                    .unwrap();
+                for id in 1..=130 {
+                    let vector = std::iter::repeat_n(id.to_string(), 2048)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    engine
+                        .execute(&format!("INSERT INTO items VALUES({id},'[{vector}]')"))
+                        .unwrap();
+                }
+                let options = if algorithm == "HNSW" {
+                    "m=4,ef_construction=32,ef_search=256"
+                } else {
+                    "nlist=4,nprobe=4,kmeans_iters=2"
+                };
+                engine
+                    .execute(&format!(
+                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options})"
+                    ))
+                    .unwrap();
+                engine.checkpoint().unwrap();
+            }
+            copy_tree(source.path(), target.path());
+            let mut role = crate::repl::role::RoleState::new_standalone();
+            role.demote_to_replica("127.0.0.1:1".into());
+            crate::repl::role::save(target.path(), &role).unwrap();
+            let master = open_strict_test_engine(source.path());
+            let replica = open_strict_test_engine(target.path());
+            replica.database().set_physical_replica_mode(true).unwrap();
+            let table = master.database().table("items").unwrap();
+            let index = table
+                .indexes
+                .iter()
+                .find(|index| index.is_vector())
+                .unwrap();
+            let before = replica.database().wal_log().lock().last_lsn();
+            let old_lineage = replica
+                .database()
+                .vector_graph_get_or_build(&table, index)
+                .unwrap()
+                .identity_lineage();
+            let query = format!(
+                "SELECT id FROM items ORDER BY DISTANCE(v,'[{}]') LIMIT 1",
+                std::iter::repeat_n("0", 2048).collect::<Vec<_>>().join(",")
+            );
+            assert_eq!(scalar(&replica, &query), "1");
+            master
+                .database()
+                .rebuild_vector_for_test(&table, index, table.id)
+                .unwrap();
+            master.database().wal_log().lock().flush().unwrap();
+            let scan = crate::wal::LogManager::scan(source.path()).unwrap();
+            let images = scan
+                .records
+                .iter()
+                .filter(|record| {
+                    record.lsn > before
+                        && matches!(
+                            record.payload,
+                            crate::wal::WalPayload::VectorIndexImage { .. }
+                        )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                images.len() >= 2,
+                "{backend}/{algorithm}: image must span multiple WAL chunks"
+            );
+            let first = images[0].lsn;
+            let image_path = match &images[0].payload {
+                crate::wal::WalPayload::VectorIndexImage { path, .. } => path.clone(),
+                _ => unreachable!(),
+            };
+            project(&master, &replica, source.path(), before, first);
+            replica.checkpoint().unwrap();
+            assert!(
+                crate::wal::LogManager::scan(target.path())
+                    .unwrap()
+                    .records
+                    .iter()
+                    .any(|record| record.lsn == first),
+                "restartpoint reclaimed an incomplete image prefix"
+            );
+            drop(replica);
+            // Emulate loss of unsynchronized staging bytes. WAL must reconstruct
+            // this private file from its retained first chunk after a crash.
+            let incoming = target.path().join(&image_path).with_extension(format!(
+                "{}.incoming",
+                std::path::Path::new(&image_path)
+                    .extension()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            ));
+            assert!(incoming.exists());
+            std::fs::write(&incoming, []).unwrap();
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            let fork = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            copy_tree(target.path(), fork.path());
+            let promoted = open_strict_test_engine(fork.path());
+            promoted
+                .database()
+                .persist_replicated_undo_for_promotion()
+                .unwrap();
+            promoted
+                .database()
+                .rollback_all_active_replication_txns()
+                .unwrap();
+            promoted
+                .database()
+                .restore_replicated_xa_for_promotion()
+                .unwrap();
+            promoted.database().prepare_sequence_promotion().unwrap();
+            promoted.checkpoint().unwrap();
+            promoted
+                .database()
+                .set_physical_replica_mode(false)
+                .unwrap();
+            promoted.database().prepare_sequence_promotion().unwrap();
+            promoted.checkpoint().unwrap();
+            crate::repl::role::save(fork.path(), &crate::repl::role::RoleState::new_standalone())
+                .unwrap();
+            let abandoned = fork
+                .path()
+                .join(incoming.strip_prefix(target.path()).unwrap());
+            assert!(
+                !abandoned.exists(),
+                "promotion must retire an unpublished partial image"
+            );
+            assert_eq!(scalar(&promoted, &query), "1");
+            assert_eq!(
+                promoted
+                    .database()
+                    .vector_graph_get_or_build(&table, index)
+                    .unwrap()
+                    .identity_lineage(),
+                old_lineage
+            );
+            drop(promoted);
+            let promoted = open_strict_test_engine(fork.path());
+            assert_eq!(scalar(&promoted, &query), "1");
+            drop(promoted);
+            let replica = open_strict_test_engine(target.path());
+            assert_eq!(scalar(&replica, &query), "1");
+            assert_eq!(
+                replica
+                    .database()
+                    .vector_graph_get_or_build(&table, index)
+                    .unwrap()
+                    .identity_lineage(),
+                old_lineage,
+                "a local checkpoint must preserve the source structure identity"
+            );
+            assert!(
+                std::fs::metadata(&incoming).unwrap().len() > 0,
+                "partial image was not reconstructed from WAL"
+            );
+            project(&master, &replica, source.path(), first, scan.next_lsn - 1);
+            let new_path = replica
+                .database()
+                .active_vector_file_for_test(&table, index, table.id)
+                .unwrap();
+            let published = master
+                .database()
+                .active_vector_file_for_test(&table, index, table.id)
+                .unwrap();
+            assert_eq!(
+                new_path,
+                target
+                    .path()
+                    .join(published.strip_prefix(source.path()).unwrap()),
+                "source publication must supersede a local checkpoint pointer"
+            );
+            let published_lineage = master
+                .database()
+                .vector_graph_get_or_build(&table, index)
+                .unwrap()
+                .identity_lineage();
+            assert_ne!(published_lineage, old_lineage);
+            assert_eq!(
+                replica
+                    .database()
+                    .vector_graph_get_or_build(&table, index)
+                    .unwrap()
+                    .identity_lineage(),
+                published_lineage
+            );
+            assert_eq!(scalar(&replica, &query), "1");
+            assert_eq!(
+                crate::storage::Database::vector_build_heap_scans_for_test(),
+                scans
+            );
+            assert!(query_rows(&replica, "SHOW WARNINGS").is_empty());
+        }
+    }
+}
+
+#[test]
+fn copy_checkpoint_between_decision_and_graph_transfer_preserves_index_journal() {
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let path = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &path);
+            } else {
+                std::fs::copy(entry.path(), path).unwrap();
+            }
+        }
+    }
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "memory"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for (algorithm, quantization) in [
+        ("HNSW", "none"),
+        ("IVF", "none"),
+        ("HNSW", "sq8"),
+        ("IVF", "pq"),
+    ] {
+        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let source = root.path().join("source");
+        let recovered = root.path().join("recovered");
+        let engine = std::sync::Arc::new(open_strict_test_engine(&source));
+        engine
+            .execute("CREATE TABLE items(id INT PRIMARY KEY,extra INT,v VECTOR(4) NOT NULL)")
+            .unwrap();
+        for id in 1..=32 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO items VALUES({id},{id},'[{id},1,2,3]')"
+                ))
+                .unwrap();
+        }
+        let options = if algorithm == "HNSW" {
+            "m=4,ef_construction=32,ef_search=128"
+        } else {
+            "nlist=2,nprobe=2"
+        };
+        let quant = if quantization == "pq" {
+            "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+        } else {
+            format!("quantization={quantization}")
+        };
+        engine
+            .execute(&format!(
+                "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options},{quant})"
+            ))
+            .unwrap();
+        engine.checkpoint().unwrap();
+        let catchup = engine.database().install_online_copy_publish_test_hook();
+        let committed = engine.database().install_vector_copy_commit_test_hook();
+        let worker = engine.clone();
+        let ddl = std::thread::spawn(move || {
+            let mut session = SessionContext::default();
+            session.connection_id = 8131;
+            worker.execute_with_session(
+                &mut session,
+                "ALTER TABLE items MODIFY extra BIGINT, LOCK=NONE",
+            )
+        });
+        let reached = catchup.wait_until_reached(std::time::Duration::from_secs(10));
+        if !reached {
+            catchup.release();
+            committed.release();
+            panic!("COPY did not reach catch-up: {:?}", ddl.join().unwrap());
+        }
+        let mut writer = SessionContext::default();
+        writer.connection_id = 8132;
+        for sql in [
+            "UPDATE items SET v='[100,100,100,100]' WHERE id=1",
+            "DELETE FROM items WHERE id=2",
+            "INSERT INTO items VALUES(999,999,'[0,0,0,0]')",
+        ] {
+            engine.execute_with_session(&mut writer, sql).unwrap();
+        }
+        catchup.release();
+        let reached = committed.wait_until_reached(std::time::Duration::from_secs(10));
+        if !reached {
+            committed.release();
+            panic!(
+                "COPY did not reach the committed transfer gap: {:?}",
+                ddl.join().unwrap()
+            );
+        }
+        let checkpoint = engine.checkpoint();
+        if checkpoint.is_ok() {
+            copy_tree(&source, &recovered);
+        }
+        committed.release();
+        ddl.join().unwrap().unwrap();
+        checkpoint.unwrap();
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        let restarted = open_strict_test_engine(&recovered);
+        let tail = "id,DISTANCE(v,'[0,0,0,0]') AS d FROM items ORDER BY d,id LIMIT 32";
+        assert_eq!(
+            scalar(
+                &restarted,
+                "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+            ),
+            "999",
+            "{algorithm}/{quantization}"
+        );
+        assert_eq!(
+            query_rows(&restarted, &format!("SELECT {tail}")),
+            query_rows(&restarted, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}")),
+            "{algorithm}/{quantization}"
+        );
+        assert_eq!(
+            scalar(&restarted, "SELECT COUNT(*) FROM items WHERE id=2"),
+            "0"
+        );
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans
+        );
+        assert!(query_rows(&restarted, "SHOW WARNINGS").is_empty());
+    }
+}
+
+#[test]
+fn failed_vector_rebuild_keeps_old_index_and_resumes_its_durable_job_after_restart() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "memory"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+    ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+        .unwrap();
+    for id in 1..=32 {
+        engine
+            .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+            .unwrap();
+    }
+    engine.execute("CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32,ef_search=256,quantization=sq8)").unwrap();
+    let table = engine.database().table("items").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    let old_uid = engine
+        .database()
+        .vector_graph_get_or_build(&table, index)
+        .unwrap()
+        .identity_lineage();
+    for id in 100..164 {
+        engine
+            .execute(&format!(
+                "INSERT INTO items VALUES({id},'[{},1,2,3]')",
+                1000 + id
+            ))
+            .unwrap();
+    }
+    engine.database().inject_vector_persist_failure_for_test(1);
+    let err = engine
+        .database()
+        .maintain_vector_indexes(|| false)
+        .unwrap_err();
+    assert!(
+        err.message()
+            .contains("injected vector persistence failure"),
+        "{err:?}"
+    );
+    assert!(engine.database().ensure_operational().is_ok());
+    assert_eq!(
+        engine
+            .database()
+            .vector_graph_get_or_build(&table, index)
+            .unwrap()
+            .identity_lineage(),
+        old_uid
+    );
+    let marker = crate::storage::naming::index_object_path_by_id(
+        dir.path(),
+        table.id,
+        table.active_generation.max(1),
+        index.index_id,
+        "vmaintenance",
+    );
+    let first = std::fs::read(&marker).unwrap();
+    assert_eq!(
+        scalar(
+            &engine,
+            "SELECT id FROM items ORDER BY DISTANCE(v,'[1100,1,2,3]') LIMIT 1"
+        ),
+        "100"
+    );
+    engine.database().inject_vector_persist_failure_for_test(1);
+    assert!(engine.database().maintain_vector_indexes(|| false).is_err());
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        first,
+        "a retry replaced the first durable failure"
+    );
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+    let restarted = open_strict_test_engine(dir.path());
+    assert_eq!(
+        crate::storage::Database::vector_build_heap_scans_for_test(),
+        scans,
+        "startup rebuilt a failed job's valid old object"
+    );
+    assert_eq!(
+        restarted
+            .database()
+            .vector_graph_get_or_build(&table, index)
+            .unwrap()
+            .identity_lineage(),
+        old_uid
+    );
+    assert!(marker.exists());
+    restarted
+        .database()
+        .maintain_vector_indexes(|| false)
+        .unwrap();
+    assert!(
+        !marker.exists(),
+        "successful explicit maintenance did not retire its durable failure"
+    );
+    assert_ne!(
+        restarted
+            .database()
+            .vector_graph_get_or_build(&table, index)
+            .unwrap()
+            .identity_lineage(),
+        old_uid
+    );
+    assert_eq!(
+        scalar(
+            &restarted,
+            "SELECT id FROM items ORDER BY DISTANCE(v,'[1100,1,2,3]') LIMIT 1"
+        ),
+        "100"
+    );
+    assert!(query_rows(&restarted, "SHOW WARNINGS").is_empty());
+}
+
+#[test]
+fn checkpoint_during_committed_vector_batch_never_overstates_snapshot_coverage() {
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let dest = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "memory"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+    ]);
+    for (datatype, algorithm, quantization) in [
+        ("FLOAT32", "HNSW", "none"),
+        ("FLOAT16", "HNSW", "none"),
+        ("INT8", "IVF", "none"),
+        ("FLOAT32", "HNSW", "sq8"),
+        ("FLOAT32", "IVF", "pq"),
+    ] {
+        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("recovered");
+        let open = |path: &std::path::Path| {
+            let mut config = memory_test_storage_config();
+            config.durability = crate::storage::DurabilityMode::Strict;
+            config.undo_retention = std::time::Duration::ZERO;
+            config.buffer_pool_pages = 2048;
+            StorageQueryEngine::open_with_storage_config_without_background_workers(path, config)
+                .unwrap()
+        };
+        let engine = std::sync::Arc::new(open(&source));
+        engine
+            .execute(&format!(
+                "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+            ))
+            .unwrap();
+        for id in 1..=20 {
+            engine
+                .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+                .unwrap();
+        }
+        let options = if algorithm == "HNSW" {
+            "m=4,ef_construction=32,ef_search=128"
+        } else {
+            "nlist=2,nprobe=2"
+        };
+        let quant = if quantization == "pq" {
+            "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+        } else {
+            format!("quantization={quantization}")
+        };
+        engine
+            .execute(&format!(
+                "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options},{quant})"
+            ))
+            .unwrap();
+        engine.checkpoint().unwrap();
+        let hook = engine.database().install_vector_apply_test_hook();
+        let worker = engine.clone();
+        let writer = std::thread::spawn(move || {
+            let mut session = SessionContext::default();
+            for sql in [
+                "BEGIN",
+                "UPDATE items SET v='[100,100,100,100]' WHERE id=1",
+                "INSERT INTO items VALUES(999,'[0,0,0,0]')",
+                "DELETE FROM items WHERE id=2",
+                "COMMIT",
+            ] {
+                worker.execute_with_session(&mut session, sql).unwrap();
+            }
+        });
+        let reached = hook.wait_until_reached(std::time::Duration::from_secs(10));
+        if !reached {
+            hook.release();
+            writer.join().unwrap();
+            panic!("vector maintenance did not pause");
+        }
+        let checkpoint = engine.checkpoint();
+        if checkpoint.is_ok() {
+            copy_tree(&source, &target);
+        }
+        hook.release();
+        writer.join().unwrap();
+        checkpoint.unwrap();
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        let recovered = open(&target);
+        assert_eq!(
+            scalar(
+                &recovered,
+                "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+            ),
+            "999",
+            "{datatype}/{algorithm}/{quantization}"
+        );
+        let tail = "id,DISTANCE(v,'[0,0,0,0]') d FROM items ORDER BY d,id LIMIT 20";
+        assert_eq!(
+            query_rows(&recovered, &format!("SELECT {tail}")),
+            query_rows(&recovered, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}"))
+        );
+        assert_eq!(scalar(&recovered,"SELECT LIVE_NODES FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"20","a partial retirement collector left live superseded versions");
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans
+        );
+        assert!(query_rows(&recovered, "SHOW WARNINGS").is_empty());
+    }
+}
+
+#[test]
+fn storage_single_insert_uses_durable_deferred_vector_maintenance() {
+    for backend in ["memory", "paged"] {
+        for (datatype, algorithm) in [("FLOAT32", "HNSW"), ("FLOAT16", "HNSW"), ("INT8", "IVF")] {
+            let _env = HnswEnv::set(&[
+                ("MYDB_VECTOR_STORAGE", backend),
+                ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+            ]);
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            {
+                let engine = open_strict_test_engine(dir.path());
+                engine
+                    .execute(&format!(
+                        "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                    ))
+                    .unwrap();
+                for id in 1..=20 {
+                    engine
+                        .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+                        .unwrap();
+                }
+                let options = if algorithm == "HNSW" {
+                    "m=4,ef_construction=32,ef_search=128"
+                } else {
+                    "nlist=2,nprobe=2"
+                };
+                engine
+                    .execute(&format!(
+                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options})"
+                    ))
+                    .unwrap();
+                engine.checkpoint().unwrap();
+                let db = engine.database();
+                let table = db.table("items").unwrap();
+                let index = table
+                    .indexes
+                    .iter()
+                    .find(|index| index.is_vector())
+                    .unwrap();
+                let dtype = match datatype {
+                    "FLOAT16" => crate::vector::VectorDataType::Float16,
+                    "INT8" => crate::vector::VectorDataType::Int8,
+                    _ => crate::vector::VectorDataType::Float32,
+                };
+                let value =
+                    crate::engine::vector::codec::parse_typed_text("[0,0,0,0]", dtype).unwrap();
+                let txn = db.begin_dml_txn().unwrap();
+                db.insert_row(
+                    txn,
+                    "test.items",
+                    vec![Value::Int(999), Value::Vector(value.clone())],
+                )
+                .unwrap();
+                assert_eq!(
+                    db.vector_graph_get_or_build(&table, index).unwrap().len(),
+                    20,
+                    "single-row storage insert mutated the public graph before its decision"
+                );
+                db.rollback_txn(txn.txn_id).unwrap();
+                assert_eq!(
+                    db.vector_graph_get_or_build(&table, index).unwrap().len(),
+                    20,
+                    "rollback left a graph ghost"
+                );
+                let txn = db.begin_dml_txn().unwrap();
+                db.insert_row(
+                    txn,
+                    "test.items",
+                    vec![Value::Int(1000), Value::Vector(value)],
+                )
+                .unwrap();
+                db.commit_txn(txn.txn_id).unwrap();
+            }
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            let reopened = open_strict_test_engine(dir.path());
+            assert_eq!(
+                scalar(
+                    &reopened,
+                    "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+                ),
+                "1000",
+                "{backend}/{datatype}/{algorithm}"
+            );
+            assert_eq!(
+                scalar(&reopened, "SELECT COUNT(*) FROM items WHERE id=999"),
+                "0"
+            );
+            assert_eq!(
+                crate::storage::Database::vector_build_heap_scans_for_test(),
+                scans
+            );
+            assert!(query_rows(&reopened, "SHOW WARNINGS").is_empty());
+        }
+    }
+}
+
+#[test]
+fn pinned_readers_keep_linear_vector_retirement_obligations() {
+    for backend in ["memory", "paged"] {
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+            ("MYDB_HNSW_UPDATE_INPLACE", "0"),
+            ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+        ]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        for sql in [
+            "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)",
+            "INSERT INTO items VALUES(1,'[0,0]')",
+            "CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32)",
+        ] {
+            engine.execute(sql).unwrap();
+        }
+        let mut reader = SessionContext::default();
+        for sql in [
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "BEGIN",
+            "SELECT COUNT(*) FROM items",
+        ] {
+            engine.execute_with_session(&mut reader, sql).unwrap();
+        }
+        for id in 1..=64 {
+            engine
+                .execute(&format!("UPDATE items SET v='[{id},0]' WHERE id=1"))
+                .unwrap();
+        }
+        assert_eq!(
+            engine
+                .database()
+                .pending_vector_retirement_versions_for_test(),
+            64,
+            "{backend}: superseded versions were scheduled repeatedly"
+        );
+        let old = super::support::result_rows(
+            engine
+                .execute_with_session(
+                    &mut reader,
+                    "SELECT VECTOR_TO_STRING(v) FROM items WHERE id=1",
+                )
+                .unwrap()
+                .materialize()
+                .unwrap(),
+        );
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0][0].to_display_string(), "[0,0]");
+        engine.execute_with_session(&mut reader, "COMMIT").unwrap();
+        engine.database().maintain_vector_indexes(|| false).unwrap();
+        assert_eq!(
+            engine
+                .database()
+                .pending_vector_retirement_versions_for_test(),
+            0
+        );
+        assert_eq!(scalar(&engine,"SELECT LIVE_NODES FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"1");
+        assert_eq!(
+            scalar(
+                &engine,
+                "SELECT VECTOR_TO_STRING(v) FROM items ORDER BY DISTANCE(v,'[64,0]') LIMIT 1"
+            ),
+            "[64,0]"
+        );
+    }
+}
+
+#[test]
+fn resident_checkpoint_retirements_stay_bounded_without_background_workers() {
+    fn snapshot_count(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    snapshot_count(&entry.path())
+                } else {
+                    usize::from(entry.path().extension().is_some_and(|ext| ext == "hnsw"))
+                }
+            })
+            .sum()
+    }
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "memory"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for (algorithm, options) in [
+        ("HNSW", "m=4,ef_construction=32"),
+        ("IVF", "nlist=2,nprobe=2,quantization=pq,pq_m=2,pq_bits=4"),
+    ] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+            .unwrap();
+        for id in 1..=32 {
+            engine
+                .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
+                .unwrap();
+        }
+        engine
+            .execute(&format!(
+                "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options})"
+            ))
+            .unwrap();
+        let table = engine.database().table("items").unwrap();
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_vector())
+            .unwrap();
+        let initial = engine
+            .database()
+            .active_vector_file_for_test(&table, index, table.id)
+            .unwrap();
+        for _ in 0..3 {
+            engine.checkpoint().unwrap();
+        }
+        assert_eq!(
+            engine
+                .database()
+                .active_vector_file_for_test(&table, index, table.id)
+                .unwrap(),
+            initial,
+            "clean checkpoints must preserve the already durable object"
+        );
+        for iteration in 0..70 {
+            engine
+                .execute(&format!(
+                    "UPDATE items SET v='[1,1,2,{}]' WHERE id=1",
+                    3 + iteration % 2
+                ))
+                .unwrap();
+            engine.checkpoint().unwrap();
+            assert_eq!(
+                snapshot_count(dir.path()),
+                1,
+                "retired resident files must be reclaimed"
+            );
+        }
+        let coverage = scalar(&engine, "SELECT LAST_PERSISTED_LSN FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'");
+        assert!(
+            coverage.parse::<u64>().unwrap() > 0,
+            "resident coverage must be observable"
+        );
+        drop(engine);
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        let engine = open_strict_test_engine(dir.path());
+        assert_eq!(
+            scalar(
+                &engine,
+                "SELECT id FROM items ORDER BY DISTANCE(v,'[0,1,2,3]') LIMIT 1"
+            ),
+            "1"
+        );
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans
+        );
+        assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
+        let root = dir.path().join("system/vector-purges.v1");
+        let mut damaged = std::fs::read(&root).unwrap();
+        assert_eq!(damaged.len(), 17);
+        damaged[0] ^= 1;
+        std::fs::write(&root, &damaged).unwrap();
+        let completed = || {
+            crate::wal::LogManager::scan(dir.path())
+                .unwrap()
+                .records
+                .iter()
+                .filter(|record| {
+                    matches!(record.payload, crate::wal::WalPayload::CheckpointEnd { .. })
+                })
+                .count()
+        };
+        let before = completed();
+        let err = engine.checkpoint().unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
+        assert_eq!(
+            completed(),
+            before,
+            "corrupt mandatory state cannot publish CheckpointEnd"
+        );
+        assert!(
+            engine.execute("SELECT 1").is_err(),
+            "known root corruption must fence service"
+        );
+        assert_eq!(
+            std::fs::read(&root).unwrap(),
+            damaged,
+            "checkpoint replaced corruption evidence"
+        );
+        drop(engine);
+        let mut config = memory_test_storage_config();
+        config.durability = crate::storage::DurabilityMode::Strict;
+        assert!(
+            StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(),
+                config
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&root).unwrap(), damaged);
+    }
+}
+
+#[test]
+fn physical_replica_explain_preserves_authoritative_statistics_and_index_state() {
+    for backend in ["memory", "paged"] {
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        for (datatype, algorithm) in [("FLOAT32", "HNSW"), ("FLOAT16", "HNSW"), ("FLOAT32", "IVF")]
+        {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let engine = open_strict_test_engine(dir.path());
+            engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL,body TEXT)")).unwrap();
+            let values = (1..=128)
+                .map(|id| format!("({id},'[{id},1,2,3]','persisted database index')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            engine
+                .execute(&format!("INSERT INTO items VALUES {values}"))
+                .unwrap();
+            let options = if algorithm == "HNSW" {
+                "m=4,ef_construction=32,ef_search=256"
+            } else {
+                "nlist=4,nprobe=4"
+            };
+            engine
+                .execute(&format!(
+                    "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options})"
+                ))
+                .unwrap();
+            engine
+                .execute("CREATE FULLTEXT INDEX ft ON items(body)")
+                .unwrap();
+            engine.database().set_physical_replica_mode(true).unwrap();
+            let table = engine.database().table("items").unwrap();
+            let before = (
+                table.schema_version,
+                serde_json::to_string(&table.stats).unwrap(),
+                engine.database().table_modification_delta(table.id),
+            );
+            assert!(table.stats_needs_refresh_with_delta(before.2));
+            let lsn = engine.database().wal_log().lock().last_lsn();
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            engine
+                .database()
+                .refresh_stale_stats_for_tables(["items"])
+                .unwrap();
+            assert_eq!(engine.database().auto_analyze_stale_tables(0.1).unwrap(), 0);
+            let hint = if algorithm == "HNSW" {
+                "HNSW_EF(256)"
+            } else {
+                "IVF_NPROBE(4)"
+            };
+            let sql = format!(
+                "SELECT /*+ {hint} */ id FROM items ORDER BY DISTANCE(v,'[0,1,2,3]') LIMIT 1"
+            );
+            let plan = query_rows(&engine, &format!("EXPLAIN {sql}"));
+            assert!(
+                plan.iter()
+                    .flatten()
+                    .any(|value| value.to_display_string().contains("Using vector index")),
+                "{plan:?}"
+            );
+            assert_eq!(scalar(&engine, &sql), "1");
+            assert_eq!(
+                scalar(
+                    &engine,
+                    "SELECT COUNT(*) FROM items WHERE MATCH(body) AGAINST('persisted')"
+                ),
+                "128"
+            );
+            let after = engine.database().table("items").unwrap();
+            assert_eq!(
+                (
+                    after.schema_version,
+                    serde_json::to_string(&after.stats).unwrap(),
+                    engine.database().table_modification_delta(after.id)
+                ),
+                before
+            );
+            assert_eq!(
+                engine.database().wal_log().lock().last_lsn(),
+                lsn,
+                "a replica query appended local WAL"
+            );
+            assert_eq!(
+                crate::storage::Database::vector_build_heap_scans_for_test(),
+                scans
+            );
+            let err = engine.database().analyze_table("items").unwrap_err();
+            assert!(
+                err.is(crate::error::catalog::ER_OPTION_PREVENTS_STATEMENT),
+                "{err:?}"
+            );
+            assert_eq!(
+                scalar(&engine, "SELECT 1"),
+                "1",
+                "rejected maintenance must not fail-stop a healthy replica"
+            );
+            assert_eq!(engine.database().wal_log().lock().last_lsn(), lsn);
         }
     }
 }

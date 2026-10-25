@@ -88,6 +88,12 @@ impl StatsSource {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct NodeStats {
+    pub rrf_branches: u8,
+    pub rrf_input_rows: [u64; 8],
+    pub rrf_unique_rows: [u64; 8],
+    pub rrf_union_rows: u64,
+    pub rrf_overlap_rows: u64,
+    pub rrf_fusion_ns: u128,
     pub source: StatsSource,
     /// Sum, over all loops, of the active time needed to produce the first
     /// iterator result.  EOF is the first result for an empty loop.
@@ -1256,6 +1262,36 @@ pub(crate) fn add_peak_memory(plan: &PhysicalPlan, bytes: u64) {
     });
 }
 
+/// Publish completed fusion work only; no partial candidates become results.
+pub(super) fn add_rrf_work(
+    plan: &PhysicalPlan,
+    branches: usize,
+    input: [u64; 8],
+    unique: [u64; 8],
+    union: u64,
+    overlap: u64,
+    fusion_ns: u128,
+) {
+    let Some(key) = plan_key(plan) else {
+        return;
+    };
+    STATS_COLLECTOR.with(|cell| {
+        if let Some(collector) = cell.borrow().as_ref().cloned() {
+            if let Ok(mut map) = collector.stats.lock() {
+                let entry = map.entry(key).or_default();
+                entry.rrf_branches = branches as u8;
+                for i in 0..branches {
+                    entry.rrf_input_rows[i] = entry.rrf_input_rows[i].saturating_add(input[i]);
+                    entry.rrf_unique_rows[i] = entry.rrf_unique_rows[i].saturating_add(unique[i]);
+                }
+                entry.rrf_union_rows = entry.rrf_union_rows.saturating_add(union);
+                entry.rrf_overlap_rows = entry.rrf_overlap_rows.saturating_add(overlap);
+                entry.rrf_fusion_ns = entry.rrf_fusion_ns.saturating_add(fusion_ns);
+            }
+        }
+    });
+}
+
 /// Accumulate `bytes` spilled by a plan node.
 pub(crate) fn add_spill_bytes(plan: &PhysicalPlan, bytes: u64) {
     if bytes == 0 {
@@ -1599,6 +1635,19 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
                         .saturating_add(stats.candidate_batches);
                     entry.candidate_window_peak =
                         entry.candidate_window_peak.max(stats.candidate_window_peak);
+                    entry.rrf_branches = entry.rrf_branches.max(stats.rrf_branches);
+                    for i in 0..8 {
+                        entry.rrf_input_rows[i] =
+                            entry.rrf_input_rows[i].saturating_add(stats.rrf_input_rows[i]);
+                        entry.rrf_unique_rows[i] =
+                            entry.rrf_unique_rows[i].saturating_add(stats.rrf_unique_rows[i]);
+                    }
+                    entry.rrf_union_rows =
+                        entry.rrf_union_rows.saturating_add(stats.rrf_union_rows);
+                    entry.rrf_overlap_rows = entry
+                        .rrf_overlap_rows
+                        .saturating_add(stats.rrf_overlap_rows);
+                    entry.rrf_fusion_ns = entry.rrf_fusion_ns.saturating_add(stats.rrf_fusion_ns);
                     if stats.peak_memory_bytes > entry.peak_memory_bytes {
                         entry.peak_memory_bytes = stats.peak_memory_bytes;
                     }
@@ -1844,6 +1893,17 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
             }
             if s.peak_memory_bytes > 0 {
                 suffix.push_str(&format!(" peak_mem={}", s.peak_memory_bytes));
+            }
+            if s.rrf_branches > 0 {
+                let n = usize::from(s.rrf_branches);
+                suffix.push_str(&format!(
+                    " rrf_inputs={:?} rrf_unique={:?} rrf_union={} rrf_overlap={} fusion_ms={:.3}",
+                    &s.rrf_input_rows[..n],
+                    &s.rrf_unique_rows[..n],
+                    s.rrf_union_rows,
+                    s.rrf_overlap_rows,
+                    s.rrf_fusion_ns as f64 / 1_000_000.0
+                ));
             }
             if s.spill_bytes > 0 {
                 suffix.push_str(&format!(" spill_bytes={}", s.spill_bytes));

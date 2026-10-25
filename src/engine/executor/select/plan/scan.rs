@@ -1,5 +1,6 @@
 //! scan execution and preparation.
 
+use super::fulltext_source::{collect_heap_documents, heap_document_id, FtSearchSource};
 use super::*;
 
 /// Wrap a scan call in a partition-pruning context derived from the
@@ -4472,10 +4473,7 @@ pub(super) struct FtScoringTerm {
 pub(super) fn fulltext_cached_postings<'c>(
     cache: &'c mut AhHashMap<String, crate::storage::fulltext::FtPostingBatch>,
     want_positions_cache: &mut AhHashSet<String>,
-    db: &Arc<Database>,
-    txn: TxnView,
-    table: &PlanTable,
-    index: &IndexSchema,
+    source: &FtSearchSource<'_>,
     token: &str,
     want_positions: bool,
 ) -> Result<&'c crate::storage::fulltext::FtPostingBatch, QueryError> {
@@ -4487,7 +4485,12 @@ pub(super) fn fulltext_cached_postings<'c>(
         cache.remove(token);
     }
     if !cache.contains_key(token) {
-        let batch = db.fulltext_scan_token(&table.schema, index, token, want_positions, txn)?;
+        let mut batch = source.scan_token(token, want_positions)?;
+        if want_positions {
+            batch
+                .postings
+                .sort_unstable_by_key(|posting| posting.row_id);
+        }
         cache.insert(token.to_string(), batch);
         if want_positions {
             want_positions_cache.insert(token.to_string());
@@ -4556,10 +4559,7 @@ pub(super) fn fulltext_row_contains_phrase(
 /// candidate set (no BM25 score reference anywhere in the plan) we skip
 /// per-term `by_row` maps entirely and use one shared `AhHashSet<RowId>`.
 pub(super) fn fulltext_natural_language_candidates(
-    db: &Arc<Database>,
-    txn: TxnView,
-    table: &PlanTable,
-    index: &IndexSchema,
+    source: &FtSearchSource<'_>,
     tokenizer: &dyn crate::storage::fulltext::Tokenizer,
     query: &str,
     need_scoring: bool,
@@ -4577,7 +4577,7 @@ pub(super) fn fulltext_natural_language_candidates(
             continue;
         }
         if need_scoring {
-            let batch = db.fulltext_scan_token(&table.schema, index, &token, false, txn)?;
+            let batch = source.scan_token(&token, false)?;
             if batch.postings.is_empty() {
                 continue;
             }
@@ -4595,18 +4595,12 @@ pub(super) fn fulltext_natural_language_candidates(
             // Row-id-only fast path: NL union with `need_score=false`
             // needs only the row-id set. Skips payload decode entirely,
             // which halves per-posting work again for `df ≈ 22k` tokens.
-            let ids = db.fulltext_scan_token_ids(&table.schema, index, &token, txn)?;
+            let ids = source.scan_ids(&token)?;
             if ids.is_empty() {
                 continue;
             }
-            let df = ids.len();
-            row_ids.reserve(df);
+            row_ids.reserve(ids.len());
             row_ids.extend(ids);
-            // Still track `df` so downstream avgdl floor is honest.
-            terms.push(FtScoringTerm {
-                df,
-                by_row: ah_hash_map(),
-            });
         }
     }
     row_ids.sort_unstable();
@@ -4627,10 +4621,7 @@ pub(super) fn fulltext_natural_language_candidates(
 /// instead of cloning `Vec<u32>` for every posting.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fulltext_boolean_candidates(
-    db: &Arc<Database>,
-    txn: TxnView,
-    table: &PlanTable,
-    index: &IndexSchema,
+    source: &FtSearchSource<'_>,
     tokenizer: &dyn crate::storage::fulltext::Tokenizer,
     columns: &[String],
     query: &str,
@@ -4668,7 +4659,7 @@ pub(super) fn fulltext_boolean_candidates(
     }
 
     for clause in &clauses {
-        let positive = clause.occur != Occur::MustNot;
+        let positive = need_scoring && clause.occur != Occur::MustNot;
         let rowset = match &clause.matcher {
             Matcher::Term(tokens) => {
                 let mut set: Option<HashSet<RowId>> = None;
@@ -4677,17 +4668,17 @@ pub(super) fn fulltext_boolean_candidates(
                     let batch = fulltext_cached_postings(
                         &mut cache,
                         &mut positions_ready,
-                        db,
-                        txn,
-                        table,
-                        index,
+                        source,
                         tok,
                         want_pos,
                     )?;
                     let s: HashSet<RowId> = batch.postings.iter().map(|p| p.row_id).collect();
                     set = Some(match set {
                         None => s,
-                        Some(prev) => prev.intersection(&s).copied().collect(),
+                        Some(mut prev) => {
+                            prev.retain(|id| s.contains(id));
+                            prev
+                        }
                     });
                     if positive && positive_seen.insert(tok.clone()) {
                         positive_tokens.push(tok.clone());
@@ -4701,7 +4692,7 @@ pub(super) fn fulltext_boolean_candidates(
                 // clauses also promote those tokens into `positive_tokens`
                 // so BM25 scores wildcard hits with their real tf/df — MySQL
                 // parity, and the fix for previously-zero prefix scores.
-                let groups = db.fulltext_scan_prefix(&table.schema, index, prefix, txn)?;
+                let groups = source.scan_prefix(prefix)?;
                 let mut rowset: HashSet<RowId> = ah_hash_set();
                 for (token, batch) in groups {
                     for p in &batch.postings {
@@ -4720,84 +4711,45 @@ pub(super) fn fulltext_boolean_candidates(
                 rowset
             }
             Matcher::Phrase(tokens) => {
-                // Fetch each phrase token's postings with positions and
-                // record the per-row position slice range (into that
-                // token's arena) so adjacency can be verified without
-                // cloning any `Vec<u32>`. We *own* the batches here
-                // (bypassing the shared `cache`) so downstream Rust
-                // borrow rules stay simple; phrase tokens are usually
-                // used only in the phrase clause anyway, so cache reuse
-                // is minimal. Scoring later re-fetches the same tokens
-                // via the cache (a fresh scan; still cheap thanks to
-                // fast_hash + arena decode).
-                let mut per_token_batches: Vec<crate::storage::fulltext::FtPostingBatch> =
-                    Vec::with_capacity(tokens.len());
-                let mut per_token_entries: Vec<Vec<(RowId, u32, u32)>> =
-                    Vec::with_capacity(tokens.len());
-                let mut candidate: Option<HashSet<RowId>> = None;
+                // Populate one shared, row-ordered batch per distinct token.
+                // Repeated phrase terms borrow the same arena; scoring reuses
+                // these batches without another B-tree scan.
                 for tok in tokens {
-                    let batch = db.fulltext_scan_token(&table.schema, index, tok, true, txn)?;
-                    let mut entries: Vec<(RowId, u32, u32)> =
-                        Vec::with_capacity(batch.postings.len());
-                    let mut rowset: HashSet<RowId> =
-                        ah_hash_set_with_capacity(batch.postings.len());
-                    for p in &batch.postings {
-                        rowset.insert(p.row_id);
-                        entries.push((p.row_id, p.pos_start, p.pos_len));
-                    }
-                    entries.sort_unstable_by_key(|(row_id, _, _)| *row_id);
-                    candidate = Some(match candidate {
-                        None => rowset,
-                        Some(prev) => prev.intersection(&rowset).copied().collect(),
-                    });
-                    per_token_entries.push(entries);
-                    per_token_batches.push(batch);
+                    fulltext_cached_postings(&mut cache, &mut positions_ready, source, tok, true)?;
                     if positive && positive_seen.insert(tok.clone()) {
                         positive_tokens.push(tok.clone());
                     }
                 }
-                let candidate = candidate.unwrap_or_default();
+                let batches: Vec<_> = tokens.iter().map(|token| &cache[token]).collect();
+                let smallest = batches.iter().min_by_key(|batch| batch.postings.len());
                 let mut verified = ah_hash_set();
                 let mut positions_scratch: Vec<&[u32]> = Vec::with_capacity(tokens.len());
-                for row_id in candidate {
-                    positions_scratch.clear();
-                    let mut have_positions = true;
-                    for (entries, batch) in per_token_entries.iter().zip(per_token_batches.iter()) {
-                        // Binary search by row_id (sorted ascending).
-                        let idx = entries.binary_search_by_key(&row_id, |(r, _, _)| *r);
-                        let pos_slice = match idx {
-                            Ok(i) => {
-                                let (_, start, len) = entries[i];
-                                let s = start as usize;
-                                let e = s + len as usize;
-                                &batch.positions_arena[s..e]
+                if let Some(smallest) = smallest {
+                    'candidate: for posting in &smallest.postings {
+                        let row_id = posting.row_id;
+                        positions_scratch.clear();
+                        let mut have_positions = true;
+                        for batch in &batches {
+                            let Ok(i) = batch.postings.binary_search_by_key(&row_id, |p| p.row_id)
+                            else {
+                                continue 'candidate;
+                            };
+                            let p = batch.postings[i];
+                            if p.pos_len == 0 {
+                                have_positions = false;
                             }
-                            Err(_) => &[][..],
+                            let start = p.pos_start as usize;
+                            positions_scratch
+                                .push(&batch.positions_arena[start..start + p.pos_len as usize]);
+                        }
+                        let matched = if have_positions {
+                            positions_phrase_match(&positions_scratch)
+                        } else {
+                            source.contains_phrase(row_id, tokenizer, columns, tokens)?
                         };
-                        if pos_slice.is_empty() {
-                            // tf>0 but no positions → built with positions off.
-                            have_positions = false;
-                            break;
+                        if matched {
+                            verified.insert(row_id);
                         }
-                        positions_scratch.push(pos_slice);
-                    }
-                    let matched = if have_positions && positions_scratch.len() == tokens.len() {
-                        positions_phrase_match(&positions_scratch)
-                    } else {
-                        // Fallback: re-tokenise the row and check adjacency.
-                        match db.read_row(&table.schema, row_id, txn)? {
-                            Some(stored) => fulltext_row_contains_phrase(
-                                tokenizer,
-                                &table.schema,
-                                columns,
-                                &stored.values,
-                                tokens,
-                            )?,
-                            None => false,
-                        }
-                    };
-                    if matched {
-                        verified.insert(row_id);
                     }
                 }
                 verified
@@ -4816,7 +4768,7 @@ pub(super) fn fulltext_boolean_candidates(
         let mut iter = must_sets.into_iter();
         let mut acc = iter.next().unwrap_or_default();
         for s in iter {
-            acc = acc.intersection(&s).copied().collect();
+            acc.retain(|id| s.contains(id));
         }
         acc
     } else {
@@ -4838,16 +4790,8 @@ pub(super) fn fulltext_boolean_candidates(
     let mut scoring: Vec<FtScoringTerm> = Vec::with_capacity(positive_tokens.len());
     if need_scoring {
         for tok in &positive_tokens {
-            let batch = fulltext_cached_postings(
-                &mut cache,
-                &mut positions_ready,
-                db,
-                txn,
-                table,
-                index,
-                tok,
-                false,
-            )?;
+            let batch =
+                fulltext_cached_postings(&mut cache, &mut positions_ready, source, tok, false)?;
             let mut by_row = ah_hash_map_with_capacity(batch.postings.len());
             for p in &batch.postings {
                 by_row.insert(p.row_id, (p.tf, p.doc_len));
@@ -4855,23 +4799,6 @@ pub(super) fn fulltext_boolean_candidates(
             scoring.push(FtScoringTerm {
                 df: batch.postings.len(),
                 by_row,
-            });
-        }
-    } else {
-        for tok in &positive_tokens {
-            let batch = fulltext_cached_postings(
-                &mut cache,
-                &mut positions_ready,
-                db,
-                txn,
-                table,
-                index,
-                tok,
-                false,
-            )?;
-            scoring.push(FtScoringTerm {
-                df: batch.postings.len(),
-                by_row: ah_hash_map(),
             });
         }
     }
@@ -4890,6 +4817,8 @@ pub(super) struct FtMatchRuntime {
     pub(super) idfs: Vec<f64>,
     pub(super) doc_len_of: AhHashMap<RowId, u32>,
     pub(super) avgdl: f64,
+    check_membership: bool,
+    _source_charge: crate::engine::executor::mem_budget::ScopedCharge,
 }
 
 pub(super) fn resolve_fulltext_query(
@@ -4926,42 +4855,40 @@ pub(super) fn build_fulltext_match_runtime(
     fingerprint: u64,
     restrict: bool,
     need_score: bool,
+    heap_rows: Option<&[Vec<Value>]>,
 ) -> Result<FtMatchRuntime, QueryError> {
     let query = resolve_fulltext_query(query, query_param)?;
     let default_meta = crate::storage::schema::FulltextMeta::default();
     let meta = index.fulltext.as_ref().unwrap_or(&default_meta);
     let tokenizer = crate::storage::fulltext::build_tokenizer_from_meta(meta);
+    let source = FtSearchSource::new(
+        db,
+        txn,
+        table,
+        index,
+        heap_rows,
+        tokenizer.as_ref(),
+        &query,
+        mode,
+    )?;
     let (candidates, scoring_terms) = match mode {
-        crate::parser::FtMode::NaturalLanguage => fulltext_natural_language_candidates(
-            db,
-            txn,
-            table,
-            index,
-            tokenizer.as_ref(),
-            &query,
-            need_score,
-        )?,
-        crate::parser::FtMode::Boolean => fulltext_boolean_candidates(
-            db,
-            txn,
-            table,
-            index,
-            tokenizer.as_ref(),
-            columns,
-            &query,
-            need_score,
-        )?,
+        crate::parser::FtMode::NaturalLanguage => {
+            fulltext_natural_language_candidates(&source, tokenizer.as_ref(), &query, need_score)?
+        }
+        crate::parser::FtMode::Boolean => {
+            fulltext_boolean_candidates(&source, tokenizer.as_ref(), columns, &query, need_score)?
+        }
     };
     let mut idfs = Vec::new();
     let mut doc_len_of = ah_hash_map();
     let mut avgdl = 1.0;
     if need_score {
-        let stats = &table.schema.stats;
+        let frozen = super::super::fulltext_context::statistics(table, index)?;
         // The unsigned modified-row counter counts INSERT, UPDATE and DELETE
         // and is only a staleness trigger. BM25's document count must use the
         // signed committed row delta, otherwise update-heavy tables make IDF
         // drift upward without gaining a single document.
-        let est = (stats.row_count as i128 + table.live_row_delta as i128).max(0) as f64;
+        let est = source.corpus.map_or(frozen.base_n, |corpus| corpus.0);
         let max_df = scoring_terms.iter().map(|term| term.df).max().unwrap_or(0) as f64;
         let n_docs = est.max(candidates.len() as f64).max(max_df).max(1.0);
         idfs = scoring_terms
@@ -4984,15 +4911,7 @@ pub(super) fn build_fulltext_match_runtime(
         if count > 0 {
             avgdl = (sum as f64 / count as f64).max(1.0);
         }
-        if let Some(corpus_avg) = table
-            .schema
-            .stats
-            .indexes
-            .get(&crate::storage::normalize_name(&index.name))
-            .and_then(|stats| stats.fulltext.as_ref())
-            .map(|stats| stats.avg_token_count)
-            .filter(|avg| *avg > 0.0)
-        {
+        if let Some(corpus_avg) = source.corpus.map(|corpus| corpus.1).or(frozen.corpus_avg) {
             avgdl = corpus_avg;
         }
     }
@@ -5005,11 +4924,18 @@ pub(super) fn build_fulltext_match_runtime(
         idfs,
         doc_len_of,
         avgdl,
+        check_membership: mode == crate::parser::FtMode::Boolean,
+        _source_charge: source.charge,
     })
 }
 
 pub(super) fn fulltext_runtime_score(runtime: &FtMatchRuntime, row_id: RowId) -> f64 {
     if !runtime.need_score {
+        return 0.0;
+    }
+    // Positive term frequencies alone do not prove Must/MustNot or phrase
+    // membership. Scalar MATCH must agree with the restricting WHERE path.
+    if runtime.check_membership && runtime.candidates.binary_search(&row_id).is_err() {
         return 0.0;
     }
     let params = crate::storage::fulltext::bm25::global_params();
@@ -5187,6 +5113,17 @@ pub(super) fn execute_fulltext_scan(
     base_access: Option<&crate::planner::FulltextBaseAccess>,
 ) -> Result<Vec<PlanRow>, QueryError> {
     if let Some(like_prefilter) = like_prefilter {
+        if txn.historical || table.schema.is_partitioned() {
+            return scan_plan_table(
+                db,
+                txn,
+                table,
+                filter,
+                &[],
+                projected_columns.map(|columns| columns.as_slice()),
+                false,
+            );
+        }
         return execute_fulltext_like_prefilter(
             db,
             txn,
@@ -5197,6 +5134,19 @@ pub(super) fn execute_fulltext_scan(
             projected_columns,
         );
     }
+    // Current postings cannot prove historical membership; bare RowId is
+    // ambiguous across partition heaps. Build a visible-text oracle with
+    // query-local document ids for these paths until specialized indexes can
+    // carry the required version/partition identity.
+    let heap_documents = if txn.historical || table.schema.is_partitioned() {
+        if txn.historical {
+            db.record_temporal_heap_fallback();
+        }
+        Some(collect_heap_documents(db, table, txn)?)
+    } else {
+        None
+    };
+    let heap_rows = heap_documents.as_ref().map(|(rows, _)| rows.as_slice());
     let primary = build_fulltext_match_runtime(
         db,
         txn,
@@ -5209,6 +5159,7 @@ pub(super) fn execute_fulltext_scan(
         match_fingerprint,
         restrict_to_matches,
         need_score,
+        heap_rows,
     )?;
     let mut runtimes = Vec::with_capacity(additional_matches.len() + 1);
     runtimes.push(primary);
@@ -5225,6 +5176,7 @@ pub(super) fn execute_fulltext_scan(
             spec.match_fingerprint,
             spec.restrict_to_matches,
             spec.needs_score,
+            heap_rows,
         )?);
     }
 
@@ -5234,7 +5186,7 @@ pub(super) fn execute_fulltext_scan(
     } else if restrict_count == 0 {
         crate::engine::status_counters::record_fulltext_aware_full_scan();
     }
-    let base_candidates = match base_access {
+    let base_candidates = match base_access.filter(|_| heap_rows.is_none()) {
         Some(crate::planner::FulltextBaseAccess::Lookup { index, key, exact }) => Some(if *exact {
             db.lookup_index_visible(&table.schema, index, key.clone(), txn)?
         } else {
@@ -5289,6 +5241,10 @@ pub(super) fn execute_fulltext_scan(
         base
     } else if let Some(index_candidates) = base_candidates {
         index_candidates
+    } else if let Some(rows) = heap_rows {
+        (0..rows.len())
+            .map(heap_document_id)
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         db.scan_rows(&table.schema.qualified_name(), txn)?
             .into_iter()
@@ -5332,7 +5288,7 @@ pub(super) fn execute_fulltext_scan(
     // large-df NL / boolean query this cuts the per-row heap decode down
     // to the columns the outer plan actually needs, and reuses the cached
     // heap handle instead of re-locating the partition on every read.
-    if let Some(projected) = projected_columns {
+    if let Some(projected) = projected_columns.filter(|_| heap_rows.is_none()) {
         if !table.schema.is_partitioned() {
             let heap = db.cached_heap_handle(table.schema.id)?;
             let read_rows = db.read_row_columns_many_with_handle(
@@ -5393,12 +5349,17 @@ pub(super) fn execute_fulltext_scan(
     }
 
     for row_id in candidates {
-        let Some(stored) = db.read_row(&table.schema, row_id, txn)? else {
-            continue;
+        let values = if let Some(rows) = heap_rows {
+            rows[super::fulltext_source::heap_document_offset(row_id)].clone()
+        } else {
+            let Some(stored) = db.read_row(&table.schema, row_id, txn)? else {
+                continue;
+            };
+            stored.values
         };
         let mut row = match projected_columns {
-            Some(cols) => stored_row_to_plan_row_projected(table, stored.values, cols)?,
-            None => stored_row_to_plan_row(table, stored.values)?,
+            Some(cols) => stored_row_to_plan_row_projected(table, values, cols)?,
+            None => stored_row_to_plan_row(table, values)?,
         };
         for (runtime, score_column) in runtimes.iter().zip(score_columns.iter()) {
             if runtime.need_score {
@@ -5613,6 +5574,7 @@ pub(super) fn execute_vector_index_scan(
     k: usize,
     ef_search: usize,
     filter: &Option<Expr>,
+    order_by: &[OrderBy],
 ) -> Result<Vec<PlanRow>, QueryError> {
     use crate::engine::vector;
     use crate::engine::vector::session::IterativeScan;
@@ -5625,6 +5587,9 @@ pub(super) fn execute_vector_index_scan(
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
     if db.xa_status_counters().0 > 0 || db.vector_snapshot_requires_exact(txn) {
+        if order_by.len() > 1 {
+            return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
+        }
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -5669,7 +5634,7 @@ pub(super) fn execute_vector_index_scan(
     // are authoritative. Ordinary IVF L2/Cosine is approximate SQ8, while the
     // governed IVF graph navigator and both HNSW backends finish on f32 and are
     // exact within their ANN candidate pool.
-    let mut exact_order = true;
+    let mut exact_order = order_by.len() == 1;
     let base_effort = if is_ivf {
         ef_search.max(1)
     } else {
@@ -5732,6 +5697,7 @@ pub(super) fn execute_vector_index_scan(
     // the existing candidate-limit widening loop below.
     if !is_ivf
         && !quantized
+        && order_by.len() == 1
         && filter.is_none()
         && !matches!(iterative_scan, IterativeScan::Off)
         && storage_ids.iter().all(|sid| {
@@ -5787,58 +5753,7 @@ pub(super) fn execute_vector_index_scan(
                 request,
             ) {
                 Ok(result) => result,
-                Err(index_error) => {
-                    // Only a rebuildable storage/index failure, or an index
-                    // that cannot be built within the memory budget, may
-                    // degrade to the exact heap oracle. Configuration,
-                    // dimension and hint errors (for example switching an
-                    // existing index between memory and paged backends) must
-                    // retain their explicit MySQL error semantics.
-                    if !index_error.is(crate::error::catalog::ER_GET_ERRNO)
-                        && !index_error.is(crate::error::catalog::ER_OUTOFMEMORY)
-                    {
-                        return Err(index_error);
-                    }
-                    if quantized {
-                        db.record_vector_query_work(
-                            &table.schema,
-                            index,
-                            *sid,
-                            examined as u64,
-                            true,
-                        );
-                    }
-                    crate::engine::api::push_statement_warning(
-                        crate::error::ConditionLevel::Warning,
-                         crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
-                        format!(
-                            "vector index `{}` could not be read; falling back to an exact scan: {}",
-                            index.name, index_error.message()
-                        ),
-                    );
-                    if let Some(residual) = filter {
-                        return execute_vector_brute_scan_filtered(
-                            db,
-                            txn,
-                            table,
-                            col_idx,
-                            query_vector,
-                            metric,
-                            k,
-                            residual,
-                        );
-                    } else {
-                        return execute_vector_brute_scan(
-                            db,
-                            txn,
-                            table,
-                            col_idx,
-                            query_vector,
-                            metric,
-                            k,
-                        );
-                    }
-                }
+                Err(index_error) => return Err(index_error),
             };
             exact_order &= part_result.exact_order;
             pool_saturated |= part_result.candidates.len() >= candidate_want;
@@ -5999,6 +5914,9 @@ pub(super) fn execute_vector_index_scan(
         }
     }
     if exact_fallback || db.vector_snapshot_requires_exact(txn) {
+        if order_by.len() > 1 {
+            return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
+        }
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -6014,6 +5932,17 @@ pub(super) fn execute_vector_index_scan(
         };
     }
 
+    if order_by.len() > 1 {
+        let rows = scored.into_iter().map(|(_, row)| row).collect();
+        let mut rows = super::super::external_sort::sort_plan_rows_for_plan(
+            db.data_dir(),
+            rows,
+            order_by,
+            None,
+        )?;
+        rows.truncate(k);
+        return Ok(rows);
+    }
     // strict_order — keep ascending distance order (default). relaxed_order
     // skips the final sort and just truncates: callers willing to trade
     // ordering for latency get the raw insertion order.
@@ -6022,6 +5951,30 @@ pub(super) fn execute_vector_index_scan(
     }
     scored.truncate(k);
     Ok(scored.into_iter().map(|(_, row)| row).collect())
+}
+
+/// Exact completion for a distance order with SQL tie-break columns.
+fn execute_ordered_vector_fallback(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    order_by: &[OrderBy],
+    k: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let rows = table.schema.stats.row_count as f64;
+    let input = PhysicalPlan::SeqScan {
+        table: table.clone(),
+        filter: filter.clone(),
+        estimated_rows: rows,
+        access_rows: rows,
+        cost: crate::engine::cbo::Cost::scalar(rows),
+        possible_keys: Vec::new(),
+        runtime_filters: Vec::new(),
+        hint_note: None,
+        projected_columns: None,
+    };
+    super::execute_topk(db, txn, &input, order_by, k)
 }
 
 /// Rare failure-path oracle used when an ANN file cannot be read or fails

@@ -13,6 +13,9 @@ use crate::storage::{Database, TxnView};
 #[derive(Clone)]
 pub(in crate::engine::executor) struct ExecutionContext {
     txn: TxnView,
+    fulltext_scoring: Option<super::fulltext_context::Context>,
+    #[cfg(test)]
+    rrf_branch_hook: Option<super::hybrid::BranchHook>,
     temporal: Option<Arc<crate::engine::executor::temporal::TemporalReadContext>>,
     cancellation: CancellationSnapshot,
     params: Option<crate::engine::params::ParamContextSnapshot>,
@@ -125,6 +128,9 @@ impl ExecutionContext {
     ) -> Self {
         Self {
             txn,
+            fulltext_scoring: super::fulltext_context::capture(),
+            #[cfg(test)]
+            rrf_branch_hook: super::hybrid::branch_hook(),
             temporal: crate::engine::executor::temporal::capture(),
             cancellation: CancellationSnapshot::capture(),
             params: crate::engine::params::snapshot_current_context(),
@@ -243,6 +249,9 @@ impl ExecutionContext {
         f: impl FnOnce() -> R,
     ) -> R {
         let txn = self.txn;
+        let _fulltext_scoring = super::fulltext_context::enter(self.fulltext_scoring.clone());
+        #[cfg(test)]
+        let _rrf_branch_hook = super::hybrid::enter_branch_hook(self.rrf_branch_hook.clone());
         let _read_schema = crate::storage::read_schema::ReadSchemaScope::enter(
             (!txn.dirty_read).then_some(txn.snapshot_scn),
         );

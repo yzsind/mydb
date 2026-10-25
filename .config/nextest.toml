@@ -1,4 +1,5 @@
-nextest-version = { required = "0.9.98" }
+# 0.9.145 fixes sibling capture-pipe inheritance during concurrent Unix spawns.
+nextest-version = { required = "0.9.145", recommended = "0.9.149" }
 experimental = ["setup-scripts"]
 
 [scripts.setup.mydb-test-seed]
@@ -39,6 +40,12 @@ priority = 90
 
 [[profile.default.overrides]]
 filter = 'test(/storage::core::vector_page_tests::/)'
+priority = 80
+
+# Bulk-load and vector datatype/quantization matrices are among the slowest
+# CI fixtures. Start the whole categories early to avoid a long serial tail.
+[[profile.default.overrides]]
+filter = 'test(/engine::executor::(load_data::tests|tests::(vector_datatypes|vector_quantization))::/)'
 priority = 80
 
 # Each per-function compatibility test opens an isolated engine. Limit the

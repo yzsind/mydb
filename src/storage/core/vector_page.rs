@@ -48,7 +48,7 @@ pub(crate) use crate::storage::format_versions::PAGED_HNSW_INDEX_VERSION as VEC_
 pub(crate) use crate::storage::format_versions::PAGED_HNSW_PAGE_VERSION as VEC_PAGE_VERSION;
 /// Meta page id.
 const VEC_META_PAGE: u64 = 0;
-const VEC_META_USED_BYTES: usize = 160;
+const VEC_META_USED_BYTES: usize = 208;
 
 // Meta pages have a short fixed prefix followed by zero padding. CRC extension
 // by this fixed suffix is affine over GF(2); cache its basis instead of hashing
@@ -225,7 +225,7 @@ fn native_geometry(dim: usize) -> Option<(crate::vector::VectorDataType, u32)> {
 
 fn vector_record_lanes(dim: usize) -> usize {
     native_geometry(dim).map_or(dim * 5 + 4, |(datatype, dimension)| {
-        datatype.payload_len(dimension)
+        datatype.payload_len(dimension) + 8
     })
 }
 
@@ -321,6 +321,12 @@ pub(crate) struct VectorMeta {
     pub nav_exact_nodes: u64,
     pub quant_model_head: u64,
     pub quant_generation: u64,
+    pub native_definition_head: u64,
+    pub native_definition_bytes: u64,
+    pub storage_id: u64,
+    pub generation: u64,
+    pub index_id: u64,
+    pub physical_generation: u64,
 }
 
 impl VectorMeta {
@@ -348,6 +354,12 @@ impl VectorMeta {
             nav_exact_nodes: 0,
             quant_model_head: 0,
             quant_generation: 0,
+            native_definition_head: 0,
+            native_definition_bytes: 0,
+            storage_id: 0,
+            generation: 0,
+            index_id: 0,
+            physical_generation: 0,
         }
     }
 }
@@ -383,6 +395,12 @@ fn encode_vector_meta(meta: &VectorMeta) -> Vec<u8> {
     write_u64(&mut buf, 136, meta.coverage_scn);
     write_u64(&mut buf, 144, meta.quant_model_head);
     write_u64(&mut buf, 152, meta.quant_generation);
+    write_u64(&mut buf, 160, meta.native_definition_head);
+    write_u64(&mut buf, 168, meta.native_definition_bytes);
+    write_u64(&mut buf, 176, meta.storage_id);
+    write_u64(&mut buf, 184, meta.generation);
+    write_u64(&mut buf, 192, meta.index_id);
+    write_u64(&mut buf, 200, meta.physical_generation);
     let checksum = vector_meta_crc(&buf, true);
     write_u32(&mut buf, 16, checksum);
     buf
@@ -455,6 +473,12 @@ fn decode_vector_meta(buf: &[u8]) -> Result<VectorMeta, QueryError> {
         nav_exact_nodes: read_u64(buf, 128),
         quant_model_head: read_u64(buf, 144),
         quant_generation: read_u64(buf, 152),
+        native_definition_head: read_u64(buf, 160),
+        native_definition_bytes: read_u64(buf, 168),
+        storage_id: read_u64(buf, 176),
+        generation: read_u64(buf, 184),
+        index_id: read_u64(buf, 192),
+        physical_generation: read_u64(buf, 200),
     })
 }
 
@@ -482,6 +506,7 @@ fn node_page_free_space(buf: &[u8]) -> usize {
 const REC_FLAG_INITIALIZED: u8 = 0b0000_0001;
 const REC_FLAG_TOMBSTONE: u8 = 0b0000_0010;
 const REC_FLAG_EXACT_NAV: u8 = 0b0000_0100;
+const REC_FLAG_LINKED: u8 = 0b0000_1000;
 
 #[derive(Clone, Copy, Debug)]
 struct PersistedNavQuant {
@@ -600,6 +625,7 @@ fn node_page_append_native(
     row_id: RowId,
     top_layer: usize,
     vector: &[u8],
+    auxiliary: u64,
     dim: usize,
     m: usize,
     m0: usize,
@@ -619,7 +645,8 @@ fn node_page_append_native(
     buf[rec_off] = REC_FLAG_INITIALIZED;
     buf[rec_off + 1] = top_layer as u8;
     write_u64(buf, rec_off + 2, vec_pack_row(row_id));
-    let vec_off = rec_off + 10;
+    write_u64(buf, rec_off + 10, auxiliary);
+    let vec_off = rec_off + 18;
     buf[vec_off..vec_off + vector.len()].copy_from_slice(vector);
     // All layer counts already zero (page was zeroed / region untouched);
     // be explicit in case of slot reuse in a future cold-build path.
@@ -1183,6 +1210,34 @@ impl VectorIndexFile {
         self.write_meta_page(txn_id_for_ddl())
     }
 
+    #[allow(private_interfaces)]
+    pub(crate) fn open_existing(
+        path: PathBuf,
+        log: Arc<crate::wal::LogMutex>,
+        durability: DurabilityMode,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Self, QueryError> {
+        if !path.try_exists().map_err(io_err)? {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                format!("missing persistent vector index {}", path.display()),
+            ));
+        }
+        let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
+        let meta = decode_vector_meta(&read_index_page(&mut file, VEC_META_PAGE)?)?;
+        Self::open_with_durability(
+            path,
+            log,
+            durability,
+            buffer_pool,
+            meta.dim,
+            meta.metric,
+            meta.m,
+            meta.m0,
+            meta.ef_construction,
+        )
+    }
+
     /// Open (or create) the `.hvec` file. A new file lays down the meta page
     /// from the supplied parameters; an existing file is validated against
     /// `dim`/`metric`/`m` so a parameter change forces a rebuild upstream.
@@ -1284,6 +1339,20 @@ impl VectorIndexFile {
         self.rel_path.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn crash_point_for_test(&self, phase: u64) -> Result<(), QueryError> {
+        if VECTOR_CRASH_PHASE.load(Ordering::Acquire) == phase {
+            let lsn = self.log_atomics.next_lsn().saturating_sub(1);
+            crate::wal::LogManager::sync_durable_to(&self.log, lsn)?;
+            std::process::exit(86);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persistent_path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn spill_data_dir(&self) -> &Path {
         let relative = Path::new(&self.rel_path);
         let canonical_root = relative.components().next().is_some_and(|part| {
@@ -1316,6 +1385,60 @@ impl VectorIndexFile {
     /// Acquire the latch guarding read-modify-write of `page_id`.
     fn page_latch(&self, page_id: u64) -> parking_lot::MutexGuard<'_, ()> {
         self.page_latches[(page_id & VEC_PAGE_LATCH_MASK) as usize].lock()
+    }
+
+    pub(crate) fn initialize_identity(
+        &self,
+        storage_id: u64,
+        generation: u64,
+        index_id: u64,
+    ) -> Result<(), QueryError> {
+        {
+            let mut state = self.meta_state.lock();
+            if state.meta.index_id != 0 || state.meta.finalized {
+                return Err(error(
+                    crate::error::catalog::ER_INDEX_CORRUPT,
+                    "cannot rebind a persistent vector index",
+                ));
+            }
+            state.meta.storage_id = storage_id;
+            state.meta.generation = generation;
+            state.meta.index_id = index_id;
+            state.meta.physical_generation = self
+                .path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(crate::engine::vector::persistence::corrupt)?;
+        }
+        self.write_meta_page(0)
+    }
+
+    pub(crate) fn check_identity(
+        &self,
+        storage_id: u64,
+        generation: u64,
+        index_id: u64,
+    ) -> Result<(), QueryError> {
+        let meta = self.meta_state.lock();
+        let physical = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<u64>().ok());
+        if (
+            meta.meta.storage_id,
+            meta.meta.generation,
+            meta.meta.index_id,
+        ) != (storage_id, generation, index_id)
+            || physical != Some(meta.meta.physical_generation)
+        {
+            return Err(error(
+                crate::error::catalog::ER_INDEX_CORRUPT,
+                "persistent vector index identity mismatch",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn meta(&self) -> VectorMeta {
@@ -1518,7 +1641,7 @@ impl VectorIndexFile {
             let mut state = self.meta_state.lock();
             state.pristine_pages.remove(&page_id)
         };
-        if txn_id == 0 && self.durability != DurabilityMode::Memory {
+        if txn_id == 0 && self.durability != DurabilityMode::Memory && !pristine {
             // System graph maintenance is redo-only. An edit to a resident
             // page whose dirty epoch is already anchored by a full image logs
             // only a dictionary delta: a neighbour-list rewrite touches a few
@@ -1577,6 +1700,7 @@ impl VectorIndexFile {
             after = pending.expect("nonresident path keeps the replacement image");
         }
         let lsn = if self.durability == DurabilityMode::Memory {
+            stamp_vector_page(&mut after, page_id, 0);
             0
         } else {
             // System graph maintenance is redo-only. A full after-image
@@ -1637,6 +1761,13 @@ impl VectorIndexFile {
             state.pristine_pages.insert(page_id);
             page_id
         };
+        // Initialize and log the allocated page before publishing the allocator
+        // high water. A crash can leave an unused tail, never a referenced hole.
+        let mut bytes = vec![0; PAGE_SIZE];
+        format_empty_node_page(&mut bytes);
+        self.write_page(txn_id, page_id, bytes)?;
+        #[cfg(test)]
+        self.crash_point_for_test(4)?;
         self.write_meta_page(txn_id)?;
         Ok(page_id)
     }
@@ -1679,6 +1810,10 @@ impl VectorIndexFile {
         // Fast path: append into the current fill page under its latch (so
         // concurrent appenders to the same page serialise and re-read the
         // committed bytes rather than losing each other's writes).
+        #[cfg(test)]
+        if VECTOR_CRASH_PHASE.load(Ordering::Acquire) == 4 {
+            self.append_hint.store(0, Ordering::Release);
+        }
         let page_id = self.append_hint.load(Ordering::Acquire);
         if page_id != 0 {
             let _latch = self.page_latch(page_id);
@@ -1737,16 +1872,25 @@ impl VectorIndexFile {
         row_id: RowId,
         top_layer: usize,
         vector: &[u8],
+        auxiliary: u64,
     ) -> Result<VecId, QueryError> {
-        self.append_native_node_hint(txn_id, row_id, top_layer, vector, &self.append_hint)
+        self.append_native_node_hint(
+            txn_id,
+            row_id,
+            top_layer,
+            vector,
+            auxiliary,
+            &self.append_hint,
+        )
     }
     pub(crate) fn append_native_ivf_entry(
         &self,
         row_id: RowId,
         vector: &[u8],
+        auxiliary: u64,
         hint: &AtomicU64,
     ) -> Result<VecId, QueryError> {
-        self.append_native_node_hint(0, row_id, 0, vector, hint)
+        self.append_native_node_hint(0, row_id, 0, vector, auxiliary, hint)
     }
 
     fn append_native_node_hint(
@@ -1755,10 +1899,11 @@ impl VectorIndexFile {
         row_id: RowId,
         top_layer: usize,
         vector: &[u8],
+        auxiliary: u64,
         hint: &AtomicU64,
     ) -> Result<VecId, QueryError> {
         let (dim, m, m0) = (self.dim_fixed, self.m_fixed, self.m0_fixed);
-        if native_geometry(dim).is_none() || vector.len() != vector_record_lanes(dim) {
+        if native_geometry(dim).is_none() || vector.len() + 8 != vector_record_lanes(dim) {
             return Err(error(
                 crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
                 format!(
@@ -1781,12 +1926,18 @@ impl VectorIndexFile {
         // Fast path: append into the current fill page under its latch (so
         // concurrent appenders to the same page serialise and re-read the
         // committed bytes rather than losing each other's writes).
+        #[cfg(test)]
+        if VECTOR_CRASH_PHASE.load(Ordering::Acquire) == 4 {
+            hint.store(0, Ordering::Release);
+        }
         let page_id = hint.load(Ordering::Acquire);
         if page_id != 0 {
             let _latch = self.page_latch(page_id);
             let slot =
                 self.rmw_node_page(txn_id, page_id, |bytes| {
-                    match node_page_append_native(bytes, row_id, top_layer, vector, dim, m, m0) {
+                    match node_page_append_native(
+                        bytes, row_id, top_layer, vector, auxiliary, dim, m, m0,
+                    ) {
                         Some(slot) => Ok((Some(slot), true)),
                         None => Ok((None, false)),
                     }
@@ -1807,7 +1958,9 @@ impl VectorIndexFile {
             let _latch = self.page_latch(retry_page);
             let slot =
                 self.rmw_node_page(txn_id, retry_page, |bytes| {
-                    match node_page_append_native(bytes, row_id, top_layer, vector, dim, m, m0) {
+                    match node_page_append_native(
+                        bytes, row_id, top_layer, vector, auxiliary, dim, m, m0,
+                    ) {
                         Some(slot) => Ok((Some(slot), true)),
                         None => Ok((None, false)),
                     }
@@ -1825,14 +1978,21 @@ impl VectorIndexFile {
         let new_page = self.alloc_node_page(txn_id)?;
         let mut bytes = vec![0u8; PAGE_SIZE];
         format_empty_node_page(&mut bytes);
-        let slot = node_page_append_native(&mut bytes, row_id, top_layer, vector, dim, m, m0)
-            .expect("a freshly formatted page must fit one node (checked above)");
+        let slot =
+            node_page_append_native(&mut bytes, row_id, top_layer, vector, auxiliary, dim, m, m0)
+                .expect("a freshly formatted page must fit one node (checked above)");
         self.write_page(txn_id, new_page, bytes)?;
         hint.store(new_page, Ordering::Release);
         let mut state = self.meta_state.lock();
         state.meta.node_count += 1;
         state.meta.nav_exact_nodes += u64::from(nav_exact);
         Ok(vid_make(new_page, slot))
+    }
+
+    pub(crate) fn native_payload_bytes(&self) -> Result<usize, QueryError> {
+        let (datatype, dimension) = native_geometry(self.dim_fixed)
+            .ok_or_else(crate::engine::vector::persistence::corrupt)?;
+        Ok(datatype.payload_len(dimension))
     }
 
     pub(crate) fn with_native_vector<R>(
@@ -1849,7 +2009,7 @@ impl VectorIndexFile {
         let mapped = self.mapped_navigation.read();
         if let Some(view) = mapped.as_ref() {
             let (page, offset) = view.record(vid)?;
-            let start = offset + 10;
+            let start = offset + 18;
             let end = start + datatype.payload_len(dimension);
             return f(crate::vector::VectorRef {
                 datatype,
@@ -1867,7 +2027,7 @@ impl VectorIndexFile {
                     ));
                 }
                 let offset = node_record_offset(bytes, vid_slot(vid))?;
-                let start = offset + 10;
+                let start = offset + 18;
                 let end = start + datatype.payload_len(dimension);
                 if bytes[offset] & REC_FLAG_INITIALIZED == 0 || end > bytes.len() {
                     return Err(error(
@@ -2630,6 +2790,7 @@ impl VectorIndexFile {
             let mut state = self.meta_state.lock();
             state.meta.finalized = true;
             state.meta.built_lsn = self.log_atomics.next_lsn();
+            state.pristine_pages.insert(VEC_META_PAGE);
         }
         self.write_meta_page(txn_id)?;
         if timing {
@@ -2672,25 +2833,119 @@ impl VectorIndexFile {
     /// DELETE/UPDATE tombstoning — a single sequential pass whose pages are
     /// evicted normally under the buffer pool, so it does not pin the whole
     /// index in memory.
+    pub(crate) fn native_node_header(&self, vid: VecId) -> Result<(usize, u64, bool), QueryError> {
+        self.buffer_pool
+            .with_raw_page(self.page_key(vid_page(vid)), |bytes| {
+                if native_geometry(self.dim_fixed).is_none() || read_u32(bytes, 0) != VEC_NODE_MAGIC
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "invalid native vector node",
+                    ));
+                }
+                let offset = node_record_offset(bytes, vid_slot(vid))?;
+                if bytes[offset] & REC_FLAG_INITIALIZED == 0 || offset + 18 > PAGE_SIZE {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "invalid native vector node header",
+                    ));
+                }
+                let level = usize::from(bytes[offset + 1]);
+                if level > crate::engine::vector::hnsw_paged::VEC_MAX_LAYER {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "invalid native vector node level",
+                    ));
+                }
+                Ok((
+                    level,
+                    read_u64(bytes, offset + 10),
+                    bytes[offset] & REC_FLAG_LINKED != 0,
+                ))
+            })
+    }
+
+    pub(crate) fn mark_node_linked(&self, vid: VecId) -> Result<(), QueryError> {
+        let _latch = self.page_latch(vid_page(vid));
+        self.rmw_node_page(0, vid_page(vid), |bytes| {
+            let offset = node_record_offset(bytes, vid_slot(vid))?;
+            if bytes[offset] & REC_FLAG_INITIALIZED == 0 {
+                return Err(crate::engine::vector::persistence::corrupt());
+            }
+            bytes[offset] |= REC_FLAG_LINKED;
+            Ok(((), true))
+        })
+    }
+
+    pub(crate) fn write_native_definition(&self, data: &[u8]) -> Result<(), QueryError> {
+        let meta = self.meta();
+        if meta.native_definition_head != 0
+            && meta.native_definition_bytes == data.len() as u64
+            && self.read_native_definition()? == data
+        {
+            return Ok(());
+        }
+        let head = self.append_quantization_blob(data)?;
+        {
+            let mut state = self.meta_state.lock();
+            state.meta.native_definition_head = head;
+            state.meta.native_definition_bytes = data.len() as u64;
+        }
+        self.write_meta_page(0)
+    }
+
+    pub(crate) fn read_native_definition(&self) -> Result<Vec<u8>, QueryError> {
+        let meta = self.meta();
+        if meta.native_definition_head == 0
+            || meta.native_definition_bytes == 0
+            || meta.native_definition_bytes
+                > meta
+                    .node_next_page_id
+                    .saturating_sub(1)
+                    .saturating_mul((PAGE_SIZE - 48) as u64)
+            || usize::try_from(meta.native_definition_bytes).is_err()
+        {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "missing or invalid native index definition",
+            ));
+        }
+        let data = self.read_quantization_blob(
+            meta.native_definition_head,
+            meta.native_definition_bytes as usize,
+        )?;
+        if data.len() != meta.native_definition_bytes as usize {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "truncated native index definition",
+            ));
+        }
+        Ok(data)
+    }
+
     pub(crate) fn for_each_node(
         &self,
         mut f: impl FnMut(VecId, RowId, bool),
     ) -> Result<(), QueryError> {
         let next = self.meta_state.lock().meta.node_next_page_id;
+        let require_checksum = !self.build_mode.load(Ordering::Acquire);
         for page_id in 1..next {
             // Reverse-index construction needs only the ten-byte header.
             // Borrow one page instead of cloning it and allocating/decoding
             // every vector and every adjacency list in the entire graph.
             self.buffer_pool
                 .with_raw_page(self.page_key(page_id), |bytes| {
-                    if read_u32(bytes, 0) != VEC_NODE_MAGIC {
-                        return Ok(());
+                    if read_u32(bytes, 0) != VEC_NODE_MAGIC
+                        || (require_checksum && read_u32(bytes, 16) != page_checksum(bytes, 16))
+                    {
+                        return Err(error(
+                            crate::error::catalog::ER_INDEX_CORRUPT,
+                            "corrupt vector index page checksum",
+                        ));
                     }
                     let slot_count = read_u16(bytes, NODE_OFF_SLOT_COUNT);
                     for slot in 0..slot_count {
-                        let Ok(offset) = node_record_offset(bytes, slot) else {
-                            continue;
-                        };
+                        let offset = node_record_offset(bytes, slot)?;
                         let flags = bytes[offset];
                         if flags & REC_FLAG_INITIALIZED != 0 {
                             f(
@@ -5133,7 +5388,11 @@ impl VectorIndexFile {
     /// redo policy. Zero-slot pages are never interpreted as graph nodes.
     pub(crate) fn append_quantization_blob(&self, data: &[u8]) -> Result<u64, QueryError> {
         let _write = self.navigation_write();
-        let _scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,PAGE_SIZE*3)?;
+        let _scratch =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                PAGE_SIZE * 3,
+            )?;
         let mut next = 0u64;
         for chunk in data.rchunks(PAGE_SIZE - 48) {
             let page_id = self.alloc_node_page(0)?;
@@ -5143,37 +5402,143 @@ impl VectorIndexFile {
             write_u64(&mut page, 32, next);
             write_u32(&mut page, 40, chunk.len() as u32);
             page[48..48 + chunk.len()].copy_from_slice(chunk);
-            stamp_vector_page(&mut page,page_id,0);
+            stamp_vector_page(&mut page, page_id, 0);
             self.write_page(0, page_id, page)?;
             next = page_id;
         }
         Ok(next)
     }
-    pub(crate) fn read_quantization_blob(&self, mut head: u64, max_bytes:usize) -> Result<Vec<u8>, QueryError> {
-        let _scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,max_bytes.saturating_add(PAGE_SIZE*2))?;
+    pub(crate) fn read_quantization_blob(
+        &self,
+        mut head: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, QueryError> {
+        let _scratch =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                max_bytes.saturating_add(PAGE_SIZE * 2),
+            )?;
         let mut out = Vec::new();
-        out.try_reserve_exact(max_bytes).map_err(|_|error(crate::error::catalog::ER_OUTOFMEMORY,"quantizer overflow allocation failed"))?;
+        out.try_reserve_exact(max_bytes).map_err(|_| {
+            error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "quantizer overflow allocation failed",
+            )
+        })?;
         let mut pages = 0;
         let limit = self.meta().node_next_page_id;
         while head != 0 {
             pages += 1;
-            if head >= limit || pages >= limit { return Err(error(crate::error::catalog::ER_GET_ERRNO, "invalid quantizer overflow chain")); }
+            if head >= limit || pages >= limit {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "invalid quantizer overflow chain",
+                ));
+            }
             let page = self.read_page_bytes(head)?;
             let len = read_u32(&page, 40) as usize;
-            if read_u32(&page,0)!=VEC_NODE_MAGIC || read_u16(&page,4)!=VEC_PAGE_VERSION || read_u16(&page,NODE_OFF_SLOT_COUNT)!=0 || len>PAGE_SIZE-48 || len>max_bytes.saturating_sub(out.len()) || read_u32(&page,16)!=page_checksum(&page,16) {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,"corrupt quantizer overflow page"));
+            if read_u32(&page, 0) != VEC_NODE_MAGIC
+                || read_u16(&page, 4) != VEC_PAGE_VERSION
+                || read_u16(&page, NODE_OFF_SLOT_COUNT) != 0
+                || len > PAGE_SIZE - 48
+                || len > max_bytes.saturating_sub(out.len())
+                || read_u32(&page, 16) != page_checksum(&page, 16)
+            {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt quantizer overflow page",
+                ));
             }
-            out.try_reserve(len).map_err(|_| error(crate::error::catalog::ER_OUTOFMEMORY,"quantizer overflow allocation failed"))?;
-            out.extend_from_slice(&page[48..48+len]);
-            let next=read_u64(&page,32);
-            if next>=head && next!=0 {return Err(error(crate::error::catalog::ER_GET_ERRNO,"cyclic quantizer overflow chain"));}
-            head=next;
+            out.try_reserve(len).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "quantizer overflow allocation failed",
+                )
+            })?;
+            out.extend_from_slice(&page[48..48 + len]);
+            let next = read_u64(&page, 32);
+            if next >= head && next != 0 {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "cyclic quantizer overflow chain",
+                ));
+            }
+            head = next;
         }
         Ok(out)
     }
-    pub(crate) fn write_quantization_model(&self, data: &[u8], generation: u64) -> Result<(), QueryError> {
-        let head=self.append_quantization_blob(data)?;
-        {let mut state=self.meta_state.lock();state.meta.quant_model_head=head;state.meta.quant_generation=generation;}
+    pub(crate) fn write_quantization_model(
+        &self,
+        data: &[u8],
+        generation: u64,
+    ) -> Result<(), QueryError> {
+        let head = self.append_quantization_blob(data)?;
+        {
+            let mut state = self.meta_state.lock();
+            state.meta.quant_model_head = head;
+            state.meta.quant_generation = generation;
+        }
         self.write_meta_page(0)
+    }
+}
+
+impl VectorIndexFile {
+    /// Recover allocator counters from checked index pages. Semantic WAL replay
+    /// follows this pass, so a partially appended native routing node is retired
+    /// before its committed replacement is reconstructed. No heap is consulted.
+    pub(crate) fn recover_persistent_counters(
+        &self,
+        retire_incomplete: bool,
+    ) -> Result<(), QueryError> {
+        let meta = self.meta();
+        let mut nodes = 0u64;
+        let mut tombstones = 0u64;
+        let mut exact = 0u64;
+        for page_id in 1..meta.node_next_page_id {
+            let bytes = self.read_page_bytes(page_id)?;
+            if read_u32(&bytes, 0) != VEC_NODE_MAGIC
+                || read_u32(&bytes, 16) != page_checksum(&bytes, 16)
+            {
+                return Err(crate::engine::vector::persistence::corrupt());
+            }
+            let mut incomplete = smallvec::SmallVec::<[VecId; 8]>::new();
+            for slot in 0..read_u16(&bytes, NODE_OFF_SLOT_COUNT) {
+                let offset = node_record_offset(&bytes, slot)?;
+                let flags = bytes[offset];
+                if flags & REC_FLAG_INITIALIZED == 0 {
+                    return Err(crate::engine::vector::persistence::corrupt());
+                }
+                nodes += 1;
+                exact += u64::from(flags & REC_FLAG_EXACT_NAV != 0);
+                let mut deleted = flags & REC_FLAG_TOMBSTONE != 0;
+                if retire_incomplete && flags & REC_FLAG_LINKED == 0 && !deleted {
+                    if meta.finalized && meta.query_ready {
+                        return Err(crate::engine::vector::persistence::corrupt());
+                    }
+                    incomplete.push(vid_make(page_id, slot));
+                    deleted = true;
+                }
+                tombstones += u64::from(deleted);
+            }
+            for vid in incomplete {
+                self.set_tombstone(0, vid, true)?;
+            }
+        }
+        let current = self.meta();
+        if (
+            current.node_count,
+            current.tombstone_count,
+            current.nav_exact_nodes,
+        ) != (nodes, tombstones, exact)
+        {
+            {
+                let mut state = self.meta_state.lock();
+                state.meta.node_count = nodes;
+                state.meta.tombstone_count = tombstones;
+                state.meta.nav_exact_nodes = exact;
+            }
+            self.write_meta_page(0)?;
+        }
+        Ok(())
     }
 }

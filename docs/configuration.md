@@ -445,8 +445,10 @@ incremental maintenance still keeps the candidate structures current:
   `mydb_hnsw_max_scan_tuples` candidate budget finishes with an exact scan
   instead of returning a short result; `mydb_hnsw_iterative_scan = off` keeps
   the single approximate pass.
-- An index that cannot be built within the memory budget falls back to an
-  exact scan with a warning, and the build is retried no more than every 10 s.
+- Required index loading, persistence and maintenance failures return explicit
+  errors. These failures do not trigger an exact scan. A failed private
+  replacement keeps the old valid object and a durable failed-job status;
+  failure while modifying the active object fences further service.
 
 Quantized indexes can request a rebuild when scalar exceptions or PQ/BQ update
 growth become significant. PQ remains `PENDING_TRAINING` and queries use exact

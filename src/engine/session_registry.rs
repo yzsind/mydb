@@ -1158,6 +1158,11 @@ impl SessionRegistry {
 }
 
 impl SessionHandle {
+    /// A lost transport must cancel owned work without counting a SQL KILL.
+    pub(crate) fn peer_disconnected(&self) {
+        self.kill_connection();
+    }
+
     pub fn kill_flag(&self) -> &Arc<AtomicBool> {
         &self.kill_flag
     }

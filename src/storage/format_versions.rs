@@ -24,7 +24,8 @@
 // v60 stores sequence recovery states and stable dependencies in catalog tables.
 /// v62 removes the retired quantized IVF algorithm and its page format.
 /// v63 persists vector WITH configuration independently from index comments.
-pub const CATALOG_VERSION: u32 = 63;
+/// v64: persistent vector manifests, snapshot identities and retirement ledger.
+pub const CATALOG_VERSION: u32 = 64;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.
@@ -33,7 +34,8 @@ pub const CATALOG_VERSION: u32 = 63;
 /// v32: explicit segment replacement horizons and redo-only file compensation.
 /// v33: sequence after-states and checkpoint coverage.
 /// v34: append-ordered source time on every frame; atomic system file batches.
-pub const WAL_VERSION: u32 = 34;
+/// v35: transactional vector-index recovery batches.
+pub const WAL_VERSION: u32 = 35;
 /// v14: reduced-redo pages require an FPI before later physiological writes.
 pub const HEAP_PAGE_VERSION: u16 = 14;
 pub const MVCC_ROW_VERSION: u8 = 8;
@@ -46,8 +48,9 @@ pub const UNDO_BINARY_VERSION: u8 = 14;
 pub const UNDO_TABLESPACE_VERSION: u32 = 1;
 pub const OVERFLOW_VERSION: u16 = 3;
 /// v4 records the committed heap coverage frontier.
-pub const PAGED_HNSW_INDEX_VERSION: u32 = 6;
-pub const PAGED_HNSW_PAGE_VERSION: u16 = 3;
+/// v7 persists native node membership and trained index definitions.
+pub const PAGED_HNSW_INDEX_VERSION: u32 = 7;
+pub const PAGED_HNSW_PAGE_VERSION: u16 = 4;
 pub const ZONE_MAP_VERSION: u32 = 6;
 /// Zone Map v6 uses shared-buffer-pool pages and physical redo. Page v2 adds
 /// mutable directory children, mixed record leaves and root revisions. Page
@@ -56,7 +59,7 @@ pub const PAGED_ZONE_MAP_PAGE_VERSION: u16 = 3;
 
 /// The optional legacy in-memory HNSW snapshot is independent from the
 /// default paged `.hvec` format and therefore has its own version.
-pub const IN_MEMORY_HNSW_VERSION: u16 = 2;
+pub const IN_MEMORY_HNSW_VERSION: u16 = 3;
 
 pub const NATIVE_REPLICATION_METADATA_VERSION: u32 = 2;
 pub const COMMIT_CLOCK_VERSION: u32 = 2;
@@ -65,7 +68,7 @@ pub const BACKUP_REPOSITORY_FORMAT: &str = "MYDB_BACKUP_REPOSITORY/2";
 pub const BACKUP_BUNDLE_VERSION: u32 = 3;
 pub const BACKUP_CHECKPOINT_VERSION: u32 = 1;
 pub const BACKUP_LINEAGE_VERSION: u32 = 1;
-pub const NATIVE_IMAGE_VERSION: u32 = 4;
+pub const NATIVE_IMAGE_VERSION: u32 = 5;
 /// The image mode pointer is the single promotion commit point.
 pub const IMAGE_MODE_VERSION: u32 = 2;
 

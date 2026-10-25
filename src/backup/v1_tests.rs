@@ -46,6 +46,46 @@ fn rows(db: &StorageQueryEngine, sql: &str) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn hybrid_rrf_immutable_backup_preserves_ranked_snapshot() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source.execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,v VECTOR(2) NOT NULL,FULLTEXT KEY ft(body))").unwrap();
+    source
+        .execute(
+            "INSERT INTO docs VALUES(1,'database guide','[1,0]'),(2,'database database','[0,1]')",
+        )
+        .unwrap();
+    source
+        .execute("CREATE INDEX hv ON docs(v) USING HNSW")
+        .unwrap();
+    let sql = "SELECT id,rrf_score,match_count FROM ((SELECT id FROM docs WHERE MATCH(body) AGAINST('database') ORDER BY MATCH(body) AGAINST('database') DESC,id LIMIT 2) RRF (SELECT /*+ HNSW_EF(32) */ id FROM docs ORDER BY L2_DISTANCE(v,TO_VECTOR('[1,0]')),id LIMIT 2)) h ORDER BY id";
+    let expected = rows(&source, sql);
+    let coordinator = Coordinator::get(source.db_handle()).unwrap();
+    let repository = root.path().join("repository");
+    let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+        .base_id
+        .unwrap();
+    source.execute("DELETE FROM docs WHERE id=1").unwrap();
+    source
+        .execute("UPDATE docs SET body='changed',v='[2,2]' WHERE id=2")
+        .unwrap();
+    let runtime = root.path().join("runtime");
+    let reader = super::open_base(&repository, &base, &runtime).unwrap();
+    let backup = StorageQueryEngine::open_backup_image(
+        reader.data_dir.clone(),
+        runtime,
+        Default::default(),
+        Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(rows(&backup, sql), expected);
+    assert!(backup.execute("DELETE FROM docs").is_err());
+    backup.shutdown().unwrap();
+    discard_source(source, coordinator);
+}
+
+#[test]
 fn sealed_fulltext_reads_prepared_xa_visible_rows_and_scores() {
     for change in [
         "UPDATE docs SET body='prepared content' WHERE id=1",
@@ -1647,4 +1687,308 @@ fn startup_retention_guard_supports_an_absent_source_directory() {
     source.shutdown().unwrap();
     drop(source);
     drop(guard);
+}
+
+#[test]
+fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds() {
+    struct Environment(Vec<(&'static str, Option<String>)>);
+    impl Drop for Environment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+    let pairs = [
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+    ];
+    let _environment = Environment(
+        pairs
+            .iter()
+            .map(|(key, value)| {
+                let old = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                (*key, old)
+            })
+            .chain(std::iter::once((
+                "MYDB_VECTOR_STORAGE",
+                std::env::var("MYDB_VECTOR_STORAGE").ok(),
+            )))
+            .collect(),
+    );
+    for backend in ["memory", "paged"] {
+        std::env::set_var("MYDB_VECTOR_STORAGE", backend);
+        let mut cases = Vec::new();
+        for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
+            for algorithm in ["HNSW", "IVF"] {
+                cases.push((datatype, algorithm, "none"));
+            }
+        }
+        for quantization in ["sq8", "sq4", "pq", "bq"] {
+            for algorithm in ["HNSW", "IVF"] {
+                cases.push(("FLOAT32", algorithm, quantization));
+            }
+        }
+        for (datatype, algorithm, quantization) in cases {
+            eprintln!("backup persistence case {backend}/{datatype}/{algorithm}/{quantization}");
+            let root = root();
+            let source = engine(&root.path().join("source"));
+            let binary = datatype == "BINARY";
+            let dim = if binary { 128 } else { 4 };
+            let metric = if binary { "HAMMING" } else { "L2" };
+            let indexes = (0..20)
+                .map(|i| format!(",INDEX ordinary_{i}(extra)"))
+                .collect::<String>();
+            source.execute(&format!("CREATE TABLE docs(id INT PRIMARY KEY,extra INT,body TEXT,v VECTOR({dim},{datatype}) NOT NULL,FULLTEXT KEY ft(body){indexes})")).unwrap();
+            let literal = |id: usize| {
+                if binary {
+                    format!(
+                        "[{}]",
+                        (0..128)
+                            .map(|bit| if bit < id { "1" } else { "0" })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                } else {
+                    format!("[{id},1,2,3]")
+                }
+            };
+            for id in 1..=20 {
+                source
+                    .execute(&format!(
+                        "INSERT INTO docs VALUES({id},{id},'database baseline','{}')",
+                        literal(id)
+                    ))
+                    .unwrap();
+            }
+            let options = if algorithm == "HNSW" {
+                "m=4,ef_construction=32,ef_search=128"
+            } else {
+                "nlist=2,nprobe=2"
+            };
+            let quant = if quantization == "pq" {
+                "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+            } else {
+                format!("quantization={quantization}")
+            };
+            source.execute(&format!("CREATE INDEX vx ON docs(v) USING {algorithm} WITH(metric={metric},{options},{quant})")).unwrap();
+            let zero = format!(
+                "[{}]",
+                std::iter::repeat_n("0", dim).collect::<Vec<_>>().join(",")
+            );
+            let query_vector = if binary {
+                format!("TO_VECTOR('{zero}','BINARY')")
+            } else {
+                format!("TO_VECTOR('{zero}')")
+            };
+            let tail = format!(
+                "id,DISTANCE(v,{query_vector},'{metric}') d,body FROM docs ORDER BY d,id LIMIT 20"
+            );
+            let sql = format!("SELECT {tail}");
+            let expected_base = rows(&source, &sql);
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            let repository = root.path().join("repo");
+            let coordinator = Coordinator::get(source.db_handle()).unwrap();
+            coordinator
+                .configure(&repository, Policy::Manual, false, None)
+                .unwrap();
+            let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+                .base_id
+                .unwrap();
+            let base_dir = root.path().join("base");
+            super::restore::restore(
+                &repository,
+                Some(&base),
+                None,
+                Target::Base,
+                &base_dir,
+                None,
+                false,
+            )
+            .unwrap();
+            let baseline = engine(&base_dir);
+            assert_eq!(rows(&baseline, &sql), expected_base);
+            drop(baseline);
+            assert_eq!(crate::storage::Database::vector_build_heap_scans_for_test(),scans,"base sealing or reading reconstructed {backend}/{datatype}/{algorithm}/{quantization}");
+            source
+                .execute(&format!(
+                    "UPDATE docs SET v='{zero}',body='database updateddelta' WHERE id=20"
+                ))
+                .unwrap();
+            source.execute("DELETE FROM docs WHERE id=1").unwrap();
+            source
+                .execute(&format!(
+                    "INSERT INTO docs VALUES(999,999,'database archiveddelta','{zero}')"
+                ))
+                .unwrap();
+            let expected = rows(&source, &sql);
+            assert_eq!(
+                expected,
+                rows(&source, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}"))
+            );
+            let receipt = job(&coordinator, coordinator.backup_wal(&repository).unwrap());
+            let target = root.path().join("pitr");
+            super::restore::restore(
+                &repository,
+                Some(&base),
+                None,
+                Target::Lsn(receipt.requested_lsn),
+                &target,
+                None,
+                false,
+            )
+            .unwrap();
+            let restored = engine(&target);
+            assert_eq!(
+                rows(&restored, &sql),
+                expected,
+                "PITR {backend}/{datatype}/{algorithm}/{quantization}"
+            );
+            assert_eq!(
+                rows(
+                    &restored,
+                    "SELECT id FROM docs WHERE MATCH(body) AGAINST('updateddelta')"
+                ),
+                vec![vec![Value::Int(20)]]
+            );
+            assert_eq!(
+                rows(
+                    &restored,
+                    "SELECT id FROM docs WHERE MATCH(body) AGAINST('archiveddelta')"
+                ),
+                vec![vec![Value::Int(999)]]
+            );
+            assert_eq!(
+                crate::storage::Database::vector_build_heap_scans_for_test(),
+                scans,
+                "PITR reconstructed {backend}/{datatype}/{algorithm}/{quantization}"
+            );
+            assert!(rows(&restored, "SHOW WARNINGS").is_empty());
+            drop(restored);
+            discard_source(source, coordinator);
+        }
+    }
+}
+
+#[test]
+fn resident_vector_seals_keep_source_lsn_for_prepared_future_decisions() {
+    let prior = std::env::var("MYDB_VECTOR_STORAGE").ok();
+    std::env::set_var("MYDB_VECTOR_STORAGE", "memory");
+    std::env::set_var("MYDB_HNSW_BRUTE_THRESHOLD", "0");
+    std::env::set_var("MYDB_HNSW_BRUTE_FILTER_ROWS", "0");
+    for (datatype, algorithm, quantization) in [
+        ("FLOAT32", "HNSW", "none"),
+        ("FLOAT16", "HNSW", "none"),
+        ("FLOAT32", "IVF", "none"),
+        ("FLOAT32", "HNSW", "pq"),
+    ] {
+        let root = root();
+        let source = engine(&root.path().join("source"));
+        source
+            .execute(&format!(
+                "CREATE TABLE docs(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+            ))
+            .unwrap();
+        for id in 1..=20 {
+            source
+                .execute(&format!("INSERT INTO docs VALUES({id},'[{id},1,2,3]')"))
+                .unwrap();
+        }
+        let options = if algorithm == "HNSW" {
+            "m=4,ef_construction=32,ef_search=128"
+        } else {
+            "nlist=2,nprobe=2"
+        };
+        let quant = if quantization == "pq" {
+            "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+        } else {
+            format!("quantization={quantization}")
+        };
+        source
+            .execute(&format!(
+                "CREATE INDEX vx ON docs(v) USING {algorithm} WITH({options},{quant})"
+            ))
+            .unwrap();
+        let mut session = crate::engine::SessionContext::default();
+        for sql in [
+            "XA START 'future-index-decision'",
+            "INSERT INTO docs VALUES(999,'[0,0,0,0]')",
+            "XA END 'future-index-decision'",
+            "XA PREPARE 'future-index-decision'",
+        ] {
+            source.execute_with_session(&mut session, sql).unwrap();
+        }
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        let repo = root.path().join("repo");
+        let coordinator = Coordinator::get(source.db_handle()).unwrap();
+        coordinator
+            .configure(&repo, Policy::Manual, false, None)
+            .unwrap();
+        let base = job(&coordinator, coordinator.backup(&repo).unwrap())
+            .base_id
+            .unwrap();
+        let baseline = root.path().join("baseline");
+        super::restore::restore(
+            &repo,
+            Some(&base),
+            None,
+            Target::Base,
+            &baseline,
+            None,
+            false,
+        )
+        .unwrap();
+        let image = native::verify(&baseline).unwrap();
+        for file in image
+            .manifest
+            .files
+            .iter()
+            .filter(|file| file.path.ends_with(".hnsw"))
+        {
+            let bytes = fs::read(baseline.join(&file.path)).unwrap();
+            assert_eq!(&bytes[..8], b"MYDBIDX2");
+            let covered = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+            assert!(covered<=image.manifest.end_lsn,"{datatype}/{algorithm}/{quantization}: local seal position {covered} exceeded source end {}",image.manifest.end_lsn);
+        }
+        source.execute("XA COMMIT 'future-index-decision'").unwrap();
+        let receipt = job(&coordinator, coordinator.backup_wal(&repo).unwrap());
+        let target = root.path().join("decision");
+        super::restore::restore(
+            &repo,
+            Some(&base),
+            None,
+            Target::Lsn(receipt.requested_lsn),
+            &target,
+            None,
+            false,
+        )
+        .unwrap();
+        let restored = engine(&target);
+        assert_eq!(
+            rows(
+                &restored,
+                "SELECT id FROM docs ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+            ),
+            vec![vec![Value::Int(999)]],
+            "{datatype}/{algorithm}/{quantization}"
+        );
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans
+        );
+        assert!(rows(&restored, "SHOW WARNINGS").is_empty());
+        drop(restored);
+        discard_source(source, coordinator);
+    }
+    if let Some(prior) = prior {
+        std::env::set_var("MYDB_VECTOR_STORAGE", prior);
+    } else {
+        std::env::remove_var("MYDB_VECTOR_STORAGE");
+    }
 }

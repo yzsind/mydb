@@ -20,8 +20,8 @@ import urllib.request
 
 IMAGE = 'quay.io/pypa/manylinux2014_x86_64@sha256:f6a6f153c9cf45470507ebbc27013e5db14ce21331b62fd2c540561f25e5f0a5'
 RUST = '1.95.0'
-NEXT = '0.9.143'
-NEXT_SHA256 = '6d891c18105ec2d33f6e441a4f92b7ccab47ba263e22055c8bb66884243f3389'
+NEXT = '0.9.149'
+NEXT_SHA256 = 'd65c7f14bcb5c1566d1ecd534c5da8dedb81ba58586e478b0ab81c877d2bd8ad'
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -74,7 +74,7 @@ def download_nextest(output):
     return binary
 
 
-def runtime_nextest_config(config, seed_binary):
+def runtime_nextest_config(config, seed_binary, *, test_harness=False):
     """Adapt only the shared seed generator, preserving runtime test policy."""
     error = 'nextest setup configuration changed; update the runtime adapter'
     try:
@@ -91,7 +91,10 @@ def runtime_nextest_config(config, seed_binary):
     section = re.search(r'(?ms)^\[scripts\.setup\.mydb-test-seed\][ \t]*(?:#[^\n]*)?\n(.*?)(?=^\[|\Z)', config)
     if section is None:
         raise SystemExit(error)
-    runtime_command = shlex.quote(str(seed_binary))
+    runtime_args = [str(seed_binary)]
+    if test_harness:
+        runtime_args += ['--ignored', '--exact', 'test_seed_setup::prepare_nextest_seed']
+    runtime_command = shlex.join(runtime_args)
     body, count = re.subn(r'(?m)^[ \t]*command[ \t]*=.*$',
                          lambda _: 'command = ' + json.dumps(runtime_command), section[1])
     if count != 1:

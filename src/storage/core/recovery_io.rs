@@ -427,7 +427,7 @@ fn with_recovery_page_io<T>(
     // their headers here, or a physical/logical redo mix would see stale LSNs.
     // Zone Map redo must validate the complete page and generation before
     // trusting its LSN; a cached 16-byte header cannot establish this.
-    if is_index_object_path(relative) || relative.ends_with(".zm") {
+    if is_index_object_path(relative) || relative.ends_with(".zm") || relative.ends_with(".hvec") {
         return None;
     }
     RECOVERY_PAGE_IO.with(|slot| {

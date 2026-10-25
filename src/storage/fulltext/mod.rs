@@ -20,8 +20,10 @@
 //! tokenizer from that snapshot — env changes across restarts can no longer mismatch historical indexes. Old indexes deserialize to `None` and use global defaults.
 //!
 //! ## Scoring
-//! Relevance uses BM25 (the `bm25` submodule). `avgdl` is approximated by the candidate-set mean
-//! (from the payload's `doc_len`, no row lookup needed); `N` is the catalog's live row count.
+//! Relevance uses BM25 (the `bm25` submodule). Indexed reads use ANALYZE's corpus
+//! average when available, otherwise the candidate-set mean; `N` is estimated
+//! from catalog statistics and committed row deltas. Historical and partitioned
+//! query oracles compute statistics from their visible documents.
 
 pub(crate) mod bm25;
 pub(crate) mod boolean;
@@ -56,7 +58,7 @@ pub struct FtPosting {
 /// single positions arena. Ordered as the B-tree returned them (i.e.
 /// **payload-bytes order**, not row-id order — sort by `row_id` post-scan
 /// when set operations are needed).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FtPostingBatch {
     pub postings: Vec<FtPosting>,
     pub positions_arena: Vec<u32>,

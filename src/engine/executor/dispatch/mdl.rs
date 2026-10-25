@@ -1566,6 +1566,11 @@ pub(super) fn collect_statement_table_uses_scoped<'q>(
         crate::parser::QueryRef::Select(select) => {
             collect_select_table_uses(select, select.for_update, cte_names, out)
         }
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_statement_table_uses_scoped(&branch.query, cte_names, out);
+            }
+        }
         crate::parser::QueryRef::SetOperation(set) => {
             collect_statement_table_uses_scoped(&set.left, cte_names, out);
             collect_statement_table_uses_scoped(&set.right, cte_names, out);
@@ -1713,7 +1718,7 @@ pub(in crate::engine::executor) fn collect_select_table_uses(
         if let Some(derived) = &join.derived {
             match derived {
                 SubQuery::Select(s) => collect_select_table_uses(s, locking, cte_names, out),
-                stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+                stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                     collect_statement_table_uses_scoped(stmt, cte_names, out)
                 }
             }
@@ -1725,7 +1730,7 @@ pub(in crate::engine::executor) fn collect_select_table_uses(
     if let Some(derived) = &select.derived {
         match derived {
             SubQuery::Select(s) => collect_select_table_uses(s, locking, cte_names, out),
-            stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+            stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                 collect_statement_table_uses_scoped(stmt, cte_names, out)
             }
         }

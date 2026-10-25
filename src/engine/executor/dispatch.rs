@@ -29,7 +29,7 @@ pub(super) use views::{
     rewrite_update_through_view,
 };
 mod setop;
-pub(in crate::engine::executor) use setop::coerce_setop_value;
+pub(in crate::engine::executor) use setop::{coerce_setop_value, set_row_key};
 pub(crate) use setop::{
     combine_set_rows_spillable_charged, combine_set_sources_spillable,
     unify_setop_declared_column_metadata, IncrementalSetOutput,
@@ -407,6 +407,10 @@ pub(super) fn statement_refs_temp_table<'q>(
                     .is_some_and(|expr| expr_refs_temp_table(session, expr))
         }
         crate::parser::QueryRef::Select(stmt) => select_refs_temp_table(session, stmt),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .any(|branch| statement_refs_temp_table(session, &branch.query)),
         crate::parser::QueryRef::SetOperation(set) => {
             statement_refs_temp_table(session, &set.left)
                 || statement_refs_temp_table(session, &set.right)
@@ -498,6 +502,10 @@ pub(crate) fn statement_is_pure_read<'q>(
             target, analyze, ..
         }) => !*analyze || statement_is_pure_read(target),
         crate::parser::QueryRef::WithCte(stmt) => statement_is_pure_read(&stmt.body),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .all(|branch| statement_is_pure_read(&branch.query)),
         crate::parser::QueryRef::SetOperation(stmt) => {
             statement_is_pure_read(&stmt.left) && statement_is_pure_read(&stmt.right)
         }
@@ -697,6 +705,33 @@ fn execute_statement_inner(
         // Resolve user references before inserting persistently bound view bodies.
         qualify_statement_tables(db, session, &mut statement)?;
         expand_views(db, session, &mut statement, 0)?;
+        let has_fusion = select::hybrid::statement_has_fusion(&statement);
+        let _fulltext_scoring = select::fulltext_context::enter_fusion(has_fusion);
+        if has_fusion {
+            crate::parser::rrf::validate_statement(&statement, &|name| {
+                [
+                    crate::parser::USER_VAR_ASSIGN_FUNCTION,
+                    "NEXTVAL",
+                    "SETVAL",
+                    "GET_LOCK",
+                    "RELEASE_LOCK",
+                    "RELEASE_ALL_LOCKS",
+                ]
+                .iter()
+                .any(|function| name.eq_ignore_ascii_case(function))
+                    || (db.has_stored_functions()
+                        && (name.contains('.')
+                            || !crate::engine::cbo::function_cost::is_known_builtin_function(name))
+                        && db
+                            .routine_definition(
+                                &session.current_database,
+                                crate::storage::RoutineKindSchema::Function,
+                                name,
+                            )
+                            .is_some())
+            })
+            .map_err(|error| error.spec.error(error.message))?;
+        }
         function_resolution.merge(super::routines::resolve_stored_functions(
             db,
             session,

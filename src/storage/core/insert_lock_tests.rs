@@ -4,7 +4,7 @@ fn insert_lock_test_dir() -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manual concurrent strict-durability insert throughput comparison; run on an idle host"]
 fn insert_lock_concurrent_benchmark() {
     for kind in ["heap", "btree"] {
         let dir = insert_lock_test_dir();
@@ -393,7 +393,7 @@ fn btree_prepared_split_revalidates_leaf_after_concurrent_delete() {
 // Isolate the changed storage paths from SQL/constraints/zone-map overhead.
 // MYDB_TEST_SERIAL_INSERT_LOCKS selects the old locking paths in test builds.
 #[test]
-#[ignore]
+#[ignore = "manual heap and B-tree locking throughput comparison; run on an idle host"]
 fn insert_lock_storage_benchmark() {
     let dir = insert_lock_test_dir();
     let mut config = test_storage_config(DurabilityMode::Strict, true);

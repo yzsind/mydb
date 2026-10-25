@@ -93,6 +93,11 @@ pub(super) fn qualify_statement_tables<'q>(
         | crate::parser::QueryMut::Other(Statement::SelectIntoFile { inner: target, .. }) => {
             qualify_statement_tables(db, session, target)?
         }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                qualify_statement_tables(db, session, &mut branch.query)?;
+            }
+        }
         crate::parser::QueryMut::SetOperation(stmt) => {
             qualify_statement_tables(db, session, &mut stmt.left)?;
             qualify_statement_tables(db, session, &mut stmt.right)?;

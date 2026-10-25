@@ -86,6 +86,7 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 - GIS uses `SRID + WKB`, supporting Geometry subtypes, column-level SRIDs, construction/access/measurement/MBR and exact predicates, GeoJSON/Geohash, spatial indexes, and `ST_COLLECT`. Some geographic computations, projection transforms, and polygon set operations still fail with explicit errors, so this is not complete GIS compatibility.
 - `VECTOR(n, datatype)` supports FLOAT32, FLOAT16, BFLOAT16, INT8, and BINARY. Numeric vectors support L2/COSINE/DOT; BINARY supports HAMMING/JACCARD with `quantization=none`. Numeric index quantization is explicit and defaults to `none`; PQ indexes without enough training rows execute exact scans. See [vector datatypes and indexes](vector-indexes.md).
 - Vector supports exact brute-force KNN plus HNSW/IVF ANN. The planner recognizes `ORDER BY distance LIMIT k` and supports prepared parameters, partitioning, transaction deltas, visible native heap re-ranking, and the `NO_VECTOR_INDEX` differential oracle. `EXPLAIN` reports quantization and the effective re-ranking pool; `information_schema.mydb_vector_indexes` exposes configuration, training state, and runtime counters.
+- [Hybrid search](hybrid-search.md) adds an SQL RRF/weighted-RRF technical preview: 2–8 independently ordered inputs, typed composite identities, relational output, prepared parameters, per-branch score explanations, and Python retrieval/reranking/evidence examples.
 
 ## 4. Query Optimization and Execution
 

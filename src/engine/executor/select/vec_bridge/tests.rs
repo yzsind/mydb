@@ -1187,6 +1187,135 @@ fn inlj_runtime_chunk_shrinks_with_live_query_headroom() {
 }
 
 #[test]
+fn native_cursor_preserves_primary_oom_without_consumer_tls() {
+    use crate::engine::api::ResultCursor;
+
+    for chunks in [false, true] {
+        for oom in [false, true] {
+            let budget = Arc::new(mem_budget::MemBudget::new(1024));
+            let context = super::super::execution_context::ExecutionContext::capture_with_budget(
+                TxnView::read_only(0, crate::storage::IsolationLevel::ReadCommitted),
+                budget,
+            )
+            .fork_worker_cancellation();
+            let cancellation = context.cancellation().clone();
+            let error = if oom {
+                context.terminal_error(
+                    crate::error::catalog::ER_OUTOFMEMORY.error("native output budget exhausted"),
+                )
+            } else {
+                cancellation.cancel_local();
+                crate::engine::cancel::interrupted_error()
+            };
+            let expected = error.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(Err(error)).unwrap();
+            drop(tx);
+            let observed = std::thread::spawn(move || {
+                assert!(mem_budget::current_budget().is_none());
+                let mut cursor = NativePlanBatchCursor {
+                    rx: Some(rx),
+                    worker: None,
+                    cancellation,
+                    budget: context.budget().clone(),
+                    current: None,
+                    current_charge: None,
+                    current_rows: Vec::new().into_iter(),
+                    warning_sink: Default::default(),
+                };
+                if chunks {
+                    cursor.next_chunk().err().expect("terminal cursor error")
+                } else {
+                    cursor.next_row().unwrap_err()
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(observed, expected, "chunks={chunks}, oom={oom}");
+        }
+    }
+}
+
+#[test]
+fn native_cursor_preserves_shared_oom_on_channel_error_or_close() {
+    use crate::engine::api::ResultCursor;
+
+    for chunks in [false, true] {
+        for queued_error in [false, true] {
+            let budget = Arc::new(mem_budget::MemBudget::new(1024));
+            let error = budget.latch_terminal_oom(
+                crate::error::catalog::ER_OUTOFMEMORY.error("native source budget exhausted"),
+            );
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if queued_error {
+                tx.send(Err(crate::engine::cancel::interrupted_error()))
+                    .unwrap();
+            }
+            drop(tx);
+            let mut cursor = NativePlanBatchCursor {
+                rx: Some(rx),
+                worker: None,
+                cancellation: crate::engine::cancel::CancellationSnapshot::capture().fork_local(),
+                budget,
+                current: None,
+                current_charge: None,
+                current_rows: Vec::new().into_iter(),
+                warning_sink: Default::default(),
+            };
+            let observed = if chunks {
+                cursor.next_chunk().err().expect("terminal cursor error")
+            } else {
+                cursor.next_row().unwrap_err()
+            };
+            assert_eq!(
+                observed, error,
+                "chunks={chunks}, queued_error={queued_error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_cursor_reports_producer_panic_instead_of_clean_eof() {
+    use crate::engine::api::ResultCursor;
+
+    for chunks in [false, true] {
+        for panics in [false, true] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                drop(tx);
+                if panics {
+                    panic!("injected native producer panic");
+                }
+            });
+            let mut cursor = NativePlanBatchCursor {
+                rx: Some(rx),
+                worker: Some(worker),
+                cancellation: crate::engine::cancel::CancellationSnapshot::capture().fork_local(),
+                budget: Arc::new(mem_budget::MemBudget::new(1024)),
+                current: None,
+                current_charge: None,
+                current_rows: Vec::new().into_iter(),
+                warning_sink: Default::default(),
+            };
+            let result = if chunks {
+                cursor.next_chunk().map(|chunk| chunk.is_some())
+            } else {
+                cursor.next_row().map(|row| row.is_some())
+            };
+            if panics {
+                let error = result.unwrap_err();
+                assert!(error.is(crate::error::catalog::ER_INTERNAL_ERROR));
+                assert!(error.message().contains("injected native producer panic"));
+            } else {
+                assert!(!result.unwrap());
+            }
+            assert!(cursor.worker.is_none());
+        }
+    }
+}
+
+#[test]
 fn native_result_cursor_holds_batch_reservation_until_consumed() {
     use crate::engine::api::ResultCursor;
     let schema = Arc::new(BatchSchema::new(vec![test_batch_field(
@@ -1213,6 +1342,7 @@ fn native_result_cursor_holds_batch_reservation_until_consumed() {
             rx: Some(receiver),
             worker: None,
             cancellation: context.cancellation().clone(),
+            budget: budget.clone(),
             current: None,
             current_charge: None,
             current_rows: Vec::new().into_iter(),
@@ -2503,6 +2633,7 @@ fn native_cursor_chunks_preserve_partial_selection_and_reservation_ownership() {
             rx: Some(rx),
             worker: None,
             cancellation: crate::engine::cancel::CancellationSnapshot::capture().fork_local(),
+            budget: budget.clone(),
             current: None,
             current_charge: None,
             current_rows: Vec::new().into_iter(),

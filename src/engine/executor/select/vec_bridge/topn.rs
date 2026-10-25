@@ -5708,7 +5708,10 @@ pub(in crate::engine::executor::select) fn try_vec_topn(
         return Ok(None);
     };
     if template.is_empty() {
-        return Ok(Some(Vec::new()));
+        // Zero output columns do not imply zero rows (source-free SELECT
+        // starts from a one-row, zero-column ValuesScan). Keep the canonical
+        // row heap until this eager adapter supports that cardinality.
+        return Ok(None);
     }
     if has_expr_keys {
         return run_vec_topn_expr_keys(input_stream.as_mut(), &template, order_by, k, offset);

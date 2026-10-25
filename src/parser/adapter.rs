@@ -1,6 +1,7 @@
 //! sqlparser integration points. Extension tokens keep source coordinates;
 //! grammar and conversion do not depend on patched SQL presentation text.
 mod operators;
+pub(in crate::parser) mod rrf;
 #[cfg(test)]
 pub(crate) use operators::max_set_operation_branches;
 pub(super) use operators::{

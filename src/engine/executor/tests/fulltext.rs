@@ -1,6 +1,315 @@
 use super::*;
 
 #[test]
+fn fulltext_boolean_scores_agree_with_membership_in_scalar_contexts() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE bool_scores(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+        .unwrap();
+    engine.execute("INSERT INTO bool_scores VALUES(1,'alpha beta'),(2,'beta alpha'),(3,'alpha gamma'),(4,'beta gamma'),(5,'unrelated text'),(6,NULL),(7,'')").unwrap();
+    for (query, expected) in [
+        ("+alpha +beta", vec!["1", "2"]),
+        ("+alpha -beta", vec!["3"]),
+        ("\"alpha beta\"", vec!["1"]),
+        ("+alpha \"beta gamma\"", vec!["1", "2", "3"]),
+        ("alpha*", vec!["1", "2", "3"]),
+        ("-alpha", vec![]),
+    ] {
+        let expr = format!("MATCH(body) AGAINST('{query}' IN BOOLEAN MODE)");
+        for predicate in [
+            expr.clone(),
+            format!("{expr} > 0"),
+            format!("NOT ({expr} = 0)"),
+        ] {
+            let sql = format!("SELECT id FROM bool_scores WHERE {predicate} ORDER BY id");
+            assert_eq!(first_col(exec_set(&engine, &sql)), expected, "{sql}");
+        }
+        let result = exec_set(
+            &engine,
+            &format!("SELECT id,{expr} AS score FROM bool_scores ORDER BY id"),
+        );
+        for row in result.rows {
+            let id = row[0].to_display_string();
+            let score: f64 = row[1].to_display_string().parse().unwrap();
+            assert_eq!(
+                score > 0.0,
+                expected.contains(&id.as_str()),
+                "{query}: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fulltext_boolean_rejects_hidden_operators_and_malformed_operands() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = docs_engine(dir.path());
+    for query in [
+        "+(database)",
+        "+>database",
+        "database)",
+        "database@2",
+        "++database",
+        "+-database",
+        "+",
+        "\"database",
+    ] {
+        let sql =
+            format!("SELECT id FROM docs WHERE MATCH(body) AGAINST('{query}' IN BOOLEAN MODE)");
+        let err = engine.execute(&sql).expect_err(&sql);
+        assert!([1064, 1235].contains(&err.code()), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn fulltext_partition_documents_keep_distinct_local_row_ids() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE part_ft(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body)) PARTITION BY HASH(id) PARTITIONS 2").unwrap();
+    engine.execute("INSERT INTO part_ft VALUES(1,'alpha beta'),(2,'beta gamma'),(3,'alpha gamma'),(4,'alpha beta')").unwrap();
+    for (query, expected) in [
+        ("alpha", vec!["1", "3", "4"]),
+        ("+alpha -beta", vec!["3"]),
+        ("\"alpha beta\"", vec!["1", "4"]),
+        ("alp*", vec!["1", "3", "4"]),
+    ] {
+        let sql = format!("SELECT id FROM part_ft WHERE MATCH(body) AGAINST('{query}' IN BOOLEAN MODE) ORDER BY id");
+        assert_eq!(first_col(exec_set(&engine, &sql)), expected, "{sql}");
+    }
+    assert_eq!(
+        first_col(exec_set(
+            &engine,
+            "SELECT id FROM part_ft WHERE id=4 AND MATCH(body) AGAINST('alpha')"
+        )),
+        vec!["4"]
+    );
+    engine
+        .execute("CREATE TABLE plain_ft(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+        .unwrap();
+    engine.execute("INSERT INTO plain_ft VALUES(1,'alpha beta'),(2,'beta gamma'),(3,'alpha gamma'),(4,'alpha beta')").unwrap();
+    engine.execute("ANALYZE TABLE plain_ft,part_ft").unwrap();
+    assert_eq!(
+        first_col(exec_set(
+            &engine,
+            "SELECT id FROM part_ft PARTITION(p0) WHERE MATCH(body) AGAINST('alpha') ORDER BY id"
+        )),
+        vec!["4"]
+    );
+    assert_eq!(
+        first_col(exec_set(
+            &engine,
+            "SELECT id FROM part_ft PARTITION(p1) WHERE MATCH(body) AGAINST('alpha') ORDER BY id"
+        )),
+        vec!["1", "3"]
+    );
+    for query in [
+        "alpha",
+        "+alpha -beta",
+        "\"alpha beta\"",
+        "alp*",
+        "\"alpha beta\" beta*",
+    ] {
+        let expr = format!("MATCH(body) AGAINST('{query}' IN BOOLEAN MODE)");
+        for predicate in [
+            "1=1".to_string(),
+            format!("{expr}>0"),
+            format!("{expr}=0"),
+            format!("{expr} OR id=2"),
+            format!("{expr} AND id=4"),
+        ] {
+            let get = |table| {
+                rows_to_strings(exec_set(
+                    &engine,
+                    &format!("SELECT id,{expr} FROM {table} WHERE {predicate} ORDER BY id"),
+                ))
+            };
+            assert_eq!(get("part_ft"), get("plain_ft"), "{query}: {predicate}");
+        }
+    }
+}
+
+#[test]
+fn fulltext_historical_queries_use_visible_document_tokens() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_ft_engine(dir.path());
+    engine
+        .execute("CREATE TABLE history_ft(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO history_ft VALUES(1,'alpha beta'),(2,'beta gamma')")
+        .unwrap();
+    engine.execute("ANALYZE TABLE history_ft").unwrap();
+    let expected_scores = rows_to_strings(exec_set(
+        &engine,
+        "SELECT id,MATCH(body) AGAINST('alpha') FROM history_ft ORDER BY id",
+    ));
+    std::thread::sleep(Duration::from_millis(2));
+    let boundary = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.6f")
+        .to_string();
+    std::thread::sleep(Duration::from_millis(2));
+    engine
+        .execute("UPDATE history_ft SET body='delta gamma' WHERE id=1")
+        .unwrap();
+    engine.execute("DELETE FROM history_ft WHERE id=2").unwrap();
+    engine
+        .execute("INSERT INTO history_ft VALUES(3,'alpha beta')")
+        .unwrap();
+    drop(engine);
+    let engine = open_strict_ft_engine(dir.path());
+    for (query, expected) in [
+        ("alpha", vec!["1"]),
+        ("\"alpha beta\"", vec!["1"]),
+        ("+beta -alpha", vec!["2"]),
+        ("del*", vec![]),
+    ] {
+        let sql = format!("SELECT id FROM history_ft FOR SYSTEM_TIME AS OF '{boundary}' WHERE MATCH(body) AGAINST('{query}' IN BOOLEAN MODE) ORDER BY id");
+        assert_eq!(first_col(exec_set(&engine, &sql)), expected, "{sql}");
+    }
+    assert_eq!(rows_to_strings(exec_set(&engine,&format!("SELECT id,MATCH(body) AGAINST('alpha') FROM history_ft FOR SYSTEM_TIME AS OF '{boundary}' ORDER BY id"))),expected_scores);
+    assert_eq!(first_col(exec_set(&engine,&format!("SELECT id FROM history_ft FOR SYSTEM_TIME AS OF '{boundary}' WHERE id=1 AND MATCH(body) AGAINST('alpha')"))),vec!["1"]);
+}
+
+#[test]
+fn fulltext_payload_settings_are_part_of_the_persisted_index_definition() {
+    use crate::storage::fulltext::payload::FtPayload;
+    use crate::storage::{IndexKey, KeyPart};
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE payload_ft(a TEXT,b TEXT,FULLTEXT KEY ft(a,b))")
+        .unwrap();
+    let table = engine.db_for_tests().table("payload_ft").unwrap();
+    let mut index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_fulltext())
+        .unwrap()
+        .clone();
+    let values = vec![Value::String("alpha".into()), Value::String("beta".into())];
+    for (positions, gap) in [(false, 7), (true, 7), (true, 0)] {
+        // Deserialize options so this regression also fails before the fields exist.
+        let mut meta = serde_json::to_value(index.fulltext.as_ref().unwrap()).unwrap();
+        meta["positions"] = positions.into();
+        meta["position_gap"] = gap.into();
+        index.fulltext = Some(serde_json::from_value(meta).unwrap());
+        let keys = table.fulltext_index_keys(&index, &values).unwrap();
+        let IndexKey(parts) = keys
+            .iter()
+            .find(|key| key.0.first() == Some(&KeyPart::String("beta".into())))
+            .unwrap();
+        let KeyPart::Bytes(bytes) = &parts[1] else {
+            panic!("missing payload")
+        };
+        let payload = FtPayload::decode(bytes, positions).unwrap();
+        assert_eq!(payload.doc_len, 2);
+        assert_eq!(
+            payload.positions,
+            if positions {
+                vec![1 + gap.max(1) as u32]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
+#[test]
+fn fulltext_shared_phrase_postings_match_with_and_without_positions_after_restart() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let engine = open_strict_ft_engine(dir.path());
+        for (name, positions) in [("with_pos", true), ("without_pos", false)] {
+            engine.execute(&format!("CREATE TABLE {name}(id INT PRIMARY KEY,title TEXT,body TEXT,FULLTEXT KEY ft(title,body))")).unwrap();
+            let table = engine.database().table(name).unwrap();
+            let mut index = table
+                .indexes
+                .iter()
+                .find(|index| index.is_fulltext())
+                .unwrap()
+                .clone();
+            index.fulltext.as_mut().unwrap().positions = Some(positions);
+            index.fulltext.as_mut().unwrap().position_gap = Some(7);
+            index.index_id = 0;
+            engine.execute(&format!("DROP INDEX ft ON {name}")).unwrap();
+            engine.database().add_index(name, index).unwrap();
+            engine.execute(&format!("INSERT INTO {name} VALUES(1,'alpha beta alpha','gamma'),(2,'alpha','beta alpha'),(3,NULL,'beta gamma'),(4,'alpha alpha beta','gamma'),(5,'unrelated',NULL)")).unwrap();
+            engine.execute(&format!("ANALYZE TABLE {name}")).unwrap();
+        }
+    }
+    let engine = open_strict_ft_engine(dir.path());
+    for query in [
+        "\"alpha beta\"",
+        "\"alpha alpha beta\"",
+        "alp* \"alpha beta\"",
+        "\"alpha beta\" alp*",
+        "+alpha -\"beta alpha\"",
+        "\"alpha beta\" \"beta alpha\"",
+        "+\"alpha beta\" +\"beta alpha\"",
+    ] {
+        let search = format!("MATCH(title,body) AGAINST('{query}' IN BOOLEAN MODE)");
+        let get = |table| {
+            rows_to_strings(exec_set(
+                &engine,
+                &format!("SELECT id,{search} FROM {table} ORDER BY id"),
+            ))
+        };
+        assert_eq!(get("with_pos"), get("without_pos"), "{query}");
+    }
+    for name in ["with_pos", "without_pos"] {
+        assert_eq!(first_col(exec_set(&engine,&format!("SELECT id FROM {name} WHERE MATCH(title,body) AGAINST('\"alpha beta\"' IN BOOLEAN MODE) ORDER BY id"))),vec!["1","4"]);
+        let meta = engine
+            .database()
+            .table(name)
+            .unwrap()
+            .indexes
+            .iter()
+            .find(|index| index.is_fulltext())
+            .unwrap()
+            .fulltext
+            .clone()
+            .unwrap();
+        assert_eq!(meta.positions, Some(name == "with_pos"));
+        assert_eq!(meta.position_gap, Some(7));
+    }
+}
+
+#[test]
+fn fulltext_vector_order_keeps_match_scores_in_every_scalar_context() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE hybrid_match (id INT PRIMARY KEY, body TEXT, v VECTOR(2) NOT NULL, FULLTEXT KEY ft(body))").unwrap();
+    engine.execute("INSERT INTO hybrid_match VALUES (1,'database systems','[0,0]'),(2,'unrelated topic','[1,0]'),(3,'database archive','[2,0]')").unwrap();
+    engine
+        .execute("CREATE INDEX hv ON hybrid_match(v) USING HNSW")
+        .unwrap();
+    for hint in ["", "/*+ HNSW_EF(64) */", "/*+ NO_VECTOR_INDEX */"] {
+        for (predicate, expected) in [
+            ("MATCH(body) AGAINST('database')", vec![1, 3]),
+            ("NOT MATCH(body) AGAINST('database')", vec![2]),
+            ("MATCH(body) AGAINST('database') OR id=2", vec![1, 2, 3]),
+        ] {
+            let sql = format!("SELECT {hint} id, MATCH(body) AGAINST('database') AS score FROM hybrid_match WHERE {predicate} ORDER BY L2_DISTANCE(v,TO_VECTOR('[0,0]')) LIMIT 3");
+            let result = exec_set(&engine, &sql);
+            assert_eq!(
+                result
+                    .rows
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().map(Value::Int).collect::<Vec<_>>(),
+                "{sql}"
+            );
+        }
+        let sql = format!("SELECT {hint} id, MATCH(body) AGAINST('database') AS score FROM hybrid_match ORDER BY L2_DISTANCE(v,TO_VECTOR('[0,0]')) LIMIT 3");
+        let result = exec_set(&engine, &sql);
+        assert_eq!(result.rows.len(), 3, "{sql}");
+        assert_eq!(result.rows[1][1], Value::Double(0.0), "{sql}");
+    }
+}
+
+#[test]
 fn fulltext_repairs_certify_partial_updates_prefixes_and_phrases() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());

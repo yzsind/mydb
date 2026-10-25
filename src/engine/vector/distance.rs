@@ -305,6 +305,17 @@ pub(crate) enum Metric {
 }
 
 impl Metric {
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::L2,
+            1 => Self::Cosine,
+            2 => Self::Dot,
+            3 => Self::Hamming,
+            4 => Self::Jaccard,
+            _ => return None,
+        })
+    }
+
     /// Parse a metric name from `DISTANCE(v1, v2, 'name')` or an index option.
     /// Accepts common spellings/aliases. Case-insensitive.
     pub(crate) fn parse(s: &str) -> Option<Metric> {

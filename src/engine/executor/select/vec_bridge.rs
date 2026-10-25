@@ -2014,7 +2014,8 @@ pub(crate) fn should_route_result_to_batch(plan: &PhysicalPlan, projection: &[Se
             PhysicalPlan::SetOp { left, right, .. } => {
                 supported_scan_spine(left) && supported_scan_spine(right)
             }
-            PhysicalPlan::GenerateSeries { .. }
+            PhysicalPlan::RrfFusion { .. }
+            | PhysicalPlan::GenerateSeries { .. }
             | PhysicalPlan::ValuesScan { .. }
             | PhysicalPlan::JsonTableScan { .. }
             | PhysicalPlan::SystemScan { .. }
@@ -2137,7 +2138,8 @@ impl NativeVecCompiler {
             PhysicalPlan::JsonTableScan { .. } => try_build_json_table_batch(plan)?,
             PhysicalPlan::SystemScan { .. } => try_build_system_batch(db, plan)?,
             PhysicalPlan::IndexMerge { .. } => try_build_direct_index_merge_batch(db, txn, plan)?,
-            PhysicalPlan::FulltextScan { .. }
+            PhysicalPlan::RrfFusion { .. }
+            | PhysicalPlan::FulltextScan { .. }
             | PhysicalPlan::SpatialScan { .. }
             | PhysicalPlan::VectorIndexScan { .. }
             | PhysicalPlan::VectorBruteScan { .. }
@@ -2656,10 +2658,34 @@ struct NativePlanBatchCursor {
     rx: Option<std::sync::mpsc::Receiver<Result<QueuedScanBatch, QueryError>>>,
     worker: Option<std::thread::JoinHandle<()>>,
     cancellation: crate::engine::cancel::CancellationSnapshot,
+    budget: Arc<mem_budget::MemBudget>,
     current: Option<Batch>,
     current_charge: Option<mem_budget::ScopedCharge>,
     current_rows: std::vec::IntoIter<usize>,
     warning_sink: crate::engine::api::StatementWarningSink,
+}
+
+impl NativePlanBatchCursor {
+    #[inline]
+    fn check_cancelled(&self) -> Result<(), QueryError> {
+        // Workers publish terminal OOM before cancelling. Resolve that primary
+        // error only on failure, without a budget lookup on successful rows.
+        self.cancellation
+            .check()
+            .map_err(|error| self.budget.terminal_oom().unwrap_or(error))
+    }
+
+    fn finish(&mut self) -> Result<(), QueryError> {
+        let result = self
+            .worker
+            .take()
+            .map(super::stream::join_stream_thread)
+            .unwrap_or(Ok(()));
+        match self.budget.terminal_oom() {
+            Some(error) => Err(error),
+            None => result,
+        }
+    }
 }
 
 impl std::fmt::Debug for NativePlanBatchCursor {
@@ -2674,7 +2700,7 @@ impl std::fmt::Debug for NativePlanBatchCursor {
 impl crate::engine::api::ResultCursor for NativePlanBatchCursor {
     fn next_chunk(&mut self) -> Result<Option<crate::engine::api::ResultChunk>, QueryError> {
         use crate::engine::api::{ResultBatch, ResultChunk};
-        self.cancellation.check()?;
+        self.check_cancelled()?;
         // Support callers switching from row consumption partway through a
         // batch. Preserve the remaining physical indices, not a dense prefix.
         if let Some(batch) = self.current.take() {
@@ -2703,14 +2729,17 @@ impl crate::engine::api::ResultCursor for NativePlanBatchCursor {
                     charge: Some(_charge),
                 })))
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Ok(None),
+            Ok(Err(error)) => Err(self.budget.terminal_oom().unwrap_or(error)),
+            Err(_) => {
+                self.finish()?;
+                Ok(None)
+            }
         }
     }
 
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         loop {
-            self.cancellation.check()?;
+            self.check_cancelled()?;
             if let Some(row) = self.current_rows.next() {
                 return Ok(Some(
                     self.current
@@ -2736,11 +2765,9 @@ impl crate::engine::api::ResultCursor for NativePlanBatchCursor {
                     self.current_rows = batch.visible_indices().collect::<Vec<_>>().into_iter();
                     self.current = Some(batch);
                 }
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => return Err(self.budget.terminal_oom().unwrap_or(error)),
                 Err(_) => {
-                    if let Some(worker) = self.worker.take() {
-                        super::stream::join_stream_thread(worker)?;
-                    }
+                    self.finish()?;
                     return Ok(None);
                 }
             }
@@ -2791,6 +2818,7 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
 
     let execution_context = execution_context.fork_worker_cancellation();
     let cancellation = execution_context.cancellation().clone();
+    let budget = execution_context.budget().clone();
     let warning_sink = execution_context.warning_sink().clone();
     let snapshot_guard = db.register_statement_snapshot(txn.snapshot_scn);
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<QueuedScanBatch, QueryError>>(
@@ -2831,6 +2859,7 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
             rx: Some(rx),
             worker: Some(worker),
             cancellation,
+            budget,
             current: None,
             current_charge: None,
             current_rows: Vec::new().into_iter(),
@@ -2923,7 +2952,7 @@ fn try_build_vec_projection_input<'a>(
     Ok(compiled)
 }
 
-fn final_projection(plan: &PhysicalPlan) -> Option<&[SelectItem]> {
+pub(super) fn final_projection(plan: &PhysicalPlan) -> Option<&[SelectItem]> {
     match plan {
         PhysicalPlan::Projection { projection, .. }
         | PhysicalPlan::StreamingDistinct { projection, .. } => Some(projection),

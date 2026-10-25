@@ -11,8 +11,7 @@ use crate::planner::{
 use crate::storage::schema::KeyPart;
 use crate::storage::{HeapHandle, IndexHandle};
 use crate::util::fast_hash::{
-    ah_hash_map, ah_hash_map_with_capacity, ah_hash_set, ah_hash_set_with_capacity, AhHashMap,
-    AhHashSet,
+    ah_hash_map, ah_hash_map_with_capacity, ah_hash_set, AhHashMap, AhHashSet,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -20,6 +19,7 @@ mod window;
 #[cfg(test)]
 pub(in crate::engine::executor) use window::WINDOW_RANK_PREFILTER_REJECTED;
 pub(super) use window::*;
+mod fulltext_source;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;
@@ -1718,6 +1718,14 @@ pub(super) fn execute_plan_rows_inner(
             crate::error::catalog::ER_UNKNOWN_ERROR,
             "RecursiveUnion must be opened by the recursive CTE operator",
         )),
+        PhysicalPlan::RrfFusion { .. } => {
+            let mut stream = super::hybrid::open_plan(db, txn, plan)?;
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next()? {
+                rows.push(row);
+            }
+            Ok(rows)
+        }
         PhysicalPlan::Materialize { input, .. } => execute_plan_rows(db, txn, input),
         PhysicalPlan::SetOp {
             left,
@@ -2174,6 +2182,7 @@ pub(super) fn execute_plan_rows_inner(
             ef_search,
             ef_hint,
             filter,
+            order_by,
             ..
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
@@ -2223,6 +2232,7 @@ pub(super) fn execute_plan_rows_inner(
                 k,
                 ef,
                 filter,
+                order_by,
             )
         }
         PhysicalPlan::VectorBruteScan {
@@ -3838,6 +3848,7 @@ fn execute_plan_stream_inner(
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
     match plan {
+        PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),
         PhysicalPlan::CteScan { .. } => open_cte_scan_stream(plan),
         PhysicalPlan::ParallelSeqScan {
             table,

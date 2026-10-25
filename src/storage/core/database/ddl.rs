@@ -1365,6 +1365,9 @@ impl Database {
             }
             if let Some(table) = self.table_by_id(id) {
                 self.initialize_empty_zone_maps_for_table(&table)?;
+                let vector_names = table.indexes.iter().filter(|index| index.is_vector())
+                    .map(|index| index.name.as_str()).collect::<Vec<_>>();
+                self.warm_vector_graphs_after_ddl(&table, &vector_names)?;
             }
             self.note_catalog_table_key(&key)?;
             self.commit_ddl_catalog_txn()
@@ -1374,7 +1377,7 @@ impl Database {
             // survives a file/sidecar/DD failure.
             let cleanup = self
                 .table_by_id(id)
-                .map(|table| self.build_drop_table_intent(&table));
+                .map(|table| self.build_drop_table_intent(&table)).transpose();
             {
                 let mut catalog = self.catalog_write()?;
                 if catalog.tables.get(&key).is_some_and(|table| table.id == id) {
@@ -1382,8 +1385,13 @@ impl Database {
                     build_fk_runtime(&mut catalog);
                 }
             }
-            if let Some(cleanup) = cleanup {
-                self.purge_dropped_table_files(&cleanup);
+            match cleanup {
+                Ok(Some(cleanup)) => {
+                    let intent = self.write_drop_table_intent(&cleanup)?;
+                    if self.purge_dropped_table_files(&cleanup) { self.remove_drop_table_intent(intent.as_ref()); }
+                }
+                Ok(None) => {},
+                Err(cleanup_err) => self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}")),
             }
             self.auto_increment.forget_table(id);
             return Err(err);
@@ -1762,15 +1770,20 @@ impl Database {
         if let Err(err) = finalize {
             let cleanup = self
                 .table_by_id(id)
-                .map(|table| self.build_drop_table_intent(&table));
+                .map(|table| self.build_drop_table_intent(&table)).transpose();
             {
                 let mut catalog = self.catalog_write()?;
                 if catalog.tables.get(&key).is_some_and(|table| table.id == id) {
                     catalog.tables.remove(&key);
                 }
             }
-            if let Some(cleanup) = cleanup {
-                self.purge_dropped_table_files(&cleanup);
+            match cleanup {
+                Ok(Some(cleanup)) => {
+                    let intent = self.write_drop_table_intent(&cleanup)?;
+                    if self.purge_dropped_table_files(&cleanup) { self.remove_drop_table_intent(intent.as_ref()); }
+                }
+                Ok(None) => {},
+                Err(cleanup_err) => self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}")),
             }
             self.auto_increment.forget_table(id);
             return Err(err);
@@ -1889,7 +1902,7 @@ impl Database {
         }
         crate::storage::temp_quota::unregister(&self.data_dir, table.id);
         self.auto_increment.forget_table(table.id);
-        self.drop_table_vector_graphs(&table);
+        self.drop_table_vector_graphs(&table)?;
         Ok(())
     }
 
@@ -1921,7 +1934,7 @@ impl Database {
         if table.auto_increment_column_index().is_some() {
             self.reset_auto_increment(table.id)?;
         }
-        self.drop_table_vector_graphs(&table);
+        self.drop_table_vector_graphs(&table)?;
         Ok(())
     }
 
@@ -3068,7 +3081,7 @@ impl Database {
         // (the atomic point), then unlink the files. A crash before the commit
         // leaves table + files + intent intact (recovery drops the stale
         // intent); a crash after it is finished by `recover_drop_tables`.
-        let intent = self.build_drop_table_intent(&table);
+        let intent = self.build_drop_table_intent(&table)?;
         let intent_path = self.write_drop_table_intent(&intent)?;
         // Catalog commit point.
         {
@@ -3164,7 +3177,7 @@ impl Database {
         let mut dropped: Vec<(Arc<TableSchema>, DropTableIntent, Option<PathBuf>)> =
             Vec::with_capacity(resolved.len());
         for (_, table) in &resolved {
-            let intent = self.build_drop_table_intent(table);
+            let intent = self.build_drop_table_intent(table)?;
             dropped.push((table.clone(), intent, None));
         }
         if dropped.is_empty() {
@@ -3288,7 +3301,7 @@ impl Database {
         candidate.stats = TableStats::empty();
         candidate.bump_schema_version();
         candidate.build_column_index();
-        let retired = self.build_drop_table_intent(&table);
+        let retired = self.build_drop_table_intent(&table)?;
         let retired_path = self.write_drop_table_intent(&retired)?;
         let private = DropTableIntent {
             retired_index: None,
@@ -4159,6 +4172,11 @@ impl Database {
         prepare_empty_file: bool,
         capture_online: bool,
     ) -> Result<(String, TableSchema, String), QueryError> {
+        if index.is_fulltext() {
+            crate::storage::fulltext::snapshot_tokenizer_config_into(
+                index.fulltext.get_or_insert_with(Default::default),
+            );
+        }
         if index.primary {
             index.unique = true;
             index.name = "PRIMARY".into();
@@ -5051,9 +5069,9 @@ impl Database {
                 let path = self.index_path_for_table_schema(&snapshot, sid, &old.name);
                 let _ = self.delete_logged_file(txn_id_for_ddl(), path);
                 if old.is_vector() {
-                    for path in self.vector_file_paths(&snapshot, &old.name, sid) {
-                        let _ = self.buffer_pool.discard_pages_for_path(&path);
-                        let _ = fs::remove_file(path);
+                    for path in self.owned_vector_files(&snapshot, old, sid)? {
+                        self.buffer_pool.discard_pages_for_path(&path)?;
+                        self.delete_logged_file(txn_id_for_ddl(), path)?;
                     }
                 }
             }
@@ -5169,7 +5187,7 @@ impl Database {
             ));
             if dropped_index.is_vector() {
                 retired.vector_files.extend(
-                    self.vector_file_paths(&table_snapshot, index_name, storage_id)
+                    self.owned_vector_files(&table_snapshot, &dropped_index, storage_id)?
                         .iter()
                         .map(|path| self.relative_path(path)),
                 );
@@ -7511,7 +7529,7 @@ impl Database {
                         .delete_logged_file(txn_id_for_ddl(), self.index_path(sid, &index.name));
                 }
             }
-            self.drop_table_vector_graphs(&old_table);
+            self.drop_table_vector_graphs(&old_table)?;
 
             if !rewritten_rows.is_empty() {
                 if candidate.is_partitioned() {
@@ -8029,7 +8047,7 @@ impl Database {
             }
             Self::enter_alter_copy_finalizing(&job)?;
             let swap_started = Instant::now();
-            let memory_graphs = if !vector_storage_paged() {
+            let memory_graphs = if !vector_storage_paged() || self.config.durability == DurabilityMode::Memory {
                 let graphs = self.vector_indexes.read();
                 candidate
                     .indexes
@@ -8050,6 +8068,7 @@ impl Database {
             } else {
                 Vec::new()
             };
+            if !memory_graphs.is_empty() { self.detach_table_vector_graphs(shadow_id); }
             if online_barrier.is_some() {
                 let graphs = self.vector_indexes.read();
                 job.retired_vector_graphs
@@ -8070,6 +8089,7 @@ impl Database {
                 published = true;
                 self.evict_table_vector_graphs(old_table.id);
                 for (name, graph) in memory_graphs {
+                    self.note_vector_snapshot_change(&graph);
                     self.vector_indexes.write().insert(
                         (
                             old_table.id,
@@ -8107,6 +8127,7 @@ impl Database {
                 .chain(file_swap.shadow_to_live.iter().map(|(shadow, _)| shadow))
                 .map(|path| self.relative_path(path))
                 .collect();
+            self.publish_copied_vector_owners(&candidate, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
                 .append_wal(
                     ddl_txn_id,
@@ -8131,11 +8152,15 @@ impl Database {
                 return Err(err);
             }
             published = true;
+            #[cfg(test)]
+            if let Some(hook) = self.vector_copy_committed_test_hook.lock().unwrap().take() { hook.pause(); }
+
             // A background opener can have cached the source path between
             // the first eviction and catalog publication. Drain it before
             // releasing MDL; in-flight cold opens are fenced by the epoch.
             self.invalidate_generation_handles(&old_table)?;
             for (name, graph) in memory_graphs {
+                self.note_vector_snapshot_change(&graph);
                 self.vector_indexes.write().insert(
                     (
                         old_table.id,
@@ -8146,6 +8171,8 @@ impl Database {
                     graph,
                 );
             }
+            self.vector_copy_publications.lock().remove(&ddl_txn_id);
+            self.vector_pending_wal.lock().remove(&ddl_txn_id);
             self.table_locks_sharded
                 .set_schema_floor(old_table.id, candidate.schema_version);
             self.primary_definition_highwater
@@ -8197,7 +8224,21 @@ impl Database {
         for index in &candidate.indexes {
             let _ = self.remove_index_cache_entry(shadow_id, &index.name);
         }
-        self.drop_table_vector_graphs(&shadow_table);
+        if published {
+            self.evict_table_vector_graphs(shadow_id);
+            for index in shadow_table.indexes.iter().filter(|index| index.is_vector()) {
+                for path in self.vector_file_paths(&shadow_table, &index.name, shadow_id) {
+                    self.buffer_pool.discard_pages_for_path(&path)?;
+                    match fs::remove_file(path) {
+                        Ok(()) => {},
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(err) => return Err(io_err(err)),
+                    }
+                }
+            }
+        } else {
+            self.drop_table_vector_graphs(&shadow_table)?;
+        }
         let shadow_lob = self.overflow_path(shadow_id);
         let _ = self.remove_overflow_cache_entry(shadow_id);
         self.unregister_reorg_storage_locs(&[shadow_id]);
@@ -8679,7 +8720,7 @@ impl Database {
             for (shadow, live) in &shadow_to_live {
                 if shadow
                     .extension()
-                    .is_some_and(|ext| matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec")))
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec" | "vmanifest")))
                     && !shadow.exists()
                 {
                     continue;
@@ -9134,7 +9175,7 @@ impl Database {
                     entries.push((key, row_id));
                 }
             }
-            self.note_vector_inserts(table, values, row_id, table.id);
+            self.note_vector_inserts(table, values, row_id, table.id)?;
         }
         self.insert_index_batches_deferred(txn.txn_id, table, index_entries)?;
         crate::binlog::record_write_rows(txn.txn_id, table, rows)?;
@@ -11245,15 +11286,6 @@ impl Database {
             txn,
             crate::engine::cancel::check_cancelled,
         )?;
-        self.evict_partition_vector_graphs(table.id, storage_ids);
-        for index in table.indexes.iter().filter(|index| index.is_vector()) {
-            for sid in storage_ids {
-                self.remove_partition_vector_files(table, *sid, &index.name);
-                if hnsw_build_on_ddl_enabled() {
-                    self.vector_graph_build_on_ddl_one(table, index, *sid)?;
-                }
-            }
-        }
         Ok(())
     }
 

@@ -59,6 +59,8 @@ pub(crate) struct DeferredCommit {
     history_index_batch: Vec<u8>,
     temporal_persist: Option<super::temporal::TemporalPersistToken>,
     commit_lsn: Option<u64>,
+    durability_lsn: Option<u64>,
+    index_error: Option<QueryError>,
     commit_group_target: u64,
     binlog_commit: Option<crate::binlog::BinlogCommit>,
     binlog_semi_sync_target: Option<(String, u64)>,
@@ -586,21 +588,11 @@ impl Database {
             self.sequences.role_epoch.fetch_add(1, Ordering::AcqRel);
         }
         if enabled && role_changed {
-            // Finish local IVF directory writes before fencing WAL and
-            // retiring the graph. Reopening an unflushed directory would
-            // otherwise rebuild it using source-owned LSNs on the replica.
-            let graphs: Vec<_> = self.vector_indexes.read().values().cloned().collect();
-            for graph in graphs {
-                graph.flush_paged_ivf()?;
-            }
+            let covered = self.log_state_atomics.next_lsn().saturating_sub(1)
+                .min(self.vector_pending_publication_floor().unwrap_or(u64::MAX).saturating_sub(1));
+            self.vector_graph_persist_all_dirty(covered)?;
         }
         self.log.lock().set_physical_replica(enabled);
-        if !enabled && role_changed {
-            if let Err(error) = self.invalidate_promoted_hnsw_files() {
-                self.log.lock().set_physical_replica(true);
-                return Err(error);
-            }
-        }
         if enabled {
             // Publish the receiving role before draining vector readers. A
             // graph opened concurrently with invalidation must observe this
@@ -618,6 +610,7 @@ impl Database {
                 txns.close_registration_history();
             }
         }
+        if !enabled && role_changed { self.finish_promoted_vector_journal()?; }
         Ok(())
     }
 
@@ -2832,6 +2825,8 @@ impl Database {
                 history_index_batch: Vec::new(),
                 temporal_persist: None,
                 commit_lsn: None,
+                durability_lsn: None,
+                index_error: None,
                 commit_group_target: 1,
                 binlog_commit: None,
                 binlog_semi_sync_target: None,
@@ -2839,7 +2834,7 @@ impl Database {
             });
         }
         let backup_feedback = self.capture.commit_sample();
-        self.prepare_pending_vector_commit(txn_id)?;
+        let has_vector_pending = self.prepare_pending_vector_commit(txn_id)?;
         // Reduced redo omits row images only for pages that were newly
         // allocated by this transaction. Force those data pages (plus their
         // file lengths) before the CommitTxn can become visible/durable. WAL
@@ -2992,6 +2987,8 @@ impl Database {
                     append().map(|lsn| (lsn, None))
                 }
             })?;
+        #[cfg(test)]
+        if has_vector_pending { self.test_vector_crash_point(1, commit_lsn)?; }
         // Publish and release row locks before the group durability barrier.
         // Strict durability guarantees COMMIT success only after WAL fsync;
         // a concurrent reader can observe an in-progress commit before that
@@ -3024,11 +3021,10 @@ impl Database {
                 ));
             }
         }
-        // The row is now committed in the MVCC slot; only now may its derived
-        // vector nodes be tombstoned. This is best-effort candidate-generator
-        // maintenance and intentionally sits outside the transaction-manager
-        // latch.
-        self.apply_pending_vector_deletes(txn_id, commit_scn);
+        // The durable decision precedes redo-only vector maintenance. Preserve
+        // errors until lock and frontier cleanup is complete, and include all
+        // required maintenance WAL in the response durability barrier.
+        let mut index_error = self.apply_pending_vector_deletes(txn_id, commit_scn).err();
         // Early lock release, now on the separate `lock_manager` latch: drop the
         // `txns` write lock first (order txns → lock_manager), then release this
         // txn's row/unique locks — still BEFORE the durability fsync below.
@@ -3050,6 +3046,14 @@ impl Database {
         // Superseded vector versions queued by this (or an earlier) commit
         // become retirable once the frontier covers them.
         self.drain_vector_purges();
+        if has_vector_pending && index_error.is_none() {
+            index_error = self.ensure_operational().err();
+        }
+        let durability_lsn = if has_vector_pending {
+            commit_lsn.max(self.log.lock().next_lsn().saturating_sub(1))
+        } else {
+            commit_lsn
+        };
         self.notify_lock_waiters_for_rows(released);
         Ok(DeferredCommit {
             _backup_feedback: backup_feedback,
@@ -3060,6 +3064,8 @@ impl Database {
             history_index_batch,
             temporal_persist,
             commit_lsn: Some(commit_lsn),
+            durability_lsn: Some(durability_lsn),
+            index_error,
             commit_group_target,
             binlog_commit,
             binlog_semi_sync_target,
@@ -3075,7 +3081,7 @@ impl Database {
         &self,
         commits: &mut [&mut DeferredCommit],
     ) -> Result<(), QueryError> {
-        let highest = commits.iter().filter_map(|commit| commit.commit_lsn).max();
+        let highest = commits.iter().filter_map(|commit| commit.durability_lsn).max();
         if let Some(highest_lsn) = highest {
             let target = commits
                 .iter()
@@ -3177,6 +3183,13 @@ impl Database {
             self.table_locks_sharded.release_txn(commit.txn_id);
         }
         self.notify_non_row_lock_waiters();
+        if let Some((txn_id, err)) = commits.iter_mut().find_map(|commit| {
+            commit.index_error.take().map(|err| (commit.txn_id, err))
+        }) {
+            return Err(err.map_message(|message| format!(
+                "transaction {txn_id} has a committed WAL decision but index maintenance failed; database is fail-stopped: {message}"
+            )));
+        }
         Ok(())
     }
 
@@ -3955,12 +3968,14 @@ impl Database {
         // reclaimed by the same slot/undo lifecycle as other transactional
         // heaps; checkpoint never serializes or garbage-collects logical
         // catalog generations.
-        let (begin_lsn, auto_increment_dirty, sequence_dirty) = {
+        let (begin_lsn, auto_increment_dirty, sequence_dirty, vector_redo_floor, vector_publish_floor) = {
             let _sequence_fence = self.sequence_checkpoint_fence.write();
             let _auto_increment_fence = self.auto_increment_checkpoint_fence.write();
             let begin_lsn = self.temporal_history.checkpoint_barrier(|| {
                 self.append_wal(txn_id_for_ddl(), WalPayload::CheckpointBegin)
             })?;
+            let vector_redo_floor = self.vector_pending_wal.lock().values().copied().min();
+            let vector_publish_floor = self.vector_pending_publication_floor();
             let dirty = self
                 .auto_increment_dirty
                 .lock()
@@ -3972,7 +3987,7 @@ impl Database {
                 })?
                 .rotate();
             let sequences = self.sequence_dirty.lock().snapshot()?;
-            (begin_lsn, dirty, sequences)
+            (begin_lsn, dirty, sequences, vector_redo_floor, vector_publish_floor)
         };
         if let Err(err) = self
             .persist_sequence_checkpoint(&sequence_dirty.entries)
@@ -4063,7 +4078,8 @@ impl Database {
         let phase_started = Instant::now();
         self.buffer_pool.sync_cached_files()?;
         flush_us = flush_us.saturating_add(elapsed_us(phase_started));
-        let redo_floor = begin_lsn
+        let mut redo_floor = begin_lsn
+            .min(vector_redo_floor.unwrap_or(u64::MAX))
             .min(txn_floor.unwrap_or(u64::MAX))
             .min(oldest_dirty_lsn.unwrap_or(u64::MAX));
         let dirty_pages_empty = dirty_page_count == 0;
@@ -4083,6 +4099,15 @@ impl Database {
             // Keep pending-sync tracking for a future enabled checkpoint.
             self.undo.write().flush()?;
         }
+        // Complete every required vector publication before CheckpointEnd and
+        // WAL reclamation. A failed index flush must fail this checkpoint.
+        let vector_covered_lsn = if matches!(self.open_mode, DatabaseOpenMode::SealBaseline | DatabaseOpenMode::RestoreWorkspace) {
+            self.recovery_context.source_end().ok_or_else(vector::persistence::corrupt)?
+        } else { begin_lsn };
+        let vector_covered_lsn = vector_covered_lsn.min(vector_publish_floor.unwrap_or(u64::MAX).saturating_sub(1));
+        self.vector_graph_persist_all_dirty(vector_covered_lsn)?;
+        redo_floor = redo_floor.min(self.vector_pending_wal.lock().values().copied().min().unwrap_or(u64::MAX));
+        self.ensure_operational()?;
         // Re-read the watermarks immediately before appending so a
         // concurrent BeginTxn/CommitTxn that raced past the snapshot
         // above (`txns_read` released its lock before `append_wal`
@@ -4173,6 +4198,7 @@ impl Database {
         // mutex before collapsing, so a racing append falls back to
         // prune-only instead of being destroyed.
         let quiesced = txn_floor.is_none()
+            && vector_redo_floor.is_none()
             && slot_floor.is_none()
             && dirty_pages_empty
             && end_lsn == begin_lsn.saturating_add(1);
@@ -4222,13 +4248,6 @@ impl Database {
         // heap-side first-update FPI gate can skip pages already
         // WAL-touched in this checkpoint window.
         self.buffer_pool.set_last_checkpoint_lsn(redo_floor);
-        // HNSW vector indexes are derived data living outside the WAL /
-        // buffer pool, but we piggy-back on the checkpoint cadence to persist
-        // dirty graphs so restart loads the snapshot + reconciles the heap
-        // instead of a full rebuild. Tombstone reclamation runs on the vector
-        // maintenance worker. Errors are swallowed (logged), as a failed
-        // persist is only a rebuild cost on the next restart.
-        self.vector_graph_persist_all_dirty(end_lsn);
         self.record_checkpoint_success(
             started,
             trigger,
@@ -4295,6 +4314,9 @@ impl Database {
         {
             restart_lsn = restart_lsn.min(floor);
         }
+        if let Some(floor) = self.replica_vector_state.lock().images.values().copied().min() {
+            restart_lsn = restart_lsn.min(floor);
+        }
         if restart_lsn == 0 {
             return Ok(());
         }
@@ -4304,6 +4326,13 @@ impl Database {
         if self.has_pending_replicated_undo() {
             return Ok(());
         }
+        if let Some(floor) = self.vector_pending_wal.lock().values().copied().min() {
+            restart_lsn = restart_lsn.min(floor);
+        }
+        let completing_floor = self.replica_vector_state.lock().transactions.values()
+            .filter(|txn| txn.completing).flat_map(|txn| txn.records.first().map(|record| record.lsn)).min();
+        let vector_covered = applied_lsn.min(completing_floor.unwrap_or(u64::MAX).saturating_sub(1));
+        self.vector_graph_persist_all_dirty(vector_covered)?;
         let phase_started = Instant::now();
         let (_, dirty_page_count) = self.buffer_pool.checkpoint_dirty_snapshot()?;
         let snapshot_us = elapsed_us(phase_started);
@@ -5917,7 +5946,7 @@ impl Database {
             end_txn_wal_buffering(&self.log, txn_id);
         }
         crate::binlog::rollback_txn(txn_id);
-        self.discard_pending_vector_deletes(txn_id);
+        self.discard_pending_vector_deletes(txn_id)?;
         let (has_undo, prepared) = {
             let txns = self.txns_read()?;
             (
@@ -6374,6 +6403,7 @@ impl Database {
         let writers = txns.active_write_count;
         let prepared = self.prepared_xa.read().len();
         writers > prepared
+            || !self.vector_commits_publishing.lock().is_empty()
             || self.sequences.active_writes.load(Ordering::SeqCst) != 0
             || self.foreground_bulk_ddl_active.load(Ordering::Acquire) != 0
             || self.analyze_scan_active.load(Ordering::Acquire) != 0
@@ -6496,6 +6526,7 @@ impl Database {
         // so it must be marked done on the frontier (at promote below, or via
         // this guard's Drop if a `?` bails first) or the frontier stalls.
         let mut frontier_guard = ScnFrontierGuard::new(self, prepare_scn);
+        self.log_pending_vector_recovery(txn_id)?;
         let prepare_lsn = self.append_wal(
             txn_id,
             WalPayload::PrepareTxn {

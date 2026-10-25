@@ -62,7 +62,7 @@ fn index_cache_eviction_flush_does_not_hold_global_lock() {
 // Real strict-durability inserts churn more index handles than fit in cache;
 // a pinned unrelated index records latency while this happens.
 #[test]
-#[ignore]
+#[ignore = "manual strict-durability cache churn latency measurement; requires MYDB_OBJECT_HANDLE_CACHE_MAX=32"]
 fn index_cache_eviction_concurrent_benchmark() {
     assert_eq!(object_handle_cache_max(), 32);
     let dir = index_eviction_test_dir();

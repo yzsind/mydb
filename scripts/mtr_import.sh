@@ -108,4 +108,4 @@ for spec in "$@"; do
 done
 
 echo "mtr_import: ${ok} fetched, ${miss} missing → ${T_DIR}"
-echo "next: MYDB_MTR_TRIAGE=1 cargo nextest run --no-capture mtr_triage"
+echo "next: cargo nextest run --run-ignored only --no-capture mtr_triage"

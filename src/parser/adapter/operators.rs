@@ -58,6 +58,7 @@ pub(in crate::parser) fn parse_sql(
     validate_complexity(&tokens)?;
     super::locks::expand_lists(&mut tokens);
     super::parameters::assign(&mut tokens)?;
+    super::rrf::lower(dialect, sql, &mut tokens)?;
     Parser::new(dialect)
         .with_recursion_limit(UPSTREAM_RECURSION_LIMIT)
         .with_tokens_with_locations(tokens)
@@ -78,6 +79,7 @@ fn parse_ordinary_sql(
     validate_complexity(&tokens)?;
     super::locks::expand_lists(&mut tokens);
     super::parameters::assign(&mut tokens)?;
+    super::rrf::lower(dialect, sql, &mut tokens)?;
     Parser::new(dialect)
         .with_recursion_limit(UPSTREAM_RECURSION_LIMIT)
         .with_tokens_with_locations(tokens)
@@ -179,7 +181,8 @@ pub(in crate::parser) fn parse_high_prefix(
 /// Upstream recursion is one level per nested expression, query or
 /// parenthesis; each prefix frame grows its stack on demand (see
 /// `MydbDialect::parse_prefix`), so this only bounds total nesting work.
-const UPSTREAM_RECURSION_LIMIT: usize = 2 * crate::engine::expr_program::MAX_EXPRESSION_DEPTH
+pub(super) const UPSTREAM_RECURSION_LIMIT: usize = 2
+    * crate::engine::expr_program::MAX_EXPRESSION_DEPTH
     + 4 * crate::parser::budget::MAX_SELECT_NESTING;
 
 /// Maximum number of set-operation branches in one statement. A chain is a
