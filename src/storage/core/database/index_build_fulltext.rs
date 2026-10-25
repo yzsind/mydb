@@ -349,64 +349,70 @@ impl Database {
                                 .spawn_scoped(scope, move || -> Result<_, QueryError> {
                                     let _worker = enter_index_build_worker();
                                     let _cancel = cancel.enter();
-                                    let tokenizer =
-                                        crate::storage::fulltext::build_tokenizer_from_meta(meta);
-                                    let mut sorter = EncodedIndexSorter::new(program, budget)
-                                        .with_sort_degree(1);
-                                    let mut rows = 0u64;
-                                    loop {
-                                        crate::engine::cancel::check_cancelled()?;
-                                        let start =
-                                            next_page.fetch_add(task_pages, Ordering::Relaxed);
-                                        if start >= page_count {
-                                            break;
-                                        }
-                                        heap.scan_mvcc_columns_direct_range_impl(
-                                            columns,
-                                            start,
-                                            start.saturating_add(task_pages).min(page_count),
-                                            |row| {
-                                                if row.header.is_deleted() {
-                                                    return Ok(false);
-                                                }
-                                                let document_bytes = row
-                                                    .values
-                                                    .iter()
-                                                    .map(|value| match value {
-                                                        Value::String(text) => text.len(),
-                                                        Value::SmallString(text) => text.len(),
-                                                        _ => 64,
-                                                    })
-                                                    .sum::<usize>()
-                                                    .saturating_mul(document_factor);
-                                                let extra = document_bytes
-                                                    .saturating_sub(WORKER_SCRATCH / 2);
-                                                let _wide = if extra > 0 {
-                                                    Some(ControlledMemoryCharge::try_new(
+                                    // LOB readers are thread-local; the parent's
+                                    // with_heap_read scope does not reach workers.
+                                    heap.with_lob(|| {
+                                        let tokenizer =
+                                            crate::storage::fulltext::build_tokenizer_from_meta(
+                                                meta,
+                                            );
+                                        let mut sorter = EncodedIndexSorter::new(program, budget)
+                                            .with_sort_degree(1);
+                                        let mut rows = 0u64;
+                                        loop {
+                                            crate::engine::cancel::check_cancelled()?;
+                                            let start =
+                                                next_page.fetch_add(task_pages, Ordering::Relaxed);
+                                            if start >= page_count {
+                                                break;
+                                            }
+                                            heap.scan_mvcc_columns_direct_range_impl(
+                                                columns,
+                                                start,
+                                                start.saturating_add(task_pages).min(page_count),
+                                                |row| {
+                                                    if row.header.is_deleted() {
+                                                        return Ok(false);
+                                                    }
+                                                    let document_bytes = row
+                                                        .values
+                                                        .iter()
+                                                        .map(|value| match value {
+                                                            Value::String(text) => text.len(),
+                                                            Value::SmallString(text) => text.len(),
+                                                            _ => 64,
+                                                        })
+                                                        .sum::<usize>()
+                                                        .saturating_mul(document_factor);
+                                                    let extra = document_bytes
+                                                        .saturating_sub(WORKER_SCRATCH / 2);
+                                                    let _wide = if extra > 0 {
+                                                        Some(ControlledMemoryCharge::try_new(
                                                         ControlledMemoryCategory::StorageScratch,
                                                         extra,
                                                     )?)
-                                                } else {
-                                                    None
-                                                };
-                                                fulltext_build_pending(
-                                                    tokenizer.as_ref(),
-                                                    cfg,
-                                                    row.values,
-                                                    |pending| {
-                                                        sorter.push(
-                                                            self.data_dir(),
-                                                            pending,
-                                                            row.row_id,
-                                                        )
-                                                    },
-                                                )?;
-                                                rows += 1;
-                                                Ok(false)
-                                            },
-                                        )?;
-                                    }
-                                    Ok((sorter, rows))
+                                                    } else {
+                                                        None
+                                                    };
+                                                    fulltext_build_pending(
+                                                        tokenizer.as_ref(),
+                                                        cfg,
+                                                        row.values,
+                                                        |pending| {
+                                                            sorter.push(
+                                                                self.data_dir(),
+                                                                pending,
+                                                                row.row_id,
+                                                            )
+                                                        },
+                                                    )?;
+                                                    rows += 1;
+                                                    Ok(false)
+                                                },
+                                            )?;
+                                        }
+                                        Ok((sorter, rows))
+                                    })
                                 })
                                 .map_err(|err| {
                                     error(
@@ -465,6 +471,55 @@ impl Database {
 mod fulltext_build_tests {
     use super::*;
     use crate::engine::executor::StorageQueryEngine;
+
+    #[test]
+    fn fulltext_parallel_build_reads_external_documents_and_reopens() {
+        for durability in [DurabilityMode::Relaxed, DurabilityMode::Strict] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut config = StorageConfig::from_env();
+            config.durability = durability;
+            config.buffer_pool_pages = 512;
+            let open = || {
+                StorageQueryEngine::open_with_storage_config_without_background_workers(
+                    dir.path(),
+                    config.clone(),
+                )
+                .unwrap()
+            };
+            let engine = open();
+            engine
+                .execute("CREATE TABLE lob_docs(id INT PRIMARY KEY,body TEXT)")
+                .unwrap();
+            let body = format!("alpha {} omega", "padding ".repeat(3000));
+            let rows = (0..64)
+                .map(|id| format!("({id},'{body}')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            engine
+                .execute(&format!("INSERT INTO lob_docs VALUES {rows}"))
+                .unwrap();
+            engine
+                .execute("CREATE /*+ PARALLEL(4) */ FULLTEXT INDEX ft ON lob_docs(body)")
+                .unwrap();
+            let verify = |engine: &StorageQueryEngine| {
+                let crate::engine::api::QueryResponse::ResultSet(result) = engine
+                    .execute("SELECT id FROM lob_docs WHERE MATCH(body) AGAINST('\"alpha padding\"' IN BOOLEAN MODE) ORDER BY id")
+                    .unwrap()
+                    .materialize()
+                    .unwrap()
+                else {
+                    panic!("expected full-text results");
+                };
+                assert_eq!(
+                    result.rows,
+                    (0..64).map(|id| vec![Value::Int(id)]).collect::<Vec<_>>()
+                );
+            };
+            verify(&engine);
+            drop(engine);
+            verify(&open());
+        }
+    }
 
     fn fixture() -> (tempfile::TempDir, StorageQueryEngine) {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();

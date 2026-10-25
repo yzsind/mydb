@@ -4566,19 +4566,21 @@ fn try_execute_index_ordered_limit_window(
             if table.schema.is_partitioned() {
                 return Ok(None);
             }
-            read_plan_table_entries_windowed(
-                db,
-                txn,
-                table,
-                index,
-                low.clone(),
-                high.clone(),
-                *reverse,
-                filter,
-                projected_columns.as_deref().map(|v| v.as_slice()),
-                offset,
-                limit,
-            )
+            super::analyze_stats::with_range_scan_plan(input, || {
+                read_plan_table_entries_windowed(
+                    db,
+                    txn,
+                    table,
+                    index,
+                    low.clone(),
+                    high.clone(),
+                    *reverse,
+                    filter,
+                    projected_columns.as_deref().map(|v| v.as_slice()),
+                    offset,
+                    limit,
+                )
+            })
             .map(Some)
         }
         PhysicalPlan::IndexRangeScan {
@@ -4600,19 +4602,21 @@ fn try_execute_index_ordered_limit_window(
             }
             let projection = projected_columns.as_deref().map(|v| v.as_slice());
             if *covering {
-                return read_plan_table_entries_windowed(
-                    db,
-                    txn,
-                    table,
-                    index,
-                    low.clone(),
-                    high.clone(),
-                    *reverse,
-                    filter,
-                    projection,
-                    offset,
-                    limit,
-                )
+                return super::analyze_stats::with_range_scan_plan(input, || {
+                    read_plan_table_entries_windowed(
+                        db,
+                        txn,
+                        table,
+                        index,
+                        low.clone(),
+                        high.clone(),
+                        *reverse,
+                        filter,
+                        projection,
+                        offset,
+                        limit,
+                    )
+                })
                 .map(Some);
             }
             if index_window_filter_blocks_fast_path(table, filter) {

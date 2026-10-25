@@ -22,17 +22,6 @@ impl super::super::plan::PlanStream for FusionStream {
     }
 }
 
-fn expression_value(row: &super::super::plan::PlanRow, expr: &Expr) -> Result<Value, QueryError> {
-    let item = SelectItem::Expr {
-        expr: expr.clone(),
-        alias: None,
-    };
-    super::super::eval::project_item(row, &item)
-        .into_iter()
-        .next()
-        .ok_or_else(|| invalid("empty identity expression"))?
-}
-
 pub(in crate::engine::executor::select) fn open_plan(
     db: &Arc<Database>,
     txn: TxnView,
@@ -74,6 +63,7 @@ pub(in crate::engine::executor::select) fn open_plan(
         .iter()
         .map(|column| column.source.collation_id)
         .collect::<Vec<_>>();
+    let has_collations = collations.iter().any(Option::is_some);
     let mut state: crate::util::fast_hash::AhHashMap<crate::engine::expr::InlineKeyBuf, Entry> =
         ah_hash_map();
     let recording = super::super::analyze_stats::is_recording();
@@ -94,6 +84,26 @@ pub(in crate::engine::executor::select) fn open_plan(
             if projection.len() != width {
                 return Err(invalid("planned identity width changed"));
             }
+            if projection
+                .iter()
+                .any(|item| !matches!(item, SelectItem::Expr { .. }))
+            {
+                return Err(invalid("explicit identity expressions are required"));
+            }
+            // Each input stream has a stable row schema. Compile once, retaining
+            // the shared projection evaluator's aggregate and scalar fallbacks.
+            let mut identity_program = None;
+            let order_projection = spec.score_details.then(|| {
+                select
+                    .order_by
+                    .iter()
+                    .map(|order| SelectItem::Expr {
+                        expr: order.expr.clone(),
+                        alias: None,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut order_program = None;
             while let Some(row) = stream.next()? {
                 let start = recording.then(std::time::Instant::now);
                 crate::engine::cancel::check_cancelled()?;
@@ -101,13 +111,13 @@ pub(in crate::engine::executor::select) fn open_plan(
                 rank = rank
                     .checked_add(1)
                     .ok_or_else(|| invalid("rank overflow"))?;
-                let mut identity = Vec::with_capacity(width);
-                for (item, column) in projection.iter().zip(&columns[..width]) {
-                    let SelectItem::Expr { expr, .. } = item else {
-                        return Err(invalid("explicit identity expressions are required"));
-                    };
-                    let mut value = coerce_identity(expression_value(&row, expr)?, column)?;
-                    match &mut value {
+                let program = identity_program.get_or_insert_with(|| {
+                    super::super::eval::PlanProjectionProgram::compile_once(&row, projection)
+                });
+                let mut identity = program.project_row_values_with_capacity(&row, width)?;
+                for (value, column) in identity.iter_mut().zip(&columns[..width]) {
+                    *value = coerce_identity(std::mem::replace(value, Value::Null), column)?;
+                    match value {
                         Value::Null => {
                             return Err(invalid(
                                 "identity components must not be NULL; filter NULL explicitly",
@@ -123,31 +133,43 @@ pub(in crate::engine::executor::select) fn open_plan(
                         Value::Double(n) if *n == 0.0 => *n = 0.0,
                         _ => {}
                     }
-                    identity.push(value);
                 }
                 let key = crate::engine::executor::dispatch::set_row_key(&collations, &identity);
-                let representation = crate::engine::executor::dispatch::set_row_key(&[], &identity);
-                if !state.contains_key(&key) {
+                let representation = if has_collations {
+                    crate::engine::executor::dispatch::set_row_key(&[], &identity)
+                } else {
+                    key.clone()
+                };
+                let key_capacity = key.capacity();
+                let entry_bytes = || {
                     let payload = identity.iter().map(Value::heap_capacity).sum::<usize>();
-                    charge.add_non_spillable(
-                        512usize
-                            .saturating_add(width * std::mem::size_of::<Value>())
-                            .saturating_add(payload)
-                            .saturating_add(key.capacity())
-                            .saturating_add(representation.capacity())
-                            .saturating_add(if spec.score_details {
-                                inputs.len() * 64
-                            } else {
-                                0
-                            }),
-                    )?;
+                    512usize
+                        .saturating_add(identity.capacity() * std::mem::size_of::<Value>())
+                        .saturating_add(payload)
+                        .saturating_add(key_capacity)
+                        .saturating_add(representation.capacity())
+                        .saturating_add(if spec.score_details {
+                            inputs.len() * 64
+                        } else {
+                            0
+                        })
+                };
+                // Entry insertion must not hide an infallible map growth. At a
+                // growth boundary, charge and reserve before borrowing Entry.
+                let precharged = state.len() == state.capacity() && !state.contains_key(&key);
+                if precharged {
+                    charge.add_non_spillable(entry_bytes())?;
                     state.try_reserve(1).map_err(|_| {
                         crate::error::catalog::ER_OUTOFMEMORY
                             .error("RRF identity map allocation failed")
                     })?;
-                    state.insert(
-                        key.clone(),
-                        Entry {
+                }
+                let entry = match state.entry(key) {
+                    hashbrown::hash_map::Entry::Vacant(vacant) => {
+                        if !precharged {
+                            charge.add_non_spillable(entry_bytes())?;
+                        }
+                        vacant.insert(Entry {
                             identity,
                             representation,
                             score: 0.0,
@@ -155,24 +177,26 @@ pub(in crate::engine::executor::select) fn open_plan(
                             matches: 0,
                             ranks: [0; 8],
                             ordered: spec.score_details.then(|| vec![None; inputs.len()]),
-                        },
-                    );
-                } else if let Some(entry) = state.get_mut(&key) {
-                    if representation < entry.representation {
-                        let old = entry
-                            .identity
-                            .iter()
-                            .map(Value::heap_capacity)
-                            .sum::<usize>()
-                            + entry.representation.capacity();
-                        let new = identity.iter().map(Value::heap_capacity).sum::<usize>()
-                            + representation.capacity();
-                        charge.add_non_spillable(new.saturating_sub(old))?;
-                        entry.identity = identity;
-                        entry.representation = representation;
+                        })
                     }
-                }
-                let entry = state.get_mut(&key).expect("identity inserted");
+                    hashbrown::hash_map::Entry::Occupied(occupied) => {
+                        let entry = occupied.into_mut();
+                        if representation < entry.representation {
+                            let old = entry
+                                .identity
+                                .iter()
+                                .map(Value::heap_capacity)
+                                .sum::<usize>()
+                                + entry.representation.capacity();
+                            let new = identity.iter().map(Value::heap_capacity).sum::<usize>()
+                                + representation.capacity();
+                            charge.add_non_spillable(new.saturating_sub(old))?;
+                            entry.identity = identity;
+                            entry.representation = representation;
+                        }
+                        entry
+                    }
+                };
                 if entry.ranks[branch_index] != 0 {
                     if let Some(start) = start {
                         fusion_ns += start.elapsed().as_nanos();
@@ -185,11 +209,14 @@ pub(in crate::engine::executor::select) fn open_plan(
                 entry.best = entry.best.min(rank);
                 entry.matches += 1;
                 if let Some(ordered) = entry.ordered.as_mut() {
-                    let values = select
-                        .order_by
-                        .iter()
-                        .map(|order| expression_value(&row, &order.expr))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let program = order_program.get_or_insert_with(|| {
+                        super::super::eval::PlanProjectionProgram::compile_once(
+                            &row,
+                            order_projection.as_ref().expect("score details projection"),
+                        )
+                    });
+                    let values =
+                        program.project_row_values_with_capacity(&row, select.order_by.len())?;
                     charge.add_non_spillable(
                         values.capacity() * std::mem::size_of::<Value>()
                             + values.iter().map(Value::heap_capacity).sum::<usize>(),

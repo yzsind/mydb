@@ -438,8 +438,19 @@ impl PlanProjectionProgram {
     /// Project directly into the result representation.  This avoids the
     /// per-row `Vec<Result<Value, _>>` allocation paid by callers that always
     /// immediately collected it into `Result<Vec<Value>, _>`.
+    #[inline]
     pub(super) fn project_row_values(&self, row: &PlanRow) -> Result<Vec<Value>, QueryError> {
-        let mut out = Vec::new();
+        self.project_row_values_with_capacity(row, 0)
+    }
+
+    /// A caller with an explicit scalar projection can reserve its known
+    /// output width without changing wildcard allocation or program layout.
+    pub(super) fn project_row_values_with_capacity(
+        &self,
+        row: &PlanRow,
+        capacity: usize,
+    ) -> Result<Vec<Value>, QueryError> {
+        let mut out = Vec::with_capacity(capacity);
         for item in &self.items {
             match item {
                 CompiledPlanSelectItem::Wildcard => out.extend(

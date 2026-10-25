@@ -2779,6 +2779,14 @@ pub(super) fn read_plan_table_entries_windowed(
     let mut compiled_filter = None;
     let mut skip = offset;
     let mut rows = Vec::with_capacity(limit.min(64));
+    // A covering scan still probes the heap for MVCC. Avoid checking a full
+    // batch when only a small ordered window is needed. Residual predicates
+    // retain the bulk path; visibility/duplicate losses adapt subsequent pulls.
+    let mut chunk_rows = if filter.is_none() {
+        offset.saturating_add(limit).clamp(1, CHUNK)
+    } else {
+        CHUNK
+    };
     let mut seen = (!index.unique).then(std::collections::HashSet::new);
     let mut cursor = if reverse {
         AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
@@ -2798,9 +2806,16 @@ pub(super) fn read_plan_table_entries_windowed(
         )?)
     };
     while rows.len() < limit {
-        let mut entries = cursor.next_chunk(CHUNK)?;
+        let mut entries = cursor.next_chunk(chunk_rows)?;
         if entries.is_empty() {
             break;
+        }
+        let examined = entries.len();
+        super::super::analyze_stats::add_range_scan_work(examined as u64, 0, 0);
+        let previous_rows = rows.len();
+        let previous_skip = skip;
+        if filter.is_none() {
+            chunk_rows = chunk_rows.saturating_mul(4).min(CHUNK);
         }
         if let Some(seen) = seen.as_mut() {
             entries.retain(|(_, row_id)| seen.insert(*row_id));
@@ -2845,6 +2860,16 @@ pub(super) fn read_plan_table_entries_windowed(
             }
             if rows.len() >= limit {
                 break;
+            }
+        }
+        if filter.is_none() && rows.len() < limit {
+            let accepted = previous_skip - skip + rows.len() - previous_rows;
+            if accepted > 0 {
+                let remaining = skip.saturating_add(limit - rows.len());
+                chunk_rows = remaining
+                    .saturating_mul(examined)
+                    .div_ceil(accepted)
+                    .clamp(1, CHUNK);
             }
         }
     }

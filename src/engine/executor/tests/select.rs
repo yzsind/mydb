@@ -8992,6 +8992,130 @@ fn ordered_index_small_window_bounds_mrr_work() {
 }
 
 #[test]
+fn ordered_covering_index_small_window_bounds_visibility_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE covering_window(id INT PRIMARY KEY,a INT,INDEX ai(a,id))")
+        .unwrap();
+    let values = (0..1000)
+        .map(|id| format!("({id},{id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO covering_window VALUES {values}"))
+        .unwrap();
+    for direction in ["ASC", "DESC"] {
+        let sql = format!("SELECT id,a FROM covering_window FORCE INDEX(ai) ORDER BY a {direction},id {direction} LIMIT 5 OFFSET 2");
+        let QueryResponse::ResultSet(result) = engine.execute(&sql).unwrap().materialize().unwrap()
+        else {
+            panic!("expected covering result");
+        };
+        let ids = if direction == "ASC" {
+            (2..7).collect::<Vec<_>>()
+        } else {
+            (993..998).rev().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            result.rows,
+            ids.into_iter()
+                .map(|id| vec![Value::Int(id), Value::Int(id)])
+                .collect::<Vec<_>>()
+        );
+        let QueryResponse::ResultSet(explain) = engine
+            .execute(&format!("EXPLAIN ANALYZE FORMAT=TREE {sql}"))
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("expected covering analysis");
+        };
+        let text = explain.rows[0][0].to_display_string();
+        let examined = text
+            .split("index_entries_examined=")
+            .nth(1)
+            .map(|tail| {
+                tail.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("missing covering work metric: {text}"));
+        assert_eq!(
+            examined, 7,
+            "covering pagination must bound visibility work: {text}"
+        );
+    }
+}
+
+#[test]
+fn ordered_covering_index_window_refills_invisible_and_filtered_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE covering_visible(id INT PRIMARY KEY,a INT,INDEX ai(a,id))")
+        .unwrap();
+    let values = (0..1000)
+        .map(|id| format!("({id},{id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO covering_visible VALUES {values}"))
+        .unwrap();
+    let rows = |response: QueryResponse| {
+        let QueryResponse::ResultSet(result) = response.materialize().unwrap() else {
+            panic!("expected covering rows");
+        };
+        result.rows
+    };
+    let sql = "SELECT id,a FROM covering_visible FORCE INDEX(ai) ORDER BY a,id LIMIT 5 OFFSET 2";
+    let expected = |start| {
+        (start..start + 5)
+            .map(|id| vec![Value::Int(id), Value::Int(id)])
+            .collect::<Vec<_>>()
+    };
+    for (direction, ids) in [("ASC", vec![194, 291, 388]), ("DESC", vec![776, 679, 582])] {
+        let filtered = format!("SELECT id FROM covering_visible FORCE INDEX(ai) WHERE MOD(a,97)=0 ORDER BY a {direction},id {direction} LIMIT 3 OFFSET 2");
+        assert_eq!(
+            rows(engine.execute(&filtered).unwrap()),
+            ids.into_iter()
+                .map(|id| vec![Value::Int(id)])
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut reader = SessionContext::default();
+    engine
+        .execute_with_session(
+            &mut reader,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        )
+        .unwrap();
+    engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+    assert_eq!(
+        rows(engine.execute_with_session(&mut reader, sql).unwrap()),
+        expected(2)
+    );
+    engine
+        .execute("DELETE FROM covering_visible WHERE a<900")
+        .unwrap();
+    assert_eq!(rows(engine.execute(sql).unwrap()), expected(902));
+    assert_eq!(
+        rows(engine.execute_with_session(&mut reader, sql).unwrap()),
+        expected(2)
+    );
+    let mut writer = SessionContext::default();
+    engine.execute_with_session(&mut writer, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut writer, "INSERT INTO covering_visible VALUES(-1,-1)")
+        .unwrap();
+    assert_eq!(rows(engine.execute(sql).unwrap()), expected(902));
+    engine
+        .execute_with_session(&mut writer, "ROLLBACK")
+        .unwrap();
+    engine.execute_with_session(&mut reader, "COMMIT").unwrap();
+}
+
+#[test]
 fn ordered_index_limit_offset_filter_fallback_remains_correct() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
