@@ -392,6 +392,14 @@ impl Binder<'_> {
         let statement = statement.into();
         match statement {
             crate::parser::QueryRef::Select(select) => self.select_output_names(select),
+            crate::parser::QueryRef::Rrf(rrf) => {
+                let mut names = self.output_names(&rrf.branches.first()?.query)?;
+                names.extend(["rrf_score", "best_rank", "match_count"].map(String::from));
+                if rrf.score_details {
+                    names.insert("rrf_details".into());
+                }
+                Some(names)
+            }
             crate::parser::QueryRef::SetOperation(set) => self.output_names(&set.left),
             crate::parser::QueryRef::WithCte(with) => self.output_names(&with.body),
             _ => None,
@@ -419,13 +427,38 @@ impl Binder<'_> {
                     out.insert(parts.last()?.to_ascii_lowercase());
                 }
                 SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                    for source in select
+                    let qualifier = match item {
+                        SelectItem::QualifiedWildcard(name) => Some(name.to_ascii_lowercase()),
+                        _ => None,
+                    };
+                    let sources = select
                         .from
                         .iter()
-                        .chain(select.joins.iter().map(|j| &j.table))
-                    {
-                        let binding = self.binding(source, None)?;
-                        out.extend(binding.visible);
+                        .enumerate()
+                        .map(|(i, source)| {
+                            (
+                                source,
+                                if i == 0 {
+                                    select.derived.as_ref()
+                                } else {
+                                    None
+                                },
+                            )
+                        })
+                        .chain(
+                            select
+                                .joins
+                                .iter()
+                                .map(|join| (&join.table, join.derived.as_ref())),
+                        );
+                    for (source, derived) in sources {
+                        let binding = self.binding(source, derived)?;
+                        if qualifier
+                            .as_ref()
+                            .is_none_or(|name| binding.names.contains(name))
+                        {
+                            out.extend(binding.visible);
+                        }
                     }
                 }
                 _ => {}
@@ -447,6 +480,7 @@ impl Binder<'_> {
         if let Some(derived) = derived {
             let columns = match derived {
                 SubQuery::Select(s) => self.select_output_names(s)?,
+                SubQuery::Rrf(_) => self.output_names(derived)?,
                 SubQuery::SetOp(s) => self.output_names(s)?,
                 SubQuery::WithCte(with) => self.output_names(&with.body)?,
             };

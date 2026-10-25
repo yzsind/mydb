@@ -1347,7 +1347,7 @@ where
             &format!("{} on {}", self.context.user, self.context.current_database),
         );
         let result = match self.run_init_connect().await {
-            Ok(()) => self.command_loop().await,
+            Ok(()) => self.command_loop_with_disconnect().await,
             Err(err) => {
                 log_message(format_args!(
                     "connection {} init_connect command failed: {} ({})",
@@ -1405,6 +1405,23 @@ where
         self.registry.unregister(self.connection_id);
         self.authenticated = false;
         result
+    }
+
+    async fn command_loop_with_disconnect(&mut self) -> io::Result<()> {
+        let peer = self.stream.clone_socket()?;
+        let handle = self.handle.as_ref().map(Arc::clone);
+        let commands = self.command_loop();
+        tokio::pin!(commands);
+        tokio::select! {
+            biased;
+            result = &mut commands => result,
+            _ = wait_peer_closed(&peer) => {
+                if let Some(handle) = handle { handle.peer_disconnected(); }
+                // Retain ownership of the in-flight context until cooperative
+                // cancellation completes; ordinary teardown then rolls back.
+                commands.await
+            }
+        }
     }
 
     async fn run_init_connect(&mut self) -> Result<(), QueryError> {
@@ -4926,29 +4943,37 @@ where
                         let texts = perf_texts.clone();
                         let mut state = std::mem::take(&mut select_memo_state);
                         let params = std::mem::take(&mut values);
-                        match crate::util::blocking_pool::spawn_session(
-                            self.blocking_affinity.as_ref(),
-                            move || {
-                                let result =
-                                    crate::engine::perf_events::with_prepared_statement_texts(
-                                        &texts,
-                                        || {
-                                            crate::engine::api::with_shared_result_metadata(|| {
-                                                engine.execute_prepared_select(
-                                                    &mut context,
-                                                    &mut state,
-                                                    &parsed,
-                                                    &sql,
-                                                    &params,
-                                                )
-                                            })
-                                        },
-                                    );
-                                (context, state, params, result)
-                            },
-                        )
-                        .await
-                        {
+                        let needs_async_progress = statement_contains_fusion(arc.as_ref())
+                            || statement_contains_blocking_function(arc.as_ref());
+                        let work = move || {
+                            let result = crate::engine::perf_events::with_prepared_statement_texts(
+                                &texts,
+                                || {
+                                    crate::engine::api::with_shared_result_metadata(|| {
+                                        engine.execute_prepared_select(
+                                            &mut context,
+                                            &mut state,
+                                            &parsed,
+                                            &sql,
+                                            &params,
+                                        )
+                                    })
+                                },
+                            );
+                            (context, state, params, result)
+                        };
+                        let job = if needs_async_progress {
+                            crate::util::blocking_pool::spawn_affine(
+                                self.blocking_affinity.as_ref(),
+                                work,
+                            )
+                        } else {
+                            crate::util::blocking_pool::spawn_session(
+                                self.blocking_affinity.as_ref(),
+                                work,
+                            )
+                        };
+                        match job.await {
                             Ok((context, state, params, result)) => {
                                 self.restore_context(context);
                                 select_memo_state = state;
@@ -6799,23 +6824,30 @@ where
         // there is no reason to throw away that authoritative AST and parse
         // the identical COM_QUERY a second time on the worker.
         let engine = Arc::clone(&self.engine);
+        // Fusion and blocking functions need independent transport progress.
+        // Retain ordinary request-worker scheduling for other SELECTs.
+        let needs_async_progress = statement_contains_fusion(statement.as_ref())
+            || statement_contains_blocking_function(statement.as_ref());
         let mut context = self.park_context();
-        let (context, result) =
-            crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), move || {
-                let result = match params {
-                    Some((params, shape_sql)) => engine.execute_parsed_with_params(
-                        &mut context,
-                        &sql,
-                        statement,
-                        params,
-                        shape_sql,
-                    ),
-                    None => engine.execute_parsed(&mut context, &sql, statement),
-                };
-                (context, result)
-            })
-            .await
-            .map_err(|err| self.recover_join_error(err))?;
+        let work = move || {
+            let result = match params {
+                Some((params, shape_sql)) => engine.execute_parsed_with_params(
+                    &mut context,
+                    &sql,
+                    statement,
+                    params,
+                    shape_sql,
+                ),
+                None => engine.execute_parsed(&mut context, &sql, statement),
+            };
+            (context, result)
+        };
+        let job = if needs_async_progress {
+            crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
+        } else {
+            crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
+        };
+        let (context, result) = job.await.map_err(|err| self.recover_join_error(err))?;
         self.restore_context(context);
 
         result
@@ -8285,6 +8317,16 @@ fn bind_statement_placeholders<'q>(
         crate::parser::QueryMut::Other(Statement::Delete(stmt)) => {
             bind_delete_placeholders(stmt, params)
         }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                bind_statement_placeholders(&mut branch.query, params)?;
+            }
+            bind_expr_placeholders(&mut rrf.rank_constant, params)?;
+            for weight in &mut rrf.weights {
+                bind_expr_placeholders(weight, params)?;
+            }
+            Ok(())
+        }
         crate::parser::QueryMut::SetOperation(stmt) => {
             bind_statement_placeholders(&mut stmt.left, params)?;
             bind_statement_placeholders(&mut stmt.right, params)?;
@@ -8391,7 +8433,7 @@ fn bind_select_placeholders(stmt: &mut Select, params: &[StmtParamValue]) -> Res
     if let Some(derived) = &mut stmt.derived {
         match derived {
             SubQuery::Select(s) => bind_select_placeholders(s, params)?,
-            stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+            stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                 bind_statement_placeholders(stmt, params)?
             }
         }
@@ -8596,6 +8638,53 @@ enum MysqlStream {
     Plain(PlainStream),
     Tls(Box<SecureStream>),
     Upgrading,
+}
+
+impl MysqlStream {
+    /// A separate reactor registration observes EOF without reading protocol
+    /// bytes, including pipelined requests or TLS records buffered by the codec.
+    fn clone_socket(&self) -> io::Result<TcpStream> {
+        let stream = match self {
+            Self::Plain(stream) => stream.get_ref(),
+            Self::Tls(stream) => stream.get_ref().0.get_ref(),
+            Self::Upgrading => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "TLS upgrade in progress",
+                ))
+            }
+        };
+        #[cfg(unix)]
+        let socket = {
+            use std::os::fd::AsFd;
+            std::net::TcpStream::from(stream.as_fd().try_clone_to_owned()?)
+        };
+        #[cfg(windows)]
+        let socket = {
+            use std::os::windows::io::AsSocket;
+            std::net::TcpStream::from(stream.as_socket().try_clone_to_owned()?)
+        };
+        TcpStream::from_std(socket)
+    }
+}
+
+async fn wait_peer_closed(stream: &TcpStream) {
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.ready(tokio::io::Interest::READABLE).await {
+            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
+            Err(_) => return,
+            _ => {}
+        }
+        match stream.peek(&mut byte).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                // Never consume another command. A pipelined request may stay
+                // unread while a worker runs, so avoid spinning on readiness.
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
 }
 
 impl AsyncRead for MysqlStream {
@@ -9279,16 +9368,56 @@ fn ddl_cache_scope(sql: &str, mode: crate::sql_lex::SqlLexMode) -> DdlCacheScope
 /// statement inline on the tokio task and skip the `spawn_blocking`
 /// hand-off; returning false routes through the blocking pool so the
 /// runtime worker is never parked.
+fn statement_contains_fusion<'q>(statement: impl Into<crate::parser::QueryRef<'q>>) -> bool {
+    match statement.into() {
+        crate::parser::QueryRef::Select(select) => {
+            struct Fusion(bool);
+            impl crate::parser::visit::AstVisitor for Fusion {
+                fn enter_query(&mut self, query: &crate::parser::QueryExpr) {
+                    self.0 |= matches!(query, crate::parser::QueryExpr::Rrf(_));
+                }
+                fn walk_query_children(&self, _: &crate::parser::QueryExpr) -> bool {
+                    !self.0
+                }
+                fn continue_expr_walk(&self) -> bool {
+                    !self.0
+                }
+            }
+            let mut fusion = Fusion(false);
+            crate::parser::visit::visit_select(&mut fusion, select);
+            fusion.0
+        }
+        crate::parser::QueryRef::Rrf(_) => true,
+        crate::parser::QueryRef::WithCte(with) => {
+            statement_contains_fusion(&with.body)
+                || with
+                    .ctes
+                    .iter()
+                    .any(|cte| statement_contains_fusion(&cte.query))
+        }
+        crate::parser::QueryRef::SetOperation(set) => {
+            statement_contains_fusion(&set.left) || statement_contains_fusion(&set.right)
+        }
+        crate::parser::QueryRef::Other(Statement::Explain {
+            target, analyze, ..
+        }) => *analyze && statement_contains_fusion(target),
+        _ => false,
+    }
+}
+
 fn statement_has_computed_ordering<'q>(statement: impl Into<crate::parser::QueryRef<'q>>) -> bool {
     let statement = statement.into();
+    if statement_contains_fusion(statement) {
+        return true;
+    }
     match statement {
         crate::parser::QueryRef::Select(select) => {
             crate::engine::cache::select_has_computed_ordering(select)
         }
-        crate::parser::QueryRef::WithCte(stmt) => statement_has_computed_ordering(&stmt.body),
-        crate::parser::QueryRef::SetOperation(stmt) => {
-            statement_has_computed_ordering(&stmt.left)
-                || statement_has_computed_ordering(&stmt.right)
+        crate::parser::QueryRef::WithCte(with) => statement_has_computed_ordering(&with.body),
+        crate::parser::QueryRef::SetOperation(set) => {
+            statement_has_computed_ordering(&set.left)
+                || statement_has_computed_ordering(&set.right)
         }
         crate::parser::QueryRef::Other(Statement::Explain {
             target, analyze, ..
@@ -9310,6 +9439,10 @@ pub(crate) fn statement_is_lock_safe_read<'q>(
             target, analyze, ..
         }) => !*analyze || statement_is_lock_safe_read(target),
         crate::parser::QueryRef::WithCte(stmt) => statement_is_lock_safe_read(&stmt.body),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .all(|branch| statement_is_lock_safe_read(&branch.query)),
         crate::parser::QueryRef::SetOperation(stmt) => {
             statement_is_lock_safe_read(&stmt.left) && statement_is_lock_safe_read(&stmt.right)
         }
@@ -9364,6 +9497,10 @@ fn statement_contains_blocking_function<'q>(
                 .any(|cte| statement_contains_blocking_function(&cte.query))
                 || statement_contains_blocking_function(&stmt.body)
         }
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .any(|branch| statement_contains_blocking_function(&branch.query)),
         crate::parser::QueryRef::SetOperation(stmt) => {
             statement_contains_blocking_function(&stmt.left)
                 || statement_contains_blocking_function(&stmt.right)
@@ -9386,7 +9523,7 @@ fn select_contains_blocking_function(stmt: &Select) -> bool {
                 .is_some_and(expr_contains_blocking_function)
                 || join.derived.as_ref().is_some_and(|derived| match derived {
                     SubQuery::Select(s) => select_contains_blocking_function(s),
-                    stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+                    stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                         statement_contains_blocking_function(stmt)
                     }
                 })
@@ -9402,7 +9539,7 @@ fn select_contains_blocking_function(stmt: &Select) -> bool {
             .any(|order| expr_contains_blocking_function(&order.expr))
         || stmt.derived.as_ref().is_some_and(|derived| match derived {
             SubQuery::Select(s) => select_contains_blocking_function(s),
-            stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+            stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                 statement_contains_blocking_function(stmt)
             }
         })
@@ -9487,6 +9624,45 @@ fn bind_sql_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_monitor_preserves_pipeline_bytes_and_observes_closed_transport() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut stream = MysqlStream::Plain(BufReader::new(server));
+        let peer = stream.clone_socket().unwrap();
+        client.write_all(b"queued command").await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(75),
+            wait_peer_closed(&peer)
+        )
+        .await
+        .is_err());
+        let mut bytes = [0u8; 14];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"queued command");
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_peer_closed(&peer))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn hybrid_rrf_nested_prepared_inputs_stay_off_reactor() {
+        for sql in [
+            "SELECT * FROM ((SELECT 1 AS id ORDER BY id LIMIT 1) RRF (SELECT 1 AS id ORDER BY id LIMIT 1)) h",
+            "SELECT (SELECT COUNT(*) FROM ((SELECT 1 AS id ORDER BY id LIMIT 1) RRF (SELECT 1 AS id ORDER BY id LIMIT 1)) h)",
+        ] {
+            assert!(statement_has_computed_ordering(&parse_statement(sql).unwrap()));
+        }
+        assert!(!statement_has_computed_ordering(
+            &parse_statement("SELECT 1").unwrap()
+        ));
+    }
 
     struct PanicCleanupEngine(std::sync::atomic::AtomicUsize);
 

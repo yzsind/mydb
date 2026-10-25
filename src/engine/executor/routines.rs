@@ -4115,6 +4115,11 @@ fn bind_statement_locals<'q>(
     use crate::parser::{InsertSource, Statement};
     match statement {
         crate::parser::QueryMut::Select(select) => bind_select_locals(select, locals)?,
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                bind_statement_locals(&mut branch.query, locals)?;
+            }
+        }
         crate::parser::QueryMut::SetOperation(set) => {
             bind_statement_locals(&mut set.left, locals)?;
             bind_statement_locals(&mut set.right, locals)?;
@@ -4239,9 +4244,9 @@ fn bind_subquery_locals(
 ) -> Result<(), QueryError> {
     match subquery {
         crate::parser::SubQuery::Select(select) => bind_select_locals(select, locals),
-        statement @ (crate::parser::SubQuery::SetOp(_) | crate::parser::SubQuery::WithCte(_)) => {
-            bind_statement_locals(statement, locals)
-        }
+        statement @ (crate::parser::SubQuery::SetOp(_)
+        | crate::parser::SubQuery::Rrf(_)
+        | crate::parser::SubQuery::WithCte(_)) => bind_statement_locals(statement, locals),
     }
 }
 
@@ -5119,6 +5124,11 @@ fn resolve_statement_functions<'q>(
         crate::parser::QueryMut::Select(select) => {
             resolve_select_functions(db, session, select, registry, needs)?;
         }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                resolve_statement_functions(db, session, &mut branch.query, registry, needs)?;
+            }
+        }
         crate::parser::QueryMut::SetOperation(set) => {
             resolve_statement_functions(db, session, &mut set.left, registry, needs)?;
             resolve_statement_functions(db, session, &mut set.right, registry, needs)?;
@@ -5263,7 +5273,7 @@ fn resolve_subquery_functions(
     use crate::parser::SubQuery;
     match subquery {
         SubQuery::Select(select) => resolve_select_functions(db, session, select, registry, needs),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             resolve_statement_functions(db, session, stmt, registry, needs)
         }
     }

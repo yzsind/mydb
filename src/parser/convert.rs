@@ -2216,7 +2216,7 @@ fn convert_query(sql: &str, query: Query) -> Result<Statement, ParseError> {
     })
 }
 
-fn convert_query_ref(sql: &str, query: &Query) -> Result<Statement, ParseError> {
+pub(super) fn convert_query_ref(sql: &str, query: &Query) -> Result<Statement, ParseError> {
     prepare_query(sql, query)?.finish(|tail| {
         convert_set_expr(
             sql,
@@ -2366,15 +2366,35 @@ fn convert_set_expr_checked(
     lock_clause: Option<LockClause>,
 ) -> Result<Statement, ParseError> {
     match set_expr {
-        SetExpr::Select(select) => convert_select(
-            sql,
-            select,
-            order_by,
-            limit,
-            offset,
-            for_update,
-            lock_clause,
-        ),
+        SetExpr::Select(select) => {
+            if select.from.is_empty() {
+                if let [SqlSelectItem::UnnamedExpr(SqlExpr::Identifier(name))] =
+                    select.projection.as_slice()
+                {
+                    if let Some(extensions::Extension::Rrf(parsed)) = extensions::get(&name.value) {
+                        let fusion = super::rrf::convert(&parsed, sql)?;
+                        return apply_tail_modifiers(
+                            sql,
+                            QueryExpr::Rrf(Box::new(fusion)).into_statement(),
+                            order_by,
+                            limit,
+                            offset,
+                            for_update,
+                            lock_clause,
+                        );
+                    }
+                }
+            }
+            convert_select(
+                sql,
+                select,
+                order_by,
+                limit,
+                offset,
+                for_update,
+                lock_clause,
+            )
+        }
         SetExpr::Query(query) => {
             // A parenthesised query nested inside another query body, e.g.
             // `(SELECT ... UNION ALL SELECT ...) ORDER BY b LIMIT 5`. sqlparser

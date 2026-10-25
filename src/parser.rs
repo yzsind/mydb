@@ -41,6 +41,7 @@ mod print;
 mod query_ref;
 pub(crate) mod query_shape;
 mod rewrite;
+pub(crate) mod rrf;
 mod source;
 pub(crate) mod visit;
 
@@ -116,3 +117,6 @@ pub(crate) fn fuzz_fast_path_differential(sql: &str, bits: u16) {
 
 mod vector_options;
 use vector_options::{apply_vector_options, strip_vector_options};
+
+#[cfg(test)]
+mod rrf_tests;

@@ -2014,7 +2014,8 @@ pub(crate) fn should_route_result_to_batch(plan: &PhysicalPlan, projection: &[Se
             PhysicalPlan::SetOp { left, right, .. } => {
                 supported_scan_spine(left) && supported_scan_spine(right)
             }
-            PhysicalPlan::GenerateSeries { .. }
+            PhysicalPlan::RrfFusion { .. }
+            | PhysicalPlan::GenerateSeries { .. }
             | PhysicalPlan::ValuesScan { .. }
             | PhysicalPlan::JsonTableScan { .. }
             | PhysicalPlan::SystemScan { .. }
@@ -2137,7 +2138,8 @@ impl NativeVecCompiler {
             PhysicalPlan::JsonTableScan { .. } => try_build_json_table_batch(plan)?,
             PhysicalPlan::SystemScan { .. } => try_build_system_batch(db, plan)?,
             PhysicalPlan::IndexMerge { .. } => try_build_direct_index_merge_batch(db, txn, plan)?,
-            PhysicalPlan::FulltextScan { .. }
+            PhysicalPlan::RrfFusion { .. }
+            | PhysicalPlan::FulltextScan { .. }
             | PhysicalPlan::SpatialScan { .. }
             | PhysicalPlan::VectorIndexScan { .. }
             | PhysicalPlan::VectorBruteScan { .. }
@@ -2923,7 +2925,7 @@ fn try_build_vec_projection_input<'a>(
     Ok(compiled)
 }
 
-fn final_projection(plan: &PhysicalPlan) -> Option<&[SelectItem]> {
+pub(super) fn final_projection(plan: &PhysicalPlan) -> Option<&[SelectItem]> {
     match plan {
         PhysicalPlan::Projection { projection, .. }
         | PhysicalPlan::StreamingDistinct { projection, .. } => Some(projection),

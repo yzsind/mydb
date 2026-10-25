@@ -97,6 +97,10 @@ pub(in crate::engine::executor) fn execute_set_operation_dispatch(
         let statement = statement.into();
         match statement {
             crate::parser::QueryRef::Select(select) => predicate(select),
+            crate::parser::QueryRef::Rrf(rrf) => rrf
+                .branches
+                .iter()
+                .all(|branch| all_selects(&branch.query, predicate)),
             crate::parser::QueryRef::SetOperation(set) => {
                 all_selects(&set.left, predicate) && all_selects(&set.right, predicate)
             }
@@ -114,6 +118,9 @@ pub(in crate::engine::executor) fn execute_set_operation_dispatch(
         match statement {
             crate::parser::QueryRef::Select(select) => {
                 crate::engine::executor::tx::select_has_locking_read(select)
+            }
+            crate::parser::QueryRef::Rrf(rrf) => {
+                rrf.branches.iter().any(|branch| has_locks(&branch.query))
             }
             crate::parser::QueryRef::SetOperation(set) => {
                 has_locks(&set.left) || has_locks(&set.right)
@@ -1089,7 +1096,10 @@ fn reduce_setop_spill_partition(
     Ok(())
 }
 
-fn set_row_key(collations: &[Option<u16>], row: &[Value]) -> SetRowKey {
+pub(in crate::engine::executor) fn set_row_key(
+    collations: &[Option<u16>],
+    row: &[Value],
+) -> SetRowKey {
     let mut key = SetRowKey::new();
     for (index, value) in row.iter().enumerate() {
         let text = match value {
@@ -2502,6 +2512,12 @@ fn materialize_setop_inline_derived<'q>(
             }
             Ok(())
         }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                materialize_setop_inline_derived(db, txn, &mut branch.query, registry, results)?;
+            }
+            Ok(())
+        }
         crate::parser::QueryMut::SetOperation(set) => {
             materialize_setop_inline_derived(db, txn, &mut set.left, registry, results)?;
             materialize_setop_inline_derived(db, txn, &mut set.right, registry, results)
@@ -2598,7 +2614,7 @@ pub(super) fn inline_single_use_with_in_select(
         }
         match subquery {
             SubQuery::Select(select) => inline_single_use_with_in_select(db, select),
-            SubQuery::SetOp(_) | SubQuery::WithCte(_) => Ok(()),
+            SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_) => Ok(()),
         }
     }
     if let Some(derived) = select.derived.as_mut() {
@@ -2626,6 +2642,9 @@ pub(in crate::engine::executor) fn execute_set_operation_branch_response(
                 return Ok(response);
             }
             crate::engine::executor::dml::execute_expression_subquery(db, txn, *select, registry)
+        }
+        crate::parser::QueryExpr::Rrf(rrf) => {
+            crate::engine::executor::select::hybrid::execute_response(db, txn, &rrf, registry)
         }
         crate::parser::QueryExpr::SetOp(set_op) => {
             execute_set_operation_rows(db, txn, *set_op, registry)

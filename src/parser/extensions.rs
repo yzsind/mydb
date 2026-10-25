@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub(super) enum Extension {
     EmptyRow,
+    Rrf(std::sync::Arc<adapter::rrf::ParsedRrf>),
     QueryTail,
     EmptyGroupingSet,
     ReturningOld(String),

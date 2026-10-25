@@ -450,6 +450,13 @@ let crate::parser::WindowSpec { partition_by, order_by, frame, .. } = & $($mutab
             match query {
                 QueryExpr::Select(select) => walk_select(visitor, select),
                 QueryExpr::SetOp(set) => walk_set_operation(visitor, set),
+                QueryExpr::Rrf(rrf) => {
+                    for branch in & $($mutable)* rrf.branches {
+                        walk_query(visitor, & $($mutable)* branch.query);
+                    }
+                    walk_expr(visitor, & $($mutable)* rrf.rank_constant);
+                    walk_exprs(visitor, & $($mutable)* rrf.weights);
+                }
                 QueryExpr::WithCte(with) => {
                     for cte in & $($mutable)* with.ctes {
                         visitor.enter_cte(cte);

@@ -3247,8 +3247,7 @@ pub(super) fn resolve_fulltext_score(
         Ok(field) => Ok(field.value.clone()),
         Err(_) => Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            "MATCH() AGAINST() is only supported when the same MATCH() drives a FULLTEXT \
-             index search in the WHERE clause",
+            "MATCH() AGAINST() requires a matching FULLTEXT score provider in this query block",
         )),
     }
 }
@@ -3520,6 +3519,9 @@ pub(super) fn bind_correlated_subquery_tree(
         outer_row: &'a PlanRow,
     }
     impl crate::parser::visit::AstVisitorMut for BindLeaves<'_> {
+        fn walk_query_children(&self, query: &crate::parser::QueryExpr) -> bool {
+            !matches!(query, crate::parser::QueryExpr::Rrf(_))
+        }
         fn enter_select(&mut self, select: &mut Select) {
             let _ = bind_correlated_subquery_in_place(self.db, select, self.outer_row);
         }
@@ -5073,6 +5075,9 @@ fn substitute_outer_in_query<'q>(
             let tables = inner_select_tables(select);
             substitute_outer_in_select(db, select, outer_row, &columns, &tables)
         }
+        // Fusion inputs are independent query scopes. Preserve unresolved
+        // outer references so ordinary binding reports them as unsupported.
+        crate::parser::QueryMut::Rrf(_) => false,
         crate::parser::QueryMut::SetOperation(set) => {
             let left = substitute_outer_in_query(db, &mut set.left, outer_row);
             substitute_outer_in_query(db, &mut set.right, outer_row) || left
@@ -5105,7 +5110,7 @@ fn substitute_outer_in_derived(
             let tables = inner_select_tables(select);
             substitute_outer_in_select(db, select, outer_row, &columns, &tables)
         }
-        statement @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        statement @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             substitute_outer_in_query(db, statement, outer_row)
         }
     }

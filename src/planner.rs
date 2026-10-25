@@ -1,4 +1,5 @@
 mod column_validation;
+mod rrf;
 use column_validation::{validate_expr_columns, validate_window_frame_columns};
 mod semi_anti;
 pub(crate) use join_cost::adaptive_candidate_cost;
@@ -358,6 +359,15 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         op: SetOp,
         all: bool,
+        estimated_rows: f64,
+        cost: crate::engine::cbo::Cost,
+    },
+    /// Exact rank fusion over independently planned finite retrieval lists.
+    RrfFusion {
+        inputs: Vec<PhysicalPlan>,
+        spec: Arc<crate::parser::RrfFusion>,
+        output_window: Option<crate::engine::executor::select::hybrid::OutputWindow>,
+        columns: Vec<crate::types::Column>,
         estimated_rows: f64,
         cost: crate::engine::cbo::Cost,
     },
@@ -1636,6 +1646,7 @@ fn plan_query_physical_checked(
             }
             plan_select(db, select)?.physical
         }
+        crate::parser::QueryRef::Rrf(spec) => rrf::build(db, spec)?,
         crate::parser::QueryRef::SetOperation(set) => {
             crate::engine::params::validate_limit(set.limit.as_ref())?;
             crate::engine::params::validate_limit(set.offset.as_ref())?;
@@ -4304,6 +4315,20 @@ fn scope_table_for_ref(
             visible,
         });
     }
+    if let Some(derived @ SubQuery::Rrf(_)) = derived {
+        let mut columns = crate::engine::executor::select::describe_subquery_columns(db, derived)?
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>();
+        apply_derived_column_aliases(table, columns.iter_mut())?;
+        return Ok(ScopeTable {
+            name: table.name.clone(),
+            alias: table.alias.clone(),
+            wildcard_columns: columns.clone(),
+            columns,
+            visible,
+        });
+    }
     if let Some(derived) = derived {
         // A set-operation derived table exposes the output columns of its
         // leftmost SELECT (SQL semantics); each branch validates itself when
@@ -4676,6 +4701,7 @@ pub(crate) fn plan_output_width(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::AdaptiveJoin { left, right, .. } => {
             plan_output_width(left) + plan_output_width(right)
         }
+        PhysicalPlan::RrfFusion { columns, .. } => (columns.len() * 32) as f64,
         PhysicalPlan::SetOp { left, right, .. } => {
             plan_output_width(left).max(plan_output_width(right))
         }
@@ -4806,6 +4832,7 @@ define_plan_metadata! {
     ValuesScan,
     JsonTableScan,
     SystemScan,
+    RrfFusion,
     SetOp,
     Materialize,
     RecursiveUnion,
@@ -9711,6 +9738,10 @@ fn try_knn_vector_scan(
             .order_by
             .iter()
             .any(|order| expr_has_window_function(&order.expr))
+        // Both indexed and brute KNN bypass FulltextScan's scalar score
+        // provider. Keep every MATCH in this query block on the ordinary
+        // full-text-aware path, including projection-only and OR/NOT uses.
+        || !collect_fulltext_matches_in_select(select).is_empty()
     {
         return None;
     }
@@ -9726,10 +9757,15 @@ fn try_knn_vector_scan(
     let limit = limit_usize(select.limit.as_ref())?;
     let offset = limit_usize(select.offset.as_ref()).unwrap_or(0);
     let k = offset.checked_add(limit).filter(|k| *k > 0)?;
-    // Exactly one sort key; a tie-breaker would impose an order the index cannot
-    // honour. Nearest-first distance is ASC. DOT_PRODUCT is a similarity, so
-    // its nearest-neighbour form is DESC.
-    if select.order_by.len() != 1 {
+    // The distance prefix drives ANN; scalar column suffixes break ties
+    // inside its complete rerank pool before truncation. Expressions that
+    // require another ranking contract retain the ordinary full TopK path.
+    if select.order_by.is_empty()
+        || select.order_by[1..].iter().any(|order| {
+            expr_column_name(resolve_order_alias(&order.expr, &select.projection))
+                .is_none_or(|name| table.schema.column_index(name).is_err())
+        })
+    {
         return None;
     }
     let order_expr = resolve_order_alias(&select.order_by[0].expr, &select.projection);
@@ -10158,7 +10194,7 @@ fn try_brute_vector_scan(
     k: usize,
     total_rows: f64,
 ) -> Option<PhysicalPlan> {
-    if !vector_brute_scan_enabled() || filter.is_some() {
+    if !vector_brute_scan_enabled() || filter.is_some() || select.order_by.len() != 1 {
         return None;
     }
     // Partitioned tables are supported: the storage-layer scan fans out across
@@ -20087,6 +20123,13 @@ fn count_plan_column_matches(
         // A set operation exposes only the left branch's output names; the
         // right branch contributes values/types but not independently
         // addressable columns.
+        PhysicalPlan::RrfFusion { columns, .. } => {
+            if qualifier.is_none_or(|name| name.eq_ignore_ascii_case("$rrf"))
+                && columns.iter().any(|c| c.name.eq_ignore_ascii_case(column))
+            {
+                *matches += 1;
+            }
+        }
         PhysicalPlan::SetOp { left, .. } => {
             count_plan_column_matches(left, qualifier, column, matches);
         }
@@ -20813,7 +20856,7 @@ fn derived_correlation_only_uses_table(
                 && derived_correlation_only_uses_table(db, &set.left, table)
                 && derived_correlation_only_uses_table(db, &set.right, table)
         }
-        crate::parser::QueryExpr::WithCte(_) => false,
+        crate::parser::QueryExpr::Rrf(_) | crate::parser::QueryExpr::WithCte(_) => false,
     }
 }
 

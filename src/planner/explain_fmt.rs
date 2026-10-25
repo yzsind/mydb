@@ -388,6 +388,25 @@ pub(super) fn collect_explain_rows(
             }
         }
 
+        PhysicalPlan::RrfFusion { inputs, spec, .. } => {
+            for input in inputs {
+                collect_explain_rows(input, rows, next_plan_id);
+            }
+            rows.push(explain_operator_row(
+                rows.len() + 1,
+                "PRIMARY".into(),
+                "<rrf fusion>".into(),
+                estimated_rows(plan).round() as usize,
+                100.0,
+                format!(
+                    "RRF fusion (rank_constant={}, branches={}, score_details={})",
+                    crate::parser::expr_to_sql(&spec.rank_constant),
+                    inputs.len(),
+                    spec.score_details
+                ),
+                Some(node_id),
+            ));
+        }
         PhysicalPlan::SetOp {
             left,
             right,

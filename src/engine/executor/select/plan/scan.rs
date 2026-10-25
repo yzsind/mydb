@@ -4956,12 +4956,12 @@ pub(super) fn build_fulltext_match_runtime(
     let mut doc_len_of = ah_hash_map();
     let mut avgdl = 1.0;
     if need_score {
-        let stats = &table.schema.stats;
+        let frozen = super::super::fulltext_context::statistics(table, index)?;
         // The unsigned modified-row counter counts INSERT, UPDATE and DELETE
         // and is only a staleness trigger. BM25's document count must use the
         // signed committed row delta, otherwise update-heavy tables make IDF
         // drift upward without gaining a single document.
-        let est = (stats.row_count as i128 + table.live_row_delta as i128).max(0) as f64;
+        let est = frozen.base_n;
         let max_df = scoring_terms.iter().map(|term| term.df).max().unwrap_or(0) as f64;
         let n_docs = est.max(candidates.len() as f64).max(max_df).max(1.0);
         idfs = scoring_terms
@@ -4984,15 +4984,7 @@ pub(super) fn build_fulltext_match_runtime(
         if count > 0 {
             avgdl = (sum as f64 / count as f64).max(1.0);
         }
-        if let Some(corpus_avg) = table
-            .schema
-            .stats
-            .indexes
-            .get(&crate::storage::normalize_name(&index.name))
-            .and_then(|stats| stats.fulltext.as_ref())
-            .map(|stats| stats.avg_token_count)
-            .filter(|avg| *avg > 0.0)
-        {
+        if let Some(corpus_avg) = frozen.corpus_avg {
             avgdl = corpus_avg;
         }
     }
@@ -5613,6 +5605,7 @@ pub(super) fn execute_vector_index_scan(
     k: usize,
     ef_search: usize,
     filter: &Option<Expr>,
+    order_by: &[OrderBy],
 ) -> Result<Vec<PlanRow>, QueryError> {
     use crate::engine::vector;
     use crate::engine::vector::session::IterativeScan;
@@ -5625,6 +5618,9 @@ pub(super) fn execute_vector_index_scan(
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
     if db.xa_status_counters().0 > 0 || db.vector_snapshot_requires_exact(txn) {
+        if order_by.len() > 1 {
+            return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
+        }
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -5669,7 +5665,7 @@ pub(super) fn execute_vector_index_scan(
     // are authoritative. Ordinary IVF L2/Cosine is approximate SQ8, while the
     // governed IVF graph navigator and both HNSW backends finish on f32 and are
     // exact within their ANN candidate pool.
-    let mut exact_order = true;
+    let mut exact_order = order_by.len() == 1;
     let base_effort = if is_ivf {
         ef_search.max(1)
     } else {
@@ -5732,6 +5728,7 @@ pub(super) fn execute_vector_index_scan(
     // the existing candidate-limit widening loop below.
     if !is_ivf
         && !quantized
+        && order_by.len() == 1
         && filter.is_none()
         && !matches!(iterative_scan, IterativeScan::Off)
         && storage_ids.iter().all(|sid| {
@@ -5816,6 +5813,11 @@ pub(super) fn execute_vector_index_scan(
                             index.name, index_error.message()
                         ),
                     );
+                    if order_by.len() > 1 {
+                        return execute_ordered_vector_fallback(
+                            db, txn, table, filter, order_by, k,
+                        );
+                    }
                     if let Some(residual) = filter {
                         return execute_vector_brute_scan_filtered(
                             db,
@@ -5999,6 +6001,9 @@ pub(super) fn execute_vector_index_scan(
         }
     }
     if exact_fallback || db.vector_snapshot_requires_exact(txn) {
+        if order_by.len() > 1 {
+            return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
+        }
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -6014,6 +6019,17 @@ pub(super) fn execute_vector_index_scan(
         };
     }
 
+    if order_by.len() > 1 {
+        let rows = scored.into_iter().map(|(_, row)| row).collect();
+        let mut rows = super::super::external_sort::sort_plan_rows_for_plan(
+            db.data_dir(),
+            rows,
+            order_by,
+            None,
+        )?;
+        rows.truncate(k);
+        return Ok(rows);
+    }
     // strict_order — keep ascending distance order (default). relaxed_order
     // skips the final sort and just truncates: callers willing to trade
     // ordering for latency get the raw insertion order.
@@ -6022,6 +6038,30 @@ pub(super) fn execute_vector_index_scan(
     }
     scored.truncate(k);
     Ok(scored.into_iter().map(|(_, row)| row).collect())
+}
+
+/// Exact completion for a distance order with SQL tie-break columns.
+fn execute_ordered_vector_fallback(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    order_by: &[OrderBy],
+    k: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let rows = table.schema.stats.row_count as f64;
+    let input = PhysicalPlan::SeqScan {
+        table: table.clone(),
+        filter: filter.clone(),
+        estimated_rows: rows,
+        access_rows: rows,
+        cost: crate::engine::cbo::Cost::scalar(rows),
+        possible_keys: Vec::new(),
+        runtime_filters: Vec::new(),
+        hint_note: None,
+        projected_columns: None,
+    };
+    super::execute_topk(db, txn, &input, order_by, k)
 }
 
 /// Rare failure-path oracle used when an ANN file cannot be read or fails

@@ -135,6 +135,12 @@ pub(in crate::engine::executor) fn execute_explain(
             let statement = statement.into();
             match statement {
                 crate::parser::QueryMut::Select(select) => prepare_select_for_planning(db, select),
+                crate::parser::QueryMut::Rrf(rrf) => {
+                    for branch in &mut rrf.branches {
+                        prepare_query(db, &mut branch.query)?;
+                    }
+                    Ok(())
+                }
                 crate::parser::QueryMut::SetOperation(set) => {
                     prepare_query(db, &mut set.left)?;
                     prepare_query(db, &mut set.right)
@@ -2191,7 +2197,9 @@ pub(super) fn execute_derived_explain(
     // follows the nesting down; otherwise take the plain single-plan path,
     // unchanged.
     let recursed = derived.derived.is_some() || needs_multi_source_explain(derived);
-    let mut rows = if recursed {
+    let mut rows = if let crate::parser::QueryExpr::Rrf(rrf) = sub {
+        planner::explain_rows(&super::hybrid::plan_for_explain(db, rrf)?)
+    } else if recursed {
         explain_select_node(db, derived)?
     } else {
         refresh_stale_stats_for_select(db, derived)?;
@@ -2696,7 +2704,7 @@ fn subquery_is_uncacheable(query: &SubQuery) -> bool {
     }
     match query {
         SubQuery::Select(s) => select_is_uncacheable(s),
-        s @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => statement(s),
+        s @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => statement(s),
     }
 }
 
@@ -3100,6 +3108,7 @@ fn derived_stub_columns_for_explain(
 /// sources, so thread-local hints alone cannot survive until materialization.
 struct InlineDerivedSelect {
     select: Select,
+    fusion: Option<std::sync::Arc<crate::parser::RrfFusion>>,
     window_topk: Option<(String, usize)>,
     rollup_topk: Option<super::plan::RollupWindowTopKHint>,
 }
@@ -3114,14 +3123,21 @@ fn materialize_analyzed_inline(
 ) -> Result<crate::engine::api::CteResult, QueryError> {
     let _window = super::super::dispatch::set_window_topk_hint(input.window_topk.clone());
     let _rollup = super::plan::set_rollup_window_topk_hint(input.rollup_topk.clone());
-    super::cte::materialize_inline_derived_for_analyze(
-        db,
-        txn,
-        alias,
-        &input.select,
-        plan,
-        registry,
-    )
+    let run = || {
+        super::cte::materialize_inline_derived_for_analyze(
+            db,
+            txn,
+            alias,
+            &input.select,
+            plan,
+            registry,
+        )
+    };
+    if let Some(fusion) = &input.fusion {
+        super::hybrid::with_analyzed_sources(db, txn, fusion, plan, registry, run)
+    } else {
+        run()
+    }
 }
 
 /// Recursive worker for formatted EXPLAIN of a SELECT that may carry inline
@@ -3140,6 +3156,7 @@ fn plan_select_with_inline_derived_for_explain(
     inline_derived: &mut Vec<(String, InlineDerivedSelect)>,
     is_lossy: &mut bool,
 ) -> Result<planner::PhysicalPlan, QueryError> {
+    let _rrf_window = super::hybrid::window_for_select(db, select)?;
     use crate::engine::api::CteResult;
     use std::sync::Arc;
 
@@ -3147,7 +3164,15 @@ fn plan_select_with_inline_derived_for_explain(
 
     let stub_inner = |alias: String,
                       sub: &crate::parser::SubQuery|
-     -> Result<(String, Select, Option<planner::PhysicalPlan>), QueryError> {
+     -> Result<
+        (
+            String,
+            Select,
+            Option<planner::PhysicalPlan>,
+            Option<std::sync::Arc<crate::parser::RrfFusion>>,
+        ),
+        QueryError,
+    > {
         let inner = sub
             .leftmost_select()
             .ok_or_else(|| {
@@ -3158,17 +3183,30 @@ fn plan_select_with_inline_derived_for_explain(
             })?
             .clone();
         let snapshot = super::cte::current_cte_registry();
-        let columns = derived_stub_columns_for_explain(db, &inner, &snapshot);
-        let key = alias.to_ascii_lowercase();
+        let columns = if matches!(sub, crate::parser::QueryExpr::Rrf(_)) {
+            super::describe_subquery_columns(db, sub)?
+        } else {
+            derived_stub_columns_for_explain(db, &inner, &snapshot)
+        };
+        let key = super::cte::next_inline_derived_name();
         super::cte::set_cte_result(&key, Arc::new(CteResult::stub_for_explain(columns, 0.0)));
         let complete_plan = match sub {
+            crate::parser::SubQuery::Rrf(rrf) => Some(planner::materialize_plan(
+                super::hybrid::plan_for_explain(db, rrf)?,
+                format!("derived:{alias}"),
+            )),
             query @ (crate::parser::SubQuery::SetOp(_) | crate::parser::SubQuery::WithCte(_)) => {
                 planner::plan_query_physical(db, query)?
-                    .map(|plan| planner::materialize_plan(plan, format!("derived:{key}")))
+                    .map(|plan| planner::materialize_plan(plan, format!("derived:{alias}")))
             }
             crate::parser::SubQuery::Select(_) => None,
         };
-        Ok((key, inner, complete_plan))
+        let fusion = if let crate::parser::QueryExpr::Rrf(fusion) = sub {
+            Some(std::sync::Arc::new((**fusion).clone()))
+        } else {
+            None
+        };
+        Ok((key, inner, complete_plan, fusion))
     };
 
     let derived_window_topk = select.derived.as_ref().and_then(|source| {
@@ -3203,18 +3241,19 @@ fn plan_select_with_inline_derived_for_explain(
         // therefore covers a strict subset of the real rows. Mark the
         // enclosing SELECT as "lossy" so EXPLAIN ANALYZE materialises this
         // owner via the legacy dispatch path instead of the partial plan.
-        if sub.as_select().is_none() {
+        if sub.as_select().is_none() && !matches!(sub, crate::parser::QueryExpr::Rrf(_)) {
             *is_lossy = true;
         }
-        let (key, inner, complete_plan) = stub_inner(alias.clone(), &sub)?;
+        let (key, inner, complete_plan, fusion) = stub_inner(alias.clone(), &sub)?;
         if let Some(t) = select.from.get_mut(0) {
-            t.name = alias.clone();
+            t.name = key.clone();
             t.alias = Some(alias);
         }
         local_inners.push((
             key,
             inner,
             complete_plan,
+            fusion,
             derived_window_topk,
             derived_rollup_topk,
         ));
@@ -3228,16 +3267,16 @@ fn plan_select_with_inline_derived_for_explain(
             .alias
             .clone()
             .unwrap_or_else(|| join.table.name.clone());
-        if sub.as_select().is_none() {
+        if sub.as_select().is_none() && !matches!(sub, crate::parser::QueryExpr::Rrf(_)) {
             *is_lossy = true;
         }
-        let (key, inner, complete_plan) = stub_inner(alias.clone(), &sub)?;
-        join.table.name = alias.clone();
+        let (key, inner, complete_plan, fusion) = stub_inner(alias.clone(), &sub)?;
+        join.table.name = key.clone();
         join.table.alias = Some(alias);
-        local_inners.push((key, inner, complete_plan, None, None));
+        local_inners.push((key, inner, complete_plan, fusion, None, None));
     }
 
-    for (key, inner, complete_plan, window_topk, rollup_topk) in local_inners {
+    for (key, inner, complete_plan, fusion, window_topk, rollup_topk) in local_inners {
         let _window_hint = super::super::dispatch::set_window_topk_hint(window_topk.clone());
         if let Some(inner_plan) = complete_plan {
             let est = planner::estimated_rows(&inner_plan);
@@ -3246,6 +3285,20 @@ fn plan_select_with_inline_derived_for_explain(
                     &key,
                     Arc::new(CteResult::stub_for_explain(existing.columns.clone(), est)),
                 );
+            }
+            if fusion.is_some() {
+                inline_derived.push((
+                    key.clone(),
+                    InlineDerivedSelect {
+                        select: Select {
+                            projection: vec![SelectItem::Wildcard],
+                            ..Select::default()
+                        },
+                        fusion,
+                        window_topk,
+                        rollup_topk,
+                    },
+                ));
             }
             cte_plans.insert(key, inner_plan);
             continue;
@@ -3284,6 +3337,7 @@ fn plan_select_with_inline_derived_for_explain(
             key,
             InlineDerivedSelect {
                 select: prepared,
+                fusion: None,
                 window_topk,
                 rollup_topk,
             },
@@ -3514,6 +3568,7 @@ impl PipelineDisplayScope {
                     | planner::PhysicalPlan::ParallelGroupingSetsAggregate { .. }
                     | planner::PhysicalPlan::WindowAgg { .. }
                     | planner::PhysicalPlan::StreamingDistinct { .. }
+                    | planner::PhysicalPlan::RrfFusion { .. }
                     | planner::PhysicalPlan::SetOp { all: false, .. }
                     | planner::PhysicalPlan::SetOp {
                         op: SetOp::Intersect | SetOp::Except,
@@ -3732,6 +3787,34 @@ fn format_plan_tree_nodes(
         return out;
     }
     match plan {
+        planner::PhysicalPlan::RrfFusion {
+            inputs,
+            spec,
+            columns,
+            output_window,
+            ..
+        } => {
+            let weights = spec
+                .weights
+                .iter()
+                .map(crate::parser::expr_to_sql)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut out = format!("{indent}{arrow}RRF fusion (rank_constant={}, weights=[{weights}], cost={cost:.2} rows={estimated_rows:.0})", crate::parser::expr_to_sql(&spec.rank_constant));
+            out.push_str(&format!(
+                " output_window={}",
+                super::hybrid::window_json(output_window)
+            ));
+            out.push_str(&format!(
+                " metadata={}",
+                super::hybrid::plan_metadata(spec, columns)
+            ));
+            out.push_str(&suffix(plan));
+            for input in inputs {
+                append_child(&mut out, input, cte_plans);
+            }
+            out
+        }
         planner::PhysicalPlan::SetOp {
             left,
             right,
@@ -4219,8 +4302,13 @@ fn format_plan_tree_nodes(
         }
         planner::PhysicalPlan::CteScan { name, alias, .. } => {
             let display = alias.as_deref().unwrap_or(name);
+            let logical_name = if name.starts_with('\0') {
+                display
+            } else {
+                name.as_str()
+            };
             let mut line = format!(
-                "{indent}{arrow}CTE scan on {display} <{name}> (cost={cost:.2} rows={estimated_rows:.0})"
+                "{indent}{arrow}CTE scan on {display} <{logical_name}> (cost={cost:.2} rows={estimated_rows:.0})"
             );
             let cte_stats = cte_scan_stats(stats, plan, name, cte_plans, cte_extras);
             line.push_str(&pipeline_tree_suffix(plan, depth));
@@ -4988,6 +5076,11 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
             s.cache_reads as f64 * 100.0 / total_reads as f64
         };
         let mut extra = String::new();
+        if s.rrf_branches > 0 {
+            let n = usize::from(s.rrf_branches);
+            let work = serde_json::json!({"input_rows": &s.rrf_input_rows[..n], "unique_rows": &s.rrf_unique_rows[..n], "union_rows": s.rrf_union_rows, "overlap_rows": s.rrf_overlap_rows, "fusion_ms": s.rrf_fusion_ns as f64 / 1_000_000.0});
+            extra.push_str(&format!(", \"rrf\": {work}"));
+        }
         if s.peak_memory_bytes > 0 {
             extra.push_str(&format!(", \"peak_mem\": {}", s.peak_memory_bytes));
             extra.push_str(&format!(", \"peak_memory_bytes\": {}", s.peak_memory_bytes));
@@ -5293,6 +5386,54 @@ fn format_plan_json_node(
         return;
     }
     match plan {
+        planner::PhysicalPlan::RrfFusion {
+            inputs,
+            spec,
+            columns,
+            output_window,
+            ..
+        } => {
+            out.push_str(&format!("{indent}\"rrf_fusion\": {{\n"));
+            out.push_str(&format!(
+                "{indent}  \"metadata\": {},\n",
+                super::hybrid::plan_metadata(spec, columns)
+            ));
+            out.push_str(&format!(
+                "{indent}  \"output_window\": {},\n",
+                super::hybrid::window_json(output_window)
+            ));
+            json_string_field(
+                out,
+                &indent,
+                "rank_constant",
+                &crate::parser::expr_to_sql(&spec.rank_constant),
+            );
+            json_string_field(
+                out,
+                &indent,
+                "weights",
+                &spec
+                    .weights
+                    .iter()
+                    .map(crate::parser::expr_to_sql)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            out.push_str(&format!(
+                "{indent}  \"rows_produced_per_join\": {},\n",
+                estimated_rows.ceil() as u64
+            ));
+            for (i, input) in inputs.iter().enumerate() {
+                append_child(
+                    out,
+                    &format!("branch_{}", i + 1),
+                    input,
+                    cte_plans,
+                    if i + 1 < inputs.len() { ",\n" } else { "" },
+                );
+            }
+            json_close_node(out, &indent, stats, plan);
+        }
         planner::PhysicalPlan::SetOp {
             left,
             right,
@@ -5864,8 +6005,13 @@ fn format_plan_json_node(
             let indent = "  ".repeat(depth);
             let cte_actual = cte_scan_stats(stats, plan, name, cte_plans, cte_extras);
             out.push_str(&format!("{indent}\"cte_scan\": {{\n"));
-            out.push_str(&format!("{indent}  \"alias\": \"{display}\",\n"));
-            out.push_str(&format!("{indent}  \"cte\": \"{name}\""));
+            json_string_field(out, &indent, "alias", display);
+            let logical_name = if name.starts_with('\0') {
+                display
+            } else {
+                name.as_str()
+            };
+            out.push_str(&format!("{indent}  \"cte\": {}", json_string(logical_name)));
             if let Some(cte_map) = cte_plans {
                 let key = name.to_ascii_lowercase();
                 if let Some(cte_plan) = cte_map.get(&key) {
@@ -6831,6 +6977,12 @@ impl DmlExplainPlan {
                                 crate::parser::QueryExpr::Select(select) => {
                                     rewrite_temp_tables_for_explain(session, select);
                                     prepare_select_for_planning(db, select)?;
+                                    Ok(())
+                                }
+                                crate::parser::QueryExpr::Rrf(rrf) => {
+                                    for branch in &mut rrf.branches {
+                                        prepare_source(db, session, &mut branch.query)?;
+                                    }
                                     Ok(())
                                 }
                                 crate::parser::QueryExpr::SetOp(set) => {

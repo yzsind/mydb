@@ -1,10 +1,11 @@
 //! Allocation-free query views at the statement/query dispatch boundary.
-use super::{CteDef, QueryExpr, Select, SetOperation, Statement};
+use super::{CteDef, QueryExpr, RrfFusion, Select, SetOperation, Statement};
 
 #[derive(Debug, Clone, Copy)]
 pub enum QueryRef<'a> {
     Select(&'a Select),
     SetOperation(&'a SetOperation),
+    Rrf(&'a RrfFusion),
     WithCte(WithRef<'a>),
     Other(&'a Statement),
 }
@@ -58,6 +59,7 @@ impl<'a> From<&'a QueryExpr> for QueryRef<'a> {
         match query {
             QueryExpr::Select(select) => Self::Select(select),
             QueryExpr::SetOp(set) => Self::SetOperation(set),
+            QueryExpr::Rrf(rrf) => Self::Rrf(rrf),
             QueryExpr::WithCte(with) => Self::WithCte(WithRef {
                 ctes: &with.ctes,
                 recursive: with.recursive,
@@ -109,6 +111,7 @@ impl<'a> From<&'a mut QueryExpr> for QueryRef<'a> {
 pub(crate) enum QueryMut<'a> {
     Select(&'a mut Select),
     SetOperation(&'a mut SetOperation),
+    Rrf(&'a mut RrfFusion),
     WithCte(WithMut<'a>),
     Other(&'a mut Statement),
 }
@@ -148,6 +151,7 @@ impl<'a> From<&'a mut QueryExpr> for QueryMut<'a> {
         match query {
             QueryExpr::Select(select) => Self::Select(select),
             QueryExpr::SetOp(set) => Self::SetOperation(set),
+            QueryExpr::Rrf(rrf) => Self::Rrf(rrf),
             QueryExpr::WithCte(with) => Self::WithCte(WithMut {
                 ctes: &mut with.ctes,
                 recursive: with.recursive,
@@ -190,6 +194,7 @@ impl<'a> QueryRef<'a> {
             match self {
                 Self::Select(select) => return Some(select),
                 Self::SetOperation(set) => self = (&set.left).into(),
+                Self::Rrf(rrf) => self = (&rrf.branches.first()?.query).into(),
                 Self::WithCte(with) => self = with.body.as_ref(),
                 Self::Other(_) => return None,
             }
@@ -199,6 +204,7 @@ impl<'a> QueryRef<'a> {
         match self {
             Self::Select(select) => Some(select.clone().into()),
             Self::SetOperation(set) => Some(set.clone().into()),
+            Self::Rrf(rrf) => Some(QueryExpr::Rrf(Box::new(rrf.clone()))),
             Self::WithCte(with) => Some(QueryExpr::WithCte(Box::new(super::QueryWithCte {
                 ctes: with.ctes.to_vec(),
                 recursive: with.recursive,
@@ -213,6 +219,7 @@ impl QueryMut<'_> {
         match self {
             Self::Select(select) => QueryMut::Select(select),
             Self::SetOperation(set) => QueryMut::SetOperation(set),
+            Self::Rrf(rrf) => QueryMut::Rrf(rrf),
             Self::WithCte(with) => QueryMut::WithCte(WithMut {
                 ctes: with.ctes,
                 recursive: with.recursive,
@@ -229,6 +236,7 @@ impl QueryMut<'_> {
         match self {
             Self::Select(select) => QueryRef::Select(select),
             Self::SetOperation(set) => QueryRef::SetOperation(set),
+            Self::Rrf(rrf) => QueryRef::Rrf(rrf),
             Self::WithCte(with) => QueryRef::WithCte(WithRef {
                 ctes: with.ctes,
                 recursive: with.recursive,
@@ -247,6 +255,7 @@ impl<'a> From<QueryMut<'a>> for QueryRef<'a> {
         match query {
             QueryMut::Select(select) => Self::Select(select),
             QueryMut::SetOperation(set) => Self::SetOperation(set),
+            QueryMut::Rrf(rrf) => Self::Rrf(rrf),
             QueryMut::WithCte(with) => Self::WithCte(WithRef {
                 ctes: with.ctes,
                 recursive: with.recursive,

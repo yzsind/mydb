@@ -598,6 +598,12 @@ fn rewrite_query(
     use crate::parser::QueryExpr;
     match query {
         QueryExpr::Select(select) => rewrite_select(select, next_idx, params, cache_sensitive),
+        QueryExpr::Rrf(rrf) => {
+            *cache_sensitive = true;
+            for branch in &mut rrf.branches {
+                rewrite_query(&mut branch.query, next_idx, params, cache_sensitive);
+            }
+        }
         QueryExpr::SetOp(set) => {
             rewrite_query(&mut set.left, next_idx, params, cache_sensitive);
             rewrite_query(&mut set.right, next_idx, params, cache_sensitive);

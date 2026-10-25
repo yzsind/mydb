@@ -330,6 +330,15 @@ fn query_effects(query: QueryRef<'_>) -> StatementEffects {
                 READ_ONLY
             }
         }
+        QueryRef::Rrf(rrf) => {
+            let mut effects = READ_ONLY;
+            for branch in &rrf.branches {
+                let branch = query_effects((&branch.query).into());
+                effects.writes_data |= branch.writes_data;
+                effects.replica_forbidden |= branch.replica_forbidden;
+            }
+            effects
+        }
         QueryRef::WithCte(with) => {
             let mut effects = query_effects(with.body.as_ref());
             for cte in with.ctes {
@@ -344,6 +353,10 @@ fn query_read_only_transaction_forbidden(query: QueryRef<'_>) -> bool {
     match query {
         QueryRef::Select(select) => select_locks(select).exclusive,
         QueryRef::SetOperation(set) => set_locks(set).exclusive,
+        QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .any(|branch| query_read_only_transaction_forbidden((&branch.query).into())),
         QueryRef::WithCte(with) => {
             query_read_only_transaction_forbidden(with.body.as_ref())
                 || with

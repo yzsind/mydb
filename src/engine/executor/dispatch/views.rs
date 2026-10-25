@@ -29,6 +29,12 @@ pub(in crate::engine::executor) fn expand_views_in_statement<'q>(
         crate::parser::QueryMut::Select(select) => {
             expand_views_in_select(db, session, select, depth, trail)
         }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                expand_views_in_statement(db, session, &mut branch.query, depth, trail)?;
+            }
+            Ok(())
+        }
         crate::parser::QueryMut::SetOperation(set) => {
             expand_views_in_statement(db, session, &mut set.left, depth, trail)?;
             expand_views_in_statement(db, session, &mut set.right, depth, trail)
@@ -297,7 +303,7 @@ fn expand_views_in_select(
     if let Some(derived) = &mut stmt.derived {
         match derived {
             SubQuery::Select(s) => expand_views_in_select(db, session, s, depth, trail)?,
-            inner @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+            inner @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                 expand_views_in_statement(db, session, inner, depth, trail)?
             }
         }
@@ -403,7 +409,7 @@ fn expand_views_in_select(
         if let Some(inner) = &mut join.derived {
             match inner {
                 SubQuery::Select(s) => expand_views_in_select(db, session, s, depth, trail)?,
-                stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+                stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
                     expand_views_in_statement(db, session, stmt, depth, trail)?
                 }
             }
@@ -1403,7 +1409,7 @@ fn derive_view_output_columns(
             SubQuery::Select(inner) => {
                 derive_view_output_columns(db, current_database, inner, &mut input)?
             }
-            SubQuery::SetOp(_) | SubQuery::WithCte(_) => {
+            SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_) => {
                 let mut context = SessionContext::default();
                 context.current_database = current_database.to_string();
                 let mut shape = select.clone();

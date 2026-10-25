@@ -133,7 +133,7 @@ pub(super) fn mark_covering_index_recursive_with_extra(
     extra_columns_expr: Option<&Expr>,
 ) {
     match plan {
-        PhysicalPlan::NullExtend { .. } => {}
+        PhysicalPlan::NullExtend { .. } | PhysicalPlan::RrfFusion { .. } => {}
 
         PhysicalPlan::IndexLookup {
             table,
@@ -910,7 +910,7 @@ impl ColumnPruningRefs {
     /// NullExtend and IndexInLookup retain their existing scope boundaries.
     fn collect_plan(&mut self, plan: &PhysicalPlan, skip_scan_filters: bool) {
         match plan {
-            PhysicalPlan::NullExtend { .. } => {}
+            PhysicalPlan::NullExtend { .. } | PhysicalPlan::RrfFusion { .. } => {}
 
             PhysicalPlan::SetOp {
                 left: _, right: _, ..

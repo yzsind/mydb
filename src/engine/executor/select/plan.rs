@@ -1718,6 +1718,14 @@ pub(super) fn execute_plan_rows_inner(
             crate::error::catalog::ER_UNKNOWN_ERROR,
             "RecursiveUnion must be opened by the recursive CTE operator",
         )),
+        PhysicalPlan::RrfFusion { .. } => {
+            let mut stream = super::hybrid::open_plan(db, txn, plan)?;
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next()? {
+                rows.push(row);
+            }
+            Ok(rows)
+        }
         PhysicalPlan::Materialize { input, .. } => execute_plan_rows(db, txn, input),
         PhysicalPlan::SetOp {
             left,
@@ -2174,6 +2182,7 @@ pub(super) fn execute_plan_rows_inner(
             ef_search,
             ef_hint,
             filter,
+            order_by,
             ..
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
@@ -2223,6 +2232,7 @@ pub(super) fn execute_plan_rows_inner(
                 k,
                 ef,
                 filter,
+                order_by,
             )
         }
         PhysicalPlan::VectorBruteScan {
@@ -3838,6 +3848,7 @@ fn execute_plan_stream_inner(
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
     match plan {
+        PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),
         PhysicalPlan::CteScan { .. } => open_cte_scan_stream(plan),
         PhysicalPlan::ParallelSeqScan {
             table,

@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn fulltext_vector_order_keeps_match_scores_in_every_scalar_context() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE hybrid_match (id INT PRIMARY KEY, body TEXT, v VECTOR(2) NOT NULL, FULLTEXT KEY ft(body))").unwrap();
+    engine.execute("INSERT INTO hybrid_match VALUES (1,'database systems','[0,0]'),(2,'unrelated topic','[1,0]'),(3,'database archive','[2,0]')").unwrap();
+    engine
+        .execute("CREATE INDEX hv ON hybrid_match(v) USING HNSW")
+        .unwrap();
+    for hint in ["", "/*+ HNSW_EF(64) */", "/*+ NO_VECTOR_INDEX */"] {
+        for (predicate, expected) in [
+            ("MATCH(body) AGAINST('database')", vec![1, 3]),
+            ("NOT MATCH(body) AGAINST('database')", vec![2]),
+            ("MATCH(body) AGAINST('database') OR id=2", vec![1, 2, 3]),
+        ] {
+            let sql = format!("SELECT {hint} id, MATCH(body) AGAINST('database') AS score FROM hybrid_match WHERE {predicate} ORDER BY L2_DISTANCE(v,TO_VECTOR('[0,0]')) LIMIT 3");
+            let result = exec_set(&engine, &sql);
+            assert_eq!(
+                result
+                    .rows
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().map(Value::Int).collect::<Vec<_>>(),
+                "{sql}"
+            );
+        }
+        let sql = format!("SELECT {hint} id, MATCH(body) AGAINST('database') AS score FROM hybrid_match ORDER BY L2_DISTANCE(v,TO_VECTOR('[0,0]')) LIMIT 3");
+        let result = exec_set(&engine, &sql);
+        assert_eq!(result.rows.len(), 3, "{sql}");
+        assert_eq!(result.rows[1][1], Value::Double(0.0), "{sql}");
+    }
+}
+
+#[test]
 fn fulltext_repairs_certify_partial_updates_prefixes_and_phrases() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());

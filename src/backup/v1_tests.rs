@@ -46,6 +46,46 @@ fn rows(db: &StorageQueryEngine, sql: &str) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn hybrid_rrf_immutable_backup_preserves_ranked_snapshot() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source.execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,v VECTOR(2) NOT NULL,FULLTEXT KEY ft(body))").unwrap();
+    source
+        .execute(
+            "INSERT INTO docs VALUES(1,'database guide','[1,0]'),(2,'database database','[0,1]')",
+        )
+        .unwrap();
+    source
+        .execute("CREATE INDEX hv ON docs(v) USING HNSW")
+        .unwrap();
+    let sql = "SELECT id,rrf_score,match_count FROM ((SELECT id FROM docs WHERE MATCH(body) AGAINST('database') ORDER BY MATCH(body) AGAINST('database') DESC,id LIMIT 2) RRF (SELECT /*+ HNSW_EF(32) */ id FROM docs ORDER BY L2_DISTANCE(v,TO_VECTOR('[1,0]')),id LIMIT 2)) h ORDER BY id";
+    let expected = rows(&source, sql);
+    let coordinator = Coordinator::get(source.db_handle()).unwrap();
+    let repository = root.path().join("repository");
+    let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+        .base_id
+        .unwrap();
+    source.execute("DELETE FROM docs WHERE id=1").unwrap();
+    source
+        .execute("UPDATE docs SET body='changed',v='[2,2]' WHERE id=2")
+        .unwrap();
+    let runtime = root.path().join("runtime");
+    let reader = super::open_base(&repository, &base, &runtime).unwrap();
+    let backup = StorageQueryEngine::open_backup_image(
+        reader.data_dir.clone(),
+        runtime,
+        Default::default(),
+        Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(rows(&backup, sql), expected);
+    assert!(backup.execute("DELETE FROM docs").is_err());
+    backup.shutdown().unwrap();
+    discard_source(source, coordinator);
+}
+
+#[test]
 fn sealed_fulltext_reads_prepared_xa_visible_rows_and_scores() {
     for change in [
         "UPDATE docs SET body='prepared content' WHERE id=1",

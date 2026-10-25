@@ -2243,6 +2243,25 @@ impl LockClause {
     }
 }
 
+/// A single ranked retrieval input. Its name and position are stable even
+/// when physical scheduling changes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfBranch {
+    pub name: String,
+    pub query: QueryExpr,
+}
+
+/// N-ary reciprocal-rank fusion; parameters belong to this node, not hints.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfFusion {
+    pub branches: Vec<RrfBranch>,
+    pub rank_constant: Expr,
+    pub weights: Vec<Expr>,
+    pub score_details: bool,
+}
+
 /// A query-only syntax node. DML/DDL and protocol statements cannot inhabit
 /// derived tables, CTE definitions or set-operation operands.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2250,6 +2269,7 @@ impl LockClause {
 pub enum QueryExpr {
     Select(Box<Select>),
     SetOp(Box<SetOperation>),
+    Rrf(Box<RrfFusion>),
     WithCte(Box<QueryWithCte>),
 }
 
@@ -2262,6 +2282,7 @@ impl Clone for QueryExpr {
             || match self {
                 Self::Select(select) => Self::Select(select.clone()),
                 Self::SetOp(set) => Self::SetOp(set.clone()),
+                Self::Rrf(rrf) => Self::Rrf(rrf.clone()),
                 Self::WithCte(with) => Self::WithCte(with.clone()),
             },
         )
@@ -2275,6 +2296,7 @@ impl PartialEq for QueryExpr {
             || match (self, other) {
                 (Self::Select(left), Self::Select(right)) => left == right,
                 (Self::SetOp(left), Self::SetOp(right)) => left == right,
+                (Self::Rrf(left), Self::Rrf(right)) => left == right,
                 (Self::WithCte(left), Self::WithCte(right)) => left == right,
                 _ => false,
             },
@@ -2289,6 +2311,7 @@ impl std::fmt::Debug for QueryExpr {
             || match self {
                 Self::Select(select) => f.debug_tuple("Select").field(select).finish(),
                 Self::SetOp(set) => f.debug_tuple("SetOp").field(set).finish(),
+                Self::Rrf(rrf) => f.debug_tuple("Rrf").field(rrf).finish(),
                 Self::WithCte(with) => f.debug_tuple("WithCte").field(with).finish(),
             },
         )
@@ -2325,6 +2348,7 @@ impl QueryExpr {
             match query {
                 Self::Select(select) => return Some(select),
                 Self::SetOp(set) => query = &set.left,
+                Self::Rrf(rrf) => query = &rrf.branches.first()?.query,
                 Self::WithCte(with) => query = &with.body,
             }
         }
@@ -2335,6 +2359,21 @@ impl QueryExpr {
         match self {
             Self::Select(select) => Statement::Select(*select),
             Self::SetOp(set) => Statement::SetOperation(*set),
+            Self::Rrf(rrf) => Statement::Select(Select {
+                projection: vec![SelectItem::Wildcard],
+                table: Some("$rrf".into()),
+                from: vec![TableRef {
+                    name: "$rrf".into(),
+                    alias: None,
+                    system_time: None,
+                    index_hints: Vec::new(),
+                    partitions: Vec::new(),
+                    generate_series: None,
+                    column_aliases: Vec::new(),
+                }],
+                derived: Some(Self::Rrf(rrf)),
+                ..Select::default()
+            }),
             Self::WithCte(with) => Statement::WithCte(WithCte {
                 ctes: with.ctes,
                 recursive: with.recursive,

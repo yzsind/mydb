@@ -1122,6 +1122,10 @@ fn statement_is_deterministic_for_cte_cache<'q>(
     let statement = statement.into();
     match statement {
         crate::parser::QueryRef::Select(select) => !select_has_nondeterministic(select),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .all(|branch| statement_is_deterministic_for_cte_cache(&branch.query)),
         crate::parser::QueryRef::SetOperation(set) => {
             statement_is_deterministic_for_cte_cache(&set.left)
                 && statement_is_deterministic_for_cte_cache(&set.right)
@@ -1866,6 +1870,10 @@ fn materialize_non_recursive(
             // response materializer. Capability fallback, when needed, stays
             // inside the affected BatchOperator after this graph is lowered.
             crate::parser::QueryRef::Select(_) => true,
+            crate::parser::QueryRef::Rrf(rrf) => rrf
+                .branches
+                .iter()
+                .all(|branch| batch_graph_is_planner_visible(&branch.query)),
             crate::parser::QueryRef::SetOperation(set) => {
                 batch_graph_is_planner_visible(&set.left)
                     && batch_graph_is_planner_visible(&set.right)
@@ -1995,6 +2003,11 @@ fn fold_query_block_constants<'q>(statement: impl Into<crate::parser::QueryMut<'
     let statement = statement.into();
     match statement {
         crate::parser::QueryMut::Select(select) => super::select::fold_select_constants(select),
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                fold_query_block_constants(&mut branch.query);
+            }
+        }
         crate::parser::QueryMut::SetOperation(set) => {
             fold_query_block_constants(&mut set.left);
             fold_query_block_constants(&mut set.right);
@@ -2014,6 +2027,11 @@ pub(super) fn pushdown_inline_derived_predicates<'q>(
     match statement {
         crate::parser::QueryMut::Select(select) => {
             crate::planner_decorrelate::derived::pushdown_derived_predicates_with_db(db, select);
+        }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                pushdown_inline_derived_predicates(db, &mut branch.query);
+            }
         }
         crate::parser::QueryMut::SetOperation(set) => {
             pushdown_inline_derived_predicates(db, &mut set.left);
@@ -2117,6 +2135,12 @@ fn materialize_inline_derived_sources<'q>(
                 )?;
                 join.table.name = name;
                 join.table.alias = Some(alias);
+            }
+            Ok(())
+        }
+        crate::parser::QueryMut::Rrf(rrf) => {
+            for branch in &mut rrf.branches {
+                materialize_inline_derived_sources(db, session, &mut branch.query, registry)?;
             }
             Ok(())
         }
@@ -3445,6 +3469,10 @@ pub(crate) fn statement_references_cte<'q>(
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(select) => select_references_cte(select, name),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .any(|branch| statement_references_cte(&branch.query, name)),
         crate::parser::QueryRef::SetOperation(s) => {
             statement_references_cte(&s.left, name) || statement_references_cte(&s.right, name)
         }
@@ -3469,7 +3497,9 @@ pub(crate) fn statement_references_cte<'q>(
 fn subquery_references_cte(sub: &SubQuery, name: &str) -> bool {
     match sub {
         SubQuery::Select(select) => select_references_cte(select, name),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => statement_references_cte(stmt, name),
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
+            statement_references_cte(stmt, name)
+        }
     }
 }
 
@@ -3794,6 +3824,11 @@ fn accumulate_scan_volume_stmt<'q>(
         crate::parser::QueryRef::Select(select) => {
             accumulate_scan_volume_select(db, current_db, select, total)
         }
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                accumulate_scan_volume_stmt(db, current_db, &branch.query, total);
+            }
+        }
         crate::parser::QueryRef::SetOperation(set) => {
             accumulate_scan_volume_stmt(db, current_db, &set.left, total);
             accumulate_scan_volume_stmt(db, current_db, &set.right, total);
@@ -3849,7 +3884,7 @@ fn accumulate_scan_volume_subquery(
 ) {
     match sub {
         SubQuery::Select(select) => accumulate_scan_volume_select(db, current_db, select, total),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             accumulate_scan_volume_stmt(db, current_db, stmt, total)
         }
     }
@@ -4143,6 +4178,11 @@ fn collect_existence_uses_stmt<'q>(
         crate::parser::QueryRef::Select(select) => {
             collect_existence_uses_select(select, cte_name, positive_in, state)
         }
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_existence_uses_stmt(&branch.query, cte_name, positive_in, state);
+            }
+        }
         crate::parser::QueryRef::SetOperation(set) => {
             collect_existence_uses_stmt(&set.left, cte_name, positive_in, state);
             collect_existence_uses_stmt(&set.right, cte_name, positive_in, state);
@@ -4166,7 +4206,7 @@ fn collect_existence_uses_subquery(
         SubQuery::Select(select) => {
             collect_existence_uses_select(select, cte_name, positive_in, state)
         }
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             collect_existence_uses_stmt(stmt, cte_name, positive_in, state)
         }
     }
@@ -5757,6 +5797,11 @@ fn collect_in_subquery_consumer_domains_stmt<'q>(
         crate::parser::QueryRef::Select(select) => {
             collect_in_subquery_consumer_domains_select(select, cte_name, cte_names, out)
         }
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_in_subquery_consumer_domains_stmt(&branch.query, cte_name, cte_names, out);
+            }
+        }
         crate::parser::QueryRef::SetOperation(set) => {
             collect_in_subquery_consumer_domains_stmt(&set.left, cte_name, cte_names, out);
             collect_in_subquery_consumer_domains_stmt(&set.right, cte_name, cte_names, out);
@@ -5817,7 +5862,7 @@ fn collect_in_subquery_consumer_domains_subquery(
         SubQuery::Select(select) => {
             collect_in_subquery_consumer_domains_select(select, cte_name, cte_names, out)
         }
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             collect_in_subquery_consumer_domains_stmt(stmt, cte_name, cte_names, out)
         }
     }
@@ -6623,6 +6668,11 @@ fn collect_pushable_sites_stmt<'q>(
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(s) => collect_pushable_sites_select(s, name, map, sites),
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_pushable_sites_stmt(&branch.query, name, map, sites);
+            }
+        }
         crate::parser::QueryRef::SetOperation(s) => {
             collect_pushable_sites_stmt(&s.left, name, map, sites);
             collect_pushable_sites_stmt(&s.right, name, map, sites);
@@ -6705,7 +6755,7 @@ fn collect_pushable_sites_subquery(
 ) {
     match sub {
         SubQuery::Select(s) => collect_pushable_sites_select(s, name, map, sites),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             collect_pushable_sites_stmt(stmt, name, map, sites)
         }
     }
@@ -6915,6 +6965,11 @@ fn collect_cte_aliases_stmt<'q>(
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(s) => collect_cte_aliases_select(s, name, out),
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_cte_aliases_stmt(&branch.query, name, out);
+            }
+        }
         crate::parser::QueryRef::SetOperation(s) => {
             collect_cte_aliases_stmt(&s.left, name, out);
             collect_cte_aliases_stmt(&s.right, name, out);
@@ -6968,7 +7023,7 @@ fn collect_cte_aliases_select(s: &Select, name: &str, out: &mut Vec<String>) {
 fn collect_cte_aliases_subquery(sub: &SubQuery, name: &str, out: &mut Vec<String>) {
     match sub {
         SubQuery::Select(s) => collect_cte_aliases_select(s, name, out),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             collect_cte_aliases_stmt(stmt, name, out)
         }
     }
@@ -7003,6 +7058,11 @@ fn collect_used_stmt<'q>(
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(s) => collect_used_select(s, aliases, used),
+        crate::parser::QueryRef::Rrf(rrf) => {
+            for branch in &rrf.branches {
+                collect_used_stmt(&branch.query, aliases, used);
+            }
+        }
         crate::parser::QueryRef::SetOperation(s) => {
             collect_used_stmt(&s.left, aliases, used);
             collect_used_stmt(&s.right, aliases, used);
@@ -7073,7 +7133,7 @@ fn table_ref_matches_any_alias(t: &TableRef, aliases: &[String]) -> bool {
 fn collect_used_subquery(sub: &SubQuery, aliases: &[String], used: &mut UsedCols) {
     match sub {
         SubQuery::Select(s) => collect_used_select(s, aliases, used),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             collect_used_stmt(stmt, aliases, used)
         }
     }
@@ -7177,6 +7237,11 @@ fn count_in_subquery_from_refs_stmt<'q>(
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(select) => count_in_subquery_from_refs_select(select, name),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .map(|branch| count_in_subquery_from_refs_stmt(&branch.query, name))
+            .sum(),
         crate::parser::QueryRef::SetOperation(set) => {
             count_in_subquery_from_refs_stmt(&set.left, name)
                 + count_in_subquery_from_refs_stmt(&set.right, name)
@@ -7222,7 +7287,7 @@ fn count_in_subquery_from_refs_select(select: &Select, name: &str) -> usize {
 fn count_in_subquery_from_refs_subquery(sub: &SubQuery, name: &str) -> usize {
     match sub {
         SubQuery::Select(select) => count_in_subquery_from_refs_select(select, name),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             count_in_subquery_from_refs_stmt(stmt, name)
         }
     }
@@ -7362,6 +7427,11 @@ fn inline_cte_into_in_subqueries_stmt<'q>(
         crate::parser::QueryMut::Select(select) => {
             inline_cte_into_in_subqueries_select(select, name, cte_body)
         }
+        crate::parser::QueryMut::Rrf(rrf) => rrf
+            .branches
+            .iter_mut()
+            .map(|branch| inline_cte_into_in_subqueries_stmt(&mut branch.query, name, cte_body))
+            .sum(),
         crate::parser::QueryMut::SetOperation(set) => {
             inline_cte_into_in_subqueries_stmt(&mut set.left, name, cte_body)
                 + inline_cte_into_in_subqueries_stmt(&mut set.right, name, cte_body)
@@ -7417,7 +7487,7 @@ fn inline_cte_into_in_subqueries_subquery(
 ) -> usize {
     match sub {
         SubQuery::Select(select) => inline_cte_into_in_subqueries_select(select, name, cte_body),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => {
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
             inline_cte_into_in_subqueries_stmt(stmt, name, cte_body)
         }
     }
@@ -7661,6 +7731,11 @@ fn count_statement_refs<'q>(stmt: impl Into<crate::parser::QueryRef<'q>>, name: 
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(select) => count_select_refs(select, name),
+        crate::parser::QueryRef::Rrf(rrf) => rrf
+            .branches
+            .iter()
+            .map(|branch| count_statement_refs(&branch.query, name))
+            .sum(),
         crate::parser::QueryRef::SetOperation(s) => {
             count_statement_refs(&s.left, name) + count_statement_refs(&s.right, name)
         }
@@ -7690,7 +7765,9 @@ fn count_statement_refs<'q>(stmt: impl Into<crate::parser::QueryRef<'q>>, name: 
 fn count_subquery_refs(sub: &SubQuery, name: &str) -> usize {
     match sub {
         SubQuery::Select(select) => count_select_refs(select, name),
-        stmt @ (SubQuery::SetOp(_) | SubQuery::WithCte(_)) => count_statement_refs(stmt, name),
+        stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
+            count_statement_refs(stmt, name)
+        }
     }
 }
 
