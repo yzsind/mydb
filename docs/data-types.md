@@ -19,7 +19,7 @@ compatibility behavior may continue to change.
 | Domain types | `ENUM`, `SET`, `BIT` | single-choice values, multi-choice sets, and fixed bit fields |
 | Semi-structured | `JSON` | binary JSON documents, path queries, and multi-valued indexes |
 | Spatial | `GEOMETRY` plus seven concrete subtypes | SRID/WKB geometries, spatial functions, and spatial indexes |
-| Vector | `VECTOR[(n)]` | dense `f32` vectors, exact KNN, and ANN retrieval |
+| Vector | `VECTOR(n[, datatype])`, bare `VECTOR` | native numeric/BINARY vectors, exact KNN, and HNSW/IVF retrieval |
 
 `NULL` is not a standalone column type. Every type can store SQL `NULL` except for columns
 declared `NOT NULL`; SQL `NULL` and the `null` inside a JSON document are two distinct values.
@@ -301,17 +301,27 @@ still return explicit unsupported errors.
 
 ## 10. `VECTOR`
 
-`VECTOR(n)` is a mydb extension and is not part of MySQL 8.0.46 Community Server. Each element
-is a finite 32-bit IEEE-754 float, the dimension range is `1..=16383`, and `NaN` or infinities
-are rejected. A fixed-dimension declaration forces every written value to have exactly `n`
-elements; a bare `VECTOR` accepts any in-range dimension but cannot gain the full benefits of
-fixed-dimension indexing and storage planning.
+`VECTOR(n, datatype)` is a mydb extension and is not part of MySQL 8.0.46
+Community Server. Omitting the datatype selects FLOAT32; bare `VECTOR` accepts
+variable-dimension FLOAT32 values. A fixed-dimension declaration requires every
+written value to have exactly `n` elements, or `n` bits for BINARY.
 
-The value dimension limit is separate from the inline row-size limit.
-Fixed-dimension columns store all `4 × n` element bytes inline; the full encoded
-row, including other columns and metadata, must fit the heap row budget.
-Oversized declarations fail with `ER_TOO_BIG_ROWSIZE`; even `VECTOR(4096)`
-exceeds that budget. A dimensionless `VECTOR` can externalize large values.
+| Datatype | Maximum dimensions | Native payload bytes |
+| --- | ---: | ---: |
+| FLOAT32 | 16383 | `4*n` |
+| FLOAT16 | 32766 | `2*n` |
+| BFLOAT16 | 32766 | `2*n` |
+| INT8 | 65532 | `n` |
+| BINARY | 524256 bits | `ceil(n/8)` |
+
+The native payload budget is 65532 bytes. Large values use heap overflow
+storage; fixed-dimension FLOAT32 payloads larger than 8192 bytes also use this
+path. The full encoded row still has to satisfy the ordinary row-size limit.
+Floating values must remain finite after conversion; FLOAT16 and BFLOAT16
+round to nearest, ties to even. INT8 requires integers in `[-128,127]` without
+implicit scaling or clamping. BINARY text contains zeroes and ones, and unused
+high bits of its final byte must be zero. See [vector datatypes and indexes](vector-indexes.md)
+for conversion, raw binary I/O, and paged-index admission limits.
 
 ```sql
 CREATE TABLE documents (
@@ -332,9 +342,12 @@ See [`function/vector/README.md`](function/vector/README.md) for the function li
 Retrieval options include:
 
 - exact brute-force KNN such as `ORDER BY L2_DISTANCE(embedding, query) LIMIT k`;
-- `USING HNSW` indexes on single-column, non-unique, `NOT NULL` vectors;
-- `IVF` indexes with the corresponding `nlist`/`nprobe` configuration;
-- metrics such as `COSINE`, `L2`, and `DOT`, plus the `NO_VECTOR_INDEX` hint.
+- `USING HNSW` indexes on one fixed-dimension, non-unique, `NOT NULL` vector column;
+- `USING IVF` indexes with `WITH (nlist=..., nprobe=...)` on the same column shape;
+- numeric `COSINE`, `L2`, and `DOT`, or BINARY `HAMMING` and `JACCARD` metrics;
+- explicit numeric index quantization via `WITH (quantization=sq8|sq4|pq|bq)`;
+  the default is `none`, and BINARY rejects quantization;
+- the `NO_VECTOR_INDEX` hint for exact distance scans.
 
 Both vectors of a single distance computation must have the same dimension. Vectors have no
 natural total order suitable for business sorting; queries should order by the distance

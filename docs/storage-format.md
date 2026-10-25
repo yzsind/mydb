@@ -166,7 +166,12 @@ For the fixed widths of all SQL types plus the DECIMAL, temporal, JSONB, WKB, an
 
 ## 7. LOB overflow
 
-A variable-length string/bytes/JSON/GEOMETRY value, or a VECTOR without a declared dimension, that exceeds the inline threshold or makes the whole row unfit for a page can be moved into the table-level `.lob`. The heap's var payload then stores a 20 B descriptor instead:
+A variable-length string/bytes/JSON/GEOMETRY value, or a VECTOR assigned to a
+variable-length lane, that exceeds the inline threshold or makes the whole row
+unfit for a page can be moved into the table-level `.lob`. VECTOR uses such a
+lane when its dimension is undeclared or its declared native payload exceeds
+8192 B for FLOAT32 / 4096 B for other datatypes. The heap's var payload then
+stores a 20 B descriptor instead:
 
 ```text
 first_page_id u32 LE
@@ -263,20 +268,32 @@ physical page redo, and are managed by the buffer pool.
 
 ### 10.1 Paged HNSW
 
-The page 0 meta stores the dimension, distance metric, `m/m0/ef_construction`, entry vid, top layer, page allocation
-high-water mark, node/tombstone counts, finalized/built LSN, and SQ8 quantization parameters. Node pages use
-the slotted layout `slot_count:u16 + heap_top:u16 + u16 record_offsets[]`.
+The page 0 meta stores typed geometry, distance metric, `m/m0/ef_construction`,
+entry vid, top layer, page allocation high-water mark, node/tombstone counts,
+and finalized/built LSN. Quantized indexes also publish their model reference
+and generation. Node pages use the slotted layout
+`slot_count:u16 + heap_top:u16 + u16 record_offsets[]`.
 
-A node record stores flags, top layer, RowId, the exact `dim*f32`, an SQ8 navigation row, a norm,
-and, per layer, `count:u16 + fixed-capacity NodeId[]`. Adjacency space is reserved at node creation with the maximum capacity for that layer,
-so edge updates can modify it in place. A persistent NodeId uses the high 24 bits for the page number and the low 8 bits for the slot; the runtime vid
-is `(page_id << 32) | slot`.
+A node record stores flags, top layer, RowId, the configured vector payload,
+and, per layer, `count:u16 + fixed-capacity NodeId[]`. Unquantized FLOAT32
+retains its FLOAT32 record layout; other unquantized datatypes retain native
+bytes. Explicit quantization uses the compressed layout below. SQL indexes
+with `quantization=none` do not use implicit SQ8 navigation. Adjacency space
+is reserved at node creation with the maximum capacity for that layer, so
+edge updates can modify it in place. A persistent NodeId uses the high 24 bits
+for the page number and the low 8 bits for the slot; the runtime vid is
+`(page_id << 32) | slot`.
+
+Each complete node must fit one 16 KiB page, including its maximum-layer
+adjacency capacity. DDL validates payload and adjacency admission even for
+empty tables; a datatype's heap dimension limit is not its paged-index limit.
 
 ### 10.2 Native IVF
 
 Native IVF uses the shared vector page container with typed geometry and no
 adjacency lists. Each record retains the RowId, deletion flag and native
-payload. Lists maintain separate fill-page hints to group their entries.
+payload when `quantization=none`. Each complete entry must fit one 16 KiB page.
+Lists maintain separate fill-page hints to group their entries.
 Coarse centers and list membership are reconstructed from committed heap
 values on cold open. WITH quantization replaces native payloads with compressed
 codes using the shared layout described below.

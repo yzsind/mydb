@@ -1,6 +1,7 @@
 # Vector Functions
 
-For HNSW query behavior, storage limits and recovery, see [Vector indexes](../../vector-indexes.md).
+For HNSW/IVF query behavior, native datatypes, WITH options, quantization,
+training, storage limits, and recovery, see [Vector indexes](../../vector-indexes.md).
 
 | Function | Description |
 | --- | --- |

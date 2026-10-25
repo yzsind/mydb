@@ -313,8 +313,13 @@ usually still require a Sort.
 - Zone Maps, spatial indexes, full-text pre-filtering, and runtime Bloom
   filters are candidate filters, not final semantic decisions.
 - HNSW/IVF are approximate candidate generators; the executor reads
-  currently visible rows and recomputes distances, but a stale index or an
-  insufficient candidate budget can still lower recall.
+  currently visible native heap values and recomputes distances. Explicit
+  SQ8/SQ4/PQ/BQ payloads affect candidate scores, while `quantization=none`
+  retains native scores. Search breadth and candidate retention can still
+  limit recall after exact re-ranking. Unusable coverage and pending PQ
+  training fall back to exact scanning; JOIN, aggregation, DISTINCT, and
+  window queries retain their complete relational input. See
+  [vector query tuning and diagnostics](vector-indexes.md).
 - Temporal `FOR SYSTEM_TIME AS OF` uses a historical snapshot; when historical
   indexes are degraded it falls back to heap/undo, and it must never return
   the current version in place of a historical one.

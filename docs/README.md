@@ -1,6 +1,6 @@
 # mydb Documentation Index
 
-Last updated: 2026-10-24. This directory contains public product, SQL, deployment,
+Last updated: 2026-10-25. This directory contains public product, SQL, deployment,
 execution, and storage documentation.
 
 ## Product and SQL
@@ -13,6 +13,7 @@ execution, and storage documentation.
 | [Performance Comparison](performance-comparison.md) | MyDB vs. MySQL measurements, test conditions, and interpretation |
 | [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Compatibility matrix, supported boundaries, and explicit differences |
 | [Data Types](data-types.md) | Declaration, ranges, conversion, comparison, and indexing semantics |
+| [Vector Datatypes and Indexes](vector-indexes.md) | Native vector types, HNSW/IVF, WITH options, quantization, query tuning, training, and recovery |
 | [Operators and Expressions](operators-and-expressions.md) | Precedence, NULL handling, and evaluation semantics |
 | [SQL Syntax Capabilities](sql-parser-capabilities.md) | Supported syntax and explicit rejections |
 | [Time Travel Queries](mysql80-compatibility.md#time-travel-queries) | Historical query semantics and support boundaries |

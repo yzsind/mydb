@@ -876,6 +876,7 @@ synchronization state, filtered by SELECT/UPDATE privileges on each sequence.
 - **HNSW**: `CREATE INDEX … USING HNSW`, with `WITH (metric=..., m=..., ef_construction=..., ef_search=..., quantization=...)`; compressed candidates are re-ranked using visible native heap values.
 - **IVF**: `CREATE INDEX … USING IVF`, with `WITH (metric=..., nlist=..., nprobe=..., kmeans_iters=..., train_sample=..., quantization=...)`; queries probe by centroid and inverted list, and `OPTIMIZE TABLE` can retrain.
 - **Quantization**: `none` (default), SQ8, SQ4, PQ, and scaled centered BQ for numeric L2/COSINE/DOT. BINARY indexes reject quantization. COMMENT is descriptive text and former parameter syntax is rejected.
+- **Training and diagnostics**: PQ requires at least `2^pq_bits` training rows; pending models execute exact scans. `EXPLAIN` reports quantization and the effective re-ranking pool; `information_schema.mydb_vector_indexes` reports configuration, training state, model/code bytes, exceptions, and query counters. See [vector datatypes and indexes](vector-indexes.md).
 - **Queries**: `ORDER BY DISTANCE(...) LIMIT k` goes through the unified `VectorIndexScan`; no index, small tables, or `NO_VECTOR_INDEX` take the exact `VectorBruteScan` (partitioned tables included).
 - **Parameterized KNN**: prepared / auto-param; the plan cache keys the query-vector expression instead of hard-coding the first vector.
 - **Transactions and boundaries**: transaction deltas provide read-your-writes; shared vector index changes follow commit, rollback, savepoint, and XA boundaries. Invalid vector values report 50001 and dimension mismatches report 50002; cosine indexes reject zero vectors. LIMIT/OFFSET and visibility rules apply to both exact and approximate paths, but ANN candidate selection does not guarantee the same nearest-neighbor rows or recall as a brute-force scan.
@@ -981,7 +982,7 @@ system/commit-ledger.v1        source of truth for AS OF commit-timeline correct
 system/history-index.v1        degradable sidecar that accelerates historical old keys
 ddl/                           DDL intent log (crash safe)
 objects/tables/<storage_id>/<generation>.{heap,lob,zm}
-objects/indexes/<storage_id>/<generation>/<index_id>.{idx,hnsw,hvec,ivf}
+objects/indexes/<storage_id>/<generation>/<index_id>.{idx,hnsw,hvec}
 mysql.sequences / mysql.sequence_values   sequence definitions and recovery state in catalog heaps
 ```
 

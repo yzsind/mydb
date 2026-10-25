@@ -77,14 +77,15 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 | JSON MVI | Multi-valued keys via `CAST(json_expr AS ... ARRAY)`; one MVI part can combine with a regular part to form a composite key |
 | FULLTEXT | Natural-language BM25, boolean mode, ngram parser; MATCH and safe LIKE ngram pre-filtering; [immutable backup queries](backup-and-recovery.md#51-fulltext-queries) |
 | SPATIAL | Persistent MBR B-tree plus a governor-managed derived R-tree, with a final heap lookup to recheck exact predicates |
-| HNSW | Graph-based ANN, L2/COSINE/DOT, SQ8 navigation + f32 rerank, in-memory and paged backends |
-| IVF | native numeric/binary inverted-file ANN, nlist/nprobe, retraining, and memory/paged backends |
+| HNSW | Graph-based ANN over native numeric/BINARY vectors; explicit none/SQ8/SQ4/PQ/BQ payloads, visible heap re-ranking, memory/paged backends |
+| IVF | Inverted-file ANN over native numeric/BINARY vectors; nlist/nprobe, explicit none/SQ8/SQ4/PQ/BQ payloads, retraining, memory/paged backends |
 
 ### 3.3 JSON, GIS, and Vector
 
 - JSON uses an internal binary JSONB, providing JSON paths, modification/query functions, JSON_VALUE, JSON_TABLE, schema validation, aggregation, and row-binlog binary JSON.
 - GIS uses `SRID + WKB`, supporting Geometry subtypes, column-level SRIDs, construction/access/measurement/MBR and exact predicates, GeoJSON/Geohash, spatial indexes, and `ST_COLLECT`. Some geographic computations, projection transforms, and polygon set operations still fail with explicit errors, so this is not complete GIS compatibility.
-- Vector supports exact brute-force KNN plus HNSW/IVF ANN. The planner recognizes `ORDER BY distance LIMIT k` and supports prepared parameters, partitioning, transaction deltas, rerank, and the `NO_VECTOR_INDEX` differential oracle.
+- `VECTOR(n, datatype)` supports FLOAT32, FLOAT16, BFLOAT16, INT8, and BINARY. Numeric vectors support L2/COSINE/DOT; BINARY supports HAMMING/JACCARD with `quantization=none`. Numeric index quantization is explicit and defaults to `none`; PQ indexes without enough training rows execute exact scans. See [vector datatypes and indexes](vector-indexes.md).
+- Vector supports exact brute-force KNN plus HNSW/IVF ANN. The planner recognizes `ORDER BY distance LIMIT k` and supports prepared parameters, partitioning, transaction deltas, visible native heap re-ranking, and the `NO_VECTOR_INDEX` differential oracle. `EXPLAIN` reports quantization and the effective re-ranking pool; `information_schema.mydb_vector_indexes` exposes configuration, training state, and runtime counters.
 
 ## 4. Query Optimization and Execution
 

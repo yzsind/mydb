@@ -546,22 +546,25 @@ ORDER BY DISTANCE(embedding, '[0.1,0.2,0.3]')
 LIMIT 10;
 ```
 
-Valid values are positive integers. `0` means no override. The final
-effective candidate pool is at least
+Valid values are positive integers. `0` means no override. The initial
+effective search breadth is
 `max(base ef, mydb_hnsw_ef_dynamic_factor × k, k)`.
 
 The precedence of the base value is:
 
 1. `HNSW_EF(n)`;
-2. the session `mydb_hnsw_ef_search` when explicitly set away from the
-   built-in default;
+2. the session `mydb_hnsw_ef_search` when explicitly SET (even to 64), or
+   configured away from the built-in default;
 3. `ef_search` in the index WITH options;
 4. the built-in default of 64.
 
 An explicit `HNSW_EF(n)` also skips the "small table / low filtered row
 count automatically switches to brute force" threshold, for cases that
 explicitly ask for the HNSW path; hard preconditions such as a missing
-index or a metric mismatch still cause fallback.
+index, a metric mismatch, or a pending PQ model still cause fallback. This
+hint changes search breadth; it does not change quantization or the index's
+`rerank_mult`. The re-ranking pool is also subject to session candidate and
+memory budgets. See [vector query tuning](vector-indexes.md#query-tuning).
 
 ### 8.2 `NO_VECTOR_INDEX`
 
@@ -597,11 +600,16 @@ Valid values are positive integers, clamped at execution time to
 recall and higher scan cost. The precedence is:
 
 1. `IVF_NPROBE(n)`;
-2. the session `mydb_ivf_nprobe` when explicitly set;
+2. the session `mydb_ivf_nprobe` when explicitly SET (even to 8), or
+   configured away from the built-in default;
 3. `nprobe` in the index WITH options;
 4. the built-in default of 8.
 
 This hint affects IVF only; HNSW remains controlled by `HNSW_EF`.
+Full probing of unquantized IVF scores all lists using native values.
+Quantized IVF retains approximate candidate scores, so probing every list
+with a finite re-ranking pool does not guarantee the global exact TopK.
+Use `NO_VECTOR_INDEX` for an exact comparison.
 
 ## 9. Diagnostics and Verification
 

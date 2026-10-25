@@ -383,10 +383,11 @@ construction graph is admitted; only compressed payloads survive publication. Th
   the build lease.
 - Finalized file-backed HNSW indexes whose `.hvec` image fits the configured
   memory target open a read-only mapping of their existing pages by default.
-  This path reads SQ8 codes, adjacency and exact rerank vectors from the
-  authoritative file; no separate navigation file or full-index startup scan
-  is needed. Larger images retain the compact navigator to avoid increasing
-  random I/O. Checksums are checked lazily on first page access.
+  This path reads stored payloads and adjacency from the authoritative file;
+  payload encoding follows the index's explicit `quantization` setting.
+  Final re-ranking uses MVCC-visible heap values. No separate navigation file
+  is needed. When mapping is unavailable, queries use an admitted cache or
+  live buffer-pool pages. Checksums are checked lazily on first page access.
   The small validation bitmap and bounded query memo are charged to the memory
   governor; clean mapped pages remain reclaimable by the OS. This does not pin
   the entire index in RAM or guarantee a warm filesystem cache after restart.
@@ -396,14 +397,19 @@ construction graph is admitted; only compressed payloads survive publication. Th
   required for visibility. A reopen or explicit navigation preparation can map
   a flushed, finalized image again. Physical replication receivers disable
   direct mapping because their redo writer bypasses local index DML. Runtime
-  statistics report `backend=paged_mapped` while the mapping is active, and
-  `backend=paged` after revocation. The existing reverse RowId lookup is still
-  initialized on first DML after reopen; this change does not persist that lookup.
-- `MYDB_HNSW_MAPPED_NAVIGATION=0` selects the previous compact-cache path for
-  differential diagnostics. Memory-only durability also uses that path.
-- `MYDB_HNSW_QUERY_CACHE_MB` controls the optional compact SQ8/CSR cache, not the
-  direct file mapping. Its default is 25% of the memory target, capped at 1 GiB;
-  `0` disables the compact cache. Admission failure uses live persistent pages.
+  statistics for unquantized FLOAT32 HNSW report `backend=paged_mapped` while
+  mapping is active, and `backend=paged` after revocation. Native and quantized
+  HNSW report `paged_native` or `memory_native`; IVF reports `ivf_paged_native`
+  or `ivf_native`. These native backend names do not distinguish mapping from
+  page access. The FLOAT32 reverse RowId lookup is initialized on first DML
+  after reopen rather than persisted separately.
+- `MYDB_HNSW_MAPPED_NAVIGATION=0` disables direct mapping for differential
+  diagnostics. Memory-only durability also bypasses mapping.
+- `MYDB_HNSW_QUERY_CACHE_MB` controls optional HNSW navigation caches, not the
+  direct file mapping. The native CSR cache defaults to 25% of the memory
+  target; the FLOAT32 compact-cache path additionally caps its default at 1 GiB.
+  `0` disables the cache. Admission failure uses live persistent pages.
+  `quantization=none` does not enable implicit SQ8 navigation.
 - `MYDB_HNSW_PRELOAD=eager|lazy` controls startup opening, default `lazy`.
   `eager` opens Public vector indexes and prepares the admitted query paths
   before accepting connections; it does not fault every mapped page into RAM.
@@ -418,24 +424,34 @@ construction graph is admitted; only compressed payloads survive publication. Th
   per-phase durations, peak scratch reservation, cache hits/misses, and the chunk
   count.
 
-HNSW maintenance runs on the `mydb-vector-maintenance` background worker
-(once per second), never on the commit or checkpoint path:
+HNSW/IVF reclamation and requested rebuilds run on the
+`mydb-vector-maintenance` background worker (once per second). Commit-time
+incremental maintenance still keeps the candidate structures current:
 
 - DELETE and re-linking UPDATE keep the superseded graph versions searchable
   until no snapshot that can still see them remains, then retire exactly those
-  versions. Small vector moves are still updated in place.
+  versions. Unquantized FLOAT32 HNSW can update small vector moves in place;
+  native and quantized indexes use deletion and reinsertion. Queries whose
+  snapshot predates an accelerator's coverage use exact scanning.
 - Tombstones are reclaimed once they reach `MYDB_HNSW_COMPACT_RATIO` (default
   0.2) of a graph or `MYDB_HNSW_COMPACT_ABSOLUTE` (default 100000) nodes;
   `MYDB_HNSW_COMPACT_DISABLE=1` turns reclamation off. The memory backend
-  rebuilds the graph with the parallel cold-build path and replays DML that
-  arrives meanwhile; the paged backend detaches tombstones from the graph in
-  place (WAL-logged), while `OPTIMIZE TABLE` reclaims `.hvec` file space.
+  rebuilds the unquantized FLOAT32 graph with the parallel cold-build path and
+  replays DML that arrives meanwhile; the corresponding paged backend detaches
+  tombstones in place (WAL-logged). Native and quantized HNSW/IVF rebuild from
+  committed heap values. `OPTIMIZE TABLE` explicitly reconstructs vector indexes
+  and reclaims `.hvec` file space.
 - A KNN whose residual filter leaves fewer than `k` rows after the
   `mydb_hnsw_max_scan_tuples` candidate budget finishes with an exact scan
   instead of returning a short result; `mydb_hnsw_iterative_scan = off` keeps
   the single approximate pass.
 - An index that cannot be built within the memory budget falls back to an
   exact scan with a warning, and the build is retried no more than every 10 s.
+
+Quantized indexes can request a rebuild when scalar exceptions or PQ/BQ update
+growth become significant. PQ remains `PENDING_TRAINING` and queries use exact
+scans until at least `2^pq_bits` committed rows are available for training.
+See [quantization](vector-indexes.md#quantization) for model and payload behavior.
 
 Stable startup options for Hash Join include:
 
@@ -654,9 +670,11 @@ Vector retrieval separates persisted index configuration from query-time setting
 
 - `MYDB_VECTOR_STORAGE=memory|paged` selects the HNSW/IVF backend, default
   `paged`;
-- `MYDB_HNSW_*` controls graph building, `ef_search`, iterative scanning,
-  candidate caps, and the brute-force scan threshold;
-- `MYDB_IVF_*` controls `nlist`, `nprobe`, k-means training, sampling, and candidate retention;
+- `MYDB_HNSW_*` controls graph building and initial session query settings;
+  runtime query controls use `mydb_hnsw_*` session variables;
+- `MYDB_IVF_NLIST`, `MYDB_IVF_KMEANS_ITERS`, and `MYDB_IVF_TRAIN_SAMPLE`
+  supply IVF build defaults. `MYDB_IVF_NPROBE`, `MYDB_IVF_ITERATIVE_SCAN`, and
+  `MYDB_IVF_MAX_SCAN_TUPLES` initialize the corresponding session variables;
 - `USING HNSW|IVF WITH (...)` stores validated index configuration independently
   from COMMENT. Build defaults are captured when the index is created.
   `quantization=none` is the default; `sq8`, `sq4`, `pq`, and `bq` are explicit
@@ -665,6 +683,8 @@ Vector retrieval separates persisted index configuration from query-time setting
 - Query hints `HNSW_EF` / `IVF_NPROBE` override explicitly set session values,
   which override index defaults. Explicit `mydb_hnsw_rerank_mult` /
   `mydb_ivf_rerank_mult` session values override the index `rerank_mult`.
+  An explicit SET to the built-in default also takes precedence. See
+  [query tuning](vector-indexes.md#query-tuning) for defaults and examples.
 
 Zone Map is an optional skip-scan structure enabled by default for persistent
 user tables; temporary and system tables do not enable it. Table creation or

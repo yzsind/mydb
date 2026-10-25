@@ -38,7 +38,7 @@ Limits fall into three classes:
 | SELECT nesting depth | **63** | Fixed |
 | Set-operation branches | **128 in debug / 1,024 in optimized builds** with the default 8 MiB worker stack; stack-derived, clamped to 128–1,024 | Derived |
 | DECIMAL precision / scale | **65 / 30** | Fixed |
-| VECTOR value dimensions | **16,383**; fixed-dimension columns also have a smaller row-layout limit | Fixed |
+| VECTOR value dimensions | FLOAT32: **16,383**; FLOAT16/BFLOAT16: **32,766**; INT8: **65,532**; BINARY: **524,256 bits**; separate heap/index layout limits apply | Fixed |
 | JSON document depth | **100** | Fixed |
 | View nesting depth | **32** | Fixed |
 
@@ -424,23 +424,31 @@ Implementation references: [parser depth guards](../src/parser/budget.rs),
 
 | Item | Value |
 | --- | --- |
-| VECTOR dimension range | 1 – **16,383** (≈ 64 KiB, 4 bytes/element) |
-| HNSW M | default 16, clamped 2 – 65,535 |
-| HNSW ef_construction | default 200, clamped 1 – 65,535 |
-| HNSW ef_search (`mydb_hnsw_ef_search`) | default 64 |
+| VECTOR dimension range | FLOAT32: 1 – 16,383; FLOAT16/BFLOAT16: 1 – 32,766; INT8: 1 – 65,532; BINARY: 1 – 524,256 bits |
+| Native VECTOR payload | at most 65,532 bytes; large heap values use overflow storage |
+| HNSW WITH m | default 16; accepts 2 – 1,024, subject to paged-node capacity |
+| HNSW WITH ef_construction | default 200; accepts m – 65,535 |
+| HNSW WITH ef_search | optional index default, accepts 1 – 1,000,000; session default `mydb_hnsw_ef_search` is 64 |
 | HNSW maximum layer index | 16 (layers 0 through 16, up to 17 layers) |
-| HNSW node id width | u32 (≈ 4.29 × 10^9 vectors); vector id u64 |
-| IVF nlist | 0 = auto (√N), clamped 1 – N (row count) |
-| IVF nprobe | default 8, clamped 1 – nlist |
-| IVF training sample | `min(N, 256 × nlist)` rows |
-| KNN k | no explicit cap (k = LIMIT + offset); navigator cache serves k ≤ 128 |
+| IVF WITH nlist | default 0 = auto (√N); accepts 0 – 1,048,576, build count clamped to 1 – N |
+| IVF WITH nprobe | optional index default, accepts 1 – 1,048,576; session default 8, execution clamps to 1 – nlist |
+| IVF WITH kmeans_iters | default 15; accepts 1 – 1,000 |
+| IVF WITH train_sample | default 256; accepts 1 – 65,536; coarse training samples at most `min(N, train_sample × nlist)` rows |
+| Index quantization | none (default), sq8, sq4, pq, bq; numeric types only |
+| WITH rerank_mult | default 4; accepts 1 – 1,024 |
+| PQ subspaces (`pq_m`) | default `ceil(dimension/8)`; accepts 1 – dimension |
+| PQ code bits (`pq_bits`) | 4 or 8; default 8 |
+| PQ training (`pq_train_samples`, `pq_iterations`) | defaults 65,536 / 25; accepts `2^pq_bits` – 1,048,576 samples / 1 – 1,000 iterations |
+| Paged vector record | complete HNSW node or IVF entry must fit one 16 KiB page; HNSW adjacency capacity also depends on m |
+| KNN k | no separate fixed cap (`k = LIMIT + offset`); search and memory budgets apply |
 
-Vector elements must be finite (NaN and ±Inf are rejected).
-The 16,383-dimension value limit does not mean every `VECTOR(n)` declaration
-fits: fixed-dimension columns always store `4 × n` bytes inline. DDL computes
-a smaller maximum dimension from the full encoded row layout and rejects
-oversized layouts with `ER_TOO_BIG_ROWSIZE` (for example, `VECTOR(4096)` already
-exceeds the entire inline row budget). Dimensionless `VECTOR` can externalize.
+Floating vector values must remain finite after conversion (NaN and ±Inf are
+rejected); INT8 and BINARY have their own strict value rules. Heap overflow
+allows large fixed-dimension values, while paged indexes have separate record
+capacity checks, including on empty tables. Invalid WITH options are rejected
+rather than silently clamped. See [vector datatypes and indexes](vector-indexes.md)
+for the complete option table, datatype/metric combinations, and PQ training
+fallback behavior.
 
 ### JSON
 

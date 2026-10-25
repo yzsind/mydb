@@ -37,8 +37,9 @@ CREATE INDEX signature_ivf ON embeddings(signature)
 
 HNSW and IVF require one fixed-dimension, non-null, non-unique vector column.
 Numeric indexes default to L2; BINARY indexes default to HAMMING. Unsupported
-metric/type combinations raise an error. `IVF` with `quantization=none` stores and scores native payloads. Hamming IVF uses binary majority centers; Jaccard IVF uses sampled
-medoids scored with Jaccard distance.
+metric/type combinations raise an error. `IVF` with `quantization=none` stores
+and scores native payloads. Hamming IVF uses binary majority centers; Jaccard
+IVF uses sampled medoids scored with Jaccard distance.
 
 ## Distances and queries
 
@@ -62,9 +63,9 @@ that become zero after narrowing. Hamming counts differing bits. Jaccard is
 `1 - popcount(a AND b)/popcount(a OR b)`; two all-zero bit vectors have
 Jaccard distance zero.
 
-Unquantized native HNSW shares navigation for identical coordinates while retaining each
-row's native payload and visibility. Deleting one member preserves the other
-members.
+Unquantized native HNSW shares navigation for identical coordinates while
+retaining each row's native payload and visibility. Deleting one member
+preserves the other members.
 
 ANN indexes generate candidates. The executor checks heap MVCC visibility,
 applies residual filters and re-ranks using visible native values. Increasing
@@ -79,21 +80,71 @@ input. Old snapshots, unusable indexes and selective filters may require an
 exact scan. Prepared executions rebind their query vector and validate its
 dimension at execution.
 
+## Query tuning
+
+The query's metric and dimension must match the index. The optimizer may
+choose exact scanning for small tables or selective predicates. Use
+`EXPLAIN` to check the actual path and `NO_VECTOR_INDEX` to compare with
+exact results.
+
+Search effort resolves in this order: query hint (`HNSW_EF` or `IVF_NPROBE`),
+explicit session setting, index `ef_search` or `nprobe`, then the session
+default. A session initialized away from the built-in default also takes
+precedence over the index default. Explicit SET takes precedence even when
+the value equals the built-in default. Re-ranking uses an explicitly set
+session multiplier, otherwise the index `rerank_mult` captured at creation.
+
+| Session variable | Default | Effect |
+| --- | --- | --- |
+| `mydb_hnsw_ef_search` | 64 | Base HNSW search breadth |
+| `mydb_hnsw_ef_dynamic_factor` | 4 | Initial effective ef is `max(base ef, factor*k, k)`; 0 disables scaling |
+| `mydb_ivf_nprobe` | 8 | IVF lists to probe, clamped to `1..nlist` at execution |
+| `mydb_hnsw_rerank_mult`, `mydb_ivf_rerank_mult` | 4 | Candidate multiplier; explicit SET overrides index `rerank_mult`, range 1..1024 |
+| `mydb_hnsw_iterative_scan`, `mydb_ivf_iterative_scan` | strict_order | `off`, `relaxed_order`, or `strict_order`; controls candidate widening after filters or visibility checks remove rows |
+| `mydb_hnsw_max_scan_tuples`, `mydb_ivf_max_scan_tuples` | 20000 | Iterative candidate budget; 0 disables this configured cap |
+| `mydb_hnsw_brute_threshold` | 10000 | Small-table threshold for automatic exact scanning |
+| `mydb_hnsw_brute_filter_rows` | 1000 | Estimated filtered-row threshold for automatic exact scanning |
+
+Here `k` includes LIMIT plus OFFSET. Candidate retention also has minimum
+pool sizes and memory limits, so `rerank_mult*k` alone does not describe the
+effective pool. Larger ef or nprobe explores more candidates; a larger
+re-ranking pool can retain more of them for exact heap scoring. Check the
+effective values in `EXPLAIN` rather than inferring them from one option.
+
+```sql
+SET SESSION mydb_hnsw_ef_search = 200;
+SET SESSION mydb_hnsw_rerank_mult = 8;
+EXPLAIN SELECT /*+ HNSW_EF(400) */ id
+FROM embeddings
+ORDER BY COSINE_DISTANCE(embedding, TO_VECTOR('[...]')) LIMIT 10;
+
+SET SESSION mydb_ivf_nprobe = 32;
+SELECT /*+ IVF_NPROBE(64) */ id FROM embeddings
+ORDER BY JACCARD_DISTANCE(signature, TO_VECTOR('[...]', 'BINARY')) LIMIT 10;
+```
+
+Replace each placeholder with a vector of the column's dimension. Hints can
+override the small-table heuristic, but cannot make an incompatible,
+unavailable, or pending-training index usable. With iterative scanning
+enabled, insufficient surviving candidates can require an exact completion
+scan. This does not make every ANN result globally exact. See [vector hints](hints.md#8-vector-search-hints)
+and [configuration](configuration.md) for the related controls.
+
 ## Storage and recovery
 
 `MYDB_VECTOR_STORAGE=memory` keeps native or compressed payloads resident.
 `paged` places payloads in the shared WAL-protected vector container.
 Unquantized FLOAT32 retains its established implementation. Quantized HNSW
 uses an admitted parallel topology builder when its temporary working set fits
-the configured build budget, otherwise it uses bounded incremental construction. Native payloads are not persistently expanded into per-row FLOAT32 copies. Numeric
-coarse centers and bounded training buffers may use FLOAT32.
+the configured build budget, otherwise it uses bounded incremental construction.
+Native payloads are not persistently expanded into per-row FLOAT32 copies.
+Numeric coarse centers and bounded training buffers may use FLOAT32.
 
 For paged storage, each complete HNSW node or IVF entry must fit in a 16 KiB
-page. HNSW checks
-maximum-layer adjacency capacity as well as payload size, so the limit also
-depends on M. DDL rejects configurations that cannot fit before publication,
-including for empty tables. A datatype's maximum dimension does not guarantee
-that its paged index can be created.
+page. HNSW checks maximum-layer adjacency capacity as well as payload size,
+so the limit also depends on M. DDL rejects configurations that cannot fit
+before publication, including for empty tables. A datatype's maximum dimension
+does not guarantee that its paged index can be created.
 
 Index files are derived from committed heap data. Native indexes rebuild from
 a registered heap snapshot on cold open, then replay committed build deltas
@@ -144,6 +195,9 @@ IVF build and rerank environment defaults are captured at index creation;
 restarting with a different environment does not reinterpret existing indexes.
 PQ-only options require `quantization=pq`. PQ uses balanced contiguous
 subspaces, so dimension need not be divisible by pq_m.
+`SHOW CREATE TABLE` emits the persisted WITH configuration, including resolved
+defaults; `CREATE TABLE ... LIKE` preserves it. `INDEX_COMMENT` remains the
+descriptive COMMENT text.
 
 ```sql
 CREATE INDEX pq_search ON embeddings(embedding) USING IVF
@@ -190,8 +244,32 @@ revokes the accelerator; committed heap data remains authoritative. Native
 indexes rebuild on cold open. Models and exceptions share the vector container,
 page checksums and recovery lifecycle.
 
-EXPLAIN reports quantization and the effective rerank pool. The
-information_schema.mydb_vector_indexes view includes QUANTIZATION,
-QUANTIZATION_STATE, QUANTIZER_BYTES, COMPRESSED_BYTES,
-QUANTIZATION_EXCEPTIONS, RERANK_MULT, CANDIDATES_RETURNED, HEAP_RERANKS and
-EXACT_FALLBACKS. GENERATION identifies the built quantizer snapshot.
+## Diagnostics
+
+`SHOW CREATE TABLE` shows the persisted index options. `EXPLAIN` reports the
+chosen query path, quantization and effective re-ranking pool. A configured
+index can still execute exact scans, for example while PQ is pending training.
+
+```sql
+SHOW CREATE TABLE embeddings;
+
+SELECT INDEX_NAME, ALGO, METRIC, QUANTIZATION, QUANTIZATION_STATE,
+       LOADED, RERANK_MULT, QUANTIZER_BYTES, COMPRESSED_BYTES,
+       QUANTIZATION_EXCEPTIONS, CANDIDATES_RETURNED, HEAP_RERANKS,
+       EXACT_FALLBACKS
+FROM information_schema.mydb_vector_indexes
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'embeddings';
+```
+
+`QUANTIZATION` and `RERANK_MULT` describe the stored configuration.
+`QUANTIZATION_STATE` is `READY` or `PENDING_TRAINING` for a loaded quantized
+index; a cold index has `LOADED=0` and no runtime training state. `GENERATION`
+identifies the built quantizer snapshot. Model/code bytes and query counters
+describe currently loaded accelerators, aggregated across loaded partitions;
+they are not durable lifetime totals. Check `LOADED` before interpreting an
+empty runtime measurement. The candidate, heap re-ranking, and fallback
+counters are collected by quantized accelerators; zero counters on an
+unquantized index do not mean it has served no queries. `HEAP_RERANKS` counts
+heap scoring work and `EXACT_FALLBACKS` counts recorded exact fallback events;
+neither is a recall measurement. Compare results with `NO_VECTOR_INDEX` to
+measure recall on the application's actual data and queries.
