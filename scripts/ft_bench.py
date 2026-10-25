@@ -12,6 +12,7 @@ they are not directly comparable to the former in-process Rust benchmark.
 """
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -137,6 +138,7 @@ def benchmark_queries(cursor, table, iters, reference):
             "p95_us": sorted(samples)[math.ceil(len(samples) * 0.95) - 1],
             "rows_per_query": row_counts[0],
             "total_matching_rows": len(ids),
+            "matching_ids_sha256": hashlib.sha256(json.dumps(ids).encode("ascii")).hexdigest(),
             "samples_us": samples,
         }
         results.append(result)

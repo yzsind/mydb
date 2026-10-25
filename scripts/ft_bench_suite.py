@@ -15,6 +15,7 @@ import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -210,7 +211,8 @@ def ngram_stage(cursor, args, stage):
         def check(rows, expected=expected[:20]):
             require(tuple(row[0] for row in rows) == expected, f"{label}: LIMIT membership mismatch")
         result = measure(cursor, label, sql, args.iters, check)
-        result.update(matching_rows=len(expected), explain=explain(cursor, sql))
+        result.update(matching_rows=len(expected), explain=explain(cursor, sql),
+                      matching_ids_sha256=hashlib.sha256(json.dumps(expected).encode("ascii")).hexdigest())
         stage["queries"].append(result)
 
 
@@ -236,7 +238,9 @@ def ranking_stage(cursor, args, stage):
             result = measure(cursor, f"rank/{search}/top{topk}", sql, args.iters, check)
             raw_order = sql.replace("ORDER BY score DESC,id", f"ORDER BY {expression} DESC,id")
             check(base.execute(cursor, raw_order))
-            result.update(matching_rows=len(oracle), explain=explain(cursor, sql), oracle="all scores sorted in Python")
+            result.update(matching_rows=len(oracle), explain=explain(cursor, sql), oracle="all scores sorted in Python",
+                          matching_ids_sha256=hashlib.sha256(json.dumps(sorted(row[0] for row in oracle)).encode("ascii")).hexdigest(),
+                          topk_ids=[row[0] for row in expected])
             stage["queries"].append(result)
     base.execute(cursor, "CREATE TABLE rank_fixture(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
     fixture = (
@@ -250,10 +254,24 @@ def ranking_stage(cursor, args, stage):
         cursor.execute("INSERT INTO rank_fixture VALUES(%s,%s)", (i, body))
     base.execute(cursor, "ANALYZE TABLE rank_fixture")
     scores = dict(base.execute(cursor, "SELECT id,MATCH(body) AGAINST('database') FROM rank_fixture"))
-    require(float(scores[0]) > float(scores[1]) > float(scores[2]), "BM25 term frequency/length fixture failed")
+    database_scores = {str(key): float(value) for key, value in scores.items()}
+    frequency = float(scores[0]) > float(scores[1])
+    length_normalization = float(scores[1]) > float(scores[2])
+    length_invariant = math.isclose(float(scores[1]), float(scores[2]), rel_tol=1e-6, abs_tol=1e-9)
+    require(frequency, "term-frequency fixture failed")
+    if args.engine == "mydb":
+        require(length_normalization, "BM25 length-normalization fixture failed")
+    else:
+        require(length_invariant, "MySQL InnoDB TF-IDF length-invariance fixture failed")
     scores = dict(base.execute(cursor, "SELECT id,MATCH(body) AGAINST('database design') FROM rank_fixture"))
     require(float(scores[3]) > float(scores[1]), "BM25 rare-term fixture failed")
-    stage["semantic_fixture"] = {"term_frequency": True, "length_normalization": True, "rare_term": True}
+    stage["semantic_fixture"] = {
+        "term_frequency": frequency, "length_normalization": length_normalization,
+        "length_invariant": length_invariant, "rare_term": True,
+        "model": "BM25" if args.engine == "mydb" else "InnoDB TF-IDF",
+        "database_scores_by_id": database_scores,
+        "database_design_scores_by_id": {str(key): float(value) for key, value in scores.items()},
+    }
 
 
 def dml_markers(chinese):
@@ -506,6 +524,8 @@ def positive_seconds(text):
 
 
 def configure(parser):
+    parser.add_argument("--engine", choices=("mydb", "mysql80"), default="mydb",
+                        help="select scoring-contract checks; query workload is unchanged (default: mydb)")
     parser.add_argument("--scenarios", type=scenario_list, default=",".join(SCENARIOS))
     parser.add_argument("--scales", type=positive_list, default="10000,100000,1000000")
     parser.add_argument("--topk", type=positive_list, default="1,20,100")
@@ -519,15 +539,20 @@ def configure(parser):
 
 def benchmark_suite(connection, args, report):
     report["suite"] = {
-        "version": 1, "selected": args.scenarios, "scales": args.scales, "topk": args.topk,
+        "version": 2, "engine": args.engine, "selected": args.scenarios, "scales": args.scales, "topk": args.topk,
         "concurrency": args.concurrency, "writers": args.writers, "duration": args.duration,
         "mutation_rows": min(args.mutations, args.rows // 3),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "baseline_script_sha256": hashlib.sha256(Path(base.__file__).read_bytes()).hexdigest(),
         "client_cpu_note": "Python threads share the GIL; throughput can be client-limited",
         "stages": [],
     }
     with connection.cursor() as cursor:
         report["server_version"] = base.execute(cursor, "SELECT VERSION()")[0][0]
+        version = report["server_version"]
+        require((args.engine == "mysql80" and version.startswith("8.0.") and "mydb" not in version.lower())
+                or (args.engine == "mydb" and "mydb" in version.lower()),
+                f"--engine {args.engine} does not match server version {version}")
         report["server_settings"] = {
             "transaction_isolation": base.execute(cursor, "SELECT @@transaction_isolation")[0][0],
             "optimizer_switch": base.execute(cursor, "SELECT @@optimizer_switch")[0][0],

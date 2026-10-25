@@ -1844,6 +1844,8 @@ pub(crate) struct GroupCommitState {
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct GroupCommitStats {
     pub batches: u64,
+    /// Participants in realized batches. Already-durable requests that return
+    /// before queue registration do not contribute to this count.
     pub waiters: u64,
     pub total_batch_size: u64,
     pub leader_wait_total_us: u64,
@@ -1860,6 +1862,7 @@ pub struct GroupCommitStats {
     pub recent_avg_batch_size: f64,
     /// M1/O1 — waiters released for free by a leader's flushed high-water
     /// (fsyncs saved). See `GroupCommitState::high_water_released`.
+    /// This counts registered waiters, not lock-free already-durable returns.
     pub high_water_released: u64,
     /// M4/O2 — batch-size histogram buckets [1, 2, 3-4, 5-8, 9-16, 17+].
     pub batch_size_buckets: [u64; 6],

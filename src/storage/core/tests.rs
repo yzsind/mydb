@@ -14642,6 +14642,15 @@ fn read_committed_dml_serializes_delete_insert_pairs() {
 
 #[test]
 fn strict_group_commit_batches_concurrent_commits_and_recovers() {
+    assert_strict_group_commit_and_recovery(false);
+}
+
+#[test]
+fn strict_group_commit_preflushed_commits_recover_without_new_batch() {
+    assert_strict_group_commit_and_recovery(true);
+}
+
+fn assert_strict_group_commit_and_recovery(preflushed: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(
         Database::open_with_config(
@@ -14716,36 +14725,66 @@ fn strict_group_commit_batches_concurrent_commits_and_recovers() {
                 vec![vec![Value::Int(id), Value::Int(id * 10)]],
             )
             .unwrap();
+            let mut deferred = preflushed.then(|| db.commit_txn_deferred(txn.txn_id).unwrap());
             inserts_done.wait();
             start_commit.wait();
-            db.commit_txn(txn.txn_id).unwrap();
+            if let Some(commit) = deferred.as_mut() {
+                db.finish_deferred_commits(&mut [commit]).unwrap();
+            } else {
+                db.commit_txn(txn.txn_id).unwrap();
+            }
+            let durable_at_ack = db.log.lock().durable_lsn();
+            (txn.txn_id, durable_at_ack)
         }));
     }
     inserts_done.wait();
+    if preflushed {
+        // A checkpoint or data-page writeback can make commit WAL durable
+        // before its owner reaches the group-commit registration point.
+        db.flush_dirty_data().unwrap();
+    }
     // Bootstrap, DDL and DML writeback may synchronize WAL independently.
     // Measure only the released concurrent commit phase.
     let before = db.storage_status();
     start_commit.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    let acknowledgements = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
 
     let status = db.storage_status();
     assert!(
         status.group_commit_batches - before.group_commit_batches < 8,
         "{status:?}"
     );
-    // Every one of the 8 concurrent committers is accounted for: either it
-    // rode in a realized batch (`group_commit_waiters`) or it was released for
-    // free by an earlier leader's flushed high-water
-    // (`group_commit_high_water_released`, the M1 optimization).
-    assert!(
-        status.group_commit_waiters - before.group_commit_waiters
-            + status.group_commit_high_water_released
-            - before.group_commit_high_water_released
-            >= 8,
-        "{status:?}"
-    );
+    // Already-durable committers return before registering as waiters. Their
+    // durability must be checked against WAL, not inferred from queue stats.
+    if preflushed {
+        assert_eq!(status.group_commit_batches, before.group_commit_batches);
+        assert_eq!(status.group_commit_waiters, before.group_commit_waiters);
+        assert_eq!(
+            status.group_commit_high_water_released,
+            before.group_commit_high_water_released
+        );
+    }
+    let scan = {
+        let _wal = db.log.lock();
+        LogManager::scan_with_mode(dir.path(), crate::wal::WalReadMode::ReadOnly).unwrap()
+    };
+    for (txn_id, durable_at_ack) in acknowledgements {
+        let commit = scan
+            .records
+            .iter()
+            .find(|record| {
+                record.txn_id == txn_id && matches!(&record.payload, WalPayload::CommitTxn { .. })
+            })
+            .unwrap_or_else(|| panic!("missing commit WAL for acknowledged transaction {txn_id}"));
+        assert!(
+            commit.lsn <= durable_at_ack,
+            "transaction {txn_id} acknowledged LSN {} above durable LSN {durable_at_ack}",
+            commit.lsn
+        );
+    }
     assert!(status.wal_syncs - before.wal_syncs < 8, "{status:?}");
     drop(db);
 
@@ -14760,9 +14799,12 @@ fn strict_group_commit_batches_concurrent_commits_and_recovers() {
         Value::Int(value) => value,
         _ => 0,
     });
-    assert_eq!(rows.len(), 8);
-    assert_eq!(rows[0].values, vec![Value::Int(1), Value::Int(10)]);
-    assert_eq!(rows[7].values, vec![Value::Int(8), Value::Int(80)]);
+    assert_eq!(
+        rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+        (1..=8)
+            .map(|id| vec![Value::Int(id), Value::Int(id * 10)])
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
