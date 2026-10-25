@@ -26862,10 +26862,16 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         {
             let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
-                dir.path(), test_storage_config(DurabilityMode::Strict, true),
-            ).unwrap();
-            engine.execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))").unwrap();
-            engine.execute("INSERT INTO docs VALUES(1,'alpha beta')").unwrap();
+                dir.path(),
+                test_storage_config(DurabilityMode::Strict, true),
+            )
+            .unwrap();
+            engine
+                .execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+                .unwrap();
+            engine
+                .execute("INSERT INTO docs VALUES(1,'alpha beta')")
+                .unwrap();
             let db = engine.database();
             let table = db.table("test.docs").unwrap();
             db.with_index_mut(table.id, "ft", |index| {
@@ -26873,21 +26879,36 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
                 for (key, row) in entries {
                     if key.0.first() == Some(&KeyPart::String("alpha".into())) {
                         index.delete_deferred(0, key, row)?;
-                        index.insert_deferred(0, IndexKey::from(vec![
-                            KeyPart::String("alpha".into()), KeyPart::Bytes(vec![2, 1]),
-                        ]), row)?;
+                        index.insert_deferred(
+                            0,
+                            IndexKey::from(vec![
+                                KeyPart::String("alpha".into()),
+                                KeyPart::Bytes(vec![2, 1]),
+                            ]),
+                            row,
+                        )?;
                     }
                 }
                 index.flush()
-            }).unwrap();
+            })
+            .unwrap();
             let err = engine.execute(sql).unwrap_err();
-            assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{sql}: {err:?}");
+            assert!(
+                err.is(crate::error::catalog::ER_INDEX_CORRUPT),
+                "{sql}: {err:?}"
+            );
             let path = db.index_path_for_table_schema(&table, table.id, "ft");
             assert!(path.with_extension("idx.corrupt").exists());
-            assert!(engine.execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('beta')").is_err());
+            assert!(engine
+                .execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('beta')")
+                .is_err());
         }
-        let err = Database::open_with_config(dir.path(), test_storage_config(DurabilityMode::Strict, true))
-            .err().expect("startup must preserve the corruption fence");
+        let err = Database::open_with_config(
+            dir.path(),
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .err()
+        .expect("startup must preserve the corruption fence");
         assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
     }
 }

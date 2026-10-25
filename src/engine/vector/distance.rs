@@ -307,8 +307,12 @@ pub(crate) enum Metric {
 impl Metric {
     pub(crate) fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
-            0 => Self::L2, 1 => Self::Cosine, 2 => Self::Dot,
-            3 => Self::Hamming, 4 => Self::Jaccard, _ => return None,
+            0 => Self::L2,
+            1 => Self::Cosine,
+            2 => Self::Dot,
+            3 => Self::Hamming,
+            4 => Self::Jaccard,
+            _ => return None,
         })
     }
 

@@ -105,8 +105,13 @@ impl<'a> FtSearchSource<'a> {
                     continue;
                 };
                 if !counted_length {
-                    sum_len =
-                        sum_len.saturating_add(FtPayload::decode_scoring_only(&payload, crate::storage::fulltext::payload::stored_positions(index))?.0 as u64);
+                    sum_len = sum_len.saturating_add(
+                        FtPayload::decode_scoring_only(
+                            &payload,
+                            crate::storage::fulltext::payload::stored_positions(index),
+                        )?
+                        .0 as u64,
+                    );
                     counted_length = true;
                 }
                 if !tokens.contains(&token)
@@ -120,8 +125,11 @@ impl<'a> FtSearchSource<'a> {
                     256 + token.len().saturating_mul(2) + payload.len().saturating_mul(16),
                 )?;
                 let batch = source.postings.entry(token).or_default();
-                let (doc_len, tf, pos_start, pos_len) =
-                    FtPayload::decode_into_arena(&payload, &mut batch.positions_arena, crate::storage::fulltext::payload::stored_positions(index))?;
+                let (doc_len, tf, pos_start, pos_len) = FtPayload::decode_into_arena(
+                    &payload,
+                    &mut batch.positions_arena,
+                    crate::storage::fulltext::payload::stored_positions(index),
+                )?;
                 batch.postings.push(FtPosting {
                     row_id: heap_document_id(ordinal)?,
                     doc_len,

@@ -78,8 +78,13 @@ impl VectorMaintenanceHandle {
                 }));
                 match round {
                     Ok(Ok(())) => {}
-                    Ok(Err(err)) => crate::util::logging::log_message(format!("vector index maintenance failed: {err:?}")),
-                    Err(_) => { db.fail_vector_maintenance_worker(); break; }
+                    Ok(Err(err)) => crate::util::logging::log_message(format!(
+                        "vector index maintenance failed: {err:?}"
+                    )),
+                    Err(_) => {
+                        db.fail_vector_maintenance_worker();
+                        break;
+                    }
                 }
             }
         });

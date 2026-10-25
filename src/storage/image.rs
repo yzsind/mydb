@@ -429,7 +429,12 @@ pub(crate) fn validate_open(path: &Path) -> Result<(), QueryError> {
     let mut contracts = BTreeMap::new();
     for contract in &seal.object_replay_contracts {
         if contract.version != 1
-            || !["SOURCE_PHYSICAL", "SOURCE_INDEX_JOURNAL", "REBUILD_FROM_AUTHORITY"].contains(&contract.mode.as_str())
+            || ![
+                "SOURCE_PHYSICAL",
+                "SOURCE_INDEX_JOURNAL",
+                "REBUILD_FROM_AUTHORITY",
+            ]
+            .contains(&contract.mode.as_str())
             || contracts
                 .insert(contract.path.as_str(), contract.mode.as_str())
                 .is_some()

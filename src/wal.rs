@@ -646,9 +646,20 @@ pub enum WalPayload {
     },
     /// A bounded chunk of an immutable initial index image. The last chunk
     /// publishes the file; subsequent physical records retain source page LSNs.
-    VectorIndexImage { path: String, offset: u64, total: u64, bytes: Vec<u8> },
-    VectorIndexComplete { txn_id: u64, commit_scn: u64 },
-    VectorIndexManifest { path: String, bytes: Vec<u8> },
+    VectorIndexImage {
+        path: String,
+        offset: u64,
+        total: u64,
+        bytes: Vec<u8>,
+    },
+    VectorIndexComplete {
+        txn_id: u64,
+        commit_scn: u64,
+    },
+    VectorIndexManifest {
+        path: String,
+        bytes: Vec<u8>,
+    },
     CatalogDelta {
         object_ids: Vec<u64>,
         invalidate_all: bool,
@@ -4413,7 +4424,9 @@ fn accumulate_wal_stats(stats: &mut WalStats, payload: &WalPayload) {
                 .index_payload_bytes
                 .saturating_add(ops.iter().map(|op| op.key.len() as u64 + 20).sum::<u64>());
         }
-        WalPayload::HistoryIndexBatch { bytes } | WalPayload::VectorIndexBatch { bytes } | WalPayload::VectorIndexModel { bytes } => {
+        WalPayload::HistoryIndexBatch { bytes }
+        | WalPayload::VectorIndexBatch { bytes }
+        | WalPayload::VectorIndexModel { bytes } => {
             stats.logical_records += 1;
             stats.index_batch_records += 1;
             stats.index_payload_bytes =
@@ -5436,14 +5449,20 @@ fn encode_payload_into(payload: &WalPayload, mut out: &mut Vec<u8>) -> Result<()
                 encode_wal_row_id(&mut out, op.row_id);
             }
         }
-        WalPayload::ZoneMapMergeBatch { bytes } | WalPayload::HistoryIndexBatch { bytes } | WalPayload::VectorIndexBatch { bytes } | WalPayload::VectorIndexModel { bytes } => {
-            write_bytes(&mut out, bytes)?
-        }
+        WalPayload::ZoneMapMergeBatch { bytes }
+        | WalPayload::HistoryIndexBatch { bytes }
+        | WalPayload::VectorIndexBatch { bytes }
+        | WalPayload::VectorIndexModel { bytes } => write_bytes(&mut out, bytes)?,
         WalPayload::VectorIndexManifest { path, bytes } => {
             write_string(&mut out, path)?;
             write_bytes(&mut out, bytes)?;
         }
-        WalPayload::VectorIndexImage { path, offset, total, bytes } => {
+        WalPayload::VectorIndexImage {
+            path,
+            offset,
+            total,
+            bytes,
+        } => {
             write_string(&mut out, path)?;
             write_u64_vec(&mut out, *offset);
             write_u64_vec(&mut out, *total);
@@ -5840,11 +5859,19 @@ fn encoded_payload_len(payload: &WalPayload) -> Result<usize, QueryError> {
             }
             Ok(len)
         }
-        WalPayload::ZoneMapMergeBatch { bytes } | WalPayload::HistoryIndexBatch { bytes } | WalPayload::VectorIndexBatch { bytes } | WalPayload::VectorIndexModel { bytes } => {
-            encoded_bytes_len(bytes.len())
-        }
-        WalPayload::VectorIndexManifest { path, bytes } => checked_sum([encoded_bytes_len(path.len())?, encoded_bytes_len(bytes.len())?]),
-        WalPayload::VectorIndexImage { path, bytes, .. } => checked_sum([encoded_bytes_len(path.len())?, 16, encoded_bytes_len(bytes.len())?]),
+        WalPayload::ZoneMapMergeBatch { bytes }
+        | WalPayload::HistoryIndexBatch { bytes }
+        | WalPayload::VectorIndexBatch { bytes }
+        | WalPayload::VectorIndexModel { bytes } => encoded_bytes_len(bytes.len()),
+        WalPayload::VectorIndexManifest { path, bytes } => checked_sum([
+            encoded_bytes_len(path.len())?,
+            encoded_bytes_len(bytes.len())?,
+        ]),
+        WalPayload::VectorIndexImage { path, bytes, .. } => checked_sum([
+            encoded_bytes_len(path.len())?,
+            16,
+            encoded_bytes_len(bytes.len())?,
+        ]),
         WalPayload::VectorIndexComplete { .. } => Ok(16),
         WalPayload::CatalogDelta { object_ids, .. } => {
             checked_add(1 + 4, object_ids.len().saturating_mul(8))
@@ -6308,14 +6335,22 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
         WalRecordType::VectorIndexBatch => WalPayload::VectorIndexBatch {
             bytes: read_bytes(input, &mut offset)?,
         },
-        WalRecordType::VectorIndexModel => WalPayload::VectorIndexModel { bytes: read_bytes(input, &mut offset)? },
-        WalRecordType::VectorIndexManifest => WalPayload::VectorIndexManifest { path: read_string(input, &mut offset)?, bytes: read_bytes(input, &mut offset)? },
+        WalRecordType::VectorIndexModel => WalPayload::VectorIndexModel {
+            bytes: read_bytes(input, &mut offset)?,
+        },
+        WalRecordType::VectorIndexManifest => WalPayload::VectorIndexManifest {
+            path: read_string(input, &mut offset)?,
+            bytes: read_bytes(input, &mut offset)?,
+        },
         WalRecordType::VectorIndexImage => WalPayload::VectorIndexImage {
-            path: read_string(input, &mut offset)?, offset: read_u64_checked(input, &mut offset)?,
-            total: read_u64_checked(input, &mut offset)?, bytes: read_bytes(input, &mut offset)?,
+            path: read_string(input, &mut offset)?,
+            offset: read_u64_checked(input, &mut offset)?,
+            total: read_u64_checked(input, &mut offset)?,
+            bytes: read_bytes(input, &mut offset)?,
         },
         WalRecordType::VectorIndexComplete => WalPayload::VectorIndexComplete {
-            txn_id: read_u64_checked(input, &mut offset)?, commit_scn: read_u64_checked(input, &mut offset)?,
+            txn_id: read_u64_checked(input, &mut offset)?,
+            commit_scn: read_u64_checked(input, &mut offset)?,
         },
         WalRecordType::CatalogDelta => {
             let invalidate_all = read_u8_checked(input, &mut offset)? != 0;

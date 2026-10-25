@@ -339,7 +339,10 @@ fn concurrent_cold_readers_share_one_build_owner() {
             "{backend}: second builder bypassed owner"
         );
         assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert_eq!(crate::storage::Database::vector_build_heap_scans_for_test(), scans);
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans
+        );
     }
 }
 
@@ -376,8 +379,13 @@ fn failed_paged_commit_returns_error_and_keeps_its_durable_fence() {
     let _env = environment("paged", false);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
-    for sql in ["CREATE TABLE items(id INT PRIMARY KEY,emb VECTOR(2) NOT NULL)",
-        "INSERT INTO items VALUES(1,'[10,0]')", "CREATE INDEX hv ON items(emb) USING HNSW"] { engine.execute(sql).unwrap(); }
+    for sql in [
+        "CREATE TABLE items(id INT PRIMARY KEY,emb VECTOR(2) NOT NULL)",
+        "INSERT INTO items VALUES(1,'[10,0]')",
+        "CREATE INDEX hv ON items(emb) USING HNSW",
+    ] {
+        engine.execute(sql).unwrap();
+    }
     FAIL_PAGED_WRITES_FOR_TEST.store(true, Ordering::Release);
     let inserted = engine.execute("INSERT INTO items VALUES(2,'[0,0]')");
     FAIL_PAGED_WRITES_FOR_TEST.store(false, Ordering::Release);
@@ -391,7 +399,10 @@ fn failed_paged_commit_returns_error_and_keeps_its_durable_fence() {
     drop(engine);
     let mut config = memory_test_storage_config();
     config.durability = crate::storage::DurabilityMode::Strict;
-    assert!(StorageQueryEngine::open_with_storage_config_without_background_workers(dir.path(), config).is_err());
+    assert!(
+        StorageQueryEngine::open_with_storage_config_without_background_workers(dir.path(), config)
+            .is_err()
+    );
     assert_eq!(std::fs::read(&files[0]).unwrap(), evidence);
 }
 
@@ -500,8 +511,15 @@ fn cold_build_commit_tail_cannot_reorder_an_existing_snapshot() {
                 .unwrap();
         }));
         let table = engine.database().table("items").unwrap();
-        let index = table.indexes.iter().find(|index| index.is_vector()).unwrap();
-        engine.database().rebuild_vector_for_test(&table, index, table.id).unwrap();
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_vector())
+            .unwrap();
+        engine
+            .database()
+            .rebuild_vector_for_test(&table, index, table.id)
+            .unwrap();
         let query = "SELECT id FROM items ORDER BY DISTANCE(emb,'[4.9,0]') LIMIT 1";
         assert_eq!(
             id_list_session(&engine, &mut reader, query),

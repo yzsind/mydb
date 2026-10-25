@@ -423,9 +423,18 @@ pub fn parse_relative_object_path(rel_path: &str) -> Option<(String, ObjectFileI
         index_id.parse::<u64>().ok()?;
         let (physical, ext) = file.rsplit_once('.')?;
         physical.parse::<u64>().ok()?;
-        if ext != "hvec" && ext != "hnsw" { return None; }
-        return Some((String::new(), ObjectFileInfo { kind: ObjectFileKind::Index,
-            table_id, part: index_id.to_string(), ext: ext.to_string() }));
+        if ext != "hvec" && ext != "hnsw" {
+            return None;
+        }
+        return Some((
+            String::new(),
+            ObjectFileInfo {
+                kind: ObjectFileKind::Index,
+                table_id,
+                part: index_id.to_string(),
+                ext: ext.to_string(),
+            },
+        ));
     }
     if let ["objects", "indexes", table_id, generation, file] = parts.as_slice() {
         let table_id = table_id.parse().ok()?;

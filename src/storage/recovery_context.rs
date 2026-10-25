@@ -55,7 +55,9 @@ impl RecoveryContext {
         self.source_range.is_some()
     }
 
-    pub(crate) fn source_end(self) -> Option<u64> { self.source_range.map(|(_, end)| end) }
+    pub(crate) fn source_end(self) -> Option<u64> {
+        self.source_range.map(|(_, end)| end)
+    }
 
     pub(crate) fn redo_floor(self) -> Option<u64> {
         self.source_range.map(|(start, _)| start)

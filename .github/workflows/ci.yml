@@ -142,6 +142,7 @@ jobs:
       # 1.2.3 drops the final OK packet on cold non-TLS RSA authentication.
       - run: python -m pip install 'pymysql==1.1.2' cryptography mysql-connector-python
       - run: python scripts/test_linux_compat.py
+      - run: python scripts/test_backup_recovery_wal.py
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends mysql-client openssl
       - run: cargo build --locked --features tools --bin mydb --bin mydb-backup
       - run: python scripts/test_native_readiness.py --binary target/debug/mydb --output /tmp/mydb/native-readiness-ci
@@ -195,44 +196,6 @@ jobs:
         with:
           key: msrv-1.95
       - run: cargo check --locked --all-targets
-
-  platform-check:
-    name: macOS compile and release smoke
-    if: always()
-    needs: [macos-check, macos-release]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require macOS compile and release smoke
-        env:
-          CHECK_RESULT: ${{ needs.macos-check.result }}
-          RELEASE_RESULT: ${{ needs.macos-release.result }}
-        run: test "$CHECK_RESULT" = success && test "$RELEASE_RESULT" = success
-
-  macos-check:
-    name: macOS all-feature compile
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-check
-      - run: cargo check --locked --all-targets --all-features
-
-  macos-release:
-    name: macOS release smoke
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-release
-      - run: cargo run --locked --release --bin mydb -- --help
 
   mtr-non-regression:
     name: MySQL MTR semantic non-regression

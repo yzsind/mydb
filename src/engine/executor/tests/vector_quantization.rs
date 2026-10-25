@@ -321,8 +321,12 @@ fn vector_quantization_high_dimensional_overflow_and_model_recovery() {
             .read_quantization_blob(meta.quant_model_head, 4 * 1024 * 1024)
             .unwrap();
         let restored = crate::engine::vector::quantization::Quantizer::deserialize(&model).unwrap();
-        assert!(restored.matches_definition(crate::vector::VectorDataType::Float32, dimension as u32,
-            crate::engine::vector::Metric::L2, &index.vector.as_ref().unwrap().quantization));
+        assert!(restored.matches_definition(
+            crate::vector::VectorDataType::Float32,
+            dimension as u32,
+            crate::engine::vector::Metric::L2,
+            &index.vector.as_ref().unwrap().quantization
+        ));
         path = file.persistent_path().to_path_buf();
         engine.database().checkpoint().unwrap();
         // A multi-page model and out-of-range payload both used overflow chains.
@@ -330,7 +334,16 @@ fn vector_quantization_high_dimensional_overflow_and_model_recovery() {
     }
     {
         let engine = open_strict_test_engine(dir.path());
-        assert_eq!(text(&engine, &format!("SELECT id FROM items ORDER BY L2_DISTANCE(v,'{}') LIMIT 1", vector("100"))), "2");
+        assert_eq!(
+            text(
+                &engine,
+                &format!(
+                    "SELECT id FROM items ORDER BY L2_DISTANCE(v,'{}') LIMIT 1",
+                    vector("100")
+                )
+            ),
+            "2"
+        );
     }
     {
         let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -340,10 +353,21 @@ fn vector_quantization_high_dimensional_overflow_and_model_recovery() {
     }
     let damaged = std::fs::read(&path).unwrap();
     let engine = open_strict_test_engine(dir.path());
-    let err = engine.execute(&format!("SELECT id FROM items ORDER BY L2_DISTANCE(v,'{}') LIMIT 1", vector("100"))).unwrap_err();
-    assert!(err.message().contains("checksum") || err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
-    assert_eq!(std::fs::read(&path).unwrap(), damaged, "corruption evidence must survive failed reads");
-
+    let err = engine
+        .execute(&format!(
+            "SELECT id FROM items ORDER BY L2_DISTANCE(v,'{}') LIMIT 1",
+            vector("100")
+        ))
+        .unwrap_err();
+    assert!(
+        err.message().contains("checksum") || err.is(crate::error::catalog::ER_INDEX_CORRUPT),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        damaged,
+        "corruption evidence must survive failed reads"
+    );
 }
 
 #[test]

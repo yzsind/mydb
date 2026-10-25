@@ -63,7 +63,7 @@ const BACKUP_FILES: &[&str] = &[
     "system/commit-ledger.v1",
     "system/history-index.v1",
     "system/vector-purges.v1",
-        "system/vector-maintenance.jobs",
+    "system/vector-maintenance.jobs",
     "system/commit-clock.v1",
 ];
 
@@ -813,7 +813,7 @@ const INSTALL_TARGETS: &[&str] = &[
     "system/commit-clock.v1",
     "system/history-index.v1",
     "system/vector-purges.v1",
-        "system/vector-maintenance.jobs",
+    "system/vector-maintenance.jobs",
     "ddl",
     "system/replication/replica_progress.json",
     "system/replication/role.json",

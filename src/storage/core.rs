@@ -629,22 +629,41 @@ struct VectorPurgeQueue {
 }
 
 impl VectorPurgeQueue {
-    fn new() -> Self { Self::default() }
-    fn len(&self) -> usize { self.by_time.len() }
-    fn is_empty(&self) -> bool { self.by_time.is_empty() }
-    fn values(&self) -> impl Iterator<Item = &VectorPurge> { self.by_time.values() }
-    fn contains_key(&self, key: &VectorPurgeIdentity) -> bool { self.by_time.contains_key(key) }
-    fn get_mut(&mut self, key: &VectorPurgeIdentity) -> Option<&mut VectorPurge> { self.by_time.get_mut(key) }
-    fn index_key(key: &VectorPurgeIdentity) -> VectorPurgeIndexIdentity { (key.1, key.2, key.3, key.4, key.5) }
+    fn new() -> Self {
+        Self::default()
+    }
+    fn len(&self) -> usize {
+        self.by_time.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.by_time.is_empty()
+    }
+    fn values(&self) -> impl Iterator<Item = &VectorPurge> {
+        self.by_time.values()
+    }
+    fn contains_key(&self, key: &VectorPurgeIdentity) -> bool {
+        self.by_time.contains_key(key)
+    }
+    fn get_mut(&mut self, key: &VectorPurgeIdentity) -> Option<&mut VectorPurge> {
+        self.by_time.get_mut(key)
+    }
+    fn index_key(key: &VectorPurgeIdentity) -> VectorPurgeIndexIdentity {
+        (key.1, key.2, key.3, key.4, key.5)
+    }
     fn insert(&mut self, purge: VectorPurge) -> Option<VectorPurge> {
         let key = purge.identity();
         for (row, versions) in &purge.rows {
             if let Some(latest) = versions.iter().max() {
-                self.latest_retired.entry((Self::index_key(&key), *row))
-                    .and_modify(|seen| *seen = (*seen).max(*latest)).or_insert(*latest);
+                self.latest_retired
+                    .entry((Self::index_key(&key), *row))
+                    .and_modify(|seen| *seen = (*seen).max(*latest))
+                    .or_insert(*latest);
             }
         }
-        self.by_index.entry(Self::index_key(&key)).or_default().insert(key.0);
+        self.by_index
+            .entry(Self::index_key(&key))
+            .or_default()
+            .insert(key.0);
         self.by_time.insert(key, purge)
     }
     fn insert_new_retirements(&mut self, mut purge: VectorPurge) {
@@ -655,23 +674,36 @@ impl VectorPurgeQueue {
             }
         }
         purge.rows.retain(|(_, versions)| !versions.is_empty());
-        if !purge.rows.is_empty() { self.insert_if_absent(purge); }
+        if !purge.rows.is_empty() {
+            self.insert_if_absent(purge);
+        }
     }
-    fn remove_completed(&mut self, key: &VectorPurgeIdentity,
-        rows: &[(RowId, smallvec::SmallVec<[u64; 1]>)]) {
+    fn remove_completed(
+        &mut self,
+        key: &VectorPurgeIdentity,
+        rows: &[(RowId, smallvec::SmallVec<[u64; 1]>)],
+    ) {
         let index = Self::index_key(key);
         for (row, versions) in rows {
             if let Some(latest) = versions.iter().max() {
-                if self.latest_retired.get(&(index, *row)).is_some_and(|seen| seen <= latest) {
+                if self
+                    .latest_retired
+                    .get(&(index, *row))
+                    .is_some_and(|seen| seen <= latest)
+                {
                     self.latest_retired.remove(&(index, *row));
                 }
             }
         }
         self.remove(key);
-        if self.is_empty() { self.latest_retired.clear(); }
+        if self.is_empty() {
+            self.latest_retired.clear();
+        }
     }
     fn insert_if_absent(&mut self, purge: VectorPurge) -> bool {
-        if self.contains_key(&purge.identity()) { return false; }
+        if self.contains_key(&purge.identity()) {
+            return false;
+        }
         self.insert(purge);
         true
     }
@@ -679,24 +711,44 @@ impl VectorPurgeQueue {
         let index = Self::index_key(key);
         if let Some(times) = self.by_index.get_mut(&index) {
             times.remove(&key.0);
-            if times.is_empty() { self.by_index.remove(&index); }
+            if times.is_empty() {
+                self.by_index.remove(&index);
+            }
         }
         self.by_time.remove(key)
     }
     fn ready_keys(&self, horizon: u64) -> Vec<VectorPurgeIdentity> {
-        self.by_time.range(..=(horizon, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX))
-            .map(|(key, _)| *key).collect()
+        self.by_time
+            .range(..=(horizon, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX))
+            .map(|(key, _)| *key)
+            .collect()
     }
-    fn for_index(&self, index: VectorPurgeIndexIdentity) -> impl Iterator<Item = &VectorPurge> + '_ {
-        self.by_index.get(&index).into_iter().flat_map(move |times| times.iter().filter_map(move |time| {
-            self.by_time.get(&(*time, index.0, index.1, index.2, index.3, index.4))
-        }))
+    fn for_index(
+        &self,
+        index: VectorPurgeIndexIdentity,
+    ) -> impl Iterator<Item = &VectorPurge> + '_ {
+        self.by_index
+            .get(&index)
+            .into_iter()
+            .flat_map(move |times| {
+                times.iter().filter_map(move |time| {
+                    self.by_time
+                        .get(&(*time, index.0, index.1, index.2, index.3, index.4))
+                })
+            })
     }
 }
 
 impl VectorPurge {
     fn identity(&self) -> VectorPurgeIdentity {
-        (self.commit_scn, self.key.0, self.key.1, self.key.2, self.index_id, self.lineage)
+        (
+            self.commit_scn,
+            self.key.0,
+            self.key.1,
+            self.key.2,
+            self.index_id,
+            self.lineage,
+        )
     }
 }
 
@@ -1177,7 +1229,8 @@ pub struct Database {
     vector_purge_queue: parking_lot::Mutex<VectorPurgeQueue>,
     vector_purge_snapshot_gate: parking_lot::RwLock<()>,
     vector_purge_drain_gate: parking_lot::Mutex<()>,
-    vector_purge_recovery_charge: parking_lot::Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
+    vector_purge_recovery_charge:
+        parking_lot::Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
     vector_purges_pending: AtomicUsize,
     /// Lazy backing store for `SET PERSIST` / `SET PERSIST_ONLY`. Opened on
     /// first read or write, materialised against `<data_dir>/system/mysqld-auto.cnf`.

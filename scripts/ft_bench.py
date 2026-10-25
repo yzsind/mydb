@@ -79,12 +79,12 @@ def timed_execute(cursor, sql):
     return time.perf_counter_ns() - started, rows
 
 
-def load_rows(cursor, table, rows, batch_size):
+def load_rows(cursor, table, rows, batch_size, document=make_doc):
     elapsed_ns = 0
     for start in range(0, rows, batch_size):
         # Generate and escape SQL before starting the insertion timer.
         values = ",".join(
-            cursor.mogrify("(%s,%s)", (index, make_doc(index)))
+            cursor.mogrify("(%s,%s)", (index, document(index)))
             for index in range(start, min(start + batch_size, rows))
         )
         duration, _ = timed_execute(cursor, f"INSERT INTO {table} VALUES {values}")
@@ -188,9 +188,9 @@ def positive_int(value):
     return number
 
 
-def parse_args():
+def parse_args(configure=None, description=__doc__):
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=positive_int, default=4837)
@@ -207,11 +207,12 @@ def parse_args():
                         help="socket read/write timeout in seconds (default: 300)")
     parser.add_argument("--output", type=Path, help="JSON report (default: /tmp/mydb/ft-bench-UUID.json)")
     parser.add_argument("--keep-data", action="store_true", help="retain the owned benchmark database")
+    if configure is not None:
+        configure(parser)
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def run(args, benchmark_fn=benchmark):
     run_id = uuid.uuid4().hex
     database = f"ft_bench_{run_id}"
     output = args.output or Path("/tmp/mydb") / f"ft-bench-{run_id}.json"
@@ -243,9 +244,10 @@ def main():
         with connection.cursor() as cursor:
             execute(cursor, f"CREATE DATABASE `{database}`")
             created = True
+            report["database_retained"] = True
             execute(cursor, f"USE `{database}`")
         print(f"[ft_bench] rows={args.rows} iters={args.iters} database={database}", flush=True)
-        benchmark(connection, args, report)
+        benchmark_fn(connection, args, report)
         report["passed"] = True
     except (Exception, KeyboardInterrupt) as error:
         report["error"] = f"{type(error).__name__}: {error}"
@@ -268,6 +270,10 @@ def main():
         output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"[ft_bench] report: {output}", flush=True)
     return 0 if report["passed"] else 1
+
+
+def main():
+    return run(parse_args())
 
 
 if __name__ == "__main__":
