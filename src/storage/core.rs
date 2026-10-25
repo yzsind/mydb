@@ -4408,6 +4408,7 @@ include!("core/database/index_access.rs");
 include!("core/database/constraints_dml.rs");
 include!("core/database/foreign_keys.rs");
 include!("core/database/index_build_encoded.rs");
+include!("core/database/index_build_fulltext.rs");
 include!("core/database/index_maintenance.rs");
 include!("core/database/shadow_generation.rs");
 include!("core/database/vector_index.rs");

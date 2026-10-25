@@ -3428,19 +3428,25 @@ fn btree_ddl_parallel_hints_build_correct_indexes_and_publish_metrics() {
 }
 
 #[test]
-fn explicit_parallel_rejects_non_btree_index_build() {
+fn explicit_parallel_fulltext_index_build_matches_existing_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = open_test_engine(dir.path());
+    let engine = open_relaxed_test_engine(dir.path());
     engine
         .execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)")
         .unwrap();
-    let err = engine
+    engine
+        .execute("INSERT INTO docs VALUES(1,'alpha beta'),(2,'beta gamma'),(3,NULL)")
+        .unwrap();
+    engine
         .execute("CREATE /*+ PARALLEL(2) */ FULLTEXT INDEX ft_body ON docs(body)")
-        .expect_err("explicit PARALLEL is BTREE-only");
-    assert_eq!(
-        err.code(),
-        crate::error::catalog::ER_NOT_SUPPORTED_YET.code()
-    );
+        .unwrap();
+    let QueryResponse::ResultSet(rows) = engine
+        .execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha') ORDER BY id")
+        .unwrap()
+    else {
+        panic!("expected result set")
+    };
+    assert_eq!(rows.rows, vec![vec![Value::Int(1)]]);
 }
 
 #[test]

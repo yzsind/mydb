@@ -122,9 +122,11 @@ production-grade MySQL replacement.
   `ALTER TABLE` can be called read-nonblocking. See [ALTER TABLE](statements/ddl/alter-table.md).
 - `information_schema.mydb_ddl_jobs` keeps the most recent 64 COPY jobs in COMMITTED/FAILED/CANCELLED terminal states, so background errors no longer vanish into logs; online change-log capacity is charged to
   `DdlOnlineLog`, and budget failure aborts the DDL instead of allowing ungoverned memory growth.
-- **Parallel B-tree `ADD/CREATE INDEX`**: ➕ supports `CREATE /*+ PARALLEL(n) */ INDEX`
+- **Parallel B-tree and FULLTEXT `ADD/CREATE INDEX`**: ➕ supports `CREATE /*+ PARALLEL(n) */ INDEX`
   and `ALTER /*+ PARALLEL(n) */ TABLE ... ADD INDEX`; this hint is a mydb extension,
-  `NO_PARALLEL` can force serial execution, and explicit parallel requests for non-BTREE return 1235.
+  `NO_PARALLEL` can force serial execution. Persistent offline FULLTEXT builds also support
+  parallel scanning, tokenization, sorting, spill consolidation, and leaf writes;
+  explicit parallel requests for other index types return 1235.
 - **`RENAME TABLE`**: ✅ cross-database renames supported
 - **Atomic recovery**: CREATE/DROP/TRUNCATE/COPY/partition reorganization and RENAME TABLE/INDEX all use
   fsync intents; RENAME startup recovery rolls file moves forward or back based on the stable table identity in the DD.

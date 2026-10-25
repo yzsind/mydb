@@ -979,7 +979,10 @@ fn reject_parallel_hint_for_non_btree(
     hints: &[crate::parser::QueryHint],
     index_type: &str,
 ) -> Result<(), QueryError> {
-    if has_explicit_parallel_hint(hints) && !index_type.eq_ignore_ascii_case("BTREE") {
+    if has_explicit_parallel_hint(hints)
+        && !index_type.eq_ignore_ascii_case("BTREE")
+        && !index_type.eq_ignore_ascii_case("FULLTEXT")
+    {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             format!("PARALLEL index creation is not supported for {index_type} indexes"),

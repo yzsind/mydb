@@ -229,6 +229,12 @@ struct EncodedInternedKey {
 
 type EncodedInternedLookup = hashbrown::HashMap<EncodedInternedKey, u32, ahash::RandomState>;
 
+fn interned_key_capacity_bytes(key: &EncodedInternedKey) -> usize {
+    // Both the dictionary and hash lookup own a copy. Include descriptor and
+    // hash-table slack, rather than counting only initialized string bytes.
+    512 + 2 * (key.order_key.capacity() + key.materialized_key.as_ref().map_or(0, Vec::capacity))
+}
+
 /// Packed low-cardinality variable record. The high 32 bits are the
 /// collation-order rank, followed by the six-byte RowId and the original
 /// dictionary id. Keeping the complete sort identity in one `u128` lets the
@@ -281,6 +287,7 @@ enum EncodedSortStorage {
         lookup: EncodedInternedLookup,
         records: Vec<u128>,
         dictionary_budget: usize,
+        dictionary_bytes: usize,
     },
 }
 
@@ -1053,6 +1060,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn create_rebuilt_from_encoded_composite(
     db: &Database,
     path: PathBuf,
@@ -1060,6 +1068,20 @@ fn create_rebuilt_from_encoded_composite(
     program: Arc<CompiledIndexKeyProgram>,
     sorted: EncodedSortedRecords,
     validation: &mut Option<IndexBuildValidation>,
+) -> Result<IndexFile, QueryError> {
+    create_rebuilt_from_encoded_composite_with_degree(
+        db, path, index, program, sorted, validation, 1,
+    )
+}
+
+fn create_rebuilt_from_encoded_composite_with_degree(
+    db: &Database,
+    path: PathBuf,
+    index: &IndexSchema,
+    program: Arc<CompiledIndexKeyProgram>,
+    sorted: EncodedSortedRecords,
+    validation: &mut Option<IndexBuildValidation>,
+    degree: usize,
 ) -> Result<IndexFile, QueryError> {
     let mut page_key = Vec::new();
     let mut previous = Vec::new();
@@ -1142,6 +1164,7 @@ fn create_rebuilt_from_encoded_composite(
         db.log.clone(),
         db.config.durability,
         db.buffer_pool.clone(),
+        degree,
     )
 }
 
@@ -1153,13 +1176,28 @@ fn create_rebuilt_from_encoded_sorted(
     sorted: EncodedSortedRecords,
     validation: &mut Option<IndexBuildValidation>,
 ) -> Result<IndexFile, QueryError> {
+    create_rebuilt_from_encoded_sorted_with_degree(db, path, index, program, sorted, validation, 1)
+}
+
+fn create_rebuilt_from_encoded_sorted_with_degree(
+    db: &Database,
+    path: PathBuf,
+    index: &IndexSchema,
+    program: Arc<CompiledIndexKeyProgram>,
+    sorted: EncodedSortedRecords,
+    validation: &mut Option<IndexBuildValidation>,
+    degree: usize,
+) -> Result<IndexFile, QueryError> {
     // Three or more parts cannot use any existing compact leaf layout.
     // Keep narrow and interned layouts on their existing dense writers.
     if db.config.durability != DurabilityMode::Memory
-        && program.index.columns.len() + program.index.included_columns.len() >= 3
+        && (index.is_fulltext()
+            || program.index.columns.len() + program.index.included_columns.len() >= 3)
         && !matches!(&sorted, EncodedSortedRecords::Interned { .. })
     {
-        return create_rebuilt_from_encoded_composite(db, path, index, program, sorted, validation);
+        return create_rebuilt_from_encoded_composite_with_degree(
+            db, path, index, program, sorted, validation, degree,
+        );
     }
     if program.physical_lane != EncodedPhysicalLane::Generic
         || matches!(&sorted, EncodedSortedRecords::Interned { .. })
@@ -1194,6 +1232,7 @@ fn create_rebuilt_from_encoded_sorted(
                 db.log.clone(),
                 db.config.durability,
                 db.buffer_pool.clone(),
+                degree,
             );
         }
         sorted => sorted,
@@ -2101,13 +2140,20 @@ impl EncodedIndexSorter {
     /// records. High-cardinality samples keep the existing arena/descriptor
     /// oracle unchanged.
     fn maybe_promote_variable_dictionary(&mut self) -> Result<(), QueryError> {
+        self.maybe_promote_variable_dictionary_after(VARIABLE_DICTIONARY_SAMPLE_ROWS)
+    }
+
+    fn maybe_promote_variable_dictionary_after(
+        &mut self,
+        sample_rows: usize,
+    ) -> Result<(), QueryError> {
         let should_sample = matches!(
             &self.storage,
             EncodedSortStorage::Variable {
                 records,
                 dictionary_sampled: false,
                 ..
-            } if records.len() >= VARIABLE_DICTIONARY_SAMPLE_ROWS
+            } if records.len() >= sample_rows
         );
         if !should_sample {
             return Ok(());
@@ -2139,12 +2185,16 @@ impl EncodedIndexSorter {
             return Ok(());
         }
 
-        let mut keys = Vec::with_capacity(VARIABLE_DICTIONARY_SAMPLE_DISTINCT_MAX);
-        let mut lookup = hashbrown::HashMap::with_capacity_and_hasher(
-            VARIABLE_DICTIONARY_SAMPLE_DISTINCT_MAX,
-            ahash::RandomState::new(),
-        );
+        let initial_keys = records
+            .len()
+            .min(VARIABLE_DICTIONARY_SAMPLE_DISTINCT_MAX)
+            .min(dictionary_budget / 1024)
+            .max(1);
+        let mut keys = Vec::with_capacity(initial_keys);
+        let mut lookup =
+            hashbrown::HashMap::with_capacity_and_hasher(initial_keys, ahash::RandomState::new());
         let mut packed = Vec::with_capacity(record_capacity.max(records.len()));
+        let mut dictionary_bytes = 0usize;
         for descriptor in &records {
             let pending = EncodedPendingIndexRecord {
                 order_key: smallvec::SmallVec::from_slice(descriptor_order_key(&arena, descriptor)),
@@ -2154,8 +2204,14 @@ impl EncodedIndexSorter {
                 },
                 has_null: descriptor.has_null,
             };
+            let prior = keys.len();
             let key_id = Self::intern_pending_key(&mut keys, &mut lookup, pending)?;
-            if keys.len() > VARIABLE_DICTIONARY_SAMPLE_DISTINCT_MAX {
+            if keys.len() != prior {
+                dictionary_bytes += interned_key_capacity_bytes(&keys[key_id as usize]);
+            }
+            if keys.len() > VARIABLE_DICTIONARY_SAMPLE_DISTINCT_MAX
+                || dictionary_bytes > dictionary_budget
+            {
                 self.storage = EncodedSortStorage::Variable {
                     arena,
                     records,
@@ -2166,6 +2222,7 @@ impl EncodedIndexSorter {
             packed.push(pack_interned_record(key_id, key_id, descriptor.row_id));
         }
         self.storage = EncodedSortStorage::Interned {
+            dictionary_bytes,
             keys,
             lookup,
             records: packed,
@@ -2380,9 +2437,14 @@ impl EncodedIndexSorter {
                 keys,
                 lookup,
                 records,
+                dictionary_bytes,
                 ..
             } => {
+                let previous_len = keys.len();
                 let key_id = Self::intern_pending_key(keys, lookup, pending)?;
+                if keys.len() != previous_len {
+                    *dictionary_bytes += interned_key_capacity_bytes(&keys[key_id as usize]);
+                }
                 records.push(pack_interned_record(key_id, key_id, row_id));
             }
         }
@@ -2430,18 +2492,13 @@ impl EncodedIndexSorter {
                     || records.len() == records.capacity()
             }
             EncodedSortStorage::Interned {
-                keys,
                 records,
                 dictionary_budget,
+                dictionary_bytes,
                 ..
             } => {
-                let key_bytes = keys.iter().fold(0usize, |total, key| {
-                    total
-                        .saturating_add(key.order_key.capacity())
-                        .saturating_add(key.materialized_key.as_ref().map_or(0, Vec::capacity))
-                });
                 records.len() == records.capacity()
-                    || key_bytes
+                    || dictionary_bytes
                         .saturating_add(order_bytes)
                         .saturating_add(payload_bytes)
                         > *dictionary_budget
@@ -2657,11 +2714,13 @@ impl EncodedIndexSorter {
                 keys,
                 lookup,
                 records,
+                dictionary_bytes,
                 ..
             } => {
                 keys.clear();
                 lookup.clear();
                 records.clear();
+                *dictionary_bytes = 0;
             }
         }
     }

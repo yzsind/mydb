@@ -79,6 +79,13 @@ fn parse_env_usize(key: &str, default: usize) -> usize {
 pub trait Tokenizer: Send + Sync {
     /// Split a piece of text into normalized tokens (duplicates included, order preserved).
     fn tokenize(&self, text: &str) -> Vec<String>;
+    /// Visit normalized tokens without allocating a token vector. Implementations
+    /// may borrow unchanged text; the default preserves the tokenization oracle.
+    fn visit_tokens<'a>(&self, text: &'a str, visit: &mut dyn FnMut(std::borrow::Cow<'a, str>)) {
+        for token in self.tokenize(text) {
+            visit(std::borrow::Cow::Owned(token));
+        }
+    }
     /// MySQL `WITH PARSER` name: `""` for the default tokenizer (not displayed), `"ngram"` for ngram.
     /// SHOW CREATE TABLE / catalog use the persisted `FulltextMeta.parser` (no tokenizer rebuild
     /// needed), so this method currently serves only tokenizer self-description and tests.
@@ -187,6 +194,28 @@ impl DefaultTokenizer {
 }
 
 impl Tokenizer for DefaultTokenizer {
+    fn visit_tokens<'a>(&self, text: &'a str, visit: &mut dyn FnMut(std::borrow::Cow<'a, str>)) {
+        if !text.is_ascii() {
+            for token in self.tokenize(text) {
+                visit(std::borrow::Cow::Owned(token));
+            }
+            return;
+        }
+        for word in text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+            if word.len() < self.cfg.min_token_size || word.len() > self.cfg.max_token_size {
+                continue;
+            }
+            let token = if word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(word.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(word)
+            };
+            if !is_stopword(&self.cfg, &token) {
+                visit(token);
+            }
+        }
+    }
+
     fn tokenize(&self, text: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();

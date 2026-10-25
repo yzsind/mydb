@@ -26,6 +26,16 @@ Column order does not matter. A missing matching index returns error 1191.
 `CREATE FULLTEXT INDEX` and `ALTER TABLE ... ADD FULLTEXT KEY` can also build
 indexes over existing rows. Prepared statements support `AGAINST(?)`.
 
+Persistent offline builds use the index-build worker budget for projected
+scanning, tokenization, sorting, spill consolidation, and leaf-page writes.
+Use `CREATE /*+ PARALLEL(8) */ FULLTEXT INDEX ft ON articles(body)` to request
+a degree, or `NO_PARALLEL` to force serial execution. The default degree is
+`MYDB_PARALLEL_DEGREE` (2 when unset); `MYDB_PARALLEL_DISABLE` takes precedence.
+Workers share a governed scratch envelope and spill bounded runs when it is
+exhausted. Repeated posting keys can use compact dictionary records, while
+high-cardinality inputs use the external merge path. Query execution, online
+backfills, and memory-only builds keep their existing execution strategies.
+
 ## Search modes
 
 Natural-language mode returns the union of indexed query terms. Repeated query

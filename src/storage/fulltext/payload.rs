@@ -173,7 +173,7 @@ impl FtPayload {
 }
 
 /// LEB128 unsigned varint write.
-fn write_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let mut byte = (v & 0x7f) as u8;
         v >>= 7;
