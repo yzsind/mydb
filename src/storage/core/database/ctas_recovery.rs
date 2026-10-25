@@ -27,7 +27,7 @@ impl Database {
             return Ok(None);
         }
         let table = self.table(table_name)?;
-        let drop = self.build_drop_table_intent(&table);
+        let drop = self.build_drop_table_intent(&table)?;
         let intent = CtasIntent {
             txn_id,
             load_committed: false,

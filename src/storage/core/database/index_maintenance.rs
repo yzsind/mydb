@@ -3045,8 +3045,11 @@ impl Database {
         self.lock_row_nonblocking(txn.txn_id, table.id, row_id)?;
         self.push_undo_deferred(txn.txn_id, UndoKind::Insert, table.id, row_id, None, None)?;
         self.insert_indexes_deferred(txn.txn_id, table, &values, row_id)?;
-        // Keep any warm HNSW graph current (no-op without a vector index).
-        self.note_vector_inserts(table, &values, row_id, table.id);
+        // The storage single-row API shares the same durable commit journal
+        // and rollback/savepoint semantics as executor batches.
+        if let Some(undo_id) = self.deferred_ann_undo_head(txn.txn_id, table)? {
+            self.defer_vector_update(txn.txn_id, undo_id, table, row_id, table.id, None, &values)?;
+        }
         Ok(row_id)
     }
 

@@ -300,7 +300,7 @@ impl Database {
     /// Enumerate every physical file the table owns, while the catalog still
     /// resolves its `(database, name)` (path helpers route through
     /// `table_loc_fs`, which only works before the catalog row is removed).
-    fn build_drop_table_intent(&self, table: &TableSchema) -> DropTableIntent {
+    fn build_drop_table_intent(&self, table: &TableSchema) -> Result<DropTableIntent, QueryError> {
         let mut files = Vec::new();
         let mut vector_files = Vec::new();
         for sid in table.storage_ids() {
@@ -310,20 +310,11 @@ impl Database {
             for index in &table.indexes {
                 files.push(self.relative_path(&self.index_path(sid, &index.name)));
                 if index.is_vector() {
-                    vector_files.push(self.relative_path(&self.vector_index_path(
-                        table,
-                        &index.name,
-                        sid,
-                    )));
-                    vector_files.push(self.relative_path(&self.vector_index_paged_path(
-                        table,
-                        &index.name,
-                        sid,
-                    )));
+                    vector_files.extend(self.owned_vector_files(table, index, sid)?.iter().map(|path| self.relative_path(path)));
                 }
             }
         }
-        DropTableIntent {
+        Ok(DropTableIntent {
             table_id: table.id,
             retired_index: None,
             had_auto_increment: table.auto_increment_column_index().is_some(),
@@ -331,7 +322,7 @@ impl Database {
             table_name: table.name.clone(),
             files,
             vector_files,
-        }
+        })
     }
 
     /// Persist a drop intent (fsync'd). Returns `None` in memory-durability mode
@@ -429,7 +420,6 @@ impl Database {
             }
             // Make cleanup replayable before unlinking any file.
             if max_lsn > 0
-                && intent.retired_index.is_none()
                 && self.config.durability != DurabilityMode::Memory
             {
                 self.sync_commit_lsn(max_lsn)?;

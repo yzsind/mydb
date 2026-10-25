@@ -69,15 +69,17 @@ pub fn parse_boolean_query(
         ))
     };
     let mut clauses = Vec::new();
+    let malformed = || {
+        crate::error::catalog::ER_PARSE_ERROR
+            .error("Invalid operand in MATCH ... AGAINST(... IN BOOLEAN MODE)")
+    };
     let mut chars = query.chars().peekable();
     while let Some(&ch) = chars.peek() {
         if ch.is_whitespace() {
             chars.next();
             continue;
         }
-        // Reject unsupported top-level operators up front — mid-word we still
-        // let them pass into the tokenizer (a URL like `a>b` becomes tokens
-        // `a`/`b` there and stops meaning "weight-up").
+        // Operators outside quoted phrases must never become plain tokens.
         if matches!(ch, '(' | ')' | '>' | '<' | '~' | '@') {
             return Err(unsupported_op(ch));
         }
@@ -92,14 +94,26 @@ pub fn parse_boolean_query(
             }
             _ => Occur::Should,
         };
+        if occur != Occur::Should
+            && chars
+                .peek()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, '+' | '-'))
+        {
+            return Err(malformed());
+        }
         if matches!(chars.peek(), Some('"')) {
             chars.next(); // opening quote
             let mut phrase = String::new();
+            let mut closed = false;
             for c in chars.by_ref() {
                 if c == '"' {
+                    closed = true;
                     break;
                 }
                 phrase.push(c);
+            }
+            if !closed {
+                return Err(malformed());
             }
             let tokens = tokenizer.tokenize(&phrase);
             if !tokens.is_empty() {
@@ -116,6 +130,9 @@ pub fn parse_boolean_query(
             if c.is_whitespace() || c == '"' {
                 break;
             }
+            if matches!(c, '(' | ')' | '>' | '<' | '~' | '@') {
+                return Err(unsupported_op(c));
+            }
             word.push(c);
             chars.next();
             if c == '*' {
@@ -128,6 +145,9 @@ pub fn parse_boolean_query(
                 }
                 break;
             }
+        }
+        if word.ends_with(['+', '-']) {
+            return Err(malformed());
         }
         if let Some(stripped) = word.strip_suffix('*') {
             let prefix = stripped.to_lowercase();

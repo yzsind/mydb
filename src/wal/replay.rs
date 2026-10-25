@@ -608,7 +608,9 @@ impl ReplayRecords {
 fn type_has_redo_path(ty: WalRecordType) -> bool {
     matches!(
         ty,
-        WalRecordType::FileClr
+        WalRecordType::VectorIndexManifest
+            | WalRecordType::VectorIndexImage
+            | WalRecordType::FileClr
             | WalRecordType::FileCreate
             | WalRecordType::FileDelete
             | WalRecordType::FileExtend
@@ -629,7 +631,9 @@ fn type_has_redo_path(ty: WalRecordType) -> bool {
 }
 fn payload_redo_path(payload: &WalPayload) -> Option<&str> {
     match payload {
-        WalPayload::FileClr { path, .. }
+        WalPayload::VectorIndexManifest { path, .. }
+        | WalPayload::VectorIndexImage { path, .. }
+        | WalPayload::FileClr { path, .. }
         | WalPayload::FileCreate { path, .. }
         | WalPayload::FileDelete { path, .. }
         | WalPayload::FileExtend { path, .. }

@@ -11,8 +11,7 @@ use crate::planner::{
 use crate::storage::schema::KeyPart;
 use crate::storage::{HeapHandle, IndexHandle};
 use crate::util::fast_hash::{
-    ah_hash_map, ah_hash_map_with_capacity, ah_hash_set, ah_hash_set_with_capacity, AhHashMap,
-    AhHashSet,
+    ah_hash_map, ah_hash_map_with_capacity, ah_hash_set, AhHashMap, AhHashSet,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -20,6 +19,7 @@ mod window;
 #[cfg(test)]
 pub(in crate::engine::executor) use window::WINDOW_RANK_PREFILTER_REJECTED;
 pub(super) use window::*;
+mod fulltext_source;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;

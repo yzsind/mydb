@@ -62,6 +62,8 @@ const BACKUP_DIRS: &[&str] = &["schemas", "objects", "system/catalog", "system/u
 const BACKUP_FILES: &[&str] = &[
     "system/commit-ledger.v1",
     "system/history-index.v1",
+    "system/vector-purges.v1",
+        "system/vector-maintenance.jobs",
     "system/commit-clock.v1",
 ];
 
@@ -380,16 +382,6 @@ fn collect_files(
         // DD B-trees are different: v46 uses them to assemble lazy
         // descriptors before user-index validation can run, so the sharp,
         // writer-frozen checkpoint must include mysql dictionary indexes.
-        let is_dd_index = next_prefix.starts_with("system/catalog/")
-            && path.extension().and_then(|ext| ext.to_str()) == Some("idx");
-        if !is_dd_index
-            && matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("idx" | "hnsw" | "hvec")
-            )
-        {
-            continue;
-        }
         if path.extension().and_then(|ext| ext.to_str()) == Some("zm") && !is_paged_zone_map(&path)?
         {
             continue;
@@ -820,6 +812,8 @@ const INSTALL_TARGETS: &[&str] = &[
     "system/commit-ledger.v1",
     "system/commit-clock.v1",
     "system/history-index.v1",
+    "system/vector-purges.v1",
+        "system/vector-maintenance.jobs",
     "ddl",
     "system/replication/replica_progress.json",
     "system/replication/role.json",
@@ -1276,13 +1270,15 @@ mod tests {
     }
 
     #[test]
-    fn native_vector_base_backup_rebuilds_derived_index() {
+    fn base_backup_preserves_important_vector_and_fulltext_indexes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("1.hvec"), b"derived native vector index").unwrap();
         std::fs::write(dir.path().join("2.idx"), b"derived btree").unwrap();
         let mut files = Vec::new();
         collect_files(dir.path(), "objects/indexes/1/1", &mut files).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| file.1.path.ends_with("1.hvec")));
+        assert!(files.iter().any(|file| file.1.path.ends_with("2.idx")));
     }
 
     #[test]

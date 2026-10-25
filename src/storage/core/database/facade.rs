@@ -349,6 +349,10 @@ impl Database {
             // Clean up hash join spill temp directories left by an abnormally exited previous process.
             crate::engine::executor::select::grace::cleanup_orphan_tmp_dirs(&data_dir);
         }
+        if data_dir.join("system/index-maintenance.failed").try_exists().map_err(io_err)? {
+            return Err(error(crate::error::catalog::ER_INDEX_CORRUPT,
+                "persistent vector maintenance failure requires explicit repair; recovery has preserved the failed files"));
+        }
         if config.durability != DurabilityMode::Memory {
             validate_heap_file_lengths(&data_dir)?;
         }
@@ -533,7 +537,8 @@ impl Database {
         };
         // All transaction/undo/log consumers are finished. Only zone deltas
         // remain; release the general recovery directory before index builds.
-        let zone_replay = scan.select(&[ReplayType::ZoneMapMergeBatch])?;
+        let zone_replay = scan.select(&[ReplayType::ZoneMapMergeBatch, ReplayType::VectorIndexBatch, ReplayType::VectorIndexModel, ReplayType::VectorIndexComplete, ReplayType::VectorIndexImage,
+            ReplayType::CommitTxn, ReplayType::AbortTxn, ReplayType::EndTxn, ReplayType::RollbackTo])?;
         crate::engine::executor::mem_budget::validate_controlled_memory_split(
             runtime_config.buffer_pool_pages,
         )?;
@@ -648,6 +653,15 @@ impl Database {
             zone_map_retirement_epoch: AtomicU64::new(0),
             pending_vector_deletes: Mutex::new(Default::default()),
             vector_commits_publishing: parking_lot::Mutex::new(Default::default()),
+            vector_recovery_active: AtomicBool::new(false),
+            #[cfg(test)]
+            vector_persist_failure: AtomicU64::new(0),
+            vector_pending_wal: parking_lot::Mutex::new(BTreeMap::new()),
+            vector_copy_publications: parking_lot::Mutex::new(HashSet::new()),
+            replica_vector_state: parking_lot::Mutex::new(ReplicaVectorState::default()),
+            replica_vector_signal: parking_lot::Condvar::new(),
+            vector_retired_graphs: parking_lot::Mutex::new(HashMap::new()),
+            vector_snapshot_dirty: parking_lot::Mutex::new(HashSet::new()),
             recovered_vector_completion: parking_lot::Mutex::new(()),
             hnsw_tombstones_rolled_back: AtomicU64::new(0),
             vector_indexes: parking_lot::RwLock::new(Default::default()),
@@ -659,7 +673,10 @@ impl Database {
             replicated_hnsw_dirty: parking_lot::Mutex::new(HashMap::new()),
             vector_build_locks: parking_lot::Mutex::new(Default::default()),
             vector_build_backoff: parking_lot::Mutex::new(Default::default()),
-            vector_purge_queue: parking_lot::Mutex::new(VecDeque::new()),
+            vector_purge_queue: parking_lot::Mutex::new(VectorPurgeQueue::new()),
+            vector_purge_snapshot_gate: parking_lot::RwLock::new(()),
+            vector_purge_drain_gate: parking_lot::Mutex::new(()),
+            vector_purge_recovery_charge: parking_lot::Mutex::new(None),
             vector_purges_pending: AtomicUsize::new(0),
             persisted_variables: std::sync::OnceLock::new(),
             log,
@@ -787,6 +804,10 @@ impl Database {
             #[cfg(test)]
             online_copy_publish_test_hook: Mutex::new(None),
             #[cfg(test)]
+            vector_copy_committed_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            vector_apply_test_hook: Mutex::new(None),
+            #[cfg(test)]
             online_index_validation_test_hook: Mutex::new(None),
         };
         for (table_id, (version, max_value, lsn)) in auto_increment_recovery {
@@ -848,6 +869,11 @@ impl Database {
         }
         #[cfg(not(test))]
         db.load_or_bootstrap_catalog()?;
+        if db.data_dir.join("system/index-maintenance.failed").try_exists().map_err(io_err)? {
+            return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "persistent vector maintenance worker failure requires explicit repair"));
+        }
+
+        db.load_vector_purge_ledger()?;
         // No live read transaction survives restart. Historical reads still
         // need snapshot-specific descriptors, including lazily loaded ones.
         db.read_definition_highwater
@@ -944,6 +970,17 @@ impl Database {
                 zone_replay_started.elapsed().as_millis()
             ));
         }
+        db.replay_persistent_vector_wal(&zone_replay)?;
+        if !snapshot_read_only && !db.physical_replica_mode() && db.open_mode != DatabaseOpenMode::SealBaseline {
+            while db.vector_purges_pending.load(Ordering::Acquire) != 0 {
+                let completed = db.drain_vector_purges();
+                db.ensure_operational()?;
+                if completed == 0 { return Err(vector::persistence::corrupt()); }
+            }
+        }
+        db.restore_prepared_vector_mutations(&zone_replay)?;
+        db.restore_replica_vector_completion(&zone_replay)?;
+        if db.open_mode == DatabaseOpenMode::ReadWrite && !db.physical_replica_mode() { db.resume_failed_vector_jobs()?; }
         drop(zone_replay);
         // Re-publish XA branches whose `PrepareTxn` records survived the
         // crash. `TransactionManager::from_wal` already marked the
@@ -1083,7 +1120,7 @@ impl Database {
         // paged HNSW query image so the first KNN after restart / failover
         // cannot race a background cache build.
         if !snapshot_read_only {
-            db.vector_graph_preload_all();
+            db.vector_graph_preload_all()?;
         }
         #[cfg(test)]
         if let Some(fixture_sync) = fixture_sync {

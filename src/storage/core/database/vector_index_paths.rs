@@ -14,15 +14,8 @@ impl Database {
         storage_id: u64,
         paged: bool,
     ) -> Result<(), QueryError> {
-        let memory = self.vector_index_path(table, &index.name, storage_id);
-        let paged_path = self.vector_index_paged_path(table, &index.name, storage_id);
-        let conflict = if paged {
-            // Memory IVF currently has no durable sidecar, so there is no
-            // conflicting artifact to detect in that direction.
-            index.vector_algo() == VectorAlgo::Hnsw && memory.exists()
-        } else {
-            paged_path.exists()
-        };
+        let manifest = self.read_vector_manifest(table, index, storage_id)?;
+        let conflict = manifest.is_some_and(|manifest| manifest.resident == paged);
         if conflict {
             return Err(crate::storage::error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!(
@@ -97,11 +90,87 @@ impl Database {
         table: &TableSchema,
         index_name: &str,
         storage_id: u64,
-    ) -> [PathBuf; 2] {
+    ) -> [PathBuf; 3] {
         [
             self.vector_index_path(table, index_name, storage_id),
             self.vector_index_paged_path(table, index_name, storage_id),
+            self.vector_index_paged_path(table, index_name, storage_id)
+                .with_extension("vmanifest"),
         ]
+    }
+
+    fn owned_vector_files(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        storage_id: u64,
+    ) -> Result<Vec<PathBuf>, QueryError> {
+        self.owned_vector_files_parts(storage_id, table.active_generation.max(1), index.index_id)
+    }
+
+    fn owned_vector_files_parts(
+        &self,
+        storage_id: u64,
+        generation: u64,
+        index_id: u64,
+    ) -> Result<Vec<PathBuf>, QueryError> {
+        let mut paths = ["hnsw", "hvec", "vmanifest"]
+            .map(|ext| self.vector_index_path_for_parts(storage_id, generation, index_id, ext))
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if let Some(manifest) = self.read_vector_manifest_parts(storage_id, generation, index_id)? {
+            for (owner, physical) in
+                std::iter::once((manifest.physical_storage_id, manifest.active))
+                    .chain(manifest.retired)
+            {
+                let mut path = self
+                    .vector_index_path_for_parts(owner, generation, index_id, "hvec")
+                    .parent()
+                    .unwrap()
+                    .join(format!("{index_id}.vector"))
+                    .join(format!("{physical}.hvec"));
+                if manifest.resident {
+                    path.set_extension("hnsw");
+                }
+                paths.insert(path.with_extension(format!(
+                    "{}.vpub",
+                    path.extension().unwrap().to_string_lossy()
+                )));
+                paths.insert(path);
+            }
+        }
+        // Include interrupted private publications owned by this exact index.
+        let directory = self
+            .vector_index_path_for_parts(storage_id, generation, index_id, "hvec")
+            .parent()
+            .unwrap()
+            .join(format!("{index_id}.vector"));
+        match fs::read_dir(directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(io_err)?;
+                    if !entry.file_type().map_err(io_err)?.is_file() {
+                        return Err(vector::persistence::corrupt());
+                    }
+                    paths.insert(entry.path());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_err(err)),
+        }
+        paths.insert(self.vector_index_path_for_parts(
+            storage_id,
+            generation,
+            index_id,
+            "vector.failed",
+        ));
+        paths.insert(self.vector_index_path_for_parts(
+            storage_id,
+            generation,
+            index_id,
+            "vmaintenance",
+        ));
+        Ok(paths.into_iter().collect())
     }
 
     /// Remove all vector backend files for one index/partition. Buffer-pool
@@ -111,43 +180,36 @@ impl Database {
         table: &TableSchema,
         storage_id: u64,
         index_name: &str,
-    ) {
-        self.remove_partition_vector_files_for_parts(
-            &table.database,
-            &table.name,
-            table.id,
-            storage_id,
-            index_name,
-        );
-    }
-
-    fn remove_partition_vector_files_for_parts(
-        &self,
-        database: &str,
-        table_name: &str,
-        table_id: u64,
-        storage_id: u64,
-        index_name: &str,
-    ) {
-        let table = self.table_by_id(table_id);
-        let generation = table
-            .as_ref()
-            .map(|table| table.active_generation.max(1))
-            .unwrap_or(1);
-        let index_id = table
-            .and_then(|table| {
-                table
-                    .indexes
-                    .iter()
-                    .find(|index| index.name.eq_ignore_ascii_case(index_name))
-                    .map(|index| index.index_id)
-            })
-            .unwrap_or_else(|| stable_missing_index_id(index_name));
-        for ext in ["hnsw", "hvec"] {
-            let _ = (database, table_name);
-            let path = self.vector_index_path_for_parts(storage_id, generation, index_id, ext);
-            let _ = self.buffer_pool.discard_pages_for_path(&path);
-            let _ = fs::remove_file(path);
+    ) -> Result<(), QueryError> {
+        let Some(index) = table
+            .indexes
+            .iter()
+            .find(|index| index.name.eq_ignore_ascii_case(index_name))
+        else {
+            return Ok(());
+        };
+        let paths = self.owned_vector_files(table, index, storage_id)?;
+        let mut last = 0;
+        if self.durability_mode() != DurabilityMode::Memory && !is_temp_table_id(storage_id) {
+            for path in &paths {
+                last = self.append_wal(
+                    0,
+                    WalPayload::FileDelete {
+                        path: self.relative_path(path),
+                        before: Vec::new(),
+                    },
+                )?;
+            }
+            crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         }
+        for path in paths {
+            self.buffer_pool.discard_pages_for_path(&path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_err(err)),
+            }
+        }
+        Ok(())
     }
 }

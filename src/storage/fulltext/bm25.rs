@@ -7,7 +7,7 @@
 //! row count, floored to `max(df, candidates.len(), 1)` to keep IDF positive; `avgdl` approximates to
 //! the mean of known doc_len in the **candidate set** (exact whole-store doc_len needs a full heap scan; the MySQL-style approximation is the chosen tradeoff).
 //!
-//! Formula (same as the MySQL InnoDB / Lucene defaults):
+//! Formula (Lucene-style BM25; not a promise of MySQL score equality):
 //! ```text
 //! IDF(t)   = ln( (N - df + 0.5) / (df + 0.5) + 1 )
 //! score(D) = Σ_t  IDF(t) · ( tf · (k1 + 1) )

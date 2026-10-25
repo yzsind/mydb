@@ -16,6 +16,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  PYTHONDONTWRITEBYTECODE: 1
 
 jobs:
   dependency-safety:
@@ -42,15 +43,15 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --locked --all-targets --all-features
       - run: scripts/render_storage_format_versions.sh --check
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_tests.py
       # The repository still has a sizeable style-warning backlog. Keep new
       # correctness/suspicious defects blocking while that backlog is reduced.
       - run: cargo clippy --locked --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
 
-  test:
-    name: Test (${{ matrix.features }})
+  test-build:
+    name: Build tests (${{ matrix.features }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -63,14 +64,66 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
-      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.features }}
+          shared-key: ${{ matrix.features }}-test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.149
+      - run: mkdir -p /tmp/mydb
       - if: matrix.features == 'default'
-        run: cargo nextest run --locked --no-fail-fast
+        run: cargo nextest archive --locked --archive-file /tmp/mydb/tests.tar.zst
       - if: matrix.features == 'no-mysql-replica'
-        run: cargo nextest run --locked --no-default-features --features tls,fast-alloc --no-fail-fast
+        run: cargo nextest archive --locked --no-default-features --features tls,fast-alloc --archive-file /tmp/mydb/tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.features }}
+          path: /tmp/mydb/tests.tar.zst
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 1
+
+  test-shard:
+    name: Test (${{ matrix.features }}, shard ${{ matrix.shard }}/3)
+    needs: test-build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, no-mysql-replica]
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.149
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-${{ matrix.features }}
+          path: /tmp/mydb/test-archive
+      - run: >-
+          python3 scripts/run_ci_tests.py
+          --archive /tmp/mydb/test-archive/tests.tar.zst
+          --output /tmp/mydb/test-run
+          -- --no-fail-fast --partition hash:${{ matrix.shard }}/3
+
+  # Retain the feature-level status checks, including when a build/shard fails.
+  test:
+    name: Test (${{ matrix.features }})
+    if: always()
+    needs: [test-build, test-shard]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, no-mysql-replica]
+    steps:
+      - name: Require all test builds and partitions
+        env:
+          BUILD_RESULT: ${{ needs.test-build.result }}
+          TEST_RESULT: ${{ needs.test-shard.result }}
+        run: test "$BUILD_RESULT" = success && test "$TEST_RESULT" = success
 
   native-readiness:
     name: Native recovery and binary protocol gates
@@ -145,6 +198,18 @@ jobs:
 
   platform-check:
     name: macOS compile and release smoke
+    if: always()
+    needs: [macos-check, macos-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require macOS compile and release smoke
+        env:
+          CHECK_RESULT: ${{ needs.macos-check.result }}
+          RELEASE_RESULT: ${{ needs.macos-release.result }}
+        run: test "$CHECK_RESULT" = success && test "$RELEASE_RESULT" = success
+
+  macos-check:
+    name: macOS all-feature compile
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -153,22 +218,35 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos
+          key: macos-check
       - run: cargo check --locked --all-targets --all-features
-      - run: cargo run --locked --release --bin mydb -- --help
 
-  mtr-non-regression:
-    name: MySQL MTR semantic non-regression
-    runs-on: ubuntu-24.04
+  macos-release:
+    name: macOS release smoke
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
-      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          key: mtr
+          key: macos-release
+      - run: cargo run --locked --release --bin mydb -- --help
+
+  mtr-non-regression:
+    name: MySQL MTR semantic non-regression
+    needs: test-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.149
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-default
+          path: /tmp/mydb/test-archive
       # GPL upstream inputs remain uncommitted; fetch the pinned oracle used by
       # scripts/mtr_import.sh and hold this high-signal cluster to its audited
       # statement-level blocker budget. The budget may only move downward.
@@ -181,7 +259,11 @@ jobs:
           MYDB_MTR_TRIAGE_MAX_BLOCKERS: 0
           MYDB_MTR_TRIAGE_ALLOWLIST: scripts/mtr_ci_diff_allowlist.json
           MYDB_MTR_TRIAGE_REPORT_DIR: /tmp/mydb/mtr-report
-        run: cargo nextest run --locked --run-ignored only --no-capture mtr_triage
+        run: >-
+          python3 scripts/run_ci_tests.py
+          --archive /tmp/mydb/test-archive/tests.tar.zst
+          --output /tmp/mydb/mtr-run
+          -- --run-ignored only --no-capture mtr_triage
       - if: always()
         uses: actions/upload-artifact@v4
         with:

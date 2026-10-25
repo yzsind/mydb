@@ -1497,7 +1497,8 @@ fn bug_fulltext_prefix_scan_matches_sorted_model() {
         index
             .read()
             .fulltext_scan_prefix(prefix, None, |token, row, payload| {
-                got.push((token.to_owned(), row, payload.to_vec()))
+                got.push((token.to_owned(), row, payload.to_vec()));
+                Ok(())
             })
             .unwrap();
         let expected = entries

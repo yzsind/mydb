@@ -74,7 +74,7 @@ def download_nextest(output):
     return binary
 
 
-def runtime_nextest_config(config, seed_binary):
+def runtime_nextest_config(config, seed_binary, *, test_harness=False):
     """Adapt only the shared seed generator, preserving runtime test policy."""
     error = 'nextest setup configuration changed; update the runtime adapter'
     try:
@@ -91,7 +91,10 @@ def runtime_nextest_config(config, seed_binary):
     section = re.search(r'(?ms)^\[scripts\.setup\.mydb-test-seed\][ \t]*(?:#[^\n]*)?\n(.*?)(?=^\[|\Z)', config)
     if section is None:
         raise SystemExit(error)
-    runtime_command = shlex.quote(str(seed_binary))
+    runtime_args = [str(seed_binary)]
+    if test_harness:
+        runtime_args += ['--ignored', '--exact', 'test_seed_setup::prepare_nextest_seed']
+    runtime_command = shlex.join(runtime_args)
     body, count = re.subn(r'(?m)^[ \t]*command[ \t]*=.*$',
                          lambda _: 'command = ' + json.dumps(runtime_command), section[1])
     if count != 1:

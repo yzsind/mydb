@@ -153,7 +153,7 @@ impl Trainer {
             return Ok(None);
         }
         let mut model = Model {
-            version: 1,
+            version: 2,
             config: self.config.clone(),
             datatype: self.datatype,
             dimension: self.dimension,
@@ -314,8 +314,106 @@ impl Quantizer {
         &self,
         config: Option<&crate::storage::vector_config::VectorIndexConfig>,
     ) -> Result<Vec<u8>, QueryError> {
-        serde_json::to_vec(&(config, &self.model)).map_err(|e| codec::vector_err(e.to_string()))
+        let mut bytes = Vec::new();
+        let mut writer = super::persistence::Writer::new(&mut bytes, 8).map_err(super::persistence::io_error)?;
+        writer.u32(2).map_err(super::persistence::io_error)?;
+        writer.u8(self.model.datatype as u8).map_err(super::persistence::io_error)?;
+        writer.u32(self.model.dimension).map_err(super::persistence::io_error)?;
+        writer.u8(self.model.metric).map_err(super::persistence::io_error)?;
+        writer.u64(self.model.trained_rows as u64).map_err(super::persistence::io_error)?;
+        writer.bytes(&serde_json::to_vec(&self.model.config).map_err(|_| super::persistence::corrupt())?).map_err(super::persistence::io_error)?;
+        writer.bytes(&serde_json::to_vec(&config).map_err(|_| super::persistence::corrupt())?).map_err(super::persistence::io_error)?;
+        fn put_floats(writer: &mut super::persistence::Writer<&mut Vec<u8>>, values: &[f64]) -> Result<(), QueryError> {
+            writer.count(values.len()).map_err(super::persistence::io_error)?;
+            for value in values {
+                if !value.is_finite() { return Err(super::persistence::corrupt()); }
+                writer.u64(value.to_bits()).map_err(super::persistence::io_error)?;
+            }
+            Ok(())
+        }
+        for values in [&self.model.low, &self.model.high, &self.model.scale] { put_floats(&mut writer, values)?; }
+        writer.count(self.model.centers.len()).map_err(super::persistence::io_error)?;
+        for center in &self.model.centers { put_floats(&mut writer, center)?; }
+        writer.count(self.model.offsets.len()).map_err(super::persistence::io_error)?;
+        for offset in &self.model.offsets { writer.count(*offset).map_err(super::persistence::io_error)?; }
+        writer.finish().map_err(super::persistence::io_error)?;
+        Ok(bytes)
     }
+
+    pub(crate) fn matches_definition(&self, datatype: VectorDataType, dimension: u32, metric: Metric,
+        config: &QuantizationConfig) -> bool {
+        self.model.datatype == datatype && self.model.dimension == dimension
+            && self.model.metric == metric.as_u8() && &self.model.config == config
+    }
+
+    pub(crate) fn deserialize(bytes: &[u8]) -> Result<Arc<Self>, QueryError> {
+        let mut reader = super::persistence::Reader::new(bytes, 8)?;
+        if reader.u32()? != 2 { return Err(super::persistence::corrupt()); }
+        let datatype = VectorDataType::from_tag(reader.u8()?).ok_or_else(super::persistence::corrupt)?;
+        let dimension = reader.u32()?;
+        let metric = reader.u8()?;
+        let trained_rows = usize::try_from(reader.u64()?).map_err(|_| super::persistence::corrupt())?;
+        if datatype == VectorDataType::Binary || dimension == 0 || dimension > datatype.max_dimension()
+            || metric > 2 || trained_rows == 0 { return Err(super::persistence::corrupt()); }
+        let config_bytes = reader.bytes()?;
+        if config_bytes.len() > 8192 { return Err(super::persistence::corrupt()); }
+        let config: QuantizationConfig = serde_json::from_slice(config_bytes).map_err(|_| super::persistence::corrupt())?;
+        let definition = reader.bytes()?;
+        if definition.len() > 8192 { return Err(super::persistence::corrupt()); }
+        let definition: Option<crate::storage::vector_config::VectorIndexConfig> =
+            serde_json::from_slice(definition).map_err(|_| super::persistence::corrupt())?;
+        if definition.as_ref().is_some_and(|definition| definition.quantization != config) { return Err(super::persistence::corrupt()); }
+        let d = dimension as usize;
+        let (parts, k, scalars) = match &config {
+            QuantizationConfig::Sq8 | QuantizationConfig::Sq4 => (0, 0, d * 3),
+            QuantizationConfig::Bq => (0, 0, d),
+            QuantizationConfig::Pq { m, bits, train_samples, iterations } => {
+                let parts = m.unwrap_or(dimension.div_ceil(8)) as usize;
+                if !matches!(bits, 4 | 8) || parts == 0 || parts > d || *iterations == 0
+                    || (*train_samples as usize) < (1usize << bits) || trained_rows < (1usize << bits) {
+                    return Err(super::persistence::corrupt());
+                }
+                let k = 1usize << bits;
+                (parts, k, d * k)
+            }
+            QuantizationConfig::None => return Err(super::persistence::corrupt()),
+        };
+        let charge = ControlledMemoryCharge::try_new_recoverable(ControlledMemoryCategory::DerivedCache,
+            scalars.saturating_mul(8).saturating_add(parts.saturating_mul(32)).saturating_add(4096))?;
+        fn read_floats(reader: &mut super::persistence::Reader<'_>, expected: usize) -> Result<Vec<f64>, QueryError> {
+            if reader.count(8)? != expected { return Err(super::persistence::corrupt()); }
+            let mut out = Vec::with_capacity(expected);
+            for _ in 0..expected {
+                let value = f64::from_bits(reader.u64()?);
+                if !value.is_finite() { return Err(super::persistence::corrupt()); }
+                out.push(value);
+            }
+            Ok(out)
+        }
+        let low = read_floats(&mut reader, if matches!(config, QuantizationConfig::Sq8 | QuantizationConfig::Sq4 | QuantizationConfig::Bq) { d } else { 0 })?;
+        let high = read_floats(&mut reader, if matches!(config, QuantizationConfig::Sq8 | QuantizationConfig::Sq4) { d } else { 0 })?;
+        let scale = read_floats(&mut reader, if matches!(config, QuantizationConfig::Sq8 | QuantizationConfig::Sq4) { d } else { 0 })?;
+        if low.iter().zip(&high).any(|(lo, hi)| lo > hi) || scale.iter().any(|value| *value < 0.0) {
+            return Err(super::persistence::corrupt());
+        }
+        if reader.count(4)? != parts { return Err(super::persistence::corrupt()); }
+        let mut centers = Vec::with_capacity(parts);
+        for part in 0..parts { centers.push(read_floats(&mut reader, k * (d / parts + usize::from(part < d % parts)))?); }
+        let offsets_count = reader.count(4)?;
+        if offsets_count != if parts == 0 { 0 } else { parts + 1 } { return Err(super::persistence::corrupt()); }
+        let mut offsets = Vec::with_capacity(offsets_count);
+        let mut expected = 0;
+        for part in 0..offsets_count {
+            let offset = reader.u32()? as usize;
+            if offset != expected { return Err(super::persistence::corrupt()); }
+            offsets.push(offset);
+            if part < parts { expected += d / parts + usize::from(part < d % parts); }
+        }
+        reader.finish()?;
+        let model = Model { version: 2, config, datatype, dimension, metric, trained_rows, low, high, scale, centers, offsets };
+        Ok(Arc::new(Self { model, _charge: charge }))
+    }
+
     pub(crate) fn prepare(&self, value: &VectorValue) -> Result<QuantQuery, QueryError> {
         self.prepare_values(|| dense(value, self.metric()))
     }
@@ -1047,4 +1145,27 @@ mod calibration_regressions {
         assert!(index.is_valid());
         assert_eq!(index.quantization_stats().2, 100);
     }
+}
+
+/// An untrained compressed index persists exact exceptions in the same container
+/// format used by a trained model. It remains a complete index while training waits.
+pub(crate) fn store_untrained(value: &VectorValue, file: Option<&Arc<VectorIndexFile>>) -> Result<VectorValue, QueryError> {
+    let Some(file) = file else { return Ok(value.clone()); };
+    let length = file.native_payload_bytes()?;
+    if length < 9 { return Err(super::persistence::corrupt()); }
+    let head = file.append_quantization_blob(&value.encode())?;
+    let mut payload = vec![0; length];
+    payload[0] = 1;
+    payload[1..9].copy_from_slice(&head.to_le_bytes());
+    Ok(VectorValue::new(VectorDataType::Int8, length as u32, payload))
+}
+
+pub(crate) fn load_untrained(payload: &[u8], file: &Arc<VectorIndexFile>, datatype: VectorDataType, dimension: u32) -> Result<VectorValue, QueryError> {
+    if payload.len() < 9 || payload[0] != 1 { return Err(super::persistence::corrupt()); }
+    let head = u64::from_le_bytes(payload[1..9].try_into().map_err(|_| super::persistence::corrupt())?);
+    let bytes = file.read_quantization_blob(head, datatype.payload_len(dimension) + 12)?;
+    let value = VectorValue::decode(&bytes).ok_or_else(super::persistence::corrupt)?;
+    codec::validate_internal(&value)?;
+    if value.datatype != datatype || value.dimension != dimension { return Err(super::persistence::corrupt()); }
+    Ok(value)
 }

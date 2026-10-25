@@ -3398,7 +3398,7 @@ impl Database {
                         Some(KeyPart::Bytes(payload)) => payload.as_slice(),
                         _ => &[][..],
                     };
-                    let decoded = FtPayload::decode(payload);
+                    let decoded = FtPayload::decode(payload, crate::storage::fulltext::payload::stored_positions(index))?;
                     let local = (u64::from(row_id.page_id) << 16) | u64::from(row_id.slot_id);
                     let doc_id = ((storage_id & 0xffff) << 48) | (local & 0x0000_ffff_ffff_ffff);
                     rows.push(FulltextDiagnosticPosting {
@@ -3427,14 +3427,16 @@ impl Database {
         txn: TxnView,
     ) -> Result<Vec<RowId>, QueryError> {
         if self.has_pending_index_repairs_for(table.id, &index.name) {
-            let batch = self.fulltext_scan_token_generic(table, index, token, txn)?;
+            let batch = self.fulltext_scan_token_generic(table, index, token, false, txn)?;
             return Ok(batch.postings.into_iter().map(|p| p.row_id).collect());
         }
         let mut out: Vec<RowId> = Vec::new();
         let mut scan_one = |sid: u64| -> Result<(), QueryError> {
             self.with_index_read(sid, &index.name, |index_file| {
-                index_file.fulltext_scan_token(token, |row_id, _payload| {
+                index_file.fulltext_scan_token(token, |row_id, payload| {
+                    crate::storage::fulltext::payload::FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
                     out.push(row_id);
+                    Ok(())
                 })
             })
         };
@@ -3446,7 +3448,7 @@ impl Database {
             scan_one(table.id)?;
         }
         if self.has_pending_index_repairs_for(table.id, &index.name) {
-            let batch = self.fulltext_scan_token_generic(table, index, token, txn)?;
+            let batch = self.fulltext_scan_token_generic(table, index, token, false, txn)?;
             return Ok(batch
                 .postings
                 .into_iter()
@@ -3485,7 +3487,7 @@ impl Database {
         // repair entries can be merged in with the same visibility model
         // as the generic scan.
         if self.has_pending_index_repairs_for(table.id, &index.name) {
-            return self.fulltext_scan_token_generic(table, index, token, txn);
+            return self.fulltext_scan_token_generic(table, index, token, want_positions, txn);
         }
 
         let mut batch = FtPostingBatch::default();
@@ -3494,7 +3496,7 @@ impl Database {
                 index_file.fulltext_scan_token(token, |row_id, payload| {
                     if want_positions {
                         let (doc_len, tf, pos_start, pos_len) =
-                            FtPayload::decode_into_arena(payload, &mut batch.positions_arena);
+                            FtPayload::decode_into_arena(payload, &mut batch.positions_arena, crate::storage::fulltext::payload::stored_positions(index))?;
                         batch.postings.push(FtPosting {
                             row_id,
                             doc_len,
@@ -3503,7 +3505,7 @@ impl Database {
                             pos_len,
                         });
                     } else {
-                        let (doc_len, tf) = FtPayload::decode_scoring_only(payload);
+                        let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
                         batch.postings.push(FtPosting {
                             row_id,
                             doc_len,
@@ -3512,6 +3514,7 @@ impl Database {
                             pos_len: 0,
                         });
                     }
+                    Ok(())
                 })
             })
         };
@@ -3523,7 +3526,7 @@ impl Database {
             scan_one(table.id)?;
         }
         if self.has_pending_index_repairs_for(table.id, &index.name) {
-            return self.fulltext_scan_token_generic(table, index, token, txn);
+            return self.fulltext_scan_token_generic(table, index, token, want_positions, txn);
         }
         Ok(batch)
     }
@@ -3554,6 +3557,7 @@ impl Database {
         table: &crate::storage::schema::TableSchema,
         index: &crate::storage::schema::IndexSchema,
         token: &str,
+        want_positions: bool,
         txn: TxnView,
     ) -> Result<crate::storage::fulltext::FtPostingBatch, QueryError> {
         use crate::storage::fulltext::payload::FtPayload;
@@ -3580,8 +3584,12 @@ impl Database {
                 Some(KeyPart::Bytes(bytes)) => bytes.as_slice(),
                 _ => &[][..],
             };
-            let (doc_len, tf, pos_start, pos_len) =
-                FtPayload::decode_into_arena(payload, &mut batch.positions_arena);
+            let (doc_len, tf, pos_start, pos_len) = if want_positions {
+                FtPayload::decode_into_arena(payload, &mut batch.positions_arena, crate::storage::fulltext::payload::stored_positions(index))?
+            } else {
+                let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+                (doc_len, tf, 0, 0)
+            };
             batch.postings.push(FtPosting {
                 row_id,
                 doc_len,
@@ -3633,15 +3641,15 @@ impl Database {
                             order.push(token.to_string());
                             by_token.entry(token.to_string()).or_default()
                         };
-                        let (doc_len, tf, pos_start, pos_len) =
-                            FtPayload::decode_into_arena(payload, &mut batch.positions_arena);
+                        let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
                         batch.postings.push(FtPosting {
                             row_id,
                             doc_len,
                             tf,
-                            pos_start,
-                            pos_len,
+                            pos_start: 0,
+                            pos_len: 0,
                         });
+                        Ok(())
                     },
                 )
             })
@@ -3720,14 +3728,13 @@ impl Database {
                 order.push(token.clone());
                 by_token.entry(token).or_default()
             };
-            let (doc_len, tf, pos_start, pos_len) =
-                FtPayload::decode_into_arena(payload, &mut batch.positions_arena);
+            let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
             batch.postings.push(FtPosting {
                 row_id,
                 doc_len,
                 tf,
-                pos_start,
-                pos_len,
+                pos_start: 0,
+                pos_len: 0,
             });
         }
         Ok(order

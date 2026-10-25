@@ -22,8 +22,8 @@
 //!   varint(pos_1 - pos_0)    #               the remaining deltas (positions ascending, small gaps)
 //!   ... ]                    # tf entries in total; the whole block is omitted when positions are off
 //! ```
-//! `tf >= 1` always holds for any inverted entry (the token must occur in the document), so "whether
-//! any bytes remain after doc_len/tf" uniquely tells whether positions were stored — no extra flag bit needed.
+//! The persisted FulltextMeta determines whether positions are required. Remaining
+//! bytes alone cannot distinguish disabled positions from a truncated posting.
 
 use crate::util::env::process_bool as parse_env_bool;
 use std::sync::OnceLock;
@@ -63,86 +63,112 @@ impl FtPayload {
         out
     }
 
-    /// Decode only `doc_len`/`tf`, skipping the positions array. **BM25 scoring and natural-language
-    /// candidate generation need just these two**; skipping the positions loop saves one `Vec` allocation
-    /// + tf varint reads — a hot path for high-tf/df corpora. Truncated/corrupt input returns `(0, 0)`; never panics.
+    /// Validate a persisted posting without allocating a positions array.
     #[inline]
-    pub fn decode_scoring_only(bytes: &[u8]) -> (u32, u32) {
-        let mut off = 0usize;
-        let doc_len = read_varint(bytes, &mut off).unwrap_or(0) as u32;
-        let tf = read_varint(bytes, &mut off).unwrap_or(0) as u32;
-        (doc_len, tf)
+    pub fn decode_scoring_only(
+        bytes: &[u8],
+        with_positions: bool,
+    ) -> Result<(u32, u32), crate::types::QueryError> {
+        // A complete one-byte stream has an exact, bounded position sum:
+        // tf <= doc_len < 128 and every delta < 128. Validate every delta;
+        // no positions are skipped or inferred from a truncated stream.
+        if bytes.len() >= 2 && bytes[0] < 0x80 && bytes[1] < 0x80 {
+            let doc_len = u32::from(bytes[0]);
+            let tf = u32::from(bytes[1]);
+            if tf == 0 || tf > doc_len {
+                return Err(corrupt_payload());
+            }
+            if !with_positions {
+                return if bytes.len() == 2 {
+                    Ok((doc_len, tf))
+                } else {
+                    Err(corrupt_payload())
+                };
+            }
+            if bytes.len() == tf as usize + 2 {
+                let mut index = 2;
+                while index < bytes.len() {
+                    let delta = bytes[index];
+                    if delta >= 0x80 || (index != 2 && delta == 0) {
+                        return Err(corrupt_payload());
+                    }
+                    index += 1;
+                }
+                return Ok((doc_len, tf));
+            }
+        }
+        Self::decode_checked(bytes, with_positions, |_| {}).ok_or_else(corrupt_payload)
     }
 
-    /// Decode `doc_len`/`tf` and append positions to `arena` (ascending, with inter-column gaps).
-    /// Returns `(doc_len, tf, arena_start_index, position_count)`. Compared with [`Self::decode`],
-    /// this saves one `Vec<u32>` allocation per posting — heavily used on the phrase path: 22k postings
-    /// mean 22k heap allocations collapse into one arena growth.
-    /// On truncation/corruption `position_count == 0` (the arena rolls back to its start) — the phrase
-    /// path falls back to row lookup, semantically identical to [`Self::decode`].
+    /// Decode a complete posting; failed decoding never leaves partial positions.
     #[inline]
-    pub fn decode_into_arena(bytes: &[u8], arena: &mut Vec<u32>) -> (u32, u32, u32, u32) {
-        let mut off = 0usize;
-        let doc_len = read_varint(bytes, &mut off).unwrap_or(0) as u32;
-        let tf = read_varint(bytes, &mut off).unwrap_or(0) as u32;
-        let start = arena.len() as u32;
-        if off >= bytes.len() {
-            return (doc_len, tf, start, 0);
-        }
-        let mut prev: u32 = 0;
-        for i in 0..tf {
-            match read_varint(bytes, &mut off) {
-                Some(delta) => {
-                    let p = if i == 0 {
-                        delta as u32
-                    } else {
-                        prev.wrapping_add(delta as u32)
-                    };
-                    arena.push(p);
-                    prev = p;
-                }
-                None => {
+    pub fn decode_into_arena(
+        bytes: &[u8],
+        arena: &mut Vec<u32>,
+        with_positions: bool,
+    ) -> Result<(u32, u32, u32, u32), crate::types::QueryError> {
+        let start = u32::try_from(arena.len()).map_err(|_| corrupt_payload())?;
+        match Self::decode_checked(bytes, with_positions, |position| arena.push(position)) {
+            Some((doc_len, tf)) => {
+                let count = if with_positions { tf } else { 0 };
+                if start.checked_add(count).is_none() {
                     arena.truncate(start as usize);
-                    return (doc_len, tf, start, 0);
+                    return Err(corrupt_payload());
                 }
+                Ok((doc_len, tf, start, count))
+            }
+            None => {
+                arena.truncate(start as usize);
+                Err(corrupt_payload())
             }
         }
-        (doc_len, tf, start, tf)
     }
 
-    /// Decode from the `Bytes` key segment. Fault tolerance: a truncated/corrupt payload degrades to
-    /// "no positions"; only `doc_len`/`tf` are trusted (queries use this to fall phrases back to row lookup); never panics.
-    pub(crate) fn decode(bytes: &[u8]) -> FtPayload {
-        let mut off = 0usize;
-        let doc_len = read_varint(bytes, &mut off).unwrap_or(0) as u32;
-        let tf = read_varint(bytes, &mut off).unwrap_or(0) as u32;
+    pub(crate) fn decode(
+        bytes: &[u8],
+        with_positions: bool,
+    ) -> Result<FtPayload, crate::types::QueryError> {
         let mut positions = Vec::new();
-        if off < bytes.len() {
-            let mut prev: u32 = 0;
-            for i in 0..tf {
-                match read_varint(bytes, &mut off) {
-                    Some(delta) => {
-                        let p = if i == 0 {
-                            delta as u32
-                        } else {
-                            prev.wrapping_add(delta as u32)
-                        };
-                        positions.push(p);
-                        prev = p;
-                    }
-                    None => {
-                        // Truncation: drop the partial positions and degrade to no-positions (phrase falls back to row lookup).
-                        positions.clear();
-                        break;
-                    }
-                }
-            }
-        }
-        FtPayload {
+        let (doc_len, tf, _, _) = Self::decode_into_arena(bytes, &mut positions, with_positions)?;
+        Ok(FtPayload {
             doc_len,
             tf,
             positions,
+        })
+    }
+
+    #[inline]
+    fn decode_checked(
+        bytes: &[u8],
+        with_positions: bool,
+        mut visit: impl FnMut(u32),
+    ) -> Option<(u32, u32)> {
+        let mut off = 0;
+        let doc_len = read_varint_u32(bytes, &mut off)?;
+        let tf = read_varint_u32(bytes, &mut off)?;
+        if tf == 0 || tf > doc_len {
+            return None;
         }
+        if with_positions {
+            // Each position consumes at least one byte. Reject impossible counts
+            // before iterating or growing the caller's arena.
+            if tf as usize > bytes.len().saturating_sub(off) {
+                return None;
+            }
+            let mut position = 0u32;
+            for i in 0..tf {
+                let delta = read_varint_u32(bytes, &mut off)?;
+                if i != 0 && delta == 0 {
+                    return None;
+                }
+                position = position.checked_add(delta)?;
+                visit(position);
+            }
+        }
+        if off != bytes.len() {
+            return None;
+        }
+        Some((doc_len, tf))
     }
 }
 
@@ -161,22 +187,38 @@ fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// LEB128 unsigned varint read; returns `None` on out-of-bounds or more than 10 bytes.
-fn read_varint(buf: &[u8], off: &mut usize) -> Option<u64> {
-    let mut result: u64 = 0;
-    let mut shift: u32 = 0;
-    loop {
+fn corrupt_payload() -> crate::types::QueryError {
+    crate::storage::error(
+        crate::error::catalog::ER_INDEX_CORRUPT,
+        "corrupt FULLTEXT posting payload",
+    )
+}
+
+#[inline(always)]
+fn read_varint_u32(buf: &[u8], off: &mut usize) -> Option<u32> {
+    let first = *buf.get(*off)?;
+    *off += 1;
+    if first < 0x80 {
+        return Some(u32::from(first));
+    }
+    let mut value = u32::from(first & 0x7f);
+    let mut shift = 7;
+    while shift <= 28 {
         let byte = *buf.get(*off)?;
         *off += 1;
-        result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some(result);
-        }
-        shift += 7;
-        if shift >= 64 {
+        if shift == 28 && byte > 0x0f {
             return None;
         }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            if byte == 0 {
+                return None;
+            }
+            return Some(value);
+        }
+        shift += 7;
     }
+    None
 }
 
 /// FULLTEXT payload configuration (process-wide, `MYDB_FT_*`, cached on first access).
@@ -192,7 +234,7 @@ impl FtPayloadConfig {
     fn from_env() -> Self {
         FtPayloadConfig {
             positions: parse_env_bool("MYDB_FT_POSITIONS", true),
-            position_gap: parse_env_u32("MYDB_FT_POSITION_GAP", 100),
+            position_gap: parse_env_u32("MYDB_FT_POSITION_GAP", 100).max(1),
         }
     }
 }
@@ -201,6 +243,25 @@ impl FtPayloadConfig {
 pub fn config() -> &'static FtPayloadConfig {
     static CFG: OnceLock<FtPayloadConfig> = OnceLock::new();
     CFG.get_or_init(FtPayloadConfig::from_env)
+}
+
+/// Resolve the persisted key format before consulting process defaults.
+pub fn config_from_meta(meta: &crate::storage::schema::FulltextMeta) -> FtPayloadConfig {
+    let defaults = config();
+    FtPayloadConfig {
+        positions: meta.positions.unwrap_or(defaults.positions),
+        position_gap: meta.position_gap.unwrap_or(defaults.position_gap).max(1),
+    }
+}
+
+/// The persisted definition determines whether a posting must contain positions.
+pub(crate) fn stored_positions(index: &crate::storage::schema::IndexSchema) -> bool {
+    index
+        .fulltext
+        .as_ref()
+        .map(config_from_meta)
+        .unwrap_or_else(|| *config())
+        .positions
 }
 
 fn parse_env_u32(key: &str, default: u32) -> u32 {
@@ -215,16 +276,16 @@ mod tests {
     use super::*;
 
     fn roundtrip(p: &FtPayload, with_positions: bool) -> FtPayload {
-        FtPayload::decode(&p.encode(with_positions))
+        FtPayload::decode(&p.encode(with_positions), with_positions).unwrap()
     }
 
     #[test]
     fn varint_roundtrip_boundaries() {
-        for v in [0u64, 1, 127, 128, 300, 16384, u32::MAX as u64, u64::MAX] {
+        for v in [0u64, 1, 127, 128, 300, 16384, u32::MAX as u64] {
             let mut buf = Vec::new();
             write_varint(&mut buf, v);
             let mut off = 0;
-            assert_eq!(read_varint(&buf, &mut off), Some(v));
+            assert_eq!(read_varint_u32(&buf, &mut off).unwrap() as u64, v);
             assert_eq!(off, buf.len());
         }
     }
@@ -266,32 +327,109 @@ mod tests {
     }
 
     #[test]
-    fn decode_truncated_is_lenient() {
-        // Truncate after doc_len/tf, discarding positions only.
+    fn corrupt_postings_are_rejected_without_partial_positions() {
         let full = FtPayload {
             doc_len: 10,
             tf: 2,
             positions: vec![3, 7],
         }
         .encode(true);
-        // Remove the last position byte.
-        let got = FtPayload::decode(&full[..full.len() - 1]);
-        assert_eq!(got.doc_len, 10);
-        assert_eq!(got.tf, 2);
-        assert!(got.positions.is_empty());
-        // The SQL phrase path uses arena decoding. A partial position list
-        // must not suppress fallback or leak into the next posting.
-        let mut arena = vec![42];
-        assert_eq!(
-            FtPayload::decode_into_arena(&full[..full.len() - 1], &mut arena),
-            (10, 2, 1, 0)
-        );
-        assert_eq!(arena, vec![42]);
+        for end in 0..full.len() {
+            let bytes = &full[..end];
+            assert!(FtPayload::decode_scoring_only(bytes, true).is_err());
+            assert!(FtPayload::decode(bytes, true).is_err());
+            let mut arena = vec![42];
+            assert!(FtPayload::decode_into_arena(bytes, &mut arena, true).is_err());
+            assert_eq!(arena, vec![42]);
+        }
+        for bytes in [
+            vec![1, 0],                            // Zero term frequency.
+            vec![1, 2, 0, 1],                      // Frequency exceeds document length.
+            vec![2, 2, 0, 0],                      // Duplicate position.
+            vec![2, 2, 255, 255, 255, 255, 15, 1], // Position overflow.
+            vec![128, 0, 1, 0],                    // Noncanonical varint.
+            vec![255, 255, 255, 255, 31, 1],       // Integer overflow.
+            vec![1, 1, 0, 0],                      // Trailing bytes.
+        ] {
+            assert!(
+                FtPayload::decode_scoring_only(&bytes, true).is_err(),
+                "{bytes:?}"
+            );
+        }
+        assert!(FtPayload::decode(&[], false).is_err());
+        assert!(FtPayload::decode(&[1, 1], true).is_err());
+        assert!(FtPayload::decode(&[1, 1, 0], false).is_err());
+        let without = FtPayload::decode(&[1, 1], false).unwrap();
+        assert_eq!((without.doc_len, without.tf), (1, 1));
+        assert!(without.positions.is_empty());
     }
+}
 
+#[cfg(test)]
+mod strict_fast_path_tests {
+    use super::*;
     #[test]
-    fn decode_empty_is_zero() {
-        let got = FtPayload::decode(&[]);
-        assert_eq!(got, FtPayload::default());
+    fn single_byte_positions_validate_the_complete_stream() {
+        for positions in [vec![0], vec![127], (0..127).map(|i| i * 127).collect()] {
+            let payload = FtPayload {
+                doc_len: 127,
+                tf: positions.len() as u32,
+                positions,
+            };
+            let bytes = payload.encode(true);
+            assert_eq!(
+                FtPayload::decode_scoring_only(&bytes, true).unwrap(),
+                (payload.doc_len, payload.tf)
+            );
+            assert_eq!(FtPayload::decode(&bytes, true).unwrap(), payload);
+            for end in 0..bytes.len() {
+                assert!(FtPayload::decode_scoring_only(&bytes[..end], true).is_err());
+            }
+        }
+        for bytes in [
+            &[1, 0, 0][..],
+            &[1, 2, 0, 1],
+            &[4, 2, 1, 0],
+            &[4, 2, 0x80, 1],
+            &[4, 1, 0x80],
+            &[4, 1, 0, 1],
+        ] {
+            assert!(
+                FtPayload::decode_scoring_only(bytes, true).is_err(),
+                "{bytes:?}"
+            );
+            let mut arena = vec![99];
+            assert!(FtPayload::decode_into_arena(bytes, &mut arena, true).is_err());
+            assert_eq!(arena, vec![99]);
+        }
+        assert_eq!(
+            FtPayload::decode_scoring_only(&[4, 1], false).unwrap(),
+            (4, 1)
+        );
+        assert!(FtPayload::decode_scoring_only(&[4, 1, 1], false).is_err());
+    }
+    #[test]
+    fn multi_byte_boundaries_keep_overflow_and_canonical_checks() {
+        for number in [0, 127, 128, 16383, 16384, u32::MAX] {
+            let mut bytes = Vec::new();
+            write_varint(&mut bytes, u64::from(number));
+            let mut off = 0;
+            assert_eq!(read_varint_u32(&bytes, &mut off), Some(number));
+            assert_eq!(off, bytes.len());
+            if number >= 128 {
+                assert!(read_varint_u32(&bytes[..bytes.len() - 1], &mut 0).is_none());
+            }
+        }
+        for bytes in [
+            &[0x80, 0][..],
+            &[0xff, 0xff, 0xff, 0xff, 0x10],
+            &[0xff, 0xff, 0xff, 0xff, 0x8f],
+            &[0x80],
+        ] {
+            assert!(read_varint_u32(bytes, &mut 0).is_none());
+        }
+        assert!(
+            FtPayload::decode_scoring_only(&[2, 2, 0xff, 0xff, 0xff, 0xff, 0x0f, 1], true).is_err()
+        );
     }
 }

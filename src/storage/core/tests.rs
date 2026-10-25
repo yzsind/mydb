@@ -3329,7 +3329,7 @@ fn fulltext_postings_carry_payload_stats() {
             .unwrap();
         assert_eq!(entries.len(), 1, "one posting per (token,row) for {token}");
         match entries[0].0 .0.get(1) {
-            Some(KeyPart::Bytes(bytes)) => FtPayload::decode(bytes),
+            Some(KeyPart::Bytes(bytes)) => FtPayload::decode(bytes, true).unwrap(),
             other => panic!("expected Bytes payload part, got {other:?}"),
         }
     };
@@ -4614,7 +4614,7 @@ fn drop_table_recovery_completes_committed_drop() {
             .get("test.t")
             .cloned()
             .unwrap();
-        let intent = db.build_drop_table_intent(&table);
+        let intent = db.build_drop_table_intent(&table).unwrap();
         db.write_drop_table_intent(&intent).unwrap();
         {
             let mut catalog = db.catalog_write().unwrap();
@@ -4656,7 +4656,7 @@ fn drop_table_recovery_rolls_back_uncommitted_drop() {
             .get("test.t")
             .cloned()
             .unwrap();
-        let intent = db.build_drop_table_intent(&table);
+        let intent = db.build_drop_table_intent(&table).unwrap();
         db.write_drop_table_intent(&intent).unwrap();
     }
 
@@ -12972,7 +12972,7 @@ fn ddl_audit_stale_truncate_cleanup_cannot_remove_new_rows() {
         let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
         simple_pk_table(&db, "t");
         let old = db.table("test.t").unwrap();
-        let retired = db.build_drop_table_intent(&old);
+        let retired = db.build_drop_table_intent(&old).unwrap();
         let legacy_wipe = db.build_truncate_table_intent(&old);
         db.truncate_table("test.t").unwrap();
         assert_ne!(db.table("test.t").unwrap().id, old.id);
@@ -26472,7 +26472,7 @@ fn audit14_replayed_lob_cache_retirement_prevents_promotion_truncation() {
     let lob = external.allocate_chain_compressible(&bytes, false).unwrap();
     db.flush_dirty_data().unwrap();
     let relative = crate::storage::naming::wal_relative_object_path(&db.overflow_path(id));
-    db.invalidate_buffer_pool_path(&relative);
+    db.invalidate_buffer_pool_path(&relative).unwrap();
     let next = db
         .with_overflow_mut(id, |file| {
             file.allocate_chain_compressible(b"promoted write", false)
@@ -26848,4 +26848,46 @@ fn memory_catalog_seed_matches_heap_loading_and_remains_private() {
                 .is(crate::error::catalog::ER_NO_SUCH_TABLE));
         },
     );
+}
+
+#[test]
+fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
+    use crate::engine::StorageQueryEngine;
+    for sql in [
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha')",
+        "SELECT MATCH(body) AGAINST('alpha') FROM docs",
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('alp*' IN BOOLEAN MODE)",
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('\"alpha beta\"' IN BOOLEAN MODE)",
+    ] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        {
+            let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(), test_storage_config(DurabilityMode::Strict, true),
+            ).unwrap();
+            engine.execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))").unwrap();
+            engine.execute("INSERT INTO docs VALUES(1,'alpha beta')").unwrap();
+            let db = engine.database();
+            let table = db.table("test.docs").unwrap();
+            db.with_index_mut(table.id, "ft", |index| {
+                let entries = index.entries()?;
+                for (key, row) in entries {
+                    if key.0.first() == Some(&KeyPart::String("alpha".into())) {
+                        index.delete_deferred(0, key, row)?;
+                        index.insert_deferred(0, IndexKey::from(vec![
+                            KeyPart::String("alpha".into()), KeyPart::Bytes(vec![2, 1]),
+                        ]), row)?;
+                    }
+                }
+                index.flush()
+            }).unwrap();
+            let err = engine.execute(sql).unwrap_err();
+            assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{sql}: {err:?}");
+            let path = db.index_path_for_table_schema(&table, table.id, "ft");
+            assert!(path.with_extension("idx.corrupt").exists());
+            assert!(engine.execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('beta')").is_err());
+        }
+        let err = Database::open_with_config(dir.path(), test_storage_config(DurabilityMode::Strict, true))
+            .err().expect("startup must preserve the corruption fence");
+        assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
+    }
 }

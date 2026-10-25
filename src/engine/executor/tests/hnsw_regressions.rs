@@ -306,6 +306,8 @@ fn concurrent_cold_readers_share_one_build_owner() {
             .find(|i| i.is_vector())
             .unwrap()
             .clone();
+        engine.database().evict_table_vector_graphs(table.id);
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         *crate::storage::VECTOR_BUILD_BEFORE_PUBLISH_HOOK.lock() = Some(Box::new(move || {
@@ -337,6 +339,7 @@ fn concurrent_cold_readers_share_one_build_owner() {
             "{backend}: second builder bypassed owner"
         );
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(crate::storage::Database::vector_build_heap_scans_for_test(), scans);
     }
 }
 
@@ -367,35 +370,29 @@ fn partitioned_cold_build_resolves_undo_in_the_owning_storage() {
 }
 
 #[test]
-fn interrupted_paged_commit_rebuilds_after_wal_recovery() {
+fn failed_paged_commit_returns_error_and_keeps_its_durable_fence() {
     use crate::engine::vector::graph::FAIL_PAGED_WRITES_FOR_TEST;
     use std::sync::atomic::Ordering;
     let _env = environment("paged", false);
     let dir = tempfile::tempdir().unwrap();
-    {
-        let engine = open_strict_test_engine(dir.path());
-        for sql in [
-            "CREATE TABLE items(id INT PRIMARY KEY,emb VECTOR(2) NOT NULL)",
-            "INSERT INTO items VALUES(1,'[10,0]')",
-            "CREATE INDEX hv ON items(emb) USING HNSW",
-        ] {
-            engine.execute(sql).unwrap();
-        }
-        FAIL_PAGED_WRITES_FOR_TEST.store(true, Ordering::Release);
-        let inserted = engine.execute("INSERT INTO items VALUES(2,'[0,0]')");
-        FAIL_PAGED_WRITES_FOR_TEST.store(false, Ordering::Release);
-        inserted.unwrap();
-        engine.database().wal_log().lock().flush().unwrap();
-        std::mem::forget(engine);
-    }
     let engine = open_strict_test_engine(dir.path());
-    assert_eq!(
-        id_list(
-            &engine,
-            "SELECT id FROM items ORDER BY DISTANCE(emb,'[0,0]') LIMIT 2"
-        ),
-        [2, 1]
-    );
+    for sql in ["CREATE TABLE items(id INT PRIMARY KEY,emb VECTOR(2) NOT NULL)",
+        "INSERT INTO items VALUES(1,'[10,0]')", "CREATE INDEX hv ON items(emb) USING HNSW"] { engine.execute(sql).unwrap(); }
+    FAIL_PAGED_WRITES_FOR_TEST.store(true, Ordering::Release);
+    let inserted = engine.execute("INSERT INTO items VALUES(2,'[0,0]')");
+    FAIL_PAGED_WRITES_FOR_TEST.store(false, Ordering::Release);
+    let err = inserted.unwrap_err();
+    assert!(err.message().contains("committed WAL decision"), "{err:?}");
+    assert!(engine.database().ensure_operational().is_err());
+    assert!(engine.checkpoint().is_err());
+    let files = find_hvec_files(dir.path());
+    assert_eq!(files.len(), 1);
+    let evidence = std::fs::read(&files[0]).unwrap();
+    drop(engine);
+    let mut config = memory_test_storage_config();
+    config.durability = crate::storage::DurabilityMode::Strict;
+    assert!(StorageQueryEngine::open_with_storage_config_without_background_workers(dir.path(), config).is_err());
+    assert_eq!(std::fs::read(&files[0]).unwrap(), evidence);
 }
 
 #[test]
@@ -457,6 +454,8 @@ fn partition_fanout_respects_one_global_candidate_budget() {
     engine
         .execute("CREATE INDEX hv ON items(emb) USING HNSW")
         .unwrap();
+    let table = engine.database().table("items").unwrap();
+    engine.database().evict_table_vector_graphs(table.id);
     let mut session = SessionContext::default();
     engine
         .execute_with_session(&mut session, "SET mydb_hnsw_max_scan_tuples=16")
@@ -500,6 +499,9 @@ fn cold_build_commit_tail_cannot_reorder_an_existing_snapshot() {
                 .execute("UPDATE items SET emb='[-4,0]' WHERE id=1")
                 .unwrap();
         }));
+        let table = engine.database().table("items").unwrap();
+        let index = table.indexes.iter().find(|index| index.is_vector()).unwrap();
+        engine.database().rebuild_vector_for_test(&table, index, table.id).unwrap();
         let query = "SELECT id FROM items ORDER BY DISTANCE(emb,'[4.9,0]') LIMIT 1";
         assert_eq!(
             id_list_session(&engine, &mut reader, query),

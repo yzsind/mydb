@@ -146,12 +146,26 @@ so the limit also depends on M. DDL rejects configurations that cannot fit
 before publication, including for empty tables. A datatype's maximum dimension
 does not guarantee that its paged index can be created.
 
-Index files are derived from committed heap data. Native indexes rebuild from
-a registered heap snapshot on cold open, then replay committed build deltas
-before publication. Failed maintenance invalidates their handles. Unfinished
-or corrupt index data is rebuilt; physical replicas use revocable accelerators
-over their own committed heap. They may fall back to exact search when an
-accelerator cannot be admitted.
+Vector indexes are important persistent objects, including resident HNSW,
+native HNSW and IVF, and every quantized backend. A normal open loads the
+persisted structure and trained model and completes committed changes from
+WAL; it does not scan the heap to reconstruct a missing or damaged index.
+Missing files, invalid identities, checksum failures and maintenance failures
+return explicit errors. Storage failures do not select an exact-query fallback.
+
+Resident structures use immutable snapshot generations and an atomic manifest;
+paged structures retain their source page identities and WAL ordering. A
+checkpoint must persist required index state before publishing CheckpointEnd
+or reclaiming dependent WAL. A committed WAL decision followed by failed index
+maintenance is reported as a committed decision with a fail-stopped database,
+not as an ordinary successful commit or a successful rollback.
+
+Physical replicas retain committed MVCC decisions while affected vector
+searches wait for the source maintenance completion record. Initial structures
+are published through bounded WAL image chunks. Backup and restore retain the
+index files and their journal dependencies. Explicit DDL reconstruction and
+background retraining publish a replacement generation only after its required
+state is recoverable; a failed replacement preserves the valid previous graph.
 
 Datatype changes and dimension changes require COPY rewriting and index
 reconstruction. Invalid conversions fail atomically, including under IGNORE;
@@ -239,9 +253,10 @@ exceptions. Small datasets and INT8/SQ8 may not become smaller or faster.
 
 Quantizer generations are immutable and replaced with their graph and coverage
 frontier. Significant scalar exceptions or PQ/BQ update growth request a
-rebuild. OPTIMIZE TABLE explicitly reconstructs the index. Failed maintenance
-revokes the accelerator; committed heap data remains authoritative. Native
-indexes rebuild on cold open. Models and exceptions share the vector container,
+rebuild. OPTIMIZE TABLE explicitly reconstructs the index. A failed private
+replacement preserves the old valid index and a durable failed-job status.
+Failure while modifying the active object fences further service. Native
+indexes load their persisted structure on cold open. Models and exceptions share the vector container,
 page checksums and recovery lifecycle.
 
 ## Diagnostics

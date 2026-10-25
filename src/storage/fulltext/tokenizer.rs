@@ -135,8 +135,9 @@ pub fn build_tokenizer_from_meta(
     }
 }
 
-/// Snapshot the process's global tokenizer configuration into the index meta at DDL time so the query side can later reproduce the same rules.
-/// `parser` is preserved (the caller injects it externally); ngram_size / min / max / stopwords are overwritten.
+/// Fill unset tokenizer and posting-format settings at DDL time. Persisting
+/// both keeps query tokenization and exact DML key reconstruction stable when
+/// process defaults change. Explicit index settings and `parser` are preserved.
 pub fn snapshot_tokenizer_config_into(meta: &mut crate::storage::schema::FulltextMeta) {
     let g = global_config();
     if meta.ngram_size.is_none() {
@@ -150,6 +151,13 @@ pub fn snapshot_tokenizer_config_into(meta: &mut crate::storage::schema::Fulltex
     }
     if meta.use_stopwords.is_none() {
         meta.use_stopwords = Some(g.use_stopwords);
+    }
+    let payload = super::payload::config();
+    if meta.positions.is_none() {
+        meta.positions = Some(payload.positions);
+    }
+    if meta.position_gap.is_none() {
+        meta.position_gap = Some(payload.position_gap);
     }
 }
 

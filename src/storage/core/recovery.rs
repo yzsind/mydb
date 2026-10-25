@@ -967,7 +967,9 @@ fn plan_redo_file_partitions_with_context(
             // Replaying older pages first can extend a truncated file with old
             // rows even when its new page zero already covers the reset LSN.
             // Discard that obsolete prefix in both serial and parallel redo.
-            if matches!(header.record_type, T::FileDelete | T::FileCreate) {
+            let starts_vector_image = header.record_type == T::VectorIndexImage
+                && matches!(records.record(idx)?.payload, WalPayload::VectorIndexImage { offset: 0, .. });
+            if starts_vector_image || matches!(header.record_type, T::FileDelete | T::FileCreate) {
                 heap.remove(path.as_ref());
                 indexes.remove(path.as_ref());
             }
@@ -1029,7 +1031,7 @@ fn precheck_recovery_index(
     if operations < target {
         return Ok(());
     }
-    IndexFile::persist_rebuild_marker(&path)?;
+    IndexFile::persist_planned_rebuild_marker(&path)?;
     state.skipped_index_redo_paths.insert(relative.into_owned());
     log_message(format_args!(
         "mydb recovery: planned index rebuild for {} (at least {} logical operations, {} pages)",
@@ -1151,13 +1153,22 @@ fn apply_redo_record_inner(
     state: &mut RedoState,
 ) -> Result<(), QueryError> {
     match &record.payload {
+        WalPayload::VectorIndexManifest { path, bytes } if should_redo_record(record, redoable, redo_cutoff) => {
+            redo_vector_manifest(data_dir, path, bytes)?;
+            state.redone_records += 1;
+        }
+        WalPayload::VectorIndexImage { path, offset, total, bytes }
+            if should_redo_record(record, redoable, redo_cutoff) => {
+            redo_vector_image(data_dir, path, *offset, *total, bytes, record.lsn)?;
+            state.redone_records += 1;
+        }
         WalPayload::FileClr { path, action, .. } if record.lsn >= redo_cutoff => {
             if (physical_replica || state.context.continuation_base.is_some())
                 && is_index_object_path(path)
                 && matches!(action, crate::wal::FileCompensation::Restore(_))
             {
                 state.recovery_indexes.remove(path);
-                IndexFile::persist_rebuild_marker(&data_dir.join(path))?;
+                IndexFile::persist_planned_rebuild_marker(&data_dir.join(path))?;
                 state.skipped_index_redo_paths.insert(path.clone());
             } else {
                 apply_file_compensation(data_dir, path, action)?;
@@ -1510,7 +1521,7 @@ pub(crate) fn is_index_object_path(path: &str) -> bool {
     let Some((_db, info)) = crate::storage::naming::parse_relative_object_path(path) else {
         return false;
     };
-    matches!(info.kind, crate::storage::naming::ObjectFileKind::Index)
+    matches!(info.kind, crate::storage::naming::ObjectFileKind::Index) && info.ext == "idx"
 }
 
 pub(crate) fn write_recovered_file(
@@ -1659,7 +1670,7 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
         };
     }
     if current_lsn != *base_lsn || crc32fast::hash(&before) != *base_crc {
-        return Err(fail("page delta base LSN or checksum mismatch"));
+        return Err(fail(&format!("page delta base LSN or checksum mismatch: page={} expected_lsn={} actual_lsn={} expected_crc={:08x} actual_crc={:08x}", page_id, base_lsn, current_lsn, base_crc, crc32fast::hash(&before))));
     }
     let mut after = vec![0; PAGE_SIZE];
     let size = lz4_flex::block::decompress_into_with_dict(compressed_after, &mut after, &before)
@@ -2892,4 +2903,88 @@ mod round2_recovery_tests {
             assert_eq!(fs::read(dir.path().join(path)).unwrap()[100], 0);
         }
     }
+}
+
+/// Publish an immutable source image without re-stamping any embedded page LSN.
+/// The durable receipt prevents an old CREATE image from replacing later redo.
+pub(crate) fn redo_vector_image(
+    data_dir: &Path, relative: &str, offset: u64, total: u64, bytes: &[u8], lsn: u64,
+) -> Result<(), QueryError> {
+    let path = Path::new(relative);
+    if path.is_absolute() || path.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || !relative.starts_with("objects/indexes/")
+        || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("hvec" | "hnsw"))
+        || bytes.is_empty() || bytes.len() > 1024 * 1024
+        || offset.checked_add(bytes.len() as u64).is_none_or(|end| end > total) {
+        return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "invalid vector image publication"));
+    }
+    let path = data_dir.join(path);
+    let receipt = path.with_extension(format!("{}.vpub", path.extension().unwrap().to_string_lossy()));
+    match fs::read(&receipt) {
+        Ok(bytes) => {
+            if bytes.len() != 12 || crc32fast::hash(&bytes[..8]) != u32::from_le_bytes(bytes[8..].try_into().unwrap()) {
+                return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "invalid vector publication receipt"));
+            }
+            if u64::from_le_bytes(bytes[..8].try_into().unwrap()) >= lsn { return Ok(()); }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_err(err)),
+    }
+    let parent = path.parent().unwrap();
+    fs::create_dir_all(parent).map_err(io_err)?;
+    let incoming = path.with_extension(format!("{}.incoming", path.extension().unwrap().to_string_lossy()));
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(offset == 0).open(&incoming).map_err(io_err)?;
+    if file.metadata().map_err(io_err)?.len() < offset {
+        return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "vector image chunk has no contiguous predecessor"));
+    }
+    file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
+    file.write_all(bytes).map_err(io_err)?;
+    if offset + bytes.len() as u64 == total {
+        file.set_len(total).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        drop(file);
+        invalidate_recovery_page_io(data_dir, relative);
+        fs::rename(&incoming, &path).map_err(io_err)?;
+        persist_vector_image_receipt(&path, lsn)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_vector_image_receipt(path: &Path, lsn: u64) -> Result<(), QueryError> {
+    let receipt = path.with_extension(format!("{}.vpub", path.extension().unwrap().to_string_lossy()));
+    let tmp = receipt.with_extension("vpub.tmp");
+    let mut bytes = lsn.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    let mut file = fs::File::create(&tmp).map_err(io_err)?;
+    file.write_all(&bytes).map_err(io_err)?;
+    file.sync_all().map_err(io_err)?;
+    fs::rename(&tmp, &receipt).map_err(io_err)?;
+    crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
+}
+
+pub(crate) fn redo_vector_manifest(data_dir: &Path, relative: &str, bytes: &[u8]) -> Result<(), QueryError> {
+    let path = Path::new(relative);
+    if !relative.starts_with("objects/indexes/") || path.extension().and_then(|e| e.to_str()) != Some("vmanifest")
+        || path.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return Err(vector::persistence::corrupt());
+    }
+    let mut reader = vector::persistence::Reader::new(bytes, 7)?;
+    let (storage_id, generation, index_id) = (reader.u64()?, reader.u64()?, reader.u64()?);
+    let incoming = VectorGenerationManifest::decode(bytes, storage_id, generation, index_id)?;
+    let path = data_dir.join(path);
+    match fs::read(&path) {
+        Ok(current) => {
+            let current = VectorGenerationManifest::decode(&current, storage_id, generation, index_id)?;
+            if current.source_lsn >= incoming.source_lsn { return Ok(()); }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+        Err(err) => return Err(io_err(err)),
+    }
+    fs::create_dir_all(path.parent().unwrap()).map_err(io_err)?;
+    let tmp = path.with_extension("vmanifest.incoming");
+    let mut file = fs::File::create(&tmp).map_err(io_err)?;
+    file.write_all(bytes).map_err(io_err)?;
+    file.sync_all().map_err(io_err)?;
+    fs::rename(tmp, &path).map_err(io_err)?;
+    crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }

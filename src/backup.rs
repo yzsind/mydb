@@ -578,6 +578,8 @@ fn collect_files<'a>(
         "system/history-index.v1",
         "system/tablespaces.json",
         "system/zone-map-checkpoint.manifest",
+        "system/vector-purges.v1",
+        "system/vector-maintenance.jobs",
     ] {
         let path = data_dir.join(relative);
         reject_symlink_path(data_dir, Path::new(relative))?;
@@ -787,7 +789,8 @@ fn snapshot_wal_files(db: &Database) -> Result<WalSnapshot, QueryError> {
 fn classify_file(relative: &str) -> FileClass {
     match Path::new(relative).extension().and_then(|ext| ext.to_str()) {
         Some("idx") => FileClass::Index,
-        Some("zm" | "hnsw" | "hvec") => FileClass::Derived,
+        Some("hnsw" | "hvec" | "vmanifest" | "vpub") => FileClass::VectorIndex,
+        Some("zm") => FileClass::Derived,
         Some("log") if relative.starts_with("system/wal/") => FileClass::RecoveryWal,
         _ => FileClass::Authoritative,
     }
@@ -1473,6 +1476,8 @@ fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
                 | "system/history-index.v1"
                 | "system/tablespaces.json"
                 | "system/zone-map-checkpoint.manifest"
+                | "system/vector-purges.v1"
+                | "system/vector-maintenance.jobs"
         );
     if !allowed {
         return Err(backup_err(format!(

@@ -233,11 +233,6 @@ name = "vector_search_bench"
 path = "src/bin/vector_search_bench.rs"
 required-features = ["tools"]
 
-[[bin]]
-name = "ft_bench"
-path = "src/bin/ft_bench.rs"
-required-features = ["tools"]
-
 [profile.dev.package."*"]
 opt-level = 3
 

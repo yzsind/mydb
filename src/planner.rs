@@ -10761,6 +10761,7 @@ fn choose_scan(
             }
             let fulltext_access_rows =
                 estimate_fulltext_access_rows(&table.schema, &specs, total_rows);
+            let heap_oracle = table.system_time.is_some() || table.schema.is_partitioned();
             // MATCH does not preclude an ordinary conjunct from providing a
             // cheaper base row-id set. Keep the MATCH posting/score maps, but
             // intersect them with a sufficiently selective B-tree access.
@@ -10768,11 +10769,13 @@ fn choose_scan(
             if let Some((access, rows)) = index_choice
                 .clone()
                 .map(|(choice, _)| cost_fulltext_base_access(&table.schema, choice, total_rows))
-                .filter(|(_, rows)| *rows < total_rows && *rows <= fulltext_access_rows.max(1.0))
+                .filter(|(_, rows)| {
+                    !heap_oracle && *rows < total_rows && *rows <= fulltext_access_rows.max(1.0)
+                })
             {
                 base_candidates.push((access, rows, "FULLTEXT + B-tree candidates".to_string()));
             }
-            if !table.schema.is_partitioned() && selected_zone_map.is_some() {
+            if !heap_oracle && selected_zone_map.is_some() {
                 if let Some(zone_filter) = filter.as_ref() {
                     if selected_seq_access_rows < total_rows
                         && selected_seq_access_rows <= fulltext_access_rows.max(1.0)
@@ -10790,16 +10793,29 @@ fn choose_scan(
             let base_access = base_candidates
                 .into_iter()
                 .min_by(|left, right| left.1.total_cmp(&right.1));
-            let access_rows = base_access
+            let candidate_rows = base_access
                 .as_ref()
                 .map(|(_, rows, _)| rows.min(fulltext_access_rows))
                 .unwrap_or(fulltext_access_rows);
             let estimated_rows = residual
                 .as_ref()
-                .map(|e| estimate_filter_rows(&table.schema, e, access_rows))
-                .unwrap_or(access_rows);
+                .map(|e| estimate_filter_rows(&table.schema, e, candidate_rows))
+                .unwrap_or(candidate_rows);
+            let access_rows = if heap_oracle {
+                total_rows
+            } else {
+                candidate_rows
+            };
             let (base_access, base_note) = match base_access {
                 Some((access, _, note)) => (Some(access), Some(note)),
+                None if heap_oracle => (
+                    None,
+                    Some(if table.system_time.is_some() {
+                        "historical FULLTEXT heap oracle".to_string()
+                    } else {
+                        "partitioned FULLTEXT heap oracle".to_string()
+                    }),
+                ),
                 None => (None, None),
             };
             let primary = specs.remove(0);

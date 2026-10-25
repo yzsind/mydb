@@ -605,8 +605,12 @@ pub(crate) struct PendingVectorMutation {
 
 /// One commit's superseded graph versions for one index, retired once no
 /// snapshot that could still see them remains.
+type VectorPurgeIdentity = (u64, u64, u64, u64, u64, u64);
+
 #[derive(Debug)]
 pub(crate) struct VectorPurge {
+    index_id: u64,
+    lineage: u64,
     key: (u64, u64, u64, String),
     rows: Vec<(RowId, smallvec::SmallVec<[u64; 1]>)>,
     commit_scn: u64,
@@ -615,6 +619,87 @@ pub(crate) struct VectorPurge {
 /// Row operations committed while a lazy vector graph build is in flight.
 /// `ops` stays append-only for the registration's lifetime, so concurrent
 /// builders of the same key each replay the complete sequence.
+type VectorPurgeIndexIdentity = (u64, u64, u64, u64, u64);
+
+#[derive(Debug, Default)]
+struct VectorPurgeQueue {
+    by_time: BTreeMap<VectorPurgeIdentity, VectorPurge>,
+    by_index: BTreeMap<VectorPurgeIndexIdentity, BTreeSet<u64>>,
+    latest_retired: BTreeMap<(VectorPurgeIndexIdentity, RowId), u64>,
+}
+
+impl VectorPurgeQueue {
+    fn new() -> Self { Self::default() }
+    fn len(&self) -> usize { self.by_time.len() }
+    fn is_empty(&self) -> bool { self.by_time.is_empty() }
+    fn values(&self) -> impl Iterator<Item = &VectorPurge> { self.by_time.values() }
+    fn contains_key(&self, key: &VectorPurgeIdentity) -> bool { self.by_time.contains_key(key) }
+    fn get_mut(&mut self, key: &VectorPurgeIdentity) -> Option<&mut VectorPurge> { self.by_time.get_mut(key) }
+    fn index_key(key: &VectorPurgeIdentity) -> VectorPurgeIndexIdentity { (key.1, key.2, key.3, key.4, key.5) }
+    fn insert(&mut self, purge: VectorPurge) -> Option<VectorPurge> {
+        let key = purge.identity();
+        for (row, versions) in &purge.rows {
+            if let Some(latest) = versions.iter().max() {
+                self.latest_retired.entry((Self::index_key(&key), *row))
+                    .and_modify(|seen| *seen = (*seen).max(*latest)).or_insert(*latest);
+            }
+        }
+        self.by_index.entry(Self::index_key(&key)).or_default().insert(key.0);
+        self.by_time.insert(key, purge)
+    }
+    fn insert_new_retirements(&mut self, mut purge: VectorPurge) {
+        let index = Self::index_key(&purge.identity());
+        for (row, versions) in &mut purge.rows {
+            if let Some(seen) = self.latest_retired.get(&(index, *row)) {
+                versions.retain(|version| *version > *seen);
+            }
+        }
+        purge.rows.retain(|(_, versions)| !versions.is_empty());
+        if !purge.rows.is_empty() { self.insert_if_absent(purge); }
+    }
+    fn remove_completed(&mut self, key: &VectorPurgeIdentity,
+        rows: &[(RowId, smallvec::SmallVec<[u64; 1]>)]) {
+        let index = Self::index_key(key);
+        for (row, versions) in rows {
+            if let Some(latest) = versions.iter().max() {
+                if self.latest_retired.get(&(index, *row)).is_some_and(|seen| seen <= latest) {
+                    self.latest_retired.remove(&(index, *row));
+                }
+            }
+        }
+        self.remove(key);
+        if self.is_empty() { self.latest_retired.clear(); }
+    }
+    fn insert_if_absent(&mut self, purge: VectorPurge) -> bool {
+        if self.contains_key(&purge.identity()) { return false; }
+        self.insert(purge);
+        true
+    }
+    fn remove(&mut self, key: &VectorPurgeIdentity) -> Option<VectorPurge> {
+        let index = Self::index_key(key);
+        if let Some(times) = self.by_index.get_mut(&index) {
+            times.remove(&key.0);
+            if times.is_empty() { self.by_index.remove(&index); }
+        }
+        self.by_time.remove(key)
+    }
+    fn ready_keys(&self, horizon: u64) -> Vec<VectorPurgeIdentity> {
+        self.by_time.range(..=(horizon, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX))
+            .map(|(key, _)| *key).collect()
+    }
+    fn for_index(&self, index: VectorPurgeIndexIdentity) -> impl Iterator<Item = &VectorPurge> + '_ {
+        self.by_index.get(&index).into_iter().flat_map(move |times| times.iter().filter_map(move |time| {
+            self.by_time.get(&(*time, index.0, index.1, index.2, index.3, index.4))
+        }))
+    }
+}
+
+impl VectorPurge {
+    fn identity(&self) -> VectorPurgeIdentity {
+        (self.commit_scn, self.key.0, self.key.1, self.key.2, self.index_id, self.lineage)
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct VectorBuildDelta {
     builders: usize,
@@ -1029,6 +1114,15 @@ pub struct Database {
     /// while the shared graph lacks them, so KNN merges exactly these (plus
     /// the reader's own) pending upserts. Never held with the map above.
     vector_commits_publishing: parking_lot::Mutex<HashSet<u64>>,
+    vector_recovery_active: AtomicBool,
+    #[cfg(test)]
+    vector_persist_failure: AtomicU64,
+    vector_pending_wal: parking_lot::Mutex<BTreeMap<u64, u64>>,
+    vector_copy_publications: parking_lot::Mutex<HashSet<u64>>,
+    replica_vector_state: parking_lot::Mutex<ReplicaVectorState>,
+    replica_vector_signal: parking_lot::Condvar,
+    vector_retired_graphs: parking_lot::Mutex<HashMap<PathBuf, std::sync::Weak<VectorGraph>>>,
+    vector_snapshot_dirty: parking_lot::Mutex<HashSet<u64>>,
     recovered_vector_completion: parking_lot::Mutex<()>,
     /// Number of deferred tombstones discarded by rollback/savepoint rollback.
     /// Surfaced in SHOW ENGINE MYDB STATUS.
@@ -1080,7 +1174,10 @@ pub struct Database {
     /// Superseded HNSW node versions (DELETE / re-linked UPDATE) that some
     /// active snapshot may still need; retired once the visibility horizon
     /// passes their commit. `vector_purges_pending` mirrors the length.
-    vector_purge_queue: parking_lot::Mutex<VecDeque<VectorPurge>>,
+    vector_purge_queue: parking_lot::Mutex<VectorPurgeQueue>,
+    vector_purge_snapshot_gate: parking_lot::RwLock<()>,
+    vector_purge_drain_gate: parking_lot::Mutex<()>,
+    vector_purge_recovery_charge: parking_lot::Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
     vector_purges_pending: AtomicUsize,
     /// Lazy backing store for `SET PERSIST` / `SET PERSIST_ONLY`. Opened on
     /// first read or write, materialised against `<data_dir>/system/mysqld-auto.cnf`.
@@ -1392,6 +1489,10 @@ pub struct Database {
     online_index_replay_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_copy_publish_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    vector_copy_committed_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    vector_apply_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_index_validation_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
 }
@@ -4257,6 +4358,10 @@ include!("core/database/index_build_encoded.rs");
 include!("core/database/index_maintenance.rs");
 include!("core/database/shadow_generation.rs");
 include!("core/database/vector_index.rs");
+include!("core/database/vector_recovery.rs");
+include!("core/database/vector_replication.rs");
+include!("core/database/vector_generations.rs");
+include!("core/database/vector_retirements.rs");
 include!("core/database/mvcc.rs");
 include!("core/database/startup.rs");
 include!("core/database/stats_ops.rs");

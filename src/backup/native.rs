@@ -736,7 +736,9 @@ pub fn prepare_directory(path: &Path) -> Result<(), QueryError> {
         .filter(|f| f.class != FileClass::RecoveryWal)
         .map(|f| ObjectReplayContract {
             path: f.path.clone(),
-            mode: if f.class == FileClass::Index || f.class == FileClass::Derived {
+            mode: if f.class == FileClass::VectorIndex {
+                "SOURCE_INDEX_JOURNAL"
+            } else if f.class == FileClass::Index || f.class == FileClass::Derived {
                 "REBUILD_FROM_AUTHORITY"
             } else {
                 "SOURCE_PHYSICAL"
@@ -1394,7 +1396,9 @@ pub(crate) fn restore_image(
         .filter(|f| f.class != FileClass::RecoveryWal)
         .map(|f| ObjectReplayContract {
             path: f.path.clone(),
-            mode: if f.class == FileClass::Index || f.class == FileClass::Derived {
+            mode: if f.class == FileClass::VectorIndex {
+                "SOURCE_INDEX_JOURNAL"
+            } else if f.class == FileClass::Index || f.class == FileClass::Derived {
                 "REBUILD_FROM_AUTHORITY"
             } else {
                 "SOURCE_PHYSICAL"

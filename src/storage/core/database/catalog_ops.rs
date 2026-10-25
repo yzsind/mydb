@@ -259,7 +259,7 @@ impl Database {
                     ),
                 ));
             }
-            let intent = self.build_drop_table_intent(table);
+            let intent = self.build_drop_table_intent(table)?;
             let path = self.write_drop_table_intent(&intent)?;
             dropped.push((table.clone(), intent, path));
         }
@@ -545,6 +545,24 @@ impl Database {
         // table name probes emit WAL). Replication installs headers from its
         // CatalogDelta before publishing the commit.
         None
+    }
+
+    /// Resolve an important object without converting descriptor I/O errors to absence.
+    fn table_by_id_checked(&self, table_id: u64) -> Result<Option<Arc<TableSchema>>, QueryError> {
+        if let Some(table) = crate::storage::data_dictionary::dd_table_schema(table_id) {
+            return Ok(Some(table));
+        }
+        if is_temp_table_id(table_id) {
+            return Ok(self.temp_tables.read().map_err(|_| vector::persistence::corrupt())?
+                .values().find(|table| table.id == table_id).cloned());
+        }
+        let header = self.catalog.read().map_err(|_| vector::persistence::corrupt())?.tables.values()
+            .find(|table| table.id == table_id || table.storage_ids().contains(&table_id)).cloned();
+        let Some(header) = header else { return Ok(None); };
+        if !header.columns.is_empty() || header.system { return Ok(Some(header)); }
+        let table = self.load_table_descriptor_from_dd(header.id)?.ok_or_else(vector::persistence::corrupt)?;
+        self.catalog.install_descriptor(table_key(&table.database, &table.name), table.clone());
+        Ok(Some(table))
     }
 
     fn table_by_id(&self, table_id: u64) -> Option<Arc<TableSchema>> {

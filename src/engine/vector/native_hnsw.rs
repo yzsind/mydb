@@ -24,6 +24,7 @@ use std::{
 
 #[derive(Debug)]
 struct Node {
+    complete: bool,
     exception: bool,
     row: RowId,
     group: usize,
@@ -72,9 +73,13 @@ pub(crate) struct NativeHnsw {
     valid: AtomicBool,
     pending: Mutex<HashSet<u64>>,
     quantizer: Option<Arc<super::quantization::Quantizer>>,
+    trained_pending: std::sync::OnceLock<Arc<super::quantization::Quantizer>>,
+    pending_training_gate: Mutex<()>,
     quantization_requested: bool,
     retrain: AtomicBool,
-    generation: u64,
+    lineage: u64,
+    generation: std::sync::atomic::AtomicU64,
+    persisted_lsn: std::sync::atomic::AtomicU64,
     candidates_returned: std::sync::atomic::AtomicU64,
     heap_reranks: std::sync::atomic::AtomicU64,
     exact_fallbacks: std::sync::atomic::AtomicU64,
@@ -114,14 +119,470 @@ impl NativeHnsw {
             valid: AtomicBool::new(true),
             pending: Mutex::new(HashSet::new()),
             quantizer: None,
+            trained_pending: std::sync::OnceLock::new(),
+            pending_training_gate: Mutex::new(()),
             quantization_requested: false,
             retrain: AtomicBool::new(false),
-            generation: 0,
+            lineage: 0,
+            generation: std::sync::atomic::AtomicU64::new(0),
+            persisted_lsn: std::sync::atomic::AtomicU64::new(0),
             candidates_returned: std::sync::atomic::AtomicU64::new(0),
             heap_reranks: std::sync::atomic::AtomicU64::new(0),
             exact_fallbacks: std::sync::atomic::AtomicU64::new(0),
         })
     }
+    fn definition_bytes(&self) -> Result<Vec<u8>, QueryError> {
+        self.definition_bytes_for(self.quantizer(), self.generation.load(Ordering::Acquire))
+    }
+    fn definition_bytes_for(
+        &self,
+        model: Option<&Arc<super::quantization::Quantizer>>,
+        generation: u64,
+    ) -> Result<Vec<u8>, QueryError> {
+        let mut out = Vec::new();
+        let mut writer =
+            super::persistence::Writer::new(&mut out, 3).map_err(super::persistence::io_error)?;
+        writer
+            .u8(self.datatype as u8)
+            .map_err(super::persistence::io_error)?;
+        writer
+            .u32(self.dimension)
+            .map_err(super::persistence::io_error)?;
+        writer
+            .u8(self.metric.as_u8())
+            .map_err(super::persistence::io_error)?;
+        writer.count(self.m).map_err(super::persistence::io_error)?;
+        writer
+            .count(self.ef_construction)
+            .map_err(super::persistence::io_error)?;
+        writer
+            .u8(u8::from(self.quantization_requested))
+            .map_err(super::persistence::io_error)?;
+        writer
+            .u64(self.lineage)
+            .map_err(super::persistence::io_error)?;
+        writer
+            .u64(generation)
+            .map_err(super::persistence::io_error)?;
+        let quantizer = model
+            .map(|q| q.serialize(None))
+            .transpose()?
+            .unwrap_or_default();
+        writer
+            .bytes(&quantizer)
+            .map_err(super::persistence::io_error)?;
+        writer.finish().map_err(super::persistence::io_error)?;
+        Ok(out)
+    }
+
+    fn from_definition(
+        bytes: &[u8],
+        file: Option<Arc<VectorIndexFile>>,
+    ) -> Result<Self, QueryError> {
+        let mut reader = super::persistence::Reader::new(bytes, 3)?;
+        let datatype =
+            VectorDataType::from_tag(reader.u8()?).ok_or_else(super::persistence::corrupt)?;
+        let dimension = reader.u32()?;
+        let metric = Metric::from_u8(reader.u8()?).ok_or_else(super::persistence::corrupt)?;
+        let m = reader.u32()? as usize;
+        let ef = reader.u32()? as usize;
+        let requested = match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(super::persistence::corrupt()),
+        };
+        let lineage = reader.u64()?;
+        let generation = reader.u64()?;
+        let model = reader.bytes()?;
+        if dimension == 0 || dimension > datatype.max_dimension() || m < 2 || ef < m {
+            return Err(super::persistence::corrupt());
+        }
+        let quantizer = if model.is_empty() {
+            None
+        } else {
+            Some(super::quantization::Quantizer::deserialize(model)?)
+        };
+        reader.finish()?;
+        let mut graph = Self::new(datatype, dimension, metric, m, ef, file)?;
+        graph.lineage = lineage;
+        graph.set_quantizer(requested, quantizer, generation);
+        Ok(graph)
+    }
+
+    pub(crate) fn persisted_lsn(&self) -> u64 {
+        self.persisted_lsn.load(Ordering::Acquire)
+    }
+    pub(crate) fn mark_persisted(&self, lsn: u64) {
+        self.persisted_lsn.store(lsn, Ordering::Release);
+    }
+
+    pub(crate) fn persist_definition(&self) -> Result<(), QueryError> {
+        if let Some(file) = &self.file {
+            file.write_native_definition(&self.definition_bytes()?)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn train_pending_model(
+        &self,
+        config: &crate::storage::vector_config::QuantizationConfig,
+        generation: u64,
+        publish: impl FnOnce(&Arc<super::quantization::Quantizer>) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        let _training = self.pending_training_gate.lock();
+        if !self.quantization_pending() {
+            return Ok(());
+        }
+        let minimum = match config {
+            crate::storage::vector_config::QuantizationConfig::Pq { bits, .. } => 1usize << bits,
+            _ => 1,
+        };
+        let state = self.state.read();
+        if state.rows.len() < minimum {
+            return Ok(());
+        }
+        let _scratch = ControlledMemoryCharge::try_new_recoverable(
+            ControlledMemoryCategory::StorageScratch,
+            self.datatype.payload_len(self.dimension).saturating_mul(3),
+        )?;
+        let mut trainer = super::quantization::Trainer::new(
+            config.clone(),
+            self.datatype,
+            self.dimension,
+            self.metric,
+        )?;
+        for (id, node) in state.nodes.iter().enumerate() {
+            if !node.deleted {
+                trainer.observe(&self.value(&state, id)?)?;
+            }
+        }
+        drop(state);
+        let Some(model) = trainer.finish()? else {
+            return Ok(());
+        };
+        publish(&model)?;
+        self.install_pending_model(model, generation)
+    }
+
+    pub(crate) fn install_pending_model(
+        &self,
+        model: Arc<super::quantization::Quantizer>,
+        generation: u64,
+    ) -> Result<(), QueryError> {
+        let mut state = self.state.write();
+        if self.quantizer().is_some() {
+            if self.generation.load(Ordering::Acquire) >= generation {
+                return Ok(());
+            }
+            return Err(super::persistence::corrupt());
+        }
+        if !self.quantization_requested {
+            return Err(super::persistence::corrupt());
+        }
+        let count = state.nodes.len();
+        let mut converted_charge = ControlledMemoryCharge::try_new_recoverable(
+            ControlledMemoryCategory::StorageScratch,
+            if self.file.is_none() {
+                count.saturating_mul(24)
+            } else {
+                0
+            },
+        )?;
+        let mut converted = Vec::new();
+        let mut old_bytes = 0usize;
+        if self.file.is_none() {
+            converted
+                .try_reserve_exact(count)
+                .map_err(|_| codec::vector_err("pending HNSW conversion allocation failed"))?;
+            for node in &state.nodes {
+                let old = node
+                    .value
+                    .as_ref()
+                    .ok_or_else(super::persistence::corrupt)?;
+                let value = model.store(old, None)?;
+                converted_charge.try_grow_recoverable(value.len())?;
+                old_bytes = old_bytes.saturating_add(old.len());
+                converted.push(value);
+            }
+        }
+        if let Some(file) = &self.file {
+            file.write_quantization_model(&model.serialize(None)?, generation)?;
+            file.write_native_definition(&self.definition_bytes_for(Some(&model), generation)?)?;
+        } else {
+            for (node, value) in state.nodes.iter_mut().zip(converted) {
+                node.exception = value.payload.first() == Some(&1);
+                node.value = Some(value);
+            }
+            state.charge.absorb(&mut converted_charge);
+            state
+                .charge
+                .shrink(old_bytes.saturating_add(count.saturating_mul(24)));
+        }
+        if self.file.is_some() {
+            for node in &mut state.nodes {
+                node.exception = true;
+            }
+        }
+        state.exceptions = state
+            .nodes
+            .iter()
+            .filter(|node| node.exception && !node.deleted)
+            .count();
+        state.incremental_exceptions = 0;
+        self.generation.store(generation, Ordering::Release);
+        self.trained_pending
+            .set(model)
+            .map_err(|_| super::persistence::corrupt())?;
+        Ok(())
+    }
+
+    pub(crate) fn matches_quantization(
+        &self,
+        config: &crate::storage::vector_config::QuantizationConfig,
+    ) -> bool {
+        self.quantization_requested == config.enabled()
+            && self.quantizer().is_none_or(|model| {
+                model.matches_definition(self.datatype, self.dimension, self.metric, config)
+            })
+    }
+
+    pub(crate) fn matches_definition(
+        &self,
+        datatype: VectorDataType,
+        dimension: u32,
+        metric: Metric,
+        m: usize,
+        ef: usize,
+    ) -> bool {
+        self.datatype == datatype
+            && self.dimension == dimension
+            && self.metric == metric
+            && self.m == m
+            && self.ef_construction == ef
+    }
+
+    fn restore_node(&self, state: &mut State, node: Node) -> Result<(), QueryError> {
+        let id = state.nodes.len();
+        if node.group > state.groups.len() || node.level > super::hnsw_paged::VEC_MAX_LAYER {
+            return Err(super::persistence::corrupt());
+        }
+        state.charge.try_grow_recoverable(
+            1024 + node.value.as_ref().map_or(0, |v| v.len())
+                + node
+                    .links
+                    .iter()
+                    .map(|links| links.len() * 8 + 24)
+                    .sum::<usize>(),
+        )?;
+        if node.group == state.groups.len() {
+            let hash = if self.quantizer().is_none() && node.complete {
+                let value = if let Some(value) = &node.value {
+                    value.clone()
+                } else {
+                    self.file
+                        .as_ref()
+                        .ok_or_else(super::persistence::corrupt)?
+                        .with_native_vector(node.vid, |value| {
+                            if self.quantization_requested {
+                                super::quantization::load_untrained(
+                                    value.payload,
+                                    self.file.as_ref().unwrap(),
+                                    self.datatype,
+                                    self.dimension,
+                                )
+                            } else {
+                                Ok(VectorValue::new(
+                                    self.datatype,
+                                    self.dimension,
+                                    value.payload.to_vec(),
+                                ))
+                            }
+                        })?
+                };
+                Some(self.coordinate_hash(state, &value))
+            } else {
+                None
+            };
+            let next_collision = hash.and_then(|hash| state.group_heads.insert(hash, node.group));
+            state.groups.push(NavigationGroup {
+                representative: id,
+                members: Vec::new(),
+                next_collision,
+            });
+        }
+        state.groups[node.group].members.push(id);
+        if !node.deleted {
+            state.rows.insert(node.row, id);
+        }
+        if node.exception && !node.deleted {
+            state.exceptions += 1;
+        }
+        if state.by_vid.insert(node.vid, id).is_some() {
+            return Err(super::persistence::corrupt());
+        }
+        state.nodes.push(node);
+        Ok(())
+    }
+
+    pub(crate) fn load_paged(file: Arc<VectorIndexFile>) -> Result<Self, QueryError> {
+        let graph = Self::from_definition(&file.read_native_definition()?, Some(file.clone()))?;
+        let mut headers = Vec::new();
+        file.for_each_node(|vid, row, deleted| headers.push((vid, row, deleted)))?;
+        let mut state = graph.state.write();
+        for (vid, row, deleted) in headers {
+            let (level, group, complete) = file.native_node_header(vid)?;
+            if !complete && !deleted && file.is_finalized() && file.meta().query_ready {
+                return Err(super::persistence::corrupt());
+            }
+            let exception = graph.quantizer().is_some()
+                && file.with_native_vector(vid, |v| Ok(v.payload.first() == Some(&1)))?;
+            graph.restore_node(
+                &mut state,
+                Node {
+                    complete,
+                    exception,
+                    row,
+                    group: usize::try_from(group).map_err(|_| super::persistence::corrupt())?,
+                    level,
+                    deleted: deleted || !complete,
+                    vid,
+                    value: None,
+                    links: Vec::new(),
+                },
+            )?;
+        }
+        let meta = file.meta();
+        if meta.entry_vid != u64::MAX {
+            state.entry = Some(
+                *state
+                    .by_vid
+                    .get(&meta.entry_vid)
+                    .ok_or_else(super::persistence::corrupt)?,
+            );
+        } else if state.nodes.iter().any(|node| node.complete) {
+            return Err(super::persistence::corrupt());
+        }
+        for group in &state.groups {
+            for layer in 0..=state.nodes[group.representative].level {
+                let _ = graph.links(&state, group.representative, layer)?;
+            }
+        }
+        drop(state);
+        Ok(graph)
+    }
+
+    pub(crate) fn serialize_into(
+        &self,
+        out: impl std::io::Write,
+        covered_lsn: u64,
+    ) -> std::io::Result<()> {
+        if self.file.is_some() {
+            return Err(std::io::Error::other(
+                "paged HNSW does not use resident snapshots",
+            ));
+        }
+        let state = self.state.read();
+        let mut writer = super::persistence::Writer::new(out, 1)?;
+        writer.bytes(&self.definition_bytes().map_err(std::io::Error::other)?)?;
+        writer.u64(covered_lsn)?;
+        writer.u64(state.entry.map_or(u64::MAX, |id| id as u64))?;
+        writer.count(state.nodes.len())?;
+        for node in &state.nodes {
+            writer.row(node.row)?;
+            writer.count(node.group)?;
+            writer.count(node.level)?;
+            writer.u8(u8::from(node.deleted))?;
+            writer.u64(node.vid)?;
+            writer.vector(
+                node.value
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("missing resident HNSW payload"))?,
+            )?;
+            writer.count(node.links.len())?;
+            for layer in &node.links {
+                writer.count(layer.len())?;
+                for id in layer {
+                    writer.count(*id)?;
+                }
+            }
+        }
+        writer.finish()
+    }
+
+    pub(crate) fn deserialize(bytes: &[u8]) -> Result<Self, QueryError> {
+        let mut reader = super::persistence::Reader::new(bytes, 1)?;
+        let graph = Self::from_definition(reader.bytes()?, None)?;
+        graph.persisted_lsn.store(reader.u64()?, Ordering::Release);
+        let entry = reader.u64()?;
+        let count = reader.count(35)?;
+        let mut state = graph.state.write();
+        for _ in 0..count {
+            let row = reader.row()?;
+            let group = reader.u32()? as usize;
+            let level = reader.u32()? as usize;
+            let deleted = match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(super::persistence::corrupt()),
+            };
+            let vid = reader.u64()?;
+            let value = reader.vector()?;
+            if graph.quantizer().is_none() {
+                codec::validate_internal(&value)?;
+            }
+            let exception = graph.quantizer().is_some() && value.payload.first() == Some(&1);
+            let layers = reader.count(4)?;
+            if layers > super::hnsw_paged::VEC_MAX_LAYER + 1 {
+                return Err(super::persistence::corrupt());
+            }
+            let mut links = Vec::with_capacity(layers);
+            for _ in 0..layers {
+                let length = reader.count(4)?;
+                let mut layer = Vec::with_capacity(length);
+                for _ in 0..length {
+                    let id = reader.u32()? as usize;
+                    if id >= count {
+                        return Err(super::persistence::corrupt());
+                    }
+                    layer.push(id);
+                }
+                links.push(layer);
+            }
+            graph.restore_node(
+                &mut state,
+                Node {
+                    complete: true,
+                    exception,
+                    row,
+                    group,
+                    level,
+                    deleted,
+                    vid,
+                    value: Some(value),
+                    links,
+                },
+            )?;
+        }
+        if entry != u64::MAX {
+            let entry = usize::try_from(entry).map_err(|_| super::persistence::corrupt())?;
+            if entry >= count {
+                return Err(super::persistence::corrupt());
+            }
+            state.entry = Some(entry);
+        } else if count != 0 {
+            return Err(super::persistence::corrupt());
+        }
+        reader.finish()?;
+        drop(state);
+        Ok(graph)
+    }
+
+    fn quantizer(&self) -> Option<&Arc<super::quantization::Quantizer>> {
+        self.quantizer
+            .as_ref()
+            .or_else(|| self.trained_pending.get())
+    }
+
     pub(crate) fn set_quantizer(
         &mut self,
         requested: bool,
@@ -129,12 +590,15 @@ impl NativeHnsw {
         generation: u64,
     ) {
         self.quantization_requested = requested;
-        self.generation = if quantizer.is_some() { generation } else { 0 };
+        self.generation.store(
+            if quantizer.is_some() { generation } else { 0 },
+            Ordering::Release,
+        );
         self.quantizer = quantizer;
     }
     pub(crate) fn query_stats(&self) -> (u64, u64, u64, u64) {
         (
-            self.generation,
+            self.generation.load(Ordering::Acquire),
             self.candidates_returned.load(Ordering::Relaxed),
             self.heap_reranks.load(Ordering::Relaxed),
             self.exact_fallbacks.load(Ordering::Relaxed),
@@ -151,14 +615,13 @@ impl NativeHnsw {
             .fetch_add(u64::from(fallback), Ordering::Relaxed);
     }
     pub(crate) fn quantization_pending(&self) -> bool {
-        self.quantization_requested && self.quantizer.is_none()
+        self.quantization_requested && self.quantizer().is_none()
     }
     pub(crate) fn quantization_stats(&self) -> (usize, usize, usize) {
         let state = self.state.read();
         (
-            self.quantizer.as_ref().map_or(0, |q| q.bytes()),
-            self.quantizer
-                .as_ref()
+            self.quantizer().map_or(0, |q| q.bytes()),
+            self.quantizer()
                 .map_or(0, |q| q.record_len() * state.nodes.len()),
             state.exceptions,
         )
@@ -169,8 +632,7 @@ impl NativeHnsw {
         topology: &super::hnsw::HnswIndex,
     ) -> Result<(), QueryError> {
         let q = self
-            .quantizer
-            .as_ref()
+            .quantizer()
             .ok_or_else(|| codec::vector_err("compressed builder requires a trained model"))?;
         let mut state = self.state.write();
         let mut vector = Vec::new();
@@ -191,7 +653,7 @@ impl NativeHnsw {
                 },
             )?;
             let vid = if let Some(file) = &self.file {
-                file.append_native_node(0, row, level, &value.payload)?
+                file.append_native_node(0, row, level, &value.payload, id as u64)?
             } else {
                 id as u64
             };
@@ -200,6 +662,7 @@ impl NativeHnsw {
                 state.exceptions += 1;
             }
             state.nodes.push(Node {
+                complete: true,
                 exception,
                 row,
                 group: id,
@@ -236,6 +699,11 @@ impl NativeHnsw {
                 )?;
             }
         }
+        if let Some(file) = &self.file {
+            for node in &state.nodes {
+                file.mark_node_linked(node.vid)?;
+            }
+        }
         if let Some((entry, level)) = topology.build_entry() {
             state.entry = Some(entry as usize);
             if let Some(file) = &self.file {
@@ -244,21 +712,25 @@ impl NativeHnsw {
         }
         Ok(())
     }
-    pub(crate) fn replace_file(&mut self, file: Arc<VectorIndexFile>) {
-        self.file = Some(file);
-    }
     pub(crate) fn file(&self) -> Option<&Arc<VectorIndexFile>> {
         self.file.as_ref()
     }
     pub(crate) fn invalidate(&self) {
         self.valid.store(false, Ordering::Release);
-        if let Some(file) = &self.file {
-            let _ = file.invalidate_build(0);
-        }
     }
+    pub(crate) fn lineage(&self) -> u64 {
+        self.lineage
+    }
+    pub(crate) fn set_lineage(&mut self, lineage: u64) {
+        self.lineage = lineage;
+    }
+
+    pub(crate) fn retraining_requested(&self) -> bool {
+        self.retrain.load(Ordering::Acquire)
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
-            && (self.quantizer.is_none() || !self.retrain.load(Ordering::Acquire))
     }
     pub(crate) fn dim(&self) -> usize {
         self.dimension as usize
@@ -376,7 +848,7 @@ impl NativeHnsw {
         query: &VectorValue,
         query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<f64, QueryError> {
-        if let Some(quant) = &self.quantizer {
+        if let Some(quant) = self.quantizer() {
             let node = &state.nodes[id];
             if let Some(value) = &node.value {
                 return quant.score_payload(&value.payload, self.file.as_ref(), query, query_code);
@@ -392,12 +864,15 @@ impl NativeHnsw {
         self.score(state, id, query)
     }
     fn score(&self, state: &State, id: usize, query: &VectorValue) -> Result<f64, QueryError> {
-        if self.quantizer.is_some() {
+        if self.quantizer().is_some() {
             return self.navigation_score(state, id, query, None);
         }
         let node = &state.nodes[id];
         match (&node.value, &self.file) {
             (Some(value), _) => typed_ordering_distance(query, value, self.metric),
+            (_, Some(_)) if self.quantization_requested => {
+                typed_ordering_distance(query, &self.value(state, id)?, self.metric)
+            }
             (_, Some(file)) => file.with_native_vector(node.vid, |value| {
                 typed_ordering_distance(query, &value, self.metric)
             }),
@@ -409,7 +884,7 @@ impl NativeHnsw {
         state: &State,
         id: usize,
     ) -> Result<(VectorValue, Option<super::quantization::QuantQuery>), QueryError> {
-        let Some(q) = &self.quantizer else {
+        let Some(q) = self.quantizer() else {
             return Ok((self.value(state, id)?, None));
         };
         let node = &state.nodes[id];
@@ -427,7 +902,7 @@ impl NativeHnsw {
     }
     fn value(&self, state: &State, id: usize) -> Result<VectorValue, QueryError> {
         let node = &state.nodes[id];
-        if let Some(quant) = &self.quantizer {
+        if let Some(quant) = self.quantizer() {
             if let Some(value) = &node.value {
                 return quant.value_payload(&value.payload, self.file.as_ref());
             }
@@ -446,6 +921,14 @@ impl NativeHnsw {
             .as_ref()
             .unwrap()
             .with_native_vector(node.vid, |v| {
+                if self.quantization_requested {
+                    return super::quantization::load_untrained(
+                        v.payload,
+                        self.file.as_ref().unwrap(),
+                        self.datatype,
+                        self.dimension,
+                    );
+                }
                 Ok(VectorValue::new(
                     v.datatype,
                     v.dimension,
@@ -700,7 +1183,19 @@ impl NativeHnsw {
         self.file
             .as_ref()
             .unwrap()
-            .with_native_vector(state.nodes[representative].vid, |v| Ok(equal(v.payload)))
+            .with_native_vector(state.nodes[representative].vid, |v| {
+                if self.quantization_requested {
+                    let original = super::quantization::load_untrained(
+                        v.payload,
+                        self.file.as_ref().unwrap(),
+                        self.datatype,
+                        self.dimension,
+                    )?;
+                    Ok(equal(&original.payload))
+                } else {
+                    Ok(equal(v.payload))
+                }
+            })
     }
     fn insert_member(
         &self,
@@ -722,11 +1217,17 @@ impl NativeHnsw {
             .map_err(|_| codec::vector_err("native HNSW posting allocation failed"))?;
         let id = state.nodes.len();
         let vid = if let Some(file) = &self.file {
-            file.append_native_node(0, row, 0, &value.payload)?
+            let stored = if self.quantization_requested {
+                super::quantization::store_untrained(&value, Some(file))?
+            } else {
+                value.clone()
+            };
+            file.append_native_node(0, row, 0, &stored.payload, group as u64)?
         } else {
             id as u64
         };
         state.nodes.push(Node {
+            complete: true,
             exception: false,
             row,
             group,
@@ -742,13 +1243,13 @@ impl NativeHnsw {
         });
         state.by_vid.insert(vid, id);
         state.groups[group].members.push(id);
+        if let Some(file) = &self.file {
+            file.mark_node_linked(vid)?;
+        }
         state.rows.insert(row, id);
         Ok(())
     }
     pub(crate) fn insert(&self, row: RowId, value: VectorValue) -> Result<(), QueryError> {
-        if self.quantization_pending() {
-            return Err(codec::vector_err("quantizer training is pending"));
-        }
         codec::validate_internal(&value)?;
         if self.metric == Metric::Cosine && super::distance::typed_is_zero(&value) {
             return Err(codec::vector_err("COSINE indexes reject zero vectors"));
@@ -762,7 +1263,7 @@ impl NativeHnsw {
             self.delete_locked(&mut state, old)?;
         }
         let hash = self.coordinate_hash(&state, &value);
-        let mut matching = if self.quantizer.is_some() {
+        let mut matching = if self.quantizer().is_some() {
             None
         } else {
             state.group_heads.get(&hash).copied()
@@ -784,9 +1285,7 @@ impl NativeHnsw {
             + if self.file.is_some() {
                 0
             } else {
-                self.quantizer
-                    .as_ref()
-                    .map_or(value.len(), |q| q.record_len())
+                self.quantizer().map_or(value.len(), |q| q.record_len())
                     + (level + 1) * (self.m * 2 * 8 + 24)
             };
         state.charge.try_grow_recoverable(bytes)?;
@@ -794,11 +1293,7 @@ impl NativeHnsw {
             .nodes
             .try_reserve(1)
             .map_err(|_| codec::vector_err("native HNSW node allocation failed"))?;
-        let prepared = self
-            .quantizer
-            .as_ref()
-            .map(|q| q.prepare(&value))
-            .transpose()?;
+        let prepared = self.quantizer().map(|q| q.prepare(&value)).transpose()?;
         let mut entry = state.entry;
         if let Some(mut current) = entry {
             for layer in ((level + 1)..=state.nodes[current].level).rev() {
@@ -806,37 +1301,47 @@ impl NativeHnsw {
             }
             entry = Some(current);
         }
-        let encoded = self
-            .quantizer
-            .as_ref()
-            .map(|q| q.store(&value, self.file.as_ref()))
-            .transpose()?;
+        let encoded = if let Some(quantizer) = self.quantizer() {
+            Some(quantizer.store(&value, self.file.as_ref())?)
+        } else if self.quantization_requested {
+            Some(super::quantization::store_untrained(
+                &value,
+                self.file.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let payload = encoded.as_ref().unwrap_or(&value);
-        if self.file.is_none() && self.quantizer.is_some() {
+        if self.file.is_none() && self.quantizer().is_some() {
             state.charge.try_grow_recoverable(
                 payload
                     .len()
-                    .saturating_sub(self.quantizer.as_ref().unwrap().record_len()),
+                    .saturating_sub(self.quantizer().unwrap().record_len()),
             )?;
         }
         let vid = if let Some(file) = &self.file {
-            file.append_native_node(0, row, level, &payload.payload)?
+            file.append_native_node(0, row, level, &payload.payload, group as u64)?
         } else {
             id as u64
         };
+        #[cfg(test)]
+        if let Some(file) = &self.file {
+            file.crash_point_for_test(5)?;
+        }
         let stored = if self.file.is_some() {
             None
         } else {
             Some(payload.clone())
         };
-        if self.quantizer.is_some() && payload.payload.first() == Some(&1) {
+        if self.quantizer().is_some() && payload.payload.first() == Some(&1) {
             state.exceptions += 1;
-            if state.nodes.len() >= self.quantizer.as_ref().unwrap().trained_rows() {
+            if state.nodes.len() >= self.quantizer().unwrap().trained_rows() {
                 state.incremental_exceptions += 1;
             }
         }
         state.nodes.push(Node {
-            exception: self.quantizer.is_some() && payload.payload.first() == Some(&1),
+            complete: true,
+            exception: self.quantizer().is_some() && payload.payload.first() == Some(&1),
             row,
             group,
             level,
@@ -916,8 +1421,11 @@ impl NativeHnsw {
                 file.set_entry(0, vid, level as u32)?;
             }
         }
+        if let Some(file) = &self.file {
+            file.mark_node_linked(vid)?;
+        }
         state.rows.insert(row, id);
-        if let Some(q) = &self.quantizer {
+        if let Some(q) = self.quantizer() {
             let exceptions = state.incremental_exceptions;
             let limit = 64usize.max(state.rows.len().div_ceil(20));
             if (matches!(q.name(), "sq8" | "sq4") && exceptions >= limit)
@@ -959,7 +1467,7 @@ impl NativeHnsw {
         query: &VectorValue,
         request: VectorSearchRequest,
     ) -> Result<VectorSearchResult, QueryError> {
-        if !self.is_valid() || self.quantization_pending() {
+        if !self.is_valid() {
             return Err(crate::storage::error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "native HNSW requires quantizer training or rebuild",
@@ -991,11 +1499,7 @@ impl NativeHnsw {
                         .saturating_mul(std::mem::size_of::<(RowId, f64)>()),
                 ),
         )?;
-        let query_code = self
-            .quantizer
-            .as_ref()
-            .map(|q| q.prepare(query))
-            .transpose()?;
+        let query_code = self.quantizer().map(|q| q.prepare(query)).transpose()?;
         for layer in (1..=state.nodes[entry].level).rev() {
             entry = self.greedy(&state, query, entry, layer, query_code.as_ref())?;
         }
@@ -1019,7 +1523,7 @@ impl NativeHnsw {
         }
         Ok(VectorSearchResult {
             candidates,
-            exact_order: self.quantizer.is_none(),
+            exact_order: self.quantizer().is_none(),
             exhausted,
         })
     }

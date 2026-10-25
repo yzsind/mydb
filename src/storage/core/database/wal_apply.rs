@@ -213,6 +213,10 @@ impl Database {
     ) -> Result<(), QueryError> {
         let lsn = record.lsn;
         let txn_id = record.txn_id;
+        let _vector_write = match replica_payload_path(&record.payload) {
+            Some(path) if path.ends_with(".hvec") || path.ends_with(".vmanifest") => self.begin_vector_physical_redo(path)?,
+            _ => None,
+        };
         let _zone_operation = replica_payload_path(&record.payload)
             .filter(|path| path.ends_with(".zm"))
             .map(|_| self.zone_map_gate.read_recursive());
@@ -282,6 +286,15 @@ impl Database {
                 // deliberately independent of transaction outcome.
                 self.apply_zone_map_wal(bytes)?;
             }
+            WalPayload::VectorIndexManifest { path, bytes } => redo_vector_manifest(&self.data_dir, path, bytes)?,
+            WalPayload::VectorIndexImage { path, offset, total, bytes } => {
+                if *offset == 0 { self.replica_vector_state.lock().images.insert(path.clone(), lsn); }
+                redo_vector_image(&self.data_dir, path, *offset, *total, bytes, lsn)?;
+                if offset.checked_add(bytes.len() as u64) == Some(*total) { self.replica_vector_state.lock().images.remove(path); }
+                self.invalidate_buffer_pool_path(path)?;
+            }
+            WalPayload::VectorIndexBatch { .. } | WalPayload::VectorIndexModel { .. } => self.note_replica_vector_record(record)?,
+            WalPayload::VectorIndexComplete { txn_id, commit_scn } => self.complete_replica_vector_transaction(*txn_id, *commit_scn)?,
             WalPayload::HistoryIndexBatch { bytes } => {
                 // Kept invisible until the matching CommitTxn installs the
                 // commit-SCN ledger entry. Abort/loser batches are harmless.
@@ -368,7 +381,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64);
+                self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 if crate::storage::core::heap_payload_counts_as_logical_row(payload) {
                     self.note_replicated_table_mutation(txn_id, path, 1, 1);
@@ -410,7 +423,7 @@ impl Database {
                     if page > max_page {
                         max_page = page;
                     }
-                    self.discard_heap_page_only(path, page);
+                    self.discard_heap_page_only(path, page)?;
                 }
                 self.refresh_heap_handle_if_grown(path, max_page);
                 let logical_rows = inserts
@@ -454,7 +467,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64);
+                self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let before_live = crate::storage::core::heap_payload_live_logical_state(before);
                 let after_live = crate::storage::core::heap_payload_live_logical_state(after);
@@ -482,7 +495,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64);
+                self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 self.note_replicated_table_mutation(txn_id, path, 1, 0);
             }
@@ -500,7 +513,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64);
+                self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let _ = before;
             }
@@ -554,7 +567,7 @@ impl Database {
                     },
                 )?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64);
+                self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
             }
             WalPayload::PageUpdate {
@@ -588,7 +601,7 @@ impl Database {
                 }
                 redo_page_update(&self.data_dir, path, *page_id, lsn, after)?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::FullPageImageCompressed { path, page_id, .. } => {
                 if Self::path_is_index_file(path) {
@@ -597,7 +610,7 @@ impl Database {
                 let after = crate::wal::wal_full_page_image_after(&record.payload)?;
                 redo_page_update(&self.data_dir, path, *page_id, lsn, &after)?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::PageDelta { path, .. } => {
                 if Self::path_is_index_file(path) {
@@ -605,7 +618,7 @@ impl Database {
                 }
                 redo_page_delta(&self.data_dir, record)?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::PageUpdateCompressed { path, page_id, .. } => {
                 if Self::path_is_index_file(path) {
@@ -614,7 +627,7 @@ impl Database {
                 let (_, after) = crate::wal::wal_compressed_page_update_images(&record.payload)?;
                 redo_page_update(&self.data_dir, path, *page_id, lsn, &after)?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::IndexBatch { path, ops } => {
                 self.apply_index_batch_record(path, lsn, txn_id, ops)?;
@@ -650,9 +663,8 @@ impl Database {
                     .is_some_and(|delta| delta.dd_touched);
                 self.vector_snapshot_floor
                     .fetch_max(*commit_scn, Ordering::AcqRel);
-                self.invalidate_replicated_hnsw_commit(txn_id, false);
+                self.begin_replica_vector_commit(txn_id)?;
                 self.apply_commit_txn(txn_id, *commit_scn)?;
-                self.invalidate_replicated_hnsw_commit(txn_id, true);
                 if schema_changed {
                     self.replicated_hnsw_table_cache.write().clear();
                 }
@@ -712,7 +724,7 @@ impl Database {
                 } else {
                     apply_file_compensation(&self.data_dir, path, action)?;
                 }
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::FileCreate { path, after } => {
                 // The initial image only exists in this record — the
@@ -738,7 +750,7 @@ impl Database {
                         .has_binlog_intent = true;
                 }
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::FileDelete { path, .. } => {
                 heap_redo.files.remove(path);
@@ -747,7 +759,7 @@ impl Database {
                         return Err(io_err(err));
                     }
                 }
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::FileExtend { path, new_len, .. } => {
                 let target = self.data_dir.join(path);
@@ -764,7 +776,7 @@ impl Database {
                 if file.metadata().map_err(io_err)?.len() < *new_len {
                     file.set_len(*new_len).map_err(io_err)?;
                 }
-                self.invalidate_buffer_pool_path(path);
+                self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::UndoRecord { undo_id, bytes } => {
                 self.undo
@@ -857,19 +869,19 @@ impl Database {
     /// that page is O(1), where the whole-file scan in
     /// `invalidate_buffer_pool_path` walks every pool shard and was the
     /// dominant cost of replica apply under TPC-C.
-    fn discard_heap_page_only(&self, relative: &str, page_id: u64) {
+    fn discard_heap_page_only(&self, relative: &str, page_id: u64) -> Result<(), QueryError> {
         let Some(table_id) = Self::parse_heap_table_id(relative) else {
             // Not a recognizable heap object — fall back to the
             // whole-file invalidation for safety.
-            self.invalidate_buffer_pool_path(relative);
-            return;
+            return self.invalidate_buffer_pool_path(relative);
         };
         let abs = self.data_dir.join(relative);
         let key = PageKey {
             file: Arc::new(BufferPool::heap_file_key(abs, table_id)),
             page_id,
         };
-        let _ = self.buffer_pool.discard_page(&key);
+        self.buffer_pool.discard_page(&key)?;
+        Ok(())
     }
 
     /// Drop the cached `HeapFile` handle when the redo touched a page
@@ -894,9 +906,9 @@ impl Database {
         }
     }
 
-    fn invalidate_buffer_pool_path(&self, relative: &str) {
+    fn invalidate_buffer_pool_path(&self, relative: &str) -> Result<(), QueryError> {
         let abs = self.data_dir.join(relative);
-        let _ = self.buffer_pool.discard_pages_for_path(&abs);
+        self.buffer_pool.discard_pages_for_path(&abs)?;
         // The heap_cache / index_cache may hold an open `HeapFile` /
         // `IndexFile` whose own buffer-pool view of these pages is
         // separate. Drop the cached handle so the next access through
@@ -904,20 +916,21 @@ impl Database {
         // We don't know the table_id from the path alone for indexes,
         // so we scan both caches.
         if let Some(table_id) = Self::parse_heap_table_id(relative) {
-            let _ = self.remove_heap_cache_entry(table_id);
+            self.remove_heap_cache_entry(table_id)?;
         }
         // LOB allocation metadata is cached separately from buffer pages.
         // Retire both owners so promotion cannot allocate from a stale high
         // water mark and truncate already replicated chains.
         if let Some((_, info)) = crate::storage::naming::parse_relative_object_path(relative) {
             if info.ext == "lob" {
-                let _ = self.remove_overflow_cache_entry(info.table_id);
-                let _ = self.remove_heap_cache_entry(info.table_id);
+                self.remove_overflow_cache_entry(info.table_id)?;
+                self.remove_heap_cache_entry(info.table_id)?;
             }
         }
         if let Some((table_id, index_name)) = self.parse_index_table_and_name(relative) {
-            let _ = self.remove_index_cache_entry(table_id, &index_name);
+            self.remove_index_cache_entry(table_id, &index_name)?;
         }
+        Ok(())
     }
 
     fn parse_heap_table_id(relative: &str) -> Option<u64> {
@@ -1563,7 +1576,7 @@ impl Database {
         for index in recovery_indexes.values_mut() {
             index.flush()?;
         }
-        self.invalidate_buffer_pool_path(path);
+        self.invalidate_buffer_pool_path(path)?;
         Ok(())
     }
 }
@@ -1582,7 +1595,9 @@ fn replica_payload_is_write(payload: &WalPayload) -> bool {
 
 fn replica_payload_path(payload: &WalPayload) -> Option<&str> {
     match payload {
-        WalPayload::PageUpdate { path, .. }
+        WalPayload::VectorIndexImage { path, .. }
+        | WalPayload::VectorIndexManifest { path, .. }
+        | WalPayload::PageUpdate { path, .. }
         | WalPayload::PageDelta { path, .. }
         | WalPayload::PageUpdateCompressed { path, .. }
         | WalPayload::FullPageImage { path, .. }

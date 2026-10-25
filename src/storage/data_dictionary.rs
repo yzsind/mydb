@@ -1946,6 +1946,8 @@ fn reconstruct_column(r: &[Value]) -> ColumnSchema {
 
 /// Physical index identity for startup validation. Key definitions are only
 /// needed if validation discovers a file that must be rebuilt.
+pub(crate) fn index_is_fulltext(row: &[Value]) -> bool { r_str(row, 3).eq_ignore_ascii_case("FULLTEXT") }
+
 pub(crate) fn index_storage_identity(row: &[Value]) -> Option<(u64, u64)> {
     (idx_state_from(&r_str(row, 7)) != IndexState::Building)
         .then(|| (r_u64(row, 0), r_u64(row, 10)))
@@ -2414,6 +2416,8 @@ mod tests {
             min_token_size: Some(4),
             max_token_size: Some(60),
             use_stopwords: Some(false),
+            positions: Some(false),
+            position_gap: Some(7),
         });
         let expected = serde_json::to_value(&idx.fulltext).unwrap();
         let rebuilt = catalog_from_dd_rows(&catalog_to_dd_rows(&catalog)).unwrap();
