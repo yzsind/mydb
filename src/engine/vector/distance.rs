@@ -435,10 +435,6 @@ pub(crate) fn ordering_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
     unsafe { ordering_distance_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len()), metric) }
 }
 
-/// Display distance: the value the `DISTANCE()` SQL function returns. Ranks
-/// identically to [`ordering_distance`] (so KNN ordering matches the projected
-/// distance) but reports true Euclidean distance for L2.
-
 /// Keep ordinary SIMD reductions unchanged; exceptional magnitudes use f64
 /// before subtraction/multiplication. Finite f32 vectors have finite f64 norms.
 #[inline]
@@ -558,8 +554,6 @@ pub(crate) fn ordering_distance_f32_bytes(a: &[f32], b: &[u8], metric: Metric) -
         ordering_distance(&a[..n], &decoded, metric)
     }
 }
-
-/// Display distance directly over little-endian byte vectors — no allocation.
 
 /// Dot product directly over little-endian byte vectors — no allocation.
 #[inline]

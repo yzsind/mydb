@@ -703,7 +703,9 @@ impl Database {
             ));
         };
         let meta = index.vector_meta_for_table(table);
-        let paged = vector_storage_paged() && !self.physical_replica_mode();
+        let paged = vector_storage_paged()
+            && !self.physical_replica_mode()
+            && !self.is_snapshot_read_only();
         let final_path = self.vector_index_paged_path(table, &index.name, storage_id);
         let mut tmp_path = final_path.clone();
         tmp_path.set_file_name(format!(
@@ -831,7 +833,9 @@ impl Database {
             ));
         };
         let meta = index.vector_meta_for_table(table);
-        let paged = vector_storage_paged() && !self.physical_replica_mode();
+        let paged = vector_storage_paged()
+            && !self.physical_replica_mode()
+            && !self.is_snapshot_read_only();
         let final_path = self.vector_index_paged_path(table, &index.name, storage_id);
         let mut tmp_path = final_path.clone();
         tmp_path.set_file_name(format!(
@@ -1237,14 +1241,6 @@ impl Database {
                         crate::error::catalog::ER_OUTOFMEMORY,
                         "HNSW full-memory build cannot reserve memory within MYDB_MEMORY_TARGET",
                     ));
-                } else if false && compact_bytes <= budget {
-                    lease =
-                        HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), compact_bytes);
-                    if lease.is_some() {
-                        HnswColdBuildMode::CompactSq8
-                    } else {
-                        HnswColdBuildMode::ChunkedPaged
-                    }
                 } else {
                     HnswColdBuildMode::ChunkedPaged
                 }
@@ -2269,11 +2265,21 @@ impl Database {
             if existing.ensure_valid().is_ok() {return Ok(existing);}
             self.evict_vector_graphs(vec![key.clone()]);
         }
-        let registration = Some(VectorBuildRegistration::begin(self, key.clone()));
+        let registration = (!self.is_snapshot_read_only())
+            .then(|| VectorBuildRegistration::begin(self, key.clone()));
         let build_epoch = self
             .vector_build_epoch
             .load(std::sync::atomic::Ordering::Acquire);
         let graph = self.vector_graph_load_or_build(table, index, storage_id)?;
+        if self.is_snapshot_read_only() {
+            // Sealing already finalized durable graphs. A cold reader only
+            // installs query accelerators; it must not replay deltas or write
+            // completion/coverage metadata back into the immutable image.
+            graph.prepare_query_navigation()?;
+            let graph = Arc::new(graph);
+            self.vector_indexes.write().insert(key, graph.clone());
+            return Ok(graph);
+        }
         let mut build_guard = VectorGraphBuildGuard {
             graph: &graph,
             published: false,
