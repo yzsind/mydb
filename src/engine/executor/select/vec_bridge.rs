@@ -958,7 +958,14 @@ impl BatchOperator for DeferredRowStorageBatchOperator<'_> {
             )?);
         }
 
-        let target = scan_decode_batch_rows(&self.schema);
+        // Keep the compatibility lane pull-bounded for FULLTEXT. A large
+        // decode batch would consume thousands of heap rows before a small
+        // downstream LIMIT can stop the incremental posting source.
+        let target = if matches!(self.plan, PhysicalPlan::FulltextScan { .. }) {
+            scan_decode_batch_rows(&self.schema).min(super::plan::FULLTEXT_BATCH_ROWS)
+        } else {
+            scan_decode_batch_rows(&self.schema)
+        };
         let mut accumulators: Vec<ColumnAccumulator> = self
             .schema
             .fields()

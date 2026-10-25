@@ -20,6 +20,8 @@ mod window;
 pub(in crate::engine::executor) use window::WINDOW_RANK_PREFILTER_REJECTED;
 pub(super) use window::*;
 mod fulltext_source;
+mod fulltext_stream;
+pub(super) use fulltext_stream::FULLTEXT_BATCH_ROWS;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;
@@ -2123,42 +2125,13 @@ pub(super) fn execute_plan_rows_inner(
                 })
             }
         }
-        PhysicalPlan::FulltextScan {
-            table,
-            index,
-            mode,
-            query,
-            query_param,
-            columns,
-            match_fingerprint,
-            filter,
-            projected_columns,
-            needs_score,
-            restrict_to_matches,
-            additional_matches,
-            like_prefilter,
-            base_access,
-            ..
-        } => {
-            let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
-            execute_fulltext_scan(
-                db,
-                txn,
-                table,
-                index,
-                *mode,
-                query,
-                *query_param,
-                columns,
-                *match_fingerprint,
-                filter,
-                projected_columns.as_ref(),
-                *needs_score,
-                *restrict_to_matches,
-                additional_matches,
-                like_prefilter.as_ref(),
-                base_access.as_ref(),
-            )
+        PhysicalPlan::FulltextScan { .. } => {
+            let mut stream = fulltext_stream::open(db, txn, plan)?;
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next()? {
+                rows.push(row);
+            }
+            Ok(rows)
         }
         PhysicalPlan::SpatialScan {
             table,
@@ -3848,6 +3821,7 @@ fn execute_plan_stream_inner(
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
     match plan {
+        PhysicalPlan::FulltextScan { .. } => fulltext_stream::open(db, txn, plan),
         PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),
         PhysicalPlan::CteScan { .. } => open_cte_scan_stream(plan),
         PhysicalPlan::ParallelSeqScan {

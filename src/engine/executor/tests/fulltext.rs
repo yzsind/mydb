@@ -1769,3 +1769,95 @@ fn fulltext_audit_ddl_rejects_ignored_options() {
         .execute("CREATE FULLTEXT INDEX ft ON docs(body) WITH PARSER NGRAM")
         .unwrap();
 }
+
+#[test]
+fn fulltext_small_limit_bounds_heap_reads_after_matching() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE ft_limit(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+        .unwrap();
+    let values = (0..2049)
+        .map(|id| format!("({id},'alpha beta gamma')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO ft_limit VALUES {values}"))
+        .unwrap();
+    let mut session = SessionContext::default();
+    let sql = "SELECT id FROM ft_limit WHERE MATCH(body) AGAINST('alpha') LIMIT 5 OFFSET 7";
+    let response = engine.execute_with_session(&mut session, sql).unwrap();
+    let QueryResponse::ResultSet(result) = response.materialize().unwrap() else {
+        panic!("expected result set");
+    };
+    assert_eq!(result.rows.len(), 5);
+    // Statement completion transfers the thread counter into PFS history.
+    let QueryResponse::ResultSet(events) = engine
+        .execute_with_session(&mut session, &format!("SELECT ROWS_EXAMINED FROM performance_schema.events_statements_history WHERE SQL_TEXT = '{escaped}'", escaped = sql.replace('\'', "''")))
+        .unwrap()
+        .materialize()
+        .unwrap()
+    else {
+        panic!("expected statement history");
+    };
+    assert_eq!(events.rows.len(), 1);
+    let examined = events.rows[0][0]
+        .to_display_string()
+        .parse::<u64>()
+        .unwrap();
+    // Posting membership still scans all matches; a small unordered LIMIT
+    // must not fetch every matching heap row before its first output.
+    assert!(
+        examined > 0 && examined <= 512,
+        "heap rows read: {examined}"
+    );
+}
+
+#[test]
+fn fulltext_stream_windows_preserve_filters_scores_and_column_types() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE ft_windows(id INT PRIMARY KEY,body TEXT,amount DECIMAL(12,2),day DATE,extra JSON,FULLTEXT KEY ft(body))").unwrap();
+    let values = (0..777)
+        .map(|id| {
+            let body = if id % 3 == 0 {
+                "alpha beta alpha"
+            } else {
+                "alpha gamma"
+            };
+            format!("({id},'{body}',{id}.25,'2026-10-26','{{\"id\":{id}}}')")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO ft_windows VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE ft_windows").unwrap();
+    for search in ["alpha", "+alpha -beta", "\"alpha beta\"", "alp*"] {
+        let expression = format!("MATCH(body) AGAINST('{search}' IN BOOLEAN MODE)");
+        for predicate in [
+            format!("{expression} AND id>=260 AND id%2=0"),
+            format!("{expression} OR id=1"),
+            format!("{expression} AND MATCH(body) AGAINST('gamma')"),
+        ] {
+            for order in ["id DESC", "score DESC,id", "amount,day,id"] {
+                let sql = format!("SELECT id,amount,day,extra,{expression} AS score FROM ft_windows WHERE {predicate} ORDER BY {order}");
+                let complete = rows_to_strings(exec_set(&engine, &sql));
+                for (offset, limit) in [(0, 1), (17, 20), (251, 31), (1000, 5)] {
+                    let limited = format!("{sql} LIMIT {limit} OFFSET {offset}");
+                    let expected = complete
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        rows_to_strings(exec_set(&engine, &limited)),
+                        expected,
+                        "{limited}"
+                    );
+                }
+            }
+        }
+    }
+}

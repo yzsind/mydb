@@ -535,7 +535,7 @@ pub enum PhysicalPlan {
         table: PlanTable,
         index: IndexSchema,
         /// Search mode (natural language vs boolean). Both modes are fully
-        /// executed by `execute_fulltext_scan`; `WITH QUERY EXPANSION` is
+        /// executed by `open_fulltext_scan`; `WITH QUERY EXPANSION` is
         /// rejected at parse time.
         mode: crate::parser::FtMode,
         /// Raw AGAINST query text, tokenised at execution time.
@@ -1834,7 +1834,7 @@ pub(crate) fn plan_prepared_physical_select(
 /// upstream of a `FulltextScan` (i.e. in any expression that could ever
 /// read back the `__ft_score_<fingerprint>` pseudo-column), then flip the
 /// scan's `needs_score` off when its fingerprint isn't in that set. Lets
-/// `execute_fulltext_scan` skip the per-term `by_row` hashmaps, the
+/// `open_fulltext_scan` skip the per-term `by_row` hashmaps, the
 /// `doc_len_of` map, and BM25 arithmetic for the common
 /// `WHERE MATCH() … ORDER BY <non-score>` shape.
 ///

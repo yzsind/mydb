@@ -4524,6 +4524,31 @@ pub(super) fn positions_phrase_match(per_token: &[&[u32]]) -> bool {
     false
 }
 
+/// Seek monotonically through a row-ordered posting list. Galloping bounds
+/// the search for sparse intersections without re-searching consumed rows;
+/// dense intersections advance in constant time per posting.
+fn seek_fulltext_posting(
+    postings: &[crate::storage::fulltext::FtPosting],
+    cursor: &mut usize,
+    row_id: RowId,
+) -> Option<crate::storage::fulltext::FtPosting> {
+    let remaining = &postings[*cursor..];
+    if remaining.first()?.row_id < row_id {
+        let mut bound = 1usize;
+        while bound < remaining.len() && remaining[bound].row_id < row_id {
+            bound = bound.saturating_mul(2);
+        }
+        *cursor += remaining[..bound.saturating_add(1).min(remaining.len())]
+            .partition_point(|posting| posting.row_id < row_id);
+    }
+    let posting = postings.get(*cursor)?;
+    if posting.row_id != row_id {
+        return None;
+    }
+    *cursor += 1;
+    Some(*posting)
+}
+
 /// Re-tokenize each column separately, preserving the write-side token order
 /// without introducing adjacency between different columns.
 pub(super) fn fulltext_row_contains_phrase(
@@ -4729,17 +4754,17 @@ pub(super) fn fulltext_boolean_candidates(
                 let smallest = batches.iter().min_by_key(|batch| batch.postings.len());
                 let mut verified = ah_hash_set();
                 let mut positions_scratch: Vec<&[u32]> = Vec::with_capacity(tokens.len());
+                let mut cursors = vec![0usize; batches.len()];
                 if let Some(smallest) = smallest {
                     'candidate: for posting in &smallest.postings {
                         let row_id = posting.row_id;
                         positions_scratch.clear();
                         let mut have_positions = true;
-                        for batch in &batches {
-                            let Ok(i) = batch.postings.binary_search_by_key(&row_id, |p| p.row_id)
+                        for (batch, cursor) in batches.iter().zip(&mut cursors) {
+                            let Some(p) = seek_fulltext_posting(&batch.postings, cursor, row_id)
                             else {
                                 continue 'candidate;
                             };
-                            let p = batch.postings[i];
                             if p.pos_len == 0 {
                                 have_positions = false;
                             }
@@ -5099,7 +5124,7 @@ pub(super) fn execute_fulltext_like_prefilter(
 /// residual expression that stumbles onto it via `resolve_ft_score`
 /// remains well-defined (returns 0 rather than error 1235).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn execute_fulltext_scan(
+pub(super) fn open_fulltext_scan(
     db: &Arc<Database>,
     txn: TxnView,
     table: &PlanTable,
@@ -5116,10 +5141,10 @@ pub(super) fn execute_fulltext_scan(
     additional_matches: &[crate::planner::FulltextMatchPlan],
     like_prefilter: Option<&crate::planner::FulltextLikePrefilterPlan>,
     base_access: Option<&crate::planner::FulltextBaseAccess>,
-) -> Result<Vec<PlanRow>, QueryError> {
+) -> Result<Box<dyn PlanStream>, QueryError> {
     if let Some(like_prefilter) = like_prefilter {
         if txn.historical || table.schema.is_partitioned() {
-            return scan_plan_table(
+            return Ok(Box::new(MaterializedStream::new(scan_plan_table(
                 db,
                 txn,
                 table,
@@ -5127,17 +5152,19 @@ pub(super) fn execute_fulltext_scan(
                 &[],
                 projected_columns.map(|columns| columns.as_slice()),
                 false,
-            );
+            )?)));
         }
-        return execute_fulltext_like_prefilter(
-            db,
-            txn,
-            table,
-            index,
-            like_prefilter,
-            filter,
-            projected_columns,
-        );
+        return Ok(Box::new(MaterializedStream::new(
+            execute_fulltext_like_prefilter(
+                db,
+                txn,
+                table,
+                index,
+                like_prefilter,
+                filter,
+                projected_columns,
+            )?,
+        )));
     }
     // Current postings cannot prove historical membership; bare RowId is
     // ambiguous across partition heaps. Build a visible-text oracle with
@@ -5259,133 +5286,19 @@ pub(super) fn execute_fulltext_scan(
     candidates.sort_unstable();
     candidates.dedup();
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Box::new(MaterializedStream::new(Vec::new())));
     }
 
-    // Score each candidate from its payloads, read the heap row once for
-    // output + residual filter (scoring no longer needs the heap).
-    //
-    // Hot-loop micro-tweaks:
-    //   - Skip pushing the score pseudo-field when no downstream reader
-    //     will ever consume it (see `mark_fulltext_score_needs`).
-    //   - When column-pruning nailed the row down to a projected subset,
-    //     use `read_row_columns_many_with_handle` — it only decodes the
-    //     kept columns from the heap page instead of the full record.
-    //     For a `WHERE MATCH(body) … ORDER BY id LIMIT 20` query on a
-    //     narrow `(id INT, body TEXT)` table this drops the per-row
-    //     read cost by ~half.
-    let table_name = table.schema.name.clone();
-    let table_alias = table.alias.clone();
-    let score_columns: Vec<String> = runtimes
-        .iter()
-        .map(|runtime| format!("{FT_SCORE_PREFIX}{:016x}", runtime.fingerprint))
-        .collect();
-    let score_count = runtimes.iter().filter(|runtime| runtime.need_score).count();
-    let mut out: Vec<PlanRow> = Vec::with_capacity(candidates.len());
-    let mut eval_ctx = EvalQueryContext::default();
-
-    // Fast bulk path: projected read via cached heap handle.
-    //
-    // `read_row_columns_many_with_handle` is the workhorse used by
-    // non-covering INLJ / range scans; it takes a slice of row_ids and a
-    // projected column list, opens one heap handle for the batch, and
-    // returns `(row_id, [projected values])` for every visible row. For a
-    // large-df NL / boolean query this cuts the per-row heap decode down
-    // to the columns the outer plan actually needs, and reuses the cached
-    // heap handle instead of re-locating the partition on every read.
-    if let Some(projected) = projected_columns.filter(|_| heap_rows.is_none()) {
-        if !table.schema.is_partitioned() {
-            let heap = db.cached_heap_handle(table.schema.id)?;
-            let read_rows = db.read_row_columns_many_with_handle(
-                &heap,
-                &table.schema,
-                &candidates,
-                txn,
-                projected.as_ref(),
-            )?;
-            let metas = cached_column_metas(table);
-            for (row_id, mut values) in read_rows {
-                let mut fields: Vec<PlanField> = Vec::with_capacity(projected.len() + score_count);
-                for (offset, &idx) in projected.iter().enumerate() {
-                    let meta = metas.get(idx).cloned().ok_or_else(|| {
-                        error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "projected column index out of bounds",
-                        )
-                    })?;
-                    let value = values
-                        .get_mut(offset)
-                        .map(|slot| std::mem::replace(slot, Value::Null))
-                        .ok_or_else(|| {
-                            error(
-                                crate::error::catalog::ER_GET_ERRNO,
-                                "projected row has too few values",
-                            )
-                        })?;
-                    fields.push(PlanField { meta, value });
-                }
-                let mut row = PlanRow {
-                    fields,
-                    group: None,
-                    agg_values: None,
-                    schema: PlanRow::empty_schema(),
-                };
-                for (runtime, score_column) in runtimes.iter().zip(score_columns.iter()) {
-                    if runtime.need_score {
-                        row.push_field(PlanField::new(
-                            table_name.clone(),
-                            table_alias.clone(),
-                            score_column.clone(),
-                            ColumnType::Double,
-                            Value::Double(fulltext_runtime_score(runtime, row_id)),
-                        ));
-                    }
-                }
-                let keep = match filter {
-                    Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
-                    None => true,
-                };
-                if keep {
-                    out.push(row);
-                }
-            }
-            return Ok(out);
-        }
-    }
-
-    for row_id in candidates {
-        let values = if let Some(rows) = heap_rows {
-            rows[super::fulltext_source::heap_document_offset(row_id)].clone()
-        } else {
-            let Some(stored) = db.read_row(&table.schema, row_id, txn)? else {
-                continue;
-            };
-            stored.values
-        };
-        let mut row = match projected_columns {
-            Some(cols) => stored_row_to_plan_row_projected(table, values, cols)?,
-            None => stored_row_to_plan_row(table, values)?,
-        };
-        for (runtime, score_column) in runtimes.iter().zip(score_columns.iter()) {
-            if runtime.need_score {
-                row.push_field(PlanField::new(
-                    table_name.clone(),
-                    table_alias.clone(),
-                    score_column.clone(),
-                    ColumnType::Double,
-                    Value::Double(fulltext_runtime_score(runtime, row_id)),
-                ));
-            }
-        }
-        let keep = match filter {
-            Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
-            None => true,
-        };
-        if keep {
-            out.push(row);
-        }
-    }
-    Ok(out)
+    Ok(Box::new(super::fulltext_stream::FulltextScanStream::new(
+        db,
+        txn,
+        table,
+        filter,
+        projected_columns,
+        runtimes,
+        candidates,
+        heap_documents,
+    )?))
 }
 
 /// Execute a `SpatialScan`: query the R-tree (built from the SPATIAL index's
@@ -6357,5 +6270,40 @@ fn null_extend_plan<const NULL_LEFT: bool>(
         group: None,
         agg_values: None,
         schema: PlanRow::empty_schema(),
+    }
+}
+
+#[cfg(test)]
+mod fulltext_posting_seek_tests {
+    use super::*;
+    use crate::storage::fulltext::FtPosting;
+
+    #[test]
+    fn monotone_seek_matches_binary_search_for_dense_and_sparse_lists() {
+        for spacing in [1u32, 3, 257] {
+            let postings: Vec<_> = (0..1000)
+                .map(|id| FtPosting {
+                    row_id: RowId::new(id * spacing, (id % 7) as u16),
+                    doc_len: 4,
+                    tf: 1,
+                    pos_start: 0,
+                    pos_len: 1,
+                })
+                .collect();
+            for stride in [1usize, 2, 37, 999, 1001] {
+                let mut cursor = 0;
+                for page in (0..1001 * spacing).step_by(stride) {
+                    for slot in [0u16, 3, 6] {
+                        let row_id = RowId::new(page, slot);
+                        let expected = postings.binary_search_by_key(&row_id, |p| p.row_id).ok();
+                        let actual = seek_fulltext_posting(&postings, &mut cursor, row_id);
+                        assert_eq!(
+                            actual.map(|p| p.row_id),
+                            expected.map(|i| postings[i].row_id)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
