@@ -54,7 +54,7 @@ production-grade MySQL replacement.
 | System schemas and SHOW | ◑ | Common surfaces with real producers work; some registered tables honestly return empty |
 | MySQL replication | ◑ | ROW/FULL source-replica pipeline works; no SBR/MIXED, MINIMAL, or MTS |
 | MySQL operations ecosystem | ◑/❌ | Common configuration/logging/privilege surfaces work; no Group Replication, Router, Shell/X, or plugin ABI |
-| mydb extensions | ➕ | VECTOR/HNSW/IVF_SQ8, Zone Map, time travel, sequences, DML RETURNING, physical replication, and more |
+| mydb extensions | ➕ | VECTOR/HNSW/IVF, Zone Map, time travel, sequences, DML RETURNING, physical replication, and more |
 
 ---
 
@@ -151,7 +151,7 @@ production-grade MySQL replacement.
 | FULLTEXT (BM25 + boolean mode) | ✅ |
 | SPATIAL (MBR B-tree + derived R-tree) | ✅ |
 | HNSW vector index (`USING HNSW`) | ➕ see [§9](#9-vector-search) |
-| IVF_SQ8 vector index (`USING IVF_SQ8`) | ➕ see [§9](#9-vector-search) |
+| IVF vector index (`USING IVF`) | ➕ see [§9](#9-vector-search) |
 
 LIKE access paths follow the column collation: pure literals/fixed prefixes can
 use B-trees (including composite, prefix, and functional indexes) and string
@@ -213,7 +213,7 @@ for syntax and operational limits.
 - `ANALYZE PARTITION` persists per-leaf row counts, heap pages, column/index sketches, and check status; the CBO merges costs over the pruned leaf set. Partition-wise hash join is enabled when the topology is identical and the equality join covers the full partition key, and partition-wise aggregate when `GROUP BY` covers the full partition key.
 - Partition bulk DML, physical DDL, and statistics builds are charged to the unified governor categories `PartitionDmlBatch`, `PartitionDdl`, and `PartitionStats` respectively; current values and rejection counts are exposed via `SHOW STATUS`, `information_schema.mydb_memory_advisor`, and the memory summary views.
 - Per-partition physical options: `ENGINE` accepts only the `mydb`/`InnoDB` current-engine aliases and is not persisted; `DATA/INDEX DIRECTORY`, `TABLESPACE`, `MAX_ROWS`, `MIN_ROWS`, and `NODEGROUP` return explicit not-supported errors and are never silently ignored.
-- FULLTEXT, SPATIAL, HNSW, and IVF_SQ8 can be used on partitioned tables; this is a mydb extension enabled by default that no longer requires a runtime switch.
+- FULLTEXT, SPATIAL, HNSW, and IVF can be used on partitioned tables; this is a mydb extension enabled by default that no longer requires a runtime switch.
 
 ### Views (VIEW)
 
@@ -871,21 +871,18 @@ synchronization state, filtered by SELECT/UPDATE privileges on each sequence.
 
 ➕ **mydb extension** (MySQL 8.0.46 Community Server has no native vector type or vector index).
 
-- **`VECTOR(n)`** type: inline little-endian f32, never externalized.
-- **Distance functions**: L2 / COSINE / DOT + the pgvector infix operators `<->` / `<#>` (`<=>` conflicts with NULL-safe-eq and is deliberately omitted).
-- **HNSW**: `CREATE INDEX … USING HNSW`, with COMMENT support for METRIC/M/EF_CONSTRUCTION/EF_SEARCH; queries use SQ8 navigation + f32 rerank.
-- **IVF_SQ8**: `CREATE INDEX … USING IVF_SQ8`, with COMMENT support for METRIC/NLIST/NPROBE/KMEANS_ITERS/TRAIN_SAMPLE; queries probe by centroid and inverted list, and `OPTIMIZE TABLE` can retrain.
-- **High-dimensional IVF navigation**: off by default; with an explicit `MYDB_IVF_NAVIGATOR=on`, the paged backend tries to build an M=8 derived graph billed by the governor for IVF of at least
-  100,000 rows and 256 dimensions. Without budget or after DML it falls back to an inverted-list scan; `BACKEND=ivf_paged_nav` indicates the navigator is currently effective.
-  The default paged backend's `nprobe=nlist` bypasses navigation, probes every list, and keeps all live candidates
-  for the executor to rerank as heap f32, providing an exact-recall escape path; `NO_VECTOR_INDEX` can serve as an
-  exact full-scan control.
+- **`VECTOR(n, datatype)`** type: FLOAT32 (default), FLOAT16, BFLOAT16, INT8 and BINARY with native payload storage.
+- **Distance functions**: L2 / COSINE / DOT / HAMMING / JACCARD + the pgvector infix operators `<->` / `<#>` (`<=>` conflicts with NULL-safe-eq and is deliberately omitted).
+- **HNSW**: `CREATE INDEX … USING HNSW`, with `WITH (metric=..., m=..., ef_construction=..., ef_search=..., quantization=...)`; compressed candidates are re-ranked using visible native heap values.
+- **IVF**: `CREATE INDEX … USING IVF`, with `WITH (metric=..., nlist=..., nprobe=..., kmeans_iters=..., train_sample=..., quantization=...)`; queries probe by centroid and inverted list, and `OPTIMIZE TABLE` can retrain.
+- **Quantization**: `none` (default), SQ8, SQ4, PQ, and scaled centered BQ for numeric L2/COSINE/DOT. BINARY indexes reject quantization. COMMENT is descriptive text and former parameter syntax is rejected.
+- **Training and diagnostics**: PQ requires at least `2^pq_bits` training rows; pending models execute exact scans. `EXPLAIN` reports quantization and the effective re-ranking pool; `information_schema.mydb_vector_indexes` reports configuration, training state, model/code bytes, exceptions, and query counters. See [vector datatypes and indexes](vector-indexes.md).
 - **Queries**: `ORDER BY DISTANCE(...) LIMIT k` goes through the unified `VectorIndexScan`; no index, small tables, or `NO_VECTOR_INDEX` take the exact `VectorBruteScan` (partitioned tables included).
 - **Parameterized KNN**: prepared / auto-param; the plan cache keys the query-vector expression instead of hard-coding the first vector.
 - **Transactions and boundaries**: transaction deltas provide read-your-writes; shared vector index changes follow commit, rollback, savepoint, and XA boundaries. Invalid vector values report 50001 and dimension mismatches report 50002; cosine indexes reject zero vectors. LIMIT/OFFSET and visibility rules apply to both exact and approximate paths, but ANN candidate selection does not guarantee the same nearest-neighbor rows or recall as a brute-force scan.
-- **Two storage backends** (`MYDB_VECTOR_STORAGE`, default `paged`): HNSW uses `.hvec` and IVF_SQ8 uses `.ivf`, both incorporated into the buffer pool and physical WAL; the `memory` backend uses in-memory graph/inverted structures respectively and serves as the diffing oracle.
+- **Two storage backends** (`MYDB_VECTOR_STORAGE`, default `paged`): HNSW and native IVF use the shared `.hvec` page container, both incorporated into the buffer pool and physical WAL; the `memory` backend uses in-memory graph/inverted structures respectively and serves as the diffing oracle.
 - **Operations/import**: `LOAD DATA`/`LOAD XML` accept `[x,…]` text; `MYDB_LOAD_DATA_VECTOR_FORMAT=base64` accepts little-endian f32; `OPTIMIZE TABLE` performs HNSW compaction or IVF retraining.
-- **Replication**: mydb row-based binlog encodes VECTOR as a MySQL `LONG BLOB` with payload `MYDBVEC1 + u32 dimension + raw f32 LE`; MySQL can store it losslessly as a BLOB, and a mydb replica recognizes the versioned envelope while remaining compatible with the old raw payload.
+- **Replication**: mydb row-based binlog encodes VECTOR as a MySQL `LONG BLOB` with a `MYDBVEC2` typed envelope; MySQL can store it losslessly as a BLOB, and a mydb replica validates datatype, dimension and payload.
 - GUCs: `mydb_hnsw_*`, `mydb_ivf_*`; hints are `HNSW_EF(n)`, `IVF_NPROBE(n)`, and `NO_VECTOR_INDEX`.
 
 ---
@@ -985,7 +982,7 @@ system/commit-ledger.v1        source of truth for AS OF commit-timeline correct
 system/history-index.v1        degradable sidecar that accelerates historical old keys
 ddl/                           DDL intent log (crash safe)
 objects/tables/<storage_id>/<generation>.{heap,lob,zm}
-objects/indexes/<storage_id>/<generation>/<index_id>.{idx,hnsw,hvec,ivf}
+objects/indexes/<storage_id>/<generation>/<index_id>.{idx,hnsw,hvec}
 mysql.sequences / mysql.sequence_values   sequence definitions and recovery state in catalog heaps
 ```
 

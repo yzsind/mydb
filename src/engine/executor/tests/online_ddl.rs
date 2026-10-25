@@ -1973,7 +1973,7 @@ fn copy_modify_non_strict_clamps_decimal_and_temporal_values() {
 }
 
 #[test]
-fn copy_modify_non_strict_coerces_enum_set_and_vector() {
+fn copy_modify_non_strict_coerces_enum_set_but_rejects_lossy_vector() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
@@ -2000,9 +2000,10 @@ fn copy_modify_non_strict_coerces_enum_set_and_vector() {
     engine
         .execute_with_session(&mut session, "ALTER TABLE t MODIFY COLUMN s SET('a','b')")
         .unwrap();
-    engine
+    let error = engine
         .execute_with_session(&mut session, "ALTER TABLE t MODIFY COLUMN emb VECTOR(2)")
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(error.code(), 50002);
 
     let QueryResponse::ResultSet(rs) = engine
         .execute_with_session(&mut session, "SELECT e, s, VECTOR_TO_STRING(emb) FROM t")
@@ -2015,7 +2016,7 @@ fn copy_modify_non_strict_coerces_enum_set_and_vector() {
         vec![
             Value::Bytes(Vec::new()),
             Value::String("a,b".to_string()),
-            Value::String("[1,2]".to_string()),
+            Value::String("[1,2,3]".to_string()),
         ]
     );
 }

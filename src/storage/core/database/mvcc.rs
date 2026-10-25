@@ -229,7 +229,9 @@ impl Database {
                 }
                 Some(ColumnKind::Json) => Value::Json(bytes),
                 Some(ColumnKind::Geometry) => Value::Geometry(bytes),
-                Some(ColumnKind::Vector) => Value::Vector(bytes),
+                Some(ColumnKind::Vector { dim, datatype }) => {
+                    Value::Vector(vector_from_storage(bytes, *datatype, *dim)?)
+                }
                 _ => Value::Bytes(bytes),
             };
             values[*col] = value;
@@ -1703,8 +1705,7 @@ impl Database {
                 self.persist_rollback_progress(
                     txn_id,
                     undo_ptr,
-                    *recovery_cursor
-                        .get_or_insert_with(|| self.log.lock().last_txn_lsn(txn_id)),
+                    *recovery_cursor.get_or_insert_with(|| self.log.lock().last_txn_lsn(txn_id)),
                     (0, 0),
                     &compensated,
                     true,

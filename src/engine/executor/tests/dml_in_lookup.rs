@@ -272,7 +272,7 @@ fn dml_in_lookup_triggers_returning_limit_and_fk() {
 
 #[test]
 fn dml_in_lookup_vector_delete_commit_rollback_and_restart() {
-    for algorithm in ["HNSW", "IVF_SQ8"] {
+    for algorithm in ["HNSW", "IVF"] {
         let dir = tempfile::tempdir().unwrap();
         let engine = open_strict_test_engine(dir.path());
         engine
@@ -281,8 +281,8 @@ fn dml_in_lookup_vector_delete_commit_rollback_and_restart() {
         engine
             .execute("INSERT INTO t VALUES (1,'[1,0,0]'),(2,'[2,0,0]'),(3,'[3,0,0]'),(4,'[4,0,0]')")
             .unwrap();
-        let options = if algorithm == "IVF_SQ8" {
-            " COMMENT 'NLIST=2 NPROBE=2'"
+        let options = if algorithm == "IVF" {
+            " WITH (nlist=2, nprobe=2)"
         } else {
             ""
         };

@@ -40,11 +40,48 @@ fn chained_union_all(
         ));
     }
     unify_setop_declared_column_metadata(&mut lcols, &mut rcols)?;
+    let columns: Vec<_> = lcols
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.column_type == ColumnType::Vector)
+        .map(|(i, col)| (i, col.clone()))
+        .collect();
+    let chained: Box<dyn crate::engine::api::ResultCursor> =
+        Box::new(crate::engine::api::ChainedCursor::new(vec![lcur, rcur]));
+    let cursor = if columns.is_empty() {
+        chained
+    } else {
+        Box::new(VectorDomainCursor {
+            inner: chained,
+            columns,
+        })
+    };
     Ok(QueryResponse::StreamingResultSet(StreamingResultSet {
         columns: lcols,
         found_rows: None,
-        cursor: Box::new(crate::engine::api::ChainedCursor::new(vec![lcur, rcur])),
+        cursor,
     }))
+}
+
+#[derive(Debug)]
+struct VectorDomainCursor {
+    inner: Box<dyn crate::engine::api::ResultCursor>,
+    columns: Vec<(usize, Column)>,
+}
+impl crate::engine::api::ResultCursor for VectorDomainCursor {
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+        let Some(mut row) = self.inner.next_row()? else {
+            return Ok(None);
+        };
+        for (i, col) in &self.columns {
+            let value = std::mem::replace(&mut row[*i], Value::Null);
+            row[*i] = coerce_setop_value(value, col.column_type, &col.source)?;
+        }
+        Ok(Some(row))
+    }
+    fn take_warnings(&mut self) -> crate::engine::api::SqlWarnings {
+        self.inner.take_warnings()
+    }
 }
 
 pub(in crate::engine::executor) fn execute_set_operation_dispatch(
@@ -335,6 +372,12 @@ pub(in crate::engine::executor) fn coerce_setop_value(
         return Ok(value);
     }
     Ok(match column_type {
+        ColumnType::Vector => {
+            let (datatype, dim) = source.vector_type.unwrap_or_default();
+            Value::Vector(crate::engine::vector::codec::coerce_value(
+                value, datatype, dim,
+            )?)
+        }
         ColumnType::VarString | ColumnType::Blob => {
             if source.collation_id == Some(63) {
                 Value::Bytes(crate::engine::expr::value_bytes(&value))
@@ -426,6 +469,16 @@ fn unify_setop_numeric_columns(
     for i in 0..ncols {
         let left_type = left.columns[i].column_type;
         let right_type = right.columns[i].column_type;
+        if left_type == ColumnType::Vector {
+            let source = &left.columns[i].source;
+            for row in left.rows.iter_mut().chain(right.rows.iter_mut()) {
+                if let Some(value) = row.get_mut(i) {
+                    let original = std::mem::replace(value, Value::Null);
+                    *value = coerce_setop_value(original, ColumnType::Vector, source)?;
+                }
+            }
+            continue;
+        }
         if matches!(left_type, ColumnType::VarString | ColumnType::Blob) {
             let binary = left.columns[i].source.collation_id == Some(63);
             for row in left.rows.iter_mut().chain(right.rows.iter_mut()) {

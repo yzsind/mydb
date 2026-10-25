@@ -188,6 +188,7 @@ fn run_lineitem() -> Result<(), QueryError> {
                 visible: true,
                 comment: String::new(),
                 fulltext_parser: String::new(),
+                vector_options: None,
             },
             IndexDef {
                 name: Some("idx_partkey".to_string()),
@@ -202,6 +203,7 @@ fn run_lineitem() -> Result<(), QueryError> {
                 visible: true,
                 comment: String::new(),
                 fulltext_parser: String::new(),
+                vector_options: None,
             },
             IndexDef {
                 name: Some("idx_suppkey".to_string()),
@@ -216,6 +218,7 @@ fn run_lineitem() -> Result<(), QueryError> {
                 visible: true,
                 comment: String::new(),
                 fulltext_parser: String::new(),
+                vector_options: None,
             },
         ],
     )?;

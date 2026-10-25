@@ -377,12 +377,33 @@ impl Database {
         columns: &[usize],
         page_lo: u64,
         page_hi: u64,
+        visit: F,
+    ) -> Result<(), QueryError>
+    where
+        F: FnMut(RowId, &[Value]) -> Result<(), QueryError>,
+    {
+        self.scan_rows_columns_storage_streaming_range_with_ids_impl(
+            table, storage_id, txn, columns, page_lo, page_hi, true, visit,
+        )
+    }
+
+    pub(crate) fn scan_rows_columns_storage_streaming_range_with_ids_impl<F>(
+        &self,
+        table: &TableSchema,
+        storage_id: u64,
+        txn: TxnView,
+        columns: &[usize],
+        page_lo: u64,
+        page_hi: u64,
+        validate_generation: bool,
         mut visit: F,
     ) -> Result<(), QueryError>
     where
         F: FnMut(RowId, &[Value]) -> Result<(), QueryError>,
     {
-        self.check_primary_read_view(table, txn)?;
+        if validate_generation {
+            self.check_primary_read_view(table, txn)?;
+        }
         let examined = crate::engine::perf_events::RowsExaminedBatch::new();
         let scan_policy = self.scan_cache_policy_for_table(table)?;
         // The caller owns this immutable catalog snapshot through deferred

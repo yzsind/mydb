@@ -448,7 +448,7 @@ fn dot_index_supports_pgvector_and_max_inner_product_ordering() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(2) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_dot ON items(emb) USING HNSW COMMENT 'METRIC=DOT'")
+        .execute("CREATE INDEX idx_dot ON items(emb) USING HNSW WITH (metric=dot)")
         .unwrap();
     engine
         .execute(
@@ -681,7 +681,7 @@ fn hnsw_inline_index_with_cosine_metric() {
     engine
         .execute(
             "CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(2) NOT NULL, \
-             INDEX idx_emb (emb) USING HNSW COMMENT 'DISTANCE=COSINE')",
+             INDEX idx_emb (emb) USING HNSW WITH (metric=cosine))",
         )
         .unwrap();
     // Vectors at distinct angles; cosine ranks by direction, not magnitude.
@@ -890,12 +890,12 @@ fn vector_index_dropped_cleanly() {
 /// (or unset) on drop. `cargo nextest` already isolates per-test
 /// processes; this guard makes the tests safe under plain `cargo test`
 /// (shared-process parallel) too.
-struct HnswEnv {
+pub(super) struct HnswEnv {
     keys: Vec<(&'static str, Option<String>)>,
 }
 
 impl HnswEnv {
-    fn set(pairs: &[(&'static str, &str)]) -> Self {
+    pub(super) fn set(pairs: &[(&'static str, &str)]) -> Self {
         let keys = pairs
             .iter()
             .map(|(k, v)| {
@@ -2911,7 +2911,7 @@ fn paged_hnsw_missing_stats_after_restart_uses_physical_row_estimate() {
             .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(6) NOT NULL)")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW COMMENT 'EF_SEARCH=1'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (ef_search=1)")
             .unwrap();
         // The fixture stays well beyond the configured non-zero brute
         // crossover, proving physical page estimates keep the index eligible.
@@ -2955,8 +2955,8 @@ fn paged_hnsw_missing_stats_after_restart_uses_physical_row_estimate() {
 }
 
 #[test]
-fn ivf_sq8_corrupt_ivf_file_rebuilds_from_heap() {
-    // B3: a corrupt `.ivf` meta page (or a dim/metric change) used to make the
+fn ivf_corrupt_native_file_rebuilds_from_heap() {
+    // B3: a corrupt `.hvec` meta page (or a dim/metric change) used to make the
     // open return a hard 1030 that propagated to every KNN query with no
     // self-heal. The heap is the durable record, so the fix discards the
     // unusable file and rebuilds from the heap instead of failing.
@@ -2975,10 +2975,10 @@ fn ivf_sq8_corrupt_ivf_file_rebuilds_from_heap() {
             .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(8) NOT NULL)")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=8'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=8)")
             .unwrap();
         bulk_insert_vectors(&engine, &vectors);
-        // Build + finalize the paged `.ivf` (first query).
+        // Build + finalize the paged `.hvec` (first query).
         let q = vec_text(&vectors[0]);
         assert_eq!(
             id_list(
@@ -2988,9 +2988,9 @@ fn ivf_sq8_corrupt_ivf_file_rebuilds_from_heap() {
             vec![1]
         );
     }
-    // Corrupt the `.ivf` meta page (clobber the magic at offset 0) on disk.
+    // Corrupt the `.hvec` meta page (clobber the magic at offset 0) on disk.
     let files = find_ivf_files(dir.path());
-    assert!(!files.is_empty(), "an .ivf file should exist");
+    assert!(!files.is_empty(), "a native .hvec file should exist");
     {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new()
@@ -3012,21 +3012,19 @@ fn ivf_sq8_corrupt_ivf_file_rebuilds_from_heap() {
     assert_eq!(
         nearest,
         vec![1],
-        "corrupt .ivf must rebuild from heap and still answer (B3)"
+        "corrupt native .hvec must rebuild from heap and still answer (B3)"
     );
 }
 
-/// Locate every `.ivf` paged inverted-file under a data dir's indexes dir.
+/// Locate every `.hvec` paged inverted-file under a data dir's indexes dir.
 fn find_ivf_files(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    find_object_files_with_extension(data_dir, "ivf")
+    find_object_files_with_extension(data_dir, "hvec")
 }
 
 #[test]
-fn paged_ivf_survives_restart_from_durable_index() {
-    // The paged IVF_SQ8 backend's `.ivf` file IS the durable index (buffer pool
-    // + WAL). Build it, restart the engine, and confirm the first post-restart
-    // KNN reads it back from disk — no snapshot, no heap rebuild — and answers
-    // correctly on the index path.
+fn paged_ivf_rebuilds_after_restart() {
+    // Native IVF rebuilds from committed heap values on cold open. Its paged
+    // payloads remain governed by the buffer pool and physical WAL.
     let _env = HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", "paged"),
         ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
@@ -3042,7 +3040,7 @@ fn paged_ivf_survives_restart_from_durable_index() {
             .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(16) NOT NULL)")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=12'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=12)")
             .unwrap();
         bulk_insert_vectors(&engine, &vectors);
         // Build the paged inverted file (first query) before restart.
@@ -3056,11 +3054,10 @@ fn paged_ivf_survives_restart_from_durable_index() {
         );
         assert!(
             !find_ivf_files(dir.path()).is_empty(),
-            "an .ivf file should exist"
+            "a native .hvec file should exist"
         );
     }
-    // Reopen the same data dir: the paged index is durable, so the first
-    // post-restart KNN reads it back and stays on the index path.
+    // Reopen the data directory, rebuild, and stay on the index query path.
     let reopened = open_strict_test_engine(dir.path());
     let query = gen_vectors(1, dim, 0x1212_3434_5656_7878)[0].clone();
     let qtext = vec_text(&query);
@@ -3137,7 +3134,7 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
     engine
         .execute(
             "CREATE INDEX idx_emb ON items(emb) USING HNSW \
-             COMMENT 'DISTANCE=COSINE M=24 EF_CONSTRUCTION=120 EF_SEARCH=80'",
+             WITH (metric=cosine, m=24, ef_construction=120, ef_search=80)",
         )
         .unwrap();
 
@@ -3208,7 +3205,7 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
 }
 
 #[test]
-fn vector_comment_validation_show_create_roundtrip_and_json_explain() {
+fn vector_with_validation_show_create_roundtrip_and_json_explain() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
@@ -3224,13 +3221,13 @@ fn vector_comment_validation_show_create_roundtrip_and_json_explain() {
         .execute_with_session(
             &mut session,
             "CREATE INDEX idx_emb ON items(emb) USING HNSW \
-             COMMENT 'METRIC=COSINE M=20 EF_CONSTRUCTION=96 EF_SEARCH=48 FUTURE_OPT=1'",
+             WITH (metric=cosine, m=20, ef_construction=96, ef_search=48) COMMENT 'FUTURE_OPT=1'",
         )
         .unwrap();
-    assert!(session.warnings.iter().any(|w| w.code() == 1287));
+    assert!(session.warnings.is_empty());
     let create = rows(&engine, "SHOW CREATE TABLE items")[0][1].to_display_string();
     assert!(create.contains("USING HNSW"), "{create}");
-    assert!(create.contains("METRIC=COSINE"), "{create}");
+    assert!(create.contains("metric=cosine"), "{create}");
     // Recreate from SHOW CREATE and verify parsed parameters survive.
     let copy = create.replacen("`items`", "`items_copy`", 1);
     engine.execute(&copy).unwrap();
@@ -3366,7 +3363,7 @@ fn vector_backend_files_follow_index_and_table_rename() {
 }
 
 #[test]
-fn join_knn_uses_left_vector_driver_and_preserves_results() {
+fn join_knn_retains_final_relational_topk_and_preserves_results() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
@@ -3389,7 +3386,7 @@ fn join_knn_uses_left_vector_driver_and_preserves_results() {
     let sql = "SELECT /*+ HNSW_EF(64) */ items.id FROM items \
                JOIN tags ON tags.item_id=items.id \
                ORDER BY L2_DISTANCE(items.emb, '[0,0]') LIMIT 5";
-    assert!(explain_mentions_vector_index(&engine, sql));
+    assert!(!explain_mentions_vector_index(&engine, sql));
     assert_eq!(id_list(&engine, sql), vec![1, 2, 3, 4, 5]);
 }
 
@@ -3438,7 +3435,7 @@ fn cosine_index_rejects_zero_rows_and_zero_knn_query() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW COMMENT 'DISTANCE=COSINE'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
 
     let err = engine
@@ -3506,7 +3503,7 @@ fn hnsw_metric_mismatch_warns_1287() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW COMMENT 'DISTANCE=COSINE'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
     for i in 0..8 {
         engine
@@ -3581,7 +3578,7 @@ fn per_index_default_ef_search_drives_plan() {
     engine
         .execute(
             "CREATE INDEX idx_emb ON items(emb) USING HNSW \
-             COMMENT 'DISTANCE=L2 EF_SEARCH=200'",
+             WITH (metric=l2, ef_search=200)",
         )
         .unwrap();
     for i in 0..20 {
@@ -3979,19 +3976,19 @@ fn n1_drop_table_does_not_delete_colliding_table_vector_graph() {
 }
 
 // ---------------------------------------------------------------------------
-// IVF_SQ8 inverted-file index (memory backend). Mirrors the HNSW coverage:
+// IVF inverted-file index (memory backend). Mirrors the HNSW coverage:
 // DDL round-trip, KNN correctness vs brute force, DML visibility, EXPLAIN.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ivf_sq8_knn_matches_bruteforce_full_probe() {
+fn ivf_knn_matches_bruteforce_full_probe() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(6) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'METRIC=L2 NLIST=5'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (metric=l2, nlist=5)")
         .unwrap();
 
     // Small n so a generous nprobe makes the candidate pool cover every row —
@@ -4009,7 +4006,7 @@ fn ivf_sq8_knn_matches_bruteforce_full_probe() {
         "SELECT /*+ IVF_NPROBE(64) */ id FROM items ORDER BY DISTANCE(emb, '{qtext}') LIMIT {k}"
     );
 
-    // Driven by the IVF_SQ8 index (no full Sort).
+    // Driven by the IVF index (no full Sort).
     assert!(
         explain_mentions_vector_index(&engine, &knn),
         "EXPLAIN should show the vector index for `{knn}`"
@@ -4019,19 +4016,19 @@ fn ivf_sq8_knn_matches_bruteforce_full_probe() {
     let expected = brute_force_l2(&vectors, &query, k);
     assert_eq!(
         got, expected,
-        "full-probe IVF_SQ8 KNN must match brute-force top-{k}"
+        "full-probe IVF KNN must match brute-force top-{k}"
     );
 }
 
 #[test]
-fn ivf_sq8_explain_shows_algo_and_nprobe() {
+fn ivf_explain_shows_algo_and_nprobe() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=4 NPROBE=3'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=4, nprobe=3)")
         .unwrap();
     for i in 0..40 {
         let v = gen_vectors(1, 4, 0x100 + i as u64)[0].clone();
@@ -4053,8 +4050,8 @@ fn ivf_sq8_explain_shows_algo_and_nprobe() {
     .collect::<Vec<_>>()
     .join("\n");
     assert!(
-        explain.contains("IVF_SQ8"),
-        "EXPLAIN should name IVF_SQ8: {explain}"
+        explain.contains("IVF"),
+        "EXPLAIN should name IVF: {explain}"
     );
     assert!(
         explain.contains("nprobe"),
@@ -4073,10 +4070,10 @@ fn knn_planner_enumerates_same_column_vector_indexes_and_honors_algorithm_hint()
     // The first catalog index deliberately has the wrong metric; the old
     // first-index-only planner missed the later compatible IVF index.
     engine
-        .execute("CREATE INDEX idx_cos ON items(emb) USING HNSW COMMENT 'METRIC=COSINE'")
+        .execute("CREATE INDEX idx_cos ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_l2 ON items(emb) USING IVF_SQ8 COMMENT 'METRIC=L2 NLIST=4'")
+        .execute("CREATE INDEX idx_l2 ON items(emb) USING IVF WITH (metric=l2, nlist=4)")
         .unwrap();
     let explain = rows(
         &engine,
@@ -4088,27 +4085,25 @@ fn knn_planner_enumerates_same_column_vector_indexes_and_honors_algorithm_hint()
     .collect::<Vec<_>>()
     .join("\n");
     assert!(explain.contains("idx_l2"), "unexpected plan:\n{explain}");
-    assert!(explain.contains("IVF_SQ8"), "unexpected plan:\n{explain}");
+    assert!(explain.contains("IVF"), "unexpected plan:\n{explain}");
 }
 
 #[test]
-fn ivf_sq8_show_create_round_trips() {
+fn ivf_show_create_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute(
-            "CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'METRIC=COSINE NLIST=16'",
-        )
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (metric=cosine, nlist=16)")
         .unwrap();
     let show =
         |e: &StorageQueryEngine| rows(e, "SHOW CREATE TABLE items")[0][1].to_display_string();
     let create = show(&engine);
     assert!(
-        create.contains("USING IVF_SQ8"),
-        "SHOW CREATE TABLE must echo USING IVF_SQ8, got:\n{create}"
+        create.contains("USING IVF"),
+        "SHOW CREATE TABLE must echo USING IVF, got:\n{create}"
     );
     // The echoed DDL must reparse (round-trip) into an equivalent table.
     engine.execute("DROP TABLE items").unwrap();
@@ -4121,14 +4116,14 @@ fn ivf_sq8_show_create_round_trips() {
 }
 
 #[test]
-fn ivf_sq8_insert_and_delete_visible() {
+fn ivf_insert_and_delete_visible() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=4'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=4)")
         .unwrap();
     for i in 0..40 {
         let v = gen_vectors(1, 4, 0x900 + i as u64)[0].clone();
@@ -4172,7 +4167,7 @@ fn ivf_sq8_insert_and_delete_visible() {
 }
 
 #[test]
-fn ivf_sq8_ddl_rejects_invalid_column() {
+fn ivf_ddl_rejects_invalid_column() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
@@ -4181,9 +4176,9 @@ fn ivf_sq8_ddl_rejects_invalid_column() {
     // Nullable vector column is rejected.
     assert!(
         engine
-            .execute("CREATE INDEX i ON t1(emb) USING IVF_SQ8")
+            .execute("CREATE INDEX i ON t1(emb) USING IVF")
             .is_err(),
-        "IVF_SQ8 on a nullable column must be rejected"
+        "IVF on a nullable column must be rejected"
     );
     engine
         .execute("CREATE TABLE t2 (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)")
@@ -4191,21 +4186,21 @@ fn ivf_sq8_ddl_rejects_invalid_column() {
     // Non-vector column is rejected.
     assert!(
         engine
-            .execute("CREATE INDEX i ON t2(name) USING IVF_SQ8")
+            .execute("CREATE INDEX i ON t2(name) USING IVF")
             .is_err(),
-        "IVF_SQ8 on a non-vector column must be rejected"
+        "IVF on a non-vector column must be rejected"
     );
 }
 
 #[test]
-fn ivf_sq8_update_moves_vector_in_knn() {
+fn ivf_update_moves_vector_in_knn() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=4'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=4)")
         .unwrap();
     for i in 0..40 {
         let v = gen_vectors(1, 4, 0xA00 + i as u64)[0].clone();
@@ -4239,14 +4234,14 @@ fn ivf_sq8_update_moves_vector_in_knn() {
 }
 
 #[test]
-fn ivf_sq8_transaction_delta_is_read_your_writes_and_rollback_safe() {
+fn ivf_transaction_delta_is_read_your_writes_and_rollback_safe() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=3 NPROBE=3'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=3, nprobe=3)")
         .unwrap();
     engine
         .execute("INSERT INTO items VALUES (1,'[1,0,0]'),(2,'[2,0,0]'),(3,'[3,0,0]')")
@@ -4336,14 +4331,14 @@ fn ivf_sq8_transaction_delta_is_read_your_writes_and_rollback_safe() {
 }
 
 #[test]
-fn ivf_sq8_optimize_retrains_and_stays_correct() {
+fn ivf_optimize_retrains_and_stays_correct() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(5) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=6'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=6)")
         .unwrap();
     let n = 60;
     let mut vectors = gen_vectors(n, 5, 0xB0B0_1234);
@@ -4391,21 +4386,21 @@ fn ivf_sq8_optimize_retrains_and_stays_correct() {
 }
 
 #[test]
-fn ivf_sq8_information_schema_reports_algo_and_nlist() {
+fn ivf_information_schema_reports_algo_and_nlist() {
     let _env = HnswEnv::set(&[("MYDB_HNSW_BUILD_ON_DDL", "off")]);
     let dir = tempfile::tempdir().unwrap();
-    let engine = open_hnsw_test_engine(dir.path());
+    let engine = open_strict_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(4) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=5'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=5)")
         .unwrap();
     let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
     // ALGO is available even when cold.
     assert_eq!(
         col_strings(&engine, &format!("SELECT ALGO {base}")),
-        vec!["IVF_SQ8"]
+        vec!["IVF"]
     );
     assert_eq!(
         col_strings(&engine, &format!("SELECT REQUESTED_NLIST {base}")),
@@ -4432,11 +4427,11 @@ fn ivf_sq8_information_schema_reports_algo_and_nlist() {
         &engine,
         "SELECT /*+ IVF_NPROBE(5) */ id FROM items ORDER BY DISTANCE(emb, '[0,0,0,0]') LIMIT 3",
     );
-    // Backend is the IVF memory (`ivf`) or paged (`ivf_paged`) sub-backend
+    // Backend is the IVF memory (`ivf_native`) or paged (`ivf_paged_native`) sub-backend
     // depending on MYDB_VECTOR_STORAGE (default: paged).
     let backend = col_strings(&engine, &format!("SELECT BACKEND {base}"));
     assert!(
-        backend == vec!["ivf"] || backend == vec!["ivf_paged"],
+        backend == vec!["ivf_native"] || backend == vec!["ivf_paged_native"],
         "unexpected IVF backend: {backend:?}"
     );
     assert_eq!(
@@ -4455,7 +4450,10 @@ fn ivf_sq8_information_schema_reports_algo_and_nlist() {
         col_strings(&engine, &format!("SELECT BUILD_STATE {base}")),
         vec!["READY"]
     );
-    if backend == vec!["ivf_paged"] {
+    if backend == vec!["ivf_paged_native"] {
+        // Native pages may still be dirty in the buffer pool. File size is
+        // a physical statistic, so flush before requiring an on-disk extent.
+        engine.checkpoint().unwrap();
         assert!(
             col_strings(&engine, &format!("SELECT PAGED_FILE_SIZE_BYTES {base}"))[0]
                 .parse::<u64>()
@@ -4466,44 +4464,9 @@ fn ivf_sq8_information_schema_reports_algo_and_nlist() {
             col_strings(&engine, &format!("SELECT SQ8_COVERED_NODES {base}"))[0]
                 .parse::<u64>()
                 .unwrap()
-                > 0
+                == 0
         );
     }
-}
-
-#[test]
-fn ivf_sq8_sme_mode_knn_matches_bruteforce() {
-    // Opt-in SME L2 mode (MYDB_IVF_SME=on): the inverted lists keep f32 and are
-    // scored via the SME batch kernel (or NEON fallback). Either way scoring is
-    // exact f32, so a full-probe KNN must equal brute force. This is the SQL-
-    // level differential oracle for the SME option.
-    let _sme = HnswEnv::set(&[("MYDB_IVF_SME", "on")]);
-    let dir = tempfile::tempdir().unwrap();
-    let engine = open_hnsw_test_engine(dir.path());
-    engine
-        .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(16) NOT NULL)")
-        .unwrap();
-    engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'METRIC=L2 NLIST=5'")
-        .unwrap();
-    let n = 40;
-    let dim = 16;
-    let vectors = gen_vectors(n, dim, 0x5EED_1111_2222_3333);
-    bulk_insert_vectors(&engine, &vectors);
-    let query = gen_vectors(1, dim, 0x9999_0000_AAAA_BBBB)[0].clone();
-    let qtext = vec_text(&query);
-    let k = 5;
-    let got = id_list(
-        &engine,
-        &format!(
-            "SELECT /*+ IVF_NPROBE(64) */ id FROM items ORDER BY DISTANCE(emb, '{qtext}') LIMIT {k}"
-        ),
-    );
-    let expected = brute_force_l2(&vectors, &query, k);
-    assert_eq!(
-        got, expected,
-        "SME-mode full-probe KNN must match brute-force top-{k}"
-    );
 }
 
 #[test]
@@ -4518,7 +4481,7 @@ fn online_type_copy_vector_generations_allow_tail_writes() {
                 ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
                 ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
             ]);
-            for algo in ["HNSW", "IVF_SQ8"] {
+            for algo in ["HNSW", "IVF"] {
                 let dir = tempfile::tempdir().unwrap();
                 let engine = std::sync::Arc::new(open_strict_test_engine(dir.path()));
                 engine
@@ -4578,7 +4541,7 @@ fn online_type_copy_vector_generations_allow_tail_writes() {
 }
 
 #[test]
-fn ivf_sq8_physical_replica_reopens_invalidated_warm_graph() {
+fn ivf_physical_replica_reopens_invalidated_warm_graph() {
     let _env = paged_index_env();
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
@@ -4586,7 +4549,7 @@ fn ivf_sq8_physical_replica_reopens_invalidated_warm_graph() {
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=3'")
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=3)")
         .unwrap();
     engine
         .execute("INSERT INTO items VALUES (1,'[1,0,0]'),(2,'[2,0,0]')")
@@ -4594,7 +4557,7 @@ fn ivf_sq8_physical_replica_reopens_invalidated_warm_graph() {
     let sql = "SELECT /*+ IVF_NPROBE(1) */ id FROM items ORDER BY DISTANCE(emb,'[2,0,0]') LIMIT 1";
     assert_eq!(id_list(&engine, sql), vec![2]);
     engine.database().set_physical_replica_mode(true).unwrap();
-    engine.database().invalidate_replicated_ivf_graphs(None);
+    engine.database().invalidate_replicated_vector_graphs();
     assert!(engine.database().vector_index_runtime_stats().is_empty());
     assert_eq!(id_list(&engine, sql), vec![2]);
     assert!(!engine.database().vector_index_runtime_stats().is_empty());
@@ -4602,7 +4565,7 @@ fn ivf_sq8_physical_replica_reopens_invalidated_warm_graph() {
 }
 
 #[test]
-fn ivf_sq8_replica_wal_dml_refreshes_warm_directory() {
+fn ivf_replica_wal_dml_refreshes_warm_directory() {
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -4627,7 +4590,7 @@ fn ivf_sq8_replica_wal_dml_refreshes_warm_directory() {
             .execute("INSERT INTO items VALUES (1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')")
             .unwrap();
         engine
-            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8 COMMENT 'NLIST=2'")
+            .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=2)")
             .unwrap();
     }
     copy_tree(source.path(), target.path());
@@ -4669,8 +4632,8 @@ fn ivf_sq8_replica_wal_dml_refreshes_warm_directory() {
         let stats = replica.database().vector_index_runtime_stats();
         assert_eq!(stats.len(), 1);
         let stats = stats.values().next().unwrap();
-        assert_eq!(stats.backend, "ivf_paged");
-        assert!(stats.finalized);
+        assert_eq!(stats.backend, "ivf_native");
+        assert!(!stats.finalized);
         let brute = sql.replace("IVF_NPROBE(2)", "NO_VECTOR_INDEX()");
         assert_eq!(id_list(&replica, sql), id_list(&replica, &brute));
     }
@@ -4686,6 +4649,12 @@ fn source_audit_dimension_rejection(backend: &str) {
         .unwrap();
     engine
         .execute("INSERT INTO audit_dim VALUES (1, '[1,2,3]')")
+        .unwrap();
+    assert!(engine
+        .execute("CREATE INDEX iv ON audit_dim(v) USING HNSW")
+        .is_err());
+    engine
+        .execute("ALTER TABLE audit_dim MODIFY v VECTOR(3) NOT NULL")
         .unwrap();
     engine
         .execute("CREATE INDEX iv ON audit_dim(v) USING HNSW")
@@ -4818,15 +4787,23 @@ fn source_audit_b5_restart_reconciles_snapshot_vectors() {
 }
 
 #[test]
-fn source_audit_dimension_check_preserves_empty_variable_ivf_bootstrap() {
+fn source_audit_variable_vector_requires_declared_index_dimension() {
     let _env = HnswEnv::set(&[("MYDB_VECTOR_STORAGE", "memory")]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR NOT NULL)")
         .unwrap();
+    for algo in ["HNSW", "IVF"] {
+        assert!(engine
+            .execute(&format!("CREATE INDEX idx_emb ON items(emb) USING {algo}"))
+            .is_err());
+    }
     engine
-        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF_SQ8")
+        .execute("ALTER TABLE items MODIFY emb VECTOR(2) NOT NULL")
+        .unwrap();
+    engine
+        .execute("CREATE INDEX idx_emb ON items(emb) USING IVF")
         .unwrap();
     engine
         .execute("INSERT INTO items VALUES (1,'[1,2]')")
@@ -5324,6 +5301,9 @@ fn paged_hnsw_delta_wal_recovers_after_crash() {
             .unwrap();
         rows.extend(extra);
         rows.retain(|(id, _)| id % 5 != 0);
+        // The derived completion marker follows CommitTxn. Make that marker
+        // durable to exercise complete-delta redo rather than safe rebuild.
+        engine.database().wal_log().lock().flush().unwrap();
         // Crash: no checkpoint, no buffer-pool writeback.
         std::mem::forget(engine);
     }
@@ -5342,4 +5322,178 @@ fn paged_hnsw_delta_wal_recovers_after_crash() {
     }
     // The durable graph was replayed (tombstones included), not rebuilt.
     assert_eq!(hnsw_stats(&engine).unwrap(), (500, 400, 100));
+}
+
+#[path = "hnsw_regressions.rs"]
+mod hnsw_regressions;
+
+#[test]
+fn review_20261024_hnsw_replica_wal_dml_refreshes_warm_graph() {
+    for backend in ["memory", "paged"] {
+        for partitioned in [false, true] {
+            hnsw_replica_case(backend, partitioned);
+        }
+    }
+}
+
+fn hnsw_replica_case(backend: &str, partitioned: bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    let _env = paged_index_env();
+    let _backend = HnswEnv::set(&[("MYDB_VECTOR_STORAGE", backend)]);
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    {
+        let engine = open_strict_test_engine(source.path());
+        let partition = if partitioned {
+            " PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(2),PARTITION p1 VALUES LESS THAN MAXVALUE)"
+        } else {
+            ""
+        };
+        engine
+            .execute(&format!(
+                "CREATE TABLE items(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL){partition}"
+            ))
+            .unwrap();
+        engine
+            .execute("INSERT INTO items VALUES (1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')")
+            .unwrap();
+        engine
+            .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW")
+            .unwrap();
+    }
+    copy_tree(source.path(), target.path());
+    let mut role = crate::repl::role::RoleState::new_standalone();
+    role.demote_to_replica("127.0.0.1:1".into());
+    crate::repl::role::save(target.path(), &role).unwrap();
+    let master = open_strict_test_engine(source.path());
+    let replica = open_strict_test_engine(target.path());
+    replica.database().set_physical_replica_mode(true).unwrap();
+    let sql = "SELECT /*+ HNSW_EF(64) */ id FROM items ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1";
+    assert_eq!(id_list(&replica, sql), vec![1]);
+    // Mirror the applier's real WAL projection, without TCP timing in the test.
+    let mut next_lsn = replica.database().wal_log().lock().last_lsn() + 1;
+    for (dml, expected) in [
+        ("INSERT INTO items VALUES (4,'[0,0,0]')", 4),
+        ("UPDATE items SET emb='[40,0,0]' WHERE id=4", 1),
+        ("DELETE FROM items WHERE id=1", 2),
+    ] {
+        master.execute(dml).unwrap();
+        master.database().wal_log().lock().flush().unwrap();
+        let scan = crate::wal::LogManager::scan(source.path()).unwrap();
+        // Persist the same physical frames as the real receiver before page
+        // redo. Applying only decoded records cannot support a restart test.
+        let after = next_lsn - 1;
+        let prefixes = master
+            .database()
+            .wal_log()
+            .lock()
+            .pin_prefix_after(after, None)
+            .unwrap();
+        for prefix in prefixes {
+            let mut file = prefix.file.open().unwrap().try_clone().unwrap();
+            file.seek(SeekFrom::Start(prefix.start_offset)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(prefix.len - prefix.start_offset)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let frame = crate::wal::decode_frame_for_replication(&bytes[offset..]).unwrap();
+                if frame.header.lsn > replica.database().wal_log().lock().last_lsn() {
+                    replica
+                        .database()
+                        .wal_log()
+                        .lock()
+                        .append_replication_frame(&bytes[offset..offset + frame.frame_len], &frame)
+                        .unwrap();
+                }
+                offset += frame.frame_len;
+            }
+        }
+        replica.database().wal_log().lock().flush().unwrap();
+        for record in scan.records.iter().filter(|r| r.lsn >= next_lsn) {
+            replica.database().apply_wal_record(record).unwrap();
+        }
+        next_lsn = scan.next_lsn;
+        let mut session = SessionContext::default();
+        assert_eq!(
+            id_list_session(&replica, &mut session, sql),
+            vec![expected],
+            "replica after {dml}"
+        );
+        assert!(
+            session.warnings.is_empty(),
+            "unexpected fallback: {:?}",
+            session.warnings
+        );
+        let stats = replica.database().vector_index_runtime_stats();
+        assert_eq!(stats.len(), 1);
+        let stats = stats.values().next().unwrap();
+        assert_eq!(stats.backend, "memory");
+
+        let brute = sql.replace("HNSW_EF(64)", "NO_VECTOR_INDEX()");
+        assert_eq!(id_list(&replica, sql), id_list(&replica, &brute));
+    }
+    replica.database().set_physical_replica_mode(false).unwrap();
+    crate::repl::role::save(
+        target.path(),
+        &crate::repl::role::RoleState::new_standalone(),
+    )
+    .unwrap();
+    assert_eq!(
+        id_list(&replica, sql),
+        vec![2],
+        "promoted {backend}, partitioned={partitioned}"
+    );
+    drop(replica);
+    let promoted = open_strict_test_engine(target.path());
+    assert_eq!(
+        id_list(&promoted, sql),
+        vec![2],
+        "promoted restart {backend}, partitioned={partitioned}"
+    );
+}
+
+#[test]
+fn vector_indexes_reject_retired_algorithm_in_all_ddl_forms() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE retired_algorithm(id INT PRIMARY KEY,v VECTOR(3) NOT NULL)")
+        .unwrap();
+    for sql in [
+        "CREATE INDEX obsolete ON retired_algorithm(v) USING IVF_SQ8",
+        "ALTER TABLE retired_algorithm ADD INDEX obsolete(v) USING IVF_SQ8",
+        "CREATE TABLE retired_inline(id INT PRIMARY KEY,v VECTOR(3) NOT NULL,KEY obsolete(v) USING IVF_SQ8)",
+    ] {
+        let err = engine.execute(sql).expect_err("retired algorithm must not be accepted");
+        assert!(err.is(crate::error::catalog::ER_NOT_SUPPORTED_YET)
+                && err.to_string().contains("IVF_SQ8"), "{sql}: {err:?}");
+    }
+    assert_eq!(
+        engine
+            .database()
+            .snapshot_table_schema("retired_algorithm")
+            .unwrap()
+            .indexes
+            .iter()
+            .filter(|i| i.name == "obsolete")
+            .count(),
+        0
+    );
+    engine
+        .execute("CREATE INDEX native ON retired_algorithm(v) USING IVF WITH (nlist=1)")
+        .unwrap();
 }

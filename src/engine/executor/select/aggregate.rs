@@ -3943,7 +3943,9 @@ mod retained_state_memory_tests {
 
     #[test]
     fn first_value_counts_all_owned_payloads_and_spare_capacity() {
-        for ctor in [Value::Bytes, Value::Json, Value::Geometry, Value::Vector] {
+        for ctor in [Value::Bytes, Value::Json, Value::Geometry, |v: Vec<u8>| {
+            Value::Vector(v.into())
+        }] {
             let mut bytes = Vec::with_capacity(128 * 1024);
             bytes.push(1);
             let value = ctor(bytes);

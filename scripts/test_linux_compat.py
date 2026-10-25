@@ -43,6 +43,9 @@ class BackupJobTests(unittest.TestCase):
 
 
 class SnapshotStartupTests(unittest.TestCase):
+    def setUp(self):
+        Path('/tmp/mydb').mkdir(parents=True, exist_ok=True)
+
     def test_native_volume_snapshot_mount_is_read_only(self):
         with tempfile.TemporaryDirectory(dir='/tmp/mydb') as temporary:
             args = SimpleNamespace(output=Path(temporary), binary=Path('/tmp/mydb/server'),

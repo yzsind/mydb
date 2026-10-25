@@ -321,8 +321,8 @@ impl GraceRangePartitioning {
                         | Value::SmallString(_)
                         | Value::Bytes(_)
                         | Value::Json(_)
-                        | Value::Geometry(_)
-                        | Value::Vector(_) => false,
+                        | Value::Geometry(_) => false,
+                        Value::Vector(_) => false,
                         Value::Decimal(text) => text.len() <= 128,
                         _ => true,
                     },

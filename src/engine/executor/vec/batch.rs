@@ -526,9 +526,12 @@ impl ColumnVector {
             ColumnVector::Geometry { offsets, data, .. } => {
                 Value::Geometry(data[offsets[idx] as usize..offsets[idx + 1] as usize].to_vec())
             }
-            ColumnVector::Vector { offsets, data, .. } => {
-                Value::Vector(data[offsets[idx] as usize..offsets[idx + 1] as usize].to_vec())
-            }
+            ColumnVector::Vector { offsets, data, .. } => Value::Vector(
+                crate::engine::vector::codec::decode_value(
+                    &data[offsets[idx] as usize..offsets[idx + 1] as usize],
+                )
+                .expect("validated vector batch encoding"),
+            ),
             ColumnVector::Generic { values } => values[idx].clone(),
         }
     }
@@ -590,9 +593,9 @@ impl ColumnVector {
             }
             ColumnVector::Vector { offsets, data, .. } => {
                 let bytes = &data[offsets[idx] as usize..offsets[idx + 1] as usize];
-                Ok(Value::Vector(
-                    crate::engine::executor::mem_budget::try_copy_bytes(bytes, "vector value")?,
-                ))
+                Ok(Value::Vector(crate::engine::vector::codec::decode_value(
+                    bytes,
+                )?))
             }
             ColumnVector::Generic { values } => {
                 crate::engine::executor::mem_budget::try_clone_value(
@@ -1735,7 +1738,7 @@ fn build_semantic_bytes(values: Vec<Value>, kind: SemanticBytesKind) -> ColumnVe
                 data.extend_from_slice(bytes)
             }
             Value::Vector(bytes) if matches!(kind, SemanticBytesKind::Vector) => {
-                data.extend_from_slice(bytes)
+                data.extend_from_slice(&bytes.encode())
             }
             _ => unreachable!(),
         }
@@ -2936,8 +2939,11 @@ impl ColumnAccumulator {
                         *any_null = true;
                         None
                     }
-                    Value::Json(bytes) | Value::Geometry(bytes) | Value::Vector(bytes) => {
-                        Some(bytes.as_slice())
+                    Value::Json(bytes) | Value::Geometry(bytes) => Some(bytes.as_slice()),
+                    Value::Vector(bytes) => {
+                        data.extend_from_slice(&bytes.encode());
+                        offsets.push(data.len() as u32);
+                        return;
                     }
                     _ => None,
                 };
@@ -3693,17 +3699,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
     }
     #[inline]
     fn put_vector(&mut self, col: usize, bytes: &[u8]) {
-        match self.accumulator(col) {
-            ColumnAccumulator::Vector { offsets, data, .. } => {
-                data.extend_from_slice(bytes);
-                offsets.push(data.len() as u32);
-            }
-            ColumnAccumulator::Bytes { offsets, data, .. } => {
-                data.extend_from_slice(bytes);
-                offsets.push(data.len() as u32);
-            }
-            other => other.push(&Value::Vector(bytes.to_vec())),
-        }
+        self.put_value(col, Value::Vector(bytes.to_vec().into()));
     }
     #[inline]
     fn put_value(&mut self, col: usize, value: Value) {
@@ -4236,7 +4232,7 @@ mod tests {
             (Value::Timestamp(4_102_444_799_123_456), "timestamp"),
             (Value::Json(br#"{"a":1}"#.to_vec()), "json"),
             (Value::Geometry(vec![1, 2, 3]), "geometry"),
-            (Value::Vector(vec![4, 5, 6]), "vector"),
+            (Value::Vector(vec![4, 5, 6, 0].into()), "vector"),
         ];
         for (value, label) in cases {
             let column = ColumnVector::from_values(vec![value.clone(), Value::Null]);

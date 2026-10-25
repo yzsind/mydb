@@ -17,16 +17,25 @@ pub(super) fn random_level(ordinal: u64, ml: f64, max_layer: usize) -> usize {
 }
 
 pub(super) fn quant_enabled_uncached() -> bool {
-    match std::env::var("MYDB_HNSW_QUANTIZE") {
-        Ok(v) => !matches!(v.as_str(), "0" | "off" | "OFF" | "false" | "FALSE"),
-        Err(_) => true,
+    // Low-level differential tests retain the old diagnostic override. SQL
+    // indexes select explicit per-index payloads and disable this legacy cache.
+    #[cfg(test)]
+    {
+        match std::env::var("MYDB_HNSW_QUANTIZE") {
+            Ok(v) => !matches!(v.as_str(), "0" | "off" | "OFF" | "false" | "FALSE"),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        true
     }
 }
 
 /// Heap order shared by both backends; the identifier keeps its native width.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct Scored<Id> {
-    pub(crate) dist: f32,
+    pub(crate) dist: f64,
     pub(crate) id: Id,
 }
 impl<Id: Eq> Eq for Scored<Id> {}
@@ -49,7 +58,7 @@ impl<Id: Ord> PartialOrd for Scored<Id> {
 pub(super) fn select_diverse<Id: Copy, E>(
     candidates: &[Scored<Id>],
     maximum: usize,
-    mut distance: impl FnMut(Id, Id) -> Result<f32, E>,
+    mut distance: impl FnMut(Id, Id) -> Result<f64, E>,
 ) -> Result<Vec<Scored<Id>>, E> {
     select_diverse_by(
         candidates.iter().copied(),
@@ -87,7 +96,7 @@ pub(super) fn select_diverse_by<C: Copy, E>(
 }
 
 #[inline]
-pub(super) fn permits_in_place_update(drift_sq: f32, nearest_sq: f32, ratio_sq: f32) -> bool {
+pub(super) fn permits_in_place_update(drift_sq: f64, nearest_sq: f64, ratio_sq: f64) -> bool {
     !(!nearest_sq.is_finite() || drift_sq > ratio_sq * nearest_sq)
 }
 
@@ -113,7 +122,7 @@ mod tests {
 
     #[test]
     fn diversity_keeps_equal_and_unordered_distances() {
-        for distance in [0.0, -0.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        for distance in [0.0, -0.0, 1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             let candidates = [
                 Scored { id: 0, dist: 0.0 },
                 Scored {
@@ -121,7 +130,7 @@ mod tests {
                     dist: distance,
                 },
             ];
-            for pair_distance in [distance, f32::NAN] {
+            for pair_distance in [distance, f64::NAN] {
                 let selected =
                     select_diverse(&candidates, 2, |_, _| Ok::<_, ()>(pair_distance)).unwrap();
                 assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [0, 1]);
@@ -158,7 +167,7 @@ mod tests {
             selected.into_iter().map(|s| s.id).collect::<Vec<_>>(),
             [10, 30]
         );
-        let result = select_diverse(&candidates, 3, |_, _| Err::<f32, _>("page read failed"));
+        let result = select_diverse(&candidates, 3, |_, _| Err::<f64, _>("page read failed"));
         assert_eq!(result.unwrap_err(), "page read failed");
     }
 
@@ -166,6 +175,6 @@ mod tests {
     fn movement_requires_a_finite_local_scale_and_keeps_the_equal_boundary() {
         assert!(permits_in_place_update(4.0, 16.0, 0.25));
         assert!(!permits_in_place_update(4.1, 16.0, 0.25));
-        assert!(!permits_in_place_update(0.0, f32::INFINITY, 1.0));
+        assert!(!permits_in_place_update(0.0, f64::INFINITY, 1.0));
     }
 }

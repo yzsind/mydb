@@ -2189,10 +2189,10 @@ pub(super) fn execute_plan_rows_inner(
             let _ = ef_search; // baked planning-time value; superseded by the live re-resolution
                                // Resolve the algorithm-appropriate search effort from the *live*
                                // session: an ef candidate-pool size for HNSW, an nprobe cell count
-                               // for IVF_SQ8. Both flow through the same `ef` argument — the
+                               // for IVF. Both flow through the same `ef` argument — the
                                // backend (`VectorGraph::search`) interprets it per its algorithm.
             let ef = match index.vector_algo() {
-                crate::storage::schema::VectorAlgo::IvfSq8 => {
+                crate::storage::schema::VectorAlgo::Ivf => {
                     let index_default = index.vector_meta().default_nprobe.map(|v| v as u64);
                     crate::engine::vector::session::effective_nprobe(&cfg, *ef_hint, index_default)
                 }

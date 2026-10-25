@@ -141,7 +141,7 @@ pub(crate) fn slice_value_bytes(value: &Value, offset: u64, len: u64) -> Value {
         Value::Bytes(b) => Value::Bytes(take(b)),
         Value::Json(b) => Value::Json(take(b)),
         Value::Geometry(b) => Value::Geometry(take(b)),
-        Value::Vector(b) => Value::Vector(take(b)),
+        Value::Vector(b) => Value::Bytes(take(b)),
         Value::Null => Value::Null,
         other => other.clone(),
     }
@@ -662,7 +662,8 @@ fn encode_mvcc_row(
             Value::String(s) | Value::Decimal(s) => s.len() + 5,
             Value::SmallString(b) => b.len() + 5,
             Value::Bytes(b) => b.len() + 5,
-            Value::Json(b) | Value::Geometry(b) | Value::Vector(b) => b.len() + 5,
+            Value::Json(b) | Value::Geometry(b) => b.len() + 5,
+            Value::Vector(b) => b.len() + 17,
         };
     }
     let estimated = mvcc_header_len(&header) + 3 + value_bytes_est;
@@ -1250,7 +1251,7 @@ pub(crate) fn encode_row_into(values: &[Value], out: &mut Vec<u8>) -> Result<(),
             }
             Value::Json(b) => write_var_bytes(out, TAG_JSON, b)?,
             Value::Geometry(b) => write_var_bytes(out, TAG_GEOMETRY, b)?,
-            Value::Vector(b) => write_var_bytes(out, TAG_VECTOR, b)?,
+            Value::Vector(b) => write_var_bytes(out, TAG_VECTOR, &b.encode())?,
         }
     }
     Ok(())
@@ -1288,7 +1289,7 @@ pub(crate) fn encoded_row_len(values: &[Value]) -> Result<usize, QueryError> {
             Value::Year(_) => 1 + 1,
             Value::Json(b) => checked_var_value_len(b.len())?,
             Value::Geometry(b) => checked_var_value_len(b.len())?,
-            Value::Vector(b) => checked_var_value_len(b.len())?,
+            Value::Vector(b) => checked_var_value_len(b.len() + 12)?,
         };
         len = len.checked_add(added).ok_or_else(|| {
             error(
@@ -1549,7 +1550,9 @@ fn read_value_by_tag(input: &[u8], pos: &mut usize, tag: u8) -> Result<Value, Qu
         }
         TAG_JSON => Ok(Value::Json(read_var_bytes(input, pos)?)),
         TAG_GEOMETRY => Ok(Value::Geometry(read_var_bytes(input, pos)?)),
-        TAG_VECTOR => Ok(Value::Vector(read_var_bytes(input, pos)?)),
+        TAG_VECTOR => Ok(Value::Vector(crate::engine::vector::codec::decode_value(
+            &read_var_bytes(input, pos)?,
+        )?)),
         _ => Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "unknown row value tag",
@@ -1863,7 +1866,10 @@ pub(crate) enum ColumnKind {
     /// bytes addressed by the varlen directory (see
     /// `engine::vector`). Distinct from `VarBytes` so the decoder reconstructs
     /// a `Value::Vector`, and so large vectors externalize off-page.
-    Vector,
+    Vector {
+        dim: Option<u32>,
+        datatype: crate::vector::VectorDataType,
+    },
     /// Fixed-width BINARY(n) payload in the fixed block.
     FixedBytes {
         width: usize,
@@ -1879,6 +1885,7 @@ pub(crate) enum ColumnKind {
     /// Fixed-width VECTOR(n), stored as `dim * 4` little-endian f32 bytes.
     VectorFixed {
         dim: u32,
+        datatype: crate::vector::VectorDataType,
     },
     /// ENUM stored as a 1- or 2-byte ordinal. Ordinal 0 is the empty/error
     /// value; 1-based ordinals map to declared labels.
@@ -2126,9 +2133,23 @@ pub(crate) fn codec_has_externalizable_columns(codec: &RowCodec) -> bool {
                     | ColumnKind::VarBytes
                     | ColumnKind::Json
                     | ColumnKind::Geometry
-                    | ColumnKind::Vector
+                    | ColumnKind::Vector { .. }
             )
         })
+}
+
+fn vector_column_kind(dim: Option<u32>, datatype: crate::vector::VectorDataType) -> ColumnKind {
+    let limit = if datatype == crate::vector::VectorDataType::Float32 {
+        8192
+    } else {
+        4096
+    };
+    match dim {
+        Some(dim) if datatype.payload_len(dim) <= limit => {
+            ColumnKind::VectorFixed { dim, datatype }
+        }
+        dim => ColumnKind::Vector { dim, datatype },
+    }
 }
 
 fn column_kind_for(ty: &DataTypeKind, unsigned: bool) -> ColumnKind {
@@ -2189,8 +2210,7 @@ fn column_kind_for(ty: &DataTypeKind, unsigned: bool) -> ColumnKind {
         },
         DataTypeKind::Json => ColumnKind::Json,
         DataTypeKind::Geometry { .. } => ColumnKind::Geometry,
-        DataTypeKind::Vector { dim: Some(dim) } => ColumnKind::VectorFixed { dim: *dim },
-        DataTypeKind::Vector { dim: None } => ColumnKind::Vector,
+        DataTypeKind::Vector { dim, datatype } => vector_column_kind(*dim, *datatype),
         DataTypeKind::Binary { len: Some(len) } => ColumnKind::FixedBytes { width: *len },
         DataTypeKind::Bit { len } => ColumnKind::Bit {
             width: len.unwrap_or(1).div_ceil(8),
@@ -2276,10 +2296,19 @@ fn column_kind_from_layout_codec_kind(encoded: &str) -> Option<ColumnKind> {
             fsp: parse_debug_u8(body, "fsp").unwrap_or(0),
         },
         _ if body.starts_with("Geometry") => ColumnKind::Geometry,
-        _ if body.starts_with("Vector") => match parse_debug_option_u32(body, "dim") {
-            Some(dim) => ColumnKind::VectorFixed { dim },
-            None => ColumnKind::Vector,
-        },
+        _ if body.starts_with("Vector") => {
+            let datatype = [
+                crate::vector::VectorDataType::Float32,
+                crate::vector::VectorDataType::Float16,
+                crate::vector::VectorDataType::BFloat16,
+                crate::vector::VectorDataType::Int8,
+                crate::vector::VectorDataType::Binary,
+            ]
+            .into_iter()
+            .find(|t| body.contains(&format!("datatype: {t:?}")))
+            .unwrap_or_default();
+            vector_column_kind(parse_debug_option_u32(body, "dim"), datatype)
+        }
         _ => return None,
     })
 }
@@ -2391,7 +2420,7 @@ fn fixed_width_for_kind(kind: &ColumnKind) -> Option<usize> {
         ColumnKind::Year => 1,
         ColumnKind::FixedBytes { width } => *width,
         ColumnKind::Bit { width } => *width,
-        ColumnKind::VectorFixed { dim } => (*dim as usize).saturating_mul(4),
+        ColumnKind::VectorFixed { dim, datatype } => datatype.payload_len(*dim),
         ColumnKind::Enum { width, .. } | ColumnKind::Set { width, .. } => *width as usize,
         ColumnKind::Decimal { .. }
         | ColumnKind::DecimalWide { .. }
@@ -2399,10 +2428,9 @@ fn fixed_width_for_kind(kind: &ColumnKind) -> Option<usize> {
         | ColumnKind::VarBytes
         | ColumnKind::Json
         | ColumnKind::Geometry
-        | ColumnKind::Vector => return None,
+        | ColumnKind::Vector { .. } => return None,
     })
 }
-
 
 #[inline]
 fn dir_entry_offset(dir_start: usize, ord: usize) -> usize {
@@ -3337,10 +3365,12 @@ impl<'a> RowDecodeSink for ValueVecSink<'a> {
     #[inline]
     fn put_vector(&mut self, col: usize, bytes: &[u8]) {
         if let Value::Vector(v) = &mut self.0[col] {
+            v.datatype = crate::vector::VectorDataType::Float32;
+            v.dimension = (bytes.len() / 4) as u32;
             v.clear();
             v.extend_from_slice(bytes);
         } else {
-            self.0[col] = Value::Vector(bytes.to_vec());
+            self.0[col] = Value::Vector(bytes.to_vec().into());
         }
     }
     #[inline]
@@ -4088,8 +4118,11 @@ fn fast_op_for_kind(kind: &ColumnKind) -> (u8, u8, u8) {
         // BIT round-trips as an integer, not raw bytes, so it takes the
         // general encode/decode arms rather than the byte-copy fast op.
         ColumnKind::Bit { .. } => (OP_FALLBACK, 0, 0),
-        ColumnKind::VectorFixed { dim } => {
-            let total = (*dim as usize).saturating_mul(4);
+        ColumnKind::VectorFixed { dim, datatype } => {
+            let total = datatype.payload_len(*dim);
+            if *datatype != crate::vector::VectorDataType::Float32 {
+                return (OP_FALLBACK, 0, 0);
+            }
             if total > u8::MAX as usize {
                 (OP_FALLBACK, 0, 0)
             } else {
@@ -4113,7 +4146,7 @@ fn fast_op_for_kind(kind: &ColumnKind) -> (u8, u8, u8) {
         ColumnKind::VarBytes => (OP_VAR_BYTES, 0, 0),
         ColumnKind::Json => (OP_VAR_JSON, 0, 0),
         ColumnKind::Geometry => (OP_VAR_GEOMETRY, 0, 0),
-        ColumnKind::Vector => (OP_VAR_VECTOR, 0, 0),
+        ColumnKind::Vector { .. } => (OP_FALLBACK, 0, 0),
     }
 }
 
@@ -4425,7 +4458,7 @@ fn decode_fixed_by_op(op: u8, scale: u8, bytes: &[u8]) -> Value {
         }
         OP_YEAR => Value::Year(bytes[0]),
         OP_FIXED_BYTES => Value::Bytes(bytes.to_vec()),
-        OP_VECTOR_FIXED => Value::Vector(bytes.to_vec()),
+        OP_VECTOR_FIXED => Value::Vector(bytes.to_vec().into()),
         // Unknown / unsupported ops should never reach here because the
         // step list is built by `fast_op_for_kind`, which routes them
         // through `OP_FALLBACK`. Use a defensive return rather than
@@ -4471,8 +4504,8 @@ fn value_len_for_kind(kind: &ColumnKind, value: &Value) -> Result<usize, QueryEr
             let bytes = geometry_coerce_to_internal(value)?;
             bytes.len()
         }
-        ColumnKind::Vector => {
-            let bytes = vector_coerce_to_internal(value)?;
+        ColumnKind::Vector { dim, datatype } => {
+            let bytes = vector_coerce_to_internal(value, *datatype, *dim)?;
             bytes.len()
         }
         _ => unreachable!("fixed-width kinds returned above"),
@@ -4583,16 +4616,30 @@ fn encode_fixed_for_kind(
             // the big-endian u64 are exactly the M-bit value.
             out.copy_from_slice(&be[be.len() - width..]);
         }
-        ColumnKind::VectorFixed { dim } => {
-            let bytes = vector_coerce_to_internal_cow(value)?;
-            let expected = (*dim as usize).saturating_mul(4);
+        ColumnKind::VectorFixed { dim, datatype } => {
+            let coerced;
+            let bytes = match value {
+                Value::Vector(v) if v.datatype == *datatype && v.dimension == *dim => {
+                    crate::engine::vector::validate_internal(v)?;
+                    v.payload.as_slice()
+                }
+                _ => {
+                    coerced = crate::engine::vector::codec::coerce_value(
+                        value.clone(),
+                        *datatype,
+                        Some(*dim),
+                    )?;
+                    coerced.payload.as_slice()
+                }
+            };
+            let expected = datatype.payload_len(*dim);
             if bytes.len() != expected {
                 return Err(error(
                     crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                     format!("VECTOR({dim}) value has {} bytes", bytes.len()),
                 ));
             }
-            out.copy_from_slice(&bytes);
+            out.copy_from_slice(bytes);
         }
         ColumnKind::Enum { values, width } => {
             let ord = enum_ordinal(value, values)?;
@@ -4608,7 +4655,7 @@ fn encode_fixed_for_kind(
         | ColumnKind::VarBytes
         | ColumnKind::Json
         | ColumnKind::Geometry
-        | ColumnKind::Vector => {
+        | ColumnKind::Vector { .. } => {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "variable column in fixed encoder",
@@ -4682,7 +4729,9 @@ fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, Query
             }
             Ok(Value::UInt(n))
         }
-        ColumnKind::VectorFixed { .. } => Ok(Value::Vector(input.to_vec())),
+        ColumnKind::VectorFixed { dim, datatype } => Ok(Value::Vector(
+            crate::vector::VectorValue::new(*datatype, *dim, input.to_vec()),
+        )),
         ColumnKind::Enum { values, width } => {
             let ord = read_unsigned_le_width(&input[..*width as usize])? as usize;
             if ord == 0 {
@@ -4714,7 +4763,7 @@ fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, Query
         | ColumnKind::VarBytes
         | ColumnKind::Json
         | ColumnKind::Geometry
-        | ColumnKind::Vector => Err(error(
+        | ColumnKind::Vector { .. } => Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "variable column in fixed decoder",
         )),
@@ -4740,7 +4789,9 @@ fn encode_var_for_kind(
         ColumnKind::VarBytes => append_bytes_value_bytes_inline(value, out),
         ColumnKind::Json => out.extend_from_slice(&json_coerce_to_jsonb(value)?),
         ColumnKind::Geometry => out.extend_from_slice(&geometry_coerce_to_internal(value)?),
-        ColumnKind::Vector => out.extend_from_slice(&vector_coerce_to_internal_cow(value)?),
+        ColumnKind::Vector { dim, datatype } => {
+            out.extend_from_slice(&vector_coerce_to_internal_cow(value, *datatype, *dim)?)
+        }
         _ => {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -4838,8 +4889,7 @@ fn decode_var_for_kind_into(
         }
         (ColumnKind::VarBytes, Value::Bytes(v))
         | (ColumnKind::Json, Value::Json(v))
-        | (ColumnKind::Geometry, Value::Geometry(v))
-        | (ColumnKind::Vector, Value::Vector(v)) => {
+        | (ColumnKind::Geometry, Value::Geometry(v)) => {
             v.clear();
             v.extend_from_slice(input);
             Ok(())
@@ -4893,7 +4943,11 @@ fn decode_var_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, QueryEr
         ColumnKind::VarBytes => Ok(Value::Bytes(input.to_vec())),
         ColumnKind::Json => Ok(Value::Json(input.to_vec())),
         ColumnKind::Geometry => Ok(Value::Geometry(input.to_vec())),
-        ColumnKind::Vector => Ok(Value::Vector(input.to_vec())),
+        ColumnKind::Vector { dim, datatype } => Ok(Value::Vector(vector_from_storage(
+            input.to_vec(),
+            *datatype,
+            *dim,
+        )?)),
         _ => Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "fixed column in var decoder",
@@ -5223,7 +5277,6 @@ fn set_mask(value: &Value, values: &[String]) -> Result<u64, QueryError> {
 
 // --- value coercion helpers ----------------------------------------------
 
-
 fn value_to_f32(v: &Value) -> f32 {
     match v {
         Value::Float(x) => *x,
@@ -5339,7 +5392,7 @@ fn value_to_bytes(v: &Value) -> Vec<u8> {
         // Geometry flowing into a binary column keeps its internal bytes.
         Value::Geometry(b) => b.clone(),
         // Vector flowing into a binary column keeps its internal bytes.
-        Value::Vector(b) => b.clone(),
+        Value::Vector(b) => b.payload.clone(),
         Value::DecimalCompact(..)
         | Value::Decimal128(..)
         | Value::DecimalWide(..)
@@ -5405,38 +5458,61 @@ fn geometry_coerce_to_internal(value: &Value) -> Result<Vec<u8>, QueryError> {
 }
 
 /// Coerce any `Value` into canonical internal vector bytes (little-endian
-/// `f32` array) for a `ColumnKind::Vector` column. The common case
+/// `f32` array) for a `ColumnKind::Vector {..}` column. The common case
 /// (`Value::Vector`) is already internal form and is returned *borrowed*
 /// after an in-place validation — the encoder then copies it once into the
 /// row buffer, avoiding the redundant `to_vec()` clone the old path paid per
 /// row. Text/bytes must be parsed and so produce an owned `Vec`. An invalid
 /// vector is rejected rather than silently stored.
-fn vector_coerce_to_internal_cow(value: &Value) -> Result<std::borrow::Cow<'_, [u8]>, QueryError> {
+fn vector_coerce_to_internal_cow(
+    value: &Value,
+    datatype: crate::vector::VectorDataType,
+    dim: Option<u32>,
+) -> Result<std::borrow::Cow<'_, [u8]>, QueryError> {
     use std::borrow::Cow;
-    match value {
-        Value::Vector(b) => {
-            crate::engine::vector::validate_internal(b)?;
-            Ok(Cow::Borrowed(b.as_slice()))
+    if let Value::Vector(v) = value {
+        crate::engine::vector::validate_internal(v)?;
+        if v.datatype == datatype && dim == Some(v.dimension) {
+            return Ok(Cow::Borrowed(&v.payload));
         }
-        Value::Bytes(b) => Ok(Cow::Owned(crate::engine::vector::coerce_bytes_to_internal(
-            b,
-        )?)),
-        Value::String(s) | Value::Decimal(s) => Ok(Cow::Owned(
-            crate::engine::vector::coerce_bytes_to_internal(s.as_bytes())?,
-        )),
-        Value::Null => Ok(Cow::Owned(Vec::new())),
-        _ => Err(error(
-            crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
-            "Cannot get a VECTOR value from the data sent to the VECTOR field",
-        )),
     }
+    let value = crate::engine::vector::codec::coerce_value(value.clone(), datatype, dim)?;
+    if dim.is_some() {
+        return Ok(Cow::Owned(value.payload));
+    }
+    let mut encoded = Vec::with_capacity(value.len() + 4);
+    encoded.extend_from_slice(&value.dimension.to_le_bytes());
+    encoded.extend_from_slice(&value.payload);
+    Ok(Cow::Owned(encoded))
 }
-
-/// Owned variant of [`vector_coerce_to_internal_cow`] for callers that must
-/// take ownership (e.g. allocating an overflow chain for a variable
-/// `VECTOR`).
-fn vector_coerce_to_internal(value: &Value) -> Result<Vec<u8>, QueryError> {
-    Ok(vector_coerce_to_internal_cow(value)?.into_owned())
+fn vector_coerce_to_internal(
+    value: &Value,
+    datatype: crate::vector::VectorDataType,
+    dim: Option<u32>,
+) -> Result<Vec<u8>, QueryError> {
+    Ok(vector_coerce_to_internal_cow(value, datatype, dim)?.into_owned())
+}
+fn vector_from_storage(
+    mut payload: Vec<u8>,
+    datatype: crate::vector::VectorDataType,
+    declared: Option<u32>,
+) -> Result<crate::vector::VectorValue, QueryError> {
+    let dimension = if let Some(dimension) = declared {
+        dimension
+    } else {
+        if payload.len() < 4 {
+            return Err(crate::engine::vector::vector_err(
+                "truncated stored vector dimension",
+            ));
+        }
+        let dimension = u32::from_le_bytes(payload[..4].try_into().unwrap());
+        payload.copy_within(4.., 0);
+        payload.truncate(payload.len() - 4);
+        dimension
+    };
+    let value = crate::vector::VectorValue::new(datatype, dimension, payload);
+    crate::engine::vector::validate_internal(&value)?;
+    Ok(value)
 }
 
 // --- integer encoding ----------------------------------------------------
@@ -6718,7 +6794,7 @@ mod row_codec_tests {
         // walks past the before-image via `encoded_row_skip_len`), and decode.
         // A missing TAG_VECTOR arm in `skip_value_by_tag` broke WAL replay of
         // DELETE/UPDATE undo records on vector tables (restart recovery).
-        let emb = Value::Vector(vec![0, 0, 128, 63, 0, 0, 0, 64]); // [1.0, 2.0] LE f32
+        let emb = Value::Vector(vec![0, 0, 128, 63, 0, 0, 0, 64].into()); // [1.0, 2.0] LE f32
         round_trip(vec![emb.clone()]);
         // Mixed with other tagged values, and as a non-leading column so the
         // skip must land `pos` exactly for the following value to decode.
@@ -7636,7 +7712,11 @@ mod row_codec_tests {
             let quantum = temporal_quantum(fsp);
             let max = crate::types::MAX_DATETIME_MICROS / quantum * quantum;
             let codec = codec(vec![ColumnKind::Timestamp { fsp }]);
-            for micros in [crate::types::MIN_TIMESTAMP_MICROS, max, crate::types::ZERO_DATETIME] {
+            for micros in [
+                crate::types::MIN_TIMESTAMP_MICROS,
+                max,
+                crate::types::ZERO_DATETIME,
+            ] {
                 let value = Value::Timestamp(micros);
                 let mut encoded = Vec::new();
                 encode_row_schema_into(&[value.clone()], &codec, &mut encoded).unwrap();

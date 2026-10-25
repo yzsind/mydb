@@ -996,7 +996,19 @@ pub(crate) fn register(reg: &mut Registry) {
         1_000,
     );
 
-    // IVF_SQ8 query-time knob: number of inverted-file cells probed per KNN
+    register_session_uint64(
+        reg,
+        "mydb_hnsw_rerank_mult",
+        |s| s.sysvars.mydb_hnsw_rerank_mult,
+        |s, n| {
+            s.sysvars.mydb_hnsw_rerank_mult = n.clamp(1, 1024);
+            s.sysvars.mydb_hnsw_rerank_mult_explicit = true;
+        },
+        "HNSW exact heap-rerank candidate multiplier vs LIMIT k.",
+        4,
+    );
+
+    // IVF query-time knob: number of inverted-file cells probed per KNN
     // query (the IVF analogue of HNSW `ef_search`). pgvector-style dot-form
     // alias `ivf.nprobe` for muscle memory / tooling parity.
     register_session_uint64_aliased(
@@ -1007,7 +1019,7 @@ pub(crate) fn register(reg: &mut Registry) {
             s.sysvars.mydb_ivf_nprobe = n;
             s.sysvars.mydb_ivf_nprobe_explicit = true;
         },
-        "IVF_SQ8 number of inverted lists to probe per KNN search.",
+        "IVF number of inverted lists to probe per KNN search.",
         8,
         &["ivf.nprobe"],
     );
@@ -1015,8 +1027,11 @@ pub(crate) fn register(reg: &mut Registry) {
         reg,
         "mydb_ivf_rerank_mult",
         |s| s.sysvars.mydb_ivf_rerank_mult,
-        |s, n| s.sysvars.mydb_ivf_rerank_mult = n.max(1),
-        "IVF_SQ8 exact heap-rerank candidate multiplier vs LIMIT k.",
+        |s, n| {
+            s.sysvars.mydb_ivf_rerank_mult = n.clamp(1, 1024);
+            s.sysvars.mydb_ivf_rerank_mult_explicit = true;
+        },
+        "IVF exact heap-rerank candidate multiplier vs LIMIT k.",
         4,
     );
     register_session_uint64_aliased(
@@ -1024,7 +1039,7 @@ pub(crate) fn register(reg: &mut Registry) {
         "mydb_ivf_max_scan_tuples",
         |s| s.sysvars.mydb_ivf_max_scan_tuples,
         |s, n| s.sysvars.mydb_ivf_max_scan_tuples = n,
-        "IVF_SQ8 iterative-scan upper bound on candidate tuples.",
+        "IVF iterative-scan upper bound on candidate tuples.",
         20_000,
         &["ivf.max_scan_tuples"],
     );
@@ -1034,7 +1049,7 @@ pub(crate) fn register(reg: &mut Registry) {
             Scope::Both,
             DataType::String { max_len: Some(32) },
         )
-        .with_doc("IVF_SQ8 iterative-scan policy: off, relaxed_order, strict_order (default).")
+        .with_doc("IVF iterative-scan policy: off, relaxed_order, strict_order (default).")
         .with_aliases(&["ivf.iterative_scan"]),
         |ctx| match ctx.session {
             Some(s) => SysVarValue::String(s.sysvars.mydb_ivf_iterative_scan.clone()),

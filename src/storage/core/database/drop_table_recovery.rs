@@ -46,8 +46,7 @@ pub(crate) struct DropTableIntent {
     /// (heap / lob / zone-map / btree-idx). Removing these
     /// only after the catalog commit is what makes DROP crash-safe.
     files: Vec<String>,
-    /// Relative paths of paged / derived vector index files (`.hnsw` / `.hvec`
-    /// / `.ivf`). Their buffer-pool pages are discarded before the unlink so a
+    /// Relative paths of paged / derived vector index files (`.hnsw` / `.hvec`). Their buffer-pool pages are discarded before the unlink so a
     /// writeback cannot resurrect the file.
     vector_files: Vec<String>,
 }
@@ -320,12 +319,6 @@ impl Database {
                         table,
                         &index.name,
                         sid,
-                    )));
-                    vector_files.push(self.relative_path(&self.vector_index_paged_path_ext(
-                        table,
-                        &index.name,
-                        sid,
-                        "ivf",
                     )));
                 }
             }

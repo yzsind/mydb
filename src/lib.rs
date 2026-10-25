@@ -51,5 +51,6 @@ pub(crate) mod statement_effects;
 pub mod storage;
 pub mod types;
 pub mod util;
+pub mod vector;
 pub mod wal;
 pub mod xa;

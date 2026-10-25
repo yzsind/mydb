@@ -89,7 +89,7 @@ const VEC_DDL_TXN: u64 = 0;
 /// Upper bound on a node's HNSW layer. Bounds the reserved per-node
 /// neighbour footprint on disk; `random_level` essentially never exceeds
 /// this for realistic cardinalities.
-pub(super) const VEC_MAX_LAYER: usize = 16;
+pub(crate) const VEC_MAX_LAYER: usize = 16;
 
 /// Below this row count a cold build stays single-threaded: spawn/join +
 /// per-thread scratch (each thread re-decodes the vectors it visits) only pays
@@ -144,10 +144,9 @@ fn paged_quant_enabled_uncached() -> bool {
 /// borrowed unchanged otherwise. A zero vector has no direction → left as-is.
 fn quant_src(v: &[f32], metric: Metric) -> std::borrow::Cow<'_, [f32]> {
     if metric == Metric::Cosine {
-        let s: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if s > 0.0 {
-            return std::borrow::Cow::Owned(v.iter().map(|x| x / s).collect());
-        }
+        let mut normalized = v.to_vec();
+        super::distance::normalize_in_place(&mut normalized);
+        return std::borrow::Cow::Owned(normalized);
     }
     std::borrow::Cow::Borrowed(v)
 }
@@ -237,7 +236,7 @@ struct QueryCacheEntry {
     k: usize,
     ef: usize,
     query_bits: Box<[u32]>,
-    result: Arc<[(RowId, f32)]>,
+    result: Arc<[(RowId, f64)]>,
 }
 
 /// Small eight-way set-associative memo for exact repeated vector searches. It
@@ -279,7 +278,7 @@ impl QueryNavCache {
         hash ^ (hash >> 32)
     }
 
-    pub(crate) fn get(&self, query: &[f32], k: usize, ef: usize) -> Option<Vec<(RowId, f32)>> {
+    pub(crate) fn get(&self, query: &[f32], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
         if k > QUERY_CACHE_MAX_K {
             return None;
         }
@@ -307,7 +306,7 @@ impl QueryNavCache {
         None
     }
 
-    pub(crate) fn insert(&self, query: &[f32], k: usize, ef: usize, result: &[(RowId, f32)]) {
+    pub(crate) fn insert(&self, query: &[f32], k: usize, ef: usize, result: &[(RowId, f64)]) {
         if k > QUERY_CACHE_MAX_K || result.len() > QUERY_CACHE_MAX_K {
             return;
         }
@@ -386,7 +385,7 @@ fn query_navigation_allocation(
         .checked_mul(
             std::mem::size_of::<Option<QueryCacheEntry>>()
                 .checked_add(dim.checked_mul(std::mem::size_of::<u32>())?)?
-                .checked_add(QUERY_CACHE_MAX_K.checked_mul(std::mem::size_of::<(RowId, f32)>())?)?,
+                .checked_add(QUERY_CACHE_MAX_K.checked_mul(std::mem::size_of::<(RowId, f64)>())?)?,
         )?
         .checked_add(QUERY_CACHE_ENTRIES.checked_mul(2 * std::mem::size_of::<usize>())?)?;
     let row_seed_bytes = RowLookup::reserved_bytes(nodes)?;
@@ -424,13 +423,13 @@ impl QueryNavArena {
     }
 
     #[inline]
-    fn distance(&self, qcodes: &[i8], qnorm: i32, ordinal: usize) -> f32 {
+    fn distance(&self, qcodes: &[i8], qnorm: i32, ordinal: usize) -> f64 {
         let codes = self.codes_at(ordinal);
-        (qnorm + self.norms[ordinal] - 2 * dot_i8(qcodes, codes)) as f32 * self.dist_mul
+        (qnorm + self.norms[ordinal] - 2 * dot_i8(qcodes, codes)) as f64 * (self.dist_mul as f64)
     }
 
     #[inline]
-    fn distances4(&self, qcodes: &[i8], qnorm: i32, ordinals: [usize; 4]) -> [f32; 4] {
+    fn distances4(&self, qcodes: &[i8], qnorm: i32, ordinals: [usize; 4]) -> [f64; 4] {
         let rows = [
             self.codes_at(ordinals[0]),
             self.codes_at(ordinals[1]),
@@ -439,7 +438,7 @@ impl QueryNavArena {
         ];
         let dots = dot_i8_batch4_ptrs(qcodes, rows);
         std::array::from_fn(|index| {
-            (qnorm + self.norms[ordinals[index]] - 2 * dots[index]) as f32 * self.dist_mul
+            (qnorm + self.norms[ordinals[index]] - 2 * dots[index]) as f64 * (self.dist_mul as f64)
         })
     }
 
@@ -480,49 +479,202 @@ impl QueryNavArena {
 
 struct QueryNavScratch {
     visited: Vec<u64>,
+    touched_words: Vec<usize>,
+    capacity_nodes: usize,
+    output_capacity: usize,
     frontier: BinaryHeap<Reverse<Scored>>,
     results: BinaryHeap<Scored>,
     unseen_neighbors: Vec<u32>,
+    charge: Option<ControlledMemoryCharge>,
 }
+
+// A cache-sized bitmap is cheaper to clear in bulk than to track its first
+// touched word on every node visit. Large graphs retain sparse reset.
+const QUERY_NAV_DENSE_RESET_WORDS: usize = 4096 / std::mem::size_of::<u64>();
 
 impl QueryNavScratch {
     fn new(nodes: usize, ef: usize) -> Self {
+        let ef = ef.min(nodes);
+        let words = nodes.saturating_add(63) / 64;
         Self {
-            visited: vec![0; nodes.saturating_add(63) / 64],
+            visited: vec![0; words],
+            touched_words: Vec::with_capacity(if words > QUERY_NAV_DENSE_RESET_WORDS {
+                words.min(ef.saturating_mul(32).max(64))
+            } else {
+                0
+            }),
+            capacity_nodes: nodes,
+            output_capacity: ef,
+            charge: None,
             frontier: BinaryHeap::with_capacity(ef.saturating_mul(2)),
             results: BinaryHeap::with_capacity(ef),
             unseen_neighbors: Vec::with_capacity(64),
         }
     }
 
-    #[inline]
-    fn visit(&mut self, ordinal: usize) -> bool {
-        let word = ordinal >> 6;
-        let mask = 1u64 << (ordinal & 63);
-        let fresh = self.visited[word] & mask == 0;
-        self.visited[word] |= mask;
-        fresh
+    fn try_new(nodes: usize, ef: usize, dim: usize) -> Result<Self, QueryError> {
+        let ef = ef.min(nodes);
+        let words = nodes.checked_add(63).ok_or_else(query_scratch_error)? / 64;
+        let touched = if words > QUERY_NAV_DENSE_RESET_WORDS {
+            words.min(ef.saturating_mul(32).max(64))
+        } else {
+            0
+        };
+        let bytes = words
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(touched.saturating_mul(8)))
+            .and_then(|n| n.checked_add(ef.saturating_mul(3 * std::mem::size_of::<Scored>() + 24)))
+            .and_then(|n| n.checked_add(dim.saturating_mul(8)))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(query_scratch_error)?;
+        let charge =
+            ControlledMemoryCharge::try_new(ControlledMemoryCategory::DerivedCache, bytes)?;
+        let mut scratch = Self::new(nodes, ef);
+        scratch.charge = Some(charge);
+        Ok(scratch)
+    }
+
+    fn prepare_effort(&mut self, ef: usize) -> Result<(), QueryError> {
+        let ef = ef.min(self.capacity_nodes);
+        if ef > self.output_capacity {
+            if let Some(charge) = self.charge.as_mut() {
+                charge.try_grow((ef - self.output_capacity).saturating_mul(24))?;
+            }
+            self.output_capacity = ef;
+        }
+        Ok(())
+    }
+
+    fn reserve_unseen(&mut self, count: usize) -> Result<(), QueryError> {
+        reserve_query_vec(&mut self.unseen_neighbors, count, &mut self.charge)
+    }
+
+    fn reset(&mut self) {
+        if self.visited.len() <= QUERY_NAV_DENSE_RESET_WORDS {
+            self.visited.fill(0);
+        } else {
+            for word in self.touched_words.drain(..) {
+                self.visited[word] = 0;
+            }
+        }
+        self.frontier.clear();
+        self.results.clear();
+        self.unseen_neighbors.clear();
     }
 
     #[inline]
-    fn consider(&mut self, scored: Scored, ef: usize) {
+    fn visit(&mut self, ordinal: usize) -> Result<bool, QueryError> {
+        let word = ordinal >> 6;
+        let mask = 1u64 << (ordinal & 63);
+        let fresh = self.visited[word] & mask == 0;
+        if self.visited.len() > QUERY_NAV_DENSE_RESET_WORDS && self.visited[word] == 0 {
+            let needed = self.touched_words.len() + 1;
+            reserve_query_vec(&mut self.touched_words, needed, &mut self.charge)?;
+            self.touched_words.push(word);
+        }
+        self.visited[word] |= mask;
+        Ok(fresh)
+    }
+
+    #[inline]
+    fn consider(&mut self, scored: Scored, ef: usize) -> Result<(), QueryError> {
         if self.results.len() < ef {
+            reserve_query_heap(&mut self.frontier, &mut self.charge)?;
+            reserve_query_heap(&mut self.results, &mut self.charge)?;
             self.frontier.push(Reverse(scored));
             self.results.push(scored);
-            return;
+            return Ok(());
         }
         let furthest = self
             .results
             .peek()
             .map(|item| item.dist)
-            .unwrap_or(f32::INFINITY);
+            .unwrap_or(f64::INFINITY);
         if scored.dist < furthest {
+            reserve_query_heap(&mut self.frontier, &mut self.charge)?;
             if let Some(mut top) = self.results.peek_mut() {
                 *top = scored;
             }
             self.frontier.push(Reverse(scored));
         }
+        Ok(())
     }
+}
+
+#[cold]
+fn query_scratch_error() -> QueryError {
+    crate::storage::error(
+        crate::error::catalog::ER_OUTOFMEMORY,
+        "HNSW query scratch allocation failed",
+    )
+}
+
+#[inline]
+fn reserve_query_vec<T>(
+    values: &mut Vec<T>,
+    needed: usize,
+    charge: &mut Option<ControlledMemoryCharge>,
+) -> Result<(), QueryError> {
+    if needed <= values.capacity() {
+        return Ok(());
+    }
+    grow_query_vec(values, needed, charge)
+}
+
+#[cold]
+#[inline(never)]
+fn grow_query_vec<T>(
+    values: &mut Vec<T>,
+    needed: usize,
+    charge: &mut Option<ControlledMemoryCharge>,
+) -> Result<(), QueryError> {
+    let capacity = needed.max(values.capacity().saturating_mul(2)).max(16);
+    let extra = (capacity - values.capacity()).saturating_mul(std::mem::size_of::<T>());
+    if let Some(charge) = charge.as_mut() {
+        charge.try_grow(extra)?;
+    }
+    if values.try_reserve_exact(capacity - values.len()).is_err() {
+        if let Some(charge) = charge.as_mut() {
+            charge.shrink(extra);
+        }
+        return Err(query_scratch_error());
+    }
+    Ok(())
+}
+
+#[inline]
+fn reserve_query_heap<T: Ord>(
+    heap: &mut BinaryHeap<T>,
+    charge: &mut Option<ControlledMemoryCharge>,
+) -> Result<(), QueryError> {
+    if heap.len() < heap.capacity() {
+        return Ok(());
+    }
+    grow_query_heap(heap, charge)
+}
+
+#[cold]
+#[inline(never)]
+fn grow_query_heap<T: Ord>(
+    heap: &mut BinaryHeap<T>,
+    charge: &mut Option<ControlledMemoryCharge>,
+) -> Result<(), QueryError> {
+    let capacity = heap.capacity().saturating_mul(2).max(16);
+    let extra = (capacity - heap.capacity()).saturating_mul(std::mem::size_of::<T>());
+    if let Some(charge) = charge.as_mut() {
+        charge.try_grow(extra)?;
+    }
+    if heap.try_reserve_exact(capacity - heap.len()).is_err() {
+        if let Some(charge) = charge.as_mut() {
+            charge.shrink(extra);
+        }
+        return Err(query_scratch_error());
+    }
+    Ok(())
+}
+
+thread_local! {
+    static QUERY_NAV_SCRATCH: std::cell::RefCell<Option<QueryNavScratch>> = const { std::cell::RefCell::new(None) };
 }
 
 /// One global SQ8 scale for an entire chunked build. Reusing it across chunks
@@ -1392,12 +1544,7 @@ impl BuildVectorArena {
             let norm_data: Option<Vec<f32>> = normalize.then(|| {
                 let mut nd = data.clone();
                 for row in nd.chunks_mut(dim) {
-                    let s: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if s > 0.0 {
-                        for x in row.iter_mut() {
-                            *x /= s;
-                        }
-                    }
+                    super::distance::normalize_in_place(row);
                 }
                 nd
             });
@@ -1413,7 +1560,7 @@ impl BuildVectorArena {
                     }
                 }
                 (vmax > vmin).then(|| {
-                    let mid = (vmax + vmin) * 0.5;
+                    let mid = (vmax as f64 * 0.5 + vmin as f64 * 0.5) as f32;
                     let inv_scale = 254.0 / (vmax - vmin);
                     let scale_sq = inv_scale.recip().powi(2);
                     BuildQuantParams {
@@ -1423,7 +1570,9 @@ impl BuildVectorArena {
                     }
                 })
             });
-            if let Some(params) = params {
+            if let Some(params) = params
+                .filter(|p| p.mid.is_finite() && p.inv_scale.is_normal() && p.dist_mul.is_normal())
+            {
                 mid = params.mid;
                 inv_scale = params.inv_scale;
                 dist_mul = params.dist_mul;
@@ -1518,17 +1667,17 @@ impl BuildVectorArena {
     /// SQ8 squared-L2 (in real units) from a quantized query (`qcodes`, `qnorm`)
     /// to the node at ordinal `o` — the navigation hot path.
     #[inline]
-    fn ssd_from_query(&self, qcodes: &[i8], qnorm: i32, o: usize) -> f32 {
+    fn ssd_from_query(&self, qcodes: &[i8], qnorm: i32, o: usize) -> f64 {
         let ssd = qnorm + self.norms[o] - 2 * dot_i8(qcodes, self.codes_at(o));
-        ssd as f32 * self.dist_mul
+        ssd as f64 * (self.dist_mul as f64)
     }
 
     /// SQ8 squared-L2 (in real units) between two arena nodes `oa`, `ob`.
     #[inline]
-    fn ssd_nodes(&self, oa: usize, ob: usize) -> f32 {
+    fn ssd_nodes(&self, oa: usize, ob: usize) -> f64 {
         let ssd =
             self.norms[oa] + self.norms[ob] - 2 * dot_i8(self.codes_at(oa), self.codes_at(ob));
-        ssd as f32 * self.dist_mul
+        ssd as f64 * (self.dist_mul as f64)
     }
 }
 
@@ -1580,8 +1729,8 @@ struct Scratch {
     cache_hits: u64,
     cache_misses: u64,
     nav_batch_order: Vec<usize>,
-    nav_batch_approx: Vec<Option<f32>>,
-    nav_batch_distances: Vec<f32>,
+    nav_batch_approx: Vec<Option<f64>>,
+    nav_batch_distances: Vec<f64>,
     neighbor_buf: Vec<VecId>,
 }
 
@@ -1776,6 +1925,9 @@ impl RowLookup {
 /// Paged HNSW graph over one `.hvec` file.
 #[derive(Debug)]
 pub(crate) struct PagedHnsw {
+    navigation_quant_enabled: bool,
+    valid: AtomicBool,
+    pending_commits: parking_lot::Mutex<std::collections::HashSet<u64>>,
     file: Arc<VectorIndexFile>,
     navigation_gate: Arc<parking_lot::RwLock<()>>,
     /// Cache reconstruction freezes DML topology while searches continue on
@@ -1825,6 +1977,10 @@ pub(crate) struct PagedHnsw {
 impl PagedHnsw {
     /// Wrap an open vector index file, reading its parameters from the meta
     /// page.
+    pub(crate) fn without_navigation_quantization(mut self) -> Self {
+        self.navigation_quant_enabled = false;
+        self
+    }
     pub(crate) fn new(file: Arc<VectorIndexFile>) -> Self {
         let meta = file.meta();
         let m = (meta.m as usize).max(2);
@@ -1840,12 +1996,16 @@ impl PagedHnsw {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(256);
-        let build_cache_max_entries = ((cache_mb * 1024 * 1024) / (dim * 4)).max(1);
+        let build_cache_max_entries =
+            (cache_mb.saturating_mul(1024 * 1024) / dim.saturating_mul(4)).max(1);
         let query_nav = Arc::new(parking_lot::RwLock::new(None));
         let query_nav_building = Arc::new(AtomicBool::new(false));
         let query_nav_epoch = Arc::new(AtomicU64::new(0));
         let finalized = meta.finalized;
         let this = Self {
+            navigation_quant_enabled: true,
+            valid: AtomicBool::new(true),
+            pending_commits: parking_lot::Mutex::new(std::collections::HashSet::new()),
             file,
             metric,
             m,
@@ -1873,6 +2033,36 @@ impl PagedHnsw {
             this.start_query_navigation_build();
         }
         this
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+        self.file.disable_navigation_mapping();
+        self.invalidate_query_navigation();
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_transaction_delta(&self, txn_id: u64) -> Result<(), QueryError> {
+        let mut pending = self.pending_commits.lock();
+        self.file.invalidate_build(VEC_DDL_TXN)?;
+        pending.insert(txn_id);
+        Ok(())
+    }
+
+    pub(crate) fn finish_committed_delta(
+        &self,
+        txn_id: u64,
+        commit_scn: u64,
+    ) -> Result<(), QueryError> {
+        let mut pending = self.pending_commits.lock();
+        self.file.advance_coverage(commit_scn);
+        if pending.remove(&txn_id) && pending.is_empty() && self.is_valid() {
+            self.file.mark_delta_finalized(VEC_DDL_TXN)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn node_count(&self) -> u64 {
@@ -1903,14 +2093,15 @@ impl PagedHnsw {
     ) -> Result<(), QueryError> {
         self.invalidate_query_navigation();
         self.file.set_navigation_quantization(
-            (self.metric != Metric::Dot && paged_quant_enabled())
-                .then_some(params)
-                .flatten(),
+            (self.metric != Metric::Dot
+                && (self.navigation_quant_enabled && paged_quant_enabled()))
+            .then_some(params)
+            .flatten(),
         )
     }
 
     fn ensure_navigation_quantization(&self, vector: &[f32]) -> Result<(), QueryError> {
-        if self.metric == Metric::Dot || !paged_quant_enabled() {
+        if self.metric == Metric::Dot || !(self.navigation_quant_enabled && paged_quant_enabled()) {
             return Ok(());
         }
         let count = self.file.node_count();
@@ -1957,12 +2148,7 @@ impl PagedHnsw {
         }
         scratch.qcodes.clear();
         scratch.qcodes.resize(self.dim(), 0);
-        quantize_into(
-            &quant_src(query, self.metric),
-            mid,
-            inv_scale,
-            &mut scratch.qcodes,
-        );
+        quantize_into(&src, mid, inv_scale, &mut scratch.qcodes);
         scratch.qnorm = dot_i8(&scratch.qcodes, &scratch.qcodes);
     }
 
@@ -2241,7 +2427,7 @@ impl PagedHnsw {
     pub(crate) fn refresh_query_navigation(&self) -> Result<(), QueryError> {
         let _gate = self.navigation_gate.write();
         if self.metric != Metric::Dot
-            && paged_quant_enabled()
+            && (self.navigation_quant_enabled && paged_quant_enabled())
             && (self.file.navigation_quantization().is_none()
                 || self.file.meta().nav_exact_nodes != 0)
         {
@@ -2770,7 +2956,7 @@ impl PagedHnsw {
         };
         // `ordering_distance` for L2 is *squared* L2, so `drift ≤ ratio·d_nn`
         // becomes `drift_sq ≤ ratio²·d_nn_sq`.
-        let ratio_sq = ratio * ratio;
+        let ratio_sq = (ratio as f64).powi(2);
         let mut old = Vec::with_capacity(self.dim());
         let mut nbrs: Vec<VecId> = Vec::new();
         let mut nbvec = Vec::with_capacity(self.dim());
@@ -2783,7 +2969,7 @@ impl PagedHnsw {
             }
             let drift_sq = ordering_distance(&old, new_vector, self.metric);
             // Nearest *live* layer-0 neighbour distance, from the current vector.
-            let mut d_nn_sq = f32::INFINITY;
+            let mut d_nn_sq = f64::INFINITY;
             self.file.read_neighbors_into(vid, 0, &mut nbrs)?;
             for &nb in &nbrs {
                 match self.file.read_vector_meta_into(nb, &mut nbvec)? {
@@ -2897,12 +3083,7 @@ impl PagedHnsw {
                     return Ok(None);
                 }
                 if self.metric == Metric::Cosine {
-                    let norm = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if norm > 0.0 {
-                        for value in &mut decoded {
-                            *value /= norm;
-                        }
-                    }
+                    super::distance::normalize_in_place(&mut decoded);
                 }
                 output.resize(self.dim(), 0);
                 quantize_into(&decoded, params.mid, params.inv_scale, output);
@@ -2929,7 +3110,7 @@ impl PagedHnsw {
 
     /// Distance from `query` to `vid`, scoring against the cached vector.
     /// `INFINITY` for a missing node so it never wins selection.
-    fn dist_q(&self, query: &[f32], vid: VecId, scratch: &mut Scratch) -> Result<f32, QueryError> {
+    fn dist_q(&self, query: &[f32], vid: VecId, scratch: &mut Scratch) -> Result<f64, QueryError> {
         if let Some(arena) = scratch.navigation.as_deref() {
             if let Some(ordinal) = arena.ordinal(vid) {
                 return Ok(arena.distance(&scratch.qcodes, scratch.qnorm, ordinal));
@@ -2963,16 +3144,16 @@ impl PagedHnsw {
             {
                 if let Some((codes, norm)) = store.mapped_codes(vid, mapping) {
                     return Ok(
-                        (scratch.qnorm + norm - 2 * dot_i8(&scratch.qcodes, codes)) as f32
-                            * params.dist_mul,
+                        (scratch.qnorm + norm - 2 * dot_i8(&scratch.qcodes, codes)) as f64
+                            * (params.dist_mul as f64),
                     );
                 }
             }
             if let Some(Some(CachedVector::Sq8 { codes, norm })) = scratch.vec_cache.get(&vid) {
                 scratch.cache_hits = scratch.cache_hits.saturating_add(1);
                 return Ok(
-                    (scratch.qnorm + *norm - 2 * dot_i8(&scratch.qcodes, codes)) as f32
-                        * params.dist_mul,
+                    (scratch.qnorm + *norm - 2 * dot_i8(&scratch.qcodes, codes)) as f64
+                        * (params.dist_mul as f64),
                 );
             }
         }
@@ -2995,12 +3176,12 @@ impl PagedHnsw {
             Some(CachedVector::Exact(v)) => Ok(ordering_distance(query, &v, self.metric)),
             Some(CachedVector::Sq8 { codes, norm }) => {
                 let Some(params) = scratch.build_quant.or(scratch.incremental_quant) else {
-                    return Ok(f32::INFINITY);
+                    return Ok(f64::INFINITY);
                 };
                 let ssd = scratch.qnorm + norm - 2 * dot_i8(&scratch.qcodes, &codes);
-                Ok(ssd as f32 * params.dist_mul)
+                Ok(ssd as f64 * (params.dist_mul as f64))
             }
-            None => Ok(f32::INFINITY),
+            None => Ok(f64::INFINITY),
         }
     }
 
@@ -3040,7 +3221,7 @@ impl PagedHnsw {
     }
 
     /// Node-to-node distance via cached vectors (build heuristic).
-    fn dist_nodes(&self, a: VecId, b: VecId, scratch: &mut Scratch) -> Result<f32, QueryError> {
+    fn dist_nodes(&self, a: VecId, b: VecId, scratch: &mut Scratch) -> Result<f64, QueryError> {
         if let (Some(params), Some(store), Some(mapping)) = (
             scratch.build_quant,
             scratch.build_adj.as_deref(),
@@ -3050,7 +3231,7 @@ impl PagedHnsw {
                 store.mapped_codes(a, mapping),
                 store.mapped_codes(b, mapping),
             ) {
-                return Ok((na + nb - 2 * dot_i8(a, b)) as f32 * params.dist_mul);
+                return Ok((na + nb - 2 * dot_i8(a, b)) as f64 * (params.dist_mul as f64));
             }
         }
         if let Some(params) = scratch.incremental_quant {
@@ -3058,8 +3239,8 @@ impl PagedHnsw {
                 if let (Some(a), Some(b)) = (arena.ordinal(a), arena.ordinal(b)) {
                     return Ok((arena.norms[a] + arena.norms[b]
                         - 2 * dot_i8(arena.codes_at(a), arena.codes_at(b)))
-                        as f32
-                        * params.dist_mul);
+                        as f64
+                        * (params.dist_mul as f64));
                 }
             }
             let va = self.read_and_maybe_cache(a, scratch)?;
@@ -3068,7 +3249,7 @@ impl PagedHnsw {
                 (
                     Some(CachedVector::Sq8 { codes: a, norm: na }),
                     Some(CachedVector::Sq8 { codes: b, norm: nb }),
-                ) => Ok((na + nb - 2 * dot_i8(&a, &b)) as f32 * params.dist_mul),
+                ) => Ok((na + nb - 2 * dot_i8(&a, &b)) as f64 * (params.dist_mul as f64)),
                 (Some(CachedVector::Exact(a)), Some(CachedVector::Exact(b))) => {
                     Ok(ordering_distance(&a, &b, self.metric))
                 }
@@ -3081,12 +3262,12 @@ impl PagedHnsw {
                     if !self.file.read_vector_into(a, &mut left)?
                         || !self.file.read_vector_into(b, &mut right)?
                     {
-                        Ok(f32::INFINITY)
+                        Ok(f64::INFINITY)
                     } else {
                         Ok(ordering_distance(&left, &right, self.metric))
                     }
                 }
-                _ => Ok(f32::INFINITY),
+                _ => Ok(f64::INFINITY),
             };
         }
         // Do not clone the shared arena per distance: that contends on one
@@ -3120,8 +3301,8 @@ impl PagedHnsw {
                             .expect("cache lookup retains build arena");
                         return Ok(
                             (arena.norms[oa] + norm - 2 * dot_i8(arena.codes_at(oa), &codes))
-                                as f32
-                                * dist_mul,
+                                as f64
+                                * (dist_mul as f64),
                         );
                     }
                 }
@@ -3135,8 +3316,8 @@ impl PagedHnsw {
                             .expect("cache lookup retains build arena");
                         return Ok(
                             (norm + arena.norms[ob] - 2 * dot_i8(&codes, arena.codes_at(ob)))
-                                as f32
-                                * dist_mul,
+                                as f64
+                                * (dist_mul as f64),
                         );
                     }
                 }
@@ -3154,19 +3335,19 @@ impl PagedHnsw {
                         }),
                     ) = (va, vb)
                     {
-                        return Ok((na + nb - 2 * dot_i8(&ca, &cb)) as f32 * dist_mul);
+                        return Ok((na + nb - 2 * dot_i8(&ca, &cb)) as f64 * (dist_mul as f64));
                     }
                 }
                 (Some(_), Some(_)) => unreachable!("covered pair returned above"),
             }
-            return Ok(f32::INFINITY);
+            return Ok(f64::INFINITY);
         }
         // DML and non-quantized builds retain the exact pair-distance rule.
         let Some(CachedVector::Exact(va)) = self.read_and_maybe_cache(a, scratch)? else {
-            return Ok(f32::INFINITY);
+            return Ok(f64::INFINITY);
         };
         let Some(CachedVector::Exact(vb)) = self.read_and_maybe_cache(b, scratch)? else {
-            return Ok(f32::INFINITY);
+            return Ok(f64::INFINITY);
         };
         Ok(ordering_distance(&va, &vb, self.metric))
     }
@@ -3326,7 +3507,7 @@ impl PagedHnsw {
                 .results
                 .peek()
                 .map(|s| s.dist)
-                .unwrap_or(f32::INFINITY);
+                .unwrap_or(f64::INFINITY);
             if c.dist > furthest && scratch.results.len() >= ef {
                 break;
             }
@@ -3354,7 +3535,7 @@ impl PagedHnsw {
                         .results
                         .peek()
                         .map(|x| x.dist)
-                        .unwrap_or(f32::INFINITY);
+                        .unwrap_or(f64::INFINITY);
                     if d < furthest {
                         if let Some(mut top) = scratch.results.peek_mut() {
                             *top = s;
@@ -3398,7 +3579,7 @@ impl PagedHnsw {
                         let (a, na) = codes[i];
                         let (b, nb) = codes[j];
                         Ok::<_, QueryError>(
-                            (na + nb - 2 * dot_i8(a, b)) as f32 * params.dist_mul
+                            (na + nb - 2 * dot_i8(a, b)) as f64 * (params.dist_mul as f64)
                                 < candidates[i].dist,
                         )
                     })?;
@@ -3463,7 +3644,8 @@ impl PagedHnsw {
             Ok::<_, QueryError>(
                 match (parts(&sources[i], arena), parts(&sources[r], arena)) {
                     (Some((a, na)), Some((b, nb))) => {
-                        (na + nb - 2 * dot_i8(a, b)) as f32 * arena.dist_mul < candidates[i].dist
+                        (na + nb - 2 * dot_i8(a, b)) as f64 * (arena.dist_mul as f64)
+                            < candidates[i].dist
                     }
                     _ => false,
                 },
@@ -3697,7 +3879,10 @@ impl PagedHnsw {
         // The caller retains the original f32 rows through linking. Only the
         // exact fallback needs a second f32 arena; SQ8 owns one byte per value.
         std::mem::size_of::<f32>()
-            + if calibrated && paged_quant_enabled() && self.metric != Metric::Dot {
+            + if calibrated
+                && (self.navigation_quant_enabled && paged_quant_enabled())
+                && self.metric != Metric::Dot
+            {
                 1
             } else {
                 4
@@ -3711,8 +3896,9 @@ impl PagedHnsw {
         quantization: Option<(f32, f32, f32)>,
         expected_rows: usize,
     ) -> Result<PagedHnswBuildSession, QueryError> {
-        let quantization =
-            quantization.filter(|_| paged_quant_enabled() && self.metric != Metric::Dot);
+        let quantization = quantization.filter(|_| {
+            (self.navigation_quant_enabled && paged_quant_enabled()) && self.metric != Metric::Dot
+        });
         if quantization.is_some() {
             self.file.set_navigation_quantization(quantization)?;
         }
@@ -3914,13 +4100,9 @@ impl PagedHnsw {
         // Reset the per-insert best-first state; the vector cache persists
         // (it is shared across inserts during a bulk build).
         scratch.clear_layer();
-        let (ep, max_level) = match self.file.entry_with_level() {
+        let (ep, max_level) = match self.file.claim_entry(txn_id, id, level as u32)? {
             Some((ep, ml)) if ep != id => (ep, ml as usize),
-            _ => {
-                // First node (or self): become the entry point, no navigation.
-                self.file.set_entry(txn_id, id, level as u32)?;
-                return Ok(());
-            }
+            _ => return Ok(()),
         };
 
         // Seed the cache with the new node's own vector (used by every pairwise
@@ -4012,7 +4194,7 @@ impl PagedHnsw {
         }
         // Phase 4: raise the entry point if this node's level beats the max.
         if level > max_level {
-            self.file.set_entry(txn_id, id, level as u32)?;
+            self.file.raise_entry(txn_id, id, level as u32)?;
         }
         Ok(())
     }
@@ -4024,101 +4206,122 @@ impl PagedHnsw {
         qnorm: i32,
         entry: usize,
         ef: usize,
-    ) -> Vec<usize> {
-        let mut scratch = QueryNavScratch::new(arena.vids.len(), ef);
-        scratch.visit(entry);
-        let first = Scored {
-            dist: arena.distance(qcodes, qnorm, entry),
-            id: entry as u64,
-        };
-        scratch.frontier.push(Reverse(first));
-        scratch.results.push(first);
-        // Keep CPU lookahead small for resident images. Disk-backed probes
-        // need a wider bounded I/O window to overlap random page misses.
-        let prefetch_ahead = if matches!(&arena.codes, QueryNavCodes::Spilled(_))
-            && arena.codes.len()
-                > crate::engine::executor::mem_budget::effective_memory_limit_bytes() / 4
-        {
-            32
-        } else {
-            8
-        };
-        while let Some(Reverse(candidate)) = scratch.frontier.pop() {
-            let furthest = scratch
-                .results
-                .peek()
-                .map(|scored| scored.dist)
-                .unwrap_or(f32::INFINITY);
-            if candidate.dist > furthest && scratch.results.len() >= ef {
-                break;
-            }
-            let neighbors = arena.neighbors(candidate.id as usize);
-            // Mark visited first and prefetch only genuinely new neighbours.
-            // The old loop prefetched every back-edge before rejecting it,
-            // polluting caches without changing the candidate set.
-            scratch.unseen_neighbors.clear();
-            for &neighbor in neighbors {
-                let ordinal = match &arena.neighbors {
-                    QueryNavEdges::Resident(_) => neighbor as usize,
-                    QueryNavEdges::Spilled(_) => {
-                        let Some(ordinal) = arena.ordinal(file.vid_from_node_id(neighbor)) else {
-                            continue;
-                        };
-                        ordinal
+    ) -> Result<Vec<usize>, QueryError> {
+        QUERY_NAV_SCRATCH.with(|pool| {
+            let mut cached = pool.borrow_mut();
+            let mut scratch = match cached
+                .take()
+                .filter(|s| s.capacity_nodes == arena.vids.len())
+            {
+                Some(mut scratch) => {
+                    scratch.reset();
+                    scratch
+                }
+                None => QueryNavScratch::try_new(arena.vids.len(), ef, arena.dim)?,
+            };
+            scratch.prepare_effort(ef)?;
+            scratch.visit(entry)?;
+            let first = Scored {
+                dist: arena.distance(qcodes, qnorm, entry),
+                id: entry as u64,
+            };
+            scratch.frontier.push(Reverse(first));
+            scratch.results.push(first);
+            // Keep CPU lookahead small for resident images. Disk-backed probes
+            // need a wider bounded I/O window to overlap random page misses.
+            let prefetch_ahead = if matches!(&arena.codes, QueryNavCodes::Spilled(_))
+                && arena.codes.len()
+                    > crate::engine::executor::mem_budget::effective_memory_limit_bytes() / 4
+            {
+                32
+            } else {
+                8
+            };
+            while let Some(Reverse(candidate)) = scratch.frontier.pop() {
+                let furthest = scratch
+                    .results
+                    .peek()
+                    .map(|scored| scored.dist)
+                    .unwrap_or(f64::INFINITY);
+                if candidate.dist > furthest && scratch.results.len() >= ef {
+                    break;
+                }
+                let neighbors = arena.neighbors(candidate.id as usize);
+                // Mark visited first and prefetch only genuinely new neighbours.
+                // The old loop prefetched every back-edge before rejecting it,
+                // polluting caches without changing the candidate set.
+                scratch.reserve_unseen(neighbors.len())?;
+                scratch.unseen_neighbors.clear();
+                for &neighbor in neighbors {
+                    let ordinal = match &arena.neighbors {
+                        QueryNavEdges::Resident(_) => neighbor as usize,
+                        QueryNavEdges::Spilled(_) => {
+                            let Some(ordinal) = arena.ordinal(file.vid_from_node_id(neighbor))
+                            else {
+                                continue;
+                            };
+                            ordinal
+                        }
+                    };
+                    if scratch.visit(ordinal)? {
+                        scratch.unseen_neighbors.push(ordinal as u32);
                     }
-                };
-                if scratch.visit(ordinal) {
-                    scratch.unseen_neighbors.push(ordinal as u32);
                 }
-            }
-            for &neighbor in scratch.unseen_neighbors.iter().take(prefetch_ahead) {
-                arena.prefetch_code_vector(neighbor as usize);
-            }
-            let mut index = 0usize;
-            while index + 4 <= scratch.unseen_neighbors.len() {
-                for &future in scratch
-                    .unseen_neighbors
-                    .iter()
-                    .skip(index + prefetch_ahead)
-                    .take(4)
-                {
-                    arena.prefetch_code_vector(future as usize);
+                for &neighbor in scratch.unseen_neighbors.iter().take(prefetch_ahead) {
+                    arena.prefetch_code_vector(neighbor as usize);
                 }
-                let neighbors = [
-                    scratch.unseen_neighbors[index],
-                    scratch.unseen_neighbors[index + 1],
-                    scratch.unseen_neighbors[index + 2],
-                    scratch.unseen_neighbors[index + 3],
-                ];
-                let ordinals = neighbors.map(|neighbor| neighbor as usize);
-                let distances = arena.distances4(qcodes, qnorm, ordinals);
-                for offset in 0..4 {
+                let mut index = 0usize;
+                while index + 4 <= scratch.unseen_neighbors.len() {
+                    for &future in scratch
+                        .unseen_neighbors
+                        .iter()
+                        .skip(index + prefetch_ahead)
+                        .take(4)
+                    {
+                        arena.prefetch_code_vector(future as usize);
+                    }
+                    let neighbors = [
+                        scratch.unseen_neighbors[index],
+                        scratch.unseen_neighbors[index + 1],
+                        scratch.unseen_neighbors[index + 2],
+                        scratch.unseen_neighbors[index + 3],
+                    ];
+                    let ordinals = neighbors.map(|neighbor| neighbor as usize);
+                    let distances = arena.distances4(qcodes, qnorm, ordinals);
+                    for offset in 0..4 {
+                        scratch.consider(
+                            Scored {
+                                dist: distances[offset],
+                                id: u64::from(neighbors[offset]),
+                            },
+                            ef,
+                        )?;
+                    }
+                    index += 4;
+                }
+                while index < scratch.unseen_neighbors.len() {
+                    let neighbor = scratch.unseen_neighbors[index];
+                    let ordinal = neighbor as usize;
                     scratch.consider(
                         Scored {
-                            dist: distances[offset],
-                            id: u64::from(neighbors[offset]),
+                            dist: arena.distance(qcodes, qnorm, ordinal),
+                            id: u64::from(neighbor),
                         },
                         ef,
-                    );
+                    )?;
+                    index += 1;
                 }
-                index += 4;
             }
-            while index < scratch.unseen_neighbors.len() {
-                let neighbor = scratch.unseen_neighbors[index];
-                let ordinal = neighbor as usize;
-                scratch.consider(
-                    Scored {
-                        dist: arena.distance(qcodes, qnorm, ordinal),
-                        id: u64::from(neighbor),
-                    },
-                    ef,
-                );
-                index += 1;
+            let mut found: Vec<Scored> = scratch.results.drain().collect();
+            found.sort_unstable();
+            let output = found.into_iter().map(|scored| scored.id as usize).collect();
+            let limit = (crate::engine::executor::mem_budget::memory_target_bytes() / 16)
+                .min(64 * 1024 * 1024);
+            if scratch.charge.as_ref().is_some_and(|c| c.bytes() <= limit) {
+                *cached = Some(scratch);
             }
-        }
-        let mut found: Vec<Scored> = scratch.results.into_vec();
-        found.sort_unstable();
-        found.into_iter().map(|scored| scored.id as usize).collect()
+            Ok(output)
+        })
     }
 
     /// k-NN search. Returns up to `k` `(row_id, exact_distance)` for live
@@ -4129,7 +4332,7 @@ impl PagedHnsw {
         query: &[f32],
         k: usize,
         ef_search: usize,
-    ) -> Result<Vec<(RowId, f32)>, QueryError> {
+    ) -> Result<Vec<(RowId, f64)>, QueryError> {
         let _gate = self.navigation_gate.read();
         if k == 0 {
             return Ok(Vec::new());
@@ -4138,7 +4341,7 @@ impl PagedHnsw {
             Some((ep, ml)) => (ep, ml as usize),
             None => return Ok(Vec::new()),
         };
-        let ef = ef_search.max(k);
+        let ef = ef_search.max(k).min(self.node_count() as usize).max(1);
         if let Some(result) = self
             .file
             .with_navigation_mapping(|mapping| mapping.search(query, k, ef))
@@ -4187,7 +4390,7 @@ impl PagedHnsw {
                 scratch.qnorm,
                 entry,
                 ef,
-            );
+            )?;
             let candidate_vids: Vec<VecId> =
                 cand.iter().map(|&ordinal| arena.vids[ordinal]).collect();
             // Navigation no longer warms the persistent node pages. Submit the
@@ -4207,7 +4410,7 @@ impl PagedHnsw {
                     out.push((row_id, distance));
                 }
             }
-            let cmp = |a: &(RowId, f32), b: &(RowId, f32)| {
+            let cmp = |a: &(RowId, f64), b: &(RowId, f64)| {
                 a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
             };
             if out.len() > k {
@@ -4866,5 +5069,28 @@ mod source_audit_tests {
         assert!(!graph.has_live_row_id(row(1)).unwrap());
         assert_eq!(graph.tombstones.load(Ordering::Acquire), 2);
         assert_eq!(graph.mark_deleted_by_row_id(row(1)).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod scratch_regressions {
+    use super::*;
+    #[test]
+    fn huge_effort_is_bounded_and_dense_and_sparse_resets_clear_previous_visits() {
+        for nodes in [65, QUERY_NAV_DENSE_RESET_WORDS * 64 + 1] {
+            let mut scratch = QueryNavScratch::new(nodes, usize::MAX);
+            assert!(scratch.frontier.capacity() <= nodes * 2);
+            for id in [0, 64, nodes - 1] {
+                scratch.visit(id).unwrap();
+                assert!(!scratch.visit(id).unwrap());
+            }
+            assert_eq!(scratch.touched_words.is_empty(), nodes == 65);
+            scratch.reset();
+            assert!(scratch.visit(0).unwrap());
+            assert!(scratch.visit(64).unwrap());
+            if nodes != 65 {
+                assert!(scratch.visit(nodes - 1).unwrap());
+            }
+        }
     }
 }

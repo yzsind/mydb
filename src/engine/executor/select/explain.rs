@@ -4004,6 +4004,19 @@ fn format_plan_tree_nodes(
                 ("k", k.to_string()),
                 (effort_key, ef_search.to_string()),
             ];
+            details.push((
+                "quantization",
+                index
+                    .vector
+                    .as_ref()
+                    .map_or("none", |v| v.quantization.name())
+                    .to_string(),
+            ));
+            details.push((
+                "rerank_pool",
+                crate::engine::vector::session::explained_rerank_pool(index, *k, *ef_search)
+                    .to_string(),
+            ));
             push_partition_tree_detail(&mut details, table, filter.as_ref());
             push_scan_filter_and_hint(&mut details, filter.as_ref(), hint_note.as_deref());
             append_tree_details(&mut line, details);
@@ -5480,8 +5493,14 @@ fn format_plan_json_node(
             json_scan_estimates(out, &indent, table, filter, *access_rows, *estimated_rows);
             json_attached_condition(out, &indent, filter.as_ref());
             let (algo, effort_key) = vector_access_labels(index);
+            let quant = index
+                .vector
+                .as_ref()
+                .map_or("none", |v| v.quantization.name());
+            let rerank =
+                crate::engine::vector::session::explained_rerank_pool(index, *k, *ef_search);
             out.push_str(&format!(
-                "{indent}  \"vector_scan\": {{\"algo\": \"{algo}\", \"metric\": \"{metric}\", \"k\": {k}, \"{effort_key}\": {ef_search}}},\n"
+                "{indent}  \"vector_scan\": {{\"algo\": \"{algo}\", \"metric\": \"{metric}\", \"k\": {k}, \"{effort_key}\": {ef_search}, \"quantization\": \"{quant}\", \"rerank_pool\": {rerank}}},\n"
             ));
             json_cost_info(out, &indent, plan, *cost);
             json_close_node(out, &indent, stats, plan);

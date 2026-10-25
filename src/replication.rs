@@ -4667,8 +4667,12 @@ fn mysql_value_to_mydb(
             DataTypeKind::Bit { .. } => Value::Bytes(bytes.clone()),
             // VECTOR(n): mydb producers use the versioned portable envelope;
             // legacy/raw producers remain accepted for backward compatibility.
-            DataTypeKind::Vector { .. } => {
-                Value::Vector(crate::engine::vector::coerce_bytes_to_internal(bytes)?)
+            DataTypeKind::Vector { dim, datatype } => {
+                Value::Vector(crate::engine::vector::codec::coerce_value(
+                    Value::Bytes(bytes.clone()),
+                    *datatype,
+                    *dim,
+                )?)
             }
             _ => decode_replicated_string(bytes, target_charset)?,
         },
@@ -7525,22 +7529,30 @@ mod tests {
     }
 
     #[test]
-    fn vector_row_value_preserves_raw_f32_bytes() {
-        // VECTOR row image is the raw little-endian f32 array. IEEE-754 bytes
-        // are not valid UTF-8, so the `_` arm would corrupt them. The Vector
-        // arm passes them through as `Value::Vector`.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1.0f32.to_le_bytes());
-        bytes.extend_from_slice(&(-2.5f32).to_le_bytes());
-        assert!(bytes.iter().any(|b| *b >= 0x80));
-        let converted = mysql_value_to_mydb(
-            &mysql::Value::Bytes(bytes.clone()),
-            &DataTypeKind::Vector { dim: Some(2) },
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(converted, Value::Vector(bytes));
+    fn vector_row_value_preserves_native_envelopes() {
+        use crate::vector::VectorDataType;
+        for (datatype, text) in [
+            (VectorDataType::Float32, "[1,-2.5]"),
+            (VectorDataType::Float16, "[1,-2.5]"),
+            (VectorDataType::BFloat16, "[1,-2.5]"),
+            (VectorDataType::Int8, "[-128,127]"),
+            (VectorDataType::Binary, "[1,0,1,1,0,0,0,0,1]"),
+        ] {
+            let vector = crate::engine::vector::codec::parse_typed_text(text, datatype).unwrap();
+            let mut envelope = crate::engine::vector::codec::VECTOR_BINLOG_MAGIC.to_vec();
+            envelope.extend(vector.encode());
+            let converted = mysql_value_to_mydb(
+                &mysql::Value::Bytes(envelope),
+                &DataTypeKind::Vector {
+                    dim: Some(vector.dimension),
+                    datatype,
+                },
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(converted, Value::Vector(vector));
+        }
     }
 
     #[test]
@@ -7565,7 +7577,7 @@ mod tests {
                 &schema,
                 index,
                 schema.id,
-                &[1.0, 0.0],
+                &crate::engine::vector::codec::from_f32(&[1.0, 0.0]),
                 crate::engine::vector::VectorSearchRequest {
                     candidate_limit: 8,
                     rerank_limit: 8,

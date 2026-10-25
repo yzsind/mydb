@@ -2331,7 +2331,7 @@ fn write_lenenc_json_text(payload: &mut Vec<u8>, jsonb: &[u8]) {
 /// Write a VECTOR cell as canonical `[a,b,c]` lenenc text, reusing the
 /// per-thread scratch buffer.
 #[inline]
-fn write_lenenc_vector_text(payload: &mut Vec<u8>, internal: &[u8]) {
+fn write_lenenc_vector_text(payload: &mut Vec<u8>, internal: &crate::vector::VectorValue) {
     ROW_TEXT_SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
         crate::engine::vector::to_text_into(internal, &mut s);

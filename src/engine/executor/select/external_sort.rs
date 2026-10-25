@@ -1894,7 +1894,7 @@ mod tests {
             Value::Bytes(vec![0, 255, 1]),
             Value::Json(vec![1, 2]),
             Value::Geometry(vec![3, 4]),
-            Value::Vector(vec![5, 6]),
+            Value::Vector(vec![5, 6, 0, 0].into()),
             Value::String("seven".into()),
             Value::Null,
         ];

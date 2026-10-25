@@ -739,9 +739,9 @@ pub(super) fn collect_explain_rows(
         } => {
             // EXPLAIN "Using vector index (<algo>)" with the metric / k and the
             // algorithm-appropriate search-effort knob (ef_search for HNSW,
-            // nprobe for IVF_SQ8) so a user can confirm the KNN scan fired.
+            // nprobe for IVF) so a user can confirm the KNN scan fired.
             let (algo, effort_key) = match index.vector_algo() {
-                crate::storage::schema::VectorAlgo::IvfSq8 => ("IVF_SQ8", "nprobe"),
+                crate::storage::schema::VectorAlgo::Ivf => ("IVF", "nprobe"),
                 crate::storage::schema::VectorAlgo::Hnsw => ("HNSW", "ef_search"),
             };
             let mut extra_str = format!(
@@ -750,6 +750,14 @@ pub(super) fn collect_explain_rows(
                 k,
                 ef_search
             );
+            extra_str.push_str(&format!(
+                " quantization={} rerank_pool={}",
+                index
+                    .vector
+                    .as_ref()
+                    .map_or("none", |v| v.quantization.name()),
+                crate::engine::vector::session::explained_rerank_pool(index, *k, *ef_search)
+            ));
             if let Some(note) = hint_note {
                 append_extra(&mut extra_str, note);
             }

@@ -244,10 +244,6 @@ fn recovery_page_valid(bytes: &[u8]) -> bool {
                 | OVFL_MAGIC
                 | VEC_META_MAGIC
                 | VEC_NODE_MAGIC
-                | IVF_META_MAGIC
-                | IVF_CENT_MAGIC
-                | IVF_DIR_MAGIC
-                | IVF_LIST_MAGIC
                 | zone_map_page::MAGIC
         )
         && read_u32(bytes, 16) == page_checksum(bytes, 16)
@@ -616,7 +612,10 @@ mod recovery_io_tests {
         }
         let reopened =
             IndexFile::open_for_recovery(dir.path().join(relative), Arc::clone(&log), 400).unwrap();
-        assert_eq!(reopened.range_entries(None, None, false).unwrap().len(), 3 * 48);
+        assert_eq!(
+            reopened.range_entries(None, None, false).unwrap().len(),
+            3 * 48
+        );
     }
 
     #[test]
@@ -629,7 +628,8 @@ mod recovery_io_tests {
         let mut key = Vec::new();
         encode_index_key_into(&IndexKey::from(vec![KeyPart::Int(1)]), &mut key).unwrap();
         let records = (0..128u64)
-            .map(|lsn| WalRecord { source_time_us: 0,
+            .map(|lsn| WalRecord {
+                source_time_us: 0,
                 lsn: lsn + 1,
                 prev_txn_lsn: 0,
                 txn_id: 1,
@@ -716,7 +716,8 @@ mod recovery_io_tests {
         );
         _scope.finish().unwrap();
         assert_eq!(page_lsn(&fs::read(dir.path().join(relative)).unwrap()), 30);
-        let deletion = WalRecord { source_time_us: 0,
+        let deletion = WalRecord {
+            source_time_us: 0,
             lsn: 40,
             prev_txn_lsn: 0,
             txn_id: 0,

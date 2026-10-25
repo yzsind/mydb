@@ -372,7 +372,7 @@ fn audit_mvcc_lob_index_rollback() {
         column_prefix_lengths: vec![Some(8)], column_directions: Vec::new(),
         key_expressions: Vec::new(), unique: false, primary: false,
         included_columns: Vec::new(), state: IndexState::Public,
-        index_type: "BTREE".into(), visible: true, comment: String::new(), fulltext: None,
+        index_type: "BTREE".into(), visible: true, comment: String::new(), vector: None, fulltext: None,
     }).unwrap();
     audit_seed(&db);
     let t = db.begin_txn().unwrap();

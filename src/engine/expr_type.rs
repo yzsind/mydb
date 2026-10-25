@@ -115,7 +115,8 @@ pub(crate) enum ExprTypeKind {
         srid: Option<u32>,
     },
     Vector {
-        dim: Option<u16>,
+        dim: Option<u32>,
+        datatype: crate::vector::VectorDataType,
     },
     Unknown,
 }
@@ -336,7 +337,12 @@ impl ExprType {
                 subtype: GeometrySubtype::Geometry,
                 srid: None,
             },
-            ColumnType::Vector => ExprTypeKind::Vector { dim: None },
+            ColumnType::Vector => {
+                let (datatype, dim) = source
+                    .vector_type
+                    .unwrap_or((crate::vector::VectorDataType::Float32, None));
+                ExprTypeKind::Vector { dim, datatype }
+            }
         };
         Self {
             dynamic_parameter: false,
@@ -427,8 +433,9 @@ impl ExprType {
                 subtype: *subtype,
                 srid: *srid,
             },
-            DataTypeKind::Vector { dim } => ExprTypeKind::Vector {
-                dim: dim.and_then(|dim| u16::try_from(dim).ok()),
+            DataTypeKind::Vector { dim, datatype } => ExprTypeKind::Vector {
+                dim: *dim,
+                datatype: *datatype,
             },
             DataTypeKind::Enum { .. } => ExprTypeKind::String {
                 kind: StringKind::Enum,
@@ -495,6 +502,11 @@ impl ExprType {
     }
 
     pub(crate) fn apply_to_source(self, source: &mut ColumnSource) {
+        source.vector_type = if let ExprTypeKind::Vector { datatype, dim } = self.kind {
+            Some((datatype, dim))
+        } else {
+            None
+        };
         source.dynamic_parameter =
             self.dynamic_parameter && matches!(self.kind, ExprTypeKind::Unknown);
         use crate::mysql::protocol::{BINARY_FLAG, NOT_NULL_FLAG, UNSIGNED_FLAG};
@@ -593,6 +605,26 @@ pub(crate) fn aggregate_branch_types(left: ExprType, right: ExprType) -> ExprTyp
         (Null, other) => ExprType::new(other, true),
         (other, Null) => ExprType::new(other, true),
         (a, b) if a == b => ExprType::new(a, nullable),
+        (
+            Vector {
+                dim: ld,
+                datatype: lt,
+            },
+            Vector {
+                dim: rd,
+                datatype: rt,
+            },
+        ) => ExprType::new(
+            Vector {
+                dim: if ld == rd { ld } else { None },
+                datatype: if lt == rt {
+                    lt
+                } else {
+                    crate::vector::VectorDataType::Float32
+                },
+            },
+            nullable,
+        ),
         (
             Integer {
                 width: lw,
@@ -793,7 +825,29 @@ pub(crate) fn checked_branch_types(
     left: ExprType,
     right: ExprType,
 ) -> Result<ExprType, crate::types::QueryError> {
+    if let (ExprTypeKind::Vector { datatype: l, .. }, ExprTypeKind::Vector { datatype: r, .. }) =
+        (left.kind, right.kind)
+    {
+        if (l == crate::vector::VectorDataType::Binary)
+            != (r == crate::vector::VectorDataType::Binary)
+        {
+            return Err(crate::engine::vector::vector_err(
+                "cannot merge BINARY and numeric vector types",
+            ));
+        }
+    }
     let mut result = aggregate_branch_types(left, right);
+    if let ExprTypeKind::Vector {
+        dim: Some(dim),
+        datatype,
+    } = result.kind
+    {
+        if dim > datatype.max_dimension() {
+            return Err(crate::engine::vector::vector_err(
+                "merged vector exceeds target datatype dimension limit",
+            ));
+        }
+    }
     if matches!(result.kind, ExprTypeKind::String { .. }) {
         let operands: Vec<Expr> = [left, right]
             .iter()
@@ -922,6 +976,9 @@ fn boolean_result(nullable: bool) -> ExprType {
 
 fn bound_value_type(value: &Value, context: &TypeContext<'_>) -> ExprType {
     let mut source = ColumnSource::default();
+    if let Value::Vector(v) = value {
+        source.vector_type = Some((v.datatype, Some(v.dimension)));
+    }
     source.flags = if matches!(value, Value::Null) {
         0
     } else {
@@ -1017,6 +1074,13 @@ pub(crate) fn current_parameter_type_fingerprint() -> u64 {
         let context = TypeContext::context_free(&no_column, &no_placeholder);
         for value in params {
             bound_value_type(value, &context).hash(&mut hasher);
+            let shape = match value {
+                Value::String(s) => crate::vector::text_parameter_shape(s.as_bytes()),
+                Value::Bytes(b) => crate::vector::text_parameter_shape(b),
+                Value::SmallString(s) => crate::vector::text_parameter_shape(s.as_ref()),
+                _ => None,
+            };
+            shape.hash(&mut hasher);
         }
         hasher.finish()
     });
@@ -1298,6 +1362,20 @@ fn cast_type(args: &[Expr], input: ExprType, context: &TypeContext<'_>) -> ExprT
             fsp: integer_arg(2).unwrap_or(0).min(6),
         },
         "JSON" => ExprTypeKind::Json,
+        "VECTOR" => {
+            let dim = args.get(2).and_then(|e| match e {
+                Expr::Literal(Literal::Int(v)) => u32::try_from(*v).ok(),
+                _ => None,
+            });
+            let datatype = args
+                .get(3)
+                .and_then(|e| match e {
+                    Expr::Literal(Literal::String(s)) => crate::vector::VectorDataType::parse(s),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            ExprTypeKind::Vector { dim, datatype }
+        }
         "BINARY" => ExprTypeKind::String {
             kind: StringKind::Binary,
         },
@@ -1707,6 +1785,69 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 return descriptor;
             }
             let normalized = crate::engine::sys_schema::NormalizedFuncName::new(name);
+            if crate::engine::vector::sql::returns_vector(normalized.as_str()) {
+                let string = |expr: &Expr| -> Option<std::string::String> {
+                    match expr {
+                        Expr::Literal(Literal::String(s)) => Some(s.clone()),
+                        Expr::BoundValue(Value::String(s)) => Some(s.clone()),
+                        Expr::Placeholder(i) => {
+                            crate::engine::params::current_param(*i).map(|v| v.to_display_string())
+                        }
+                        _ => None,
+                    }
+                };
+                let integer = |expr: &Expr| -> Option<u32> {
+                    match expr {
+                        Expr::Literal(Literal::Int(i)) => u32::try_from(*i).ok(),
+                        Expr::BoundValue(Value::Int(i)) => u32::try_from(*i).ok(),
+                        _ => None,
+                    }
+                };
+                let (datatype, dim) = match normalized.as_str() {
+                    "SUBVECTOR" => {
+                        let ty = args.first().map(|a| infer_expr_type(a, context));
+                        let datatype = ty
+                            .and_then(|t| {
+                                if let Vector { datatype, .. } = t.kind {
+                                    Some(datatype)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        (datatype, args.get(2).and_then(integer))
+                    }
+                    "L2_NORMALIZE" => {
+                        let dim = args.first().and_then(|a| {
+                            if let Vector { dim, .. } = infer_expr_type(a, context).kind {
+                                dim
+                            } else {
+                                None
+                            }
+                        });
+                        (crate::vector::VectorDataType::Float32, dim)
+                    }
+                    _ => {
+                        let datatype = args
+                            .get(1)
+                            .and_then(string)
+                            .and_then(|s| crate::vector::VectorDataType::parse(&s))
+                            .unwrap_or_default();
+                        let dim = if normalized.as_str() == "VECTOR_FROM_BINARY" {
+                            args.get(2).and_then(integer)
+                        } else {
+                            args.first()
+                                .and_then(string)
+                                .map(|s| s.bytes().filter(|b| *b == b',').count() as u32 + 1)
+                        };
+                        (datatype, dim)
+                    }
+                };
+                return ExprType::new(
+                    Vector { dim, datatype },
+                    args.iter().any(|a| infer_expr_type(a, context).nullable),
+                );
+            }
             match normalized.as_str() {
                 "__TEMPORAL_COMPARISON_KEY" if args.len() == 1 => ExprType::new(
                     Temporal {
@@ -2761,4 +2902,42 @@ mod tests {
             Some(1024)
         );
     }
+}
+
+/// Validate control-flow vector domains without evaluating unselected branches.
+pub(crate) fn validate_vector_control_flow(
+    expr: &Expr,
+    infer: &impl Fn(&Expr) -> ExprType,
+) -> Result<(), crate::types::QueryError> {
+    let branches: Vec<&Expr> = match expr {
+        Expr::Case {
+            results,
+            else_result,
+            ..
+        } => results
+            .iter()
+            .chain(else_result.iter().map(Box::as_ref))
+            .collect(),
+        Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("IF") => {
+            args.iter().skip(1).collect()
+        }
+        Expr::Function { name, args, .. }
+            if name.eq_ignore_ascii_case("IFNULL") || name.eq_ignore_ascii_case("COALESCE") =>
+        {
+            args.iter().collect()
+        }
+        _ => return Ok(()),
+    };
+    let mut vector: Option<ExprType> = None;
+    for branch in branches {
+        let ty = infer(branch);
+        if matches!(ty.kind, ExprTypeKind::Vector { .. }) {
+            vector = Some(if let Some(previous) = vector {
+                checked_branch_types(previous, ty)?
+            } else {
+                ty
+            });
+        }
+    }
+    Ok(())
 }

@@ -271,7 +271,7 @@ impl crate::storage::RowDecodeSink for PredicateValueSink<'_> {
     }
     #[inline]
     fn put_vector(&mut self, col: usize, bytes: &[u8]) {
-        self.values[col] = PredicateValue::Value(Value::Vector(bytes.to_vec()));
+        self.values[col] = PredicateValue::Value(Value::Vector(bytes.to_vec().into()));
     }
     #[inline]
     fn put_value(&mut self, col: usize, value: Value) {

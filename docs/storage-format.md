@@ -44,7 +44,6 @@ The following are the canonical paths; files are created on demand, and not ever
 │   ├── indexes/<storage_id>/<generation>/
 │   │   ├── <index_id>.idx
 │   │   ├── <index_id>.hvec
-│   │   ├── <index_id>.ivf
 │   │   └── <index_id>.hnsw
 ├── system/
 │   ├── catalog/
@@ -88,7 +87,7 @@ objects, but their lifecycles and recovery semantics differ.
 | Undo tablespace | Rollback, old snapshots, and time-travel versions | Records not past the retention boundary must not be deleted early |
 | `commit-ledger.v1` | Source of truth for commit SCN and time mapping | Repair the tail from still-retained WAL |
 | `.idx` | Persistent index | Rebuildable from the Catalog definition and the heap; constraint enforcement must still preserve semantics |
-| `.hvec` / `.ivf` / `.hnsw` | Vector candidate structures | Rebuild/degrade when not finalized, missing, or incompatible |
+| `.hvec` / `.hnsw` | Vector candidate structures | Rebuild/degrade when not finalized, missing, or incompatible |
 | `.zm` | Conservative page-pruning sidecar | Fall back to a heap scan when missing, corrupted, stale, or short of memory |
 | In-memory R-tree | Spatial candidate cache | Rebuilt from the persistent MBR BTREE |
 | `history-index.v1` | Historical old-key accelerator | Once degraded, fall back to heap/undo; correctness is unaffected |
@@ -167,7 +166,12 @@ For the fixed widths of all SQL types plus the DECIMAL, temporal, JSONB, WKB, an
 
 ## 7. LOB overflow
 
-A variable-length string/bytes/JSON/GEOMETRY value, or a VECTOR without a declared dimension, that exceeds the inline threshold or makes the whole row unfit for a page can be moved into the table-level `.lob`. The heap's var payload then stores a 20 B descriptor instead:
+A variable-length string/bytes/JSON/GEOMETRY value, or a VECTOR assigned to a
+variable-length lane, that exceeds the inline threshold or makes the whole row
+unfit for a page can be moved into the table-level `.lob`. VECTOR uses such a
+lane when its dimension is undeclared or its declared native payload exceeds
+8192 B for FLOAT32 / 4096 B for other datatypes. The heap's var payload then
+stores a 20 B descriptor instead:
 
 ```text
 first_page_id u32 LE
@@ -259,31 +263,65 @@ optional summary does not authorize accepting invalid redo.
 
 ## 10. Vector Indexes
 
-Both the paged HNSW `.hvec` and the IVF_SQ8 `.ivf` use the unified 24 B page header, page LSN, CRC32, and WAL
+Paged HNSW and native IVF share the `.hvec` container and use the unified 24 B page header, page LSN, CRC32, and WAL
 physical page redo, and are managed by the buffer pool.
 
 ### 10.1 Paged HNSW
 
-The page 0 meta stores the dimension, distance metric, `m/m0/ef_construction`, entry vid, top layer, page allocation
-high-water mark, node/tombstone counts, finalized/built LSN, and SQ8 quantization parameters. Node pages use
-the slotted layout `slot_count:u16 + heap_top:u16 + u16 record_offsets[]`.
+The page 0 meta stores typed geometry, distance metric, `m/m0/ef_construction`,
+entry vid, top layer, page allocation high-water mark, node/tombstone counts,
+and finalized/built LSN. Quantized indexes also publish their model reference
+and generation. Node pages use the slotted layout
+`slot_count:u16 + heap_top:u16 + u16 record_offsets[]`.
 
-A node record stores flags, top layer, RowId, the exact `dim*f32`, an SQ8 navigation row, a norm,
-and, per layer, `count:u16 + fixed-capacity NodeId[]`. Adjacency space is reserved at node creation with the maximum capacity for that layer,
-so edge updates can modify it in place. A persistent NodeId uses the high 24 bits for the page number and the low 8 bits for the slot; the runtime vid
-is `(page_id << 32) | slot`.
+A node record stores flags, top layer, RowId, the configured vector payload,
+and, per layer, `count:u16 + fixed-capacity NodeId[]`. Unquantized FLOAT32
+retains its FLOAT32 record layout; other unquantized datatypes retain native
+bytes. Explicit quantization uses the compressed layout below. SQL indexes
+with `quantization=none` do not use implicit SQ8 navigation. Adjacency space
+is reserved at node creation with the maximum capacity for that layer, so
+edge updates can modify it in place. A persistent NodeId uses the high 24 bits
+for the page number and the low 8 bits for the slot; the runtime vid is
+`(page_id << 32) | slot`.
 
-### 10.2 IVF_SQ8
+Each complete node must fit one 16 KiB page, including its maximum-layer
+adjacency capacity. DDL validates payload and adjacency admission even for
+empty tables; a datatype's heap dimension limit is not its paged-index limit.
 
-An `.ivf` file has four page kinds: meta, centroid, directory, and list. The meta stores dimension/metric, whether f32 is retained,
-trained/finalized state, nlist/nprobe, global quantization parameters, per-page ranges, and entry counts. Centroid pages store
-f32 in row-major order; each directory entry is 24 B: `head_page:u64 + tail_page:u64 + count:u64`.
+### 10.2 Native IVF
 
-Each list is a singly linked page chain. Starting at offset 38, a list page splits the code, norm, 6 B RowId, and tombstone
-bitmap into contiguous regions so batch distance kernels can read them sequentially. A cold-built file that is not finalized must not be published;
-upper layers discard it and rebuild from the heap.
+Native IVF uses the shared vector page container with typed geometry and no
+adjacency lists. Each record retains the RowId, deletion flag and native
+payload when `quantization=none`. Each complete entry must fit one 16 KiB page.
+Lists maintain separate fill-page hints to group their entries.
+Coarse centers and list membership are reconstructed from committed heap
+values on cold open. WITH quantization replaces native payloads with compressed
+codes using the shared layout described below.
 
-Both approximate index kinds only produce candidates; the executor performs MVCC reads on the candidates and re-ranks them with the exact f32 vectors from the heap.
+Both ANN algorithms generate candidates. The executor checks MVCC visibility
+and reranks using native heap values. Full probing (`nprobe=nlist`) of unquantized IVF scores every visible candidate
+with native values. A quantized IVF candidate pool remains approximate even
+when all lists are probed.
+
+### 10.3 Quantized payloads and overflow
+
+Container version 6 / page version 3 adds a model-chain head at meta offset
+144 and a quantizer generation at offset 152. Quantized records use native
+INT8 geometry whose dimension is the fixed encoded-record byte length. Each
+payload starts with a one-byte kind and an eight-byte overflow reference,
+followed by the configured SQ8, SQ4, PQ or BQ code. Normal records contain no
+full-precision vector. Exceptions reference a versioned native vector value
+in the same container. The Data Dictionary stores the independent, typed
+vector_config in mysql.indexes.
+
+Model and exception overflow chains use zero-slot vector pages. The ordinary
+header, page version and CRC32 remain authoritative; offset 32 stores the
+next page, offset 40 the chunk length, and offset 48 starts the chunk. References
+must descend within the allocated page high-water mark, preventing cycles.
+These pages use the same buffer-pool and redo policy as ordinary vector pages.
+A build publishes its model, codes and coverage frontier together. Native
+indexes reconstruct from committed heap data on cold open rather than trusting
+an incomplete or mismatched model generation.
 
 ## 11. Catalog and Generation Publication
 

@@ -1135,6 +1135,7 @@ impl TableSchema {
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         };
         let mut indexes = Vec::new();
@@ -1954,7 +1955,18 @@ fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
         }
         DataTypeKind::Binary { len } => len.unwrap_or(1),
         DataTypeKind::Bit { len } => len.unwrap_or(1).div_ceil(8),
-        DataTypeKind::Vector { dim: Some(dim) } => (*dim as usize).saturating_mul(4),
+        DataTypeKind::Vector {
+            dim: Some(dim),
+            datatype,
+        } if *datatype != crate::vector::VectorDataType::Float32
+            && datatype.payload_len(*dim) > 4096 =>
+        {
+            return None
+        }
+        DataTypeKind::Vector {
+            dim: Some(dim),
+            datatype,
+        } => datatype.payload_len(*dim),
         DataTypeKind::Enum { values } => crate::storage::enum_storage_width(values.len()) as usize,
         DataTypeKind::Set { values } => crate::storage::set_storage_width(values.len()) as usize,
         DataTypeKind::Char { .. }
@@ -1964,7 +1976,7 @@ fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
         | DataTypeKind::Blob { .. }
         | DataTypeKind::Json
         | DataTypeKind::Geometry { .. }
-        | DataTypeKind::Vector { dim: None } => return None,
+        | DataTypeKind::Vector { dim: None, .. } => return None,
     })
 }
 
@@ -2147,9 +2159,10 @@ pub struct IndexSchema {
     pub visible: bool,
     #[serde(default)]
     pub comment: String,
-    /// Metadata (tokenizer configuration) for a FULLTEXT index. `None` means a non-fulltext
-    /// index. A purely additive `Option`; `#[serde(default)]` lets old catalogs deserialize
-    /// smoothly to `None` without bumping `CATALOG_VERSION`.
+    /// Complete vector index configuration, independent from the user comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<crate::storage::vector_config::VectorIndexConfig>,
+    /// Persisted FULLTEXT tokenizer settings, independent from vector options.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulltext: Option<FulltextMeta>,
 }
@@ -2186,14 +2199,13 @@ pub struct FulltextMeta {
 pub enum VectorAlgo {
     /// HNSW graph (in-memory `HnswIndex` / paged `PagedHnsw`).
     Hnsw,
-    /// IVF + 8-bit scalar-quantized inverted table (`engine::vector::ivf`).
-    IvfSq8,
+    /// Native inverted-file index.
+    Ivf,
 }
 
-/// Vector-index build parameters, parsed from the index COMMENT (not a separately
-/// persisted field). HNSW uses `m`/`ef_construction`/`default_ef_search`; IVF_SQ8 uses
-/// `nlist`/`default_nprobe`/`kmeans_iters`/`train_sample_mult`. Both algorithms share
-/// `metric`; fields unused by one are ignored by its build/query path.
+/// Resolved build/planner view of the persisted typed VectorIndexConfig.
+/// SQL comments are independent descriptive text. Algorithm-specific options
+/// are validated before this common read-only view is constructed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorIndexMeta {
     /// Distance metric name: "L2" | "COSINE" | "DOT".
@@ -2203,19 +2215,18 @@ pub struct VectorIndexMeta {
     /// Dynamic candidate-list size during construction.
     pub ef_construction: u32,
     /// Per-index default query-time `ef_search` (pgvector-style). `None` means
-    /// "use the session / GUC default". Parsed from `EF_SEARCH=` in the index
-    /// comment; planner priority is HINT > session > index default > GUC.
+    /// "use the session default". Priority is hint > explicit session > index > default.
     pub default_ef_search: Option<u32>,
-    /// IVF_SQ8: number of inverted-list cells (k-means centroids). `None`/`0` = auto √N at build time.
-    /// Parsed from COMMENT `NLIST=`.
+    /// IVF: number of inverted-list cells (k-means centroids). `None`/`0` = auto √N at build time.
+    /// Resolved from WITH nlist at index creation.
     pub nlist: Option<u32>,
-    /// IVF_SQ8: per-index default number of probe cells per query. `None` = session / GUC default.
-    /// Parsed from COMMENT `NPROBE=`; priority HINT > session > index default > GUC.
+    /// IVF: per-index default number of probe cells per query. `None` = session / GUC default.
+    /// Priority is hint > explicit session > index default > system default.
     pub default_nprobe: Option<u32>,
-    /// IVF_SQ8: k-means iteration rounds (`None` = GUC default). From COMMENT `KMEANS_ITERS=`.
+    /// IVF: k-means iteration rounds (`None` = GUC default). Captured at index creation.
     pub kmeans_iters: Option<u32>,
-    /// IVF_SQ8: training sample multiplier — samples `min(N, mult·nlist)` rows for training (`None` = GUC default).
-    /// Parsed from COMMENT `TRAIN_SAMPLE=`.
+    /// IVF: training sample multiplier — samples `min(N, mult·nlist)` rows for training (`None` = GUC default).
+    /// Captured at index creation.
     pub train_sample_mult: Option<u32>,
 }
 
@@ -2235,199 +2246,6 @@ impl Default for VectorIndexMeta {
 }
 
 impl VectorIndexMeta {
-    /// Collapse ` ` / `\t` immediately around every `=` so `KEY = VAL`,
-    /// `KEY =VAL`, and `KEY= VAL` all tokenize the same as `KEY=VAL`. Without
-    /// this the whitespace tokenizer below turns `NLIST = 512` into three
-    /// value-less tokens (`NLIST`, `=`, `512`) and **silently drops the
-    /// parameter** — a natural `COMMENT 'NLIST = 512, NPROBE = 16'` would revert
-    /// every knob to its default with no error (C3).
-    fn collapse_spaces_around_eq(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '=' {
-                while matches!(out.chars().last(), Some(' ') | Some('\t')) {
-                    out.pop();
-                }
-                out.push('=');
-                while matches!(chars.peek(), Some(' ') | Some('\t')) {
-                    chars.next();
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    /// Parse `DISTANCE=.. M=.. EF_CONSTRUCTION=..` tokens from an index comment.
-    /// Unknown / malformed tokens are ignored; missing keys keep their default.
-    pub fn parse_from_comment(comment: &str) -> Self {
-        let mut meta = VectorIndexMeta::default();
-        let normalized = Self::collapse_spaces_around_eq(comment);
-        for tok in normalized.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-            let Some((k, v)) = tok.split_once('=') else {
-                continue;
-            };
-            match k.trim().to_ascii_uppercase().as_str() {
-                "DISTANCE" | "METRIC" => {
-                    if let Some(m) = crate::engine::vector::Metric::parse(v) {
-                        meta.metric = m.as_str().to_string();
-                    }
-                }
-                "M" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 2 {
-                            meta.m = n;
-                        }
-                    }
-                }
-                "EF_CONSTRUCTION" | "EFCONSTRUCTION" | "EF_CONSTRUCT" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.ef_construction = n;
-                        }
-                    }
-                }
-                "EF_SEARCH" | "EFSEARCH" | "DEFAULT_EF_SEARCH" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.default_ef_search = Some(n);
-                        }
-                    }
-                }
-                "NLIST" | "LISTS" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.nlist = Some(n);
-                        }
-                    }
-                }
-                "NPROBE" | "PROBES" | "DEFAULT_NPROBE" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.default_nprobe = Some(n);
-                        }
-                    }
-                }
-                "KMEANS_ITERS" | "KMEANS_ITER" | "ITERS" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.kmeans_iters = Some(n);
-                        }
-                    }
-                }
-                "TRAIN_SAMPLE" | "TRAIN_SAMPLE_MULT" | "SAMPLE_MULT" => {
-                    if let Ok(n) = v.trim().parse::<u32>() {
-                        if n >= 1 {
-                            meta.train_sample_mult = Some(n);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        meta
-    }
-
-    /// DDL-time strict validation. Free-form words remain legal index-comment
-    /// prose, but every `KEY=value` token must be recognized and valid.
-    pub(crate) fn validate_from_comment(
-        comment: &str,
-        algo: VectorAlgo,
-    ) -> Result<Self, crate::types::QueryError> {
-        let normalized = Self::collapse_spaces_around_eq(comment);
-        for tok in normalized.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-            let Some((key, value)) = tok.split_once('=') else {
-                continue;
-            };
-            let key = key.trim().to_ascii_uppercase();
-            let value = value.trim();
-            let numeric = matches!(
-                key.as_str(),
-                "M" | "EF_CONSTRUCTION"
-                    | "EFCONSTRUCTION"
-                    | "EF_CONSTRUCT"
-                    | "EF_SEARCH"
-                    | "EFSEARCH"
-                    | "DEFAULT_EF_SEARCH"
-                    | "NLIST"
-                    | "LISTS"
-                    | "NPROBE"
-                    | "PROBES"
-                    | "DEFAULT_NPROBE"
-                    | "KMEANS_ITERS"
-                    | "KMEANS_ITER"
-                    | "ITERS"
-                    | "TRAIN_SAMPLE"
-                    | "TRAIN_SAMPLE_MULT"
-                    | "SAMPLE_MULT"
-            );
-            let hnsw_only = matches!(
-                key.as_str(),
-                "M" | "EF_CONSTRUCTION"
-                    | "EFCONSTRUCTION"
-                    | "EF_CONSTRUCT"
-                    | "EF_SEARCH"
-                    | "EFSEARCH"
-                    | "DEFAULT_EF_SEARCH"
-            );
-            let ivf_only = matches!(
-                key.as_str(),
-                "NLIST"
-                    | "LISTS"
-                    | "NPROBE"
-                    | "PROBES"
-                    | "DEFAULT_NPROBE"
-                    | "KMEANS_ITERS"
-                    | "KMEANS_ITER"
-                    | "ITERS"
-                    | "TRAIN_SAMPLE"
-                    | "TRAIN_SAMPLE_MULT"
-                    | "SAMPLE_MULT"
-            );
-            if (algo == VectorAlgo::IvfSq8 && hnsw_only) || (algo == VectorAlgo::Hnsw && ivf_only) {
-                return Err(crate::storage::error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!("vector index COMMENT option '{key}' is not valid for {algo:?}"),
-                ));
-            }
-            if matches!(key.as_str(), "DISTANCE" | "METRIC") {
-                if crate::engine::vector::Metric::parse(value).is_none() {
-                    return Err(crate::storage::error(
-                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                        format!("invalid vector index {key} value '{value}'"),
-                    ));
-                }
-            } else if numeric {
-                let parsed = value.parse::<u32>().ok().filter(|n| match key.as_str() {
-                    "M" => (2..=1024).contains(n),
-                    "NLIST" | "LISTS" | "NPROBE" | "PROBES" | "DEFAULT_NPROBE" => {
-                        (1..=1_048_576).contains(n)
-                    }
-                    "KMEANS_ITERS" | "KMEANS_ITER" | "ITERS" => (1..=1000).contains(n),
-                    "TRAIN_SAMPLE" | "TRAIN_SAMPLE_MULT" | "SAMPLE_MULT" => {
-                        (1..=65_536).contains(n)
-                    }
-                    _ => (1..=1_000_000).contains(n),
-                });
-                if parsed.is_none() {
-                    return Err(crate::storage::error(
-                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                        format!("invalid vector index {key} value '{value}'"),
-                    ));
-                }
-            } else {
-                crate::engine::api::push_statement_warning(
-                    crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
-                    format!("unknown vector index COMMENT option '{key}' was ignored"),
-                );
-            }
-        }
-        Ok(Self::parse_from_comment(comment))
-    }
-
     /// Resolve the metric name to the [`crate::engine::vector::Metric`] enum.
     /// `pub(crate)` (not `pub`) so this public struct doesn't leak the
     /// crate-internal `Metric` type through its signature.
@@ -2697,7 +2515,7 @@ impl IndexSchema {
         self.index_type.eq_ignore_ascii_case("SPATIAL")
     }
 
-    /// Whether this is a vector index (HNSW graph or IVF_SQ8 inverted table). A vector index keeps a
+    /// Whether this is a vector index (HNSW graph or IVF inverted table). A vector index keeps a
     /// degenerate B-tree (constant key → row_id) as a row_id registry to reuse the DML/recovery
     /// infrastructure; the real ANN structure is a derived candidate generator (`engine::vector`:
     /// lazily built from heap scans, incrementally maintained, and authoritative for queries).
@@ -2705,25 +2523,50 @@ impl IndexSchema {
     pub fn is_vector(&self) -> bool {
         self.index_type.eq_ignore_ascii_case("HNSW")
             || self.index_type.eq_ignore_ascii_case("VECTOR")
-            || self.index_type.eq_ignore_ascii_case("IVF_SQ8")
+            || self.index_type.eq_ignore_ascii_case("IVF")
     }
 
-    /// The vector index's concrete algorithm (HNSW graph vs IVF_SQ8 inverted table). Called only
+    /// The vector index's concrete algorithm (HNSW graph vs IVF inverted table). Called only
     /// where truly branching by algorithm (build/query routing, parameter parsing); elsewhere share [`Self::is_vector`].
     /// Returns `Hnsw` for non-vector indexes (conventional default; callers should filter via `is_vector()` first).
     pub fn vector_algo(&self) -> VectorAlgo {
-        if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
-            VectorAlgo::IvfSq8
+        if self.index_type.eq_ignore_ascii_case("IVF") {
+            VectorAlgo::Ivf
         } else {
             VectorAlgo::Hnsw
         }
     }
 
-    /// HNSW graph build parameters, parsed from the index COMMENT (e.g.
-    /// `COMMENT 'DISTANCE=COSINE M=16 EF_CONSTRUCTION=200'`), falling back to defaults when absent.
-    /// Kept in the comment rather than a dedicated catalog field, avoiding a new field on every IndexSchema literal.
+    /// Resolve the persisted configuration against a column's native datatype.
+    pub(crate) fn vector_meta_for_table(&self, table: &TableSchema) -> VectorIndexMeta {
+        let mut meta = self.vector_meta();
+        let explicit = self.vector.as_ref().is_some_and(|v| v.metric.is_some());
+        let binary = self
+            .columns
+            .first()
+            .and_then(|name| {
+                table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+            })
+            .is_some_and(|c| {
+                matches!(
+                    c.data_type,
+                    DataTypeKind::Vector {
+                        datatype: crate::vector::VectorDataType::Binary,
+                        ..
+                    }
+                )
+            });
+        if binary && !explicit {
+            meta.metric = "HAMMING".into();
+        }
+        meta
+    }
+
     pub fn vector_meta(&self) -> VectorIndexMeta {
-        VectorIndexMeta::parse_from_comment(&self.comment)
+        self.vector.as_ref().map(|v| v.meta()).unwrap_or_default()
     }
 
     /// All columns physically encoded into each index entry's key, in
@@ -3033,6 +2876,7 @@ pub enum DataTypeKind {
     /// dimension accepted).
     Vector {
         dim: Option<u32>,
+        datatype: crate::vector::VectorDataType,
     },
     Enum {
         values: Vec<String>,
@@ -3090,7 +2934,10 @@ fn data_type_kind_for_column_type(
             subtype: GeometrySubtype::Geometry,
             srid: None,
         },
-        ColumnType::Vector => DataTypeKind::Vector { dim: None },
+        ColumnType::Vector => {
+            let (datatype, dim) = source.vector_type.unwrap_or_default();
+            DataTypeKind::Vector { dim, datatype }
+        }
         ColumnType::Bit { bits } => DataTypeKind::Bit {
             len: Some(bits as usize),
         },
@@ -4030,8 +3877,8 @@ fn decimal_keypart_for_value(v: &Value, precision: u8, scale: u8) -> Result<KeyP
         | Value::DateTime(_)
         | Value::Timestamp(_)
         | Value::Year(_)
-        | Value::Geometry(_)
-        | Value::Vector(_) => 0,
+        | Value::Geometry(_) => 0,
+        Value::Vector(_) => 0,
     };
     if precision > 38 {
         Ok(KeyPart::DecimalWide {
@@ -4607,6 +4454,11 @@ impl TableSchema {
             _ => None,
         };
         crate::types::ColumnSource {
+            vector_type: if let DataTypeKind::Vector { datatype, dim } = column.data_type {
+                Some((datatype, dim))
+            } else {
+                None
+            },
             collation_coercibility: Some(2),
             dynamic_parameter: false,
             wire_type,
@@ -5194,7 +5046,7 @@ impl DataTypeKind {
             // Vector is not a normal B-tree key column (it is indexed via the
             // HNSW vector index); report the declared byte width for width
             // estimation only.
-            DataTypeKind::Vector { dim } => (dim.unwrap_or(192) as usize) * 4 + 2,
+            DataTypeKind::Vector { dim, datatype } => datatype.payload_len(dim.unwrap_or(192)) + 2,
             // ENUM stores a 1- or 2-byte ordinal (1 byte when ≤255
             // members, else 2). SET stores a bitmask of ceil(N/8) bytes,
             // capped at 8. Reporting the tight width keeps CBO key-space
@@ -5263,7 +5115,7 @@ impl From<DataType> for DataTypeKind {
             DataType::Year => Self::Year,
             DataType::Json => Self::Json,
             DataType::Geometry(subtype, srid) => Self::Geometry { subtype, srid },
-            DataType::Vector(dim) => Self::Vector { dim },
+            DataType::Vector(dim, datatype) => Self::Vector { dim, datatype },
             DataType::Enum(values) => Self::Enum { values },
             DataType::Set(values) => Self::Set { values },
             // Preserve the declaration exactly until DDL validation. In
@@ -5325,7 +5177,7 @@ impl KeyPart {
             Value::Geometry(v) => Self::Bytes(v.clone()),
             // Vector keys on its internal bytes for the rare direct path
             // (vector columns are indexed via the HNSW graph).
-            Value::Vector(v) => Self::Bytes(v.clone()),
+            Value::Vector(v) => Self::Bytes(v.encode()),
             Value::Date(d) => Self::Date(*d),
             Value::Time(t) => Self::Time(*t),
             Value::DateTime(dt) => Self::DateTime(*dt),
@@ -6256,63 +6108,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vector_comment_tolerates_spaces_around_eq() {
-        // C3: `KEY = VAL` (spaces around `=`) must parse the same as `KEY=VAL`.
-        // Regression: the whitespace tokenizer used to split `NLIST = 512` into
-        // three value-less tokens and silently drop every parameter.
-        let m = VectorIndexMeta::parse_from_comment("METRIC = COSINE, NLIST = 512, NPROBE = 16");
-        assert_eq!(m.metric.to_ascii_uppercase(), "COSINE");
-        assert_eq!(m.nlist, Some(512));
-        assert_eq!(m.default_nprobe, Some(16));
-        // Mixed spacing variants all resolve identically.
+    fn vector_comment_configuration_is_rejected() {
+        use crate::storage::vector_config::VectorIndexConfig;
         for c in [
-            "NLIST=512 NPROBE=16",
-            "NLIST =512 NPROBE= 16",
-            "NLIST = 512   NPROBE = 16",
-            "NLIST\t=\t512,NPROBE\t=\t16",
+            "M=16",
+            "NLIST = 32",
+            "DISTANCE=COSINE",
+            "EFSEARCH=64",
+            "QUANTIZATION=sq8",
         ] {
-            let mm = VectorIndexMeta::parse_from_comment(c);
-            assert_eq!(mm.nlist, Some(512), "nlist for {c:?}");
-            assert_eq!(mm.default_nprobe, Some(16), "nprobe for {c:?}");
-        }
-        // KMEANS_ITERS / TRAIN_SAMPLE also honour spacing.
-        let k = VectorIndexMeta::parse_from_comment("KMEANS_ITERS = 20, TRAIN_SAMPLE = 128");
-        assert_eq!(k.kmeans_iters, Some(20));
-        assert_eq!(k.train_sample_mult, Some(128));
-        // Malformed / overflowing numerics still fall back (documented behavior).
-        let bad = VectorIndexMeta::parse_from_comment("NLIST = abc, NPROBE = 99999999999");
-        assert_eq!(bad.nlist, None);
-        assert_eq!(bad.default_nprobe, None);
-    }
-
-    #[test]
-    fn vector_comment_validation_is_algorithm_specific_and_bounded() {
-        assert!(VectorIndexMeta::validate_from_comment(
-            "NLIST=128 NPROBE=8 KMEANS_ITERS=20",
-            VectorAlgo::IvfSq8,
-        )
-        .is_ok());
-        assert_eq!(
-            VectorIndexMeta::validate_from_comment("M=16", VectorAlgo::IvfSq8)
+            assert!(VectorIndexConfig::validate_comment(c)
                 .unwrap_err()
-                .code(),
-            1235
-        );
-        assert_eq!(
-            VectorIndexMeta::validate_from_comment("NLIST=16", VectorAlgo::Hnsw)
-                .unwrap_err()
-                .code(),
-            1235
-        );
-        for comment in ["NLIST=0", "NPROBE=1048577", "KMEANS_ITERS=1001"] {
-            assert_eq!(
-                VectorIndexMeta::validate_from_comment(comment, VectorAlgo::IvfSq8)
-                    .unwrap_err()
-                    .code(),
-                1235,
-                "{comment} must be rejected"
-            );
+                .message()
+                .contains("WITH"));
         }
+        assert!(VectorIndexConfig::validate_comment("Embedding index; owner=search").is_ok());
     }
 
     fn legacy_table_json() -> &'static str {

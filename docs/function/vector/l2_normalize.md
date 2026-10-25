@@ -14,11 +14,11 @@ L2_NORMALIZE(vector)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `vector` | Yes | VECTOR, valid vector text, or encoded vector bytes | A nonempty finite-f32 vector; integer scalars and metric names are not vector values |
+| `vector` | Yes | VECTOR or valid vector text | A nonempty native vector; integer scalars and metric names are not vector values |
 
 ## Return Value
 
-Returns a VECTOR; returns `NULL` when any argument is `NULL`.
+Returns a FLOAT32 VECTOR; returns `NULL` when any argument is `NULL`.
 
 ## Examples
 
@@ -34,9 +34,10 @@ Result:
 
 ## Notes
 
-- A zero vector is returned unchanged; `L2_NORMALIZE('[0,0]')` returns `[0,0]`. Nonzero results retain f32 precision, so decimal rendering can show rounding.
+- Supports numeric datatypes; BINARY raises an error. The result must fit the FLOAT32 dimension limit of 16383.
+- A zero vector retains its components after conversion to FLOAT32; `L2_NORMALIZE('[0,0]')` returns `[0,0]`. Nonzero results retain f32 precision, so decimal rendering can show rounding.
 
-- Vector values must be nonempty, contain finite f32 elements, and binary vector operations require equal dimensions. Invalid encodings, dimensions or scalar integer operands return an explicit vector error. Distance metric names are case-insensitive.
+- Vectors must be nonempty, floating elements must be finite, and distance operands must have equal dimensions. Numeric datatypes may be mixed without narrowing the query. BINARY cannot be mixed with numeric vectors. Invalid encodings and scalar integer operands raise a vector error. Raw payloads require `VECTOR_FROM_BINARY`; metric names are case-insensitive.
 
 ## Related Functions
 

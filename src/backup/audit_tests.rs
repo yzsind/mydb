@@ -482,10 +482,10 @@ fn audit_r05_file_generations_and_authoritative_objects_continue_from_e() {
         "INSERT INTO docs VALUES(1,'backup database')",
         "CREATE TABLE vecs(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)",
         "INSERT INTO vecs VALUES(1,'[0,0,0]'),(2,'[1,0,0]')",
-        "CREATE INDEX vi ON vecs(emb) USING HNSW",
+        "CREATE INDEX vi ON vecs(emb) USING HNSW WITH (quantization=sq4)",
         "CREATE TABLE ivfs(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)",
         "INSERT INTO ivfs VALUES(1,'[0,0,0]'),(2,'[1,0,0]')",
-        "CREATE INDEX ii ON ivfs(emb) USING IVF_SQ8 COMMENT 'NLIST=1 NPROBE=1'",
+        "CREATE INDEX ii ON ivfs(emb) USING IVF WITH (nlist=1, nprobe=1, quantization=bq)",
         "CREATE SEQUENCE audit_seq",
     ] { f.source.execute(sql).unwrap(); }
     let queries = [
@@ -590,6 +590,113 @@ fn audit_r05_file_generations_and_authoritative_objects_continue_from_e() {
         assert_eq!(query_rows(&restored, &q), query_rows(&f.source, &q), "{q}");
     }
     restored.shutdown().unwrap();
+}
+
+#[test]
+fn immutable_vector_indexes_load_without_persistent_writes() {
+    let f = Fixture::new(Policy::Manual);
+    let cases = [
+        ("paged_hnsw", "FLOAT32", "HNSW", ""),
+        ("typed_hnsw", "FLOAT16", "HNSW", ""),
+        ("quantized_hnsw", "FLOAT32", "HNSW", "quantization=sq4"),
+        ("plain_ivf", "FLOAT32", "IVF", "nlist=1,nprobe=1"),
+        ("typed_ivf", "INT8", "IVF", "nlist=1,nprobe=1"),
+        (
+            "quantized_ivf",
+            "FLOAT32",
+            "IVF",
+            "nlist=1,nprobe=1,quantization=bq",
+        ),
+    ];
+    for (name, datatype, algo, options) in cases {
+        f.source
+            .execute(&format!(
+                "CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR(3,{datatype}) NOT NULL)"
+            ))
+            .unwrap();
+        f.source
+            .execute(&format!(
+                "INSERT INTO {name} VALUES(1,'[0,0,0]'),(2,'[2,0,0]'),(3,'[4,1,0]')"
+            ))
+            .unwrap();
+        let options = if options.is_empty() {
+            String::new()
+        } else {
+            format!(" WITH ({options})")
+        };
+        f.source
+            .execute(&format!(
+                "CREATE INDEX vi ON {name}(v) USING {algo}{options}"
+            ))
+            .unwrap();
+    }
+    let base = completed(&f.c, f.c.backup(&f.repo).unwrap())
+        .base_id
+        .unwrap();
+    for (name, ..) in cases {
+        f.source
+            .execute(&format!("UPDATE {name} SET v='[1,0,0]' WHERE id=3"))
+            .unwrap();
+    }
+    completed(&f.c, f.c.backup_wal(&f.repo).unwrap());
+    let restored = f.root.path().join("restored-vectors");
+    super::restore::restore(
+        &f.repo,
+        Some(&base),
+        None,
+        Target::Latest,
+        &restored,
+        None,
+        false,
+    )
+    .unwrap();
+    let runtime = f.root.path().join("vector-runtime");
+    let lease = super::open_base(&f.repo, &base, &runtime).unwrap();
+    for (path, expected) in [
+        (
+            lease.data_dir.clone(),
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+        ),
+        (restored, vec![vec![Value::Int(1)], vec![Value::Int(3)]]),
+    ] {
+        let reader = StorageQueryEngine::open_backup_image(
+            &path,
+            runtime.clone(),
+            Default::default(),
+            Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+            vec![],
+        )
+        .unwrap();
+        let db = reader.db_handle();
+        assert!(db.is_snapshot_read_only());
+        for (name, ..) in cases {
+            let table = db.snapshot_table_schema(&format!("test.{name}")).unwrap();
+            let index = table
+                .indexes
+                .iter()
+                .find(|index| index.is_vector())
+                .unwrap();
+            // Force cold graph loading even when a tiny SQL query chooses an exact scan.
+            db.vector_graph_get_or_build_for_partition(&table, index, table.id)
+                .unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    query_rows(
+                        &reader,
+                        &format!("SELECT id FROM {name} ORDER BY DISTANCE(v,'[0,0,0]') LIMIT 2")
+                    ),
+                    expected,
+                    "{name}"
+                );
+            }
+            assert!(reader
+                .execute(&format!("UPDATE {name} SET v='[9,0,0]' WHERE id=1"))
+                .is_err());
+        }
+        reader.shutdown().unwrap();
+        drop(reader);
+        native::verify(&path).unwrap();
+    }
 }
 
 #[test]

@@ -299,7 +299,7 @@ cost is higher.
 | `IndexInLookup` | Index driven by `column IN (subquery)` | The subquery first forms a key set, then prefix+IN probes run |
 | `FulltextScan` | FULLTEXT postings and BM25 | MATCH postings produce candidates while the ordinary residual still rechecks; can be combined with B-tree/Zone Map candidate intersection |
 | `SpatialScan` | MBR candidates from the in-memory R-tree | The R-tree returns a superset; exact spatial predicates must be rechecked |
-| `VectorIndexScan` | HNSW/IVF_SQ8 vector KNN | After candidates are generated, re-ranks using MVCC-visible heap vectors; the approximate index affects recall but never relaxes visibility |
+| `VectorIndexScan` | HNSW/IVF vector KNN | After candidates are generated, re-ranks using MVCC-visible heap vectors; the approximate index affects recall but never relaxes visibility |
 | `VectorBruteScan` | Exact brute-force KNN | Scans all visible vectors with a bounded Top-K; materializes only the winners |
 
 Index-only visibility treats the heap MVCC header as the source of truth; the
@@ -312,9 +312,14 @@ usually still require a Sort.
 
 - Zone Maps, spatial indexes, full-text pre-filtering, and runtime Bloom
   filters are candidate filters, not final semantic decisions.
-- HNSW/IVF_SQ8 are approximate candidate generators; the executor reads
-  currently visible rows and recomputes distances, but a stale index or an
-  insufficient candidate budget can still lower recall.
+- HNSW/IVF are approximate candidate generators; the executor reads
+  currently visible native heap values and recomputes distances. Explicit
+  SQ8/SQ4/PQ/BQ payloads affect candidate scores, while `quantization=none`
+  retains native scores. Search breadth and candidate retention can still
+  limit recall after exact re-ranking. Unusable coverage and pending PQ
+  training fall back to exact scanning; JOIN, aggregation, DISTINCT, and
+  window queries retain their complete relational input. See
+  [vector query tuning and diagnostics](vector-indexes.md).
 - Temporal `FOR SYSTEM_TIME AS OF` uses a historical snapshot; when historical
   indexes are degraded it falls back to heap/undo, and it must never return
   the current version in place of a historical one.

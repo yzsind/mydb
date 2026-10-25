@@ -148,6 +148,20 @@ fn validate_supported_index_type(index: &IndexSchema) -> Result<(), QueryError> 
     Ok(())
 }
 
+fn resolve_vector_config(columns: &[ColumnSchema], index: &mut IndexSchema) -> Result<(), QueryError> {
+    if !index.is_vector() { return Ok(()); }
+    let algo = index.vector_algo();
+    if index.vector.is_none() {
+        index.vector = crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, None, &index.comment)?;
+    }
+    if let Some(column) = index.columns.first().and_then(|name| columns.iter().find(|c|c.name.eq_ignore_ascii_case(name))) {
+        if let DataTypeKind::Vector {datatype,dim: Some(dimension)} = column.data_type {
+            index.vector.as_mut().unwrap().resolve(datatype,dimension,algo)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_vector_index_column(
     table: &TableSchema,
     index: &IndexSchema,
@@ -165,6 +179,47 @@ fn validate_vector_index_column(
             .find(|c| c.name.eq_ignore_ascii_case(&index.columns[0]))
         {
             Some(c) if matches!(c.data_type, crate::storage::DataTypeKind::Vector { .. }) => {
+                let crate::storage::DataTypeKind::Vector { dim, datatype } = c.data_type else {
+                    unreachable!()
+                };
+                if dim.is_none() {
+                    return Err(vector::vector_err(
+                        "a vector index requires a fixed dimension",
+                    ));
+                }
+                if let Some(mut config)=index.vector.clone(){config.resolve(datatype,dim.unwrap(),index.vector_algo())?;}
+                let metric = index.vector_meta_for_table(table).metric_enum();
+                if (datatype == crate::vector::VectorDataType::Binary)
+                    != matches!(metric, vector::Metric::Hamming | vector::Metric::Jaccard)
+                {
+                    return Err(vector::vector_err(
+                        "vector datatype and index metric are incompatible",
+                    ));
+                }
+
+                if vector_storage_paged() && index.vector_algo() == VectorAlgo::Hnsw {
+                    if let crate::storage::DataTypeKind::Vector {
+                        dim: Some(dim),
+                        datatype,
+                    } = c.data_type
+                    {
+                        VectorIndexFile::validate_hnsw_layout(
+                            if let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) {
+                                native_vector_geometry(crate::vector::VectorDataType::Int8,(config.quantization.code_len(dim)+9) as u32) as usize
+                            } else if datatype == crate::vector::VectorDataType::Float32 {
+                                dim as usize
+                            } else {
+                                native_vector_geometry(datatype, dim) as usize
+                            },
+                            index.vector_meta().m as usize,
+                        )?;
+                    }
+                }
+                if vector_storage_paged() && index.vector_algo() == VectorAlgo::Ivf {
+                    if let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) {
+                        VectorIndexFile::validate_native_ivf_layout(crate::vector::VectorDataType::Int8,(config.quantization.code_len(dim.unwrap())+9) as u32)?;
+                    } else {VectorIndexFile::validate_native_ivf_layout(datatype, dim.unwrap())?;}
+                }
                 if c.nullable {
                     return Err(error(
                         crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -494,6 +549,24 @@ fn validate_mysql_identifier(name: &str) -> Result<(), QueryError> {
     }
 }
 
+fn validate_vector_declaration(
+    dim: Option<u32>,
+    datatype: crate::vector::VectorDataType,
+) -> Result<(), QueryError> {
+    if dim.is_some_and(|n| n == 0 || n > datatype.max_dimension()) {
+        return Err(vector::vector_err(format!(
+            "{datatype} VECTOR dimension must be in [1,{}]",
+            datatype.max_dimension()
+        )));
+    }
+    if dim.is_none() && datatype != crate::vector::VectorDataType::Float32 {
+        return Err(vector::vector_err(format!(
+            "{datatype} VECTOR requires a declared dimension; use CAST AS VECTOR(n,{datatype})"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_create_table_identifiers(
     table_name: &str,
     columns: &[ColumnDef],
@@ -507,6 +580,9 @@ fn validate_create_table_identifiers(
     }
     for column in columns {
         validate_mysql_identifier(&column.name)?;
+        if let crate::parser::DataType::Vector(dim, datatype) = column.data_type {
+            validate_vector_declaration(dim, datatype)?;
+        }
     }
     Ok(())
 }
@@ -520,6 +596,9 @@ fn validate_table_column_identifiers(table: &TableSchema) -> Result<(), QueryErr
     }
     for (_, column) in table.iter_visible_columns() {
         validate_mysql_identifier(&column.name)?;
+        if let DataTypeKind::Vector { dim, datatype } = column.data_type {
+            validate_vector_declaration(dim, datatype)?;
+        }
     }
     Ok(())
 }
@@ -615,6 +694,7 @@ fn prepare_create_table_schema(
             index_type: "BTREE".to_string(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         });
     }
@@ -718,7 +798,7 @@ fn prepare_create_table_schema(
         let is_spatial = index.index_type.eq_ignore_ascii_case("SPATIAL");
         let is_vector = index.index_type.eq_ignore_ascii_case("HNSW")
             || index.index_type.eq_ignore_ascii_case("VECTOR")
-            || index.index_type.eq_ignore_ascii_case("IVF_SQ8");
+            || index.index_type.eq_ignore_ascii_case("IVF");
         if !index.index_type.eq_ignore_ascii_case("BTREE")
             && !index.index_type.eq_ignore_ascii_case("FULLTEXT")
             && !is_spatial
@@ -731,14 +811,7 @@ fn prepare_create_table_schema(
         }
 
         if is_vector {
-            crate::storage::schema::VectorIndexMeta::validate_from_comment(
-                &index.comment,
-                if index.index_type.eq_ignore_ascii_case("IVF_SQ8") {
-                    crate::storage::schema::VectorAlgo::IvfSq8
-                } else {
-                    crate::storage::schema::VectorAlgo::Hnsw
-                },
-            )?;
+            crate::storage::vector_config::VectorIndexConfig::validate_comment(&index.comment)?;
             if columns.len() != 1 || index.unique {
                 return Err(error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -953,6 +1026,7 @@ fn prepare_create_table_schema(
             primary,
             included_columns,
             state: crate::storage::IndexState::Public,
+            vector: crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, index.vector_options.as_ref(), &index.comment)?,
             index_type: index.index_type,
             visible: index.visible,
             comment: index.comment,
@@ -1037,6 +1111,8 @@ impl PreparedCreateTableSchema {
             pctused: self.pctused.unwrap_or(0).min(50),
             mysql_table_options,
         };
+        for index in &mut table.indexes { resolve_vector_config(&table.columns, index)?; }
+        for index in &table.indexes { validate_vector_index_column(&table, index)?; }
         table.check_constraints =
             build_check_constraints_for_table(&table, self.check_defs, None, None)?;
         for (column_name, comment) in self.column_comments {
@@ -2111,6 +2187,7 @@ impl Database {
         validate_index_column_names(&table, &index)?;
         validate_index_prefix_columns(&table, &index, &index.column_prefix_lengths)?;
         index.validate_multi_valued_definition()?;
+        resolve_vector_config(&table.columns, &mut index)?;
         validate_vector_index_column(&table, &index)?;
         if index.primary && table.indexes.iter().any(|existing| existing.primary) {
             return Err(error(
@@ -4110,10 +4187,7 @@ impl Database {
             &index.comment,
         )?;
         if index.is_vector() {
-            crate::storage::schema::VectorIndexMeta::validate_from_comment(
-                &index.comment,
-                index.vector_algo(),
-            )?;
+            crate::storage::vector_config::VectorIndexConfig::validate_comment(&index.comment)?;
         }
         index.column_prefix_lengths =
             normalized_index_prefix_lengths(index.column_prefix_lengths, index.columns.len());
@@ -4153,6 +4227,7 @@ impl Database {
                     format!("duplicate index '{}'", index.name),
                 ));
             }
+            resolve_vector_config(&table.columns, &mut index)?;
             validate_add_index_definition(table, &index)?;
             if !index.included_columns.is_empty() {
                 if index.unique {
@@ -4244,6 +4319,7 @@ impl Database {
                 ));
             }
             table.next_index_id = table.next_index_id.max(index.index_id.saturating_add(1));
+            resolve_vector_config(&table.columns, &mut index)?;
             validate_add_index_definition(table, &index)?;
             if index.primary
                 && (table.indexes.iter().any(|existing| existing.primary)
@@ -6557,18 +6633,18 @@ impl Database {
         pos: usize,
         new: &ColumnSchema,
     ) -> Result<(), QueryError> {
-        if table.indexes.iter().any(|index| {
-            index.is_vector()
-                && index
-                    .columns
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&table.columns[pos].name))
-        }) && (new.nullable || !matches!(new.data_type, DataTypeKind::Vector { .. }))
-        {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "a vector index column must remain VECTOR and NOT NULL; drop the index first",
-            ));
+        let affected=|index:&IndexSchema|index.is_vector() && index.columns.iter().any(|name|name.eq_ignore_ascii_case(&table.columns[pos].name));
+        if !table.indexes.iter().any(affected){return Ok(());}
+        if new.nullable || !matches!(new.data_type,DataTypeKind::Vector{..}) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,"a vector index column must remain VECTOR and NOT NULL; drop the index first"));
+        }
+        // Validate before COPY allocates or publishes any shadow generation.
+        // CHANGE COLUMN renames keys later; preserve their current name here.
+        let mut prospective=table.clone();
+        prospective.columns[pos]=new.clone();
+        prospective.columns[pos].name=table.columns[pos].name.clone();
+        for index in prospective.indexes.iter().filter(|index|affected(index)) {
+            validate_vector_index_column(&prospective,index)?;
         }
         Ok(())
     }
@@ -8554,7 +8630,10 @@ impl Database {
         // New index-generation and private-object directories must themselves
         // be durable, not just the files or the live heap's immediate parent.
         crate::platform::fs::sync_paths(
-            directories.iter().rev().filter(|directory| directory.exists()),
+            directories
+                .iter()
+                .rev()
+                .filter(|directory| directory.exists()),
         )
         .map_err(io_err)
     }
@@ -8598,9 +8677,10 @@ impl Database {
                 }
             }
             for (shadow, live) in &shadow_to_live {
-                if shadow.extension().is_some_and(|ext| {
-                    matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec" | "ivf"))
-                }) && !shadow.exists()
+                if shadow
+                    .extension()
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec")))
+                    && !shadow.exists()
                 {
                     continue;
                 }
@@ -9565,10 +9645,8 @@ impl Database {
 /// the declared key columns. Returns the normalized include list (empty
 /// when the index declared none). The ALTER `add_index` path enforces the
 /// same rules independently in `validate_index_definition`.
-/// M7 — validate that a row's fixed footprint fits one page. `VECTOR(n)` maps to
-/// `VectorFixed` (fixed n*4 bytes, **never externalized**); extreme dimensions can
-/// outgrow the page. Previously only the first INSERT raised the generic 1118; here
-/// CREATE/ALTER fails early with a clear error carrying the dimension cap (1118/42000). `ROW_FIT_BUDGET` = PAGE_SIZE - page header - slot.
+/// Validate the schema-derived fixed row footprint before publication. Large
+/// vector payloads use varlen/overflow lanes; remaining fixed lanes must fit.
 /// MySQL restricts `BIT(M)` to `1 <= M <= 64`; a wider declaration is
 /// `ERROR 1439 (42000): Display width out of range for column '<c>' (max = 64)`.
 /// mydb previously accepted any width and then *panicked* on the first
@@ -9622,34 +9700,6 @@ fn validate_row_fits_page(table: &TableSchema) -> Result<(), QueryError> {
     let footprint = table.row_codec.min_fixed_row_footprint();
     if footprint <= ROW_FIT_BUDGET {
         return Ok(());
-    }
-    // Over page: prefer the largest VECTOR(n) column for a targeted hint (it is the
-    // most likely culprit and yields an explicit dimension cap); otherwise emit the generic "fixed columns too wide" error.
-    let widest_vec = table
-        .columns
-        .iter()
-        .filter_map(|c| match c.data_type {
-            DataTypeKind::Vector { dim: Some(dim) } => Some((c.name.clone(), dim)),
-            _ => None,
-        })
-        .max_by_key(|(_, dim)| *dim);
-    if let Some((col, dim)) = widest_vec {
-        // Other fixed usage (excluding this vector column) = footprint - dim*4. The byte
-        // budget available for the vector = ROW_FIT_BUDGET - other usage; max dim = budget / 4.
-        let this_vec_bytes = (dim as usize).saturating_mul(4);
-        let other = footprint.saturating_sub(this_vec_bytes);
-        let budget_for_vec = ROW_FIT_BUDGET.saturating_sub(other);
-        let max_dim = budget_for_vec / 4;
-        return Err(error(
-            crate::error::catalog::ER_TOO_BIG_ROWSIZE,
-            format!(
-                "VECTOR({dim}) column '{col}' is too large to store inline: a row \
-                 ({footprint} bytes of fixed columns + row header) exceeds the single-page \
-                 limit ({ROW_FIT_BUDGET} bytes). VECTOR(n) is stored inline (never \
-                 off-page); the maximum dimension for this table layout is {max_dim}. \
-                 Reduce the dimension or remove other wide fixed columns."
-            ),
-        ));
     }
     Err(error(
         crate::error::catalog::ER_TOO_BIG_ROWSIZE,
@@ -10419,18 +10469,6 @@ fn coerce_column_value_for_alter_copy_lossy(
             );
             Ok(coerced)
         }
-        DataTypeKind::Vector { dim }
-            if err.is(crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE)
-                || err.is(crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH) =>
-        {
-            let coerced = coerce_vector_lossy(value, *dim)?;
-            push_alter_copy_warning(
-                warnings,
-                crate::error::catalog::WARN_DATA_TRUNCATED,
-                format!("data truncated for column '{}'", column.name),
-            );
-            Ok(coerced)
-        }
         _ => Err(err),
     }
 }
@@ -10637,29 +10675,6 @@ fn coerce_set_lossy(value: Value, allowed: &[String]) -> Value {
     Value::String(out.join(","))
 }
 
-fn coerce_vector_lossy(value: Value, dim: Option<u32>) -> Result<Value, QueryError> {
-    let Some(dim) = dim else {
-        return Err(error(
-            crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
-            "Cannot get a VECTOR value from the data sent to the VECTOR field",
-        ));
-    };
-    let target_len = dim as usize * std::mem::size_of::<f32>();
-    let mut bytes = match value {
-        Value::Vector(bytes) => crate::engine::vector::normalize_internal(&bytes),
-        Value::Bytes(bytes) => crate::engine::vector::coerce_bytes_to_internal(&bytes),
-        Value::String(text) | Value::Decimal(text) => {
-            crate::engine::vector::coerce_bytes_to_internal(text.as_bytes())
-        }
-        _ => Ok(Vec::new()),
-    }
-    .unwrap_or_default();
-    bytes.truncate(target_len);
-    bytes.resize(target_len, 0);
-    crate::engine::vector::validate_dimension(&bytes, Some(dim))?;
-    Ok(Value::Vector(bytes))
-}
-
 /// MySQL 8.0.23+ guard: every table needs at least one visible
 /// (non-INVISIBLE, non-Dropped) column. Shared by the single-action
 /// MODIFY/CHANGE candidates, ALTER COLUMN … SET INVISIBLE, and the
@@ -10792,6 +10807,7 @@ impl Database {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             });
             table_id = updated.id;

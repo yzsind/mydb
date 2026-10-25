@@ -404,6 +404,7 @@ fn mvcc_fix_lob_update_prefix_keys_and_repeated_purge() {
             index_type: "BTREE".into(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         },
     )

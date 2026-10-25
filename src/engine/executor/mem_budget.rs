@@ -967,10 +967,15 @@ impl ControlledMemoryCharge {
     }
 
     pub(crate) fn try_grow(&mut self, extra: usize) -> Result<(), QueryError> {
+        self.try_grow_recoverable(extra).map_err(terminal_oom)
+    }
+
+    /// Derived indexes may release failed accelerator state and execute an exact scan.
+    pub(crate) fn try_grow_recoverable(&mut self, extra: usize) -> Result<(), QueryError> {
         if extra == 0 {
             return Ok(());
         }
-        charge_controlled(self.category, extra).map_err(terminal_oom)?;
+        charge_controlled(self.category, extra)?;
         self.bytes = self.bytes.saturating_add(extra);
         Ok(())
     }
@@ -2165,7 +2170,11 @@ pub(crate) fn try_clone_value(
         Value::Bytes(bytes) => Value::Bytes(try_copy_bytes(bytes, site)?),
         Value::Json(bytes) => Value::Json(try_copy_bytes(bytes, site)?),
         Value::Geometry(bytes) => Value::Geometry(try_copy_bytes(bytes, site)?),
-        Value::Vector(bytes) => Value::Vector(try_copy_bytes(bytes, site)?),
+        Value::Vector(bytes) => Value::Vector(crate::vector::VectorValue::new(
+            bytes.datatype,
+            bytes.dimension,
+            try_copy_bytes(bytes, site)?,
+        )),
         // DecimalWide is bounded by MySQL's 65-digit precision and
         // SmallString is inline; their Clone allocations are therefore not
         // user-unbounded executor growth.

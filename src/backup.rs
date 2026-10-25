@@ -787,7 +787,7 @@ fn snapshot_wal_files(db: &Database) -> Result<WalSnapshot, QueryError> {
 fn classify_file(relative: &str) -> FileClass {
     match Path::new(relative).extension().and_then(|ext| ext.to_str()) {
         Some("idx") => FileClass::Index,
-        Some("zm" | "hnsw" | "hvec" | "ivf") => FileClass::Derived,
+        Some("zm" | "hnsw" | "hvec") => FileClass::Derived,
         Some("log") if relative.starts_with("system/wal/") => FileClass::RecoveryWal,
         _ => FileClass::Authoritative,
     }
@@ -1103,7 +1103,7 @@ fn read_stable_chunk_with(
     let page_bytes = crate::storage::PAGE_SIZE;
     let paged = matches!(
         path.extension().and_then(|value| value.to_str()),
-        Some("heap" | "idx" | "lob" | "ovf" | "hvec" | "ivf" | "zm")
+        Some("heap" | "idx" | "lob" | "ovf" | "hvec" | "zm")
     );
     // Compare bulk reads, retrying only pages changed by a concurrent writer.
     // Each accepted page still has two identical reads and a valid CRC.

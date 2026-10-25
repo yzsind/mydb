@@ -32,7 +32,7 @@ Ordinary persistent objects use ID/generation paths that are independent of SQL 
       <generation>.zm                     # paged Zone Map pruning structure
     indexes/<storage_id>/<generation>/
       <index_id>.idx
-      <index_id>.hvec | <index_id>.ivf    # when vector indexes exist
+      <index_id>.hvec    # when vector indexes exist
   system/catalog/
     <dd_table_id>.heap
     indexes/<dd_table_id>/<generation>/<index_id>.idx
@@ -224,8 +224,8 @@ means it lives in the var payload. All string lengths are counted in bytes.
 | `YEAR` | fixed 1 B | `year - 1900`; 0 means `0000`, and 1..255 means 1901..2155 |
 | `JSON` | variable-length | mydb `jsonb` binary node stream |
 | `GEOMETRY` family | variable-length | `SRID u32 LE + canonical little-endian WKB` |
-| `VECTOR(n)` | fixed `n*4` B | `n` contiguous IEEE-754 `f32` LE, never externalized |
-| `VECTOR` without declared dimension | variable-length | likewise a bare `f32` LE array, externalizable |
+| `VECTOR(n, datatype)` | native payload length; fixed or variable-length lane | FLOAT32 `4*n`, FLOAT16/BFLOAT16 `2*n`, INT8 `n`, BINARY `ceil(n/8)` B; large payloads are externalizable |
+| `VECTOR` without declared dimension | variable-length | `dimension u32 LE + FLOAT32 payload`; externalizable |
 
 The physical width of `TIME`/`DATETIME` is `base + fractional_bytes`: fsp 0 adds 0 B, fsp 1..2
 adds 1 B, fsp 3..4 adds 2 B, and fsp 5..6 adds 3 B; the TIME base is 3, and the DATETIME/TIMESTAMP
@@ -269,13 +269,31 @@ After GEOMETRY's 4 B SRID prefix comes standard 2-D WKB. Every WKB geometry has 
 `u32 type code`, and a type-specific payload; the system accepts NDR/XDR on read and canonicalizes all writes to
 little-endian NDR. Z/M and type codes carrying EWKB SRID flags are currently rejected.
 
-VECTOR has no dimension header; the dimension is derived as `byte_len / 4`. Every element must be finite (NaN,
-`+Inf`, and `-Inf` are not allowed). `VECTOR(n)` with a declared dimension is a fixed block member, so table creation/alteration
-checks whether it fits within the 16347 B row budget; it is never automatically moved to `.lob` the way a BLOB is.
+Fixed-dimension VECTOR heap values store only native payload bytes; datatype
+and dimension come from the column layout. FLOAT32 uses IEEE-754 `f32` LE;
+FLOAT16 and BFLOAT16 use their respective 16-bit LE encodings; INT8 uses signed
+bytes. BINARY uses bit `i%8` of byte `i/8`, least significant bit first, and
+unused high bits of the final byte must be zero. Floating values must remain
+finite after conversion. The native payload limit is 65532 B. See
+[vector datatypes and indexes](vector-indexes.md) for per-type dimension limits.
+
+Declared FLOAT32 payloads up to 8192 B and other declared native payloads up to
+4096 B use the fixed block. Larger declared payloads use a variable-length lane
+and can be moved to `.lob`; the declared dimension is still enforced. Bare
+`VECTOR` uses a variable-length lane with a `dimension:u32 LE` prefix followed
+by FLOAT32 payload bytes. The full encoded row must satisfy the 16347 B inline
+row budget after externalization.
+
+Standalone internal vector values, used outside a fixed heap column layout,
+have a separate 12 B header: `version:u8` (1), `datatype:u8` (FLOAT32=0,
+FLOAT16=1, BFLOAT16=2, INT8=3, BINARY=4), two reserved zero bytes,
+`dimension:u32 LE`, and `payload_len:u32 LE`, followed by native payload bytes.
+This is distinct from the ROW/FULL binlog `MYDBVEC2` envelope and from the raw
+bytes returned by `VECTOR_TO_BINARY`.
 
 ## 7. LOB overflow Files
 
-When a variable-length string/bytes/JSON/GEOMETRY value or an undeclared-dimension VECTOR exceeds
+When a variable-length string/bytes/JSON/GEOMETRY value or an externalizable VECTOR payload exceeds
 `mydb_lob_inline_max` (4096 B by default at startup), or when the whole row otherwise cannot fit in a heap page, the write path may
 externalize it. Each table's `.lob` is a 16 KiB page array: page 0 is the meta page, and the data pages form a singly linked list.
 
@@ -496,7 +514,7 @@ stays uniformly ascending, and DESC is realized through a reverse range cursor.
 - Ordinary MySQL JSON columns must extract scalars through functional/multi-valued indexes; only direct paths store
   canonical jsonb bytes as `Bytes`.
 - SPATIAL indexes go through MBR/R-tree separately; the BTREE of a vector index uses only a NULL key as the persistent RowId
-  registry, while the discriminating data lives in HNSW.
+  registry, while HNSW/IVF candidate structures hold the vector search data.
 - FULLTEXT currently encodes the token and posting payload as two parts: `String(token), Bytes(payload)`.
 
 ## 13. Compact Page-level Key Layouts

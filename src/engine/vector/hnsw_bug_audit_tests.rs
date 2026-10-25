@@ -47,7 +47,7 @@ fn set_quant(on: bool) {
 }
 
 fn brute_topk(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<usize> {
-    let mut scored: Vec<(f32, usize)> = vectors
+    let mut scored: Vec<(f64, usize)> = vectors
         .iter()
         .enumerate()
         .map(|(i, v)| (super::distance::ordering_distance(query, v, Metric::L2), i))

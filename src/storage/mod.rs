@@ -19,6 +19,7 @@ pub(crate) mod snapshot;
 mod stats;
 pub(crate) mod temp_quota;
 mod temporal;
+pub mod vector_config;
 pub use recovery_context::DatabaseOpenMode;
 mod txn;
 pub(crate) use txn::{metadata_wait_timeout, MetadataWaitTimeoutGuard};
@@ -124,7 +125,7 @@ pub(crate) use core::{
     HeapHandle, IndexHandle, IndexRangeCursor, IndexRangeLease, IndexRangeReverseCursor,
     ProjectedReadPlan, RowDecodePlan, PAGE_SIZE,
 };
-pub(crate) use core::{IvfIndexFile, NodeId, VecId, VectorIndexFile};
+pub(crate) use core::{NodeId, VecId, VectorIndexFile};
 pub use mdl::{MdlDuration, MdlLockType, MdlObjectKey, MdlObjectType, MdlRequest, MetadataLockRow};
 pub use naming::{
     event_key, is_system_database, normalize_name, routine_key, split_table_name, table_key,

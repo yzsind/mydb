@@ -65,6 +65,11 @@ impl VectorIndexFile {
         {
             return Ok(false);
         }
+        if self.navigation_writers.load(Ordering::Acquire) == 0
+            && self.mapped_navigation.read().is_some()
+        {
+            return Ok(true);
+        }
         let revision = self.navigation_revision.load(Ordering::Acquire);
         let meta = self.meta();
         if !meta.finalized || meta.node_count == 0 {
@@ -112,9 +117,17 @@ impl VectorIndexFile {
         let words = (len / PAGE_SIZE).div_ceil(64);
         // A lazy checksum bitmap plus the same bounded exact-query memo used
         // by the compact path. File-backed clean pages remain OS-reclaimable.
-        let bytes = words
-            .saturating_mul(8)
-            .saturating_add(512usize.saturating_mul(meta.dim as usize * 4 + 128 * 16 + 128));
+        let bytes =
+            words.saturating_mul(8).saturating_add(
+                512usize.saturating_mul(
+                    native_geometry(meta.dim as usize)
+                        .map_or(meta.dim as usize * 4, |(datatype, dim)| {
+                            datatype.payload_len(dim)
+                        })
+                        + 128 * 16
+                        + 128,
+                ),
+            );
         let Some(charge) =
             ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, bytes)
         else {
@@ -231,7 +244,7 @@ impl MappedVectorNavigation {
         vid: VecId,
         query: &[f32],
         metric: crate::engine::vector::Metric,
-    ) -> Result<(RowId, bool, f32), QueryError> {
+    ) -> Result<(RowId, bool, f64), QueryError> {
         let (page, offset) = self.record(vid)?;
         let start = offset + 10;
         let distance = crate::engine::vector::distance::ordering_distance_f32_bytes(
@@ -268,13 +281,13 @@ impl MappedVectorNavigation {
         metric: crate::engine::vector::Metric,
         codes: &[i8],
         norm: i32,
-    ) -> Result<f32, QueryError> {
+    ) -> Result<f64, QueryError> {
         if !codes.is_empty() {
             if let Some((row, row_norm)) = self.codes(vid)? {
                 return Ok((norm + row_norm
                     - 2 * crate::engine::vector::distance::dot_i8(codes, row))
-                    as f32
-                    * self.meta.nav_dist_mul);
+                    as f64
+                    * (self.meta.nav_dist_mul as f64));
             }
         }
         Ok(self.exact(vid, query, metric)?.2)
@@ -287,7 +300,7 @@ impl MappedVectorNavigation {
         metric: crate::engine::vector::Metric,
         codes: &[i8],
         norm: i32,
-        out: &mut Vec<f32>,
+        out: &mut Vec<f64>,
     ) -> Result<(), QueryError> {
         use crate::engine::vector::distance::{dot_i8_batch4_ptrs, prefetch_read};
         out.clear();
@@ -313,7 +326,7 @@ impl MappedVectorNavigation {
                 if let [Some(a), Some(b), Some(c), Some(d)] = rows {
                     let dots = dot_i8_batch4_ptrs(codes, [a.0, b.0, c.0, d.0]);
                     for (row, dot) in [a, b, c, d].iter().zip(dots) {
-                        out.push((norm + row.1 - 2 * dot) as f32 * self.meta.nav_dist_mul);
+                        out.push((norm + row.1 - 2 * dot) as f64 * self.meta.nav_dist_mul as f64);
                     }
                     continue;
                 }
@@ -333,7 +346,7 @@ impl MappedVectorNavigation {
         query: &[f32],
         k: usize,
         ef: usize,
-    ) -> Result<Vec<(RowId, f32)>, QueryError> {
+    ) -> Result<Vec<(RowId, f64)>, QueryError> {
         use crate::engine::vector::distance::{dot_i8, quantize_into, Metric};
         use crate::engine::vector::hnsw_core::Scored;
         use std::cmp::Reverse;
@@ -354,8 +367,8 @@ impl MappedVectorNavigation {
         };
         let mut normalized = Vec::new();
         let src = if metric == Metric::Cosine {
-            let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
-            normalized.extend(query.iter().map(|v| if norm > 0.0 { v / norm } else { *v }));
+            normalized.extend_from_slice(query);
+            crate::engine::vector::distance::normalize_in_place(&mut normalized);
             normalized.as_slice()
         } else {
             query
@@ -449,7 +462,7 @@ impl MappedVectorNavigation {
             let furthest = results
                 .peek()
                 .map(|s: &Scored<VecId>| s.dist)
-                .unwrap_or(f32::INFINITY);
+                .unwrap_or(f64::INFINITY);
             if results.len() >= ef && candidate.dist > furthest {
                 break;
             }
@@ -465,7 +478,7 @@ impl MappedVectorNavigation {
                 let furthest = results
                     .peek()
                     .map(|s: &Scored<VecId>| s.dist)
-                    .unwrap_or(f32::INFINITY);
+                    .unwrap_or(f64::INFINITY);
                 if results.len() < ef || score < furthest {
                     let entry = Scored {
                         dist: score,

@@ -1819,7 +1819,7 @@ pub enum DataType {
     /// optional column SRID constraint.
     Geometry(crate::storage::schema::GeometrySubtype, Option<u32>),
     /// `VECTOR(n)` with an optional declared dimension (`None` = unconstrained).
-    Vector(Option<u32>),
+    Vector(Option<u32>, crate::vector::VectorDataType),
     Enum(Vec<String>),
     Set(Vec<String>),
     Bit(Option<usize>),
@@ -1863,6 +1863,7 @@ pub struct IndexDef {
     /// Always empty for non-FULLTEXT indexes. Extracted from SQL by [`strip_fulltext_parsers`] and
     /// injected by [`apply_fulltext_parsers`] after conversion.
     pub fulltext_parser: String,
+    pub vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
 }
 
 impl IndexDef {
@@ -1874,8 +1875,8 @@ impl IndexDef {
     /// Return the concrete vector algorithm encoded by the parser-level
     /// index type. Callers must first establish that this is a vector index.
     pub fn vector_algo(&self) -> crate::storage::schema::VectorAlgo {
-        if self.index_type.eq_ignore_ascii_case("IVF_SQ8") {
-            crate::storage::schema::VectorAlgo::IvfSq8
+        if self.index_type.eq_ignore_ascii_case("IVF") {
+            crate::storage::schema::VectorAlgo::Ivf
         } else {
             crate::storage::schema::VectorAlgo::Hnsw
         }
@@ -1914,6 +1915,7 @@ pub struct CreateIndex {
     /// is extracted by [`strip_fulltext_parsers`] and injected by [`apply_fulltext_parsers`],
     /// aligned with the inline / ALTER [`IndexDef::fulltext_parser`].
     pub fulltext_parser: String,
+    pub vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2544,14 +2546,14 @@ pub enum QueryHint {
     HnswEf {
         ef: u64,
     },
-    /// `/*+ IVF_NPROBE(n) */` — override the IVF_SQ8 `nprobe` (number of
+    /// `/*+ IVF_NPROBE(n) */` — override the IVF `nprobe` (number of
     /// inverted cells probed) for this statement. Wins over the session/global
     /// `mydb_ivf_nprobe` and the per-index `NPROBE=`. `n == 0` = "no override".
     IvfNprobe {
         nprobe: u64,
     },
     /// `/*+ NO_VECTOR_INDEX */` — force the planner to skip the
-    /// vector VectorIndexScan path (HNSW or IVF_SQ8) and fall back to a full
+    /// vector VectorIndexScan path (HNSW or IVF) and fall back to a full
     /// scan + sort (brute-force KNN). Useful for small-table queries and
     /// recall debugging.
     NoVectorIndex,

@@ -1679,7 +1679,7 @@ const MYDB_VECTOR_INDEXES_COLUMNS: &[SystemColumn] = &[
     i64c!("DIRTY_NODES"),
     i64c!("GENERATION"),
     i64c!("LAST_PERSISTED_LSN"),
-    // Algorithm discriminator + IVF_SQ8-specific runtime stats. `ALGO` is
+    // Algorithm discriminator + IVF-specific runtime stats. `ALGO` is
     // always present; `NLIST` / `INSERTS_SINCE_TRAIN` are NULL for HNSW and for
     // cold (never-queried) IVF indexes.
     v!("ALGO"),
@@ -1698,6 +1698,15 @@ const MYDB_VECTOR_INDEXES_COLUMNS: &[SystemColumn] = &[
     i64c!("DEFAULT_NPROBE"),
     i64c!("KMEANS_ITERS"),
     i64c!("TRAIN_SAMPLE_MULT"),
+    v!("QUANTIZATION"),
+    vn!("QUANTIZATION_STATE"),
+    i64c!("QUANTIZER_BYTES"),
+    i64c!("COMPRESSED_BYTES"),
+    i64c!("QUANTIZATION_EXCEPTIONS"),
+    i64c!("RERANK_MULT"),
+    i64c!("CANDIDATES_RETURNED"),
+    i64c!("HEAP_RERANKS"),
+    i64c!("EXACT_FALLBACKS"),
 ];
 
 /// Per-table statistics freshness. Lets a DBA see, at a glance, which
@@ -2243,6 +2252,7 @@ pub(crate) fn columns_for_table_name(table_name: &str) -> Result<Vec<Column>, Qu
                 });
             Column {
                 source: crate::types::ColumnSource {
+                    vector_type: None,
                     collation_coercibility: Some(2),
                     dynamic_parameter: false,
                     wire_type: None,
@@ -2485,7 +2495,7 @@ fn rows(
         ("information_schema", "mydb_caches") => Ok(mydb_caches_rows(db)),
         ("information_schema", "mydb_plan_cache") => Ok(mydb_plan_cache_rows(db)),
         ("information_schema", "mydb_memory_advisor") => Ok(mydb_memory_advisor_rows(db)),
-        ("information_schema", "mydb_vector_indexes") => Ok(mydb_vector_indexes_rows(db)),
+        ("information_schema", "mydb_vector_indexes") => Ok(mydb_vector_indexes_rows(db, request)),
         ("information_schema", "mydb_undo_history") => Ok(mydb_undo_history_rows(db)),
         ("information_schema", "mydb_temporal_history") => {
             Ok(mydb_temporal_history_rows(db))
@@ -6804,28 +6814,29 @@ fn mydb_plan_cache_rows(db: &Database) -> Vec<Vec<Value>> {
 
 /// One row per HNSW vector index in the catalog, joining static catalog
 /// metadata against any warm runtime graph. See `MYDB_VECTOR_INDEXES_COLUMNS`.
-fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
+fn mydb_vector_indexes_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
     use crate::storage::naming::normalize_name;
     use crate::storage::schema::DataTypeKind;
     let visibility = Visibility::compute(db);
     let runtime = db.vector_index_runtime_stats();
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for table in db.catalog().tables.values() {
+    let catalog = db.catalog();
+    visit_requested_table_descriptors(db, &catalog, request, |table| {
         if !visibility.table_visible(&table.database, &table.name) {
-            continue;
+            return;
         }
         for index in table.iter_public_indexes() {
             if !index.is_vector() {
                 continue;
             }
-            let meta = index.vector_meta();
+            let meta = index.vector_meta_for_table(&table);
             let col_name = index.columns.first().cloned().unwrap_or_default();
             let declared_dim = table
                 .columns
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(&col_name))
                 .and_then(|c| match &c.data_type {
-                    DataTypeKind::Vector { dim } => *dim,
+                    DataTypeKind::Vector { dim, .. } => *dim,
                     _ => None,
                 });
             let stats = runtime.get(&(table.id, normalize_name(&index.name)));
@@ -6856,7 +6867,7 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 opt_i64(stats.map(|st| st.last_persisted_lsn as i64)),
                 // ALGO from the catalog (available even when cold).
                 s(match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8 => "IVF_SQ8",
+                    crate::storage::schema::VectorAlgo::Ivf => "IVF",
                     crate::storage::schema::VectorAlgo::Hnsw => "HNSW",
                 }),
                 meta.nlist
@@ -6868,9 +6879,9 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 opt_i64(stats.map(|st| st.list_max_entries as i64)),
                 opt_i64(stats.map(|st| st.list_p95_entries as i64)),
                 match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8 => stats
+                    crate::storage::schema::VectorAlgo::Ivf => stats
                         .map(|st| {
-                            s(if st.backend != "ivf_paged" || st.finalized {
+                            s(if st.backend != "ivf_paged_native" || st.finalized {
                                 "READY"
                             } else {
                                 "REBUILD_REQUIRED"
@@ -6880,7 +6891,7 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                     crate::storage::schema::VectorAlgo::Hnsw => Value::Null,
                 },
                 match index.vector_algo() {
-                    crate::storage::schema::VectorAlgo::IvfSq8 => {
+                    crate::storage::schema::VectorAlgo::Ivf => {
                         opt_i64(stats.map(|st| st.inserts_since_train as i64))
                     }
                     crate::storage::schema::VectorAlgo::Hnsw => Value::Null,
@@ -6899,9 +6910,29 @@ fn mydb_vector_indexes_rows(db: &Database) -> Vec<Vec<Value>> {
                 meta.train_sample_mult
                     .map(|v| Value::Int(v as i64))
                     .unwrap_or(Value::Null),
+                s(index
+                    .vector
+                    .as_ref()
+                    .map_or("none", |v| v.quantization.name())),
+                stats
+                    .map(|st| {
+                        s(if st.quantization_pending {
+                            "PENDING_TRAINING"
+                        } else {
+                            "READY"
+                        })
+                    })
+                    .unwrap_or(Value::Null),
+                opt_i64(stats.map(|st| st.quantizer_bytes as i64)),
+                opt_i64(stats.map(|st| st.compressed_bytes as i64)),
+                opt_i64(stats.map(|st| st.quantization_exceptions as i64)),
+                Value::Int(index.vector.as_ref().map_or(4, |v| v.rerank_mult) as i64),
+                opt_i64(stats.map(|st| st.candidates_returned as i64)),
+                opt_i64(stats.map(|st| st.heap_reranks as i64)),
+                opt_i64(stats.map(|st| st.exact_fallbacks as i64)),
             ]);
         }
-    }
+    });
     rows
 }
 

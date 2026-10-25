@@ -300,6 +300,8 @@ pub(crate) enum Metric {
     /// `ORDER BY DISTANCE(...) LIMIT k` selects the largest dot products
     /// (pgvector's `<#>` semantics).
     Dot,
+    Hamming,
+    Jaccard,
 }
 
 impl Metric {
@@ -312,6 +314,8 @@ impl Metric {
             "DOT" | "IP" | "INNER_PRODUCT" | "DOT_PRODUCT" | "NEGATIVE_INNER_PRODUCT" => {
                 Some(Metric::Dot)
             }
+            "HAMMING" => Some(Metric::Hamming),
+            "JACCARD" => Some(Metric::Jaccard),
             _ => None,
         }
     }
@@ -322,6 +326,8 @@ impl Metric {
             Metric::L2 => "L2",
             Metric::Cosine => "COSINE",
             Metric::Dot => "DOT",
+            Metric::Hamming => "HAMMING",
+            Metric::Jaccard => "JACCARD",
         }
     }
 
@@ -332,6 +338,8 @@ impl Metric {
             Metric::L2 => 0,
             Metric::Cosine => 1,
             Metric::Dot => 2,
+            Metric::Hamming => 3,
+            Metric::Jaccard => 4,
         }
     }
 }
@@ -368,72 +376,136 @@ pub(crate) fn l2_sq_batch4(query: &[f32], rows: &[f32], dim: usize) -> [f32; 4] 
     std::array::from_fn(|j| l2_sq(query, &rows[j * dim..j * dim + n]))
 }
 
-/// True for a zero vector (`|v| == 0`). Cosine similarity is undefined for
-/// these, so the `COSINE_DISTANCE` SQL function returns NULL and cosine HNSW
-/// indexes reject them on INSERT (aligning with pgvector / MySQL 9.x, which
-/// return NaN / reject rather than treating a zero vector as "identical").
-#[inline]
-pub(crate) fn is_zero_norm(v: &[f32]) -> bool {
-    dot(v, v) == 0.0
-}
-
-/// Byte-form counterpart of [`is_zero_norm`] over a little-endian f32 vector.
+/// Zero detection over native little-endian FLOAT32 bytes.
 #[inline]
 pub(crate) fn is_zero_norm_bytes(v: &[u8]) -> bool {
-    dot_bytes(v, v) == 0.0
+    v.chunks_exact(4)
+        .all(|x| f32::from_le_bytes(x.try_into().unwrap()) == 0.0)
+}
+
+/// Stable norm across the complete finite f32 input domain.
+pub(crate) fn norm(v: &[f32]) -> f64 {
+    let squared = dot(v, v);
+    if squared.is_normal() {
+        (squared as f64).sqrt()
+    } else {
+        v.iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            .sqrt()
+    }
+}
+
+pub(crate) fn norm_bytes(v: &[u8]) -> f64 {
+    let squared = dot_bytes(v, v);
+    if squared.is_normal() {
+        (squared as f64).sqrt()
+    } else {
+        v.chunks_exact(4)
+            .map(|b| {
+                let x = f32::from_le_bytes(b.try_into().unwrap()) as f64;
+                x * x
+            })
+            .sum::<f64>()
+            .sqrt()
+    }
+}
+
+pub(crate) fn normalize_in_place(v: &mut [f32]) {
+    let n = norm(v);
+    if n > 0.0 {
+        for x in v {
+            *x = (*x as f64 / n) as f32;
+        }
+    }
 }
 
 /// Cosine similarity `(a · b) / (|a|·|b|)`. Zero-norm operands yield NaN.
+#[cfg(test)]
 #[inline]
 pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    // SAFETY: pointers are valid for `n` reads (n ≤ both lengths).
-    let (dot, na, nb) = unsafe { cosine_parts_ptr(a.as_ptr(), b.as_ptr(), n) };
-    finish_cosine(dot, na, nb)
-}
-
-/// Squared norm using exactly the cosine kernel's reduction order. Cached
-/// immutable vectors must not substitute `dot(v, v)`: its SIMD grouping differs.
-#[inline]
-pub(crate) fn cosine_norm_sq(v: &[f32]) -> f32 {
-    unsafe { cosine_parts_ptr(v.as_ptr(), v.as_ptr(), v.len()).1 }
-}
-
-/// Cosine ordering with precomputed squared norms for equal-width vectors.
-/// Selecting only the dot component lets the inlined kernel eliminate both
-/// norm reductions while preserving the original dot's floating-point order.
-#[inline]
-pub(crate) fn cosine_distance_precomputed(a: &[f32], b: &[f32], na: f32, nb: f32) -> f32 {
-    if a.len() != b.len() {
-        return 1.0 - cosine_similarity(a, b);
-    }
-    let dot = unsafe { cosine_parts_ptr(a.as_ptr(), b.as_ptr(), a.len()).0 };
-    1.0 - finish_cosine(dot, na, nb)
+    (1.0 - ordering_distance(a, b, Metric::Cosine)) as f32
 }
 
 /// Ordering distance: **smaller = more similar**. Used by the HNSW graph for
 /// navigation and by the executor to rank candidates. L2 uses squared distance
 /// (sqrt-free) since it ranks identically to true L2.
 #[inline]
-pub(crate) fn ordering_distance(a: &[f32], b: &[f32], metric: Metric) -> f32 {
-    match metric {
-        Metric::L2 => l2_sq(a, b),
-        Metric::Cosine => 1.0 - cosine_similarity(a, b),
-        Metric::Dot => -dot(a, b),
-    }
+pub(crate) fn ordering_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
+    unsafe { ordering_distance_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len()), metric) }
 }
 
-/// Display distance: the value the `DISTANCE()` SQL function returns. Ranks
-/// identically to [`ordering_distance`] (so KNN ordering matches the projected
-/// distance) but reports true Euclidean distance for L2.
+/// Keep ordinary SIMD reductions unchanged; exceptional magnitudes use f64
+/// before subtraction/multiplication. Finite f32 vectors have finite f64 norms.
 #[inline]
-pub(crate) fn display_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
-    let v = match metric {
-        Metric::L2 => l2_sq(a, b).sqrt(),
-        Metric::Cosine => 1.0 - cosine_similarity(a, b),
-        Metric::Dot => -dot(a, b),
-    };
-    v as f64
+unsafe fn ordering_distance_ptr(a: *const f32, b: *const f32, n: usize, metric: Metric) -> f64 {
+    match metric {
+        Metric::Hamming | Metric::Jaccard => return f64::NAN,
+        Metric::L2 => {
+            let value = l2_sq_ptr(a, b, n);
+            if value.is_normal() {
+                return value as f64;
+            }
+            if value == 0.0 && (a == b || libc::memcmp(a.cast(), b.cast(), n * 4) == 0) {
+                return 0.0;
+            }
+        }
+        Metric::Dot => {
+            let value = -dot_ptr(a, b, n);
+            if value.is_normal() {
+                return value as f64;
+            }
+        }
+        Metric::Cosine => {
+            let (d, na, nb) = cosine_parts_ptr(a, b, n);
+            if d.is_finite() && na.is_normal() && nb.is_normal() {
+                return (1.0 - finish_cosine(d, na, nb)) as f64;
+            }
+        }
+    }
+    wide_ordering_distance_ptr(a, b, n, metric)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn wide_ordering_distance_ptr(
+    a: *const f32,
+    b: *const f32,
+    n: usize,
+    metric: Metric,
+) -> f64 {
+    let (mut dot, mut na, mut nb, mut l2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let x = read_unaligned(a.add(i)) as f64;
+        let y = read_unaligned(b.add(i)) as f64;
+        match metric {
+            Metric::Hamming | Metric::Jaccard => return f64::NAN,
+            Metric::L2 => {
+                let d = x - y;
+                l2 += d * d;
+            }
+            Metric::Dot => dot += x * y,
+            Metric::Cosine => {
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+        }
+    }
+    match metric {
+        Metric::Hamming | Metric::Jaccard => return f64::NAN,
+        Metric::L2 => l2,
+        Metric::Dot => -dot,
+        Metric::Cosine => {
+            if na == 0.0 || nb == 0.0 {
+                f64::NAN
+            } else if dot == na && na == nb {
+                0.0
+            } else {
+                1.0 - (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
+            }
+        }
+    }
 }
 
 // ── Public kernels over `&[u8]` little-endian vectors (zero-alloc) ──────────
@@ -452,18 +524,14 @@ fn byte_elems(a: &[u8], b: &[u8]) -> usize {
 
 /// Ordering distance directly over little-endian byte vectors — no allocation.
 #[inline]
-pub(crate) fn ordering_distance_bytes(a: &[u8], b: &[u8], metric: Metric) -> f32 {
-    let n = byte_elems(a, b);
-    let pa = a.as_ptr() as *const f32;
-    let pb = b.as_ptr() as *const f32;
-    // SAFETY: `n` ≤ both byte lengths / 4; the f32 kernels do unaligned reads.
-    match metric {
-        Metric::L2 => unsafe { l2_sq_ptr(pa, pb, n) },
-        Metric::Cosine => {
-            let (d, na, nb) = unsafe { cosine_parts_ptr(pa, pb, n) };
-            1.0 - finish_cosine(d, na, nb)
-        }
-        Metric::Dot => unsafe { -dot_ptr(pa, pb, n) },
+pub(crate) fn ordering_distance_bytes(a: &[u8], b: &[u8], metric: Metric) -> f64 {
+    unsafe {
+        ordering_distance_ptr(
+            a.as_ptr().cast(),
+            b.as_ptr().cast(),
+            byte_elems(a, b),
+            metric,
+        )
     }
 }
 
@@ -471,49 +539,20 @@ pub(crate) fn ordering_distance_bytes(a: &[u8], b: &[u8], metric: Metric) -> f32
 /// f32 byte vector. The paged HNSW re-rank calls this while the candidate page
 /// is pinned, avoiding a full vector copy into transient `Vec<f32>` scratch.
 #[inline]
-pub(crate) fn ordering_distance_f32_bytes(a: &[f32], b: &[u8], metric: Metric) -> f32 {
-    let n = a.len().min(b.len() / std::mem::size_of::<f32>());
+pub(crate) fn ordering_distance_f32_bytes(a: &[f32], b: &[u8], metric: Metric) -> f64 {
+    let n = a.len().min(b.len() / 4);
     #[cfg(target_endian = "little")]
     {
-        let pa = a.as_ptr();
-        let pb = b.as_ptr().cast::<f32>();
-        // SAFETY: `n` is bounded by both inputs; SIMD kernels use unaligned
-        // loads, and persisted vector bytes are native IEEE-754 on LE targets.
-        return match metric {
-            Metric::L2 => unsafe { l2_sq_ptr(pa, pb, n) },
-            Metric::Cosine => {
-                let (d, na, nb) = unsafe { cosine_parts_ptr(pa, pb, n) };
-                1.0 - finish_cosine(d, na, nb)
-            }
-            Metric::Dot => unsafe { -dot_ptr(pa, pb, n) },
-        };
+        unsafe { ordering_distance_ptr(a.as_ptr(), b.as_ptr().cast(), n, metric) }
     }
     #[cfg(target_endian = "big")]
     {
         let decoded: Vec<f32> = b[..n * 4]
             .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte f32")))
+            .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
             .collect();
         ordering_distance(&a[..n], &decoded, metric)
     }
-}
-
-/// Display distance directly over little-endian byte vectors — no allocation.
-#[inline]
-pub(crate) fn display_distance_bytes(a: &[u8], b: &[u8], metric: Metric) -> f64 {
-    let n = byte_elems(a, b);
-    let pa = a.as_ptr() as *const f32;
-    let pb = b.as_ptr() as *const f32;
-    // SAFETY: as above.
-    let v = match metric {
-        Metric::L2 => unsafe { l2_sq_ptr(pa, pb, n).sqrt() },
-        Metric::Cosine => {
-            let (d, na, nb) = unsafe { cosine_parts_ptr(pa, pb, n) };
-            1.0 - finish_cosine(d, na, nb)
-        }
-        Metric::Dot => unsafe { -dot_ptr(pa, pb, n) },
-    };
-    v as f64
 }
 
 /// Dot product directly over little-endian byte vectors — no allocation.
@@ -716,43 +755,8 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     unsafe { dot_i8_ptr(a.as_ptr(), b.as_ptr(), n) }
 }
 
-/// Dot one query against row-major int8 vectors. On aarch64, four rows share
-/// each query load and use eight independent SDOT accumulators; other targets
-/// retain the scalar API as a correctness-preserving fallback.
-pub(crate) fn dot_i8_batch(query: &[i8], rows: &[i8], dim: usize, out: &mut [i32]) {
-    if dim == 0 {
-        out.fill(0);
-        return;
-    }
-    let count = out.len().min(rows.len() / dim);
-    let mut row = 0usize;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let has_dotprod = if cfg!(target_os = "macos") {
-            true
-        } else {
-            std::arch::is_aarch64_feature_detected!("dotprod")
-        };
-        if query.len() >= dim && has_dotprod {
-            while row + 4 <= count {
-                dot_i8_batch4_neon_dotprod(
-                    query.as_ptr(),
-                    rows.as_ptr().add(row * dim),
-                    dim,
-                    out.as_mut_ptr().add(row),
-                );
-                row += 4;
-            }
-        }
-    }
-    while row < count {
-        out[row] = dot_i8(query, &rows[row * dim..row * dim + dim]);
-        row += 1;
-    }
-}
-
-/// Dot one query against four independently located int8 rows. Unlike
-/// [`dot_i8_batch`], HNSW callers do not have contiguous candidates: graph
+/// Dot one query against four independently located int8 rows. HNSW
+/// callers do not have contiguous candidates: graph
 /// neighbours are random ordinals in the resident code arena. Sharing each
 /// query load across four SDOT streams avoids re-reading the query four times
 /// and exposes enough independent accumulators to cover random-row latency.
@@ -795,18 +799,6 @@ pub(crate) fn dot_i8_batch4_ptrs(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
         dot_i8(query, rows[2]),
         dot_i8(query, rows[3]),
     ]
-}
-
-/// Four-row SDOT kernel. Rows are contiguous with stride `n`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-#[inline]
-unsafe fn dot_i8_batch4_neon_dotprod(query: *const i8, rows: *const i8, n: usize, out: *mut i32) {
-    let r0 = rows;
-    let r1 = rows.add(n);
-    let r2 = rows.add(n * 2);
-    let r3 = rows.add(n * 3);
-    dot_i8_batch4_ptrs_neon_dotprod(query, r0, r1, r2, r3, n, out);
 }
 
 /// Four-row SDOT kernel for independently located rows.
@@ -1536,35 +1528,6 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cached_cosine_norms_match_original_bits() {
-        for dim in [0, 1, 3, 7, 8, 15, 16, 31, 67, 128, 257, 768, 1536] {
-            let a = pseudo(dim, 17);
-            let b = pseudo(dim, 93);
-            for scale in [0.0, 1e-10, 1.0, 1000.0] {
-                let b: Vec<f32> = b.iter().map(|v| v * scale).collect();
-                let expected = ordering_distance(&a, &b, Metric::Cosine);
-                let actual =
-                    cosine_distance_precomputed(&a, &b, cosine_norm_sq(&a), cosine_norm_sq(&b));
-                if expected.is_nan() {
-                    assert!(actual.is_nan());
-                } else {
-                    assert_eq!(
-                        actual.to_bits(),
-                        expected.to_bits(),
-                        "dim={dim} scale={scale}"
-                    );
-                }
-            }
-        }
-        let a = pseudo(17, 4);
-        let b = pseudo(9, 2);
-        assert_eq!(
-            cosine_distance_precomputed(&a, &b, cosine_norm_sq(&a), cosine_norm_sq(&b)).to_bits(),
-            ordering_distance(&a, &b, Metric::Cosine).to_bits(),
-        );
-    }
-
     fn pseudo(n: usize, seed: u64) -> Vec<f32> {
         // SplitMix64 → f32 in [-1, 1], deterministic.
         let mut s = seed;
@@ -1602,9 +1565,9 @@ mod tests {
             let ab = to_bytes(&a);
             let bb = to_bytes(&b);
 
-            let want_l2 = l2_sq_scalar(&a, &b);
+            let want_l2 = l2_sq_scalar(&a, &b) as f64;
             for got in [
-                l2_sq(&a, &b),
+                l2_sq(&a, &b) as f64,
                 ordering_distance_bytes(&ab, &bb, Metric::L2),
                 ordering_distance_f32_bytes(&a, &bb, Metric::L2),
             ] {
@@ -1631,17 +1594,17 @@ mod tests {
             // Cosine via the byte ordering path: 1 - sim.
             let got_cos_dist = ordering_distance_bytes(&ab, &bb, Metric::Cosine);
             assert!(
-                (got_cos_dist - (1.0 - want_cos)).abs() <= 1e-3,
+                (got_cos_dist - (1.0 - want_cos) as f64).abs() <= 1e-3,
                 "cosine-bytes dim={dim}"
             );
             let got_mixed_cos = ordering_distance_f32_bytes(&a, &bb, Metric::Cosine);
             assert!(
-                (got_mixed_cos - (1.0 - want_cos)).abs() <= 1e-3,
+                (got_mixed_cos - (1.0 - want_cos) as f64).abs() <= 1e-3,
                 "cosine-mixed dim={dim}"
             );
             let got_mixed_dot = ordering_distance_f32_bytes(&a, &bb, Metric::Dot);
             assert!(
-                (got_mixed_dot + want_dot).abs() <= 1e-3 * want_dot.abs().max(1.0),
+                (got_mixed_dot + want_dot as f64).abs() <= 1e-3 * (want_dot as f64).abs().max(1.0),
                 "dot-mixed dim={dim}"
             );
         }
@@ -1787,27 +1750,6 @@ mod tests {
     }
 
     #[test]
-    fn dot_i8_batch_matches_single_row_kernel() {
-        for &dim in &[1usize, 31, 32, 33, 128, 768] {
-            let query_f = pseudo(dim, 0x1234 + dim as u64);
-            let mut query = vec![0i8; dim];
-            quantize_into(&query_f, 0.0, 127.0, &mut query);
-            let mut rows = Vec::new();
-            let mut expected = Vec::new();
-            for row in 0..9u64 {
-                let values = pseudo(dim, 0x9000 + row * 17 + dim as u64);
-                let mut codes = vec![0i8; dim];
-                quantize_into(&values, 0.0, 127.0, &mut codes);
-                expected.push(dot_i8(&query, &codes));
-                rows.extend_from_slice(&codes);
-            }
-            let mut got = vec![0i32; expected.len()];
-            dot_i8_batch(&query, &rows, dim, &mut got);
-            assert_eq!(got, expected, "batch dot dim={dim}");
-        }
-    }
-
-    #[test]
     fn dot_i8_batch4_ptrs_matches_independent_rows() {
         for &dim in &[1usize, 31, 32, 33, 128, 768] {
             let query_f = pseudo(dim, 0xC001 + dim as u64);
@@ -1878,6 +1820,181 @@ mod tests {
         let mut bb = vec![0u8; 1];
         bb.extend_from_slice(&to_bytes(&b));
         let got = ordering_distance_bytes(&ab[1..], &bb[1..], Metric::L2);
-        assert!((got - want).abs() <= 1e-3 * want.abs().max(1.0));
+        assert!((got - want as f64).abs() <= 1e-3 * (want as f64).abs().max(1.0));
+    }
+}
+
+/// Exact scoring of native payloads, with no per-candidate allocation.
+pub(crate) fn typed_ordering_distance<
+    A: crate::vector::VectorInput + ?Sized,
+    B: crate::vector::VectorInput + ?Sized,
+>(
+    a: &A,
+    b: &B,
+    metric: Metric,
+) -> Result<f64, crate::types::QueryError> {
+    use super::codec::vector_err;
+    use crate::vector::VectorDataType as D;
+    if a.dimension() != b.dimension() {
+        return Err(vector_err("VECTOR dimension mismatch"));
+    }
+    let binary = a.datatype() == D::Binary || b.datatype() == D::Binary;
+    if binary {
+        if a.datatype() != D::Binary
+            || b.datatype() != D::Binary
+            || !matches!(metric, Metric::Hamming | Metric::Jaccard)
+        {
+            return Err(vector_err(
+                "BINARY vectors require HAMMING or JACCARD and two BINARY operands",
+            ));
+        }
+        let mut different = 0u64;
+        let mut intersection = 0u64;
+        let mut union = 0u64;
+        for (x, y) in a.payload().chunks(8).zip(b.payload().chunks(8)) {
+            let mut xb = [0; 8];
+            let mut yb = [0; 8];
+            xb[..x.len()].copy_from_slice(x);
+            yb[..y.len()].copy_from_slice(y);
+            let x = u64::from_le_bytes(xb);
+            let y = u64::from_le_bytes(yb);
+            if metric == Metric::Hamming {
+                different += (x ^ y).count_ones() as u64;
+            } else {
+                intersection += (x & y).count_ones() as u64;
+                union += (x | y).count_ones() as u64;
+            }
+        }
+        return Ok(if metric == Metric::Hamming {
+            different as f64
+        } else if union == 0 {
+            0.0
+        } else {
+            1.0 - intersection as f64 / union as f64
+        });
+    }
+    if matches!(metric, Metric::Hamming | Metric::Jaccard) {
+        return Err(vector_err("HAMMING/JACCARD require BINARY vectors"));
+    }
+    if a.datatype() == D::Float32 && b.datatype() == D::Float32 {
+        return Ok(ordering_distance_bytes(a.payload(), b.payload(), metric));
+    }
+    if a.datatype() == D::Int8 && b.datatype() == D::Int8 {
+        let (mut l2, mut dot, mut na, mut nb) = (0i64, 0i64, 0i64, 0i64);
+        for (&x, &y) in a.payload().iter().zip(b.payload()) {
+            let x = x as i8 as i64;
+            let y = y as i8 as i64;
+            match metric {
+                Metric::L2 => l2 += (x - y) * (x - y),
+                Metric::Dot => dot += x * y,
+                Metric::Cosine => {
+                    dot += x * y;
+                    na += x * x;
+                    nb += y * y;
+                }
+                _ => unreachable!(),
+            }
+        }
+        return Ok(match metric {
+            Metric::L2 => l2 as f64,
+            Metric::Dot => -(dot as f64),
+            Metric::Cosine => {
+                if na == 0 || nb == 0 {
+                    f64::NAN
+                } else {
+                    1.0 - ((dot as f64) / ((na as f64).sqrt() * (nb as f64).sqrt()))
+                        .clamp(-1.0, 1.0)
+                }
+            }
+            _ => unreachable!(),
+        });
+    }
+    let (mut sum, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    let mut left = [0.0f32; 64];
+    let mut right = [0.0f32; 64];
+    for start in (0..a.dimension() as usize).step_by(64) {
+        let length = (a.dimension() as usize - start).min(64);
+        decode_native_block(a, start, &mut left[..length]);
+        decode_native_block(b, start, &mut right[..length]);
+        let l = &left[..length];
+        let r = &right[..length];
+        match metric {
+            Metric::L2 => sum += ordering_distance(l, r, Metric::L2),
+            Metric::Dot => sum += ordering_distance(l, r, Metric::Dot),
+            Metric::Cosine => {
+                sum -= ordering_distance(l, r, Metric::Dot);
+                na -= ordering_distance(l, l, Metric::Dot);
+                nb -= ordering_distance(r, r, Metric::Dot);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(match metric {
+        Metric::L2 | Metric::Dot => sum,
+        Metric::Cosine => {
+            if na == 0.0 || nb == 0.0 {
+                f64::NAN
+            } else {
+                1.0 - (sum / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
+            }
+        }
+        _ => unreachable!(),
+    })
+}
+
+fn decode_native_block<V: crate::vector::VectorInput + ?Sized>(
+    value: &V,
+    start: usize,
+    out: &mut [f32],
+) {
+    use crate::vector::VectorDataType as D;
+    use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+    match value.datatype() {
+        D::Float16 | D::BFloat16 => {
+            let mut words = [0u16; 64];
+            for (word, bytes) in words
+                .iter_mut()
+                .zip(value.payload()[start * 2..(start + out.len()) * 2].chunks_exact(2))
+            {
+                *word = u16::from_le_bytes(bytes.try_into().unwrap());
+            }
+            let words = &words[..out.len()];
+            if value.datatype() == D::Float16 {
+                words
+                    .reinterpret_cast::<half::f16>()
+                    .convert_to_f32_slice(out);
+            } else {
+                words
+                    .reinterpret_cast::<half::bf16>()
+                    .convert_to_f32_slice(out);
+            }
+        }
+        D::Float32 => {
+            for (x, bytes) in out
+                .iter_mut()
+                .zip(value.payload()[start * 4..].chunks_exact(4))
+            {
+                *x = f32::from_le_bytes(bytes.try_into().unwrap());
+            }
+        }
+        D::Int8 => {
+            for (x, &v) in out.iter_mut().zip(&value.payload()[start..]) {
+                *x = (v as i8) as f32;
+            }
+        }
+        D::Binary => unreachable!("binary distances use packed kernels"),
+    }
+}
+
+/// Domain-independent zero detection does not underflow on floating subnormals.
+pub(crate) fn typed_is_zero(value: &crate::vector::VectorValue) -> bool {
+    use crate::vector::VectorDataType as D;
+    match value.datatype {
+        D::Float32 => is_zero_norm_bytes(&value.payload),
+        D::Float16 | D::BFloat16 => value
+            .payload
+            .chunks_exact(2)
+            .all(|v| u16::from_le_bytes(v.try_into().unwrap()) & 0x7fff == 0),
+        D::Int8 | D::Binary => value.payload.iter().all(|&v| v == 0),
     }
 }

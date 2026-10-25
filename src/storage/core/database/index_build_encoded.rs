@@ -5822,6 +5822,7 @@ mod encoded_index_program_tests {
             index_type: "BTREE".into(),
             visible: true,
             comment: String::new(),
+            vector: None,
             fulltext: None,
         }
     }

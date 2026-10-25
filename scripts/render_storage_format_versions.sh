@@ -45,8 +45,7 @@ The current development format is incompatible with earlier versions. If version
 | B-tree index file / page | $(version INDEX_VERSION) / $(version INDEX_PAGE_VERSION) |
 | undo binary / tablespace | $(version UNDO_BINARY_VERSION) / $(version UNDO_TABLESPACE_VERSION) |
 | overflow | $(version OVERFLOW_VERSION) |
-| paged HNSW index / page | $(version PAGED_HNSW_INDEX_VERSION) / $(version PAGED_HNSW_PAGE_VERSION) |
-| paged IVF_SQ8 index / page | $(version PAGED_IVF_INDEX_VERSION) / $(version PAGED_IVF_PAGE_VERSION) |
+| paged vector container (HNSW / IVF) index / page | $(version PAGED_HNSW_INDEX_VERSION) / $(version PAGED_HNSW_PAGE_VERSION) |
 | Zone Map file / page | $(version ZONE_MAP_VERSION) / $(version PAGED_ZONE_MAP_PAGE_VERSION) |
 | legacy in-memory HNSW snapshot | $(version IN_MEMORY_HNSW_VERSION) |
 | native replication metadata | $(version NATIVE_REPLICATION_METADATA_VERSION) |

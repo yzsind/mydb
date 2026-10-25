@@ -280,9 +280,9 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             }
             let columns = convert_index_columns(index_columns)?;
             let (index_type, comment) = convert_index_type_and_options(using, &index_options)?;
-            // BTREE and vector (HNSW / IVF_SQ8) indexes are creatable via
+            // BTREE and vector (HNSW / IVF) indexes are creatable via
             // CREATE INDEX; SPATIAL/FULLTEXT use dedicated keyword paths.
-            if index_type != "BTREE" && index_type != "HNSW" && index_type != "IVF_SQ8" {
+            if index_type != "BTREE" && index_type != "HNSW" && index_type != "IVF" {
                 return unsupported(&format!("CREATE INDEX USING {index_type}"));
             }
             let included_columns: Vec<String> = include.into_iter().map(ident_value).collect();
@@ -314,6 +314,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
                 // The FULLTEXT keyword is stripped in [`strip_create_index_fulltext`];
                 // here we convert as a plain index first; the parser name is injected later by [`apply_fulltext_parsers`].
                 fulltext_parser: String::new(),
+                vector_options: None,
             }))
         }
         SqlStatement::Analyze(analyze) => convert_analyze(sql, analyze),
@@ -1169,6 +1170,7 @@ fn convert_create_table(
                 visible: true,
                 comment: String::new(),
                 fulltext_parser: String::new(),
+                vector_options: None,
             });
         }
         columns.push(column);
@@ -1219,6 +1221,7 @@ fn convert_create_table(
                         visible: true,
                         comment,
                         fulltext_parser: String::new(),
+                        vector_options: None,
                     });
                 } else {
                     primary_key = columns.names;
@@ -1257,6 +1260,7 @@ fn convert_create_table(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::Index(constraint) => {
@@ -1265,9 +1269,9 @@ fn convert_create_table(
                     constraint.index_type,
                     &constraint.index_options,
                 )?;
-                // BTREE and vector (HNSW / IVF_SQ8) indexes are allowed as inline
+                // BTREE and vector (HNSW / IVF) indexes are allowed as inline
                 // table keys; other special index types use dedicated keyword paths.
-                if index_type != "BTREE" && index_type != "HNSW" && index_type != "IVF_SQ8" {
+                if index_type != "BTREE" && index_type != "HNSW" && index_type != "IVF" {
                     return Ok(Statement::Unsupported {
                         kind: format!("INDEX USING {index_type}"),
                         sql: sql.to_string(),
@@ -1286,6 +1290,7 @@ fn convert_create_table(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::Check(constraint) => {
@@ -1316,6 +1321,7 @@ fn convert_create_table(
                     visible: true,
                     comment: String::new(),
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::FulltextOrSpatial(constraint) => {
@@ -1345,6 +1351,7 @@ fn convert_create_table(
                     visible: true,
                     comment: String::new(),
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 });
             }
             TableConstraint::ForeignKey(fk) => {
@@ -1605,6 +1612,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             }
             TableConstraint::PrimaryKey(constraint) => {
@@ -1640,6 +1648,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             }
             TableConstraint::Index(constraint) => {
@@ -1661,6 +1670,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment,
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             }
             TableConstraint::Check(constraint) => {
@@ -1715,6 +1725,7 @@ fn convert_alter_table_action(
                     visible: true,
                     comment: String::new(),
                     fulltext_parser: String::new(),
+                    vector_options: None,
                 })
             } // NB: `TableConstraint` is matched exhaustively — a new
               // sqlparser variant will surface as a compile error here rather
@@ -3936,7 +3947,10 @@ fn convert_data_type_with_unsigned(
             let name_str = name.to_string();
             if name_str.eq_ignore_ascii_case("VECTOR") {
                 // `VECTOR(n)` — the dimension arrives as a string modifier.
-                DataType::Vector(parse_vector_dim(&modifiers, sql)?)
+                {
+                    let (dim, datatype) = parse_vector_type(&modifiers, sql)?;
+                    DataType::Vector(dim, datatype)
+                }
             } else if name_str.eq_ignore_ascii_case("NCHAR") {
                 let length = match modifiers.as_slice() {
                     [] => None,
@@ -5611,6 +5625,18 @@ fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>)
                         extra.push(Expr::Literal(Literal::Int(n as i64)));
                     }
                     ("CHAR".to_string(), extra)
+                }
+                "VECTOR" => {
+                    let (dim, datatype) = parse_vector_type(args, "CAST AS VECTOR")?;
+                    let extra = dim
+                        .map(|d| {
+                            vec![
+                                Expr::Literal(Literal::Int(d as i64)),
+                                Expr::Literal(Literal::String(datatype.name().into())),
+                            ]
+                        })
+                        .unwrap_or_default();
+                    ("VECTOR".into(), extra)
                 }
                 _ => (upper, vec![]),
             }
@@ -8008,28 +8034,41 @@ fn validate_year_display_width(modifiers: &[String], sql: &str) -> Result<(), Pa
     })
 }
 
-fn parse_vector_dim(modifiers: &[String], sql: &str) -> Result<Option<u32>, ParseError> {
+fn parse_vector_type(
+    modifiers: &[String],
+    sql: &str,
+) -> Result<(Option<u32>, crate::vector::VectorDataType), ParseError> {
+    use crate::vector::VectorDataType;
     let span = Span {
         start: 0,
         end: sql.len(),
     };
-    let Some(raw) = modifiers.first() else {
-        return Ok(None);
-    };
-    let dim: u32 = raw.trim().parse().map_err(|_| {
-        ParseError::unsupported_at(sql, span, format!("invalid VECTOR dimension '{raw}'"))
-    })?;
-    if dim == 0 || dim as usize > crate::engine::vector::codec::MAX_DIM {
-        return Err(ParseError::unsupported_at(
-            sql,
-            span,
-            format!(
-                "VECTOR dimension {dim} out of range [1, {}]",
-                crate::engine::vector::codec::MAX_DIM
-            ),
+    let fail = |message: String| ParseError::unsupported_at(sql, span, message);
+    if modifiers.is_empty() {
+        return Ok((None, VectorDataType::Float32));
+    }
+    if modifiers.len() > 2 {
+        return Err(fail(
+            "VECTOR accepts dimension and optional datatype".into(),
         ));
     }
-    Ok(Some(dim))
+    let datatype = if modifiers.len() == 2 {
+        VectorDataType::parse(&modifiers[1])
+            .ok_or_else(|| fail(format!("invalid VECTOR datatype '{}'", modifiers[1])))?
+    } else {
+        VectorDataType::Float32
+    };
+    let dim: u32 = modifiers[0]
+        .trim()
+        .parse()
+        .map_err(|_| fail(format!("invalid VECTOR dimension '{}'", modifiers[0])))?;
+    if dim == 0 || dim > datatype.max_dimension() {
+        return Err(fail(format!(
+            "VECTOR dimension {dim} out of range [1, {}] for {datatype}",
+            datatype.max_dimension()
+        )));
+    }
+    Ok((Some(dim), datatype))
 }
 
 /// Extract the column name from the column reference of `MATCH (cols)`. Phase 1
@@ -8456,7 +8495,7 @@ pub(super) fn fold_const_string_to_vector(expr: Expr) -> Expr {
         {
             if let Expr::Literal(Literal::String(s)) = &args[0] {
                 if let Ok(bytes) = crate::engine::vector::codec::parse_text(s) {
-                    return Expr::BoundValue(crate::types::Value::Vector(bytes));
+                    return Expr::BoundValue(crate::types::Value::Vector(bytes.into()));
                 }
             }
         }

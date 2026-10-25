@@ -510,7 +510,7 @@ pub(super) fn execute_load_data_with_reader(
     }
     // B1 — the fast/parallel LOAD paths write heap-only and never run the
     // `note_vector_*` maintenance hooks, so any row bulk-loaded into a table
-    // with an already-*warm* vector index (HNSW or IVF_SQ8) would be absent
+    // with an already-*warm* vector index (HNSW or IVF) would be absent
     // from KNN results until restart/OPTIMIZE. Evict the warm graphs on a
     // successful load (no file deletion — the next KNN query rebuilds from the
     // now-complete heap). Cold graphs are unaffected, and a bulk rebuild is the
@@ -5676,7 +5676,10 @@ enum CoercionOp {
     },
     PassThroughString,
     PassThroughBytes,
-    VectorBase64,
+    VectorBase64 {
+        datatype: crate::vector::VectorDataType,
+        dimension: Option<u32>,
+    },
     Date,
     Time,
     DateTime,
@@ -5733,11 +5736,14 @@ fn build_coercion_plan(table: &TableSchema, column_indexes: &[usize]) -> Vec<Coe
                 // Geometry is loaded as raw text (WKT) or bytes (WKB/internal)
                 // and coerced to internal form by the column constraint path.
                 DataTypeKind::Geometry { .. } => CoercionOp::PassThroughString,
-                DataTypeKind::Vector { .. } => {
+                DataTypeKind::Vector { dim, datatype } => {
                     if std::env::var("MYDB_LOAD_DATA_VECTOR_FORMAT")
                         .is_ok_and(|v| v.eq_ignore_ascii_case("base64"))
                     {
-                        CoercionOp::VectorBase64
+                        CoercionOp::VectorBase64 {
+                            datatype: *datatype,
+                            dimension: *dim,
+                        }
                     } else {
                         CoercionOp::PassThroughString
                     }
@@ -6410,7 +6416,10 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
             Ok(str_to_string_value(load_utf8(field_bytes)?))
         }
         CoercionOp::PassThroughBytes => Ok(Value::Bytes(field_bytes.to_vec())),
-        CoercionOp::VectorBase64 => {
+        CoercionOp::VectorBase64 {
+            datatype,
+            dimension,
+        } => {
             use base64::Engine;
             let clean: Vec<u8> = field_bytes
                 .iter()
@@ -6425,7 +6434,10 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
                         "invalid base64 VECTOR value in LOAD DATA",
                     )
                 })?;
-            Ok(Value::Vector(bytes))
+            let dimension = dimension.unwrap_or((bytes.len() / 4) as u32);
+            let value = crate::vector::VectorValue::new(*datatype, dimension, bytes);
+            crate::engine::vector::validate_internal(&value)?;
+            Ok(Value::Vector(value))
         }
         CoercionOp::Date
         | CoercionOp::Time

@@ -1,24 +1,20 @@
-//! Internal binary codec for the MySQL-compatible `VECTOR` data type.
+//! Native vector codecs, strict numeric conversion and canonical array text.
 //!
-//! A `VECTOR(n)` value is stored — on disk, inside [`crate::types::Value::Vector`],
-//! and on the wire — as a bare little-endian `f32` array: `n` consecutive
-//! 4-byte IEEE-754 floats, so `dim = bytes.len() / 4`. This mirrors MySQL 9.0's
-//! internal vector format and keeps reads zero-parse (the bytes are already the
-//! payload). The text form `[a, b, c]` is produced only at the protocol /
-//! `VECTOR_TO_STRING` boundary, exactly like JSON/GEOMETRY render lazily.
-//!
-//! `Vec<u8>` is not guaranteed 4-byte aligned, so callers that do arithmetic
-//! decode to an owned `Vec<f32>` ([`to_f32`]) first; distance kernels then run
-//! over aligned `&[f32]` where the compiler can emit SIMD (see [`super::distance`]).
+//! Fixed-dimension heap lanes keep native little-endian payloads and obtain
+//! datatype/dimension from their row layout. Standalone values, spills and
+//! replication envelopes retain the explicit domain. Binary payloads pack bits
+//! least-significant bit first. Exact kernels borrow payloads without per-row
+//! FLOAT32 materialization.
 
+use crate::vector::{VectorDataType, VectorInput, VectorValue};
 use std::cmp::Ordering;
 
 use crate::types::QueryError;
 
 /// Portable row-binlog envelope for VECTOR values encoded as a MySQL LONG
 /// BLOB. MySQL 8.0 replicas can store it losslessly in a BLOB column; mydb
-/// replicas recognize the magic and recover the native little-endian f32 body.
-pub(crate) const VECTOR_BINLOG_MAGIC: &[u8; 8] = b"MYDBVEC1";
+/// replicas recognize the magic and recover the explicit datatype, dimension and native payload.
+pub(crate) const VECTOR_BINLOG_MAGIC: &[u8; 8] = b"MYDBVEC2";
 
 /// Build a `QueryError` for an invalid VECTOR value/operation. Centralised so
 /// the error code / SQLSTATE conventions stay consistent across the module.
@@ -31,83 +27,68 @@ pub(crate) fn vector_err(message: impl Into<String>) -> QueryError {
 /// MySQL 9.0's `VECTOR` cap (16383 four-byte elements ≈ 64 KiB).
 pub(crate) const MAX_DIM: usize = 16383;
 
-/// Dimension (element count) of an internal vector byte string.
-#[inline]
-pub(crate) fn dim(internal: &[u8]) -> usize {
-    internal.len() / 4
-}
-
-/// Decode internal little-endian bytes into an owned, aligned `Vec<f32>`.
-/// A trailing partial element (should never occur after [`normalize_internal`])
-/// is ignored.
-#[inline]
-pub(crate) fn to_f32(internal: &[u8]) -> Vec<f32> {
-    internal
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+pub(crate) fn to_f32<T: VectorInput + ?Sized>(internal: &T) -> Vec<f32> {
+    (0..internal.dimension() as usize)
+        .map(|i| internal.element(i) as f32)
         .collect()
 }
 
-/// Encode an `f32` slice into internal little-endian bytes. Used by the
-/// vector-producing SQL functions (`L2_NORMALIZE` / `SUBVECTOR`) and as a
-/// convenience for constructing vector fixtures in tests.
-#[inline]
-pub(crate) fn from_f32(values: &[f32]) -> Vec<u8> {
+pub(crate) fn from_f32(values: &[f32]) -> VectorValue {
     let mut out = Vec::with_capacity(values.len() * 4);
     for &v in values {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out
+    out.into()
 }
 
-/// Validate an internal byte string in place (zero allocation): the length
-/// must be a whole number of 4-byte elements, the dimension within
-/// `[1, MAX_DIM]`, and every element finite. The finite test inspects the
-/// IEEE-754 exponent bits directly — NaN and ±Inf are exactly the encodings
-/// with all eight exponent bits set (`0x7F80_0000`), independent of sign or
-/// mantissa — so it word-steps the buffer and the compiler can vectorise it,
-/// instead of materialising an `f32` per element and calling `is_finite`.
-pub(crate) fn validate_internal(bytes: &[u8]) -> Result<(), QueryError> {
-    if bytes.len() % 4 != 0 {
-        return Err(vector_err(
-            "invalid VECTOR value: byte length is not a multiple of 4",
-        ));
-    }
-    let d = bytes.len() / 4;
-    if d == 0 {
-        return Err(vector_err("invalid VECTOR value: dimension must be >= 1"));
-    }
-    if d > MAX_DIM {
+pub(crate) fn validate_internal<T: VectorInput + ?Sized>(value: &T) -> Result<(), QueryError> {
+    let datatype = value.datatype();
+    let dimension = value.dimension();
+    let bytes = value.payload();
+    if dimension == 0
+        || dimension > datatype.max_dimension()
+        || bytes.len() != datatype.payload_len(dimension)
+    {
         return Err(vector_err(format!(
-            "VECTOR dimension {d} exceeds the maximum of {MAX_DIM}"
+            "invalid {datatype} VECTOR dimension or payload length"
         )));
     }
-    for c in bytes.chunks_exact(4) {
-        let bits = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        if bits & 0x7F80_0000 == 0x7F80_0000 {
-            return Err(vector_err(
-                "invalid VECTOR value: elements must be finite (no NaN/Inf)",
-            ));
+    let finite = match datatype {
+        VectorDataType::Float32 => bytes
+            .chunks_exact(4)
+            .all(|c| u32::from_le_bytes(c.try_into().unwrap()) & 0x7f80_0000 != 0x7f80_0000),
+        VectorDataType::Float16 => bytes
+            .chunks_exact(2)
+            .all(|c| u16::from_le_bytes(c.try_into().unwrap()) & 0x7c00 != 0x7c00),
+        VectorDataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .all(|c| u16::from_le_bytes(c.try_into().unwrap()) & 0x7f80 != 0x7f80),
+        VectorDataType::Int8 => true,
+        VectorDataType::Binary => {
+            dimension % 8 == 0 || bytes.last().is_some_and(|b| b >> (dimension % 8) == 0)
         }
+    };
+    if !finite {
+        return Err(vector_err(
+            "invalid VECTOR value: non-finite element or nonzero binary padding",
+        ));
     }
     Ok(())
 }
 
-/// Validate and canonicalise an internal byte string, returning an owned copy.
-/// Callers that already hold the bytes and only need to copy them into a row
-/// buffer should prefer [`validate_internal`] + a direct copy to avoid this
-/// allocation; this owned form is for the text/bytes coercion paths that must
-/// produce a fresh `Vec` anyway.
-pub(crate) fn normalize_internal(bytes: &[u8]) -> Result<Vec<u8>, QueryError> {
-    validate_internal(bytes)?;
-    Ok(bytes.to_vec())
+pub(crate) fn normalize_internal<T: VectorInput + ?Sized>(
+    value: &T,
+) -> Result<VectorValue, QueryError> {
+    validate_internal(value)?;
+    Ok(VectorValue::new(
+        value.datatype(),
+        value.dimension(),
+        value.payload().to_vec(),
+    ))
 }
 
-/// Owned twin of [`normalize_internal`]. Assignment coercion already owns its
-/// `Value`, so validating and returning that allocation avoids copying every
-/// high-dimensional vector before the row encoder copies it into page/WAL
-/// storage.
-pub(crate) fn normalize_internal_owned(bytes: Vec<u8>) -> Result<Vec<u8>, QueryError> {
+#[cfg(test)]
+pub(crate) fn normalize_internal_owned(bytes: VectorValue) -> Result<VectorValue, QueryError> {
     validate_internal(&bytes)?;
     Ok(bytes)
 }
@@ -244,7 +225,7 @@ fn parse_f32_fast(s: &str) -> Option<f32> {
 /// Parse the JSON-array text form `"[a, b, c]"` into internal bytes. Accepts
 /// integers, decimals, scientific notation, signs, and surrounding / interior
 /// whitespace. `"[]"` is rejected (a vector needs at least one dimension).
-pub(crate) fn parse_text(s: &str) -> Result<Vec<u8>, QueryError> {
+pub(crate) fn parse_text(s: &str) -> Result<VectorValue, QueryError> {
     let trimmed = s.trim();
     let inner = trimmed
         .strip_prefix('[')
@@ -328,48 +309,57 @@ pub(crate) fn parse_text(s: &str) -> Result<Vec<u8>, QueryError> {
             }
         }
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 /// Render internal bytes as the canonical text form `"[a,b,c]"`. Returns an
 /// empty string on undecodable input (lenient contract matching
 /// `json::to_text` / `geo::to_text`). Elements use the shortest round-trippable
 /// `f32` representation.
-pub(crate) fn to_text(internal: &[u8]) -> String {
+pub(crate) fn to_text<T: VectorInput + ?Sized>(internal: &T) -> String {
     let mut out = String::new();
     to_text_into(internal, &mut out);
     out
 }
 
-/// Serialise internal vector bytes to `[a,b,c]` text, reusing the caller's
-/// buffer (cleared first). Lets the result-set row encoder avoid one
-/// `String` allocation per VECTOR cell by threading a scratch across rows.
-pub(crate) fn to_text_into(internal: &[u8], out: &mut String) {
+pub(crate) fn to_text_into<T: VectorInput + ?Sized>(internal: &T, out: &mut String) {
     out.clear();
-    if internal.is_empty() || internal.len() % 4 != 0 {
+    if validate_internal(internal).is_err() {
         return;
     }
-    out.reserve(internal.len() * 4 + 2);
+    use std::fmt::Write;
+    let width = match internal.datatype() {
+        VectorDataType::Binary => 2,
+        VectorDataType::Int8 => 5,
+        VectorDataType::Float16 => 24,
+        _ => 48,
+    };
+    out.reserve(internal.dimension() as usize * width + 2);
     out.push('[');
-    for (i, c) in internal.chunks_exact(4).enumerate() {
+    let bytes = internal.payload();
+    let mut integer = itoa::Buffer::new();
+    for i in 0..internal.dimension() as usize {
         if i > 0 {
             out.push(',');
         }
-        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        out.push_str(&format_f32(v));
+        match internal.datatype() {
+            VectorDataType::Binary => out.push(if bytes[i / 8] & (1 << (i % 8)) == 0 {
+                '0'
+            } else {
+                '1'
+            }),
+            VectorDataType::Int8 => out.push_str(integer.format(bytes[i] as i8)),
+            _ => {
+                let value = internal.element(i) as f32;
+                if value == 0.0 {
+                    out.push('0');
+                } else {
+                    write!(out, "{value}").expect("String formatting");
+                }
+            }
+        }
     }
     out.push(']');
-}
-
-/// Shortest decimal that round-trips to `v` (Rust's default `f32` Display is
-/// already shortest-round-trip). `-0.0` is normalised to `0`.
-#[inline]
-fn format_f32(v: f32) -> String {
-    if v == 0.0 {
-        "0".to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 /// Interpret an arbitrary byte string as internal vector bytes: first as the
@@ -377,17 +367,9 @@ fn format_f32(v: f32) -> String {
 /// `[..]` text. Used when a string/bytes value flows into a `VECTOR` column or
 /// a vector function. `Value`-level coercion that also accepts an existing
 /// `Value::Vector` lives in the storage / SQL layer.
-pub(crate) fn coerce_bytes_to_internal(b: &[u8]) -> Result<Vec<u8>, QueryError> {
+pub(crate) fn coerce_bytes_to_internal(b: &[u8]) -> Result<VectorValue, QueryError> {
     if let Some(rest) = b.strip_prefix(VECTOR_BINLOG_MAGIC) {
-        if rest.len() < 4 {
-            return Err(vector_err("invalid VECTOR binlog envelope"));
-        }
-        let declared = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
-        let payload = &rest[4..];
-        if payload.len() != declared.saturating_mul(4) {
-            return Err(vector_err("invalid VECTOR binlog envelope dimension"));
-        }
-        return normalize_internal(payload);
+        return decode_value(rest);
     }
     // Text form is unambiguous (starts with '['); try it first so a UTF-8
     // "[1,2,3]" is never misread as 3+ raw floats.
@@ -415,7 +397,8 @@ pub(crate) fn coerce_bytes_to_internal(b: &[u8]) -> Result<Vec<u8>, QueryError> 
 /// bytes are validated in place and retain their allocation. Text and binlog
 /// envelopes still use the canonical conversion path because their output is a
 /// different byte range/representation.
-pub(crate) fn coerce_bytes_to_internal_owned(b: Vec<u8>) -> Result<Vec<u8>, QueryError> {
+#[cfg(test)]
+pub(crate) fn coerce_bytes_to_internal_owned(b: Vec<u8>) -> Result<VectorValue, QueryError> {
     if b.starts_with(VECTOR_BINLOG_MAGIC) {
         return coerce_bytes_to_internal(&b);
     }
@@ -424,7 +407,7 @@ pub(crate) fn coerce_bytes_to_internal_owned(b: Vec<u8>) -> Result<Vec<u8>, Quer
             return parse_text(text);
         }
     }
-    normalize_internal_owned(b)
+    normalize_internal_owned(b.into())
 }
 
 /// Total ordering for `ORDER BY` / `DISTINCT` / `GROUP BY` on vector columns.
@@ -432,8 +415,418 @@ pub(crate) fn coerce_bytes_to_internal_owned(b: Vec<u8>) -> Result<Vec<u8>, Quer
 /// binary (deterministic and stable). Similarity ranking is expressed through
 /// `DISTANCE()`, never through raw column ordering.
 #[inline]
-pub(crate) fn compare(a: &[u8], b: &[u8]) -> Ordering {
-    a.cmp(b)
+pub(crate) fn compare(a: &VectorValue, b: &VectorValue) -> Ordering {
+    (a.datatype, a.dimension.to_le_bytes(), &a.payload).cmp(&(
+        b.datatype,
+        b.dimension.to_le_bytes(),
+        &b.payload,
+    ))
+}
+
+pub(crate) fn decode_value(bytes: &[u8]) -> Result<VectorValue, QueryError> {
+    let value =
+        VectorValue::decode(bytes).ok_or_else(|| vector_err("invalid typed VECTOR encoding"))?;
+    validate_internal(&value)?;
+    Ok(value)
+}
+
+pub(crate) fn parse_typed_text(
+    text: &str,
+    datatype: VectorDataType,
+) -> Result<VectorValue, QueryError> {
+    if datatype == VectorDataType::Float32 {
+        return parse_text(text);
+    }
+    let text = text.trim();
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| vector_err("VECTOR text must be a '[..]' array"))?;
+    let expected = inner.bytes().filter(|&b| b == b',').count() + 1;
+    if expected > datatype.max_dimension() as usize {
+        return Err(vector_err(format!(
+            "{datatype} VECTOR dimension exceeds {}",
+            datatype.max_dimension()
+        )));
+    }
+    let mut payload = Vec::with_capacity(datatype.payload_len(expected as u32));
+    let mut dimension = 0u32;
+    for token in inner.split(',') {
+        let number = token
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| vector_err(format!("invalid VECTOR element '{token}'")))?;
+        if !number.is_finite() {
+            return Err(vector_err("VECTOR elements must be finite"));
+        }
+        if dimension >= datatype.max_dimension() {
+            return Err(vector_err(format!(
+                "{datatype} VECTOR dimension exceeds {}",
+                datatype.max_dimension()
+            )));
+        }
+        if matches!(datatype, VectorDataType::Int8 | VectorDataType::Binary) {
+            exact_integer_text(token.trim()).ok_or_else(|| {
+                vector_err("integer VECTOR element has a fractional value or is out of range")
+            })?;
+        }
+        if matches!(datatype, VectorDataType::Float16 | VectorDataType::BFloat16) {
+            let bits = narrow_text_bits(number, token.trim(), datatype);
+            let exponent = if datatype == VectorDataType::Float16 {
+                0x7c00
+            } else {
+                0x7f80
+            };
+            if bits & exponent == exponent {
+                return Err(vector_err(format!("{datatype} VECTOR element overflow")));
+            }
+            payload.extend_from_slice(&bits.to_le_bytes());
+        } else {
+            append_number(&mut payload, dimension, datatype, number)?;
+        }
+        dimension += 1;
+    }
+    let value = VectorValue::new(datatype, dimension, payload);
+    validate_internal(&value)?;
+    Ok(value)
+}
+
+fn exact_integer_text(token: &str) -> Option<i16> {
+    // The common integer spelling needs no allocation; decimal/exponent
+    // spellings retain the exact mathematical-integrality checks below.
+    if let Ok(value) = token.parse::<i16>() {
+        return Some(value);
+    }
+    let (mantissa, exponent) = token.split_once(['e', 'E']).map_or((token, 0), |(m, e)| {
+        (m, e.parse::<i32>().unwrap_or(i32::MIN))
+    });
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix(['-', '+']).unwrap_or(mantissa);
+    let fractional = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
+    let digits: std::string::String = mantissa.chars().filter(|&c| c != '.').collect();
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let scale = (exponent as i64) - (fractional as i64);
+    let mut digits = digits.to_owned();
+    if scale < 0 {
+        let cut = usize::try_from(-scale).ok()?;
+        if cut >= digits.len() || !digits[digits.len() - cut..].bytes().all(|b| b == b'0') {
+            return None;
+        }
+        digits.truncate(digits.len() - cut);
+    } else {
+        if digits.len() as i64 + scale > 3 {
+            return None;
+        }
+        digits.extend(std::iter::repeat_n('0', scale as usize));
+    }
+    let value = digits.parse::<i16>().ok()?;
+    Some(if negative { -value } else { value })
+}
+
+/// Repair the dependency's truncated/double-rounded f64 paths against exact
+/// adjacent representable values. Binary32 inputs retain the hardware fast path.
+fn narrow_f64_bits(number: f64, datatype: VectorDataType) -> u16 {
+    let single = number as f32;
+    if single as f64 == number {
+        return if datatype == VectorDataType::Float16 {
+            half::f16::from_f32(single).to_bits()
+        } else {
+            half::bf16::from_f32(single).to_bits()
+        };
+    }
+    let sign = if number.is_sign_negative() { 0x8000 } else { 0 };
+    let value = number.abs();
+    let infinity = if datatype == VectorDataType::Float16 {
+        0x7c00
+    } else {
+        0x7f80
+    };
+    let maximum = infinity - 1;
+    let decode = |bits| {
+        if datatype == VectorDataType::Float16 {
+            half::f16::from_bits(bits).to_f64()
+        } else {
+            half::bf16::from_bits(bits).to_f64()
+        }
+    };
+    let overflow = decode(maximum) + (decode(maximum) - decode(maximum - 1)) * 0.5;
+    if value >= overflow {
+        return sign | infinity;
+    }
+    let mut bits = (if datatype == VectorDataType::Float16 {
+        half::f16::from_f64(value).to_bits()
+    } else {
+        half::bf16::from_f64(value).to_bits()
+    })
+    .min(maximum);
+    let converted = decode(bits);
+    if value < converted && bits > 0 {
+        let middle = (decode(bits - 1) + converted) * 0.5;
+        if value < middle || (value == middle && bits & 1 != 0) {
+            bits -= 1;
+        }
+    } else if value > converted && bits < maximum {
+        let middle = (decode(bits + 1) + converted) * 0.5;
+        if value > middle || (value == middle && bits & 1 != 0) {
+            bits += 1;
+        }
+    }
+    sign | bits
+}
+
+/// Exact decimal comparison is needed only when f64 parsing lands precisely on
+/// a destination midpoint. The reference has at most 135 decimal places; the
+/// input is streamed without constructing an input-sized arbitrary integer.
+fn compare_decimal_magnitude(token: &str, reference: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let token = token
+        .trim()
+        .strip_prefix(['-', '+'])
+        .unwrap_or(token.trim());
+    let (mantissa, exponent) = token
+        .split_once(['e', 'E'])
+        .map_or((token, 0i64), |(m, e)| {
+            (
+                m,
+                e.parse::<i64>()
+                    .expect("finite nonzero half midpoint exponent fits i64"),
+            )
+        });
+    let fraction = mantissa.split_once('.').map_or(0, |(_, part)| part.len());
+    let mut digits = mantissa
+        .bytes()
+        .filter(|&b| b != b'.')
+        .skip_while(|&b| b == b'0');
+    let length = digits.clone().count();
+    if length == 0 {
+        return Ordering::Less;
+    }
+    let bits = reference.to_bits();
+    let mut significant = (bits & 0x000f_ffff_ffff_ffff) | (1u64 << 52);
+    let mut exponent2 = ((bits >> 52) & 0x7ff) as i32 - 1023 - 52;
+    let zeros = significant.trailing_zeros();
+    significant >>= zeros;
+    exponent2 += zeros as i32;
+    let (coefficient, scale) = if exponent2 >= 0 {
+        (
+            num_bigint::BigUint::from(significant) << exponent2 as usize,
+            0usize,
+        )
+    } else {
+        (
+            num_bigint::BigUint::from(significant)
+                * num_bigint::BigUint::from(5u8).pow((-exponent2) as u32),
+            (-exponent2) as usize,
+        )
+    };
+    let exact = coefficient.to_str_radix(10);
+    let order = (length as i128 + exponent as i128 - fraction as i128)
+        .cmp(&(exact.len() as i128 - scale as i128));
+    if order != Ordering::Equal {
+        return order;
+    }
+    for i in 0..length.max(exact.len()) {
+        let order = digits
+            .next()
+            .unwrap_or(b'0')
+            .cmp(&exact.as_bytes().get(i).copied().unwrap_or(b'0'));
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    Ordering::Equal
+}
+
+fn narrow_text_bits(number: f64, token: &str, datatype: VectorDataType) -> u16 {
+    use std::cmp::Ordering;
+    let bits = narrow_f64_bits(number, datatype);
+    let sign = bits & 0x8000;
+    let mut magnitude = bits & 0x7fff;
+    let infinity = if datatype == VectorDataType::Float16 {
+        0x7c00
+    } else {
+        0x7f80
+    };
+    let maximum = infinity - 1;
+    let decode = |bits| {
+        if datatype == VectorDataType::Float16 {
+            half::f16::from_bits(bits).to_f64()
+        } else {
+            half::bf16::from_bits(bits).to_f64()
+        }
+    };
+    let value = number.abs();
+    let overflow = decode(maximum) + (decode(maximum) - decode(maximum - 1)) * 0.5;
+    if magnitude == infinity {
+        if value == overflow && compare_decimal_magnitude(token, value) == Ordering::Less {
+            magnitude = maximum;
+        }
+    } else {
+        let converted = decode(magnitude);
+        if value > converted {
+            let middle = if magnitude == maximum {
+                overflow
+            } else {
+                (converted + decode(magnitude + 1)) * 0.5
+            };
+            if value == middle && compare_decimal_magnitude(token, middle) == Ordering::Greater {
+                magnitude += 1;
+            }
+        } else if value < converted && magnitude > 0 {
+            let middle = (converted + decode(magnitude - 1)) * 0.5;
+            if value == middle && compare_decimal_magnitude(token, middle) == Ordering::Less {
+                magnitude -= 1;
+            }
+        }
+    }
+    sign | magnitude
+}
+
+fn append_number(
+    payload: &mut Vec<u8>,
+    i: u32,
+    datatype: VectorDataType,
+    number: f64,
+) -> Result<(), QueryError> {
+    match datatype {
+        VectorDataType::Float32 => {
+            let number = number as f32;
+            if !number.is_finite() {
+                return Err(vector_err("FLOAT32 VECTOR element overflow"));
+            }
+            payload.extend_from_slice(&number.to_le_bytes());
+        }
+        VectorDataType::Float16 => {
+            let number = half::f16::from_bits(narrow_f64_bits(number, datatype));
+            if !number.is_finite() {
+                return Err(vector_err("FLOAT16 VECTOR element overflow"));
+            }
+            payload.extend_from_slice(&number.to_le_bytes());
+        }
+        VectorDataType::BFloat16 => {
+            let number = half::bf16::from_bits(narrow_f64_bits(number, datatype));
+            if !number.is_finite() {
+                return Err(vector_err("BFLOAT16 VECTOR element overflow"));
+            }
+            payload.extend_from_slice(&number.to_le_bytes());
+        }
+        VectorDataType::Int8 => {
+            if number.fract() != 0.0 || !(-128.0..=127.0).contains(&number) {
+                return Err(vector_err(
+                    "INT8 VECTOR elements must be integers in [-128,127]",
+                ));
+            }
+            payload.push(number as i8 as u8);
+        }
+        VectorDataType::Binary => {
+            if number != 0.0 && number != 1.0 {
+                return Err(vector_err("BINARY VECTOR elements must be 0 or 1"));
+            }
+            if i % 8 == 0 {
+                payload.push(0);
+            }
+            if number == 1.0 {
+                *payload.last_mut().unwrap() |= 1 << (i % 8);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn convert_value(
+    value: &VectorValue,
+    datatype: VectorDataType,
+    dimension: Option<u32>,
+) -> Result<VectorValue, QueryError> {
+    validate_internal(value)?;
+    if dimension.is_some_and(|d| d != value.dimension) {
+        return Err(super::VectorError::DimensionMismatch {
+            actual: value.dimension as usize,
+            declared: dimension.unwrap(),
+        }
+        .into_query_error());
+    }
+    if value.datatype == datatype {
+        return Ok(value.clone());
+    }
+    if value.datatype == VectorDataType::Binary || datatype == VectorDataType::Binary {
+        return Err(vector_err(
+            "cannot convert between numeric and BINARY vectors",
+        ));
+    }
+    if value.dimension > datatype.max_dimension() {
+        return Err(vector_err(format!(
+            "VECTOR dimension exceeds {datatype} limit"
+        )));
+    }
+    let mut payload = Vec::with_capacity(datatype.payload_len(value.dimension));
+    for i in 0..value.dimension {
+        append_number(&mut payload, i, datatype, value.element(i as usize))?;
+    }
+    Ok(VectorValue::new(datatype, value.dimension, payload))
+}
+
+/// Recreate a native build row from the lossless FLOAT32 construction buffer.
+pub(crate) fn from_build_f32(
+    values: &[f32],
+    datatype: VectorDataType,
+) -> Result<VectorValue, QueryError> {
+    let mut payload = Vec::with_capacity(datatype.payload_len(values.len() as u32));
+    for (i, &v) in values.iter().enumerate() {
+        append_number(&mut payload, i as u32, datatype, v as f64)?;
+    }
+    Ok(VectorValue::new(datatype, values.len() as u32, payload))
+}
+
+pub(crate) fn coerce_value(
+    value: crate::types::Value,
+    datatype: VectorDataType,
+    dimension: Option<u32>,
+) -> Result<VectorValue, QueryError> {
+    use crate::types::Value;
+    let value = match value {
+        Value::Vector(value) => {
+            if value.datatype == datatype {
+                validate_internal(&value)?;
+                if dimension.is_some_and(|d| d != value.dimension) {
+                    return Err(super::VectorError::DimensionMismatch {
+                        actual: value.dimension as usize,
+                        declared: dimension.unwrap(),
+                    }
+                    .into_query_error());
+                }
+                return Ok(value);
+            }
+            return convert_value(&value, datatype, dimension);
+        }
+        Value::String(text) | Value::Decimal(text) => parse_typed_text(&text, datatype)?,
+        Value::SmallString(text) => parse_typed_text(
+            std::str::from_utf8(text.as_ref()).map_err(|_| vector_err("invalid VECTOR text"))?,
+            datatype,
+        )?,
+        Value::Bytes(bytes) => {
+            if let Some(body) = bytes.strip_prefix(VECTOR_BINLOG_MAGIC) {
+                return convert_value(&decode_value(body)?, datatype, dimension);
+            }
+            parse_typed_text(
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| vector_err("raw VECTOR payload requires VECTOR_FROM_BINARY"))?,
+                datatype,
+            )?
+        }
+        _ => return Err(vector_err("cannot convert value to VECTOR")),
+    };
+    if dimension.is_some_and(|d| d != value.dimension) {
+        return Err(super::VectorError::DimensionMismatch {
+            actual: value.dimension as usize,
+            declared: dimension.unwrap(),
+        }
+        .into_query_error());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -474,7 +867,7 @@ mod tests {
 
         let owned = from_f32(&[1.0, 2.0, 3.0, 4.0]);
         let ptr = owned.as_ptr();
-        let from_owned = coerce_bytes_to_internal_owned(owned).unwrap();
+        let from_owned = coerce_bytes_to_internal_owned(owned.payload).unwrap();
         assert_eq!(from_owned, raw);
         assert_eq!(
             from_owned.as_ptr(),
@@ -648,7 +1041,7 @@ mod tests {
                 format!("  [ {body} ]  ")
             };
             match (parse_text(&text), naive(&text)) {
-                (Ok(a), Ok(b)) => assert_eq!(a, b, "byte mismatch for {text:?}"),
+                (Ok(a), Ok(b)) => assert_eq!(a.payload, b, "byte mismatch for {text:?}"),
                 (Err(_), Err(_)) => {}
                 (got, exp) => panic!(
                     "accept/reject disagreement for {text:?}: parse_text={:?} naive_ok={}",
@@ -764,6 +1157,141 @@ mod bench_attribution {
             println!(
                 "dim={dim:5} | parse_text {parse_ns:9.1}ns ({:.1}ns/dim) | normalize {norm_ns:8.1}ns | finite-only {finite_ns:7.1}ns | acc={acc}",
                 parse_ns / dim as f64,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_datatype_tests {
+    use super::*;
+    #[test]
+    fn native_half_all_bit_patterns_validate_and_round_trip() {
+        for datatype in [VectorDataType::Float16, VectorDataType::BFloat16] {
+            for bits in 0..=u16::MAX {
+                let value = VectorValue::new(datatype, 1, bits.to_le_bytes().to_vec());
+                let finite = match datatype {
+                    VectorDataType::Float16 => half::f16::from_bits(bits).is_finite(),
+                    _ => half::bf16::from_bits(bits).is_finite(),
+                };
+                assert_eq!(validate_internal(&value).is_ok(), finite);
+                if finite {
+                    assert_eq!(decode_value(&value.encode()).unwrap(), value);
+                    let narrowed = match datatype {
+                        VectorDataType::Float16 => half::f16::from_f64(value.element(0)).to_bits(),
+                        _ => half::bf16::from_f64(value.element(0)).to_bits(),
+                    };
+                    assert_eq!(bits, narrowed);
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_integer_text_is_exact_and_binary_padding_is_strict() {
+        for text in [
+            "[1.0000000000000000000001]",
+            "[127.00000000000000001]",
+            "[1e-999]",
+            "[128]",
+            "[-129]",
+        ] {
+            assert!(
+                parse_typed_text(text, VectorDataType::Int8).is_err(),
+                "{text}"
+            );
+        }
+        for text in ["[1.000]", "[10e-1]", "[-128]", "[127]"] {
+            assert!(
+                parse_typed_text(text, VectorDataType::Int8).is_ok(),
+                "{text}"
+            );
+        }
+        for dim in [1, 7, 8, 9, 63, 64, 65, 65_536, 524_256] {
+            let datatype = VectorDataType::Binary;
+            let value = VectorValue::new(datatype, dim, vec![0; datatype.payload_len(dim)]);
+            assert!(validate_internal(&value).is_ok());
+            assert_eq!(decode_value(&value.encode()).unwrap().dimension, dim);
+        }
+        assert!(
+            validate_internal(&VectorValue::new(VectorDataType::Binary, 7, vec![0x80])).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_rounding_tests {
+    use super::*;
+    #[test]
+    fn native_half_midpoints_and_adjacent_f64_values_round_to_even() {
+        for datatype in [VectorDataType::Float16, VectorDataType::BFloat16] {
+            let infinity = if datatype == VectorDataType::Float16 {
+                0x7c00
+            } else {
+                0x7f80
+            };
+            let decode = |bits| {
+                if datatype == VectorDataType::Float16 {
+                    half::f16::from_bits(bits).to_f64()
+                } else {
+                    half::bf16::from_bits(bits).to_f64()
+                }
+            };
+            for lower in 0..infinity - 1 {
+                let upper = lower + 1;
+                let middle = (decode(lower) + decode(upper)) * 0.5;
+                for (number, expected) in [
+                    (f64::from_bits(middle.to_bits() - 1), lower),
+                    (middle, if lower & 1 == 0 { lower } else { upper }),
+                    (f64::from_bits(middle.to_bits() + 1), upper),
+                ] {
+                    assert_eq!(
+                        narrow_f64_bits(number, datatype),
+                        expected,
+                        "{datatype}/{lower:04x}/{number}"
+                    );
+                    assert_eq!(narrow_f64_bits(-number, datatype), expected | 0x8000);
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_text_rounding_preserves_decimal_midpoint_sides() {
+        for (datatype, text, expected) in [
+            (VectorDataType::Float16, "1.00048828125", 0x3c00),
+            (
+                VectorDataType::Float16,
+                "1.00048828125000000000000000001",
+                0x3c01,
+            ),
+            (
+                VectorDataType::Float16,
+                "1.00146484374999999999999999999",
+                0x3c01,
+            ),
+            (VectorDataType::Float16, "1.00146484375", 0x3c02),
+            (
+                VectorDataType::Float16,
+                "65519.9999999999999999999999999",
+                0x7bff,
+            ),
+            (VectorDataType::BFloat16, "1.00390625", 0x3f80),
+            (
+                VectorDataType::BFloat16,
+                "1.00390625000000000000000000001",
+                0x3f81,
+            ),
+            (
+                VectorDataType::BFloat16,
+                "1.01171874999999999999999999999",
+                0x3f81,
+            ),
+            (VectorDataType::BFloat16, "1.01171875", 0x3f82),
+        ] {
+            let value = parse_typed_text(&format!("[{text}]"), datatype).unwrap();
+            assert_eq!(
+                u16::from_le_bytes(value.payload[..2].try_into().unwrap()),
+                expected,
+                "{datatype}/{text}"
             );
         }
     }

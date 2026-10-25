@@ -8,7 +8,7 @@
 // the spatial R-tree: built lazily from a heap scan, grown incrementally on
 // insert, and never the source of truth. Every candidate it returns is re-read
 // under the query's MVCC snapshot and re-ranked by the live heap vector, so a
-// stale / invisible / rolled-back node only costs recall, never correctness.
+// validity and snapshot coverage must be checked independently of heap re-rank.
 //
 // M1 added an optional `.hnsw` on-disk snapshot written by the checkpoint
 // path. On restart we load the snapshot, then walk the heap and INSERT only
@@ -27,7 +27,7 @@ use crate::engine::vector::hnsw_paged::{
     HnswBuildStats, HnswChunkBuildStats, PagedHnsw, BUILD_NODE_METADATA_BYTES,
 };
 use crate::engine::vector::{
-    self, CompactHnswBuilder, CompactHnswStats, HnswIndex, IvfParams, IvfSq8Index, VectorGraph,
+    self, CompactHnswBuilder, CompactHnswStats, HnswIndex, IvfParams, VectorGraph,
 };
 use crate::storage::schema::VectorAlgo;
 // `VectorIndexFile`, `NodeView`, `VecId` are defined in `core.rs` itself (via
@@ -175,40 +175,14 @@ fn vector_storage_paged() -> bool {
     )
 }
 
-/// Resolve IVF_SQ8 build/query parameters: index COMMENT tokens
+/// Resolve IVF build/query parameters: index COMMENT tokens
 /// (`NLIST=`/`NPROBE=`/`KMEANS_ITERS=`/`TRAIN_SAMPLE=`) take priority, then
 /// env-var build defaults (`MYDB_IVF_*`), then the built-in defaults. `nlist=0`
-/// means "auto (√N)". `nprobe_default` here is only the build-time fallback;
-/// the query path re-resolves nprobe from the live session GUC / hint.
+/// means "auto (√N)". Query-time nprobe is resolved separately from the
+/// live session, hint and per-index metadata.
 fn ivf_params_from_meta(meta: &crate::storage::schema::VectorIndexMeta) -> IvfParams {
-    fn env_usize(name: &str) -> Option<usize> {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-    }
-    let def = IvfParams::default();
-    IvfParams {
-        nlist: meta
-            .nlist
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_NLIST"))
-            .unwrap_or(0),
-        nprobe_default: meta
-            .default_nprobe
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_NPROBE").filter(|n| *n > 0))
-            .unwrap_or(def.nprobe_default),
-        kmeans_iters: meta
-            .kmeans_iters
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_KMEANS_ITERS").filter(|n| *n > 0))
-            .unwrap_or(def.kmeans_iters),
-        train_sample_mult: meta
-            .train_sample_mult
-            .map(|n| n as usize)
-            .or_else(|| env_usize("MYDB_IVF_TRAIN_SAMPLE").filter(|n| *n > 0))
-            .unwrap_or(def.train_sample_mult),
-    }
+    let def=IvfParams::default();
+    IvfParams {nlist:meta.nlist.unwrap_or(0) as usize,kmeans_iters:meta.kmeans_iters.map_or(def.kmeans_iters,|v|v as usize),train_sample_mult:meta.train_sample_mult.map_or(def.train_sample_mult,|v|v as usize)}
 }
 
 /// Soft-cap (12.5%) on dirty nodes before the opportunistic checkpoint
@@ -455,12 +429,12 @@ fn vector_brute_scan_threads() -> usize {
 
 /// One brute-KNN candidate: an ordering distance (sqrt-free for L2) keyed to
 /// the heap row it came from. NULL / dimensionless vectors map to
-/// `f32::NEG_INFINITY` so they sort first under `ORDER BY distance ASC`,
+/// `f64::NEG_INFINITY` so they sort first under `ORDER BY distance ASC`,
 /// matching MySQL's NULLs-first ordering (the row-based oracle returns
 /// `DISTANCE(NULL, q) = NULL`, which sorts ahead of every real distance).
 #[derive(Clone, Copy)]
 struct BruteCand {
-    key: f32,
+    key: f64,
     /// Partition storage id — `table.id` for unpartitioned tables. RowIds are
     /// only unique within a partition, so the tie-break (and the executor's
     /// row read) must disambiguate by `sid`.
@@ -501,7 +475,7 @@ impl PartialOrd for BruteCand {
 
 /// Bounded top-`k` nearest accumulator: a binary **max-heap** of capacity
 /// `k` whose top is the current k-th nearest (the worst kept), so a closer
-/// candidate evicts it in O(log k). Holds only `(f32, RowId)` — never a
+/// candidate evicts it in O(log k). Holds only `(f64, RowId)` — never a
 /// `Value` — so the hot scan loop allocates nothing per row; the K winners
 /// are re-materialised once at the end.
 struct BruteTopK {
@@ -518,7 +492,9 @@ impl BruteTopK {
     }
 
     #[inline]
-    fn push(&mut self, key: f32, sid: u64, rid: RowId) {
+    fn push(&mut self, key: impl Into<f64>, sid: u64, rid: RowId) {
+        let key = key.into();
+        let key = if key.is_nan() { f64::NEG_INFINITY } else { key };
         if self.k == 0 {
             return;
         }
@@ -542,7 +518,7 @@ impl BruteTopK {
 
     /// Drain into `(distance, storage_id, row_id)` ascending. `storage_id`
     /// routes the executor's row read to the right partition.
-    fn into_sorted(self) -> Vec<(f32, u64, RowId)> {
+    fn into_sorted(self) -> Vec<(f64, u64, RowId)> {
         let mut cands = self.heap.into_vec();
         cands.sort_unstable();
         cands.into_iter().map(|c| (c.key, c.sid, c.rid)).collect()
@@ -558,16 +534,49 @@ impl Database {
     fn vector_graph_load_from_disk(
         &self,
         table: &TableSchema,
-        index_name: &str,
+        index: &IndexSchema,
         storage_id: u64,
     ) -> std::io::Result<Option<HnswIndex>> {
-        let path = self.vector_index_path(table, index_name, storage_id);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+        let path = self.vector_index_path(table, &index.name, storage_id);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
         };
-        HnswIndex::deserialize(&bytes).map(Some)
+        let length = usize::try_from(file.metadata()?.len())
+            .map_err(|_| std::io::Error::other("HNSW snapshot exceeds address space"))?;
+        let _snapshot_charge =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                length,
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| std::io::Error::other("HNSW snapshot allocation failed"))?;
+        file.take(length as u64).read_to_end(&mut bytes)?;
+        let graph = HnswIndex::deserialize(&bytes)?.without_navigation_quantization();
+        let meta = index.vector_meta_for_table(table);
+        let column = table
+            .column_index(&index.columns[0])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let dim = match table.columns[column].data_type {
+            DataTypeKind::Vector { dim, .. } => dim.map(|v| v as usize),
+            _ => None,
+        };
+        if !graph.matches_configuration(
+            meta.metric_enum(),
+            meta.m as usize,
+            meta.ef_construction as usize,
+            dim,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HNSW snapshot parameters differ from the catalog",
+            ));
+        }
+        Ok(Some(graph))
     }
 
     /// Load a snapshot, then compare every current heap vector against its
@@ -587,32 +596,54 @@ impl Database {
         index: &IndexSchema,
         storage_id: u64,
     ) -> Result<VectorGraph, QueryError> {
+        let column = table.column_index(&index.columns[0])?;
+        if (matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32)
+            || index.vector.as_ref().is_some_and(|v|v.quantization.enabled()))
+            && index.vector_algo() == VectorAlgo::Hnsw
+        {
+            return self.vector_native_hnsw_load_or_build(table, index, storage_id);
+        }
+        if index.vector_algo() == VectorAlgo::Ivf {
+            return self.vector_native_ivf_load_or_build(table, index, storage_id);
+        }
+        // Source HNSW page redo is not applied locally. A replica owns only
+        // a revocable resident accelerator built from its committed heap view.
+        if self.physical_replica_mode() && index.vector_algo() == VectorAlgo::Hnsw {
+            let meta = index.vector_meta_for_table(table);
+            let graph = HnswIndex::new(
+                meta.metric_enum(),
+                meta.m as usize,
+                meta.ef_construction as usize,
+            ).without_navigation_quantization();
+            let col = table.column_index(&index.columns[0])?;
+            self.vector_graph_populate_from_heap(
+                table,
+                storage_id,
+                &[col],
+                &graph,
+                hnsw_build_threads(),
+            )?;
+            return Ok(VectorGraph::Memory(graph));
+        }
         let paged_backend = vector_storage_paged();
         self.ensure_vector_backend_compatible(table, index, storage_id, paged_backend)?;
-        // IVF_SQ8 has its own (memory-backend) build path. It rebuilds the
-        // inverted lists from the heap on every cold load — the heap is the
-        // source of truth and the build is cached in `vector_indexes` for the
-        // process lifetime, so there is no snapshot to load or catch up.
-        if index.vector_algo() == VectorAlgo::IvfSq8 {
-            return self.vector_ivf_load_or_build(table, index, storage_id);
-        }
         if paged_backend {
             return Ok(VectorGraph::Paged(
                 self.vector_graph_paged_load_or_build(table, index, storage_id)?,
             ));
         }
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let col_idx = table.column_index(&index.columns[0])?;
         let cols = [col_idx];
 
         let graph = if hnsw_persist_enabled() {
-            match self.vector_graph_load_from_disk(table, &index.name, storage_id) {
+            match self.vector_graph_load_from_disk(table, index, storage_id) {
                 Ok(Some(g)) => g,
                 Ok(None) => HnswIndex::new(
                     meta.metric_enum(),
                     meta.m as usize,
                     meta.ef_construction as usize,
-                ),
+                ).without_navigation_quantization(),
                 Err(e) => {
                     log_message(&format!(
                         "hnsw: corrupt or unreadable {}/{}/{} (sid={}) — falling back to rebuild: {}",
@@ -622,7 +653,7 @@ impl Database {
                         meta.metric_enum(),
                         meta.m as usize,
                         meta.ef_construction as usize,
-                    )
+                    ).without_navigation_quantization()
                 }
             }
         } else {
@@ -630,7 +661,7 @@ impl Database {
                 meta.metric_enum(),
                 meta.m as usize,
                 meta.ef_construction as usize,
-            )
+            ).without_navigation_quantization()
         };
 
         // M4: parallel cold-build path. `HnswIndex::insert` is `&self` under
@@ -642,327 +673,306 @@ impl Database {
         // parking_lot::RwLock read so concurrent workers don't serialise on
         // the heap.
         let threads = hnsw_build_threads();
-        self.vector_graph_populate_from_heap(storage_id, &cols, &graph, threads)?;
+        self.vector_graph_populate_from_heap(table, storage_id, &cols, &graph, threads)?;
 
         Ok(VectorGraph::Memory(graph))
     }
 
-    /// IVF_SQ8 cold build: materialize every visible vector from the partition
-    /// heap into a `(RowId, vector)` batch, then train the coarse quantizer and
-    /// populate the SQ8 inverted lists. Build parameters come from the index
-    /// COMMENT (`NLIST=`/`NPROBE=`/`KMEANS_ITERS=`/`TRAIN_SAMPLE=`) with env
-    /// fallbacks. An empty heap yields an untrained (empty) index that later
-    /// DML / the next cold build populates.
-    fn vector_ivf_load_or_build(
+    fn train_vector_quantizer(&self,table:&TableSchema,index:&IndexSchema,storage_id:u64,txn:TxnView,col:usize)->Result<Option<Arc<vector::quantization::Quantizer>>,QueryError>{
+        let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) else{return Ok(None);};
+        let DataTypeKind::Vector{datatype,dim:Some(dimension)}=table.columns[col].data_type else{return Err(vector::vector_err("quantization requires fixed-dimension VECTOR"));};
+        let mut trainer=vector::quantization::Trainer::new(config.quantization.clone(),datatype,dimension,index.vector_meta_for_table(table).metric_enum())?;
+        self.scan_hnsw_build_rows(table,storage_id,txn,&[col],0,u64::MAX,|_,values|{if let Some(Value::Vector(v))=values.first(){trainer.observe(v)?;}Ok(false)})?;
+        trainer.finish()
+    }
+
+    fn vector_native_hnsw_load_or_build(
         &self,
         table: &TableSchema,
         index: &IndexSchema,
         storage_id: u64,
     ) -> Result<VectorGraph, QueryError> {
-        if vector_storage_paged() {
-            return self.vector_ivf_paged_load_or_build(table, index, storage_id);
-        }
-        let meta = index.vector_meta();
-        let ivf = IvfSq8Index::new(meta.metric_enum(), ivf_params_from_meta(&meta));
-        let col_idx = table.column_index(&index.columns[0])?;
-        let cols = [col_idx];
-        let mut rows: Vec<(RowId, Vec<f32>)> = Vec::new();
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(&cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        rows.push((row.row_id, vector::to_f32(bytes)));
-                    }
-                }
-                Ok(false)
-            })
-        })?;
-        ivf.build_from_rows(&rows)?;
-        Ok(VectorGraph::Ivf(ivf))
-    }
-
-    /// Paged IVF_SQ8 build/open: open (or create) the `.ivf` file — which *is*
-    /// the durable index (buffer pool + WAL) — and cold-build it from the
-    /// partition heap when it holds no finalized index yet (a fresh file, or an
-    /// interrupted/legacy build). A finalized file is trusted and used as-is,
-    /// so it survives restart on its own with no snapshot to load. Mirrors
-    /// `vector_graph_paged_load_or_build` for HNSW.
-    fn vector_ivf_paged_load_or_build(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-    ) -> Result<VectorGraph, QueryError> {
-        let col_idx = table.column_index(&index.columns[0])?;
-        let cols = [col_idx];
-        let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-        let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-        let params = ivf_params_from_meta(&index.vector_meta());
-        // Opening can fail when the persisted `.ivf` disagrees with the current
-        // dim/metric (a COMMENT metric change, a dim change) or its meta page is
-        // corrupt. The heap is the durable record, so rather than failing every
-        // KNN query with a hard 1030 (B3), discard the unusable file and reopen
-        // fresh — the `!is_finalized()` branch below then rebuilds it from the
-        // heap. Mirrors the HNSW memory path's log-and-rebuild.
-        let paged = match self.open_ivf_index_file(table, index, storage_id, dim) {
-            Ok(file) => file,
-            Err(e) => {
-                if self.is_snapshot_read_only() || self.physical_replica_mode() {
-                    return Err(e);
-                }
-                log_message(&format!(
-                    "ivf(paged): unusable .ivf at {} ({e:?}); discarding and rebuilding from heap",
-                    path.display()
-                ));
-                self.buffer_pool.discard_pages_for_path(&path)?;
-                let _ = fs::remove_file(&path);
-                self.open_ivf_index_file(table, index, storage_id, dim)?
-            }
-        };
-        let paged = if self.physical_replica_mode() {
-            crate::engine::vector::ivf_paged::PagedIvf::new_for_replica(Arc::new(paged), params)
-        } else {
-            crate::engine::vector::ivf_paged::PagedIvf::new(Arc::new(paged), params)
-        };
-        if !paged.is_finalized() {
-            if self.physical_replica_mode() {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "replicated IVF index is not finalized; wait for source replay",
-                ));
-            }
-            log_message(format!(
-                "ivf(paged): unfinalized index {}; rebuilding from heap",
-                path.display()
-            ));
-            self.ensure_writable()?;
-            drop(paged);
-            self.buffer_pool.discard_pages_for_path(&path)?;
-            let _ = fs::remove_file(&path);
-            let file = self.open_ivf_index_file(table, index, storage_id, dim)?;
-            let rebuilt = crate::engine::vector::ivf_paged::PagedIvf::new(Arc::new(file), params);
-            self.vector_ivf_paged_build_from_heap(storage_id, &cols, &rebuilt)?;
-            return Ok(VectorGraph::Ivf(IvfSq8Index::from_paged(rebuilt)));
-        }
-        self.vector_ivf_paged_build_navigator_from_heap(storage_id, &cols, &paged)?;
-        Ok(VectorGraph::Ivf(IvfSq8Index::from_paged(paged)))
-    }
-
-    /// Open (creating if absent) the `.ivf` file for one paged IVF_SQ8 index,
-    /// wiring it to the shared WAL + buffer pool. The on-disk payload layout
-    /// (SQ8 codes vs raw f32) is fixed at create time by the metric + the SME
-    /// env; a reopen adopts the file's persisted layout.
-    fn open_ivf_index_file(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-        dim: u32,
-    ) -> Result<crate::storage::IvfIndexFile, QueryError> {
-        let meta = index.vector_meta();
-        let metric = meta.metric_enum();
-        let stores_f32 = crate::engine::vector::ivf_paged::PagedIvf::stores_f32_for(metric);
-        let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-        self.open_ivf_index_file_at_path(path, dim, metric.as_u8(), stores_f32)
-    }
-
-    fn open_ivf_index_file_at_path(
-        &self,
-        path: PathBuf,
-        dim: u32,
-        metric: u8,
-        stores_f32: bool,
-    ) -> Result<crate::storage::IvfIndexFile, QueryError> {
-        crate::storage::IvfIndexFile::open_with_durability(
-            path,
-            self.log.clone(),
-            self.durability_mode(),
-            self.buffer_pool.clone(),
-            dim,
-            metric,
-            stores_f32,
-        )
-    }
-
-    /// Build a replacement `.ivf` beside the live file and atomically publish
-    /// it.  The old finalized index remains queryable until rename succeeds.
-    fn rebuild_paged_ivf_atomic(
-        &self,
-        table: &TableSchema,
-        index: &IndexSchema,
-        storage_id: u64,
-    ) -> Result<Arc<VectorGraph>, QueryError> {
-        let col_idx = table.column_index(&index.columns[0])?;
-        let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-        let meta = index.vector_meta();
-        let metric = meta.metric_enum();
-        let stores_f32 = crate::engine::vector::ivf_paged::PagedIvf::stores_f32_for(metric);
-        let params = ivf_params_from_meta(&meta);
-        let final_path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-        let tmp_path = final_path.with_extension("ivf.optimize.tmp");
-        let _ = self.buffer_pool.discard_pages_for_path(&tmp_path);
-        let _ = fs::remove_file(&tmp_path);
-        let replacement = crate::engine::vector::ivf_paged::PagedIvf::new(
-            Arc::new(self.open_ivf_index_file_at_path(
-                tmp_path.clone(),
-                dim,
-                metric.as_u8(),
-                stores_f32,
-            )?),
-            params,
-        );
-        self.vector_ivf_paged_build_from_heap(storage_id, &[col_idx], &replacement)?;
-        replacement.file().flush()?;
-        if self.durability_mode() == DurabilityMode::Memory {
-            // The test/in-memory durability backend has no physical pathname
-            // to rename; publishing the fully-built Arc is the atomic swap.
-            return Ok(Arc::new(VectorGraph::Ivf(IvfSq8Index::from_paged(
-                replacement,
-            ))));
-        }
-        let navigator = replacement.navigator();
-        drop(replacement);
-        self.buffer_pool.discard_pages_for_path(&tmp_path)?;
-        self.buffer_pool.discard_pages_for_path(&final_path)?;
-        fs::rename(&tmp_path, &final_path).map_err(|e| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                format!(
-                    "cannot atomically publish optimized IVF index {} -> {}: {e}",
-                    tmp_path.display(),
-                    final_path.display()
-                ),
-            )
-        })?;
-        if let Some(parent) = final_path.parent() {
-            crate::platform::fs::sync_path(parent).map_err(io_err)?;
-        }
-        let reopened = crate::engine::vector::ivf_paged::PagedIvf::new(
-            Arc::new(self.open_ivf_index_file(table, index, storage_id, dim)?),
-            params,
-        );
-        reopened.install_navigator(navigator);
-        Ok(Arc::new(VectorGraph::Ivf(IvfSq8Index::from_paged(
-            reopened,
-        ))))
-    }
-
-    /// Cold-build a paged IVF index with reserved resident metadata. Small
-    /// inputs keep the memory fast path; larger matrices and training samples
-    /// use quota-accounted read-only mappings. The heap remains the durable
-    /// record, so a scan error leaves a non-finalized, rebuildable index.
-    fn vector_ivf_paged_build_from_heap(
-        &self,
-        storage_id: u64,
-        cols: &[usize],
-        paged: &crate::engine::vector::ivf_paged::PagedIvf,
-    ) -> Result<(), QueryError> {
-        // Count without decoding vectors before reserving all resident metadata.
-        let mut count = 0usize;
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(&[], |row| {
-                if !row.header.is_deleted() {
-                    count += 1;
-                }
-                Ok(false)
-            })
-        })?;
-        let _build_gate = hnsw_build_memory_gate()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let full_bytes = count
-            .saturating_mul(paged.dim().saturating_mul(12).saturating_add(192))
-            .saturating_add(16 * 1024 * 1024);
-        if full_bytes <= hnsw_bulk_memory_budget_bytes()? as usize {
-            if let Some(_lease) =
-                HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), full_bytes)
-            {
-                let mut rows = Vec::with_capacity(count);
-                self.with_heap_read(storage_id, |heap| {
-                    heap.scan_mvcc_columns_until(cols, |row| {
-                        if !row.header.is_deleted() {
-                            if let Some(Value::Vector(bytes)) = row.values.first() {
-                                rows.push((row.row_id, vector::to_f32(bytes)));
-                            }
-                        }
-                        Ok(false)
-                    })
-                })?;
-                return paged.build_from_rows(&rows);
-            }
-        }
-        let scratch = paged.spill_build_scratch_bytes(count);
-        let lease = HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), scratch)
-            .ok_or_else(|| error(crate::error::catalog::ER_OUTOFMEMORY,
-                format!("IVF spill build cannot reserve {scratch} bytes of metadata and training scratch")))?;
-        lease.use_streaming_buffer()?;
-        let mut spill =
-            crate::engine::vector::spill_rows::VectorRowSpill::new(self.data_dir(), paged.dim())?;
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        spill.push(
-                            row.row_id,
-                            &paged.prepare_build_vector(&vector::to_f32(bytes)),
-                        )?;
-                    }
-                }
-                Ok(false)
-            })
-        })?;
-        let mapped = spill.finish()?;
-        mapped.advise_random();
-        let rows = mapped.rows();
-        if rows.len() != count {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "IVF build row count changed during scan",
-            ));
-        }
-        paged.build_from_spilled_rows(&rows, self.data_dir())?;
-        drop(rows);
-        drop(mapped);
-        drop(lease);
-        self.vector_ivf_paged_build_navigator_from_heap(storage_id, cols, paged)
-    }
-
-    /// Rebuild only the optional governed query navigator for an already
-    /// finalized `.ivf` file (for example after process restart). The durable
-    /// IVF pages are left untouched; allocation pressure merely causes the
-    /// navigator to decline publication and list scanning remains available.
-    fn vector_ivf_paged_build_navigator_from_heap(
-        &self,
-        storage_id: u64,
-        cols: &[usize],
-        paged: &crate::engine::vector::ivf_paged::PagedIvf,
-    ) -> Result<(), QueryError> {
-        if !crate::engine::vector::ivf_paged::PagedIvf::navigator_enabled() {
-            return Ok(());
-        }
-        let scratch_bytes = paged.live_count().saturating_mul(
-            std::mem::size_of::<(RowId, Vec<f32>)>()
-                .saturating_add(paged.dim().saturating_mul(std::mem::size_of::<f32>())),
-        );
-        let Some(_scratch_lease) =
-            HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), scratch_bytes)
+        let col = table.column_index(&index.columns[0])?;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[col].data_type
         else {
-            log_message("ivf(paged): navigation rebuild skipped; no governed heap-scan scratch");
-            return Ok(());
+            return Err(vector::vector_err(
+                "native HNSW requires a declared dimension",
+            ));
         };
-        let mut rows: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(paged.live_count());
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        rows.push((row.row_id, vector::to_f32(bytes)));
-                    }
+        let meta = index.vector_meta_for_table(table);
+        let paged = vector_storage_paged()
+            && !self.physical_replica_mode()
+            && !self.is_snapshot_read_only();
+        let final_path = self.vector_index_paged_path(table, &index.name, storage_id);
+        let mut tmp_path = final_path.clone();
+        tmp_path.set_file_name(format!(
+            "{}.native-build-{}.hvec",
+            final_path.file_stem().unwrap_or_default().to_string_lossy(),
+            self.visible_scn()
+        ));
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let requested=index.vector.as_ref().is_some_and(|v|v.quantization.enabled());
+        let quantizer=self.train_vector_quantizer(table,index,storage_id,txn,col)?;
+        let record_bytes=index.vector.as_ref().filter(|v|v.quantization.enabled()).map(|v|v.quantization.code_len(dimension)+9);
+        let geometry = record_bytes.map_or_else(||native_vector_geometry(datatype, dimension),|n|native_vector_geometry(crate::vector::VectorDataType::Int8,n as u32));
+        let file = if paged {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            if tmp_path.exists() {
+                fs::remove_file(&tmp_path).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                tmp_path.clone(),
+                geometry,
+                meta.metric_enum().as_u8(),
+                meta.m as u16,
+                (meta.m * 2) as u16,
+                meta.ef_construction.min(u16::MAX as u32) as u16,
+            )?);
+            file.invalidate_build(0)?;
+            file.begin_build();
+            Some(file)
+        } else {
+            None
+        };
+        let mut graph = vector::native_hnsw::NativeHnsw::new(
+            datatype,
+            dimension,
+            meta.metric_enum(),
+            meta.m as usize,
+            meta.ef_construction as usize,
+            file,
+        )?;
+        graph.set_quantizer(requested,quantizer.clone(),txn.snapshot_scn.max(1));
+        if let (Some(q),Some(file))=(&quantizer,graph.file()) {
+            let _model_scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,q.bytes().saturating_mul(8).saturating_add(4096))?;
+            let data=q.serialize(index.vector.as_ref())?;
+            file.write_quantization_model(&data,txn.snapshot_scn.max(1))?;
+        }
+        let mut used_parallel=false;
+        if let Some(q)=&quantizer {
+            let rows=q.trained_rows();let threads=hnsw_build_threads();
+            let scratch=rows.saturating_mul((dimension as usize).saturating_mul(4).saturating_add(4096+meta.m as usize*256)).saturating_add(threads*1024*1024);
+            if rows>=2048 && threads>1 && scratch as u64<=hnsw_bulk_memory_budget_bytes()? {
+                let _gate=hnsw_build_memory_gate().lock().unwrap_or_else(|e|e.into_inner());
+                if let Some(mut lease)=HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(),scratch) {
+                    let topology=HnswIndex::new(meta.metric_enum(),meta.m as usize,meta.ef_construction as usize).without_navigation_quantization().with_build_reservation(lease.take_charge(),rows);
+                    self.vector_graph_append_from_heap(table,txn,storage_id,&[col],&topology,threads)?;
+                    topology.link_all(threads);
+                    graph.import_build_topology(&topology)?;
+                    used_parallel=true;
+                }
+            }
+        }
+        let built=if used_parallel {Ok(())}else {
+            self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            &[col],
+            0,
+            u64::MAX,
+            |row, values| {
+                if let Some(Value::Vector(value)) = values.first() {
+                    if !graph.quantization_pending() {graph.insert(row, value.clone())?;}
                 }
                 Ok(false)
-            })
+            },
+        )
+        };
+        if let Err(err) = built {
+            graph.invalidate();
+            return Err(err);
+        }
+        if let Some(file) = graph.file() {
+            file.advance_coverage(txn.snapshot_scn);
+            file.finalize_build(0)?;
+        }
+        if paged && self.durability_mode() != DurabilityMode::Memory {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            self.buffer_pool.discard_pages_for_path(&final_path)?;
+            fs::rename(&tmp_path, &final_path).map_err(io_err)?;
+            if let Some(parent) = final_path.parent() {
+                crate::platform::fs::sync_path(parent).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                final_path,
+                geometry,
+                meta.metric_enum().as_u8(),
+                meta.m as u16,
+                (meta.m * 2) as u16,
+                meta.ef_construction.min(u16::MAX as u32) as u16,
+            )?);
+            graph.replace_file(file);
+        }
+        graph.prepare_navigation()?;
+        Ok(VectorGraph::NativeHnsw(graph))
+    }
+
+    fn vector_native_ivf_load_or_build(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        storage_id: u64,
+    ) -> Result<VectorGraph, QueryError> {
+        let col = table.column_index(&index.columns[0])?;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[col].data_type
+        else {
+            return Err(vector::vector_err(
+                "native IVF requires a declared dimension",
+            ));
+        };
+        let meta = index.vector_meta_for_table(table);
+        let paged = vector_storage_paged()
+            && !self.physical_replica_mode()
+            && !self.is_snapshot_read_only();
+        let final_path = self.vector_index_paged_path(table, &index.name, storage_id);
+        let mut tmp_path = final_path.clone();
+        tmp_path.set_file_name(format!(
+            "{}.native-build-{}.hvec",
+            final_path.file_stem().unwrap_or_default().to_string_lossy(),
+            self.visible_scn()
+        ));
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let requested=index.vector.as_ref().is_some_and(|v|v.quantization.enabled());
+        let quantizer=self.train_vector_quantizer(table,index,storage_id,txn,col)?;
+        let record_bytes=index.vector.as_ref().filter(|v|v.quantization.enabled()).map(|v|v.quantization.code_len(dimension)+9);
+        let geometry = record_bytes.map_or_else(||native_vector_geometry(datatype, dimension),|n|native_vector_geometry(crate::vector::VectorDataType::Int8,n as u32));
+        let file = if paged {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            if tmp_path.exists() {
+                fs::remove_file(&tmp_path).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                tmp_path.clone(),
+                geometry,
+                meta.metric_enum().as_u8(),
+                2,
+                0,
+                1,
+            )?);
+            file.invalidate_build(0)?;
+            file.begin_build();
+            Some(file)
+        } else {
+            None
+        };
+        let mut graph = vector::native_ivf::NativeIvf::new(
+            datatype,
+            dimension,
+            meta.metric_enum(),
+            ivf_params_from_meta(&meta),
+            file,
+        )?;
+        graph.set_quantizer(requested,quantizer.clone(),txn.snapshot_scn.max(1));
+        if let (Some(q),Some(file))=(&quantizer,graph.file()) {
+            let _model_scratch=crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,q.bytes().saturating_mul(8).saturating_add(4096))?;
+            let data=q.serialize(index.vector.as_ref())?;
+            file.write_quantization_model(&data,txn.snapshot_scn.max(1))?;
+        }
+        let mut count = 0usize;
+        self.scan_hnsw_build_rows(table, storage_id, txn, &[col], 0, u64::MAX, |_, values| {
+            if matches!(values.first(), Some(Value::Vector(_))) {
+                count += 1;
+            }
+            Ok(false)
         })?;
-        paged.rebuild_navigator(&rows);
-        Ok(())
+        if count > 0 {
+            let params = ivf_params_from_meta(&meta);
+            let nlist = if params.nlist == 0 {
+                (count as f64).sqrt() as usize
+            } else {
+                params.nlist
+            }
+            .max(1)
+            .min(count);
+            let sample_count = nlist.saturating_mul(params.train_sample_mult).min(count);
+            let sample_charge =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    sample_count.saturating_mul(datatype.payload_len(dimension) + 96),
+                )?;
+            let mut ordinals = vector::ivf::training_sample(count, sample_count);
+            ordinals.sort_unstable();
+            let mut ordinals = ordinals.into_iter().peekable();
+            let mut ordinal = 0usize;
+            let mut rows = Vec::with_capacity(sample_count);
+            self.scan_hnsw_build_rows(
+                table,
+                storage_id,
+                txn,
+                &[col],
+                0,
+                u64::MAX,
+                |row, values| {
+                    if let Some(Value::Vector(value)) = values.first() {
+                        if ordinals.peek() == Some(&ordinal) {
+                            rows.push((row, value.clone()));
+                            ordinals.next();
+                        }
+                        ordinal += 1;
+                    }
+                    Ok(ordinals.peek().is_none())
+                },
+            )?;
+            graph.initialize_from_sample(rows, nlist)?;
+            drop(sample_charge);
+        }
+        let built = self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            &[col],
+            0,
+            u64::MAX,
+            |row, values| {
+                if let Some(Value::Vector(value)) = values.first() {
+                    if !graph.quantization_pending() {graph.insert(row, value.clone())?;}
+                }
+                Ok(false)
+            },
+        );
+        if let Err(err) = built {
+            graph.invalidate();
+            return Err(err);
+        }
+        if let Some(file) = graph.file() {
+            file.advance_coverage(txn.snapshot_scn);
+            file.finalize_build(0)?;
+        }
+        if paged && self.durability_mode() != DurabilityMode::Memory {
+            self.buffer_pool.discard_pages_for_path(&tmp_path)?;
+            self.buffer_pool.discard_pages_for_path(&final_path)?;
+            fs::rename(&tmp_path, &final_path).map_err(io_err)?;
+            if let Some(parent) = final_path.parent() {
+                crate::platform::fs::sync_path(parent).map_err(io_err)?;
+            }
+            let file = Arc::new(self.open_vector_index_file_at_path(
+                final_path,
+                geometry,
+                meta.metric_enum().as_u8(),
+                2,
+                0,
+                1,
+            )?);
+            graph.replace_file(file);
+        }
+        Ok(VectorGraph::NativeIvf(graph))
     }
 
     /// Paged-backend build/open: open (or create) the `.hvec` graph file —
@@ -1002,19 +1012,25 @@ impl Database {
         if self.physical_replica_mode() {
             file.disable_navigation_mapping();
         }
-        let paged = PagedHnsw::new(Arc::new(file));
+        let paged = PagedHnsw::new(Arc::new(file)).without_navigation_quantization();
         // Build when the file has no finalized graph yet: either a freshly
         // created `.hvec`, or an interrupted/legacy build (non-finalized). A
         // finalized file — even an empty one, or one extended only by
         // incremental DML inserts — is trusted and used as-is.
-        if !paged.is_finalized() {
+        if !paged.is_finalized() || !paged.file().meta().query_ready {
+            if self.is_snapshot_read_only() {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "paged HNSW coverage requires rebuilding; use exact heap scan",
+                ));
+            }
             self.ensure_writable()?;
             drop(paged);
             self.buffer_pool.discard_pages_for_path(&path)?;
             let _ = fs::remove_file(&path);
             let file = self.open_vector_index_file(table, index, storage_id, dim)?;
-            let rebuilt = PagedHnsw::new(Arc::new(file));
-            self.vector_graph_paged_build_from_heap(storage_id, &cols, &rebuilt)?;
+            let rebuilt = PagedHnsw::new(Arc::new(file)).without_navigation_quantization();
+            self.vector_graph_paged_build_from_heap(table, storage_id, &cols, &rebuilt)?;
             return Ok(rebuilt);
         }
         Ok(paged)
@@ -1032,7 +1048,7 @@ impl Database {
         col_idx: usize,
         storage_id: u64,
     ) -> Result<u32, QueryError> {
-        if let DataTypeKind::Vector { dim: Some(d) } = table.columns[col_idx].data_type {
+        if let DataTypeKind::Vector { dim: Some(d), .. } = table.columns[col_idx].data_type {
             return Ok(d);
         }
         let cols = [col_idx];
@@ -1070,7 +1086,7 @@ impl Database {
         storage_id: u64,
         dim: u32,
     ) -> Result<VectorIndexFile, QueryError> {
-        let meta = index.vector_meta();
+        let meta = index.vector_meta_for_table(table);
         let metric = meta.metric_enum().as_u8();
         let m = meta.m.clamp(2, u32::from(u16::MAX)) as u16;
         let m0 = (u32::from(m) * 2).min(u32::from(u16::MAX)) as u16;
@@ -1108,10 +1124,21 @@ impl Database {
     /// have succeeded.
     fn vector_graph_paged_build_from_heap(
         &self,
+        table: &TableSchema,
         storage_id: u64,
         cols: &[usize],
         paged: &PagedHnsw,
     ) -> Result<(), QueryError> {
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        // A DDL-owned shadow heap contains the copying transaction's own
+        // rows. Its catalog generation remains protected by the DDL barrier.
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+
+        paged.file().advance_coverage(txn.snapshot_scn);
         paged.begin_bulk_build();
         let timing = std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok();
         let total_started = Instant::now();
@@ -1122,16 +1149,21 @@ impl Database {
         // allocation and governor reservation capacity-based.
         let stats_started = Instant::now();
         let mut stats = CompactHnswStats::new(metric);
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        stats.observe(&vector::to_f32(bytes));
-                    }
+        self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            cols,
+            0,
+            u64::MAX,
+            |_row_id, values| {
+                if let Some(Value::Vector(bytes)) = values.first() {
+                    stats.observe(&vector::to_f32(bytes));
                 }
+
                 Ok(false)
-            })
-        })?;
+            },
+        )?;
         if stats.rows() == 0 {
             paged.finalize_bulk_build()?;
             paged.record_build_stats(HnswBuildStats {
@@ -1188,7 +1220,7 @@ impl Database {
             full_bytes,
             compact_bytes,
             budget,
-            stats.quantizable(),
+            false,
         );
         let mut build_mode = match preferred {
             HnswColdBuildMode::FullMemory if full_bytes > budget => {
@@ -1209,14 +1241,6 @@ impl Database {
                         crate::error::catalog::ER_OUTOFMEMORY,
                         "HNSW full-memory build cannot reserve memory within MYDB_MEMORY_TARGET",
                     ));
-                } else if stats.quantizable() && compact_bytes <= budget {
-                    lease =
-                        HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), compact_bytes);
-                    if lease.is_some() {
-                        HnswColdBuildMode::CompactSq8
-                    } else {
-                        HnswColdBuildMode::ChunkedPaged
-                    }
                 } else {
                     HnswColdBuildMode::ChunkedPaged
                 }
@@ -1260,12 +1284,12 @@ impl Database {
         };
         match build_mode {
             HnswColdBuildMode::FullMemory => {
-                let graph = HnswIndex::new(metric, m, ef_construction).with_build_reservation(
+                let graph = HnswIndex::new(metric, m, ef_construction).without_navigation_quantization().with_build_reservation(
                     lease.as_mut().expect("admitted full build").take_charge(),
                     stats.rows(),
                 );
                 let scan_started = Instant::now();
-                self.vector_graph_append_from_heap(storage_id, cols, &graph, threads)?;
+                self.vector_graph_append_from_heap(table, txn, storage_id, cols, &graph, threads)?;
                 build_stats.encode_ms = scan_started.elapsed().as_millis() as u64;
                 if timing {
                     eprintln!(
@@ -1276,6 +1300,7 @@ impl Database {
                 }
                 let link_started = Instant::now();
                 graph.link_all(threads);
+                crate::engine::cancel::check_cancelled()?;
                 build_stats.link_ms = link_started.elapsed().as_millis() as u64;
                 let materialize_started = Instant::now();
                 paged.materialize_memory_graph(&graph)?;
@@ -1299,19 +1324,24 @@ impl Database {
                     )
                 })?;
                 let encode_started = Instant::now();
-                self.with_heap_read(storage_id, |heap| {
-                    heap.scan_mvcc_columns_until(cols, |row| {
-                        if !row.header.is_deleted() {
-                            if let Some(Value::Vector(bytes)) = row.values.first() {
-                                let values = vector::to_f32(bytes);
-                                builder.push(row.row_id, &values).map_err(|message| {
-                                    error(crate::error::catalog::ER_GET_ERRNO, message)
-                                })?;
-                            }
+                self.scan_hnsw_build_rows(
+                    table,
+                    storage_id,
+                    txn,
+                    cols,
+                    0,
+                    u64::MAX,
+                    |row_id, values| {
+                        if let Some(Value::Vector(bytes)) = values.first() {
+                            let values = vector::to_f32(bytes);
+                            builder.push(row_id, &values).map_err(|message| {
+                                error(crate::error::catalog::ER_GET_ERRNO, message)
+                            })?;
                         }
+
                         Ok(false)
-                    })
-                })?;
+                    },
+                )?;
                 build_stats.encode_ms = encode_started.elapsed().as_millis() as u64;
                 let link_started = Instant::now();
                 let graph = builder
@@ -1319,14 +1349,17 @@ impl Database {
                     .map_err(|message| error(crate::error::catalog::ER_GET_ERRNO, message))?;
                 build_stats.link_ms = link_started.elapsed().as_millis() as u64;
                 let materialize_started = Instant::now();
-                self.vector_graph_materialize_compact_from_heap(storage_id, cols, paged, &graph)?;
+                self.vector_graph_materialize_compact_from_heap(
+                    table, txn, storage_id, cols, paged, &graph,
+                )?;
                 build_stats.materialize_ms = materialize_started.elapsed().as_millis() as u64;
                 drop(graph);
             }
             _ => {
                 drop(lease.take());
-                let chunked = self
-                    .vector_graph_paged_build_chunked(storage_id, cols, paged, &stats, threads)?;
+                let chunked = self.vector_graph_paged_build_chunked(
+                    table, txn, storage_id, cols, paged, &stats, threads,
+                )?;
                 build_stats.link_ms = chunked.link_ms;
                 build_stats.materialize_ms = chunked.materialize_ms;
                 build_stats.peak_scratch_bytes = chunked.reserved_bytes;
@@ -1365,6 +1398,8 @@ impl Database {
 
     fn vector_graph_materialize_compact_from_heap(
         &self,
+        table: &TableSchema,
+        txn: TxnView,
         storage_id: u64,
         cols: &[usize],
         paged: &PagedHnsw,
@@ -1375,19 +1410,24 @@ impl Database {
             let (sender, receiver) = std::sync::mpsc::sync_channel::<ExactRow>(8);
             let scanner = scope.spawn(move || -> Result<usize, QueryError> {
                 let mut sent = 0usize;
-                self.with_heap_read(storage_id, |heap| {
-                    heap.scan_mvcc_columns_until(cols, |row| {
-                        if !row.header.is_deleted() {
-                            if let Some(Value::Vector(bytes)) = row.values.first() {
-                                if sender.send((row.row_id, vector::to_f32(bytes))).is_err() {
-                                    return Ok(true);
-                                }
-                                sent += 1;
+                self.scan_hnsw_build_rows(
+                    table,
+                    storage_id,
+                    txn,
+                    cols,
+                    0,
+                    u64::MAX,
+                    |row_id, values| {
+                        if let Some(Value::Vector(bytes)) = values.first() {
+                            if sender.send((row_id, vector::to_f32(bytes))).is_err() {
+                                return Ok(true);
                             }
+                            sent += 1;
                         }
+
                         Ok(false)
-                    })
-                })?;
+                    },
+                )?;
                 Ok(sent)
             });
 
@@ -1436,6 +1476,8 @@ impl Database {
 
     fn vector_graph_paged_build_chunked(
         &self,
+        table: &TableSchema,
+        txn: TxnView,
         storage_id: u64,
         cols: &[usize],
         paged: &PagedHnsw,
@@ -1526,29 +1568,30 @@ impl Database {
         let mut rows: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(chunk_rows);
         let mut chunks = 0usize;
         let link_started = Instant::now();
-        self.with_heap_read(storage_id, |heap| {
-            heap.scan_mvcc_columns_until(cols, |row| {
-                if !row.header.is_deleted() {
-                    if let Some(Value::Vector(bytes)) = row.values.first() {
-                        rows.push((row.row_id, vector::to_f32(bytes)));
-                        if rows.len() >= chunk_rows {
-                            paged.insert_bulk_chunk_parallel(
-                                &mut rows,
-                                chunk_threads,
-                                &mut session,
-                            )?;
-                            rows.clear();
-                            // Workers have joined and decoded vectors are gone.
-                            // Return allocator-retained pages before refilling
-                            // this chunk while the statement remains active.
-                            crate::engine::memory_reclaimer::reclaim_bulk_operation_pressure();
-                            chunks += 1;
-                        }
+        self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            cols,
+            0,
+            u64::MAX,
+            |row_id, values| {
+                if let Some(Value::Vector(bytes)) = values.first() {
+                    rows.push((row_id, vector::to_f32(bytes)));
+                    if rows.len() >= chunk_rows {
+                        paged.insert_bulk_chunk_parallel(&mut rows, chunk_threads, &mut session)?;
+                        rows.clear();
+                        // Workers have joined and decoded vectors are gone.
+                        // Return allocator-retained pages before refilling
+                        // this chunk while the statement remains active.
+                        crate::engine::memory_reclaimer::reclaim_bulk_operation_pressure();
+                        chunks += 1;
                     }
                 }
+
                 Ok(false)
-            })
-        })?;
+            },
+        )?;
         if !rows.is_empty() {
             paged.insert_bulk_chunk_parallel(&mut rows, chunk_threads, &mut session)?;
             rows.clear();
@@ -1584,6 +1627,42 @@ impl Database {
         })
     }
 
+    /// All build passes resolve the same committed snapshot, including undo.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_hnsw_build_rows(
+        &self,
+        table: &TableSchema,
+        storage_id: u64,
+        txn: TxnView,
+        columns: &[usize],
+        lo: u64,
+        hi: u64,
+        mut visit: impl FnMut(RowId, &[Value]) -> Result<bool, QueryError>,
+    ) -> Result<(), QueryError> {
+        crate::engine::cancel::check_cancelled()?;
+        let mut stopped = false;
+        let mut observed = 0usize;
+        self.scan_rows_columns_storage_streaming_range_with_ids_impl(
+            table,
+            storage_id,
+            txn,
+            columns,
+            lo,
+            hi,
+            false,
+            |row_id, values| {
+                if !stopped {
+                    if observed & 1023 == 0 {
+                        crate::engine::cancel::check_cancelled()?;
+                    }
+                    observed += 1;
+                    stopped = visit(row_id, values)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Walk one storage_id's heap (one partition, or the whole table for
     /// unpartitioned cases) and reconcile its vectors with `graph`.
     /// Dispatches between a single-threaded serial
@@ -1592,30 +1671,41 @@ impl Database {
     /// spawn / join overhead never dominates.
     fn vector_graph_populate_from_heap(
         &self,
+        table: &TableSchema,
         storage_id: u64,
         cols: &[usize],
         graph: &HnswIndex,
         threads: usize,
     ) -> Result<(), QueryError> {
+        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
+        // A DDL-owned shadow heap contains the copying transaction's own
+        // rows. Its catalog generation remains protected by the DDL barrier.
+        if table.row_generation_txn_id != 0 {
+            txn.txn_id = table.row_generation_txn_id;
+        }
+        self.vector_snapshot_floor
+            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+
         // Two-phase cold build vs incremental catch-up. A fresh graph (no nodes
         // yet) takes the fast path: append every row first (cheap, lock-free),
         // build the SQ8 navigation arena over the complete set, then link the
         // whole graph on the contiguous int8 codes. A graph that already has
         // nodes (snapshot loaded → catch-up) must link *new* rows incrementally
         // so `link_all` doesn't double-wire the loaded ones.
-        if graph.is_empty() {
+        if graph.node_count() == 0 {
             let timing = std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok();
             let t_a = std::time::Instant::now();
-            self.vector_graph_append_from_heap(storage_id, cols, graph, threads)?;
+            self.vector_graph_append_from_heap(table, txn, storage_id, cols, graph, threads)?;
             if timing {
                 eprintln!("[hnsw] PhaseA append-from-heap: {:?}", t_a.elapsed());
             }
             graph.link_all(threads);
+            crate::engine::cancel::check_cancelled()?;
             return Ok(());
         }
 
         // Catch-up: retain unchanged live nodes and re-link changed/new rows.
-        self.vector_graph_insert_from_heap(storage_id, cols, graph, threads)
+        self.vector_graph_insert_from_heap(table, txn, storage_id, cols, graph, threads)
     }
 
     /// Phase A of the cold build: append every visible vector row into `graph`
@@ -1625,6 +1715,8 @@ impl Database {
     /// shared `RwLock` so workers don't serialise on the heap.
     fn vector_graph_append_from_heap(
         &self,
+        table: &TableSchema,
+        txn: TxnView,
         storage_id: u64,
         cols: &[usize],
         graph: &HnswIndex,
@@ -1638,16 +1730,21 @@ impl Database {
         let max_by_pages = (page_count / min_pages).max(1) as usize;
         let effective = threads.min(max_by_pages).max(1);
         if effective <= 1 {
-            return self.with_heap_read(storage_id, |heap| {
-                heap.scan_mvcc_columns_until(cols, |row| {
-                    if !row.header.is_deleted() {
-                        if let Some(Value::Vector(bytes)) = row.values.first() {
-                            graph.append_node(row.row_id, vector::to_f32(bytes))?;
-                        }
+            return self.scan_hnsw_build_rows(
+                table,
+                storage_id,
+                txn,
+                cols,
+                0,
+                u64::MAX,
+                |row_id, values| {
+                    if let Some(Value::Vector(bytes)) = values.first() {
+                        graph.append_node(row_id, vector::to_f32(bytes))?;
                     }
+
                     Ok(false)
-                })
-            });
+                },
+            );
         }
 
         let chunk = page_count.div_ceil(effective as u64);
@@ -1659,16 +1756,21 @@ impl Database {
                 let cols_ref = cols;
                 let graph_ref = graph;
                 let h = scope.spawn(move || -> Result<(), QueryError> {
-                    self.with_heap_read(storage_id, |heap| {
-                        heap.scan_mvcc_columns_range_until(cols_ref, lo, hi, |row| {
-                            if !row.header.is_deleted() {
-                                if let Some(Value::Vector(bytes)) = row.values.first() {
-                                    graph_ref.append_node(row.row_id, vector::to_f32(bytes))?;
-                                }
+                    self.scan_hnsw_build_rows(
+                        table,
+                        storage_id,
+                        txn,
+                        cols_ref,
+                        lo,
+                        hi,
+                        |row_id, values| {
+                            if let Some(Value::Vector(bytes)) = values.first() {
+                                graph_ref.append_node(row_id, vector::to_f32(bytes))?;
                             }
+
                             Ok(false)
-                        })
-                    })
+                        },
+                    )
                 });
                 handles.push(h);
                 lo = hi;
@@ -1689,6 +1791,8 @@ impl Database {
     /// snapshot nodes whose row no longer exists in the heap are tombstoned.
     fn vector_graph_insert_from_heap(
         &self,
+        table: &TableSchema,
+        txn: TxnView,
         storage_id: u64,
         cols: &[usize],
         graph: &HnswIndex,
@@ -1705,19 +1809,16 @@ impl Database {
         let max_by_pages = (page_count / min_pages).max(1) as usize;
         let effective = threads.min(max_by_pages).max(1);
         let scan_range = |lo: u64, hi: u64| -> Result<(), QueryError> {
-            self.with_heap_read(storage_id, |heap| {
-                heap.scan_mvcc_columns_range_until(cols, lo, hi, |row| {
-                    if !row.header.is_deleted() {
-                        if let Some(Value::Vector(bytes)) = row.values.first() {
-                            graph.reconcile_heap_vector_marked(
-                                row.row_id,
-                                vector::to_f32(bytes),
-                                Some(marks),
-                            )?;
-                        }
-                    }
-                    Ok(false)
-                })
+            self.scan_hnsw_build_rows(table, storage_id, txn, cols, lo, hi, |row_id, values| {
+                if let Some(Value::Vector(bytes)) = values.first() {
+                    graph.reconcile_heap_vector_marked(
+                        row_id,
+                        vector::to_f32(bytes),
+                        Some(marks),
+                    )?;
+                }
+
+                Ok(false)
             })
         };
         if effective <= 1 {
@@ -1777,10 +1878,10 @@ impl Database {
         table: &TableSchema,
         txn: TxnView,
         col_idx: usize,
-        query: &[u8],
+        query: &crate::vector::VectorValue,
         metric: vector::Metric,
         k: usize,
-    ) -> Result<Vec<(f32, u64, RowId)>, QueryError> {
+    ) -> Result<Vec<(f64, u64, RowId)>, QueryError> {
         if k == 0 || query.is_empty() {
             return Ok(Vec::new());
         }
@@ -1908,7 +2009,7 @@ impl Database {
         table: &TableSchema,
         txn: TxnView,
         cols: &[usize],
-        query: &[u8],
+        query: &crate::vector::VectorValue,
         metric: vector::Metric,
         storage_id: u64,
         page_lo: u64,
@@ -1923,7 +2024,16 @@ impl Database {
         // existing fused NEON kernels; default-off keeps the old path as a
         // differential oracle. Packing is bounded per worker and amortises one
         // SMSTART/SMSTOP over many candidates.
-        let use_sme = metric == vector::Metric::L2 && vector::distance::brute_sme_enabled();
+        let use_sme = query.datatype == crate::vector::VectorDataType::Float32
+            && matches!(
+                table.columns[col_idx].data_type,
+                DataTypeKind::Vector {
+                    datatype: crate::vector::VectorDataType::Float32,
+                    ..
+                }
+            )
+            && metric == vector::Metric::L2
+            && vector::distance::brute_sme_enabled();
         let sme_batch_rows = std::env::var("MYDB_VECTOR_BRUTE_SME_BATCH_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1953,8 +2063,17 @@ impl Database {
                     "SME brute-KNN batch dispatch failed",
                 ));
             }
-            for (&rid, &d) in ids.iter().zip(&dist[..n]) {
-                top.push(d, storage_id, rid);
+            for (i, (&rid, &d)) in ids.iter().zip(&dist[..n]).enumerate() {
+                let score = if d.is_normal() {
+                    d as f64
+                } else {
+                    vector::distance::ordering_distance_bytes(
+                        query,
+                        &rows[i * query.len()..(i + 1) * query.len()],
+                        metric,
+                    )
+                };
+                top.push(score, storage_id, rid);
             }
             rows.clear();
             ids.clear();
@@ -1988,7 +2107,7 @@ impl Database {
                         row.has_external,
                         col_idx,
                     )? {
-                        Some(range) if range.width == query.len() => {
+                        Some(range) => {
                             let vb = &body
                                 [range.offset_in_payload..range.offset_in_payload + range.width];
                             if use_sme {
@@ -1999,16 +2118,32 @@ impl Database {
                                 }
                                 return Ok(false);
                             }
-                            vector::distance::ordering_distance_bytes(query, vb, metric)
+                            {
+                                let DataTypeKind::Vector {
+                                    dim: Some(dimension),
+                                    datatype,
+                                } = table.columns[col_idx].data_type
+                                else {
+                                    return Err(vector::vector_err("invalid vector column layout"));
+                                };
+                                let v = crate::vector::VectorRef {
+                                    datatype,
+                                    dimension,
+                                    payload: vb,
+                                };
+                                vector::distance::typed_ordering_distance(query, &v, metric)?
+                            }
                         }
                         // Dimension drift on a VECTOR(n) column is impossible
                         // for a well-formed table (write path + planner both pin
                         // the dim); skip defensively rather than scoring garbage.
-                        Some(_) => return Ok(false),
                         // NULL or dimensionless vector → NULL distance, which
                         // sorts first under ASC (NULLs-first), matching the
                         // row-based oracle.
-                        None => f32::NEG_INFINITY,
+                        None => {
+                            deferred.push(row.row_id);
+                            return Ok(false);
+                        }
                     };
                     top.push(key, storage_id, row.row_id);
                     Ok(false)
@@ -2026,11 +2161,11 @@ impl Database {
         for rid in deferred {
             if let Some(values) = self.read_row_columns(table, rid, txn, cols)? {
                 let key = match values.first() {
-                    Some(Value::Vector(b)) if b.len() == query.len() => {
-                        vector::distance::ordering_distance_bytes(query, b, metric)
+                    Some(Value::Vector(b)) if b.dimension == query.dimension => {
+                        vector::distance::typed_ordering_distance(query, b, metric)?
                     }
                     Some(Value::Vector(_)) => continue,
-                    _ => f32::NEG_INFINITY,
+                    _ => f64::NEG_INFINITY,
                 };
                 top.push(key, storage_id, rid);
             }
@@ -2063,27 +2198,11 @@ impl Database {
             table.active_generation.max(1),
             normalize_name(&index.name),
         );
-        if self.physical_replica_mode() && index.vector_algo() == VectorAlgo::IvfSq8 {
-            if !vector_storage_paged() {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,
-                    "memory IVF acceleration unavailable during physical replication; using exact heap search"));
-            }
-            if let Some(graph) = self.vector_indexes.read().get(&key) {
-                return Ok(graph.clone());
-            }
-            // Serialize publication with redo invalidation. Otherwise a build
-            // started before eviction can publish its obsolete resident state
-            // after the applier has already removed the old cache entry.
-            let mut map = self.vector_indexes.write();
-            if let Some(graph) = map.get(&key) {
-                return Ok(graph.clone());
-            }
-            let graph = Arc::new(self.vector_graph_load_or_build(table, index, storage_id)?);
-            map.insert(key, graph.clone());
-            return Ok(graph);
-        }
-        if let Some(graph) = self.vector_indexes.read().get(&key) {
-            return Ok(graph.clone());
+
+        let cached=self.vector_indexes.read().get(&key).cloned();
+        if let Some(graph)=cached {
+            if graph.ensure_valid().is_ok() {return Ok(graph);}
+            self.evict_vector_graphs(vec![key.clone()]);
         }
         // A build that just failed memory admission would fail again: report
         // it immediately (callers fall back to an exact scan) instead of
@@ -2122,40 +2241,131 @@ impl Database {
         storage_id: u64,
         key: (u64, u64, u64, String),
     ) -> Result<Arc<VectorGraph>, QueryError> {
-        let registration = (index.vector_algo() == VectorAlgo::Hnsw)
+        let build_lock = {
+            let mut locks = self.vector_build_locks.lock();
+            locks.retain(|_, owner| owner.strong_count() > 0);
+            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(parking_lot::Mutex::new(()));
+                    locks.insert(key.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _owner = loop {
+            if let Some(guard) = build_lock.try_lock_for(std::time::Duration::from_millis(25)) {
+                break guard;
+            }
+            crate::engine::cancel::check_cancelled()?;
+        };
+        crate::engine::cancel::check_cancelled()?;
+        let cached=self.vector_indexes.read().get(&key).cloned();
+        if let Some(existing)=cached {
+            if existing.ensure_valid().is_ok() {return Ok(existing);}
+            self.evict_vector_graphs(vec![key.clone()]);
+        }
+        let registration = (!self.is_snapshot_read_only())
             .then(|| VectorBuildRegistration::begin(self, key.clone()));
+        let build_epoch = self
+            .vector_build_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
         let graph = self.vector_graph_load_or_build(table, index, storage_id)?;
+        if self.is_snapshot_read_only() {
+            // Sealing already finalized durable graphs. A cold reader only
+            // installs query accelerators; it must not replay deltas or write
+            // completion/coverage metadata back into the immutable image.
+            graph.prepare_query_navigation()?;
+            let graph = Arc::new(graph);
+            self.vector_indexes.write().insert(key, graph.clone());
+            return Ok(graph);
+        }
+        let mut build_guard = VectorGraphBuildGuard {
+            graph: &graph,
+            published: false,
+        };
         #[cfg(test)]
-        if let Some(hook) = VECTOR_BUILD_BEFORE_PUBLISH_HOOK.lock().take() {
-            hook();
+        {
+            let hook = VECTOR_BUILD_BEFORE_PUBLISH_HOOK.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let mut applied = 0;
         if let Some(registration) = &registration {
-            // Catch up without blocking DML; the final tail is replayed under
-            // the publication lock below.
-            loop {
-                let batch = registration.ops_since(applied);
+            for _ in 0..8 {
+                let (next, batch) = registration.ops_since(applied)?;
                 if batch.is_empty() {
                     break;
                 }
-                applied += batch.len();
+                applied = next;
                 for (row_id, vector) in batch {
                     graph.replace_row(row_id, vector)?;
                 }
+                crate::engine::cancel::check_cancelled()?;
             }
         }
         let mut map = self.vector_indexes.write();
+        if self
+            .vector_build_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != build_epoch
+        {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector build invalidated by concurrent state change",
+            ));
+        }
         if let Some(existing) = map.get(&key) {
             return Ok(existing.clone());
         }
         if let Some(registration) = &registration {
-            for (row_id, vector) in registration.ops_since(applied) {
+            let (_, batch) = registration.ops_since(applied)?;
+            if batch.len() > 4096 {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "vector build publication tail exceeded its work budget",
+                ));
+            }
+            for (row_id, vector) in batch {
                 graph.replace_row(row_id, vector)?;
             }
         }
+        if let VectorGraph::Paged(paged) = &graph {
+            paged.file().advance_coverage(self.visible_scn());
+            paged.file().mark_delta_finalized(0)?;
+            paged.refresh_query_navigation()?;
+        }
+        if let VectorGraph::NativeHnsw(native) = &graph {
+            if let Some(file) = native.file() {
+                file.advance_coverage(self.visible_scn());
+                file.mark_delta_finalized(0)?;
+            }
+        }
+        if let VectorGraph::NativeIvf(native) = &graph {
+            if let Some(file) = native.file() {
+                file.advance_coverage(self.visible_scn());
+                file.mark_delta_finalized(0)?;
+            }
+        }
+        if let VectorGraph::Memory(memory) = &graph {
+            memory.set_background_quant(crate::engine::vector_maintenance::is_active(self));
+        }
+        build_guard.published = true;
+        drop(build_guard);
         let graph = Arc::new(graph);
         map.insert(key, graph.clone());
         Ok(graph)
+    }
+
+    pub(crate) fn sync_vector_background_quant(&self) {
+        let graphs = self.vector_indexes.read();
+        let active = crate::engine::vector_maintenance::is_active(self);
+        for graph in graphs.values() {
+            if let VectorGraph::Memory(memory) = graph.as_ref() {
+                memory.set_background_quant(active);
+            }
+        }
     }
 
     /// Record committed maintenance for a key whose graph is not published.
@@ -2165,7 +2375,7 @@ impl Database {
         &self,
         key: &(u64, u64, u64, String),
         row_id: RowId,
-        vector: Option<Vec<f32>>,
+        vector: Option<crate::vector::VectorValue>,
     ) {
         if self
             .vector_builds_in_flight
@@ -2175,7 +2385,58 @@ impl Database {
             return;
         }
         if let Some(delta) = self.vector_build_deltas.lock().get_mut(key) {
-            delta.ops.push((row_id, vector));
+            if delta.failed {
+                return;
+            }
+            let previous = delta.ops.get(&row_id).map_or(0, |(_, value)| {
+                value
+                    .as_ref()
+                    .map_or(0, |v| v.capacity())
+                    .saturating_mul(2)
+                    .saturating_add(128)
+            });
+            let bytes = vector
+                .as_ref()
+                .map_or(0, |v| v.capacity())
+                .saturating_mul(2)
+                .saturating_add(128);
+            let increase = bytes.saturating_sub(previous);
+            let limit = (crate::engine::executor::mem_budget::memory_target_bytes() / 32)
+                .clamp(1024 * 1024, 32 * 1024 * 1024);
+            if delta
+                .charge
+                .as_ref()
+                .map_or(0, |c| c.bytes())
+                .saturating_add(increase)
+                > limit
+            {
+                delta.failed = true;
+                return;
+            }
+            let admitted = match delta.charge.as_mut() {
+                Some(charge) => charge.try_grow(increase).is_ok(),
+                None => match crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    bytes,
+                ) {
+                    Ok(charge) => {
+                        delta.charge = Some(charge);
+                        true
+                    }
+                    Err(_) => false,
+                },
+            };
+            if !admitted {
+                delta.failed = true;
+                return;
+            }
+            if previous > bytes {
+                if let Some(charge) = delta.charge.as_mut() {
+                    charge.shrink(previous - bytes);
+                }
+            }
+            delta.next_seq = delta.next_seq.saturating_add(1);
+            delta.ops.insert(row_id, (delta.next_seq, vector));
         }
     }
 
@@ -2262,13 +2523,17 @@ impl Database {
         if self.vector_indexes.read().contains_key(&key) {
             return Ok(()); // already warm (e.g. a concurrent query built it)
         }
-        if index.vector_algo() == VectorAlgo::IvfSq8 && vector_storage_paged() {
-            let graph = self.rebuild_paged_ivf_atomic(table, index, storage_id)?;
-            self.vector_indexes.write().entry(key).or_insert(graph);
-            return Ok(());
-        }
         self.vector_graph_build_and_publish(table, index, storage_id, key)?;
         Ok(())
+    }
+
+    /// Current graph ordering/cold coverage is unsuitable for an older view.
+    pub(crate) fn vector_snapshot_requires_exact(&self, txn: TxnView) -> bool {
+        txn.historical
+            || txn.snapshot_scn
+                < self
+                    .vector_snapshot_floor
+                    .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Per-partition k-nearest-neighbour candidate search. Returns
@@ -2283,11 +2548,11 @@ impl Database {
         table: &TableSchema,
         index: &IndexSchema,
         storage_id: u64,
-        query: &[f32],
+        query: &crate::vector::VectorValue,
         request: crate::engine::vector::VectorSearchRequest,
     ) -> Result<crate::engine::vector::VectorSearchResult, QueryError> {
         let graph = self.vector_graph_get_or_build_for_partition(table, index, storage_id)?;
-        if !graph.is_empty() && graph.dim() != query.len() {
+        if !graph.is_empty() && graph.dim() != query.dimension as usize {
             return Err(error(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                 format!(
@@ -2303,7 +2568,24 @@ impl Database {
                 paged.file().disable_navigation_mapping();
             }
         }
-        graph.search(query, request)
+        let result = graph.search(query, request);
+        if let Ok(r)=&result {graph.record_query_stats(r.candidates.len() as u64,0,false);}
+        if !graph.quantization_pending() && result
+            .as_ref()
+            .is_err_and(|error| error.is(crate::error::catalog::ER_GET_ERRNO))
+            && matches!(
+                graph.as_ref(),
+                VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+            )
+        {
+            self.evict_vector_graphs(vec![(
+                table.id,
+                storage_id,
+                table.active_generation.max(1),
+                normalize_name(&index.name),
+            )]);
+        }
+        result
     }
 
     /// Dimensionless columns still obey a fixed dimension once indexed.
@@ -2322,7 +2604,7 @@ impl Database {
             let col = table.column_index(&index.columns[0])?;
             if !matches!(
                 table.columns[col].data_type,
-                DataTypeKind::Vector { dim: None }
+                DataTypeKind::Vector { dim: None, .. }
             ) || changed.is_some_and(|cols| !cols.contains(&col))
             {
                 continue;
@@ -2388,10 +2670,10 @@ impl Database {
                 continue;
             };
             let Some(graph) = map.get(&key) else {
-                self.record_vector_build_delta(&key, row_id, Some(vector::to_f32(bytes)));
+                self.record_vector_build_delta(&key, row_id, Some(bytes.clone()));
                 continue;
             };
-            if graph.insert(row_id, vector::to_f32(bytes)).is_err() {
+            if graph.insert(row_id, bytes.clone()).is_err() {
                 failed.push(key);
             }
         }
@@ -2436,10 +2718,16 @@ impl Database {
                 (Some(old), Some(new)) => old != new,
                 _ => true,
             };
+            // Cold-build replay also changes positions relative to old views.
+            // Publish the floor even when no shared graph exists yet.
+            if changed {
+                self.vector_snapshot_floor
+                    .fetch_max(retire.commit_scn, std::sync::atomic::Ordering::AcqRel);
+            }
             let Some(graph) = map.get(&key) else {
                 if changed {
                     let vector = match new_values.get(col) {
-                        Some(Value::Vector(bytes)) => Some(vector::to_f32(bytes)),
+                        Some(Value::Vector(bytes)) => Some(bytes.clone()),
                         _ => None,
                     };
                     self.record_vector_build_delta(&key, row_id, vector);
@@ -2451,7 +2739,7 @@ impl Database {
                 // the node in place (keep id + edges) and skip the re-link. Large
                 // moves return false and fall through to tombstone + re-insert.
                 if update_in_place
-                    && matches!(new_values.get(col), Some(Value::Vector(bytes)) if graph.try_update_in_place(row_id, &vector::to_f32(bytes), ratio))
+                    && matches!(new_values.get(col), Some(Value::Vector(bytes)) if graph.try_update_in_place(row_id, bytes, ratio))
                 {
                     continue;
                 }
@@ -2460,7 +2748,7 @@ impl Database {
                     // findable for snapshots that still see them.
                     graph.live_versions(row_id).and_then(|versions| {
                         if let Some(Value::Vector(bytes)) = new_values.get(col) {
-                            graph.insert(row_id, vector::to_f32(bytes))?;
+                            graph.insert(row_id, bytes.clone())?;
                         }
                         retire.retire(&key, row_id, versions);
                         Ok(())
@@ -2469,9 +2757,7 @@ impl Database {
                     graph
                         .mark_deleted_by_row_id(row_id)
                         .and_then(|_| match new_values.get(col) {
-                            Some(Value::Vector(bytes)) => {
-                                graph.insert(row_id, vector::to_f32(bytes))
-                            }
+                            Some(Value::Vector(bytes)) => graph.insert(row_id, bytes.clone()),
                             _ => Ok(()),
                         })
                 };
@@ -2485,7 +2771,7 @@ impl Database {
                 // live graph node exists instead of permanently no-oping.
                 if !graph.has_live_row_id(row_id) {
                     if let Some(Value::Vector(bytes)) = new_values.get(col) {
-                        if graph.insert(row_id, vector::to_f32(bytes)).is_err() {
+                        if graph.insert(row_id, bytes.clone()).is_err() {
                             failed.push(key.clone());
                         }
                     }
@@ -2525,13 +2811,19 @@ impl Database {
                             .live_versions(row_id)
                             .map(|versions| retire.retire(&key, row_id, versions))
                     } else {
+                        self.vector_snapshot_floor
+                            .fetch_max(retire.commit_scn, std::sync::atomic::Ordering::AcqRel);
                         graph.mark_deleted_by_row_id(row_id).map(|_| ())
                     };
                     if retired.is_err() {
                         failed.push(key);
                     }
                 }
-                None => self.record_vector_build_delta(&key, row_id, None),
+                None => {
+                    self.vector_snapshot_floor
+                        .fetch_max(retire.commit_scn, std::sync::atomic::Ordering::AcqRel);
+                    self.record_vector_build_delta(&key, row_id, None);
+                }
             }
         }
         drop(map);
@@ -2546,7 +2838,9 @@ impl Database {
         }
         let mut map = self.vector_indexes.write();
         for key in failed {
-            map.remove(&key);
+            if let Some(graph) = map.remove(&key) {
+                graph.invalidate();
+            }
         }
     }
 
@@ -2710,50 +3004,42 @@ impl Database {
                 table.active_generation.max(1),
                 normalize_name(&index.name),
             );
-            let mut graph = self.vector_indexes.read().get(&key).cloned();
-            // A cold but finalized file still represents a durable index.
-            // Leaving it untouched would retain stale pages on both restart
-            // and replicas. Reopen it (without a heap rebuild) before commit
-            // so the ordinary delta hooks maintain it too.
-            if graph.is_none()
-                && index.vector_algo() == VectorAlgo::IvfSq8
-                && vector_storage_paged()
+            if index.vector_algo() == VectorAlgo::Hnsw
+                && self.vector_build_deltas.lock().contains_key(&key)
             {
-                let path = self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf");
-                if path.exists() {
-                    let col_idx = table.column_index(&index.columns[0])?;
-                    let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
-                    let file = self.open_ivf_index_file(table, index, storage_id, dim)?;
-                    if file.is_finalized() {
-                        let paged = crate::engine::vector::ivf_paged::PagedIvf::new(
-                            Arc::new(file),
-                            ivf_params_from_meta(&index.vector_meta()),
-                        );
-                        let candidate = Arc::new(VectorGraph::Ivf(IvfSq8Index::from_paged(paged)));
-                        graph = Some(
-                            self.vector_indexes
-                                .write()
-                                .entry(key.clone())
-                                .or_insert(candidate)
-                                .clone(),
-                        );
-                    }
-                }
+                continue;
             }
-            // A finalized `.hvec` is trusted on reopen without a heap scan, so
-            // commits must reach it even while it is cold. Unfinalized files
-            // are rebuilt from the heap and need no maintenance here.
-            if graph.is_none() && index.vector_algo() == VectorAlgo::Hnsw && vector_storage_paged()
+            let mut graph = self.vector_indexes.read().get(&key).cloned();
+            // FLOAT32's finalized `.hvec` is trusted without a heap scan, so
+            // commits must reach it while cold. Native files always rebuild
+            // from heap and must not enter this legacy FLOAT32 open path.
+            if graph.is_none()
+                && !index.vector.as_ref().is_some_and(|v|v.quantization.enabled())
+                && index.vector_algo() == VectorAlgo::Hnsw
+                && vector_storage_paged()
+                && matches!(
+                    table.columns[table.column_index(&index.columns[0])?].data_type,
+                    DataTypeKind::Vector {
+                        datatype: crate::vector::VectorDataType::Float32,
+                        ..
+                    }
+                )
             {
                 let path = self.vector_index_paged_path(table, &index.name, storage_id);
                 if path.exists() {
                     let col_idx = table.column_index(&index.columns[0])?;
                     let dim = self.vector_paged_resolve_dim(table, col_idx, storage_id)?;
                     let file = self.open_vector_index_file(table, index, storage_id, dim)?;
-                    if file.is_finalized() {
+                    if file.is_finalized() && file.meta().query_ready {
                         let candidate =
-                            Arc::new(VectorGraph::Paged(PagedHnsw::new(Arc::new(file))));
-                        self.vector_indexes.write().entry(key).or_insert(candidate);
+                            Arc::new(VectorGraph::Paged(PagedHnsw::new(Arc::new(file)).without_navigation_quantization()));
+                        graph = Some(
+                            self.vector_indexes
+                                .write()
+                                .entry(key)
+                                .or_insert(candidate)
+                                .clone(),
+                        );
                     }
                 }
             }
@@ -2836,7 +3122,7 @@ impl Database {
                     normalize_name(&index.name),
                 );
                 if let Some(graph) = map.get(&key) {
-                    if let Err(e) = graph.finish_committed_delta(txn_id) {
+                    if let Err(e) = graph.finish_committed_delta(txn_id, commit_scn) {
                         log_message(format!(
                             "vector index delta finalize failed for {}: {e:?}",
                             index.name
@@ -2920,7 +3206,7 @@ impl Database {
         for (table_id, storage_id) in affected {
             for ((tid, sid, _, _), graph) in map.iter() {
                 if *tid == table_id && *sid == storage_id {
-                    if let Err(e) = graph.finish_committed_delta(txn_id) {
+                    if let Err(e) = graph.finish_committed_delta(txn_id, self.visible_scn()) {
                         log_message(format!("vector rollback marker cleanup failed: {e:?}"));
                     }
                 }
@@ -2976,6 +3262,11 @@ impl Database {
     /// section. Cold (never-queried) indexes don't appear — the view joins this
     /// against the catalog and reports them as `LOADED = 0`. Takes only the
     /// `vector_indexes` read lock; never builds a graph.
+    pub(crate) fn record_vector_query_work(&self,table:&TableSchema,index:&IndexSchema,storage_id:u64,heap:u64,fallback:bool){
+        let key=(table.id,storage_id,table.active_generation.max(1),normalize_name(&index.name));
+        if let Some(graph)=self.vector_indexes.read().get(&key){graph.record_query_stats(0,heap,fallback);}
+    }
+
     pub(crate) fn vector_index_runtime_stats(
         &self,
     ) -> HashMap<(u64, String), vector::VectorIndexRuntimeStats> {
@@ -2994,27 +3285,146 @@ impl Database {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Physical IVF redo replaces pages beneath resident directories. Retire
-    /// both cached and already-cloned handles; a later query reopens finalized
-    /// pages, while an incomplete delta uses the executor's exact fallback.
-    pub(crate) fn invalidate_replicated_ivf_graphs(&self, path: Option<&str>) {
-        self.vector_indexes.write().retain(|_, graph| {
-            if let VectorGraph::Paged(paged) = graph.as_ref() {
-                if path.is_none_or(|path| paged.file().relative_path() == path) {
-                    paged.file().disable_navigation_mapping();
-                }
-            }
-            if let VectorGraph::Ivf(IvfSq8Index::Paged(paged)) = graph.as_ref() {
-                if path.is_none_or(|path| paged.file().relative_path() == path) {
-                    paged.invalidate_replicated_pages();
-                    false
-                } else {
-                    true
-                }
+    fn note_replicated_hnsw_heap(&self, txn_id: u64, storage_id: u64) {
+        let cached = self
+            .replicated_hnsw_table_cache
+            .read()
+            .get(&storage_id)
+            .copied();
+        let owner = if let Some(cached) = cached {
+            cached
+        } else {
+            let Some(table) = self.table_by_id(storage_id) else {
+                return;
+            };
+            // Resident native accelerators have no index-file redo. Track
+            // every vector table so heap commits also revoke those handles.
+            let owner = table
+                .indexes
+                .iter()
+                .any(|i| i.is_vector())
+                .then_some(table.id);
+            self.replicated_hnsw_table_cache
+                .write()
+                .insert(storage_id, owner);
+            owner
+        };
+        if let Some(owner) = owner {
+            self.replicated_hnsw_dirty
+                .lock()
+                .entry(txn_id)
+                .or_default()
+                .insert(owner);
+        }
+    }
+
+    fn note_replicated_hnsw(&self, txn_id: u64, storage_id: u64, name: &str) {
+        let Some(table) = self.table_by_id(storage_id) else {
+            return;
+        };
+        if table.indexes.iter().any(|index| {
+            index.name.eq_ignore_ascii_case(name)
+                && index.is_vector()
+                && index.vector_algo() == VectorAlgo::Hnsw
+        }) {
+            self.replicated_hnsw_dirty
+                .lock()
+                .entry(txn_id)
+                .or_default()
+                .insert(table.id);
+        }
+    }
+
+    fn invalidate_replicated_hnsw_commit(&self, txn_id: u64, finish: bool) {
+        let tables = {
+            let mut dirty = self.replicated_hnsw_dirty.lock();
+            if finish {
+                dirty.remove(&txn_id)
             } else {
-                !(path.is_none() && matches!(graph.as_ref(), VectorGraph::Ivf(_)))
+                dirty.get(&txn_id).cloned()
+            }
+        };
+        let Some(tables) = tables else {
+            return;
+        };
+        let mut graphs = self.vector_indexes.write();
+        self.vector_build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        graphs.retain(|(table, _, _, _), graph| {
+            if tables.contains(table)
+                && (graph.supports_versions()
+                    || matches!(
+                        graph.as_ref(),
+                        VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+                    ))
+            {
+                graph.invalidate();
+                false
+            } else {
+                true
             }
         });
+    }
+
+    /// Replica HNSW files were not physically redone. Fence every durable
+    /// candidate file before the promoted node can reopen it as a primary.
+    fn invalidate_promoted_hnsw_files(&self) -> Result<(), QueryError> {
+        let ids: Vec<_> = self
+            .catalog
+            .read()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "catalog lock poisoned"))?
+            .tables
+            .values()
+            .filter(|table| !table.system)
+            .map(|table| table.id)
+            .collect();
+        let mut directories = std::collections::HashSet::new();
+        for id in ids {
+            let Some(table) = self.table_by_id(id) else {
+                continue;
+            };
+            for index in table
+                .indexes
+                .iter()
+                .filter(|index| index.is_vector() && index.vector_algo() == VectorAlgo::Hnsw)
+            {
+                for storage in table.storage_ids() {
+                    let path = self.vector_index_paged_path(&table, &index.name, storage);
+                    if !path.exists() {
+                        continue;
+                    }
+                    self.buffer_pool.discard_pages_for_path(&path)?;
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            if let Some(parent) = path.parent() {
+                                directories.insert(parent.to_path_buf());
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(io_err(error)),
+                    }
+                }
+            }
+        }
+        // No local WAL is appended here: an I/O failure may still cancel the
+        // role transition and let the replica resume receiving source LSNs.
+        for directory in directories {
+            crate::platform::fs::sync_path(directory).map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Replicated heap commits retire resident accelerators, including handles
+    /// already borrowed by queries. Rebuild from the committed heap snapshot.
+    pub(crate) fn invalidate_replicated_vector_graphs(&self) {
+        self.replicated_hnsw_table_cache.write().clear();
+        self.vector_build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut graphs = self.vector_indexes.write();
+        for graph in graphs.values() {
+            graph.invalidate();
+        }
+        graphs.clear();
     }
 
     /// Per-index tombstone hook. Mirrors `vector_graph_note_insert` for
@@ -3058,9 +3468,17 @@ impl Database {
     /// search rebuilds it.
     pub(crate) fn drop_vector_graph(&self, table_id: u64, index_name: &str) {
         let normalized = normalize_name(index_name);
+        self.vector_build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.vector_indexes
             .write()
-            .retain(|(tid, _sid, _generation, name), _| !(*tid == table_id && *name == normalized));
+            .retain(|(tid, _, _, name), graph| {
+                let keep = !(*tid == table_id && *name == normalized);
+                if !keep {
+                    graph.invalidate();
+                }
+                keep
+            });
         let Some(table) = self.table_by_id(table_id) else {
             return;
         };
@@ -3078,9 +3496,15 @@ impl Database {
     /// Evict derived graph handles when replacing physical table storage.
     /// Callers must establish the appropriate write barrier before eviction.
     pub(crate) fn evict_table_vector_graphs(&self, table_id: u64) {
-        self.vector_indexes
-            .write()
-            .retain(|(tid, _sid, _generation, _name), _| *tid != table_id);
+        self.vector_build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.vector_indexes.write().retain(|(tid, _, _, _), graph| {
+            let keep = *tid != table_id;
+            if !keep {
+                graph.invalidate();
+            }
+            keep
+        });
     }
 
     /// Drop every cached vector graph for a table (DROP TABLE / TRUNCATE)
@@ -3097,9 +3521,15 @@ impl Database {
     /// is still available at every call site, so we resolve precise paths.
     pub(crate) fn drop_table_vector_graphs(&self, table: &TableSchema) {
         let table_id = table.id;
-        self.vector_indexes
-            .write()
-            .retain(|(tid, _sid, _generation, _name), _| *tid != table_id);
+        self.vector_build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.vector_indexes.write().retain(|(tid, _, _, _), graph| {
+            let keep = *tid != table_id;
+            if !keep {
+                graph.invalidate();
+            }
+            keep
+        });
         for index in &table.indexes {
             if !index.is_vector() {
                 continue;
@@ -3110,30 +3540,15 @@ impl Database {
         }
     }
 
-    /// Walk every cached vector graph and rebuild any whose tombstone
-    /// count exceeds either the ratio or the absolute gate. Called from
-    /// the checkpoint path **before** `vector_graph_persist_all_dirty`
-    /// so the snapshot reflects the compacted topology.
-    ///
-    /// Compaction itself is internal to `HnswIndex::compact`: it takes the
-    /// graph's topology + nodes write lock briefly to clear the slab, then
-    /// re-inserts survivors via the standard `&self` path. INSERT and
-    /// SEARCH block only during the clear and the per-survivor appends —
-    /// not for the full rebuild — but the design doc lists `ArcSwap`-style
-    /// non-blocking replacement as a future refinement.
-    ///
-    /// Skipped on physical replicas (they recompute graphs locally) and
-    /// when `MYDB_HNSW_COMPACT_DISABLE=1`.
-    /// One round of background vector-index maintenance: retire superseded
-    /// versions whose readers are gone, then reclaim tombstones in every warm
-    /// graph past the ratio / absolute gates (slab and IVF: build-then-swap
-    /// compaction; paged: in-place detachment). Runs on the
-    /// `mydb-vector-maintenance` worker, never on a commit or checkpoint path.
+    /// Background maintenance refreshes requested navigation codes and
+    /// retires/repairs tombstones. Compaction has admitted, bounded delta work;
+    /// searches keep using the existing graph until a replacement is ready.
     pub(crate) fn maintain_vector_indexes(&self, should_stop: impl Fn() -> bool) {
         self.drain_vector_purges();
-        if hnsw_compact_disabled() || self.physical_replica_mode() {
+        if self.physical_replica_mode() {
             return;
         }
+        let compact_disabled = hnsw_compact_disabled();
         let ratio_gate = hnsw_compact_ratio();
         let absolute_gate = u64::from(hnsw_compact_absolute());
         let entries: Vec<((u64, u64, u64, String), Arc<VectorGraph>)> = self
@@ -3147,16 +3562,21 @@ impl Database {
             if should_stop() {
                 return;
             }
+            if let VectorGraph::Memory(memory) = graph.as_ref() {
+                memory.refresh_requested_quant();
+            }
+            let force_rebuild=matches!(graph.as_ref(),VectorGraph::NativeHnsw(_)|VectorGraph::NativeIvf(_)) && graph.ensure_valid().is_err();
+            if compact_disabled && !force_rebuild {continue;}
             let total = graph.node_count() as u64;
             let reclaimable = match graph.as_ref() {
                 VectorGraph::Paged(paged) => paged.unrepaired_tombstones(),
                 _ => u64::from(graph.stale_count()),
             };
-            if reclaimable == 0 || total == 0 {
+            if !force_rebuild && (reclaimable == 0 || total == 0) {
                 continue;
             }
             let ratio = reclaimable as f64 / total as f64;
-            if ratio < ratio_gate && reclaimable < absolute_gate {
+            if !force_rebuild && ratio < ratio_gate && reclaimable < absolute_gate {
                 continue;
             }
             let Some(table) = self.table_by_id(table_id) else {
@@ -3171,6 +3591,29 @@ impl Database {
                 format!(" (p={storage_id})")
             };
             let label = format!("{}/{}/{}{}", table.database, table.name, index_name, suffix);
+            if matches!(
+                graph.as_ref(),
+                VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)
+            ) {
+                let key = (table_id, storage_id, generation, index_name.clone());
+                let Some(index) = table
+                    .indexes
+                    .iter()
+                    .find(|i| i.name.eq_ignore_ascii_case(&index_name))
+                else {
+                    continue;
+                };
+                self.evict_vector_graphs(vec![key.clone()]);
+                drop(graph);
+                if let Err(error) =
+                    self.vector_graph_build_and_publish(&table, index, storage_id, key)
+                {
+                    log_message(format!(
+                        "native vector maintenance rebuild failed for {label}: {error}"
+                    ));
+                }
+                continue;
+            }
             let reclaimed = match graph.as_ref() {
                 VectorGraph::Paged(paged) => match paged.repair_tombstones(&should_stop) {
                     Ok(repaired) => repaired,
@@ -3543,6 +3986,24 @@ impl<'a> VectorRetire<'a> {
     }
 }
 
+/// A completed file is not query-ready until its captured commit tail lands.
+struct VectorGraphBuildGuard<'a> {
+    graph: &'a VectorGraph,
+    published: bool,
+}
+impl Drop for VectorGraphBuildGuard<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.graph.invalidate();
+            if let VectorGraph::Paged(paged) = self.graph {
+                if let Err(err) = paged.file().invalidate_build(0) {
+                    log_message(format!("HNSW failed build invalidation: {err:?}"));
+                }
+            }
+        }
+    }
+}
+
 /// Keeps a lazy HNSW build's delta registration alive until it publishes or
 /// fails; the registry entry is dropped with its last builder.
 struct VectorBuildRegistration<'a> {
@@ -3562,13 +4023,29 @@ impl<'a> VectorBuildRegistration<'a> {
         Self { db, key }
     }
 
-    fn ops_since(&self, applied: usize) -> Vec<(RowId, Option<Vec<f32>>)> {
-        self.db
-            .vector_build_deltas
-            .lock()
-            .get(&self.key)
-            .map(|delta| delta.ops[applied..].to_vec())
-            .unwrap_or_default()
+    fn ops_since(
+        &self,
+        applied: u64,
+    ) -> Result<(u64, Vec<(RowId, Option<crate::vector::VectorValue>)>), QueryError> {
+        let deltas = self.db.vector_build_deltas.lock();
+        let Some(delta) = deltas.get(&self.key) else {
+            return Ok((applied, Vec::new()));
+        };
+        if delta.failed {
+            return Err(error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "vector build delta exceeded its memory admission",
+            ));
+        }
+        Ok((
+            delta.next_seq,
+            delta
+                .ops
+                .iter()
+                .filter(|(_, (seq, _))| *seq > applied)
+                .map(|(&row, (_, value))| (row, value.clone()))
+                .collect(),
+        ))
     }
 }
 

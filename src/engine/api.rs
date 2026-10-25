@@ -2520,7 +2520,7 @@ pub struct SessionSysVarState {
     /// `mydb_hnsw_brute_filter_rows` — estimated filter-output row
     /// count below which the planner skips HNSW. Default 1000.
     pub mydb_hnsw_brute_filter_rows: u64,
-    /// `mydb_ivf_nprobe` — number of inverted-file cells an IVF_SQ8 KNN query
+    /// `mydb_ivf_nprobe` — number of inverted-file cells an IVF KNN query
     /// probes. Query-time effort knob (the IVF analogue of `ef_search`).
     /// Per-query `/*+ IVF_NPROBE(n) */` and a per-index `NPROBE=` override
     /// this. Default 8.
@@ -2530,6 +2530,9 @@ pub struct SessionSysVarState {
     pub mydb_ivf_nprobe_explicit: bool,
     /// Exact heap rerank pool multiplier, independent of `nprobe`.
     pub mydb_ivf_rerank_mult: u64,
+    pub mydb_ivf_rerank_mult_explicit: bool,
+    pub mydb_hnsw_rerank_mult: u64,
+    pub mydb_hnsw_rerank_mult_explicit: bool,
     /// IVF-specific iterative widening policy.
     pub mydb_ivf_iterative_scan: String,
     /// IVF-specific tuple budget across iterative candidate widening.
@@ -2634,7 +2637,10 @@ impl Default for SessionSysVarState {
             mydb_hnsw_brute_filter_rows: hnsw_env_u64("MYDB_HNSW_BRUTE_FILTER_ROWS", 1_000),
             mydb_ivf_nprobe: hnsw_env_u64("MYDB_IVF_NPROBE", 8),
             mydb_ivf_nprobe_explicit: false,
-            mydb_ivf_rerank_mult: hnsw_env_u64("MYDB_IVF_RERANK_MULT", 4),
+            mydb_ivf_rerank_mult: 4,
+            mydb_ivf_rerank_mult_explicit: false,
+            mydb_hnsw_rerank_mult: 4,
+            mydb_hnsw_rerank_mult_explicit: false,
             mydb_ivf_iterative_scan: vector_env_iterative("MYDB_IVF_ITERATIVE_SCAN"),
             mydb_ivf_max_scan_tuples: hnsw_env_u64("MYDB_IVF_MAX_SCAN_TUPLES", 20_000),
             mydb_parallel_degree: u64::from(crate::planner::default_parallel_degree()),

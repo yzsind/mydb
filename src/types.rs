@@ -56,6 +56,8 @@ pub struct Column {
 /// type-derived metadata".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ColumnSource {
+    /// Native vector domain preserved by expressions, derived tables and set operations.
+    pub vector_type: Option<(crate::vector::VectorDataType, Option<u32>)>,
     /// An untyped parameter projection obtains its domain at execution time.
     /// This provenance survives derived/CTE passthrough metadata.
     pub dynamic_parameter: bool,
@@ -155,10 +157,8 @@ pub enum ColumnType {
     /// is carried separately in the catalog (`DataTypeKind::Geometry`). The
     /// value form is [`Value::Geometry`].
     Geometry,
-    /// `VECTOR(n)` — a fixed-width array of 32-bit floats for similarity
-    /// search. Maps to the MySQL wire type `MYSQL_TYPE_VECTOR (0xf2)`; the
-    /// declared dimension is carried in the catalog (`DataTypeKind::Vector`).
-    /// The value form is [`Value::Vector`].
+    /// Native VECTOR domain. Datatype and dimension are retained in catalog
+    /// and expression metadata; the wire tag remains MYSQL_TYPE_VECTOR.
     Vector,
     /// `BIT(M)` — a fixed-width bit field of `M` bits (1..=64). Maps to the
     /// MySQL wire type `MYSQL_TYPE_BIT (0x10)`; the declared bit count is
@@ -246,13 +246,10 @@ pub enum Value {
     /// `ST_AsText`/`ST_AsWKB` to render them. Parsed into a geometry tree only
     /// when a spatial function computes over it.
     Geometry(Vec<u8>),
-    /// A `VECTOR(n)` value as a bare little-endian `f32` array (see
-    /// `engine::vector`). Like JSON/GEOMETRY it stays binary on disk and over
-    /// the wire, rendered to `[a,b,c]` text only at the protocol boundary
-    /// (`vector::to_text`). It has no natural total order; similarity is
-    /// computed by `DISTANCE()` and the HNSW index, and `ORDER BY` on the raw
-    /// column falls back to internal-byte order (`vector::compare`).
-    Vector(Vec<u8>),
+    /// Native vector payload with explicit datatype and logical dimension.
+    /// Heap storage remains compact; the protocol renders canonical array text.
+    /// Raw ordering uses the stable typed representation, not similarity.
+    Vector(crate::vector::VectorValue),
 }
 
 /// Sentinel value of `Value::Date` for the MySQL zero date `0000-00-00`.
@@ -448,6 +445,8 @@ pub(crate) fn assign_value_reusing(dst: &mut Value, src: &Value) {
             d.extend_from_slice(s);
         }
         (Value::Vector(d), Value::Vector(s)) => {
+            d.datatype = s.datatype;
+            d.dimension = s.dimension;
             d.clear();
             d.extend_from_slice(s);
         }
@@ -510,10 +509,8 @@ impl Value {
             Value::Decimal(value) | Value::String(value) => value.capacity(),
             Value::SmallString(value) if value.spilled() => value.capacity(),
             Value::DecimalWide(_) => self.decimal_heap_bytes(),
-            Value::Bytes(value)
-            | Value::Json(value)
-            | Value::Geometry(value)
-            | Value::Vector(value) => value.capacity(),
+            Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => value.capacity(),
+            Value::Vector(value) => value.capacity(),
             _ => 0,
         }
     }

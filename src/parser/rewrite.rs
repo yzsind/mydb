@@ -74,6 +74,7 @@ pub(super) struct PostParseState {
     pub(super) create_zone_options: Vec<(String, String)>,
     pub(super) inline_index_visibility: Vec<(String, bool)>,
     pub(super) inline_index_includes: Vec<Vec<String>>,
+    pub(super) vector_options: Vec<crate::storage::vector_config::VectorIndexOptions>,
 }
 
 impl PostParseState {
@@ -162,6 +163,7 @@ impl PostParseState {
         }
         apply_inline_index_visibility(statement, &self.inline_index_visibility)?;
         apply_inline_index_includes(statement, &self.inline_index_includes)?;
+        apply_vector_options(statement, &self.vector_options)?;
         Ok(())
     }
 }
@@ -512,7 +514,7 @@ fn create_table_target_mut(statement: &mut Statement) -> Option<&mut CreateTable
 /// Visit inline index definitions in declaration order without collecting a
 /// temporary Vec of mutable references. Standalone CREATE INDEX has its own
 /// upstream grammar and is deliberately outside this scope.
-fn for_each_inline_index(
+pub(super) fn for_each_inline_index(
     statement: &mut Statement,
     mut apply: impl FnMut(&mut IndexDef) -> Result<(), ParseError>,
 ) -> Result<(), ParseError> {

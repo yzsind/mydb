@@ -2,7 +2,6 @@
 // Included into `storage/core.rs`.
 
 impl Database {
-
     /// Refuse to silently reinterpret an existing vector index through a
     /// different storage backend. Vector backend files are format-specific;
     /// changing `MYDB_VECTOR_STORAGE` requires an explicit DROP+CREATE so an
@@ -16,14 +15,7 @@ impl Database {
         paged: bool,
     ) -> Result<(), QueryError> {
         let memory = self.vector_index_path(table, &index.name, storage_id);
-        let paged_path = match index.vector_algo() {
-            VectorAlgo::Hnsw => {
-                self.vector_index_paged_path(table, &index.name, storage_id)
-            }
-            VectorAlgo::IvfSq8 => {
-                self.vector_index_paged_path_ext(table, &index.name, storage_id, "ivf")
-            }
-        };
+        let paged_path = self.vector_index_paged_path(table, &index.name, storage_id);
         let conflict = if paged {
             // Memory IVF currently has no durable sidecar, so there is no
             // conflicting artifact to detect in that direction.
@@ -60,12 +52,7 @@ impl Database {
         )
     }
 
-    fn vector_index_path(
-        &self,
-        table: &TableSchema,
-        index_name: &str,
-        storage_id: u64,
-    ) -> PathBuf {
+    fn vector_index_path(&self, table: &TableSchema, index_name: &str, storage_id: u64) -> PathBuf {
         let index_id = table
             .indexes
             .iter()
@@ -102,12 +89,7 @@ impl Database {
             .find(|index| index.name.eq_ignore_ascii_case(index_name))
             .map(|index| index.index_id)
             .unwrap_or_else(|| stable_missing_index_id(index_name));
-        self.vector_index_path_for_parts(
-            storage_id,
-            table.active_generation.max(1),
-            index_id,
-            ext,
-        )
+        self.vector_index_path_for_parts(storage_id, table.active_generation.max(1), index_id, ext)
     }
 
     fn vector_file_paths(
@@ -115,11 +97,10 @@ impl Database {
         table: &TableSchema,
         index_name: &str,
         storage_id: u64,
-    ) -> [PathBuf; 3] {
+    ) -> [PathBuf; 2] {
         [
             self.vector_index_path(table, index_name, storage_id),
             self.vector_index_paged_path(table, index_name, storage_id),
-            self.vector_index_paged_path_ext(table, index_name, storage_id, "ivf"),
         ]
     }
 
@@ -162,10 +143,9 @@ impl Database {
                     .map(|index| index.index_id)
             })
             .unwrap_or_else(|| stable_missing_index_id(index_name));
-        for ext in ["hnsw", "hvec", "ivf"] {
+        for ext in ["hnsw", "hvec"] {
             let _ = (database, table_name);
-            let path =
-                self.vector_index_path_for_parts(storage_id, generation, index_id, ext);
+            let path = self.vector_index_path_for_parts(storage_id, generation, index_id, ext);
             let _ = self.buffer_pool.discard_pages_for_path(&path);
             let _ = fs::remove_file(path);
         }

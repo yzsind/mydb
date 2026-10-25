@@ -193,7 +193,7 @@ pub(crate) fn write_value_payload<W: Write>(w: &mut W, v: &Value) -> std::io::Re
         Value::Year(y) => w.write_all(&[*y]),
         Value::Json(b) => write_bytes(w, b),
         Value::Geometry(b) => write_bytes(w, b),
-        Value::Vector(b) => write_bytes(w, b),
+        Value::Vector(b) => write_bytes(w, &b.encode()),
     }
 }
 
@@ -342,9 +342,9 @@ pub(crate) fn read_payload_limited<R: Read>(
         VALUE_GEOMETRY => Value::Geometry(
             read_bytes_accounted(r, budget.as_deref_mut(), available).map_err(io_err)?,
         ),
-        VALUE_VECTOR => Value::Vector(
-            read_bytes_accounted(r, budget.as_deref_mut(), available).map_err(io_err)?,
-        ),
+        VALUE_VECTOR => Value::Vector(crate::engine::vector::codec::decode_value(
+            &read_bytes_accounted(r, budget.as_deref_mut(), available).map_err(io_err)?,
+        )?),
         other => {
             return Err(crate::storage::error(
                 crate::error::catalog::ER_UNKNOWN_ERROR,
@@ -388,7 +388,7 @@ mod tests {
             Value::Year(99),
             Value::Json(vec![1, 2]),
             Value::Geometry(vec![3, 4]),
-            Value::Vector(vec![5, 6]),
+            Value::Vector(vec![5, 6, 0, 0].into()),
         ];
         for value in values {
             let mut encoded = Vec::new();

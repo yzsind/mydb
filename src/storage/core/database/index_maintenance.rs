@@ -969,8 +969,6 @@ fn reserve_load_data_index_scratch(
     }
 }
 
-
-
 fn load_data_memory_budgets_for_concurrency(
     sorter_count: usize,
     emit_logical_wal: bool,
@@ -2652,10 +2650,10 @@ impl Database {
                 Value::Decimal(value) | Value::String(value) => value.capacity(),
                 Value::SmallString(value) if value.spilled() => value.capacity(),
                 Value::DecimalWide(_) => value.decimal_heap_bytes(),
-                Value::Bytes(value)
-                | Value::Json(value)
-                | Value::Geometry(value)
-                | Value::Vector(value) => value.capacity(),
+                Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => {
+                    value.capacity()
+                }
+                Value::Vector(value) => value.capacity(),
                 _ => 0,
             };
             let entry_capacity = table
@@ -4148,15 +4146,25 @@ impl Database {
     fn collect_vector_registry_entries(
         &self,
         table: &TableSchema,
+        index: Option<&IndexSchema>,
         degree: usize,
         scratch_bytes: usize,
         direct: bool,
     ) -> Result<SortedIndexEntries, QueryError> {
         let mut sorter = IndexEntryExternalSorter::with_exact_run_bytes(scratch_bytes);
         let key = IndexKey::from(vec![KeyPart::Null]);
+        let cosine = index.is_some_and(|i| {
+            i.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine
+        });
+        let columns = if cosine {
+            vec![table.column_index(&index.unwrap().columns[0])?]
+        } else {
+            Vec::new()
+        };
         self.with_heap_read(table.id, |heap| {
             let mut append = |row: ProjectedMvccStoredRow<'_>| {
                 if !row.header.is_deleted() {
+                    if cosine&&matches!(row.values.first(),Some(Value::Vector(value)) if vector::distance::typed_is_zero(value)){return Err(vector::vector_err("COSINE indexes reject existing zero vectors"));}
                     sorter.push(
                         self.data_dir(),
                         IndexEntry {
@@ -4168,9 +4176,9 @@ impl Database {
                 Ok(false)
             };
             if direct {
-                heap.scan_mvcc_columns_direct_until(&[], &mut append)
+                heap.scan_mvcc_columns_direct_until(&columns, &mut append)
             } else {
-                heap.scan_mvcc_columns_until(&[], &mut append)
+                heap.scan_mvcc_columns_until(&columns, &mut append)
             }
         })?;
         sorter.finish_with_degree(self.data_dir(), degree)
@@ -4184,7 +4192,13 @@ impl Database {
         scratch_bytes: usize,
     ) -> Result<SortedIndexEntries, QueryError> {
         if index.is_vector() {
-            return self.collect_vector_registry_entries(table, degree, scratch_bytes, DIRECT);
+            return self.collect_vector_registry_entries(
+                table,
+                Some(index),
+                degree,
+                scratch_bytes,
+                DIRECT,
+            );
         }
         if index.is_fulltext() || index.has_multi_valued_parts() {
             return self.collect_sorted_multi_key_entries(table, index, scratch_bytes);

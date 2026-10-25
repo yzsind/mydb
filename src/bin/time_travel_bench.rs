@@ -320,6 +320,7 @@ fn create_schema(db: &Database) -> Result<(), QueryError> {
             visible: true,
             comment: String::new(),
             fulltext_parser: String::new(),
+            vector_options: None,
         }],
     )
 }

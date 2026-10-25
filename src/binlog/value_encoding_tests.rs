@@ -121,13 +121,18 @@ fn binlog_byte_views_preserve_binary_and_text_lanes() {
         Value::Decimal("-12.3400".into()),
         Value::Bytes(vec![0, 0xff, 0x80]),
         Value::Geometry(geometry),
-        Value::Vector(1f32.to_le_bytes().to_vec()),
+        Value::Vector(1f32.to_le_bytes().to_vec().into()),
     ];
     for value in cases {
+        if let Value::Vector(v) = &value {
+            assert_eq!(value_bytes(&value).as_ref(), v.encode());
+            continue;
+        }
         let expected = match &value {
             Value::String(s) | Value::Decimal(s) => s.as_bytes(),
             Value::SmallString(s) => s.as_slice(),
-            Value::Bytes(b) | Value::Geometry(b) | Value::Vector(b) => b.as_slice(),
+            Value::Bytes(b) | Value::Geometry(b) => b.as_slice(),
+            Value::Vector(b) => b.as_slice(),
             _ => unreachable!(),
         };
         let bytes = value_bytes(&value);

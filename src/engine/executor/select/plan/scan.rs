@@ -5518,23 +5518,6 @@ pub(super) fn execute_spatial_scan(
 /// random heap read each); the true top-k almost always sits within the
 /// approximate top `k·mult`, so we cap reads there. `MYDB_HNSW_RERANK_MULT`
 /// (default 4) tunes the safety margin; floored at 32 and never above `want`.
-pub(super) fn vector_rerank_fetch(k: usize, want: usize) -> usize {
-    #[cfg(not(test))]
-    static MULT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let resolve = || {
-        crate::util::env::var("MYDB_HNSW_RERANK_MULT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|m| *m > 0)
-            .unwrap_or(4)
-    };
-    #[cfg(not(test))]
-    let mult = *MULT.get_or_init(resolve);
-    #[cfg(test)]
-    let mult = resolve();
-    want.min(k.saturating_mul(mult).max(32)).max(k)
-}
-
 /// IVF scans (`nprobe`) and exact-rerank pool size are independent controls.
 /// Reusing the HNSW helper capped the pool by nprobe, yielding only
 /// `max(k,nprobe)` candidates instead of the documented `k * multiplier`.
@@ -5545,25 +5528,42 @@ pub(super) fn ivf_rerank_fetch(k: usize, mult: u64) -> usize {
 pub(in crate::engine::executor::select) fn resolve_knn_query_vector(
     table: &PlanTable,
     column_index: usize,
-    baked: &[u8],
+    baked: &crate::vector::VectorValue,
     expr: &Option<Expr>,
-) -> Result<Vec<u8>, QueryError> {
+) -> Result<crate::vector::VectorValue, QueryError> {
+    let binary = matches!(
+        table.schema.columns[column_index].data_type,
+        crate::storage::DataTypeKind::Vector {
+            datatype: crate::vector::VectorDataType::Binary,
+            ..
+        }
+    );
     let bytes = if let Some(expr) = expr {
         let value = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])?;
-        crate::planner::value_to_vector_bytes(&value).ok_or_else(|| {
+        (if binary && !matches!(value, Value::Vector(_)) {
+            crate::engine::vector::codec::coerce_value(
+                value,
+                crate::vector::VectorDataType::Binary,
+                None,
+            )
+            .ok()
+        } else {
+            crate::planner::value_to_vector_bytes(&value)
+        })
+        .ok_or_else(|| {
             error(
                 crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
                 "query vector parameter is not a valid VECTOR value",
             )
         })?
     } else {
-        baked.to_vec()
+        baked.clone()
     };
-    if let Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(dim) }) =
+    if let Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(dim), .. }) =
         table.schema.columns.get(column_index).map(|c| &c.data_type)
     {
-        let actual = bytes.len() / std::mem::size_of::<f32>();
-        if bytes.len() % std::mem::size_of::<f32>() != 0 || actual != *dim as usize {
+        let actual = bytes.dimension as usize;
+        if actual != *dim as usize {
             return Err(error(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                 format!(
@@ -5577,11 +5577,22 @@ pub(in crate::engine::executor::select) fn resolve_knn_query_vector(
 }
 
 pub(in crate::engine::executor::select) fn validate_knn_query_vector(
-    bytes: &[u8],
+    bytes: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
 ) -> Result<(), QueryError> {
+    let binary = bytes.datatype == crate::vector::VectorDataType::Binary;
+    if binary
+        != matches!(
+            metric,
+            crate::engine::vector::Metric::Hamming | crate::engine::vector::Metric::Jaccard
+        )
+    {
+        return Err(crate::engine::vector::vector_err(
+            "query datatype and distance metric are incompatible",
+        ));
+    }
     if metric == crate::engine::vector::Metric::Cosine
-        && crate::engine::vector::distance::is_zero_norm_bytes(bytes)
+        && crate::engine::vector::distance::typed_is_zero(bytes)
     {
         return Err(error(
             crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
@@ -5597,7 +5608,7 @@ pub(super) fn execute_vector_index_scan(
     txn: TxnView,
     table: &PlanTable,
     index: &IndexSchema,
-    query_vector: &[u8],
+    query_vector: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
     k: usize,
     ef_search: usize,
@@ -5608,12 +5619,12 @@ pub(super) fn execute_vector_index_scan(
     if k == 0 {
         return Ok(Vec::new());
     }
-    let query = vector::to_f32(query_vector);
+    let query = query_vector;
     let col_idx = table.schema.column_index(&index.columns[0])?;
     // A recovered/sealed graph contains physical current vectors. Prepared
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
-    if db.xa_status_counters().0 > 0 {
+    if db.xa_status_counters().0 > 0 || db.vector_snapshot_requires_exact(txn) {
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -5630,16 +5641,23 @@ pub(super) fn execute_vector_index_scan(
     }
     let hnsw_cfg = vector::session::current_config();
     // Algorithm-specific search semantics. For HNSW the `effort` argument is
-    // an `ef` candidate-pool size, which must be at least `k`. For IVF_SQ8 it
+    // an `ef` candidate-pool size, which must be at least `k`. For IVF it
     // is `nprobe` — a *cell count* that is independent of the result size; the
     // rerank fetch (`vector_rerank_fetch` below) still guarantees ≥ `k`
     // candidates, so inflating nprobe by `k` (the old `max(k)`) only
     // over-probes and silently defeats the `NPROBE=` / `mydb_ivf_nprobe`
     // tuning knob for large-`k` queries.
-    let is_ivf = matches!(
-        index.vector_algo(),
-        crate::storage::schema::VectorAlgo::IvfSq8
-    );
+    let is_ivf = matches!(index.vector_algo(), crate::storage::schema::VectorAlgo::Ivf);
+    let quantized = index
+        .vector
+        .as_ref()
+        .is_some_and(|v| v.quantization.enabled());
+    let rerank_mult = vector::session::effective_rerank_mult(&hnsw_cfg, index);
+    let rerank_fetch = |want: usize| {
+        want.min(k.saturating_mul(rerank_mult as usize).max(32))
+            .max(k)
+    };
+
     // Whether the backend's candidate ordering is *exact*. HNSW re-ranks on
     // full-f32 node vectors, and IVF's Dot lists store f32 — for those, the
     // first `k` visible candidates (already in exact-distance order) ARE the
@@ -5676,12 +5694,16 @@ pub(super) fn execute_vector_index_scan(
         (configured_max_scan as usize).max(k)
     };
     let mut eval_ctx = EvalQueryContext::default();
-    let mut scored: Vec<(f32, PlanRow)> = Vec::new();
-    let mut effort = base_effort;
-    let mut candidate_want = if is_ivf {
-        ivf_rerank_fetch(k, hnsw_cfg.ivf_rerank_mult)
+    let mut scored: Vec<(f64, PlanRow)> = Vec::new();
+    let mut effort = if is_ivf {
+        base_effort
     } else {
-        vector_rerank_fetch(k, effort)
+        base_effort.min(max_scan)
+    };
+    let mut candidate_want = if is_ivf {
+        ivf_rerank_fetch(k, rerank_mult).max(if quantized { 32 } else { k })
+    } else {
+        rerank_fetch(effort)
     }
     .min(max_scan)
     .max(k);
@@ -5709,6 +5731,7 @@ pub(super) fn execute_vector_index_scan(
     // require reordering by their heap values. Invisible rows are handled by
     // the existing candidate-limit widening loop below.
     if !is_ivf
+        && !quantized
         && filter.is_none()
         && !matches!(iterative_scan, IterativeScan::Off)
         && storage_ids.iter().all(|sid| {
@@ -5719,6 +5742,8 @@ pub(super) fn execute_vector_index_scan(
         candidate_want = k;
     }
 
+    let partition_budget = max_scan / storage_ids.len().max(1);
+
     // Candidates already heap-read and filtered, keyed by partition-qualified
     // row identity. Widening re-runs the graph search with a larger pool but
     // never re-reads or re-evaluates a row an earlier pass already judged, so
@@ -5726,13 +5751,16 @@ pub(super) fn execute_vector_index_scan(
     let mut seen: std::collections::HashSet<(u64, RowId)> = std::collections::HashSet::new();
     let mut examined = 0usize;
     let exact_fallback = loop {
+        if !is_ivf && candidate_want.saturating_mul(storage_ids.len()) > max_scan {
+            break true;
+        }
         // Exchange candidates from every partition graph. The graph *explores*
         // `want` (= ef_search) breadth for recall, but we only re-rank the top
         // `rerank_want` of those by graph distance — each re-rank is a heap
         // `read_row`, so fetching ef_search of them was the dominant fixed
         // query cost. Widening below grows the pool when too few survive
         // MVCC visibility or the residual filter.
-        let mut candidates: Vec<(u64, RowId, f32)> = Vec::new();
+        let mut candidates: Vec<(u64, RowId, f64)> = Vec::new();
         let mut all_backends_exhausted = true;
         let mut pool_saturated = false;
         for sid in &storage_ids {
@@ -5741,12 +5769,14 @@ pub(super) fn execute_vector_index_scan(
                 rerank_limit: if is_ivf {
                     candidate_want
                 } else {
-                    vector_rerank_fetch(k, effort).min(max_scan).max(k)
+                    rerank_fetch(effort).min(partition_budget).max(k)
                 },
                 effort: if is_ivf {
                     vector::VectorSearchEffort::Ivf { nprobe: effort }
                 } else {
-                    vector::VectorSearchEffort::Hnsw { ef: effort }
+                    vector::VectorSearchEffort::Hnsw {
+                        ef: effort.min(partition_budget).max(k),
+                    }
                 },
             };
             let part_result = match db.vector_index_search_for_partition(
@@ -5768,6 +5798,15 @@ pub(super) fn execute_vector_index_scan(
                         && !index_error.is(crate::error::catalog::ER_OUTOFMEMORY)
                     {
                         return Err(index_error);
+                    }
+                    if quantized {
+                        db.record_vector_query_work(
+                            &table.schema,
+                            index,
+                            *sid,
+                            examined as u64,
+                            true,
+                        );
                     }
                     crate::engine::api::push_statement_warning(
                         crate::error::ConditionLevel::Warning,
@@ -5819,7 +5858,7 @@ pub(super) fn execute_vector_index_scan(
                 candidates.extend(
                     txn_delta
                         .into_iter()
-                        .map(|rid| (*sid, rid, f32::NEG_INFINITY)),
+                        .map(|rid| (*sid, rid, f64::NEG_INFINITY)),
                 );
             }
         }
@@ -5827,7 +5866,12 @@ pub(super) fn execute_vector_index_scan(
         // the closest copy in stale-graph cases.
         candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
 
+        let mut budget_exhausted = false;
         for (sid, row_id, graph_dist) in candidates {
+            if examined >= max_scan {
+                budget_exhausted = true;
+                break;
+            }
             // (storage_id, row_id) is the partition-disambiguated identity.
             // A row judged by an earlier, narrower pass keeps its verdict.
             if !seen.insert((sid, row_id)) {
@@ -5852,10 +5896,10 @@ pub(super) fn execute_vector_index_scan(
             // candidate `Vec<f32>` decode.
             let dist = match stored.values.get(col_idx) {
                 Some(Value::Vector(bytes)) => {
-                    if bytes.len() != query_vector.len() {
+                    if bytes.dimension != query_vector.dimension {
                         continue; // dimension drift — skip defensively
                     }
-                    vector::distance::ordering_distance_bytes(query_vector, bytes, metric)
+                    vector::distance::typed_ordering_distance(query_vector, bytes, metric)?
                 }
                 _ => continue,
             };
@@ -5891,18 +5935,34 @@ pub(super) fn execute_vector_index_scan(
                 }
             }
         }
+        if budget_exhausted {
+            break true;
+        }
         if scored.len() >= k || matches!(iterative_scan, IterativeScan::Off) {
             break false;
         }
         // Every backend proved it holds no further candidates: a short
         // result is the true answer.
         if all_backends_exhausted && !pool_saturated {
-            break false;
+            // An ANN frontier can exhaust a disconnected component, or contain
+            // multiple versions of the same row. It cannot prove heap exhaustion.
+            break !is_ivf;
         }
         // Rows exist beyond what the ANN budget may inspect. Returning a
         // short LIMIT would silently drop matching rows, so finish exactly.
         if examined >= max_scan {
             break true;
+        }
+        // Once observed filtering would require random heap reads for a
+        // substantial part of the relation, a bounded streaming TopK is cheaper.
+        // A smoothed survival estimate avoids treating one empty pool as proof
+        // that a selective predicate has no matches.
+        if !is_ivf && filter.is_some() && examined >= 64 {
+            let population = crate::planner::table_row_estimate(db, table)?;
+            let survival = (scored.len() as f64 + 2.0) / (examined as f64 + 16.0);
+            if population > 0.0 && k as f64 / survival > population * 0.25 {
+                break true;
+            }
         }
         if is_ivf {
             // First retain more candidates from the already-selected cells;
@@ -5923,11 +5983,22 @@ pub(super) fn execute_vector_index_scan(
                 break true;
             }
             let next = effort.max(candidate_want).saturating_mul(2).min(max_scan);
-            effort = effort.max(next);
+            effort = next;
             candidate_want = next.max(k);
         }
     };
-    if exact_fallback {
+    if quantized {
+        if let Some(&sid) = storage_ids.first() {
+            db.record_vector_query_work(
+                &table.schema,
+                index,
+                sid,
+                examined as u64,
+                exact_fallback || db.vector_snapshot_requires_exact(txn),
+            );
+        }
+    }
+    if exact_fallback || db.vector_snapshot_requires_exact(txn) {
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
                 db,
@@ -5963,30 +6034,68 @@ pub(super) fn execute_vector_brute_scan_filtered(
     txn: TxnView,
     table: &PlanTable,
     col_idx: usize,
-    query_vector: &[u8],
+    query_vector: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
     k: usize,
     filter: &Expr,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+    use crate::engine::vector::hnsw_core::Scored;
+    if k == 0 {
+        return Ok(Vec::new());
+    }
     let mut eval_ctx = EvalQueryContext::default();
-    let mut scored = Vec::new();
-    for stored in db.scan_rows(&table.schema.qualified_name(), txn)? {
-        let Some(Value::Vector(bytes)) = stored.values.get(col_idx) else {
-            continue;
+    let mut admitted =
+        ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, 0)?;
+    let mut best: std::collections::BinaryHeap<Scored<usize>> = std::collections::BinaryHeap::new();
+    let mut retained: Vec<Option<PlanRow>> = Vec::new();
+    let mut row_bytes: Vec<usize> = Vec::new();
+    db.scan_rows_ordered_streaming(&table.schema.qualified_name(), txn, |values| {
+        crate::engine::cancel::check_cancelled()?;
+        let Some(Value::Vector(bytes)) = values.get(col_idx) else {
+            return Ok(());
         };
-        if bytes.len() != query_vector.len() {
-            continue;
+        if bytes.dimension != query_vector.dimension {
+            return Ok(());
+        }
+        let row = stored_row_to_plan_row(table, values.to_vec())?;
+        if !eval_plan_bool_with_db(db, txn, filter, &row, &mut eval_ctx)? {
+            return Ok(());
         }
         let distance =
-            crate::engine::vector::distance::ordering_distance_bytes(query_vector, bytes, metric);
-        let row = stored_row_to_plan_row(table, stored.values)?;
-        if eval_plan_bool_with_db(db, txn, filter, &row, &mut eval_ctx)? {
-            scored.push((distance, row));
+            crate::engine::vector::distance::typed_ordering_distance(query_vector, bytes, metric)?;
+        let distance = if distance.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            distance
+        };
+        if best.len() < k {
+            let bytes = super::nested_loop::materialized_plan_row_charge(&row);
+            admitted.try_grow(bytes)?;
+            let slot = retained.len();
+            retained.push(Some(row));
+            row_bytes.push(bytes);
+            best.push(Scored {
+                dist: distance,
+                id: slot,
+            });
+        } else if best.peek().is_some_and(|worst| distance < worst.dist) {
+            let mut worst = best.peek_mut().expect("nonempty bounded top-k");
+            let slot = worst.id;
+            let bytes = super::nested_loop::materialized_plan_row_charge(&row);
+            admitted.try_grow(bytes.saturating_sub(row_bytes[slot]))?;
+            admitted.shrink(row_bytes[slot].saturating_sub(bytes));
+            row_bytes[slot] = bytes;
+            retained[slot] = Some(row);
+            worst.dist = distance;
         }
-    }
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    scored.truncate(k);
-    Ok(scored.into_iter().map(|(_, row)| row).collect())
+        Ok(())
+    })?;
+    Ok(best
+        .into_sorted_vec()
+        .into_iter()
+        .map(|score| retained[score.id].take().expect("retained top-k row"))
+        .collect())
 }
 
 /// Brute-force **exact** KNN over a `VECTOR(n)` column with no HNSW index
@@ -6007,7 +6116,7 @@ pub(super) fn execute_vector_brute_scan(
     txn: TxnView,
     table: &PlanTable,
     col_idx: usize,
-    query_vector: &[u8],
+    query_vector: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
     k: usize,
 ) -> Result<Vec<PlanRow>, QueryError> {

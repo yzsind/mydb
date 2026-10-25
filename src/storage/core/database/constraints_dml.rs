@@ -275,7 +275,7 @@ impl Database {
         if table
             .columns
             .iter()
-            .any(|c| matches!(c.data_type, DataTypeKind::Vector { dim: None }))
+            .any(|c| matches!(c.data_type, DataTypeKind::Vector { dim: None, .. }))
         {
             for row in rows {
                 self.check_hnsw_index_dimensions(table, row, None)?;

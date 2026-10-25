@@ -394,6 +394,11 @@ fn indexes_table() -> TableSchema {
                 true,
             ),
             ucol("readable_from_scn", DataTypeKind::BigInt, false),
+            col(
+                "vector_config",
+                DataTypeKind::Text { max_len: 65_535 },
+                true,
+            ),
         ],
     )
 }
@@ -1309,6 +1314,7 @@ fn push_table_rows(set: &mut DdRowSet, table: &TableSchema) {
             uv(index.index_id),
             jsonv(&index.fulltext),
             uv(index.readable_from_scn),
+            jsonv(&index.vector),
         ]);
         let mut ord = 0u64;
         for pos in 0..index.columns.len() {
@@ -1559,6 +1565,17 @@ fn catalog_from_dd_rows_with_auth(
     set: &DdRowSet,
     auth: AuthCatalog,
 ) -> Result<Catalog, crate::types::QueryError> {
+    // Partial descriptor snapshots omit properties. A persisted authority must
+    // never be silently relabelled with the current binary's format version.
+    for row in &set.dd_properties {
+        if r_str(row, 0) == "catalog_version" {
+            let persisted = r_str(row, 1);
+            if persisted.parse::<u32>().ok() != Some(CATALOG_VERSION) {
+                return Err(crate::storage::error(crate::error::catalog::ER_GET_ERRNO,
+                    format!("catalog version '{persisted}' is incompatible with mydb development storage format version {CATALOG_VERSION}; use a new data directory or rebuild data")));
+            }
+        }
+    }
     let mut databases = BTreeMap::new();
     for row in &set.schemata {
         let name = r_str(row, 0);
@@ -1619,7 +1636,7 @@ fn catalog_from_dd_rows_with_auth(
 
         let mut col_rows = cols_by_table.remove(&id).unwrap_or_default();
         col_rows.sort_by_key(|r| r_u64(r, 4)); // physical_pos
-        let columns = col_rows.iter().map(|r| reconstruct_column(r)).collect();
+        let columns: Vec<ColumnSchema> = col_rows.iter().map(|r| reconstruct_column(r)).collect();
 
         let mut idx_rows = idx_by_table.remove(&id).unwrap_or_default();
         idx_rows.sort_by_key(|r| r_u64(r, 1)); // ordinal_position
@@ -1627,9 +1644,53 @@ fn catalog_from_dd_rows_with_auth(
             .iter()
             .map(|r| {
                 let parts = icu_by_index.remove(&(id, r_str(r, 2))).unwrap_or_default();
-                reconstruct_index(r, parts)
+                let mut index = reconstruct_index(r, parts);
+                if index.is_vector() {
+                    let raw = r.get(13).and_then(crate::types::value_str).ok_or_else(|| {
+                        crate::storage::error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "missing vector_config in data dictionary",
+                        )
+                    })?;
+                    index.vector = serde_json::from_str(raw).map_err(|e| {
+                        crate::storage::error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            format!("corrupt vector_config: {e}"),
+                        )
+                    })?;
+                    let algo = index.vector_algo();
+                    let config = index.vector.as_mut().ok_or_else(|| {
+                        crate::storage::error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "missing vector index configuration",
+                        )
+                    })?;
+                    let column = index
+                        .columns
+                        .first()
+                        .and_then(|name| columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
+                        .ok_or_else(|| {
+                            crate::storage::error(
+                                crate::error::catalog::ER_GET_ERRNO,
+                                "missing vector index column",
+                            )
+                        })?;
+                    if let DataTypeKind::Vector {
+                        datatype,
+                        dim: Some(dim),
+                    } = column.data_type
+                    {
+                        config.resolve(datatype, dim, algo)?;
+                    } else {
+                        return Err(crate::storage::error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "invalid vector index column type",
+                        ));
+                    }
+                }
+                Ok(index)
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::types::QueryError>>()?;
 
         let mut chk_rows = chk_by_table.remove(&id).unwrap_or_default();
         chk_rows.sort_by(|a, b| r_str(a, 1).cmp(&r_str(b, 1)));
@@ -1956,6 +2017,7 @@ fn reconstruct_index(irow: &[Value], mut parts: Vec<&Vec<Value>>) -> IndexSchema
         visible: r_bool(irow, 6),
         comment: r_str(irow, 8),
         fulltext,
+        vector: r_json(irow, 13),
     }
 }
 
@@ -2321,6 +2383,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vector_format_rejects_stale_persisted_catalog_version() {
+        for version in [
+            (CATALOG_VERSION - 1).to_string(),
+            (CATALOG_VERSION + 1).to_string(),
+            "invalid".into(),
+        ] {
+            let mut set = DdRowSet::default();
+            set.dd_properties
+                .push(vec![sv("catalog_version"), sv(&version)]);
+            let error = catalog_from_dd_rows(&set).unwrap_err();
+            assert!(error.message().contains("new data directory"), "{error}");
+        }
+        let mut set = DdRowSet::default();
+        set.dd_properties
+            .push(vec![sv("catalog_version"), sv(CATALOG_VERSION.to_string())]);
+        assert!(catalog_from_dd_rows(&set).is_ok());
+        assert!(catalog_schema_from_dd_rows(&DdRowSet::default()).is_ok());
+    }
+
+    #[test]
     fn audit_fulltext_config_roundtrip() {
         let mut catalog = sample_catalog();
         let table = std::sync::Arc::make_mut(catalog.tables.get_mut("test.t").unwrap());
@@ -2444,6 +2526,7 @@ mod tests {
                     index_type: "BTREE".to_string(),
                     visible: true,
                     comment: String::new(),
+                    vector: None,
                     fulltext: None,
                 },
                 IndexSchema {
@@ -2461,6 +2544,7 @@ mod tests {
                     index_type: "BTREE".to_string(),
                     visible: true,
                     comment: String::new(),
+                    vector: None,
                     fulltext: None,
                 },
             ],
@@ -2715,6 +2799,7 @@ mod tests {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             },
             IndexSchema {
@@ -2732,6 +2817,7 @@ mod tests {
                 index_type: "BTREE".to_string(),
                 visible: true,
                 comment: String::new(),
+                vector: None,
                 fulltext: None,
             },
         ];

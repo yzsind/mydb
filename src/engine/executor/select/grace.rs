@@ -341,6 +341,10 @@ impl PartitionWriter {
                 write_opt_u16(&mut self.writer, f.source.collation_id).map_err(io_err)?;
                 write_opt_u8(&mut self.writer, f.source.collation_coercibility).map_err(io_err)?;
                 write_opt_u8(&mut self.writer, f.source.wire_type).map_err(io_err)?;
+                write_opt_u8(&mut self.writer, f.source.vector_type.map(|v| v.0 as u8))
+                    .map_err(io_err)?;
+                let dim = f.source.vector_type.and_then(|v| v.1).unwrap_or(0);
+                self.writer.write_all(&dim.to_le_bytes()).map_err(io_err)?;
                 self.writer
                     .write_all(&[u8::from(f.source.dynamic_parameter)])
                     .map_err(io_err)?;
@@ -539,6 +543,21 @@ impl PartitionReader {
             let collation_id = read_opt_u16(&mut reader).map_err(io_err)?;
             let collation_coercibility = read_opt_u8(&mut reader).map_err(io_err)?;
             let wire_type = read_opt_u8(&mut reader).map_err(io_err)?;
+            let datatype = read_opt_u8(&mut reader).map_err(io_err)?;
+            let mut vector_dim = [0u8; 4];
+            reader.read_exact(&mut vector_dim).map_err(io_err)?;
+            let vector_dim = u32::from_le_bytes(vector_dim);
+            let vector_type = datatype
+                .map(|tag| {
+                    crate::vector::VectorDataType::from_tag(tag)
+                        .map(|datatype| (datatype, (vector_dim != 0).then_some(vector_dim)))
+                        .ok_or_else(|| {
+                            crate::engine::vector::vector_err(
+                                "invalid vector datatype in spill metadata",
+                            )
+                        })
+                })
+                .transpose()?;
             let mut dynamic_parameter = [0u8; 1];
             reader.read_exact(&mut dynamic_parameter).map_err(io_err)?;
             schema.push(crate::engine::executor::select::plan::intern_col_meta(
@@ -548,6 +567,7 @@ impl PartitionReader {
                     column,
                     column_type,
                     source: crate::types::ColumnSource {
+                        vector_type,
                         dynamic_parameter: dynamic_parameter[0] != 0,
                         schema: source_schema,
                         table: source_table,
@@ -684,9 +704,8 @@ pub(crate) fn estimate_value_row_bytes(row: &[Value]) -> u64 {
             Value::Float(_) => 4,
             Value::String(s) | Value::Decimal(s) => 4 + s.len() as u64,
             Value::SmallString(b) => 4 + b.len() as u64,
-            Value::Bytes(b) | Value::Json(b) | Value::Geometry(b) | Value::Vector(b) => {
-                4 + b.len() as u64
-            }
+            Value::Bytes(b) | Value::Json(b) | Value::Geometry(b) => 4 + b.len() as u64,
+            Value::Vector(b) => 4 + b.len() as u64,
             Value::DecimalCompact(..) => 9,
             Value::Decimal128(..) => 17,
             Value::DecimalWide(_) => 5 + v.decimal_heap_bytes() as u64,
@@ -1411,7 +1430,7 @@ mod tests {
             Value::Bytes(vec![0, 1, 255]),
             Value::Json(br#"{"k":1}"#.to_vec()),
             Value::Geometry(vec![9, 8, 7]),
-            Value::Vector(vec![6, 5, 4]),
+            Value::Vector(vec![6, 5, 4, 0].into()),
             Value::Null,
         ];
         let columns = source
@@ -1562,6 +1581,7 @@ mod tests {
         let tmp = SpillTmpDir::create(dir.path()).unwrap();
         let path = tmp.path().join("meta");
         let source = crate::types::ColumnSource {
+            vector_type: Some((crate::vector::VectorDataType::Binary, Some(65))),
             collation_coercibility: Some(0),
             dynamic_parameter: true,
             wire_type: Some(crate::mysql::protocol::MYSQL_TYPE_STRING),

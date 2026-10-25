@@ -22,7 +22,6 @@
 
 use super::hnsw::HnswIndex;
 use super::hnsw_paged::PagedHnsw;
-use super::ivf::IvfSq8Index;
 use crate::storage::RowId;
 use crate::types::QueryError;
 use crate::util::logging::log_message;
@@ -37,11 +36,9 @@ pub(crate) static FAIL_PAGED_WRITES_FOR_TEST: std::sync::atomic::AtomicBool =
 #[derive(Debug)]
 pub(crate) enum VectorGraph {
     Memory(HnswIndex),
+    NativeHnsw(super::native_hnsw::NativeHnsw),
+    NativeIvf(super::native_ivf::NativeIvf),
     Paged(PagedHnsw),
-    /// In-memory IVF_SQ8 inverted-file index ([`IvfSq8Index`]). Rebuilt from
-    /// the heap on cold load (no snapshot in this backend). The third
-    /// `search` argument is interpreted as **nprobe** rather than ef.
-    Ivf(IvfSq8Index),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -54,16 +51,16 @@ pub(crate) enum VectorSearchEffort {
 pub(crate) struct VectorSearchRequest {
     pub candidate_limit: usize,
     /// Preserve the exact re-rank pool independently from the number of rows
-    /// returned to the executor. The slab backend truncates SQ8 candidates
-    /// before exact scoring; the paged backend already scores the full ef.
+    /// returned to the executor. Both HNSW backends score their explored
+    /// candidate pool before returning its nearest retained rows.
     pub rerank_limit: usize,
     pub effort: VectorSearchEffort,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct VectorSearchResult {
-    pub candidates: Vec<(RowId, f32)>,
-    /// Candidate distances are authoritative f32 ordering distances. With no
+    pub candidates: Vec<(RowId, f64)>,
+    /// Candidate distances order the stored vectors, including wide arithmetic. With no
     /// residual filter the executor may stop after the first k MVCC-visible
     /// rows instead of heap-reading the complete rerank pool.
     pub exact_order: bool,
@@ -95,13 +92,12 @@ pub(crate) struct VectorIndexRuntimeStats {
     pub generation: u64,
     /// Max persisted LSN across partitions (memory backend; 0 for paged).
     pub last_persisted_lsn: u64,
-    /// `"memory"`, `"paged"`, `"paged_mapped"`, `"ivf"`, `"ivf_paged"`, or
-    /// `"ivf_paged_nav"` when the governed large-index navigator is active.
+    /// Backend identity for resident, paged and native vector indexes.
     pub backend: &'static str,
-    /// IVF_SQ8: number of inverted lists (k-means centroids). 0 for HNSW /
+    /// IVF: number of inverted lists (k-means centroids). 0 for HNSW /
     /// cold IVF.
     pub nlist: u64,
-    /// IVF_SQ8: rows inserted since the last (re)train — a centroid-drift
+    /// IVF: rows inserted since the last (re)train — a centroid-drift
     /// signal suggesting when to `OPTIMIZE TABLE`. 0 for HNSW.
     pub inserts_since_train: u64,
     pub list_avg_entries: u64,
@@ -125,6 +121,13 @@ pub(crate) struct VectorIndexRuntimeStats {
     pub last_build_cache_hits: u64,
     pub last_build_cache_misses: u64,
     pub last_build_chunks: u64,
+    pub quantization_pending: bool,
+    pub quantizer_bytes: u64,
+    pub compressed_bytes: u64,
+    pub quantization_exceptions: u64,
+    pub candidates_returned: u64,
+    pub heap_reranks: u64,
+    pub exact_fallbacks: u64,
 }
 
 impl VectorIndexRuntimeStats {
@@ -139,21 +142,43 @@ impl VectorIndexRuntimeStats {
         self.generation = self.generation.max(graph.generation());
         self.last_persisted_lsn = self.last_persisted_lsn.max(graph.last_persisted_lsn());
         self.backend = graph.backend_name();
-        if let Some(ivf) = graph.as_ivf() {
-            self.nlist = self.nlist.max(ivf.nlist() as u64);
-            self.inserts_since_train += ivf.inserts_since_train();
-            if let Some((file_bytes, sq8_nodes, list_avg, list_max, list_p95, finalized)) =
-                ivf.paged_runtime_stats()
-            {
-                self.paged_file_size_bytes += file_bytes;
-                self.tombstones_on_disk += ivf.stale_count() as u64;
-                self.sq8_covered_nodes += sq8_nodes;
-                self.list_avg_entries = self.list_avg_entries.max(list_avg);
-                self.list_max_entries = self.list_max_entries.max(list_max);
-                self.list_p95_entries = self.list_p95_entries.max(list_p95);
-                self.finalized |= finalized;
+        if let VectorGraph::NativeHnsw(hnsw) = graph {
+            let (model, codes, exceptions) = hnsw.quantization_stats();
+            self.quantization_pending |= hnsw.quantization_pending();
+            self.quantizer_bytes += model as u64;
+            self.compressed_bytes += codes as u64;
+            self.quantization_exceptions += exceptions as u64;
+            let (generation, candidates, heap, fallbacks) = hnsw.query_stats();
+            self.generation = self.generation.max(generation);
+            self.candidates_returned += candidates;
+            self.heap_reranks += heap;
+            self.exact_fallbacks += fallbacks;
+
+            if let Some(file) = hnsw.file() {
+                self.paged_file_size_bytes += file.file_size_bytes();
+                self.tombstones_on_disk += hnsw.stale_count() as u64;
+                self.finalized |= file.is_finalized();
             }
         }
+        if let VectorGraph::NativeIvf(ivf) = graph {
+            let (model, codes, exceptions) = ivf.quantization_stats();
+            self.quantization_pending |= ivf.quantization_pending();
+            self.quantizer_bytes += model as u64;
+            self.compressed_bytes += codes as u64;
+            self.quantization_exceptions += exceptions as u64;
+            let (generation, candidates, heap, fallbacks) = ivf.query_stats();
+            self.generation = self.generation.max(generation);
+            self.candidates_returned += candidates;
+            self.heap_reranks += heap;
+            self.exact_fallbacks += fallbacks;
+
+            self.nlist = self.nlist.max(ivf.nlist() as u64);
+            if let Some(file) = ivf.file() {
+                self.paged_file_size_bytes += file.file_size_bytes();
+                self.finalized |= file.is_finalized();
+            }
+        }
+
         if let VectorGraph::Paged(paged) = graph {
             let (nav_pages, exact_fallback, covered, file_bytes) = paged.navigation_stats();
             self.nav_pages += nav_pages;
@@ -202,7 +227,48 @@ impl VectorGraph {
     pub(crate) fn prepare_query_navigation(&self) -> Result<(), QueryError> {
         match self {
             VectorGraph::Paged(graph) => graph.refresh_query_navigation(),
-            VectorGraph::Memory(_) | VectorGraph::Ivf(_) => Ok(()),
+            VectorGraph::NativeHnsw(g) => g.prepare_navigation(),
+            VectorGraph::Memory(_) | VectorGraph::NativeIvf(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn invalidate(&self) {
+        match self {
+            Self::NativeHnsw(g) => g.invalidate(),
+            Self::NativeIvf(g) => g.invalidate(),
+            Self::Memory(g) => g.invalidate(),
+            Self::Paged(p) => p.invalidate(),
+        }
+    }
+
+    pub(crate) fn quantization_pending(&self) -> bool {
+        match self {
+            Self::NativeHnsw(g) => g.quantization_pending(),
+            Self::NativeIvf(g) => g.quantization_pending(),
+            _ => false,
+        }
+    }
+    pub(crate) fn record_query_stats(&self, candidates: u64, heap: u64, fallback: bool) {
+        match self {
+            Self::NativeHnsw(g) => g.record_query_stats(candidates, heap, fallback),
+            Self::NativeIvf(g) => g.record_query_stats(candidates, heap, fallback),
+            _ => {}
+        }
+    }
+    pub(crate) fn ensure_valid(&self) -> Result<(), QueryError> {
+        let valid = match self {
+            Self::NativeHnsw(g) => g.is_valid(),
+            Self::NativeIvf(g) => g.is_valid(),
+            Self::Memory(g) => g.is_valid(),
+            Self::Paged(p) => p.is_valid(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector index handle was invalidated; rebuild required",
+            ))
         }
     }
 
@@ -212,26 +278,17 @@ impl VectorGraph {
     pub(crate) fn as_memory(&self) -> Option<&HnswIndex> {
         match self {
             VectorGraph::Memory(g) => Some(g),
-            VectorGraph::Paged(_) | VectorGraph::Ivf(_) => None,
-        }
-    }
-
-    /// Borrow the IVF backend, if this is one. Used by the retrain path
-    /// (`OPTIMIZE TABLE`) and observability in `vector_index.rs`.
-    #[allow(dead_code)] // wired by M2 retrain / M5 observability
-    pub(crate) fn as_ivf(&self) -> Option<&IvfSq8Index> {
-        match self {
-            VectorGraph::Ivf(i) => Some(i),
-            _ => None,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => None,
         }
     }
 
     /// Total node count, including tombstones.
     pub(crate) fn node_count(&self) -> usize {
         match self {
+            VectorGraph::NativeHnsw(g) => g.node_count(),
+            VectorGraph::NativeIvf(g) => g.node_count(),
             VectorGraph::Memory(g) => g.node_count(),
             VectorGraph::Paged(p) => p.node_count() as usize,
-            VectorGraph::Ivf(i) => i.node_count(),
         }
     }
 
@@ -239,18 +296,20 @@ impl VectorGraph {
     #[allow(dead_code)] // used by the test-only hnsw_stats_for_test.
     pub(crate) fn len(&self) -> usize {
         match self {
+            VectorGraph::NativeHnsw(g) => g.len(),
+            VectorGraph::NativeIvf(g) => g.len(),
             VectorGraph::Memory(g) => g.len(),
             VectorGraph::Paged(p) => p.live_count(),
-            VectorGraph::Ivf(i) => i.live_count(),
         }
     }
 
     /// No live nodes.
     pub(crate) fn is_empty(&self) -> bool {
         match self {
+            VectorGraph::NativeHnsw(g) => g.len() == 0,
+            VectorGraph::NativeIvf(g) => g.len() == 0,
             VectorGraph::Memory(g) => g.is_empty(),
             VectorGraph::Paged(p) => p.node_count() == 0,
-            VectorGraph::Ivf(i) => i.is_empty(),
         }
     }
 
@@ -258,15 +317,18 @@ impl VectorGraph {
     /// memory backend).
     pub(crate) fn dim(&self) -> usize {
         match self {
+            VectorGraph::NativeHnsw(g) => g.dim(),
+            VectorGraph::NativeIvf(g) => g.dim(),
             VectorGraph::Memory(g) => g.dim(),
             VectorGraph::Paged(p) => p.dim(),
-            VectorGraph::Ivf(i) => i.dim(),
         }
     }
 
     /// Backend tag for `information_schema.mydb_vector_indexes` / SHOW ENGINE.
     pub(crate) fn backend_name(&self) -> &'static str {
         match self {
+            VectorGraph::NativeHnsw(g) => g.backend_name(),
+            VectorGraph::NativeIvf(g) => g.backend_name(),
             VectorGraph::Memory(_) => "memory",
             VectorGraph::Paged(graph) => {
                 if graph.file().with_navigation_mapping(|_| ()).is_some() {
@@ -275,8 +337,6 @@ impl VectorGraph {
                     "paged"
                 }
             }
-            // "ivf" (memory) or "ivf_paged" (buffer-pool + WAL).
-            VectorGraph::Ivf(i) => i.backend_name(),
         }
     }
 
@@ -285,7 +345,7 @@ impl VectorGraph {
     pub(crate) fn generation(&self) -> u64 {
         match self {
             VectorGraph::Memory(g) => g.generation(),
-            VectorGraph::Paged(_) | VectorGraph::Ivf(_) => 0,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 
@@ -295,16 +355,17 @@ impl VectorGraph {
     pub(crate) fn last_persisted_lsn(&self) -> u64 {
         match self {
             VectorGraph::Memory(g) => g.last_persisted_lsn(),
-            VectorGraph::Paged(_) | VectorGraph::Ivf(_) => 0,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 
     /// Tombstoned node count.
     pub(crate) fn stale_count(&self) -> u32 {
         match self {
+            VectorGraph::NativeHnsw(g) => g.stale_count(),
+            VectorGraph::NativeIvf(g) => g.stale_count(),
             VectorGraph::Memory(g) => g.stale_count(),
             VectorGraph::Paged(p) => p.stale_count(),
-            VectorGraph::Ivf(i) => i.stale_count(),
         }
     }
 
@@ -313,7 +374,7 @@ impl VectorGraph {
     pub(crate) fn dirty_count(&self) -> u32 {
         match self {
             VectorGraph::Memory(g) => g.dirty_count(),
-            VectorGraph::Paged(_) | VectorGraph::Ivf(_) => 0,
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 
@@ -321,9 +382,18 @@ impl VectorGraph {
     /// un-finalizes the `.hvec` and returns the error: callers evict the
     /// graph, so the next access rebuilds it from the heap instead of trusting
     /// a file that silently lacks a committed row.
-    pub(crate) fn insert(&self, row_id: RowId, vector: Vec<f32>) -> Result<(), QueryError> {
+    pub(crate) fn insert(
+        &self,
+        row_id: RowId,
+        vector: crate::vector::VectorValue,
+    ) -> Result<(), QueryError> {
+        self.ensure_valid()?;
         match self {
-            VectorGraph::Memory(g) => g.insert(row_id, vector),
+            VectorGraph::NativeHnsw(g) => g.insert(row_id, vector).inspect_err(|_| g.invalidate()),
+            VectorGraph::NativeIvf(g) => g.insert(row_id, vector).inspect_err(|_| g.invalidate()),
+            VectorGraph::Memory(g) => g
+                .insert(row_id, super::to_f32(&vector))
+                .inspect_err(|_| g.invalidate()),
             VectorGraph::Paged(p) => {
                 #[cfg(test)]
                 if FAIL_PAGED_WRITES_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
@@ -333,13 +403,9 @@ impl VectorGraph {
                     );
                     return Err(Self::invalidate_paged(p, "insert", err));
                 }
-                p.insert_ddl(row_id, &vector)
+                p.insert_ddl(row_id, &super::to_f32(&vector))
                     .map(|_| ())
                     .map_err(|e| Self::invalidate_paged(p, "insert", e))
-            }
-            VectorGraph::Ivf(i) => {
-                i.insert(row_id, &vector);
-                Ok(())
             }
         }
     }
@@ -350,10 +416,12 @@ impl VectorGraph {
     pub(crate) fn replace_row(
         &self,
         row_id: RowId,
-        vector: Option<Vec<f32>>,
+        vector: Option<crate::vector::VectorValue>,
     ) -> Result<(), QueryError> {
         match (self, vector) {
-            (VectorGraph::Memory(g), Some(vector)) => g.reconcile_heap_vector(row_id, vector),
+            (VectorGraph::Memory(g), Some(vector)) => {
+                g.reconcile_heap_vector(row_id, super::to_f32(&vector))
+            }
             (_, vector) => {
                 self.mark_deleted_by_row_id(row_id)?;
                 vector.map_or(Ok(()), |vector| self.insert(row_id, vector))
@@ -363,21 +431,30 @@ impl VectorGraph {
 
     pub(crate) fn begin_transaction_delta(&self, txn_id: u64) -> Result<(), QueryError> {
         match self {
-            VectorGraph::Ivf(i) => i.begin_transaction_delta(txn_id),
+            VectorGraph::NativeHnsw(g) => g.begin_transaction_delta(txn_id),
+            VectorGraph::NativeIvf(g) => g.begin_transaction_delta(txn_id),
+            VectorGraph::Paged(p) => p.begin_transaction_delta(txn_id),
             _ => Ok(()),
         }
     }
 
-    pub(crate) fn finish_committed_delta(&self, txn_id: u64) -> Result<(), QueryError> {
+    pub(crate) fn finish_committed_delta(
+        &self,
+        txn_id: u64,
+        commit_scn: u64,
+    ) -> Result<(), QueryError> {
         match self {
-            VectorGraph::Ivf(i) => i.finish_committed_delta(txn_id),
+            VectorGraph::NativeHnsw(g) => g.finish_committed_delta(txn_id, commit_scn),
+            VectorGraph::NativeIvf(g) => g.finish_committed_delta(txn_id, commit_scn),
+            VectorGraph::Paged(p) => p.finish_committed_delta(txn_id, commit_scn),
             _ => Ok(()),
         }
     }
 
     pub(crate) fn flush_paged_ivf(&self) -> Result<(), QueryError> {
         match self {
-            VectorGraph::Ivf(i) => i.flush(),
+            VectorGraph::NativeIvf(g) => g.file().map_or(Ok(()), |f| f.flush()),
+            VectorGraph::NativeHnsw(g) => g.file().map_or(Ok(()), |f| f.flush()),
             _ => Ok(()),
         }
     }
@@ -387,9 +464,22 @@ impl VectorGraph {
     /// heap MVCC; storage errors are propagated to its explicit fallback.
     pub(crate) fn search(
         &self,
-        query: &[f32],
+        query: &crate::vector::VectorValue,
         request: VectorSearchRequest,
     ) -> Result<VectorSearchResult, QueryError> {
+        self.ensure_valid()?;
+        if let VectorGraph::NativeHnsw(g) = self {
+            let result = g.search(query, request)?;
+            self.ensure_valid()?;
+            return Ok(result);
+        }
+        if let VectorGraph::NativeIvf(g) = self {
+            let result = g.search(query, request)?;
+            self.ensure_valid()?;
+            return Ok(result);
+        }
+        let decoded = super::to_f32(query);
+        let query = decoded.as_slice();
         // A short result proves exhaustion only if widening `ef` cannot reach
         // more live nodes. The slab search keeps tombstones out of its result
         // pool, so it stops early only after draining its reachable frontier.
@@ -410,9 +500,6 @@ impl VectorGraph {
                     && ef.max(request.candidate_limit) as u64 >= p.node_count();
                 (candidates, exhausted)
             }
-            (VectorGraph::Ivf(i), VectorSearchEffort::Ivf { nprobe }) => {
-                return i.try_search_result(query, request.candidate_limit, nprobe);
-            }
             _ => {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_GET_ERRNO,
@@ -420,6 +507,7 @@ impl VectorGraph {
                 ));
             }
         };
+        self.ensure_valid()?;
         Ok(VectorSearchResult {
             candidates,
             exact_order: true,
@@ -431,11 +519,12 @@ impl VectorGraph {
     /// A failed paged write invalidates the file exactly like [`Self::insert`].
     pub(crate) fn mark_deleted_by_row_id(&self, row_id: RowId) -> Result<u32, QueryError> {
         match self {
+            VectorGraph::NativeHnsw(g) => g.delete(row_id),
+            VectorGraph::NativeIvf(g) => g.delete(row_id),
             VectorGraph::Memory(g) => Ok(g.mark_deleted_by_row_id(row_id)),
             VectorGraph::Paged(p) => p
                 .mark_deleted_by_row_id(row_id)
                 .map_err(|e| Self::invalidate_paged(p, "delete", e)),
-            VectorGraph::Ivf(i) => Ok(i.mark_deleted_by_row_id(row_id)),
         }
     }
 
@@ -443,6 +532,7 @@ impl VectorGraph {
         log_message(format!(
             "hnsw(paged): {action} failed; index will be rebuilt from the heap: {err:?}"
         ));
+        graph.invalidate();
         if let Err(meta_err) = graph.file().invalidate_build(0) {
             log_message(format!(
                 "hnsw(paged): could not invalidate index after failed {action}: {meta_err:?}"
@@ -465,7 +555,7 @@ impl VectorGraph {
             VectorGraph::Paged(p) => p
                 .live_versions(row_id)
                 .map_err(|e| Self::invalidate_paged(p, "version lookup", e)),
-            VectorGraph::Ivf(_) => Ok(SmallVec::new()),
+            VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => Ok(SmallVec::new()),
         }
     }
 
@@ -480,15 +570,17 @@ impl VectorGraph {
             VectorGraph::Paged(p) => p
                 .retire_versions(row_id, versions)
                 .map_err(|e| Self::invalidate_paged(p, "purge", e)),
-            VectorGraph::Ivf(i) => Ok(i.mark_deleted_by_row_id(row_id)),
+            VectorGraph::NativeHnsw(g) => g.delete(row_id),
+            VectorGraph::NativeIvf(g) => g.delete(row_id),
         }
     }
 
     pub(crate) fn has_live_row_id(&self, row_id: RowId) -> bool {
         match self {
+            VectorGraph::NativeHnsw(g) => g.has_row(row_id),
+            VectorGraph::NativeIvf(g) => g.has_row(row_id),
             VectorGraph::Memory(g) => g.has_live_row_id(row_id),
             VectorGraph::Paged(p) => p.has_live_row_id(row_id).unwrap_or(false),
-            VectorGraph::Ivf(i) => i.has_live_row_id(row_id),
         }
     }
 
@@ -501,20 +593,25 @@ impl VectorGraph {
     pub(crate) fn try_update_in_place(
         &self,
         row_id: RowId,
-        new_vector: &[f32],
+        new_vector: &crate::vector::VectorValue,
         ratio: f32,
     ) -> bool {
+        // Native updates use deletion and reinsertion. Keep packed binary and
+        // low-precision values out of the legacy FLOAT32 displacement path.
+        if matches!(self, VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_)) {
+            return false;
+        }
+        let decoded = super::to_f32(new_vector);
+        let new_vector = decoded.as_slice();
         match self {
+            VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => false,
             VectorGraph::Memory(g) => g.try_update_in_place(row_id, new_vector, ratio),
             VectorGraph::Paged(p) => p
                 .try_update_in_place(row_id, new_vector, ratio)
                 .unwrap_or_else(|e| {
-                    log_message(format!(
-                        "hnsw(paged): in-place update failed (re-link): {e:?}"
-                    ));
+                    Self::invalidate_paged(p, "in-place update", e);
                     false
                 }),
-            VectorGraph::Ivf(i) => i.try_update_in_place(row_id, new_vector, ratio),
         }
     }
 
@@ -523,8 +620,7 @@ impl VectorGraph {
     pub(crate) fn compact(&self, threads: usize) -> u32 {
         match self {
             VectorGraph::Memory(g) => g.compact_with_threads(threads),
-            VectorGraph::Paged(_) => 0,
-            VectorGraph::Ivf(i) => i.compact(),
+            VectorGraph::Paged(_) | VectorGraph::NativeHnsw(_) | VectorGraph::NativeIvf(_) => 0,
         }
     }
 }

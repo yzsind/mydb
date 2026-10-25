@@ -204,11 +204,12 @@ MyDB minimizes DDL locking and query waiting by coordinating schema versions, in
 
 ### Native vectors: from storage to large-scale similarity search
 
-- **Native `VECTOR(n)` type**: up to **16,383 dimensions**, with L2, cosine, dot-product and other distance and computation functions.
-- **Disk-resident graph indexes**: paged HNSW integrates graph search with disk storage — index pages participate in the buffer pool and WAL, so vector indexes can exceed memory capacity. An IVF_SQ8 path and exact scan are also provided.
+- **Native `VECTOR(n, datatype)` type**: FLOAT32 (default), FLOAT16, BFLOAT16, INT8, and BINARY retain their native payloads. Numeric vectors support L2, cosine, and dot-product distance; BINARY supports Hamming and Jaccard. Dimension limits depend on the datatype, from 16,383 for FLOAT32 to 524,256 bits for BINARY.
+- **HNSW and IVF indexes**: both support memory and paged storage. Paged index pages participate in the buffer pool and WAL, allowing index payloads to exceed memory capacity; exact KNN scans are also available.
+- **Explicit quantization**: `WITH (quantization=sq8|sq4|pq|bq)` compresses numeric index payloads, with final re-ranking against visible heap values. The default is `none`; search breadth and re-ranking budgets determine the recall, memory, and latency tradeoff.
 - **Unified SQL**: the optimizer recognizes `ORDER BY distance LIMIT k` and supports parameterized queries; vector writes participate in transaction commit and rollback.
 
-Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. See the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF_SQ8; disk residency does not imply a complete DiskANN implementation.
+Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. See [vector datatypes and indexes](docs/vector-indexes.md) for options, training, limits, and recovery, and the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
 
 ### Try vector retrieval and RETURNING
 
@@ -229,7 +230,7 @@ INSERT INTO agent_notes VALUES
 RETURNING id;
 
 CREATE INDEX idx_agent_notes_embedding ON agent_notes (embedding)
-USING HNSW COMMENT 'METRIC=L2';
+USING HNSW WITH (metric=l2);
 
 SELECT id, content,
        L2_DISTANCE(embedding, STRING_TO_VECTOR('[1,0,0]')) AS distance

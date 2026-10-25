@@ -761,7 +761,7 @@ impl Database {
             self.evict_table_vector_graphs(table.id);
             for index in table.indexes.iter().filter(|index| index.is_vector()) {
                 for sid in table.storage_ids() {
-                    for ext in ["hnsw", "hvec", "ivf"] {
+                    for ext in ["hnsw", "hvec"] {
                         let path = self.vector_index_paged_path_ext(&table, &index.name, sid, ext);
                         self.buffer_pool.discard_pages_for_path(&path)?;
                         match fs::remove_file(&path) {

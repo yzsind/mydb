@@ -240,7 +240,12 @@ fn recover_from_wal_with_options(
     // checkpoint scan. Retained records below the cutoff remain available to
     // UNDO but need no REDO.
     if let Some(base) = context.continuation_base {
-        redo_cutoff = base.checked_add(1).ok_or_else(|| error(crate::error::catalog::MYDB_ER_BACKUP_FAILED, "source LSN overflow"))?;
+        redo_cutoff = base.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                "source LSN overflow",
+            )
+        })?;
     } else if let Some(backup_floor) = context.redo_floor() {
         redo_cutoff = redo_cutoff.min(backup_floor);
     }
@@ -255,8 +260,13 @@ fn recover_from_wal_with_options(
     // a shared, internally locked LogManager. Records for one index stay on
     // one worker in LSN order; distinct index files are physically independent
     // and can therefore replay concurrently after the heap pass.
-    let (heap_partitions, index_partitions) =
-        plan_redo_file_partitions_with_context(&scan.records, &redoable, &committed, redo_cutoff,context)?;
+    let (heap_partitions, index_partitions) = plan_redo_file_partitions_with_context(
+        &scan.records,
+        &redoable,
+        &committed,
+        redo_cutoff,
+        context,
+    )?;
     let has_index_redo = !index_partitions.is_empty();
     let partition_count = heap_partitions.len();
     let parallel = recovery_parallel_enabled() && partition_count > 1;
@@ -902,8 +912,19 @@ fn recover_from_wal_with_options(
 type RecoveryPartitions = hashbrown::HashMap<String, Vec<usize>, ahash::RandomState>;
 
 #[cfg(test)]
-fn plan_redo_file_partitions(records:&(impl WalRecordSource+?Sized),redoable:&RecoveryTxnSet,committed:&RecoveryTxnSet,redo_cutoff:u64)->Result<(RecoveryPartitions,RecoveryPartitions),QueryError>{
-    plan_redo_file_partitions_with_context(records,redoable,committed,redo_cutoff,RecoveryContext::default())
+fn plan_redo_file_partitions(
+    records: &(impl WalRecordSource + ?Sized),
+    redoable: &RecoveryTxnSet,
+    committed: &RecoveryTxnSet,
+    redo_cutoff: u64,
+) -> Result<(RecoveryPartitions, RecoveryPartitions), QueryError> {
+    plan_redo_file_partitions_with_context(
+        records,
+        redoable,
+        committed,
+        redo_cutoff,
+        RecoveryContext::default(),
+    )
 }
 
 fn plan_redo_file_partitions_with_context(
@@ -939,7 +960,9 @@ fn plan_redo_file_partitions_with_context(
             }
         }
         if let Some(path) = records.redo_path(idx)? {
-            if context.continuation_base.is_some()&&path.ends_with(".zm"){continue;}
+            if context.continuation_base.is_some() && path.ends_with(".zm") {
+                continue;
+            }
             // A committed whole-file replacement starts a new incarnation.
             // Replaying older pages first can extend a truncated file with old
             // rows even when its new page zero already covers the reset LSN.
@@ -1148,7 +1171,8 @@ fn apply_redo_record_inner(
             // carry a LOCAL physical layout — a master image (meta
             // page / FPI at the master's page id) would corrupt the
             // local tree. Same rule as the online applier.
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path))
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
                 && !existing_file_generation_covers_lsn_with_context(
                     data_dir,
                     path,
@@ -1191,7 +1215,9 @@ fn apply_redo_record_inner(
             after,
             ..
         } if should_redo_record(record, redoable, redo_cutoff) => {
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path)) {
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
+            {
                 redo_page_update_with_context(
                     data_dir,
                     path,
@@ -1204,7 +1230,9 @@ fn apply_redo_record_inner(
             }
         }
         WalPayload::PageDelta { path, .. } if should_redo_record(record, redoable, redo_cutoff) => {
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path)) {
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
+            {
                 redo_page_delta(data_dir, record)?;
                 state.redone_records += 1;
             }
@@ -1212,7 +1240,9 @@ fn apply_redo_record_inner(
         WalPayload::PageUpdateCompressed { path, page_id, .. }
             if should_redo_record(record, redoable, redo_cutoff) =>
         {
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path)) {
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
+            {
                 let (_, after) = crate::wal::wal_compressed_page_update_images(&record.payload)?;
                 redo_page_update_with_context(
                     data_dir,
@@ -1230,7 +1260,9 @@ fn apply_redo_record_inner(
             page_id,
             after,
         } if should_redo_record(record, redoable, redo_cutoff) => {
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path)) {
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
+            {
                 redo_page_update_with_context(
                     data_dir,
                     path,
@@ -1245,7 +1277,9 @@ fn apply_redo_record_inner(
         WalPayload::FullPageImageCompressed { path, page_id, .. }
             if should_redo_record(record, redoable, redo_cutoff) =>
         {
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path)) {
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
+            {
                 let after = crate::wal::wal_full_page_image_after(&record.payload)?;
                 redo_page_update_with_context(
                     data_dir,
@@ -1375,7 +1409,9 @@ fn apply_redo_record_inner(
             after,
             ..
         } if record.lsn >= redo_cutoff => {
-            if !((physical_replica || state.context.continuation_base.is_some()) && is_index_object_path(path)) {
+            if !((physical_replica || state.context.continuation_base.is_some())
+                && is_index_object_path(path))
+            {
                 redo_page_update_with_context(
                     data_dir,
                     path,
@@ -1559,10 +1595,6 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
                     | OVFL_MAGIC
                     | VEC_META_MAGIC
                     | VEC_NODE_MAGIC
-                    | IVF_META_MAGIC
-                    | IVF_CENT_MAGIC
-                    | IVF_DIR_MAGIC
-                    | IVF_LIST_MAGIC
                     | zone_map_page::MAGIC
             )
             || read_u32(bytes, 16) != page_checksum(bytes, 16)
@@ -2138,7 +2170,8 @@ mod undo_audit_recovery_tests {
     fn ddl_retirement_redo_requires_commit_and_preserves_live_generation() {
         let old = "objects/tables/1/3.heap";
         let live = "objects/tables/1/4.heap";
-        let update = |lsn, path: &str| WalRecord { source_time_us: 0,
+        let update = |lsn, path: &str| WalRecord {
+            source_time_us: 0,
             lsn,
             txn_id: 0,
             prev_txn_lsn: 0,
@@ -2153,7 +2186,8 @@ mod undo_audit_recovery_tests {
         };
         let records = vec![
             update(10, old),
-            WalRecord { source_time_us: 0,
+            WalRecord {
+                source_time_us: 0,
                 lsn: 11,
                 txn_id: 7,
                 prev_txn_lsn: 0,
@@ -2193,7 +2227,8 @@ mod undo_audit_recovery_tests {
     #[test]
     fn undo_audit_redo_deletion_discards_only_obsolete_file_incarnation() {
         let path = "objects/tables/1/1.heap";
-        let record = |lsn, txn_id, payload| WalRecord { source_time_us: 0,
+        let record = |lsn, txn_id, payload| WalRecord {
+            source_time_us: 0,
             lsn,
             txn_id,
             prev_txn_lsn: 0,
@@ -2315,7 +2350,8 @@ mod zone_map_physical_redo_tests {
         // CRC/LSN must refer to the stamped resident image, not its encoding.
         for lsn in [20, 30] {
             let encoded = image(0, &[lsn as u8; 256]);
-            let record = WalRecord { source_time_us: 0,
+            let record = WalRecord {
+                source_time_us: 0,
                 lsn,
                 txn_id: 0,
                 prev_txn_lsn: 0,
@@ -2429,7 +2465,8 @@ mod zone_map_physical_redo_tests {
         let before = image(10, b"before");
         let after = image(20, b"after with a different length");
         let final_image = image(30, b"final");
-        let delta = |lsn, base_lsn, before: &[u8], after: &[u8]| WalRecord { source_time_us: 0,
+        let delta = |lsn, base_lsn, before: &[u8], after: &[u8]| WalRecord {
+            source_time_us: 0,
             lsn,
             txn_id: 0,
             prev_txn_lsn: 0,
@@ -2597,7 +2634,8 @@ mod zone_map_physical_redo_tests {
             &[(key, b"new")],
         )
         .unwrap();
-        let record = WalRecord { source_time_us: 0,
+        let record = WalRecord {
+            source_time_us: 0,
             lsn: 777,
             txn_id: 0,
             prev_txn_lsn: 0,
@@ -2628,7 +2666,8 @@ mod zone_map_physical_redo_tests {
         )
         .unwrap();
         set_page_lsn_if_formatted(&mut after, 778);
-        let delta = WalRecord { source_time_us: 0,
+        let delta = WalRecord {
+            source_time_us: 0,
             lsn: 778,
             txn_id: 0,
             prev_txn_lsn: 0,
@@ -2674,7 +2713,8 @@ mod zone_map_physical_redo_tests {
         let reading = map.data_gate.read().unwrap();
         let applying = Arc::clone(&db);
         let worker = std::thread::spawn(move || {
-            applying.apply_wal_record(&WalRecord { source_time_us: 0,
+            applying.apply_wal_record(&WalRecord {
+                source_time_us: 0,
                 lsn: 777,
                 txn_id: 0,
                 prev_txn_lsn: 0,
