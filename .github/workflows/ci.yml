@@ -176,13 +176,12 @@ jobs:
       - run: test -s tests/mydb-test/triage/t/main/type_float.test && test -s tests/mydb-test/triage/t/main/type_enum.test && test -s tests/mydb-test/triage/t/main/type_set.test && test -s tests/mydb-test/triage/t/main/type_year.test
       - name: Run statement-level compatibility budget
         env:
-          MYDB_MTR_TRIAGE: 1
           MYDB_MTR_TRIAGE_FILTER: main/type_
           MYDB_MTR_TRIAGE_EXPECT_FILES: 4
           MYDB_MTR_TRIAGE_MAX_BLOCKERS: 0
           MYDB_MTR_TRIAGE_ALLOWLIST: scripts/mtr_ci_diff_allowlist.json
           MYDB_MTR_TRIAGE_REPORT_DIR: /tmp/mydb/mtr-report
-        run: cargo nextest run --locked --no-capture mtr_triage
+        run: cargo nextest run --locked --run-ignored only --no-capture mtr_triage
       - if: always()
         uses: actions/upload-artifact@v4
         with:

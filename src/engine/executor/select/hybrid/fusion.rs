@@ -64,6 +64,12 @@ pub(in crate::engine::executor::select) fn open_plan(
     }
     statistics_result?;
     let width = columns.len() - 3 - usize::from(spec.score_details);
+    let rankers = spec.score_details.then(|| {
+        spec.branches
+            .iter()
+            .map(|branch| ranker(db, &branch.query))
+            .collect::<Vec<_>>()
+    });
     let collations = columns[..width]
         .iter()
         .map(|column| column.source.collation_id)
@@ -283,7 +289,7 @@ pub(in crate::engine::executor::select) fn open_plan(
             let details=spec.branches.iter().enumerate().map(|(i,branch)| {
                 let rank=entry.ranks[i];
                 let order_values=entry.ordered.as_ref().and_then(|ordered|ordered[i].as_ref()).map(|values|values.iter().map(ordered_json).collect::<Vec<_>>());
-                serde_json::json!({"branch_id":i+1,"name":branch.name,"weight":weights[i],"disabled":weights[i]==0.0,"rank":(rank!=0).then_some(rank),"contribution":if rank==0 {0.0}else{weights[i]/(constant+rank as f64)},"ordered_values":order_values,"ordering":branch.query.leftmost_select().map(|select|select.order_by.iter().map(|order|serde_json::json!({"ascending":order.asc,"nulls_first":order.nulls_first_effective()})).collect::<Vec<_>>()),"ranker":ranker(&branch.query)})
+                serde_json::json!({"branch_id":i+1,"name":branch.name,"weight":weights[i],"disabled":weights[i]==0.0,"rank":(rank!=0).then_some(rank),"contribution":if rank==0 {0.0}else{weights[i]/(constant+rank as f64)},"ordered_values":order_values,"ordering":branch.query.leftmost_select().map(|select|select.order_by.iter().map(|order|serde_json::json!({"ascending":order.asc,"nulls_first":order.nulls_first_effective()})).collect::<Vec<_>>()),"ranker":rankers.as_ref().expect("score details rankers")[i]})
             }).collect::<Vec<_>>();
             let bytes = crate::engine::json::from_serde(&serde_json::Value::Array(details));
             charge.add_non_spillable(bytes.capacity())?;

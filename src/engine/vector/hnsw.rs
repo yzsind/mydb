@@ -3256,7 +3256,31 @@ impl HnswIndex {
         if self.nodes.len() == 0 {
             return Vec::new();
         }
-        let ef = ef_search.max(k).min(self.nodes.len()).max(1);
+        let node_count = self.nodes.len();
+        let ef = ef_search.max(k).min(node_count).max(1);
+        let cmp =
+            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if ef == node_count {
+            // Greedy descent can enter a directed component that cannot reach
+            // every node, even when the cold-build entry can. Exhaustive effort
+            // scores the slab directly, covering such components and avoiding
+            // graph/quantization work without changing bounded ANN searches.
+            let mut out = Vec::with_capacity(node_count);
+            for id in 0..node_count as u32 {
+                let node = self.node_at(id);
+                if !node.deleted.load(Ordering::Acquire) {
+                    let distance =
+                        self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                    out.push((node.row_id, distance));
+                }
+            }
+            if out.len() > k {
+                out.select_nth_unstable_by(k, cmp);
+                out.truncate(k);
+            }
+            out.sort_unstable_by(cmp);
+            return out;
+        }
         // Build/refresh the SQ8 navigation arena (L2 only; no-op otherwise) and
         // quantize the query once. Both outlive the search closure below. The
         // `_structural` read guard above keeps the slab alive across the build.
@@ -3315,8 +3339,6 @@ impl HnswIndex {
                 break;
             }
         }
-        let cmp =
-            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
         if out.len() > k {
             out.select_nth_unstable_by(k, cmp);
             out.truncate(k);
@@ -4058,7 +4080,7 @@ mod tests {
     ///        -- --ignored --nocapture`
     /// Tunables: `BENCH_DIM` (768), `BENCH_THREADS` (avail cores), `BENCH_SIZES`.
     #[test]
-    #[ignore]
+    #[ignore = "manual high-dimensional HNSW build timing; run explicitly in release mode"]
     fn build_time_crossover_bench() {
         let dim: usize = std::env::var("BENCH_DIM")
             .ok()
@@ -5041,6 +5063,10 @@ mod query_preparation_regressions {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hnsw_quality_tests.rs"]
+mod quality_tests;
 
 #[cfg(test)]
 mod asynchronous_quant_regressions {

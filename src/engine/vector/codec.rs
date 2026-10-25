@@ -191,7 +191,7 @@ fn parse_f32_fast_at(b: &[u8], i: &mut usize) -> Option<f32> {
         if j == estart {
             return None; // 'e' with no exponent digits
         }
-        exp10 += esign * e;
+        exp10 = exp10.saturating_add(esign * e);
     }
     if mantissa > 0x00FF_FFFF || !(-10..=10).contains(&exp10) {
         return None; // outside the exact-representation window
@@ -1293,6 +1293,30 @@ mod native_rounding_tests {
                 expected,
                 "{datatype}/{text}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn vector_text_extreme_exponents_match_standard_parser() {
+        for token in [
+            "1.0e-2147483647",
+            "-1.25e-2147483648",
+            "1.0e-99999999999999999999999999",
+            "0.0e99999999999999999999999999",
+            "1.0e99999999999999999999999999",
+        ] {
+            let expected = token.parse::<f32>().unwrap();
+            let actual = parse_text(&format!("[{token}]"));
+            if expected.is_finite() {
+                assert_eq!(actual.unwrap().payload, expected.to_le_bytes(), "{token}");
+            } else {
+                assert!(actual.is_err(), "{token}");
+            }
         }
     }
 }

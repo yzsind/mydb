@@ -547,15 +547,19 @@ fn static_explain_is_allowed_but_analyze_is_rejected_in_read_only_transaction() 
 
 #[test]
 #[cfg(feature = "mysql-replica")]
+#[ignore = "requires a running local mydb server; set MYDB_EXPLAIN_PROTOCOL_TEST_PORT"]
 fn mysql_protocol_prepared_dml_explain_metadata_and_repeat_execute() {
-    let Ok(port) = std::env::var("MYDB_EXPLAIN_PROTOCOL_TEST_PORT") else {
-        return;
-    };
+    let port = std::env::var("MYDB_EXPLAIN_PROTOCOL_TEST_PORT")
+        .expect("set MYDB_EXPLAIN_PROTOCOL_TEST_PORT to a running local mydb server's port");
+    let port: u16 = port
+        .parse()
+        .expect("MYDB_EXPLAIN_PROTOCOL_TEST_PORT must be a TCP port from 1 to 65535");
+    assert_ne!(port, 0, "MYDB_EXPLAIN_PROTOCOL_TEST_PORT must not be zero");
     use ::mysql::prelude::Queryable;
 
     let opts: ::mysql::Opts = ::mysql::OptsBuilder::new()
         .ip_or_hostname(Some("127.0.0.1"))
-        .tcp_port(port.parse().unwrap())
+        .tcp_port(port)
         .user(Some("root"))
         .pass(Some("root"))
         .db_name(Some("test"))

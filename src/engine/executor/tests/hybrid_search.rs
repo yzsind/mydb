@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "hybrid_quality.rs"]
+mod quality;
+
 #[test]
 fn hybrid_rrf_rejects_unbound_outer_references_and_ordinal_domains() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();

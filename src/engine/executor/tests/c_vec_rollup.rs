@@ -237,7 +237,7 @@ const PERF_ROWS: usize = 80_000;
 const PERF_GROUPS: usize = 2500; // 50 × 50
 
 #[test]
-#[ignore]
+#[ignore = "manual release comparison of vectorized and row-based ROLLUP on 80000 rows"]
 fn perf_rollup_vec_vs_row() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

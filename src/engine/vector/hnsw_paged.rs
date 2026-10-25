@@ -4342,6 +4342,36 @@ impl PagedHnsw {
             None => return Ok(Vec::new()),
         };
         let ef = ef_search.max(k).min(self.node_count() as usize).max(1);
+        if ef == self.node_count() as usize {
+            // Full-width effort must also cover components unreachable from
+            // the greedy layer-0 entry, including mapped/cached navigation.
+            let mut vids = Vec::with_capacity(ef);
+            self.file.for_each_node(|vid, _, deleted| {
+                if !deleted {
+                    vids.push(vid);
+                }
+            })?;
+            self.file.prefetch_nodes(&vids);
+            let mut out = Vec::with_capacity(vids.len());
+            for vid in vids {
+                crate::engine::cancel::check_cancelled()?;
+                if let Some((row_id, false, distance)) =
+                    self.file
+                        .read_vector_meta_distance(vid, query, self.metric)?
+                {
+                    out.push((row_id, distance));
+                }
+            }
+            let cmp = |a: &(RowId, f64), b: &(RowId, f64)| {
+                a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+            };
+            if out.len() > k {
+                out.select_nth_unstable_by(k, cmp);
+                out.truncate(k);
+            }
+            out.sort_unstable_by(cmp);
+            return Ok(out);
+        }
         if let Some(result) = self
             .file
             .with_navigation_mapping(|mapping| mapping.search(query, k, ef))

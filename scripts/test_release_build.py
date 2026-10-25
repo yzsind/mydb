@@ -58,6 +58,12 @@ class SourceFingerprintTests(unittest.TestCase):
 
 
 class RuntimeSetupTests(unittest.TestCase):
+    def test_pinned_runner_satisfies_repository_version_requirement(self):
+        config = tomllib.loads((builder.ROOT / '.config/nextest.toml').read_text())
+        required = config['nextest-version']['required']
+        self.assertGreaterEqual(tuple(map(int, builder.NEXT.split('.'))),
+                                tuple(map(int, required.split('.'))))
+
     def test_adapter_preserves_other_commands_and_quotes_executable(self):
         config = (builder.ROOT / '.config/nextest.toml').read_text()
         config += '\n[scripts.setup.other]\ncommand = "echo leave this alone"\n'

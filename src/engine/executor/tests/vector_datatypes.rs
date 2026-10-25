@@ -3,6 +3,9 @@ use super::support::query_rows;
 use super::vector_type::HnswEnv;
 use super::*;
 
+#[path = "vector_quality.rs"]
+mod quality;
+
 fn scalar(engine: &StorageQueryEngine, sql: &str) -> String {
     query_rows(engine, sql)[0][0].to_display_string()
 }

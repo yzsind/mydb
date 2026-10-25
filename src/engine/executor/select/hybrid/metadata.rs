@@ -147,24 +147,71 @@ pub(crate) fn bind_options(rrf: &RrfFusion) -> Result<(f64, Vec<f64>), QueryErro
     Ok((constant, weights))
 }
 
-pub(super) fn ranker(query: &QueryExpr) -> serde_json::Value {
+pub(super) fn ranker(db: &Database, query: &QueryExpr) -> serde_json::Value {
     let Some(select) = query.leftmost_select() else {
         return serde_json::json!({"kind":"sql_order"});
     };
-    if let Some(Expr::Function { name, .. }) = select.order_by.first().map(|order| &order.expr) {
+    if let Some(Expr::Function { name, args, .. }) =
+        select.order_by.first().map(|order| &order.expr)
+    {
         if name.eq_ignore_ascii_case(crate::parser::FT_MATCH_FUNCTION) {
             return serde_json::json!({"kind":"bm25","higher_is_better":true});
         }
+        use crate::engine::vector::Metric;
         let metric = match name.to_ascii_uppercase().as_str() {
-            "L2_DISTANCE" => Some("L2"),
-            "COSINE_DISTANCE" => Some("COSINE"),
-            "DOT_DISTANCE" | "MAX_INNER_PRODUCT_DISTANCE" => Some("DOT"),
-            "HAMMING_DISTANCE" => Some("HAMMING"),
-            "JACCARD_DISTANCE" => Some("JACCARD"),
+            "L2_DISTANCE" => Some(Metric::L2),
+            "COSINE_DISTANCE" => Some(Metric::Cosine),
+            "DOT_DISTANCE" | "MAX_INNER_PRODUCT_DISTANCE" => Some(Metric::Dot),
+            "HAMMING_DISTANCE" => Some(Metric::Hamming),
+            "JACCARD_DISTANCE" => Some(Metric::Jaccard),
+            "DISTANCE" | "VEC_DISTANCE" if args.len() == 3 => super::super::eval::eval_plan_expr(
+                &args[2],
+                &super::super::plan::PlanRow::default(),
+            )
+            .ok()
+            .and_then(|value| match &value {
+                Value::Bytes(bytes) => std::str::from_utf8(bytes).ok().and_then(Metric::parse),
+                _ => crate::types::value_str(&value).and_then(Metric::parse),
+            }),
+            "DISTANCE" | "VEC_DISTANCE" if args.len() == 2 => {
+                // Describe operands in their original CTE/derived scope. Default
+                // distance is HAMMING when either operand is a BINARY vector.
+                fn project_operands(query: &mut QueryExpr, args: &[Expr]) {
+                    match query {
+                        QueryExpr::WithCte(with) => project_operands(&mut with.body, args),
+                        QueryExpr::Select(select) => {
+                            select.projection = args
+                                .iter()
+                                .enumerate()
+                                .map(|(i, expr)| SelectItem::Expr {
+                                    expr: expr.clone(),
+                                    alias: Some(format!("operand_{i}")),
+                                })
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+                let mut operands = query.clone();
+                project_operands(&mut operands, args);
+                super::super::describe_subquery_columns(db, &operands)
+                    .ok()
+                    .map(|columns| {
+                        if columns.iter().any(|column| {
+                            column.source.vector_type.is_some_and(|(datatype, _)| {
+                                datatype == crate::vector::VectorDataType::Binary
+                            })
+                        }) {
+                            Metric::Hamming
+                        } else {
+                            Metric::L2
+                        }
+                    })
+            }
             _ => None,
         };
         if let Some(metric) = metric {
-            return serde_json::json!({"kind":"vector_distance","metric":metric,"higher_is_better":false});
+            return serde_json::json!({"kind":"vector_distance","metric":metric.as_str(),"higher_is_better":false});
         }
     }
     serde_json::json!({"kind":"sql_order"})

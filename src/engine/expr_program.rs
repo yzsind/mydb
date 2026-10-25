@@ -4691,6 +4691,12 @@ fn build_synthetic_escape_table(schema: &InputSchema) -> Arc<TableSchema> {
                     0
                 },
                 collation_id: schema.columns[idx].collation_id,
+                vector_type: match schema.bound_types[idx].kind {
+                    crate::engine::expr_type::ExprTypeKind::Vector { dim, datatype } => {
+                        Some((datatype, dim))
+                    }
+                    _ => None,
+                },
                 ..Default::default()
             },
         })

@@ -5310,8 +5310,10 @@ fn paged_hnsw_delta_wal_recovers_after_crash() {
     let engine = open_strict_test_engine(dir.path());
     let vectors: Vec<Vec<f32>> = rows.iter().map(|(_, v)| v.clone()).collect();
     for q in gen_vectors(5, 16, 0x5EED_0044) {
+        // Recovery verifies an exact oracle; cover all 500 graph nodes so
+        // approximate recall cannot depend on concurrent cold-build topology.
         let knn = format!(
-            "SELECT id FROM items ORDER BY DISTANCE(emb, '{}') LIMIT 5",
+            "SELECT /*+ HNSW_EF(512) */ id FROM items ORDER BY DISTANCE(emb, '{}') LIMIT 5",
             vec_text(&q)
         );
         let expected: Vec<i64> = brute_force_l2(&vectors, &q, 5)

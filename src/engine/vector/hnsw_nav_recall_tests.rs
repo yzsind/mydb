@@ -113,7 +113,7 @@ mod nav_recall_tests {
     /// the navigator's operating point ef=40). Run explicitly:
     /// `cargo nextest run -E 'test(nav_scale)' --run-ignored only` (slow).
     #[test]
-    #[ignore]
+    #[ignore = "large correctness differential: serial and parallel HNSW recall on 100000 vectors of 256 dimensions"]
     fn nav_scale_differential_100k_x_256d() {
         let n = 100_000;
         let dim = 256;

@@ -13734,7 +13734,7 @@ fn parallel_redo_matches_serial_redo() {
 ///   cargo test --lib --release v7_idx_file_size_savings -- \
 ///     --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "manual legacy index-format size estimate; not a current-format correctness regression"]
 fn v7_idx_file_size_savings() {
     let dir = tempfile::tempdir().unwrap();
     let index_path = t_index_path(dir.path(), "t", 1, "PRIMARY", "idx");
@@ -19132,7 +19132,7 @@ fn v10_add_index_offline_bulk_dense_small_int_key_smoke() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "large correctness regression: offline index build on 150000 rows with dense duplicate keys"]
 fn v10_add_index_offline_bulk_150k_rows_small_int_key() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
@@ -21278,7 +21278,7 @@ fn lob_reuse_chain_survives_midupdate_failure() {
 /// overflow write volume using M6 write-amplification counters.
 /// `cargo nextest run -- --ignored lob_reuse_write_amplification_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual write-amplification comparison over 200 updates beside a 1 MiB BLOB"]
 fn lob_reuse_write_amplification_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     const ITERS: u64 = 200;
@@ -21627,7 +21627,7 @@ fn m2_lob_column_substring_left_and_right_semantics() {
 /// SUBSTRING LEFT(100) uses one page versus the full chain.
 /// `cargo nextest run --run-ignored ignored-only m2_partial_materialization_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual partial versus full LOB materialization measurement on a 7 MiB BLOB"]
 fn m2_partial_materialization_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     const BLOB_BYTES: usize = 7 * 1024 * 1024; // 7 MiB is about 449 pages, below the column's 8M limit.
@@ -22085,7 +22085,7 @@ fn m3_shrink_survives_reopen_recovery() {
 /// compare .lob file sizes before and after shrinking.
 /// `cargo nextest run --run-ignored ignored-only m3_shrink_space_reclaim_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual LOB space-reclamation measurement after large insert and delete churn"]
 fn m3_shrink_space_reclaim_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     std::env::set_var("MYDB_LOB_SHRINK_MIN_FREE_PAGES", "1");
@@ -22486,7 +22486,7 @@ fn m4_prefetch_default_on_reads_byte_correct() {
 /// versus scattered pages, prefetch on/off, page continuity, and WAL byte volume.
 /// `cargo nextest run --run-ignored ignored-only m4_sequential_read_benchmark`
 #[test]
-#[ignore]
+#[ignore = "manual sequential LOB read, extent, prefetch, and WAL measurement"]
 fn m4_sequential_read_benchmark() {
     use std::time::Instant;
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
@@ -23164,7 +23164,7 @@ fn m5_compression_survives_reopen_recovery() {
 /// `cargo nextest run --run-ignored ignored-only m5_compression_ratio_benchmark`
 /// Run each mode in a separate process with MYDB_LOB_COMPRESSION=lz4 or off.
 #[test]
-#[ignore]
+#[ignore = "manual LOB compression and WAL measurement; run lz4 and off modes in separate processes"]
 fn m5_compression_ratio_benchmark() {
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
     std::env::set_var("MYDB_LOB_COMPRESS_MIN_BYTES", "256");

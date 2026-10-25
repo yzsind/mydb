@@ -1797,9 +1797,22 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     }
                 };
                 let integer = |expr: &Expr| -> Option<u32> {
+                    let value_integer = |value: &Value| match value {
+                        Value::Int(i) => u32::try_from(*i).ok(),
+                        Value::UInt(i) => u32::try_from(*i).ok(),
+                        Value::String(text) | Value::Decimal(text) => text.trim().parse().ok(),
+                        Value::SmallString(_) => {
+                            crate::types::value_str(value)?.trim().parse().ok()
+                        }
+                        _ => None,
+                    };
                     match expr {
                         Expr::Literal(Literal::Int(i)) => u32::try_from(*i).ok(),
-                        Expr::BoundValue(Value::Int(i)) => u32::try_from(*i).ok(),
+                        Expr::Literal(Literal::UInt(i)) => u32::try_from(*i).ok(),
+                        Expr::Literal(Literal::String(text)) => text.trim().parse().ok(),
+                        Expr::BoundValue(value) => value_integer(value),
+                        Expr::Placeholder(i) => crate::engine::params::current_param(*i)
+                            .and_then(|value| value_integer(&value)),
                         _ => None,
                     }
                 };

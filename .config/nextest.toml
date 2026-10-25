@@ -1,4 +1,5 @@
-nextest-version = { required = "0.9.98" }
+# 0.9.145 fixes sibling capture-pipe inheritance during concurrent Unix spawns.
+nextest-version = { required = "0.9.145", recommended = "0.9.149" }
 experimental = ["setup-scripts"]
 
 [scripts.setup.mydb-test-seed]
