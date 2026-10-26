@@ -170,6 +170,82 @@ pub(super) fn scalar_order_key_preflight(
     }))
 }
 
+/// Capability probes can revisit a sort many times. Bind only after its
+/// native input is accepted, once for the operator that will consume rows.
+fn bind_vector_order_keys_at_open(
+    keys: &mut TopNKeyPlan,
+    order_by: &[OrderBy],
+) -> Result<(), QueryError> {
+    for (source, order) in keys.sources.iter_mut().zip(order_by) {
+        let TopNKeySource::Program { program, .. } = source else {
+            continue;
+        };
+        let Some(bound) =
+            crate::engine::expr_program::ExprCompiler::bind_vector_constants(&order.expr)
+        else {
+            continue;
+        };
+        let schema = template_to_batch_schema(&keys.template);
+        if let Some(specialized) = expr_batch::compile_for_batch(&bound, &schema)? {
+            *program = specialized;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod vector_order_binding_tests {
+    use super::*;
+    use crate::engine::vector::codec::{parse_typed_text, text_parse_calls};
+    use crate::parser::Statement;
+    use crate::vector::VectorDataType;
+
+    #[test]
+    fn vector_order_capability_preflight_keeps_binding_until_open() {
+        let Statement::Select(select) =
+            crate::parser::parse_statement("SELECT v FROM t ORDER BY L2_DISTANCE(v,TO_VECTOR(?))")
+                .unwrap()
+        else {
+            panic!("SELECT expected")
+        };
+        let template = vec![PlanField::new(
+            "t",
+            None,
+            "v",
+            ColumnType::Vector,
+            Value::Null,
+        )];
+        let vector = Value::Vector(parse_typed_text("[1,0]", VectorDataType::Float32).unwrap());
+        crate::engine::params::with_params(vec![Value::String("[0,1]".into())], || {
+            let before = text_parse_calls();
+            for _ in 0..4 {
+                assert!(
+                    scalar_order_key_preflight(template.clone(), &select.order_by, false)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert_eq!(text_parse_calls() - before, 0);
+            let mut keys = scalar_order_key_preflight(template, &select.order_by, false)
+                .unwrap()
+                .unwrap();
+            bind_vector_order_keys_at_open(&mut keys, &select.order_by).unwrap();
+            assert_eq!(text_parse_calls() - before, 1);
+            let schema = template_to_batch_schema(&keys.template);
+            let batch = Batch::new(schema, vec![ColumnVector::from_values(vec![vector; 128])]);
+            let TopNKeySource::Program { program, .. } = &keys.sources[0] else {
+                panic!("program expected")
+            };
+            for _ in 0..3 {
+                let values = expr_batch::eval_value_per_row(program, &batch).unwrap();
+                assert!(matches!(values[0], Value::Double(_)));
+                assert!(values.iter().all(|value| *value == values[0]));
+            }
+            assert_eq!(text_parse_calls() - before, 1);
+        });
+    }
+}
+
 /// Compile every ORDER BY key from immutable plan metadata. This must finish
 /// before the upstream operator is opened: an unsupported key therefore
 /// selects the row oracle without consuming and rescanning any input.
@@ -5016,7 +5092,7 @@ pub(super) fn try_build_vec_topn_input<'a>(
     if k > vec_topn::max_topn_k_for_budget() {
         return Ok(None);
     }
-    let Some(keys) = topn_key_preflight(input, order_by)? else {
+    let Some(mut keys) = topn_key_preflight(input, order_by)? else {
         return Ok(None);
     };
     if let Some(fused) =
@@ -5051,6 +5127,9 @@ pub(super) fn try_build_vec_topn_input<'a>(
             crate::error::catalog::ER_UNKNOWN_ERROR,
             "batch Top-N schema diverged from its preflight metadata",
         ));
+    }
+    if hash_aggregate_node(input).is_none() {
+        bind_vector_order_keys_at_open(&mut keys, order_by)?;
     }
     let schema = stream.schema().clone();
     let row_major_keys = keys
@@ -5468,7 +5547,7 @@ pub(super) fn try_build_vec_sort_input<'a>(
         } => (input, order_by),
         _ => return Ok(None),
     };
-    let Some(keys) = topn_key_preflight(input, order_by)? else {
+    let Some(mut keys) = topn_key_preflight(input, order_by)? else {
         return Ok(None);
     };
     let Some(VecBatchInput { stream, template }) = try_native_vec_input_stream(db, txn, input)?
@@ -5486,6 +5565,9 @@ pub(super) fn try_build_vec_sort_input<'a>(
                 keys.template.iter().map(|field| (&field.table, &field.column)).collect::<Vec<_>>()
             ),
         ));
+    }
+    if hash_aggregate_node(input).is_none() {
+        bind_vector_order_keys_at_open(&mut keys, order_by)?;
     }
     let schema = stream.schema().clone();
     let sources = keys
@@ -5831,7 +5913,9 @@ pub(super) fn run_vec_topn_expr_keys(
             sources.push(KeySource::Column(idx));
             continue;
         }
-        match crate::engine::executor::vec::expr_batch::compile_for_batch(&ob.expr, &schema)? {
+        match crate::engine::executor::vec::expr_batch::compile_for_batch_at_open(
+            &ob.expr, &schema,
+        )? {
             Some(program) => sources.push(KeySource::Program(program)),
             None => return Ok(None),
         }

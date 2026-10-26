@@ -1118,6 +1118,17 @@ pub fn compile_for_batch(
     }
 }
 
+/// Specialize vector constants for one operator execution. Compile again at
+/// the next open so a retained program cannot capture a prior parameter value.
+/// The ordinary batch compiler remains suitable for parameter-rebound programs.
+pub(crate) fn compile_for_batch_at_open(
+    expr: &Expr,
+    schema: &BatchSchema,
+) -> Result<Option<Arc<ExprProgram>>, QueryError> {
+    let bound = ExprCompiler::bind_vector_constants(expr);
+    compile_for_batch(bound.as_ref().unwrap_or(expr), schema)
+}
+
 /// Compile one whole scalar expression through the legacy semantic oracle,
 /// but bind its columns to the current BatchSchema. The returned program is
 /// still evaluated row-at-a-time inside the current batch; callers use this

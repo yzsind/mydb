@@ -5561,7 +5561,9 @@ pub(super) fn execute_vector_index_scan(
     // those rows need not occur in the ANN candidate pool at all.
     if db.xa_status_counters().0 > 0 || db.vector_snapshot_requires_exact(txn) {
         if order_by.len() > 1 {
-            return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
+            return execute_ordered_vector_fallback(
+                db, txn, table, filter, order_by, k, projection,
+            );
         }
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
@@ -5933,7 +5935,9 @@ pub(super) fn execute_vector_index_scan(
         drop(scored);
         retained_charge.release_bytes(retained_charge.charged());
         if order_by.len() > 1 {
-            return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
+            return execute_ordered_vector_fallback(
+                db, txn, table, filter, order_by, k, projection,
+            );
         }
         return match filter {
             Some(residual) => execute_vector_brute_scan_filtered(
@@ -6035,6 +6039,7 @@ pub(super) fn project_vector_scan_output(
 }
 
 /// Exact completion for a distance order with SQL tie-break columns.
+#[allow(clippy::too_many_arguments)]
 fn execute_ordered_vector_fallback(
     db: &Arc<Database>,
     txn: TxnView,
@@ -6042,20 +6047,40 @@ fn execute_ordered_vector_fallback(
     filter: &Option<Expr>,
     order_by: &[OrderBy],
     k: usize,
+    projection: Option<&[usize]>,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    let input = ordered_vector_fallback_input(table, filter, projection);
+    super::execute_topk(db, txn, &input, order_by, k)
+}
+
+pub(super) fn ordered_vector_fallback_input(
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> PhysicalPlan {
+    use crate::engine::cbo::selectivity::Selectivity;
     let rows = table.schema.stats.row_count as f64;
-    let input = PhysicalPlan::SeqScan {
+    // Keep the same required columns as the ANN leaf. Accurate survivor
+    // estimates let the ordinary scan choose predicate-first decoding instead
+    // of materializing vectors and LOBs for every row before filtering.
+    let estimated_rows = filter.as_ref().map_or(rows, |predicate| {
+        crate::engine::cbo::selectivity::default_selectivity().predicate_rows(
+            &table.schema,
+            predicate,
+            rows,
+        )
+    });
+    PhysicalPlan::SeqScan {
         table: table.clone(),
         filter: filter.clone(),
-        estimated_rows: rows,
+        estimated_rows,
         access_rows: rows,
         cost: crate::engine::cbo::Cost::scalar(rows),
         possible_keys: Vec::new(),
         runtime_filters: Vec::new(),
         hint_note: None,
-        projected_columns: None,
-    };
-    super::execute_topk(db, txn, &input, order_by, k)
+        projected_columns: projection.map(|columns| Arc::new(columns.to_vec())),
+    }
 }
 
 /// Rare failure-path oracle used when an ANN file cannot be read or fails
