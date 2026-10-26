@@ -74,6 +74,16 @@ neighbors. Full probing of unquantized IVF evaluates all lists with exact native
 scores. Quantized IVF still uses approximate candidate scores: full probing
 with a finite candidate pool does not guarantee global exact TopK.
 
+Large cold HNSW builds can use temporary calibrated SQ8 codes for construction
+navigation and neighbor selection, independently of persistent quantization.
+Compact topology and buffers have governed memory reservations; large construction
+code images use quota-accounted, reclaimable read-only file mappings. Final pages
+are written sequentially. `quantization=none` still persists original
+vectors, and declared quantized indexes retain their requested model and payload.
+Construction navigation is approximate and can affect candidate coverage; visible
+heap values still determine final query distances. Unsupported calibrations and
+insufficient memory retain the ordinary construction path.
+
 Eligible single-table distance ordering can use KNN truncation. JOIN,
 aggregation, DISTINCT and window queries retain their complete relational
 input. Old snapshots, unusable indexes and selective filters may require an

@@ -2,6 +2,7 @@
 //! Heap values retain their datatype and compact payload. ANN backends produce
 //! candidates; the executor rechecks MVCC visibility and native heap values.
 
+pub(crate) mod bulk_hnsw;
 pub(crate) mod codec;
 pub(crate) mod distance;
 pub(crate) mod graph;

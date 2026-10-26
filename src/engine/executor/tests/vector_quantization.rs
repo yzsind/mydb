@@ -573,7 +573,7 @@ fn scalar_hnsw_parallel_paged_image_survives_restart_and_dml() {
     ]);
     for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
         for metric in ["L2", "COSINE", "DOT"] {
-            for quant in ["sq8", "sq4"] {
+            for quant in ["none", "sq8", "sq4"] {
                 let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let sql = format!("SELECT /*+ HNSW_EF(4096) */ id FROM items ORDER BY DISTANCE(v,'[1,2,3,4,5,6,7,8,9]','{metric}'),id LIMIT 11");
                 let expected;

@@ -386,19 +386,68 @@ impl NativeHnsw {
             && self.ef_construction == ef
     }
 
-    fn restore_node(&self, state: &mut State, node: Node) -> Result<(), QueryError> {
+    fn reserve_paged_metadata(&self, state: &mut State, rows: usize) -> Result<(), QueryError> {
+        // Prepay actual container capacities rather than a fixed kilobyte per
+        // row. Hash tables have a <=7/8 load factor; 32 bytes per bucket also
+        // covers control bytes and alignment for these 16-byte key/value pairs.
+        let buckets = rows
+            .checked_mul(8)
+            .and_then(|n| n.div_ceil(7).max(8).checked_next_power_of_two())
+            .ok_or_else(|| codec::vector_err("native metadata capacity overflow"))?;
+        let maps = if self.quantizer().is_none() {
+            3usize
+        } else {
+            2
+        };
+        let bytes = rows
+            .checked_mul(std::mem::size_of::<Node>() + std::mem::size_of::<NavigationGroup>() + 32)
+            .and_then(|n| {
+                buckets
+                    .checked_mul(32 * maps)
+                    .and_then(|h| n.checked_add(h))
+            })
+            .ok_or_else(|| codec::vector_err("native metadata reservation overflow"))?;
+        state.charge.try_grow_recoverable(bytes)?;
+        let allocation_error = |_| {
+            crate::storage::error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "native paged metadata allocation failed",
+            )
+        };
+        state
+            .nodes
+            .try_reserve_exact(rows)
+            .map_err(allocation_error)?;
+        state
+            .groups
+            .try_reserve_exact(rows)
+            .map_err(allocation_error)?;
+        state.rows.try_reserve(rows).map_err(allocation_error)?;
+        state.by_vid.try_reserve(rows).map_err(allocation_error)?;
+        if self.quantizer().is_none() {
+            state
+                .group_heads
+                .try_reserve(rows)
+                .map_err(allocation_error)?;
+        }
+        Ok(())
+    }
+
+    fn restore_node(&self, state: &mut State, node: Node, prepaid: bool) -> Result<(), QueryError> {
         let id = state.nodes.len();
         if node.group > state.groups.len() || node.level > super::hnsw_paged::VEC_MAX_LAYER {
             return Err(super::persistence::corrupt());
         }
-        state.charge.try_grow_recoverable(
-            1024 + node.value.as_ref().map_or(0, |v| v.len())
-                + node
-                    .links
-                    .iter()
-                    .map(|links| links.len() * 8 + 24)
-                    .sum::<usize>(),
-        )?;
+        if !prepaid {
+            state.charge.try_grow_recoverable(
+                1024 + node.value.as_ref().map_or(0, |v| v.len())
+                    + node
+                        .links
+                        .iter()
+                        .map(|links| links.len() * 8 + 24)
+                        .sum::<usize>(),
+            )?;
+        }
         if node.group == state.groups.len() {
             let hash = if self.quantizer().is_none() && node.complete {
                 let value = if let Some(value) = &node.value {
@@ -451,9 +500,19 @@ impl NativeHnsw {
 
     pub(crate) fn load_paged(file: Arc<VectorIndexFile>) -> Result<Self, QueryError> {
         let graph = Self::from_definition(&file.read_native_definition()?, Some(file.clone()))?;
-        let mut headers = Vec::new();
+        let count =
+            usize::try_from(file.node_count()).map_err(|_| super::persistence::corrupt())?;
+        let _headers_charge = ControlledMemoryCharge::try_new_recoverable(
+            ControlledMemoryCategory::StorageScratch,
+            count.saturating_mul(32),
+        )?;
+        let mut headers = Vec::with_capacity(count);
         file.for_each_node(|vid, row, deleted| headers.push((vid, row, deleted)))?;
+        if headers.len() != count {
+            return Err(super::persistence::corrupt());
+        }
         let mut state = graph.state.write();
+        graph.reserve_paged_metadata(&mut state, count)?;
         for (vid, row, deleted) in headers {
             let (level, group, complete) = file.native_node_header(vid)?;
             if !complete && !deleted && file.is_finalized() && file.meta().query_ready {
@@ -474,6 +533,7 @@ impl NativeHnsw {
                     value: None,
                     links: Vec::new(),
                 },
+                true,
             )?;
         }
         let meta = file.meta();
@@ -586,6 +646,7 @@ impl NativeHnsw {
                     value: Some(value),
                     links,
                 },
+                false,
             )?;
         }
         if entry != u64::MAX {
@@ -811,6 +872,40 @@ impl NativeHnsw {
                 file.set_entry(0, state.nodes[entry as usize].vid, level as u32)?;
             }
         }
+        Ok(())
+    }
+    pub(crate) fn import_bulk_layout(
+        &self,
+        topology: &super::bulk_hnsw::BulkHnsw,
+        vids: Vec<u64>,
+    ) -> Result<(), QueryError> {
+        if vids.len() != topology.len() || self.file.is_none() {
+            return Err(super::persistence::corrupt());
+        }
+        let mut state = self.state.write();
+        self.reserve_paged_metadata(&mut state, topology.len())?;
+        for (id, vid) in vids.into_iter().enumerate() {
+            let row = topology.row(id);
+            state.nodes.push(Node {
+                complete: true,
+                exception: false,
+                row,
+                group: id,
+                level: topology.level(id),
+                deleted: false,
+                vid,
+                value: None,
+                links: Vec::new(),
+            });
+            state.groups.push(NavigationGroup {
+                representative: id,
+                members: vec![id],
+                next_collision: None,
+            });
+            state.rows.insert(row, id);
+            state.by_vid.insert(vid, id);
+        }
+        state.entry = topology.entry().map(|(id, _)| id as usize);
         Ok(())
     }
     pub(crate) fn file(&self) -> Option<&Arc<VectorIndexFile>> {

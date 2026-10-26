@@ -658,7 +658,11 @@ fn reclaim_controlled_admission_once(
             let min_buffer = (effective / 50)
                 .clamp(16 * 1024 * 1024, 256 * 1024 * 1024)
                 .min(raw);
-            let desired = operational_memory_limit_bytes().saturating_sub(bytes);
+            let desired = logical_admission_reclaim_target(
+                operational_memory_limit_bytes(),
+                before_buffer,
+                bytes,
+            );
             let physical_reclaim = crate::engine::memory_reclaimer::process_headroom_reclaim_bytes(
                 bytes,
                 operational_memory_limit_bytes(),
@@ -733,6 +737,21 @@ fn decorate_reclaim_error(
     } else {
         error
     }
+}
+
+#[inline]
+fn logical_admission_reclaim_target(limit: usize, used: usize, requested: usize) -> usize {
+    let target = limit.saturating_sub(requested);
+    if used <= target {
+        return target;
+    }
+    // A page prefetch/cleaner can refill the exact reclaimed deficit before
+    // the allocating thread retries. Retain a bounded admission window for
+    // mandatory work, just as physical-pressure reclamation already does.
+    // This returns cache residency; it does not increase either hard ceiling.
+    target.saturating_sub(
+        (limit / 32).clamp(crate::storage::PAGE_SIZE, ADMISSION_RECLAIM_HEADROOM_BYTES),
+    )
 }
 
 #[inline]
@@ -2829,6 +2848,28 @@ mod tests {
             derived_query_mem_limit_bytes(executor_target, DEFAULT_QUERY_MEM_QUOTA_PCT as usize),
             126 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn logical_admission_reclaim_survives_concurrent_page_refill() {
+        let limit = 2usize * 1024 * 1024 * 1024 / 10 * 8;
+        let used = limit - 3065;
+        let requested = 102400;
+        let target = logical_admission_reclaim_target(limit, used, requested);
+        let released =
+            (used - target).div_ceil(crate::storage::PAGE_SIZE) * crate::storage::PAGE_SIZE;
+        // Reproduce the observed 1037: an exact-deficit reclaim lost its
+        // reservation race to just one background 16 KiB page allocation.
+        let exact = limit - requested;
+        let exact_released =
+            (used - exact).div_ceil(crate::storage::PAGE_SIZE) * crate::storage::PAGE_SIZE;
+        assert!(used - exact_released + crate::storage::PAGE_SIZE + requested > limit);
+        assert!(used - released + crate::storage::PAGE_SIZE + requested <= limit);
+        assert_eq!(
+            logical_admission_reclaim_target(limit, 0, requested),
+            limit - requested
+        );
+        assert!(limit - requested - target <= ADMISSION_RECLAIM_HEADROOM_BYTES);
     }
 
     #[test]
