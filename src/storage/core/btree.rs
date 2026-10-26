@@ -7092,7 +7092,9 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                self.prefetch_next_leaves(next);
+                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), token, None, true) {
+                    self.prefetch_fulltext_leaves(next, token, None, true);
+                }
             }
             let start = leaf.entries.partition_point(|entry| entry.key < prefix);
             for entry in &leaf.entries[start..] {
@@ -7147,7 +7149,9 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                self.prefetch_next_leaves(next);
+                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), prefix, prefix_upper, false) {
+                    self.prefetch_fulltext_leaves(next, prefix, prefix_upper, false);
+                }
             }
             // Later leaves are already above the routed lower bound.
             let start = if first_leaf {
@@ -10589,19 +10593,58 @@ impl IndexFile {
     /// and on the next call to this helper (one leaf later) the chain
     /// extends a step deeper, so steady-state we keep
     /// `prefetch_pages` leaves in flight ahead of the cursor.
-    fn prefetch_next_leaves(&self, mut start: u64) {
-        let depth = self.buffer_pool.effective_prefetch_window();
-        if depth == 0 {
-            return;
+    fn prefetch_next_leaves(&self, start: u64) {
+        self.prefetch_leaves_while(start, |_| Ok(true));
+    }
+
+    fn fulltext_prefetch_may_continue(
+        last: Option<&IndexKey>,
+        prefix: &str,
+        upper: Option<&str>,
+        exact: bool,
+    ) -> bool {
+        let Some(KeyPart::String(token)) = last.and_then(|key| key.0.first()) else {
+            // Empty or unfamiliar layouts retain conservative read-ahead.
+            return true;
+        };
+        if exact {
+            token.as_str() <= prefix
+        } else {
+            token.as_str() < prefix
+                || (token.starts_with(prefix) && upper.is_none_or(|upper| token.as_str() < upper))
         }
+    }
+
+    fn prefetch_fulltext_leaves(&self, start: u64, prefix: &str, upper: Option<&str>, exact: bool) {
+        self.prefetch_leaves_while(start, |header| {
+            if header.count == 0 {
+                return Ok(true);
+            }
+            let mut cursor = header.read_slot_offset(header.count - 1);
+            let last = header.decode_key_at(&mut cursor)?;
+            Ok(Self::fulltext_prefetch_may_continue(Some(&last), prefix, upper, exact))
+        });
+    }
+
+    fn prefetch_leaves_while(
+        &self,
+        mut start: u64,
+        mut continues: impl FnMut(&LeafPayloadHeader<'_>) -> Result<bool, QueryError>,
+    ) {
+        let depth = self.buffer_pool.effective_prefetch_window();
         for _ in 0..depth {
-            self.buffer_pool.prefetch_page(self.page_key(start));
-            match self
-                .buffer_pool
-                .with_cached_bytes(&self.page_key(start), |bytes| {
-                    Ok(parse_leaf_payload_header(bytes)?.next_leaf)
-                }) {
+            let key = self.page_key(start);
+            // One resident lookup, with no demand-hit promotion. Queue only a
+            // missing/loading page, then let asynchronous I/O extend the chain.
+            match self.buffer_pool.with_cached_prefetch_bytes(&key, |bytes| {
+                let header = parse_leaf_payload_header(bytes)?;
+                Ok(if continues(&header)? { header.next_leaf } else { None })
+            }) {
                 Ok(Some(Some(next))) => start = next,
+                Ok(None) => {
+                    self.buffer_pool.prefetch_page(key);
+                    return;
+                }
                 _ => return,
             }
         }

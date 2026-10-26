@@ -2324,21 +2324,46 @@ impl BufferPool {
         key: &PageKey,
         f: impl FnOnce(&[u8]) -> Result<T, QueryError>,
     ) -> Result<Option<T>, QueryError> {
+        self.with_cached_bytes_with_intent(key, AccessIntent::Normal, f)
+    }
+
+    /// A speculative leaf-chain probe must not promote unconsumed pages or
+    /// charge a demand hit. Missing/loading pages remain asynchronous hints.
+    fn with_cached_prefetch_bytes<T>(
+        &self,
+        key: &PageKey,
+        f: impl FnOnce(&[u8]) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
+        self.with_cached_bytes_with_intent(key, AccessIntent::Prefetch, f)
+    }
+
+    fn with_cached_bytes_with_intent<T>(
+        &self,
+        key: &PageKey,
+        intent: AccessIntent,
+        f: impl FnOnce(&[u8]) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
         let Some(frame) = self.lookup_frame(key)? else {
             return Ok(None);
         };
-        if !self.try_pin_existing(&frame, AccessIntent::Normal) {
+        if !self.try_pin_existing(&frame, intent) {
             return Ok(None);
         }
+        struct UnpinOnDrop<'a>(&'a BufferPool, &'a Frame);
+        impl Drop for UnpinOnDrop<'_> {
+            fn drop(&mut self) {
+                self.1.unpin();
+                self.0.notify_frame_waiters();
+            }
+        }
+        let _pin = UnpinOnDrop(self, &frame);
         if !frame.is_ready() {
-            frame.unpin();
-            self.notify_frame_waiters();
             return Ok(None);
         }
-        self.note_normal_access(&frame);
+        if intent == AccessIntent::Normal {
+            self.note_normal_access(&frame);
+        }
         let result = self.with_finalized_frame_bytes(&frame, f);
-        frame.unpin();
-        self.notify_frame_waiters();
         result.map(Some)
     }
 
