@@ -166,9 +166,12 @@ type Scored = super::hnsw_core::Scored<VecId>;
 #[derive(Debug)]
 struct QueryNavArena {
     epoch: u64,
+    limit_bytes: usize,
     dim: usize,
     dist_mul: f32,
     vids: Vec<VecId>,
+    rows: Vec<RowId>,
+    deleted: Vec<bool>,
     // First dense ordinal per physical page. Sparse slots are verified and
     // fall back to binary search; the common packed layout resolves in O(1).
     page_starts: Vec<u32>,
@@ -373,6 +376,13 @@ struct QueryNavAllocation {
     row_seed_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryNavStorage {
+    Resident,
+    SpilledEdges,
+    Spilled,
+}
+
 impl QueryNavAllocation {
     /// Cache-local quota and process-wide pressure both permit a spill
     /// transition. A failed optional resident admission must not discard a
@@ -381,10 +391,21 @@ impl QueryNavAllocation {
         &self,
         limit: usize,
         mut reserve: impl FnMut(usize) -> Option<T>,
-    ) -> Option<(bool, T)> {
+    ) -> Option<(QueryNavStorage, T)> {
         if self.peak_bytes <= limit {
             if let Some(charge) = reserve(self.peak_bytes) {
-                return Some((false, charge));
+                return Some((QueryNavStorage::Resident, charge));
+            }
+        }
+        // Distance probes visit many more codes than adjacency lists. Keep
+        // codes resident when the smaller edge mapping can remain reclaimable.
+        let edges_peak = self
+            .peak_bytes
+            .checked_sub(self.edge_capacity.checked_mul(4)?)?
+            .checked_add(64 * 1024)?;
+        if edges_peak < self.peak_bytes && edges_peak <= limit {
+            if let Some(charge) = reserve(edges_peak) {
+                return Some((QueryNavStorage::SpilledEdges, charge));
             }
         }
         let spilled_peak = self
@@ -394,7 +415,7 @@ impl QueryNavAllocation {
             .checked_add(128 * 1024)?;
         // Tiny images gain nothing by adding two spill writer buffers.
         if spilled_peak < self.peak_bytes && spilled_peak <= limit {
-            reserve(spilled_peak).map(|charge| (true, charge))
+            reserve(spilled_peak).map(|charge| (QueryNavStorage::Spilled, charge))
         } else {
             None
         }
@@ -424,6 +445,7 @@ fn query_navigation_allocation(
         .checked_add(QUERY_CACHE_ENTRIES.checked_mul(2 * std::mem::size_of::<usize>())?)?;
     let row_seed_bytes = RowLookup::reserved_bytes(nodes)?;
     let final_bytes = codes_bytes
+        .checked_add(nodes.checked_mul(std::mem::size_of::<RowId>() + 1)?)?
         .checked_add(pages.checked_mul(std::mem::size_of::<u32>())?)?
         .checked_add(nodes.checked_mul(std::mem::size_of::<i32>())?)?
         .checked_add(nodes.checked_mul(std::mem::size_of::<VecId>())?)?
@@ -2013,12 +2035,15 @@ pub(crate) struct PagedHnsw {
 }
 
 impl PagedHnsw {
-    /// Wrap an open vector index file, reading its parameters from the meta
-    /// page.
-    pub(crate) fn without_navigation_quantization(mut self) -> Self {
+    /// Immutable images and physical replicas may read persisted navigation
+    /// codes, but may not rewrite their calibration during query preparation.
+    pub(crate) fn with_persisted_navigation_only(mut self) -> Self {
         self.navigation_quant_enabled = false;
         self
     }
+
+    /// Wrap an open vector index file, reading its parameters from the meta
+    /// page.
     pub(crate) fn new(file: Arc<VectorIndexFile>) -> Self {
         let meta = file.meta();
         let m = (meta.m as usize).max(2);
@@ -2194,14 +2219,15 @@ impl PagedHnsw {
         scratch.qnorm = dot_i8(&scratch.qcodes, &scratch.qcodes);
     }
 
-    fn query_navigation_limit_bytes() -> usize {
+    pub(crate) fn query_navigation_limit_bytes() -> usize {
         std::env::var("MYDB_HNSW_QUERY_CACHE_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .map(|mb| mb.saturating_mul(1024 * 1024))
             .unwrap_or_else(|| {
                 crate::engine::executor::mem_budget::memory_target_bytes()
-                    .saturating_div(4)
+                    .saturating_mul(2)
+                    .saturating_div(3)
                     .min(1024 * 1024 * 1024)
             })
     }
@@ -2240,16 +2266,14 @@ impl PagedHnsw {
         // One temporary offset vector is retained while on-disk NodeIds are
         // translated in place to dense ordinals. It is charged for the build
         // peak and released before publication.
-        let Some((spill_codes, mut charge)) =
-            allocation.try_reserve(Self::query_navigation_limit_bytes(), |bytes| {
-                ControlledMemoryCharge::try_new_optional(
-                    ControlledMemoryCategory::DerivedCache,
-                    bytes,
-                )
-            })
+        let limit_bytes = Self::query_navigation_limit_bytes();
+        let Some((storage, mut charge)) =
+            allocation.try_reserve(limit_bytes, |bytes| file.reserve_navigation_cache(bytes))
         else {
             return Ok(None);
         };
+        let spill_codes = storage == QueryNavStorage::Spilled;
+        let spill_edges = storage != QueryNavStorage::Resident;
         let code_tmp = if spill_codes {
             Some(
                 crate::engine::executor::select::grace::SpillTmpDir::create_kind(
@@ -2271,7 +2295,7 @@ impl PagedHnsw {
             })
             .transpose()?;
 
-        let edge_tmp = if spill_codes {
+        let edge_tmp = if spill_edges {
             Some(
                 crate::engine::executor::select::grace::SpillTmpDir::create_kind(
                     file.spill_data_dir(),
@@ -2294,6 +2318,8 @@ impl PagedHnsw {
         let mut row_seed = RowLookup::new(nodes, charge.split(allocation.row_seed_bytes));
         let mut edge_count = 0usize;
         let mut vids = Vec::with_capacity(nodes);
+        let mut rows = Vec::with_capacity(nodes);
+        let mut deleted = Vec::with_capacity(nodes);
         let mut page_starts = vec![u32::MAX; pages];
         let mut codes = Vec::with_capacity(if spill_codes {
             0
@@ -2302,7 +2328,7 @@ impl PagedHnsw {
         });
         let mut norms = Vec::with_capacity(nodes);
         let mut raw_offsets = Vec::with_capacity(nodes + 1);
-        let mut neighbors = Vec::with_capacity(if spill_codes {
+        let mut neighbors = Vec::with_capacity(if spill_edges {
             0
         } else {
             allocation.edge_capacity
@@ -2327,6 +2353,8 @@ impl PagedHnsw {
                     })?;
                 }
                 vids.push(vid);
+                rows.push(row_id);
+                deleted.push(row_deleted);
                 if !row_deleted {
                     row_seed.rows.push((row_id, vid));
                 }
@@ -2388,7 +2416,7 @@ impl PagedHnsw {
         let mut offsets = Vec::with_capacity(nodes + 1);
         offsets.push(0u32);
         let mut write = 0usize;
-        for ordinal in 0..if spill_codes { 0 } else { nodes } {
+        for ordinal in 0..if spill_edges { 0 } else { nodes } {
             let begin = raw_offsets[ordinal] as usize;
             let end = raw_offsets[ordinal + 1] as usize;
             for read in begin..end {
@@ -2449,9 +2477,12 @@ impl PagedHnsw {
         row_seed.seal();
         Ok(Some(QueryNavArena {
             epoch,
+            limit_bytes,
             dim,
             dist_mul,
             vids,
+            rows,
+            deleted,
             page_starts,
             codes,
             norms,
@@ -2468,6 +2499,13 @@ impl PagedHnsw {
     /// optional cache and leaves the paged implementation as the oracle.
     pub(crate) fn refresh_query_navigation(&self) -> Result<(), QueryError> {
         let _gate = self.navigation_gate.write();
+        if self.query_nav.read().as_ref().is_some_and(|arena| {
+            arena.epoch == self.query_nav_epoch.load(Ordering::Acquire)
+                && arena.vids.len() == self.file.node_count() as usize
+                && arena.limit_bytes == Self::query_navigation_limit_bytes()
+        }) {
+            return Ok(());
+        }
         if self.metric != Metric::Dot
             && (self.navigation_quant_enabled && paged_quant_enabled())
             && (self.file.navigation_quantization().is_none()
@@ -2480,13 +2518,35 @@ impl PagedHnsw {
             self.query_nav.write().take();
             return Ok(());
         }
+        // Searches have drained under navigation_gate. Retire the old image
+        // before reserving its replacement rather than charging two copies.
+        self.query_nav.write().take();
         let epoch = self.query_nav_epoch.load(Ordering::Acquire);
-        let arena = Self::build_query_navigation_for(&self.file, self.m0, epoch)?;
+        let arena = match Self::build_query_navigation_for(&self.file, self.m0, epoch) {
+            Ok(arena) => arena,
+            // Derived acceleration must not make a valid durable index
+            // unusable when optional temporary-file quota is exhausted.
+            Err(err) if err.message().starts_with("out of temp disk space:") => None,
+            Err(err) => return Err(err),
+        };
         let mut published = self.query_nav.write();
         if self.query_nav_epoch.load(Ordering::Acquire) == epoch {
             *published = arena.map(Arc::new);
         }
         Ok(())
+    }
+
+    pub(crate) fn evict_query_navigation(&self) {
+        // Readers retain the Arc and its charge through their last borrow.
+        // Retire ownership now so new readers cannot extend its residency
+        // while admission waits for existing readers to finish.
+        let Some(mut arena) = self.query_nav.try_write() else {
+            return;
+        };
+        if arena.take().is_some() {
+            self.query_nav_rebuild_requested
+                .store(true, Ordering::Release);
+        }
     }
 
     fn start_query_navigation_build(&self) {
@@ -2510,6 +2570,15 @@ impl PagedHnsw {
             crate::engine::executor::mem_budget::with_query_budget(budget, || {
                 let _gate = navigation_gate.read();
                 let _mutation = mutation_gate.write();
+                if query_nav.read().as_ref().is_some_and(|arena| {
+                    arena.epoch == epoch_source.load(Ordering::Acquire)
+                        && arena.vids.len() == file.node_count() as usize
+                        && arena.limit_bytes == Self::query_navigation_limit_bytes()
+                }) {
+                    requested.store(false, Ordering::Release);
+                    building.store(false, Ordering::Release);
+                    return;
+                }
                 if file.prepare_navigation_mapping().unwrap_or(false) {
                     requested.store(false, Ordering::Release);
                     building.store(false, Ordering::Release);
@@ -3901,9 +3970,8 @@ impl PagedHnsw {
         let result = self.insert_with_scratch(txn_id, row_id, vector, &mut scratch);
         drop(_mutation);
         drop(_gate);
-        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
-            self.start_query_navigation_build();
-        }
+        // A write burst must not reconstruct the complete optional image
+        // between row updates. The next search services the rebuild hint.
         result
     }
 
@@ -4404,6 +4472,69 @@ impl PagedHnsw {
         })
     }
 
+    /// Return the complete compact-navigation pool for one authoritative heap
+    /// rerank. Exact vectors need not be fetched twice from separate files.
+    pub(crate) fn search_navigation_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
+        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
+            self.start_query_navigation_build();
+        }
+        let _gate = self.navigation_gate.read();
+        let retired = self.restored_retirements.read();
+        let ef = ef.max(k).min(self.node_count() as usize);
+        if ef == self.node_count() as usize || k == 0 || !retired.0.is_empty() {
+            return Ok(None);
+        }
+        let Some(arena) = self.query_nav.read().clone().filter(|arena| {
+            arena.epoch == self.query_nav_epoch.load(Ordering::Acquire)
+                && arena.vids.len() == self.node_count() as usize
+                && arena.dim == query.len()
+        }) else {
+            return Ok(None);
+        };
+        let mut scratch = Scratch::default();
+        scratch.vec_cache_limit = 1;
+        self.configure_persisted_query(query, &mut scratch);
+        if scratch.qcodes.is_empty() {
+            return Ok(None);
+        }
+        scratch.navigation = Some(Arc::clone(&arena));
+        let Some((mut current, top)) = self.file.entry_with_level() else {
+            return Ok(Some(Vec::new()));
+        };
+        for level in (1..=top as usize).rev() {
+            current = self.greedy_descend(query, current, level, &mut scratch)?;
+        }
+        let Some(entry) = arena.ordinal(current) else {
+            return Ok(None);
+        };
+        let found = Self::search_layer_query_navigation(
+            &arena,
+            &self.file,
+            &scratch.qcodes,
+            scratch.qnorm,
+            entry,
+            ef,
+        )?;
+        Ok(Some(
+            found
+                .into_iter()
+                .filter(|&id| !arena.deleted[id])
+                .take(k)
+                .map(|id| {
+                    (
+                        arena.rows[id],
+                        arena.distance(&scratch.qcodes, scratch.qnorm, id),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
     /// k-NN search. Returns up to `k` `(row_id, exact_distance)` for live
     /// (non-tombstoned) nodes, ascending by distance. MVCC visibility of the
     /// row is the caller's responsibility.
@@ -4413,6 +4544,9 @@ impl PagedHnsw {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
+            self.start_query_navigation_build();
+        }
         let _gate = self.navigation_gate.read();
         let retired = self.restored_retirements.read();
         if k == 0 {
@@ -4992,7 +5126,7 @@ mod build_adj_tests {
 
 #[cfg(test)]
 mod query_nav_allocation_tests {
-    use super::{query_navigation_allocation, QueryNavCache, QUERY_CACHE_MAX_K};
+    use super::{query_navigation_allocation, QueryNavCache, QueryNavStorage, QUERY_CACHE_MAX_K};
     use crate::storage::RowId;
 
     #[test]
@@ -5000,12 +5134,16 @@ mod query_nav_allocation_tests {
         let layout = query_navigation_allocation(1_000_000, 768, 32, 333_334).unwrap();
         assert_eq!(
             layout.final_bytes,
-            912_000_004 + 333_334 * 4 + layout.query_cache_bytes + layout.row_seed_bytes
+            912_000_004
+                + 1_000_000 * (std::mem::size_of::<crate::storage::RowId>() + 1)
+                + 333_334 * 4
+                + layout.query_cache_bytes
+                + layout.row_seed_bytes
         );
         assert_eq!(layout.peak_bytes, layout.final_bytes + 4_000_004);
         assert!(layout.query_cache_bytes < 4 * 1024 * 1024);
         let (spilled, bytes) = layout.try_reserve(500 * 1024 * 1024 / 4, Some).unwrap();
-        assert!(spilled);
+        assert_eq!(spilled, QueryNavStorage::Spilled);
         assert!(
             bytes < 48 * 1024 * 1024,
             "million-row metadata must fit the unchanged 500 MiB target"
@@ -5031,13 +5169,28 @@ mod query_nav_allocation_tests {
             attempts.push(bytes);
             (bytes == spilled).then_some(bytes)
         });
-        assert_eq!(result, Some((true, spilled)));
-        assert_eq!(attempts, vec![layout.peak_bytes, spilled]);
+        assert_eq!(result, Some((QueryNavStorage::Spilled, spilled)));
+        assert_eq!(
+            attempts,
+            vec![
+                layout.peak_bytes,
+                layout.peak_bytes - layout.edge_capacity * 4 + 64 * 1024,
+                spilled
+            ]
+        );
         assert_eq!(
             layout.try_reserve(layout.peak_bytes, Some),
-            Some((false, layout.peak_bytes))
+            Some((QueryNavStorage::Resident, layout.peak_bytes))
         );
-        assert_eq!(layout.try_reserve(spilled, Some), Some((true, spilled)));
+        let edges = layout.peak_bytes - layout.edge_capacity * 4 + 64 * 1024;
+        assert_eq!(
+            layout.try_reserve(edges, Some),
+            Some((QueryNavStorage::SpilledEdges, edges))
+        );
+        assert_eq!(
+            layout.try_reserve(spilled, Some),
+            Some((QueryNavStorage::Spilled, spilled))
+        );
         assert!(layout
             .try_reserve::<usize>(spilled - 1, |_| panic!("over quota"))
             .is_none());
@@ -5136,6 +5289,30 @@ mod query_nav_allocation_tests {
 #[cfg(test)]
 mod source_audit_tests {
     use super::*;
+    #[test]
+    fn pressure_eviction_keeps_reader_memory_charged_until_last_arc() {
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        let graph = PagedHnsw::new(file);
+        for n in 0..16 {
+            graph.insert_ddl(row(n), &[n as f32, 1.0]).unwrap();
+        }
+        graph.refresh_query_navigation().unwrap();
+        let held = graph.query_nav.read().clone().unwrap();
+        let bytes = held._charge.bytes();
+        let before = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        graph.evict_query_navigation();
+        assert!(graph.query_nav.read().is_none());
+        assert_eq!(Arc::strong_count(&held), 1);
+        assert_eq!(
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().0,
+            before
+        );
+        drop(held);
+        assert!(
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().0 <= before - bytes
+        );
+        assert_eq!(graph.search(&[3.0, 1.0], 1, 32).unwrap()[0], (row(3), 0.0));
+    }
     fn row(n: u32) -> RowId {
         RowId {
             page_id: n,
@@ -5165,6 +5342,13 @@ mod source_audit_tests {
         graph.insert_ddl(row(64), &[10000.0, 10000.0]).unwrap();
         graph.next_calibration.store(65, Ordering::Release);
         graph.insert_ddl(row(65), &[20000.0, 20000.0]).unwrap();
+        assert!(!graph.query_nav_building.load(Ordering::Acquire));
+        // Write bursts defer optional reconstruction until a reader needs it.
+        // The first read still sees the complete, authoritative graph.
+        assert_eq!(
+            graph.search(&[20000.0, 20000.0], 1, 100).unwrap()[0],
+            (row(65), 0.0)
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !graph.has_query_navigation_for_test() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));

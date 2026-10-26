@@ -235,7 +235,13 @@ CREATE INDEX pq_search ON embeddings(embedding) USING IVF
 SQ8, SQ4, PQ and BQ support FLOAT32, FLOAT16, BFLOAT16 and INT8 with L2,
 COSINE and DOT. BINARY supports only quantization=none. Quantization changes
 index payloads, not the column datatype, heap values or SQL distance functions.
-There is no implicit SQ8 navigation for quantization=none.
+For paged FLOAT32 HNSW with L2 or COSINE, `quantization=none` preserves
+original index vectors and may use auxiliary SQ8 codes for graph navigation.
+The compact navigation cache keeps the complete rerank pool; final distances
+come from the MVCC-visible heap values. Navigation remains approximate and
+can change ANN candidate coverage. DOT and unrepresentable probes retain
+exact navigation. This auxiliary cache does not change the declared persistent
+quantization model or the stored column values.
 
 - SQ8 and SQ4 use per-dimension affine calibration over the complete build
   snapshot, with 8-bit or packed 4-bit codes. Updates outside the calibrated

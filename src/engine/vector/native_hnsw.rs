@@ -37,11 +37,79 @@ struct Node {
 #[derive(Debug)]
 struct NativeCsr {
     offsets: Vec<usize>,
-    edges: Vec<usize>,
+    edges: Vec<u32>,
+    payloads: Option<Vec<u8>>,
+    payload_stride: usize,
     _charge: ControlledMemoryCharge,
 }
 const NATIVE_MEMO_MAX_CANDIDATES: usize = 1024;
 const NATIVE_MEMO_GATES: usize = 64;
+
+struct NativeSearchScratch {
+    visited: Vec<u64>,
+    todo: BinaryHeap<Reverse<Scored<usize>>>,
+    best: BinaryHeap<Scored<usize>>,
+    charge: ControlledMemoryCharge,
+}
+
+thread_local! {
+    static NATIVE_SEARCH_SCRATCH: std::cell::RefCell<Option<NativeSearchScratch>> = const { std::cell::RefCell::new(None) };
+}
+
+impl NativeSearchScratch {
+    fn new(nodes: usize, ef: usize) -> Result<Self, QueryError> {
+        let words = nodes.div_ceil(64);
+        let bytes = words
+            .saturating_mul(8)
+            .saturating_add(ef.saturating_mul(3 * std::mem::size_of::<Scored<usize>>()));
+        let charge = ControlledMemoryCharge::try_new_recoverable(
+            ControlledMemoryCategory::StorageScratch,
+            bytes,
+        )?;
+        Ok(Self {
+            visited: vec![0; words],
+            todo: BinaryHeap::with_capacity(ef.saturating_mul(2)),
+            best: BinaryHeap::with_capacity(ef),
+            charge,
+        })
+    }
+
+    fn visit(&mut self, id: usize) -> Result<bool, QueryError> {
+        let word = self
+            .visited
+            .get_mut(id / 64)
+            .ok_or_else(super::persistence::corrupt)?;
+        let mask = 1u64 << (id % 64);
+        let fresh = *word & mask == 0;
+        *word |= mask;
+        Ok(fresh)
+    }
+
+    fn push(&mut self, score: Scored<usize>, ef: usize) -> Result<(), QueryError> {
+        if self.todo.len() == self.todo.capacity() {
+            let extra = self.todo.capacity().max(64);
+            self.charge
+                .try_grow_recoverable(extra.saturating_mul(std::mem::size_of::<Scored<usize>>()))?;
+            self.todo
+                .try_reserve_exact(extra)
+                .map_err(|_| codec::vector_err("native HNSW frontier allocation failed"))?;
+        }
+        if self.best.len() < ef && self.best.len() == self.best.capacity() {
+            let extra = ef - self.best.capacity();
+            self.charge
+                .try_grow_recoverable(extra.saturating_mul(std::mem::size_of::<Scored<usize>>()))?;
+            self.best
+                .try_reserve_exact(extra)
+                .map_err(|_| codec::vector_err("native HNSW results allocation failed"))?;
+        }
+        self.todo.push(Reverse(score));
+        if self.best.len() == ef {
+            self.best.pop();
+        }
+        self.best.push(score);
+        Ok(())
+    }
+}
 
 /// Reserve both full entries and one replacement. Capacity follows memory
 /// headroom and vector width, independently of any query corpus or dataset.
@@ -304,6 +372,7 @@ impl NativeHnsw {
             return Err(super::persistence::corrupt());
         }
         state.query_cache = None;
+        state.csr = None;
         let count = state.nodes.len();
         let mut converted_charge = ControlledMemoryCharge::try_new_recoverable(
             ControlledMemoryCategory::StorageScratch,
@@ -976,6 +1045,12 @@ impl NativeHnsw {
         self.prepare_query_cache();
         Ok(())
     }
+    pub(crate) fn evict_query_navigation(&self) {
+        if let Some(mut state) = self.state.try_write() {
+            state.csr = None;
+            state.query_cache = None;
+        }
+    }
     fn prepare_query_cache(&self) {
         if self.state.read().query_cache.is_some() {
             return;
@@ -1011,26 +1086,59 @@ impl NativeHnsw {
             return Ok(());
         }
         let mut state = self.state.write();
-        if state.csr.is_some() || state.nodes.is_empty() {
+        if state.csr.is_some() || state.nodes.is_empty() || state.nodes.len() > u32::MAX as usize {
             return Ok(());
         }
         let bytes = state
             .nodes
             .len()
-            .saturating_mul((self.m * 2 + 1) * std::mem::size_of::<usize>())
+            .saturating_mul(
+                self.m
+                    .saturating_mul(2)
+                    .saturating_mul(std::mem::size_of::<u32>())
+                    .saturating_add(std::mem::size_of::<usize>()),
+            )
             .saturating_add(8);
-        let limit = std::env::var("MYDB_HNSW_QUERY_CACHE_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or_else(|| crate::engine::executor::mem_budget::memory_target_bytes() / 4);
-        if bytes > limit {
-            return Ok(());
+        let limit = super::hnsw_paged::PagedHnsw::query_navigation_limit_bytes();
+        let stride = self.quantizer().map_or(0, |quant| quant.record_len());
+        let payload_bytes = state.nodes.len().saturating_mul(stride);
+        let combined = bytes.saturating_add(payload_bytes);
+        let reserve = |bytes| {
+            self.file.as_ref().map_or_else(
+                || {
+                    ControlledMemoryCharge::try_new_optional(
+                        ControlledMemoryCategory::DerivedCache,
+                        bytes,
+                    )
+                },
+                |file| file.reserve_navigation_cache(bytes),
+            )
+        };
+        let resident = (stride != 0 && combined <= limit)
+            .then(|| reserve(combined))
+            .flatten();
+        if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
+            eprintln!("[hnsw] query navigator: nodes={} stride={stride} bytes={combined} limit={limit} payloads={}", state.nodes.len(), resident.is_some());
         }
-        let Some(mut charge) =
-            ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, bytes)
-        else {
+        let (mut charge, reserve_payloads) = if let Some(charge) = resident {
+            (charge, true)
+        } else if bytes <= limit {
+            let Some(charge) = reserve(bytes) else {
+                return Ok(());
+            };
+            (charge, false)
+        } else {
             return Ok(());
+        };
+        let reserved = if reserve_payloads { combined } else { bytes };
+        let mut payloads = if reserve_payloads {
+            let mut payloads = Vec::new();
+            payloads
+                .try_reserve_exact(payload_bytes)
+                .map_err(|_| codec::vector_err("native HNSW payload cache allocation failed"))?;
+            Some(payloads)
+        } else {
+            None
         };
         let mut offsets = Vec::new();
         let mut edges = Vec::new();
@@ -1052,15 +1160,39 @@ impl NativeHnsw {
             })?;
         offsets.push(0);
         for id in 0..state.nodes.len() {
-            edges.extend(self.links(&state, id, 0)?);
+            crate::engine::cancel::check_cancelled()?;
+            for edge in self.links(&state, id, 0)? {
+                edges.push(u32::try_from(edge).map_err(|_| super::persistence::corrupt())?);
+            }
             offsets.push(edges.len());
+            if let Some(payloads) = &mut payloads {
+                let node = &state.nodes[id];
+                let mut append = |bytes: &[u8]| {
+                    if bytes.len() != stride {
+                        return Err(super::persistence::corrupt());
+                    }
+                    payloads.extend_from_slice(bytes);
+                    Ok(())
+                };
+                if let Some(value) = &node.value {
+                    append(&value.payload)?;
+                } else {
+                    self.file
+                        .as_ref()
+                        .ok_or_else(super::persistence::corrupt)?
+                        .with_native_vector(node.vid, |value| append(value.payload))?;
+                }
+            }
         }
-        let actual =
-            offsets.capacity().saturating_add(edges.capacity()) * std::mem::size_of::<usize>();
-        charge.shrink(bytes.saturating_sub(actual));
+        let actual = (offsets.capacity() * std::mem::size_of::<usize>()
+            + edges.capacity() * std::mem::size_of::<u32>())
+        .saturating_add(payloads.as_ref().map_or(0, Vec::capacity));
+        charge.shrink(reserved.saturating_sub(actual));
         state.csr = Some(NativeCsr {
             offsets,
             edges,
+            payloads,
+            payload_stride: stride,
             _charge: charge,
         });
         Ok(())
@@ -1074,6 +1206,17 @@ impl NativeHnsw {
     ) -> Result<f64, QueryError> {
         if let Some(quant) = self.quantizer() {
             let node = &state.nodes[id];
+            if let Some(csr) = &state.csr {
+                if let Some(payloads) = &csr.payloads {
+                    let begin = id * csr.payload_stride;
+                    return quant.score_payload(
+                        &payloads[begin..begin + csr.payload_stride],
+                        self.file.as_ref(),
+                        query,
+                        query_code,
+                    );
+                }
+            }
             if let Some(value) = &node.value {
                 return quant.score_payload(&value.payload, self.file.as_ref(), query, query_code);
             }
@@ -1167,7 +1310,10 @@ impl NativeHnsw {
         }
         if level == 0 {
             if let Some(csr) = &state.csr {
-                return Ok(csr.edges[csr.offsets[id]..csr.offsets[id + 1]].to_vec());
+                return Ok(csr.edges[csr.offsets[id]..csr.offsets[id + 1]]
+                    .iter()
+                    .map(|&id| id as usize)
+                    .collect());
             }
         }
 
@@ -1213,15 +1359,21 @@ impl NativeHnsw {
         let mut best = self.navigation_score(state, entry, query, query_code)?;
         loop {
             let mut improved = false;
-            let owned;
-            let neighbors = if level == 0 && state.csr.is_some() {
-                let csr = state.csr.as_ref().unwrap();
-                &csr.edges[csr.offsets[entry]..csr.offsets[entry + 1]]
+            let compact = state
+                .csr
+                .as_ref()
+                .filter(|_| level == 0)
+                .map(|csr| &csr.edges[csr.offsets[entry]..csr.offsets[entry + 1]]);
+            let owned = if compact.is_none() {
+                self.links(state, entry, level)?
             } else {
-                owned = self.links(state, entry, level)?;
-                &owned[..]
+                Vec::new()
             };
-            for &next in neighbors {
+            for next in compact
+                .into_iter()
+                .flat_map(|edges| edges.iter().map(|&id| id as usize))
+                .chain(owned)
+            {
                 let d = self.navigation_score(state, next, query, query_code)?;
                 if d < best {
                     best = d;
@@ -1257,99 +1409,87 @@ impl NativeHnsw {
         mut score_node: impl FnMut(usize) -> Result<f64, QueryError>,
     ) -> Result<Vec<Scored<usize>>, QueryError> {
         let ef = ef.max(1).min(state.nodes.len());
-        let mut todo = BinaryHeap::new();
-        let mut best = BinaryHeap::new();
-        let mut seen =
-            hashbrown::HashSet::<usize, ahash::RandomState>::with_hasher(ahash::RandomState::new());
-        let mut admitted = ef;
-        let mut extra = ControlledMemoryCharge::try_new_recoverable(
-            ControlledMemoryCategory::StorageScratch,
-            0,
-        )?;
-        seen.try_reserve(ef).map_err(|_| {
-            crate::storage::error(
-                crate::error::catalog::ER_OUTOFMEMORY,
-                "native HNSW visited allocation failed",
-            )
-        })?;
-        best.try_reserve(ef).map_err(|_| {
-            crate::storage::error(
-                crate::error::catalog::ER_OUTOFMEMORY,
-                "native HNSW result allocation failed",
-            )
-        })?;
-        todo.try_reserve(ef).map_err(|_| {
-            crate::storage::error(
-                crate::error::catalog::ER_OUTOFMEMORY,
-                "native HNSW frontier allocation failed",
-            )
-        })?;
-        for &id in entries {
-            if seen.insert(id) {
-                let score = Scored {
-                    dist: score_node(id)?,
-                    id,
-                };
-                todo.push(Reverse(score));
-                best.push(score);
-            }
+        if ef == 0 {
+            return Ok(Vec::new());
         }
-        while let Some(Reverse(current)) = todo.pop() {
-            if best.len() >= ef
-                && best
-                    .peek()
-                    .is_some_and(|worst: &Scored<usize>| current.dist > worst.dist)
+        NATIVE_SEARCH_SCRATCH.with(|pool| {
+            let mut cached = pool.borrow_mut();
+            let mut scratch = match cached
+                .take()
+                .filter(|s| s.visited.len() >= state.nodes.len().div_ceil(64))
             {
-                break;
-            }
-            let owned;
-            let neighbors = if level == 0 && state.csr.is_some() {
-                let csr = state.csr.as_ref().unwrap();
-                &csr.edges[csr.offsets[current.id]..csr.offsets[current.id + 1]]
-            } else {
-                owned = self.links(state, current.id, level)?;
-                &owned[..]
+                Some(mut scratch) => {
+                    scratch.visited.fill(0);
+                    scratch.todo.clear();
+                    scratch.best.clear();
+                    scratch
+                }
+                None => NativeSearchScratch::new(state.nodes.len(), ef)?,
             };
-            for &id in neighbors {
-                if seen.contains(&id) {
-                    continue;
-                }
-                if seen.len() >= admitted {
-                    let next = admitted.saturating_mul(2).max(64).min(state.nodes.len());
-                    extra
-                        .try_grow_recoverable(next.saturating_sub(admitted).saturating_mul(128))?;
-                    admitted = next;
-                }
-                seen.try_reserve(1).map_err(|_| {
-                    crate::storage::error(
-                        crate::error::catalog::ER_OUTOFMEMORY,
-                        "native HNSW visited growth failed",
-                    )
-                })?;
-                todo.try_reserve(1).map_err(|_| {
-                    crate::storage::error(
-                        crate::error::catalog::ER_OUTOFMEMORY,
-                        "native HNSW frontier growth failed",
-                    )
-                })?;
-                seen.insert(id);
-                let score = Scored {
-                    dist: score_node(id)?,
-                    id,
-                };
-                if best.len() < ef || best.peek().is_some_and(|worst| score < *worst) {
-                    todo.push(Reverse(score));
-                    best.push(score);
-                    if best.len() > ef {
-                        best.pop();
+            for &id in entries {
+                if scratch.visit(id)? {
+                    let score = Scored {
+                        dist: score_node(id)?,
+                        id,
+                    };
+                    if scratch.best.len() < ef
+                        || scratch.best.peek().is_some_and(|worst| score < *worst)
+                    {
+                        scratch.push(score, ef)?;
                     }
                 }
             }
-            if seen.len() & 1023 == 0 {
-                crate::engine::cancel::check_cancelled()?;
+            let mut steps = 0usize;
+            while let Some(Reverse(current)) = scratch.todo.pop() {
+                if scratch.best.len() >= ef
+                    && scratch
+                        .best
+                        .peek()
+                        .is_some_and(|worst: &Scored<usize>| current.dist > worst.dist)
+                {
+                    break;
+                }
+                let compact =
+                    state.csr.as_ref().filter(|_| level == 0).map(|csr| {
+                        &csr.edges[csr.offsets[current.id]..csr.offsets[current.id + 1]]
+                    });
+                let owned = if compact.is_none() {
+                    self.links(state, current.id, level)?
+                } else {
+                    Vec::new()
+                };
+                for id in compact
+                    .into_iter()
+                    .flat_map(|edges| edges.iter().map(|&id| id as usize))
+                    .chain(owned)
+                {
+                    if !scratch.visit(id)? {
+                        continue;
+                    }
+                    let score = Scored {
+                        dist: score_node(id)?,
+                        id,
+                    };
+                    if scratch.best.len() < ef
+                        || scratch.best.peek().is_some_and(|worst| score < *worst)
+                    {
+                        scratch.push(score, ef)?;
+                    }
+                }
+                steps += 1;
+                if steps & 63 == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
             }
-        }
-        Ok(best.into_sorted_vec())
+            let mut found: Vec<_> = scratch.best.drain().collect();
+            found.sort_unstable();
+            let limit = (crate::engine::executor::mem_budget::memory_target_bytes() / 16)
+                .min(64 * 1024 * 1024);
+            if scratch.charge.bytes() <= limit {
+                *cached = Some(scratch);
+            }
+            Ok(found)
+        })
     }
     fn select(
         &self,
@@ -1801,7 +1941,7 @@ impl NativeHnsw {
         // guard, avoiding a contended shared-lock operation for every score.
         // Upper-layer traversal stays outside this guard, so it never takes
         // a recursive mapping read while a writer is waiting.
-        let mapped = if state.csr.is_some() {
+        let mapped = if state.csr.as_ref().is_some_and(|csr| csr.payloads.is_none()) {
             if let (Some(file), Some(quant)) = (&self.file, self.quantizer()) {
                 file.with_navigation_mapping(|view| {
                     self.layer_scored(&state, &[entry], ef, 0, |id| {
@@ -1853,6 +1993,115 @@ impl NativeHnsw {
 #[cfg(test)]
 mod duplicate_regressions {
     use super::*;
+
+    #[test]
+    fn resident_payload_navigation_matches_row_scoring_and_invalidates_on_insert() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for config in [
+                crate::storage::vector_config::QuantizationConfig::Sq4,
+                crate::storage::vector_config::QuantizationConfig::Sq8,
+            ] {
+                let rows: Vec<_> = (0..64)
+                    .map(|row| {
+                        codec::parse_text(&format!(
+                            "[{},1,{},-3,2,{},5]",
+                            row + 1,
+                            row % 7,
+                            row % 13
+                        ))
+                        .unwrap()
+                    })
+                    .collect();
+                let mut trainer = super::super::quantization::Trainer::new(
+                    config,
+                    VectorDataType::Float32,
+                    7,
+                    metric,
+                )
+                .unwrap();
+                for row in &rows {
+                    trainer.observe(row).unwrap();
+                }
+                let mut graph =
+                    NativeHnsw::new(VectorDataType::Float32, 7, metric, 4, 32, None).unwrap();
+                graph.set_quantizer(true, trainer.finish().unwrap(), 1);
+                for (id, row) in rows.iter().enumerate() {
+                    graph
+                        .insert(
+                            RowId {
+                                page_id: id as u32,
+                                slot_id: 0,
+                            },
+                            row.clone(),
+                        )
+                        .unwrap();
+                }
+                let request = VectorSearchRequest {
+                    candidate_limit: 10,
+                    rerank_limit: 32,
+                    effort: super::super::VectorSearchEffort::Hnsw { ef: 32 },
+                };
+                let expected: Vec<_> = rows[..8]
+                    .iter()
+                    .map(|row| graph.search(row, request).unwrap().candidates)
+                    .collect();
+                graph.prepare_csr().unwrap();
+                assert!(graph.state.read().csr.as_ref().unwrap().payloads.is_some());
+                graph.state.write().query_cache = None;
+                for (row, want) in rows[..8].iter().zip(&expected) {
+                    assert_eq!(graph.search(row, request).unwrap().candidates, *want);
+                }
+                let deleted = expected[0][0].0;
+                graph.delete(deleted).unwrap();
+                assert!(!graph
+                    .search(&rows[0], request)
+                    .unwrap()
+                    .candidates
+                    .iter()
+                    .any(|(row, _)| *row == deleted));
+                graph
+                    .insert(
+                        RowId {
+                            page_id: 128,
+                            slot_id: 0,
+                        },
+                        rows[0].clone(),
+                    )
+                    .unwrap();
+                assert!(graph.state.read().csr.is_none());
+                assert!(graph.search(&rows[0], request).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn native_search_scratch_accounts_bitmap_and_heap_growth() {
+        let mut scratch = NativeSearchScratch::new(1_000_000, 1).unwrap();
+        for id in [0, 63, 64, 999_999] {
+            assert!(scratch.visit(id).unwrap());
+            assert!(!scratch.visit(id).unwrap());
+        }
+        assert!(scratch.visit(1_000_000).is_err());
+        for id in 0..256 {
+            scratch
+                .push(
+                    Scored {
+                        id,
+                        dist: -(id as f64),
+                    },
+                    16,
+                )
+                .unwrap();
+        }
+        assert_eq!(scratch.best.len(), 16);
+        assert!(
+            scratch.charge.bytes()
+                >= scratch.visited.capacity() * 8
+                    + (scratch.todo.capacity() + scratch.best.capacity())
+                        * std::mem::size_of::<Scored<usize>>()
+        );
+        assert!(scratch.charge.bytes() < 256 * 1024);
+    }
     #[test]
     fn native_memo_capacity_stays_within_its_memory_slice() {
         for dimension in [1, 7, 768, 16383, 65532] {

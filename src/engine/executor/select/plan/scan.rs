@@ -5672,6 +5672,10 @@ pub(super) fn execute_vector_index_scan(
     // the existing candidate-limit widening loop below.
     if !is_ivf
         && !quantized
+        // Compact FLOAT32 navigation defers its entire exact rerank pool to
+        // the heap. Other exact backends still need only k returned rows.
+        && !(query_vector.datatype == crate::vector::VectorDataType::Float32
+            && metric != vector::Metric::Dot)
         && order_by.len() == 1
         && filter.is_none()
         && !matches!(iterative_scan, IterativeScan::Off)
@@ -5687,8 +5691,7 @@ pub(super) fn execute_vector_index_scan(
     // Score the complete ANN pool in place, then decode output columns only
     // for winners. Filter/secondary-order/relaxed-order paths retain their
     // existing row oracle, as do transaction-local vector changes.
-    let mut late_materialize = quantized
-        && filter.is_none()
+    let mut late_materialize = filter.is_none()
         && order_by.len() == 1
         && !matches!(iterative_scan, IterativeScan::RelaxedOrder)
         && storage_ids.iter().all(|sid| {
@@ -5696,6 +5699,41 @@ pub(super) fn execute_vector_index_scan(
                 .is_empty()
         });
     let mut late_scores: Vec<(f64, u64, RowId, usize)> = Vec::new();
+    // Retain bounded fixed-width projections during scoring to avoid a
+    // second random read. This also covers vectors needed by internal order
+    // expressions; genuinely wide and LOB projections remain late.
+    let projection_bytes = output_columns.iter().try_fold(0usize, |bytes, &column| {
+        let width = match table.schema.columns[column].data_type {
+            DataTypeKind::Vector {
+                datatype,
+                dim: Some(dim),
+            } => datatype.payload_len(dim).saturating_add(64),
+            DataTypeKind::TinyInt
+            | DataTypeKind::SmallInt
+            | DataTypeKind::MediumInt
+            | DataTypeKind::Int
+            | DataTypeKind::BigInt
+            | DataTypeKind::Bool
+            | DataTypeKind::Float { .. }
+            | DataTypeKind::Double { .. }
+            | DataTypeKind::Decimal { .. }
+            | DataTypeKind::Date
+            | DataTypeKind::Time { .. }
+            | DataTypeKind::DateTime { .. }
+            | DataTypeKind::Timestamp { .. }
+            | DataTypeKind::Year => 256,
+            _ => return None,
+        };
+        bytes.checked_add(width)
+    });
+    let cache_projection =
+        output_columns.len() <= 8 && projection_bytes.is_some_and(|bytes| bytes <= 4096);
+    let cached_projection_bytes = if cache_projection {
+        projection_bytes.unwrap()
+    } else {
+        0
+    };
+    let mut late_values = crate::util::fast_hash::AhHashMap::default();
 
     // Candidates already heap-read and filtered, keyed by partition-qualified
     // row identity. Widening re-runs the graph search with a larger pool but
@@ -5772,7 +5810,11 @@ pub(super) fn execute_vector_index_scan(
         }
         if late_materialize {
             let mut scoring_charge = retained_charge.sibling();
-            scoring_charge.add_non_spillable(candidates.len().saturating_mul(128))?;
+            scoring_charge.add_non_spillable(
+                candidates
+                    .len()
+                    .saturating_mul(128 + cached_projection_bytes),
+            )?;
             let mut pending = crate::util::fast_hash::AhHashMap::default();
             for &(sid, row, _) in &candidates {
                 if seen.contains(&(sid, row)) {
@@ -5806,7 +5848,7 @@ pub(super) fn execute_vector_index_scan(
                     continue;
                 }
                 let heap = db.cached_heap_handle(sid)?;
-                for (row, distance) in db.score_vector_rows_many_with_handle(
+                for (row, distance, values) in db.score_vector_rows_many_with_handle(
                     &heap,
                     &table.schema,
                     &ids,
@@ -5814,9 +5856,17 @@ pub(super) fn execute_vector_index_scan(
                     col_idx,
                     query_vector,
                     metric,
+                    cache_projection.then_some(output_columns.as_slice()),
                 )? {
                     if let Some(&rank) = pending.get(&(sid, row)) {
                         late_scores.push((distance, sid, row, rank));
+                        if cache_projection {
+                            retained_charge.add_non_spillable(
+                                crate::engine::executor::mem_budget::estimate_row_bytes(&values)
+                                    .saturating_add(128),
+                            )?;
+                            late_values.insert((sid, row), values);
+                        }
                     }
                 }
             }
@@ -6019,6 +6069,7 @@ pub(super) fn execute_vector_index_scan(
     if exact_fallback || db.vector_snapshot_requires_exact(txn) {
         drop(scored);
         drop(late_scores);
+        drop(late_values);
         retained_charge.release_bytes(retained_charge.charged());
         if order_by.len() > 1 {
             return execute_ordered_vector_fallback(
@@ -6043,8 +6094,8 @@ pub(super) fn execute_vector_index_scan(
     if late_materialize {
         late_scores.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.3.cmp(&b.3)));
         late_scores.truncate(k);
-        let mut values_by_row = crate::util::fast_hash::AhHashMap::default();
-        for &sid in &storage_ids {
+        let mut values_by_row = late_values;
+        for &sid in storage_ids.iter().filter(|_| !cache_projection) {
             let ids: Vec<_> = late_scores
                 .iter()
                 .filter_map(|&(_, part, row, _)| (part == sid).then_some(row))

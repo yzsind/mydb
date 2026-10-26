@@ -300,6 +300,9 @@ impl Database {
                 let heap_read = heap.read();
                 let mut out_local = Vec::with_capacity(fallback.len());
                 heap_read.with_lob(|| -> Result<(), QueryError> {
+                    if heap_read.try_read_mvcc_columns_sparse_probe(
+                        &fallback, columns, decode_plan, &mut out_local,
+                    )? { return Ok(()); }
                     if heap_read.try_read_mvcc_columns_dense_probe(
                         &fallback,
                         columns,
@@ -592,7 +595,8 @@ impl Database {
         column: usize,
         query: &crate::vector::VectorValue,
         metric: crate::engine::vector::Metric,
-    ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        projection: Option<&[usize]>,
+    ) -> Result<Vec<(RowId, f64, Vec<Value>)>, QueryError> {
         self.check_primary_read_view(table, txn)?;
         let DataTypeKind::Vector {
             datatype,
@@ -607,7 +611,7 @@ impl Database {
             crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
                 crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
                 row_ids.len().saturating_mul(
-                    std::mem::size_of::<RowId>() + std::mem::size_of::<(RowId, f64)>(),
+                    std::mem::size_of::<RowId>() + std::mem::size_of::<(RowId, f64, Vec<Value>)>(),
                 ),
             )?;
         let mut ordered = row_ids.to_vec();
@@ -615,13 +619,36 @@ impl Database {
         ordered.dedup();
         let mut out = Vec::with_capacity(ordered.len());
         let mut vis_cache = ScanVisibilityCache::new();
+        let mut fallback_columns = vec![column];
+        if let Some(columns) = projection {
+            for &col in columns {
+                if !fallback_columns.contains(&col) {
+                    fallback_columns.push(col);
+                }
+            }
+        }
+        let output_plan = projection.map(|columns| ProjectedReadPlan::new(columns, table));
+        let projection_bytes = projection.map_or(0, |columns| {
+            columns
+                .iter()
+                .map(|&column| match table.columns[column].data_type {
+                    DataTypeKind::Vector {
+                        datatype,
+                        dim: Some(dim),
+                    } => datatype.payload_len(dim).saturating_add(64),
+                    _ => 256,
+                })
+                .fold(0usize, usize::saturating_add)
+        });
+        let score_columns = [column];
+        let visit_columns = projection.unwrap_or(&score_columns);
         for window in ordered.chunks(64) {
             crate::engine::cancel::check_cancelled()?;
             let base = out.len();
             let complete = {
                 let heap_read = heap.read();
                 heap_read.with_lob(|| {
-                    heap_read.visit_mvcc_payloads_many_cached_with_plan(window, &[column], |row| {
+                    heap_read.visit_mvcc_payloads_many_cached_with_plan(window, visit_columns, |row| {
                         if row.layout_id != table.active_layout_id
                             || !self.row_version_visible_cached(&mut vis_cache, row.header, txn)?
                         {
@@ -654,7 +681,16 @@ impl Database {
                         let score = crate::engine::vector::distance::typed_ordering_distance(
                             query, &value, metric,
                         )?;
-                        out.push((row.row_id, score));
+                        let mut values = Vec::new();
+                        if let Some(columns) = projection {
+                            let count = crate::storage::decode_row_schema_columns_into_with_plan_ext_for_layout(
+                                body, row.codec, row.layout_id, row.plan, &mut values, row.has_external,
+                            )?;
+                            if let Some(plan) = &output_plan {
+                                if plan.needs_adjustment(&values, count) { plan.apply(&mut values, columns, count, table); }
+                            }
+                        }
+                        out.push((row.row_id, score, values));
                         Ok(true)
                     })
                 })?
@@ -667,12 +703,15 @@ impl Database {
             let _fallback_scratch =
                 crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
                     crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
-                    window
-                        .len()
-                        .saturating_mul(datatype.payload_len(dimension).saturating_add(128)),
+                    window.len().saturating_mul(
+                        datatype
+                            .payload_len(dimension)
+                            .saturating_add(128)
+                            .saturating_add(projection_bytes),
+                    ),
                 )?;
             for (row, values) in
-                self.read_row_columns_many_with_handle(heap, table, window, txn, &[column])?
+                self.read_row_columns_many_with_handle(heap, table, window, txn, &fallback_columns)?
             {
                 if let Some(Value::Vector(value)) = values.first().filter(
                     |v| matches!(v, Value::Vector(value) if value.dimension == query.dimension),
@@ -682,6 +721,18 @@ impl Database {
                         crate::engine::vector::distance::typed_ordering_distance(
                             query, value, metric,
                         )?,
+                        projection.map_or_else(Vec::new, |columns| {
+                            columns
+                                .iter()
+                                .map(|col| {
+                                    values[fallback_columns
+                                        .iter()
+                                        .position(|idx| idx == col)
+                                        .unwrap()]
+                                    .clone()
+                                })
+                                .collect()
+                        }),
                     ));
                 }
             }

@@ -1000,6 +1000,23 @@ struct VectorMetaState {
 }
 
 impl VectorIndexFile {
+    pub(crate) fn reserve_navigation_cache(
+        &self,
+        bytes: usize,
+    ) -> Option<crate::engine::executor::mem_budget::ControlledMemoryCharge> {
+        use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+        ControlledMemoryCharge::try_new_optional_with_cache_reclaim(
+            ControlledMemoryCategory::DerivedCache,
+            bytes,
+            |target| {
+                if let Some(database) = crate::engine::executor::mem_budget::current_reclaim_database() {
+                    database.reclaim_vector_navigation_caches();
+                }
+                let _ = self.buffer_pool.reclaim_for_memory_target(target, Duration::from_millis(100));
+            },
+        )
+    }
+
     /// Flush every dirty frame belonging to this vector file. Atomic rebuild
     /// uses this before publishing the temporary file with `rename(2)`.
     pub(crate) fn flush(&self) -> Result<(), QueryError> {
@@ -3833,6 +3850,46 @@ mod vector_page_tests {
                 .count(),
             0
         );
+        struct RestoreQuota(u64);
+        impl Drop for RestoreQuota {
+            fn drop(&mut self) {
+                crate::engine::executor::spill_quota::set_global_limit_bytes(self.0);
+            }
+        }
+        let _quota = RestoreQuota(crate::engine::executor::spill_quota::global_limit_bytes());
+        crate::engine::executor::spill_quota::set_global_limit_bytes(1);
+        graph.refresh_query_navigation().unwrap();
+        assert!(!graph.has_query_navigation_for_test());
+        assert_eq!(graph.search(&vectors[0], 10, 64).unwrap(), expected[0]);
+        assert_eq!(std::fs::read_dir(crate::storage::naming::system_tmp_dir(dir.path())).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn compact_navigation_pool_matches_exact_rerank_and_tracks_deleted_rows() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let vectors = gen_clustered(128, 24, 12, 0xA12CE);
+        let (graph, vids) = build_paged(dir.path(), "candidate-pool", 24, 0, &vectors);
+        graph.file().disable_navigation_mapping();
+        graph.refresh_query_navigation().unwrap();
+        for query in &vectors[..8] {
+            let candidates = graph.search_navigation_candidates(query, 64, 64).unwrap().unwrap();
+            let mut exact = Vec::new();
+            for (row, _) in candidates {
+                let vid = vids[row.page_id as usize];
+                let (_, deleted, distance) = graph.file().read_vector_meta_distance(vid, query, crate::engine::vector::Metric::L2).unwrap().unwrap();
+                assert!(!deleted);
+                exact.push((row, distance));
+            }
+            exact.sort_unstable_by(|a,b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            exact.truncate(10);
+            assert_eq!(exact, graph.search(query, 10, 64).unwrap());
+        }
+        let deleted = RowId { page_id: 0, slot_id: 0 };
+        graph.mark_deleted_by_row_id(deleted).unwrap();
+        graph.refresh_query_navigation().unwrap();
+        assert!(!graph.search_navigation_candidates(&vectors[0], 64, 64).unwrap().unwrap().iter().any(|(row,_)| *row == deleted));
+        assert!(graph.search_navigation_candidates(&vectors[0], 128, 128).unwrap().is_none());
+        assert!(graph.search_navigation_candidates(&vec![1e20; 24], 64, 64).unwrap().is_none());
     }
 
     #[test]

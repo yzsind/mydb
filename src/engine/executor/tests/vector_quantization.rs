@@ -573,7 +573,7 @@ fn scalar_hnsw_parallel_paged_image_survives_restart_and_dml() {
     ]);
     for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
         for metric in ["L2", "COSINE", "DOT"] {
-            for quant in ["none", "sq8", "sq4"] {
+            for quant in ["none", "sq8", "sq4", "pq"] {
                 let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let sql = format!("SELECT /*+ HNSW_EF(4096) */ id FROM items ORDER BY DISTANCE(v,'[1,2,3,4,5,6,7,8,9]','{metric}'),id LIMIT 11");
                 let expected;
@@ -597,7 +597,15 @@ fn scalar_hnsw_parallel_paged_image_survives_restart_and_dml() {
                             .execute(&format!("INSERT INTO items VALUES{rows}"))
                             .unwrap();
                     }
-                    engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric={metric},m=4,ef_construction=32,quantization={quant})")).unwrap();
+                    let pq_options = if quant == "pq" {
+                        engine
+                            .execute("INSERT INTO items VALUES (3000,'[1,2,3,4,5,6,7,8,9]')")
+                            .unwrap();
+                        ",pq_bits=4,pq_train_samples=32,pq_iterations=3,rerank_mult=256"
+                    } else {
+                        ""
+                    };
+                    engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric={metric},m=4,ef_construction=32,quantization={quant}{pq_options})")).unwrap();
                     expected =
                         query_rows(&engine, &sql.replace("HNSW_EF(4096)", "NO_VECTOR_INDEX"));
                     assert_eq!(
@@ -711,6 +719,63 @@ fn quantized_late_materialization_matches_oracle_across_native_types_and_layouts
             query_rows(&engine, sql),
             query_rows(&engine, &sql.replace("HNSW_EF(128)", "NO_VECTOR_INDEX")),
             "old layout {datatype}"
+        );
+    }
+}
+
+#[test]
+fn narrow_rerank_projection_preserves_scalars_nulls_and_transaction_values() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_MAPPED_NAVIGATION", "0"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for quantization in ["none", "sq4"] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine.execute("CREATE TABLE projected(id INT PRIMARY KEY,v VECTOR(3) NOT NULL,n DECIMAL(18,6),flag BOOLEAN,d DATE,ts DATETIME,pad TEXT)").unwrap();
+        let rows = (0..128)
+            .map(|id| {
+                format!(
+                    "({id},'[{id},1,2]',{},1,'2026-10-26','2026-10-26 12:34:56','wide')",
+                    if id % 7 == 0 { "NULL" } else { "12.345678" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO projected VALUES{rows}"))
+            .unwrap();
+        engine.execute(&format!("CREATE INDEX vx ON projected(v) USING HNSW WITH(metric=L2,quantization={quantization},m=4,ef_construction=64)")).unwrap();
+        for projection in ["id,n,flag,d,ts", "id,id,n", "id,v", "id,v,pad"] {
+            let sql = format!("SELECT /*+ HNSW_EF(32) */ {projection} FROM projected ORDER BY L2_DISTANCE(v,'[17.123,1,2]') LIMIT 7");
+            assert_eq!(
+                query_rows(&engine, &sql),
+                query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX")),
+                "{quantization} {projection}"
+            );
+        }
+        engine
+            .execute("ALTER TABLE projected ADD COLUMN extra BIGINT NOT NULL DEFAULT 123456789")
+            .unwrap();
+        let sql = "SELECT /*+ HNSW_EF(32) */ id,n,flag,d,ts,extra FROM projected ORDER BY L2_DISTANCE(v,'[17.123,1,2]') LIMIT 7";
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX"))
+        );
+        engine.execute("BEGIN").unwrap();
+        engine
+            .execute("UPDATE projected SET n=NULL,flag=0,extra=9 WHERE id=17")
+            .unwrap();
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX"))
+        );
+        engine.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX"))
         );
     }
 }

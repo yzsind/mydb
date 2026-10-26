@@ -534,6 +534,13 @@ impl BruteTopK {
 }
 
 impl Database {
+    pub(crate) fn reclaim_vector_navigation_caches(&self) {
+        if let Some(graphs) = self.vector_indexes.try_read() {
+            for graph in graphs.values() {
+                graph.evict_query_navigation();
+            }
+        }
+    }
     fn note_vector_snapshot_change(&self, graph: &VectorGraph) {
         if !graph.is_paged_storage() && self.durability_mode() != DurabilityMode::Memory {
             self.vector_snapshot_dirty
@@ -868,6 +875,7 @@ impl Database {
                 "quantization requires fixed-dimension VECTOR",
             ));
         };
+        let started = Instant::now();
         let mut trainer = vector::quantization::Trainer::new(
             config.quantization.clone(),
             datatype,
@@ -880,7 +888,14 @@ impl Database {
             }
             Ok(false)
         })?;
-        trainer.finish()
+        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+            eprintln!("[quantization] training scan: {:?}", started.elapsed());
+        }
+        let model = trainer.finish()?;
+        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+            eprintln!("[quantization] training total: {:?}", started.elapsed());
+        }
+        Ok(model)
     }
 
     fn vector_native_hnsw_load_or_build(
@@ -984,7 +999,7 @@ impl Database {
         let mut used_parallel = false;
         if let (Some(q), Some(file)) = (&quantizer, graph.file()) {
             if q.trained_rows() >= 2048
-                && matches!(q.name(), "sq8" | "sq4")
+                && matches!(q.name(), "sq8" | "sq4" | "pq")
                 && file.supports_direct_bulk_build()
             {
                 let mut stats = CompactHnswStats::new(meta.metric_enum());
@@ -999,7 +1014,7 @@ impl Database {
                     |_, values| {
                         if let Some(Value::Vector(value)) = values.first() {
                             stats.observe(&vector::to_f32(value));
-                            encodable &= q.encode(value).is_some();
+                            encodable &= q.name() == "pq" || q.encode(value).is_some();
                         }
                         Ok(false)
                     },
@@ -1346,7 +1361,12 @@ impl Database {
         if self.physical_replica_mode() {
             file.disable_navigation_mapping();
         }
-        let graph = PagedHnsw::new(Arc::new(file)).without_navigation_quantization();
+        let graph = PagedHnsw::new(Arc::new(file));
+        let graph = if self.is_snapshot_read_only() || self.physical_replica_mode() {
+            graph.with_persisted_navigation_only()
+        } else {
+            graph
+        };
         if build {
             self.vector_graph_paged_build_from_heap(table, storage_id, &[col], &graph)?;
         }
@@ -1537,12 +1557,80 @@ impl Database {
         file: &VectorIndexFile,
         quantizer: Option<&Arc<vector::quantization::Quantizer>>,
     ) -> Result<Vec<VecId>, QueryError> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let mut threads = if quantizer.is_some_and(|q| q.name() == "pq") {
+            hnsw_build_threads().max(1)
+        } else {
+            1
+        };
+        let batch_rows = 64;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[col].data_type
+        else {
+            return Err(vector::vector_err(
+                "HNSW materialization requires a fixed dimension",
+            ));
+        };
+        let input_bytes = datatype.payload_len(dimension);
+        let output_bytes = quantizer.map_or(input_bytes, |q| q.record_len());
+        // Cover queued, in-flight and consumed batches, dense encoding scratch
+        // and worker stacks before starting the bounded pipeline.
+        let worker_bytes = 4 * batch_rows * (input_bytes + output_bytes + 128)
+            + dimension as usize * 8
+            + 1024 * 1024;
+        let _scratch = loop {
+            match ControlledMemoryCharge::try_new_recoverable(
+                ControlledMemoryCategory::StorageScratch,
+                threads * worker_bytes,
+            ) {
+                Ok(charge) => break charge,
+                Err(_) if threads > 1 => threads = threads.div_ceil(2),
+                Err(error) => return Err(error),
+            }
+        };
         std::thread::scope(|scope| {
-            let (sender, receiver) = std::sync::mpsc::sync_channel(32);
             let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut workers = Vec::new();
+            for _ in 0..threads {
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<Vec<(RowId, crate::vector::VectorValue)>>(1);
+                let (output, result) = std::sync::mpsc::sync_channel(1);
+                inputs.push(sender);
+                outputs.push(result);
+                let cancellation = cancellation.clone();
+                workers.push(scope.spawn(move || {
+                    let _scope = cancellation.enter();
+                    while let Ok(batch) = receiver.recv() {
+                        let encoded = batch.into_iter().map(|(row, value)| {
+                            crate::engine::cancel::check_cancelled()?;
+                            let value = if let Some(q) = quantizer {
+                                let encoded = q.store_with_reserved_scratch(&value, None)?;
+                                if encoded.payload.first() != Some(&0) {
+                                    return Err(vector::vector_err(
+                                        "HNSW bulk input requires a lossless quantization exception",
+                                    ));
+                                }
+                                encoded
+                            } else {
+                                value
+                            };
+                            Ok((row, value))
+                        }).collect::<Result<Vec<_>, QueryError>>();
+                        if output.send(encoded).is_err() { break; }
+                    }
+                }));
+            }
             let scanner = scope.spawn(move || -> Result<usize, QueryError> {
                 let _scope = cancellation.enter();
                 let mut sent = 0;
+                let mut batch = Vec::with_capacity(batch_rows);
+                let mut worker = 0;
                 self.scan_hnsw_build_rows(
                     table,
                     storage_id,
@@ -1552,41 +1640,57 @@ impl Database {
                     u64::MAX,
                     |row, values| {
                         if let Some(Value::Vector(value)) = values.first() {
-                            if sender.send((row, value.clone())).is_err() {
-                                return Ok(true);
-                            }
+                            batch.push((row, value.clone()));
                             sent += 1;
+                            if batch.len() == batch_rows {
+                                if inputs[worker]
+                                    .send(std::mem::replace(
+                                        &mut batch,
+                                        Vec::with_capacity(batch_rows),
+                                    ))
+                                    .is_err()
+                                {
+                                    return Ok(true);
+                                }
+                                worker = (worker + 1) % threads;
+                            }
                         }
                         Ok(false)
                     },
                 )?;
+                if !batch.is_empty() {
+                    let _ = inputs[worker].send(batch);
+                }
                 Ok(sent)
             });
             let mut received = 0;
+            let mut worker = 0;
+            let mut batch = Vec::new().into_iter();
             let mut next = |id: usize| -> Result<crate::vector::VectorValue, QueryError> {
                 crate::engine::cancel::check_cancelled()?;
-                let (row, value) = receiver
-                    .recv()
-                    .map_err(|_| vector::vector_err("HNSW materialization scan ended early"))?;
+                if batch.len() == 0 {
+                    batch = outputs[worker]
+                        .recv()
+                        .map_err(|_| vector::vector_err("HNSW materialization scan ended early"))??
+                        .into_iter();
+                    worker = (worker + 1) % threads;
+                }
+                let (row, value) = batch
+                    .next()
+                    .ok_or_else(|| vector::vector_err("empty HNSW materialization batch"))?;
                 if id != received || row != graph.row(id) {
                     return Err(vector::vector_err("HNSW materialization input changed"));
                 }
                 received += 1;
                 Ok(value)
             };
-            let result = if let Some(quantizer) = quantizer {
+            let result = if quantizer.is_some() {
                 file.bulk_build_native_direct(
                     graph.len(),
                     graph.entry(),
                     |id| graph.level(id),
                     |id, payload, links| {
-                        let value = next(id)?;
-                        let encoded = quantizer.store_with_reserved_scratch(&value, None)?;
-                        if encoded.payload.first() != Some(&0) {
-                            return Err(vector::vector_err(
-                                "HNSW bulk input requires a lossless quantization exception",
-                            ));
-                        }
+                        let encoded = next(id)?;
                         payload.clear();
                         payload.extend_from_slice(&encoded.payload);
                         graph.copy_links(id, links);
@@ -1598,9 +1702,9 @@ impl Database {
                     graph.len(),
                     graph.entry(),
                     |id| graph.level(id),
-                    |id, vector_out, links| {
+                    |id, payload, links| {
                         let value = next(id)?;
-                        *vector_out = vector::to_f32(&value);
+                        *payload = vector::to_f32(&value);
                         graph.copy_links(id, links);
                         Ok(graph.row(id))
                     },
@@ -1608,10 +1712,18 @@ impl Database {
                 .map(|_| Vec::new())
             };
             drop(next);
-            drop(receiver);
+            drop(outputs);
             let scanned = scanner
                 .join()
-                .map_err(|_| vector::vector_err("HNSW materialization scanner panicked"))??;
+                .map_err(|_| vector::vector_err("HNSW materialization scanner panicked"));
+            let mut worker_failed = false;
+            for worker in workers {
+                worker_failed |= worker.join().is_err();
+            }
+            if worker_failed {
+                return Err(vector::vector_err("HNSW materialization encoder panicked"));
+            }
+            let scanned = scanned??;
             let vids = result?;
             if scanned != graph.len() || received != graph.len() {
                 return Err(vector::vector_err("HNSW materialization row count changed"));

@@ -26,6 +26,7 @@ struct Model {
 #[derive(Debug)]
 pub(crate) struct Quantizer {
     model: Model,
+    pq_centers: Vec<Vec<f64>>,
     _charge: ControlledMemoryCharge,
 }
 #[derive(Debug)]
@@ -212,70 +213,188 @@ impl Trainer {
                 model_charge.try_grow_recoverable(
                     k.saturating_mul(d).saturating_mul(8) + (parts + 1) * 8 + parts * 24,
                 )?;
-                let _scratch = ControlledMemoryCharge::try_new_recoverable(
-                    ControlledMemoryCategory::StorageScratch,
-                    k.saturating_mul(d.div_ceil(parts)).saturating_mul(16) + self.sample.len() * 8,
-                )?;
+                let mut threads = std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .min(parts)
+                    .min(16);
+                let base_scratch =
+                    self.sample.len() * 8 + k * d.div_ceil(parts) * 24 + k * 8 + 1024 * 1024;
+                let row_scratch = self.sample.len() * d.div_ceil(parts) * 8;
+                // Cache-friendly subspace copies are optional. Under pressure,
+                // reduce concurrency, then train directly from the shared sample.
+                let (compact_rows, _scratch) = loop {
+                    if let Ok(charge) = ControlledMemoryCharge::try_new_recoverable(
+                        ControlledMemoryCategory::StorageScratch,
+                        threads * (base_scratch + row_scratch),
+                    ) {
+                        break (true, charge);
+                    }
+                    if threads > 1 {
+                        threads = threads.div_ceil(2);
+                        continue;
+                    }
+                    break (
+                        false,
+                        ControlledMemoryCharge::try_new_recoverable(
+                            ControlledMemoryCategory::StorageScratch,
+                            base_scratch,
+                        )?,
+                    );
+                };
                 model.offsets = Vec::with_capacity(parts + 1);
-                model.centers = Vec::with_capacity(parts);
                 model.offsets.push(0);
                 for part in 0..parts {
-                    let start = model.offsets[part];
-                    let width = d / parts + usize::from(part < d % parts);
-                    let end = start + width;
-                    model.offsets.push(end);
-                    let mut centers = Vec::with_capacity(k * width);
-                    for center in 0..k {
-                        centers.extend_from_slice(
-                            &self.sample[center * self.sample.len() / k][start..end],
-                        );
-                    }
-                    let mut assigned = vec![usize::MAX; self.sample.len()];
-                    for _ in 0..iterations {
-                        crate::engine::cancel::check_cancelled()?;
-                        let mut sums = vec![0.0; k * width];
-                        let mut counts = vec![0usize; k];
-                        let mut changed = false;
-                        for (i, row) in self.sample.iter().enumerate() {
-                            let mut best = (f64::INFINITY, 0);
-                            for (c, center) in centers.chunks_exact(width).enumerate() {
-                                let dist = row[start..end]
-                                    .iter()
-                                    .zip(center)
-                                    .map(|(x, y)| (x - y) * (x - y))
-                                    .sum::<f64>();
-                                if dist < best.0 {
-                                    best = (dist, c);
-                                }
-                            }
-                            changed |= assigned[i] != best.1;
-                            assigned[i] = best.1;
-                            counts[best.1] += 1;
-                            for j in 0..width {
-                                sums[best.1 * width + j] += row[start + j];
-                            }
-                        }
-                        for c in 0..k {
-                            if counts[c] > 0 {
-                                for j in 0..width {
-                                    centers[c * width + j] = sums[c * width + j] / counts[c] as f64;
-                                }
-                            }
-                        }
-                        if !changed {
-                            break;
-                        }
-                    }
-                    model.centers.push(centers);
+                    model
+                        .offsets
+                        .push(model.offsets[part] + d / parts + usize::from(part < d % parts));
                 }
+                model.centers = vec![Vec::new(); parts];
+                let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
+                std::thread::scope(|scope| -> Result<(), QueryError> {
+                    let mut handles = Vec::new();
+                    for (chunk, output) in model
+                        .centers
+                        .chunks_mut(parts.div_ceil(threads))
+                        .enumerate()
+                    {
+                        let sample = &self.sample;
+                        let offsets = &model.offsets;
+                        let cancellation = &cancellation;
+                        handles.push(scope.spawn(move || -> Result<(), QueryError> {
+                            let _scope = cancellation.enter();
+                            for (local, centers) in output.iter_mut().enumerate() {
+                                let part = chunk * parts.div_ceil(threads) + local;
+                                *centers = train_pq_part(
+                                    sample,
+                                    offsets[part],
+                                    offsets[part + 1],
+                                    k,
+                                    iterations,
+                                    compact_rows,
+                                )?;
+                            }
+                            Ok(())
+                        }));
+                    }
+                    for handle in handles {
+                        handle
+                            .join()
+                            .map_err(|_| codec::vector_err("PQ training worker panicked"))??;
+                    }
+                    Ok(())
+                })?;
             }
             QuantizationConfig::None => return Ok(None),
         }
-        Ok(Some(Arc::new(Quantizer {
-            model,
-            _charge: model_charge,
-        })))
+        Ok(Some(Quantizer::from_model(model, model_charge)?))
     }
+}
+
+// Eight independent centers retain coordinate summation order while allowing
+// SIMD across centers. The persisted model remains in its canonical row layout.
+fn transpose_pq_centers(centers: &[f64], width: usize) -> Vec<f64> {
+    let mut blocked = Vec::with_capacity(centers.len());
+    for block in centers.chunks_exact(width * 8) {
+        for dim in 0..width {
+            for center in 0..8 {
+                blocked.push(block[center * width + dim]);
+            }
+        }
+    }
+    blocked
+}
+
+fn nearest_pq_center(values: &[f64], centers: &[f64]) -> (f64, usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime dispatch checks the required CPU feature.
+        return unsafe { nearest_pq_center_avx2(values, centers) };
+    }
+    nearest_pq_center_portable(values, centers)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nearest_pq_center_avx2(values: &[f64], centers: &[f64]) -> (f64, usize) {
+    nearest_pq_center_portable(values, centers)
+}
+
+#[inline(always)]
+fn nearest_pq_center_portable(values: &[f64], centers: &[f64]) -> (f64, usize) {
+    let mut best = (f64::INFINITY, 0);
+    for (block, centers) in centers.chunks_exact(values.len() * 8).enumerate() {
+        let mut distances = [0.0; 8];
+        for (&x, coordinates) in values.iter().zip(centers.chunks_exact(8)) {
+            for lane in 0..8 {
+                let delta = x - coordinates[lane];
+                distances[lane] += delta * delta;
+            }
+        }
+        for (lane, distance) in distances.into_iter().enumerate() {
+            if distance < best.0 {
+                best = (distance, block * 8 + lane);
+            }
+        }
+    }
+    best
+}
+
+fn train_pq_part(
+    sample: &[Vec<f64>],
+    start: usize,
+    end: usize,
+    k: usize,
+    iterations: u32,
+    compact_rows: bool,
+) -> Result<Vec<f64>, QueryError> {
+    let width = end - start;
+    let rows = compact_rows.then(|| {
+        let mut rows = Vec::with_capacity(sample.len() * width);
+        for row in sample {
+            rows.extend_from_slice(&row[start..end]);
+        }
+        rows
+    });
+    let mut centers = Vec::with_capacity(k * width);
+    for center in 0..k {
+        centers.extend_from_slice(&sample[center * sample.len() / k][start..end]);
+    }
+    let mut assigned = vec![usize::MAX; sample.len()];
+    let mut sums = vec![0.0; k * width];
+    let mut counts = vec![0usize; k];
+    for _ in 0..iterations {
+        crate::engine::cancel::check_cancelled()?;
+        let blocked = transpose_pq_centers(&centers, width);
+        sums.fill(0.0);
+        counts.fill(0);
+        let mut changed = false;
+        for (i, sample_row) in sample.iter().enumerate() {
+            let row = rows.as_ref().map_or(&sample_row[start..end], |rows| {
+                &rows[i * width..(i + 1) * width]
+            });
+            if i % 256 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            let (_, best) = nearest_pq_center(row, &blocked);
+            changed |= assigned[i] != best;
+            assigned[i] = best;
+            counts[best] += 1;
+            for j in 0..width {
+                sums[best * width + j] += row[j];
+            }
+        }
+        for c in 0..k {
+            if counts[c] > 0 {
+                for j in 0..width {
+                    centers[c * width + j] = sums[c * width + j] / counts[c] as f64;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(centers)
 }
 
 pub(crate) struct QuantQuery {
@@ -298,6 +417,62 @@ fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
     {
         sq8_weighted_dot_portable(code, weights)
     }
+}
+
+fn sq4_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: dispatched only on CPUs with AVX2; the kernel bounds loads.
+        return unsafe { sq4_weighted_dot_avx2(code, weights) };
+    }
+    sq4_weighted_dot_portable(code, weights)
+}
+
+fn sq4_weighted_dot_portable(code: &[u8], weights: &[f64]) -> f64 {
+    let mut sums = [0.0; 8];
+    for (block, values) in weights.chunks(8).enumerate() {
+        for (lane, &weight) in values.iter().enumerate() {
+            sums[lane] += nibble(code, block * 8 + lane) as f64 * weight;
+        }
+    }
+    sums.into_iter().sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq4_weighted_dot_avx2(code: &[u8], weights: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_pd(); 2];
+    let mask = _mm_set1_epi8(15);
+    let mut i = 0;
+    while i + 8 <= weights.len() {
+        // Four packed bytes become eight consecutive unsigned coordinates.
+        // Reads are unaligned and bounded by ceil(dimension / 2) bytes.
+        let packed = _mm_cvtsi32_si128(std::ptr::read_unaligned(code.as_ptr().add(i / 2).cast()));
+        let low = _mm_and_si128(packed, mask);
+        let high = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+        let codes = _mm256_cvtepu8_epi32(_mm_unpacklo_epi8(low, high));
+        let a = _mm256_cvtepi32_pd(_mm256_castsi256_si128(codes));
+        let b = _mm256_cvtepi32_pd(_mm256_extracti128_si256(codes, 1));
+        sums[0] = _mm256_add_pd(
+            sums[0],
+            _mm256_mul_pd(a, _mm256_loadu_pd(weights.as_ptr().add(i))),
+        );
+        sums[1] = _mm256_add_pd(
+            sums[1],
+            _mm256_mul_pd(b, _mm256_loadu_pd(weights.as_ptr().add(i + 4))),
+        );
+        i += 8;
+    }
+    let mut lanes = [0.0; 8];
+    _mm256_storeu_pd(lanes.as_mut_ptr(), sums[0]);
+    _mm256_storeu_pd(lanes.as_mut_ptr().add(4), sums[1]);
+    let mut result = lanes.into_iter().sum::<f64>();
+    while i < weights.len() {
+        result += nibble(code, i) as f64 * weights[i];
+        i += 1;
+    }
+    result
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -358,6 +533,26 @@ fn sq8_weighted_dot_portable(code: &[u8], weights: &[f64]) -> f64 {
 }
 
 impl Quantizer {
+    fn from_model(
+        model: Model,
+        mut charge: ControlledMemoryCharge,
+    ) -> Result<Arc<Self>, QueryError> {
+        charge.try_grow_recoverable(model.centers.iter().map(|v| v.len() * 8 + 24).sum())?;
+        let pq_centers = model
+            .centers
+            .iter()
+            .enumerate()
+            .map(|(part, centers)| {
+                transpose_pq_centers(centers, model.offsets[part + 1] - model.offsets[part])
+            })
+            .collect();
+        Ok(Arc::new(Self {
+            model,
+            pq_centers,
+            _charge: charge,
+        }))
+    }
+
     pub(crate) fn code_len(&self) -> usize {
         self.model.config.code_len(self.model.dimension)
     }
@@ -381,6 +576,11 @@ impl Quantizer {
                 .map(|v| v.len() * 8 + 24)
                 .sum::<usize>()
             + self.model.offsets.len() * 8
+            + self
+                .pq_centers
+                .iter()
+                .map(|v| v.len() * 8 + 24)
+                .sum::<usize>()
     }
     fn metric(&self) -> Metric {
         match self.model.metric {
@@ -626,10 +826,7 @@ impl Quantizer {
             centers,
             offsets,
         };
-        Ok(Arc::new(Self {
-            model,
-            _charge: charge,
-        }))
+        Self::from_model(model, charge)
     }
 
     pub(crate) fn prepare(&self, value: &VectorValue) -> Result<QuantQuery, QueryError> {
@@ -642,7 +839,7 @@ impl Quantizer {
         let extra = match self.model.config {
             QuantizationConfig::Pq { bits, .. } => self.model.centers.len() * (1usize << bits) * 16,
             QuantizationConfig::Bq => (self.model.dimension as usize).div_ceil(4) * 16 * 8,
-            QuantizationConfig::Sq8 => self.model.dimension as usize * 8,
+            QuantizationConfig::Sq8 | QuantizationConfig::Sq4 => self.model.dimension as usize * 8,
             _ => 0,
         };
         let charge = ControlledMemoryCharge::try_new_recoverable(
@@ -660,7 +857,11 @@ impl Quantizer {
             sq_weights: Vec::new(),
             _charge: charge,
         };
-        if matches!(self.model.config, QuantizationConfig::Sq8) && self.metric() != Metric::L2 {
+        if matches!(
+            self.model.config,
+            QuantizationConfig::Sq8 | QuantizationConfig::Sq4
+        ) && self.metric() != Metric::L2
+        {
             q.sq_weights = q
                 .values
                 .iter()
@@ -782,20 +983,10 @@ impl Quantizer {
                 }
             }
             QuantizationConfig::Pq { bits, .. } => {
-                for (part, centers) in self.model.centers.iter().enumerate() {
+                for part in 0..self.model.centers.len() {
                     let start = self.model.offsets[part];
                     let end = self.model.offsets[part + 1];
-                    let mut best = (f64::INFINITY, 0);
-                    for (c, center) in centers.chunks_exact(end - start).enumerate() {
-                        let dist = v[start..end]
-                            .iter()
-                            .zip(center)
-                            .map(|(x, y)| (x - y) * (x - y))
-                            .sum::<f64>();
-                        if dist < best.0 {
-                            best = (dist, c);
-                        }
-                    }
+                    let best = nearest_pq_center(&v[start..end], &self.pq_centers[part]);
                     if bits == 8 {
                         code[part] = best.1 as u8;
                     } else {
@@ -873,6 +1064,31 @@ impl Quantizer {
         let mut score = 0.0;
         let mut norm = 0.0;
         match self.model.config {
+            QuantizationConfig::Sq4 => {
+                // Decode packed pairs directly. Calling component() for every
+                // coordinate repeats the model dispatch and bounds checks in
+                // the innermost navigation loop. Independent lanes expose the
+                // same full-width affine arithmetic to SIMD, including tails.
+                let mut scores = [0.0; 8];
+                let mut norms = [0.0; 8];
+                for (block, values) in query.values.chunks(8).enumerate() {
+                    for (lane, &x) in values.iter().enumerate() {
+                        let i = block * 8 + lane;
+                        let c = ((code[i / 2] >> ((i % 2) * 4)) & 15) as f64;
+                        let y = self.model.low[i] + self.model.scale[i] * c;
+                        scores[lane] += if metric == Metric::L2 {
+                            (x - y) * (x - y)
+                        } else {
+                            x * y
+                        };
+                        if metric == Metric::Cosine {
+                            norms[lane] += y * y;
+                        }
+                    }
+                }
+                score = scores.into_iter().sum();
+                norm = norms.into_iter().sum();
+            }
             QuantizationConfig::Sq8 => {
                 // Keep per-dimension affine scales and full f64 range. Explicit
                 // independent lanes expose SIMD without a scalar component()
@@ -979,13 +1195,25 @@ impl Quantizer {
             // The header's auxiliary word stores the reconstructed cosine norm.
             // Exception records use the same word for their blob pointer.
             if self.metric() == Metric::Cosine
-                && matches!(self.model.config, QuantizationConfig::Sq8)
+                && matches!(
+                    self.model.config,
+                    QuantizationConfig::Sq8 | QuantizationConfig::Sq4
+                )
             {
-                let norm = code
+                let norm = self
+                    .model
+                    .low
                     .iter()
-                    .zip(&self.model.low)
                     .zip(&self.model.scale)
-                    .map(|((&c, &lo), &scale)| (lo + scale * c as f64).powi(2))
+                    .enumerate()
+                    .map(|(i, (&lo, &scale))| {
+                        let c = if matches!(self.model.config, QuantizationConfig::Sq4) {
+                            nibble(&code, i) as f64
+                        } else {
+                            code[i] as f64
+                        };
+                        (lo + scale * c).powi(2)
+                    })
                     .sum::<f64>();
                 bytes[1..9].copy_from_slice(&norm.to_le_bytes());
             }
@@ -1082,8 +1310,15 @@ impl Quantizer {
                 // Older records have a zero auxiliary word. Keep their exact
                 // decoder as the fallback, including zero-norm validation.
                 if self.metric() == Metric::Dot || (norm > 0.0 && norm.is_finite()) {
-                    let dot =
-                        prepared.center_dot + sq8_weighted_dot(&bytes[9..], &prepared.sq_weights);
+                    let weighted = if matches!(self.model.config, QuantizationConfig::Sq4) {
+                        sq4_weighted_dot(&bytes[9..], &prepared.sq_weights)
+                    } else {
+                        sq8_weighted_dot(&bytes[9..], &prepared.sq_weights)
+                    };
+                    let dot = prepared.center_dot + weighted;
+                    if dot.abs() <= (prepared.center_dot.abs() + weighted.abs()) * 1e-12 {
+                        return self.score(&bytes[9..], prepared);
+                    }
                     return match self.metric() {
                         Metric::Dot => -dot,
                         Metric::Cosine if prepared.norm2 > 0.0 => {
@@ -1141,6 +1376,95 @@ mod tests {
             QuantizationConfig::Bq,
         ]
     }
+    #[test]
+    fn pq_training_compact_and_shared_samples_are_identical_and_cancellable() {
+        let sample: Vec<Vec<f64>> = (0..64)
+            .map(|row| {
+                (0..11)
+                    .map(|dim| ((row * (dim + 3)) % 101) as f64)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            train_pq_part(&sample, 1, 10, 16, 5, true).unwrap(),
+            train_pq_part(&sample, 1, 10, 16, 5, false).unwrap()
+        );
+        let _deadline =
+            crate::engine::cancel::install_statement_deadline(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let snapshot = crate::engine::cancel::CancellationSnapshot::capture();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _scope = snapshot.enter();
+                    assert!(train_pq_part(&sample, 0, 11, 16, 5, true).is_err());
+                })
+                .join()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn pq_blocked_nearest_matches_scalar_including_ties() {
+        for width in [1, 2, 3, 7, 8, 9, 17, 33, 128] {
+            for k in [16, 256] {
+                let centers: Vec<f64> = (0..k * width)
+                    .map(|i| ((i * 7919 % 997) as f64 - 498.0) / 997.0)
+                    .collect();
+                let blocked = transpose_pq_centers(&centers, width);
+                for row in 0..32 {
+                    let values: Vec<f64> = (0..width)
+                        .map(|i| ((i * 37 + row * 17) % 97) as f64 / 97.0)
+                        .collect();
+                    let mut expected = (f64::INFINITY, 0);
+                    for (id, center) in centers.chunks_exact(width).enumerate() {
+                        let distance = values
+                            .iter()
+                            .zip(center)
+                            .map(|(x, y)| (x - y) * (x - y))
+                            .sum::<f64>();
+                        if distance < expected.0 {
+                            expected = (distance, id);
+                        }
+                    }
+                    assert_eq!(nearest_pq_center_portable(&values, &blocked), expected);
+                    assert_eq!(nearest_pq_center(&values, &blocked), expected);
+                }
+                let zeros = vec![0.0; k * width];
+                assert_eq!(nearest_pq_center(&vec![0.0; width], &zeros), (0.0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn sq4_weighted_reduction_matches_scalar_with_odd_and_unaligned_codes() {
+        for dimension in [1usize, 2, 7, 8, 9, 31, 128, 768, 769, 4096] {
+            let mut buffer = vec![0xff; dimension.div_ceil(2) + 1];
+            let code = &mut buffer[1..];
+            for (i, byte) in code.iter_mut().enumerate() {
+                *byte = i.wrapping_mul(71) as u8;
+            }
+            for magnitude in [1e-100, 1.0, 1e100] {
+                let weights: Vec<_> = (0..dimension)
+                    .map(|i| ((i * 13 % 119) as f64 - 59.0) * magnitude)
+                    .collect();
+                let reference = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &w)| nibble(code, i) as f64 * w)
+                    .sum::<f64>();
+                for actual in [
+                    sq4_weighted_dot(code, &weights),
+                    sq4_weighted_dot_portable(code, &weights),
+                ] {
+                    assert!(
+                        (actual - reference).abs() <= 1e-12 * magnitude * dimension as f64 * 15.0
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn sq8_weighted_reduction_matches_scalar() {
         for dimension in [1, 7, 8, 9, 31, 128, 769, 4096] {
@@ -1224,11 +1548,26 @@ mod tests {
                                 }
                                 _ => unreachable!(),
                             };
-                            let stored = q.store(&value, None).unwrap();
+                            let mut stored = q.store(&value, None).unwrap();
                             let payload_score = q
                                 .score_payload(&stored.payload, None, &query, Some(&prepared))
                                 .unwrap();
                             assert!((payload_score - reference).abs() <= 1e-10 * reference.abs().max(1.0), "payload {datatype:?} {metric:?} {}: {payload_score} != {reference}", q.name());
+                            if matches!(q.model.config, QuantizationConfig::Sq4)
+                                && metric == Metric::Cosine
+                            {
+                                assert!(
+                                    f64::from_le_bytes(stored.payload[1..9].try_into().unwrap())
+                                        > 0.0
+                                );
+                                stored.payload[1..9].fill(0);
+                                let legacy = q
+                                    .score_payload(&stored.payload, None, &query, Some(&prepared))
+                                    .unwrap();
+                                assert!(
+                                    (legacy - reference).abs() <= 1e-10 * reference.abs().max(1.0)
+                                );
+                            }
                             let actual = q.score(&code, &prepared);
                             assert!(
                                 (actual - reference).abs() <= 1e-10 * reference.abs().max(1.0),

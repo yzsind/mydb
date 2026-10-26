@@ -406,10 +406,15 @@ construction graph is admitted; only compressed payloads survive publication. Th
 - `MYDB_HNSW_MAPPED_NAVIGATION=0` disables direct mapping for differential
   diagnostics. Memory-only durability also bypasses mapping.
 - `MYDB_HNSW_QUERY_CACHE_MB` controls optional HNSW navigation caches, not the
-  direct file mapping. The native CSR cache defaults to 25% of the memory
-  target; the FLOAT32 compact-cache path additionally caps its default at 1 GiB.
+  direct file mapping. Compact graph and payload caches default to two thirds
+  of the memory target, capped at 1 GiB per index; aggregate admission still
+  follows the shared process limits. Dense navigation may replace raw buffer
+  pages under both logical and physical memory admission.
   `0` disables the cache. Admission failure uses live persistent pages.
-  `quantization=none` does not enable implicit SQ8 navigation.
+  Paged FLOAT32 L2/COSINE indexes can use auxiliary SQ8 navigation with
+  `quantization=none`, while retaining original index vectors and exact heap
+  reranking. Native compressed HNSW can cache its existing encoded payloads
+  together with adjacency; this cache never changes the requested encoding.
 - `MYDB_HNSW_PRELOAD=eager|lazy` controls startup opening, default `lazy`.
   `eager` opens Public vector indexes and prepares the admitted query paths
   before accepting connections; it does not fault every mapped page into RAM.
