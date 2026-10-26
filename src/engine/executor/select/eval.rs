@@ -265,7 +265,11 @@ impl CompiledPlanExpr {
                 return Self::Legacy(expr.clone());
             }
         }
-        match crate::engine::expr_program::ExprCompiler::compile_cached(expr, schema) {
+        let bound = crate::engine::expr_program::ExprCompiler::bind_vector_constants(expr);
+        match crate::engine::expr_program::ExprCompiler::compile_cached(
+            bound.as_ref().unwrap_or(expr),
+            schema,
+        ) {
             Ok(program) => Self::Program(program),
             Err(_) => Self::Legacy(expr.clone()),
         }
@@ -5675,6 +5679,123 @@ mod compiled_plan_expr_tests {
 
     fn field(name: &str, value: Value) -> PlanField {
         PlanField::new("t", None, name, ColumnType::VarString, value)
+    }
+
+    #[test]
+    fn vector_constants_parse_once_per_operator_across_native_domains() {
+        use crate::engine::vector::codec::{parse_typed_text, text_parse_calls};
+        use crate::vector::VectorDataType;
+        for datatype in [
+            VectorDataType::Float32,
+            VectorDataType::Float16,
+            VectorDataType::BFloat16,
+            VectorDataType::Int8,
+            VectorDataType::Binary,
+        ] {
+            let row = PlanRow::from_fields(vec![PlanField::new(
+                "t",
+                None,
+                "v",
+                ColumnType::Vector,
+                Value::Vector(parse_typed_text("[1,0,1,0]", datatype).unwrap()),
+            )]);
+            let schema = input_schema_for_plan_row(&row);
+            let metrics: &[&str] = if datatype == VectorDataType::Binary {
+                &["hamming", "jaccard"]
+            } else {
+                &["l2", "cosine", "dot"]
+            };
+            for constructor in ["TO_VECTOR", "STRING_TO_VECTOR"] {
+                for metric in metrics {
+                    let expr = first_projection_expr(&format!(
+                        "SELECT DISTANCE(v,{constructor}(?,?),'{metric}')"
+                    ));
+                    crate::engine::params::with_params(
+                        vec![
+                            Value::String("[0,1,1,0]".into()),
+                            Value::String(datatype.name().into()),
+                        ],
+                        || {
+                            let expected = eval_plan_expr_legacy(&expr, &row).unwrap();
+                            let before = text_parse_calls();
+                            let compiled = CompiledPlanExpr::compile_once(&expr, &schema);
+                            for _ in 0..100 {
+                                assert_eq!(compiled.eval(&row).unwrap(), expected);
+                            }
+                            assert_eq!(
+                                text_parse_calls() - before,
+                                1,
+                                "{constructor}/{datatype}/{metric}"
+                            );
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_constant_binding_preserves_parameters_errors_and_literal_provenance() {
+        let row = PlanRow::default();
+        let schema = input_schema_for_plan_row(&row);
+        let expr = first_projection_expr("SELECT TO_VECTOR(?,?)");
+        for (text, datatype) in [
+            ("[1,0]", "FLOAT32"),
+            ("[0,1]", "BINARY"),
+            ("[bad]", "FLOAT32"),
+            ("[2,1]", "INT8"),
+        ] {
+            crate::engine::params::with_params(
+                vec![Value::String(text.into()), Value::String(datatype.into())],
+                || {
+                    let expected = eval_plan_expr_legacy(&expr, &row);
+                    let actual = CompiledPlanExpr::compile_once(&expr, &schema).eval(&row);
+                    match (expected, actual) {
+                        (Ok(left), Ok(right)) => assert_eq!(left, right),
+                        (Err(left), Err(right)) => assert_eq!(left.code(), right.code()),
+                        other => panic!("binding mismatch: {other:?}"),
+                    }
+                },
+            );
+        }
+        let expr = first_projection_expr("SELECT TO_VECTOR(CONCAT('[',CAST(? AS UNSIGNED),']'))");
+        for auto in [false, true] {
+            let run = || {
+                let expected = eval_plan_expr_legacy(&expr, &row).unwrap();
+                assert_eq!(
+                    CompiledPlanExpr::compile_once(&expr, &schema)
+                        .eval(&row)
+                        .unwrap(),
+                    expected
+                );
+            };
+            if auto {
+                crate::engine::params::with_auto_params(vec![Value::Bytes(vec![0x31])], run);
+            } else {
+                crate::engine::params::with_params(vec![Value::Bytes(vec![0x31])], run);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_constant_probe_does_not_consume_runtime_warnings_or_fold_columns() {
+        let row = PlanRow::from_fields(vec![field("txt", Value::String("[1,0]".into()))]);
+        let schema = input_schema_for_plan_row(&row);
+        let column = first_projection_expr("SELECT TO_VECTOR(txt)");
+        assert!(
+            crate::engine::expr_program::ExprCompiler::bind_vector_constants(&column).is_none()
+        );
+        let expr =
+            first_projection_expr("SELECT TO_VECTOR(CONCAT('[',CAST('1tail' AS SIGNED),',0]'))");
+        crate::engine::api::clear_statement_warnings();
+        let compiled = CompiledPlanExpr::compile_once(&expr, &schema);
+        assert!(crate::engine::api::statement_warnings_snapshot().is_empty());
+        for _ in 0..3 {
+            crate::engine::api::clear_statement_warnings();
+            assert!(matches!(compiled.eval(&row).unwrap(), Value::Vector(_)));
+            assert!(!crate::engine::api::statement_warnings_snapshot().is_empty());
+        }
+        crate::engine::api::clear_statement_warnings();
     }
 
     #[test]

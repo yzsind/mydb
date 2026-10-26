@@ -936,13 +936,31 @@ impl ColumnPruningRefs {
             | PhysicalPlan::IndexFastScan { filter, .. }
             | PhysicalPlan::ParallelIndexFastScan { filter, .. }
             | PhysicalPlan::ParallelIndexRangeScan { filter, .. }
-            | PhysicalPlan::SpatialScan { filter, .. }
-            | PhysicalPlan::VectorIndexScan { filter, .. } => {
+            | PhysicalPlan::SpatialScan { filter, .. } => {
                 if !skip_scan_filters {
                     if let Some(e) = filter {
                         self.collect_expr(e);
                     }
                 }
+            }
+            PhysicalPlan::VectorIndexScan {
+                table,
+                index,
+                filter,
+                order_by,
+                ..
+            } => {
+                if !skip_scan_filters {
+                    if let Some(filter) = filter {
+                        self.collect_expr(filter);
+                    }
+                }
+                for order in order_by {
+                    self.collect_expr(&order.expr);
+                }
+                // The live heap vector is authoritative even when it is not
+                // selected by an upper projection or an optimizer rewrite.
+                self.collect_index_probe_columns(table, index);
             }
             // VectorBruteScan carries no residual filter expression (it is only
             // emitted for the no-WHERE shape) and its query vector is a constant,
@@ -1497,6 +1515,11 @@ impl ColumnPruningRefs {
                 ..
             }
             | PhysicalPlan::IndexInLookup {
+                table,
+                projected_columns,
+                ..
+            }
+            | PhysicalPlan::VectorIndexScan {
                 table,
                 projected_columns,
                 ..

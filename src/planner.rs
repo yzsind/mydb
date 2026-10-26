@@ -24433,6 +24433,7 @@ fn collect_scan_targets(
         | PhysicalPlan::IndexLookup { table, .. }
         | PhysicalPlan::IndexMultiLookup { table, .. }
         | PhysicalPlan::IndexInLookup { table, .. }
+        | PhysicalPlan::VectorIndexScan { table, .. }
         | PhysicalPlan::FulltextScan { table, .. } => push_if_new(out, table),
         PhysicalPlan::IndexNestedLoopJoin {
             left, right_table, ..

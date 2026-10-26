@@ -1858,6 +1858,71 @@ fn collect_columns_in_node(node: &ExprNode, out: &mut HashSet<usize>) {
 pub(crate) struct ExprCompiler;
 
 impl ExprCompiler {
+    /// Bind successful, diagnostic-free vector constants at operator open.
+    /// The cached AST is never mutated; the resulting native value participates
+    /// in the ordinary bounded program-cache key, including datatype/dimension.
+    pub(crate) fn bind_vector_constants(expr: &Expr) -> Option<Expr> {
+        fn constructor(expr: &Expr) -> bool {
+            matches!(expr, Expr::Function { name, distinct: false, .. }
+                if crate::engine::vector::sql::returns_vector(&name.to_ascii_uppercase()))
+        }
+        if expression_depth_exceeds(expr, MAX_COMPILED_EXPRESSION_DEPTH)
+            || !crate::parser::visit::any_expr(expr, constructor)
+        {
+            return None;
+        }
+        struct Bind {
+            changed: bool,
+        }
+        impl crate::parser::visit::AstVisitorMut for Bind {
+            fn exit_expr(&mut self, expr: &mut Expr) {
+                if !constructor(expr) {
+                    return;
+                }
+                struct Classify {
+                    valid: bool,
+                }
+                impl crate::parser::visit::AstVisitorMut for Classify {
+                    fn enter_expr(&mut self, expr: &mut Expr) {
+                        match expr {
+                            Expr::Placeholder(index) => {
+                                self.valid &= crate::engine::params::has_active_param(*index);
+                                // Classification only: evaluate the original AST
+                                // below, retaining auto-parameter literal provenance.
+                                *expr = Expr::BoundValue(Value::Null);
+                            }
+                            Expr::Function { distinct: true, .. } => self.valid = false,
+                            _ => {}
+                        }
+                    }
+                }
+                let mut classification = expr.clone();
+                let mut classify = Classify { valid: true };
+                crate::parser::visit::visit_expr_mut(&mut classify, &mut classification);
+                if !classify.valid || !crate::engine::expr::expr_is_constant(&classification) {
+                    return;
+                }
+                let diagnostics = Arc::new(parking_lot::Mutex::new(Default::default()));
+                static EMPTY: OnceLock<TableSchema> = OnceLock::new();
+                let table = EMPTY.get_or_init(|| TableSchema::synthetic_for_planning("", &[]));
+                let value =
+                    crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                        eval_expr_legacy(expr, table, &[])
+                    });
+                if let Ok(value @ Value::Vector(_)) = value {
+                    if diagnostics.lock().is_empty() {
+                        *expr = Expr::BoundValue(value);
+                        self.changed = true;
+                    }
+                }
+            }
+        }
+        let mut bound = expr.clone();
+        let mut bind = Bind { changed: false };
+        crate::parser::visit::visit_expr_mut(&mut bind, &mut bound);
+        bind.changed.then_some(bound)
+    }
+
     pub(crate) fn compile(expr: &Expr, schema: &InputSchema) -> Result<ExprProgram, CompileError> {
         Self::compile_with(
             expr,

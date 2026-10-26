@@ -25,6 +25,8 @@ pub(super) use fulltext_stream::FULLTEXT_BATCH_ROWS;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;
+#[cfg(test)]
+mod vector_scan_tests;
 pub(crate) use scan::*;
 mod nested_loop;
 pub(super) use nested_loop::*;
@@ -2156,6 +2158,7 @@ pub(super) fn execute_plan_rows_inner(
             ef_hint,
             filter,
             order_by,
+            projected_columns,
             ..
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
@@ -2206,7 +2209,19 @@ pub(super) fn execute_plan_rows_inner(
                 ef,
                 filter,
                 order_by,
+                projected_columns
+                    .as_deref()
+                    .map(|columns| columns.as_slice()),
             )
+            .and_then(|rows| {
+                project_vector_scan_output(
+                    table,
+                    projected_columns
+                        .as_deref()
+                        .map(|columns| columns.as_slice()),
+                    rows,
+                )
+            })
         }
         PhysicalPlan::VectorBruteScan {
             table,

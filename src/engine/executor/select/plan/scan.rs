@@ -5518,6 +5518,7 @@ pub(super) fn execute_vector_index_scan(
     ef_search: usize,
     filter: &Option<Expr>,
     order_by: &[OrderBy],
+    projection: Option<&[usize]>,
 ) -> Result<Vec<PlanRow>, QueryError> {
     use crate::engine::vector;
     use crate::engine::vector::session::IterativeScan;
@@ -5526,6 +5527,35 @@ pub(super) fn execute_vector_index_scan(
     }
     let query = query_vector;
     let col_idx = table.schema.column_index(&index.columns[0])?;
+    let output_columns = projection
+        .map(<[usize]>::to_vec)
+        .unwrap_or_else(|| logical_visible_column_indices(&table.schema));
+    let mut read_columns = output_columns.clone();
+    if !read_columns.contains(&col_idx) {
+        read_columns.push(col_idx);
+    }
+    let vector_position = read_columns
+        .iter()
+        .position(|column| *column == col_idx)
+        .unwrap();
+    let row_schema = if read_columns.len() > super::super::row_schema::LOOKUP_THRESHOLD {
+        let metas = cached_column_metas(table);
+        let metas = read_columns
+            .iter()
+            .map(|column| {
+                metas.get(*column).cloned().ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "projected column index out of bounds",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        RowSchema::from_metas(&metas).into()
+    } else {
+        PlanRow::empty_schema()
+    };
+    let mut retained_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     // A recovered/sealed graph contains physical current vectors. Prepared
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
@@ -5725,71 +5755,114 @@ pub(super) fn execute_vector_index_scan(
         candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
 
         let mut budget_exhausted = false;
-        for (sid, row_id, graph_dist) in candidates {
+        let mut candidates = candidates.into_iter().peekable();
+        'candidate_batches: while let Some((sid, row_id, graph_dist)) = candidates.next() {
             if examined >= max_scan {
                 budget_exhausted = true;
                 break;
             }
-            // (storage_id, row_id) is the partition-disambiguated identity.
-            // A row judged by an earlier, narrower pass keeps its verdict.
-            if !seen.insert((sid, row_id)) {
+            if seen.contains(&(sid, row_id)) {
                 continue;
             }
-            examined += 1;
-            // For partitioned tables, ensure read_row routes to the right
-            // partition by installing a single-partition prune set.
-            let stored_opt = if table.schema.is_partitioned() {
-                crate::engine::executor::partition_router::with_pruned_partitions(
-                    vec![sid],
-                    || db.read_row(&table.schema, row_id, txn),
-                )?
-            } else {
-                db.read_row(&table.schema, row_id, txn)?
-            };
-            let Some(stored) = stored_opt else {
-                continue; // invisible / deleted under this snapshot
-            };
-            // Re-rank by the row's *current* heap vector, not the graph copy.
-            // Score directly over the stored little-endian bytes — no per-
-            // candidate `Vec<f32>` decode.
-            let dist = match stored.values.get(col_idx) {
-                Some(Value::Vector(bytes)) => {
-                    if bytes.dimension != query_vector.dimension {
-                        continue; // dimension drift — skip defensively
-                    }
-                    vector::distance::typed_ordering_distance(query_vector, bytes, metric)?
-                }
-                _ => continue,
-            };
-            // A superseded version kept for older snapshots sits at its old
-            // graph position; the candidate order no longer matches the heap,
-            // so this statement must rank the whole pool exactly.
-            if exact_order
-                && (dist - graph_dist).abs() > 1e-3 * dist.abs().max(graph_dist.abs()).max(1e-6)
-            {
-                exact_order = false;
+            crate::engine::cancel::check_cancelled()?;
+            // Coalesce a bounded, partition-local window without changing the
+            // candidate order, exploration budget or exact rerank policy.
+            let mut cap = 64usize.min(max_scan - examined);
+            if filter.is_none() && exact_order {
+                cap = cap.min(k.saturating_sub(scored.len()).max(1));
             }
-            let row = stored_row_to_plan_row(table, stored.values)?;
-            let keep = match filter {
-                Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
-                None => true,
-            };
-            if keep {
-                scored.push((dist, row));
-                // When the candidate ordering is *exact* (`exact_order`:
-                // HNSW's f32 node vectors, or IVF's f32 Dot lists), candidates
-                // arrive in exact ascending-distance order, so with no residual
-                // filter to drop/reorder survivors the first `k` visible rows
-                // ARE the answer — stop before reading (and MVCC-fetching) the
-                // rest of the candidate pool. `read_row` dominated the fixed
-                // cost of a low-ef KNN query; this cuts it from ~`rerank_want`
-                // heap reads to ~`k`. For IVF L2/Cosine the pool order is only
-                // SQ8-approximate, so we must exact-score the whole pool (no
-                // early break) and let the final sort recover the true top-k.
-                // With a filter we must keep scanning regardless (dropped rows
-                // need replacements — the iterative widening below handles it).
-                if filter.is_none() && exact_order && scored.len() >= k {
-                    break;
+            let mut window = vec![(row_id, graph_dist)];
+            let mut local_seen = crate::util::fast_hash::ah_hash_set();
+            local_seen.insert(row_id);
+            while window.len() < cap && candidates.peek().is_some_and(|next| next.0 == sid) {
+                let (_, next_row, distance) = candidates.next().unwrap();
+                if !seen.contains(&(sid, next_row)) && local_seen.insert(next_row) {
+                    window.push((next_row, distance));
+                }
+            }
+            let heap = db.cached_heap_handle(sid)?;
+            let ids = window.iter().map(|(row, _)| *row).collect::<Vec<_>>();
+            let values = db.read_row_columns_many_with_handle(
+                &heap,
+                &table.schema,
+                &ids,
+                txn,
+                &read_columns,
+            )?;
+            let mut batch_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+            batch_charge.add_non_spillable(
+                values
+                    .iter()
+                    .map(|(_, values)| {
+                        crate::engine::executor::mem_budget::estimate_row_bytes(values)
+                    })
+                    .sum(),
+            )?;
+            let mut values = values
+                .into_iter()
+                .collect::<crate::util::fast_hash::AhHashMap<_, _>>();
+            for (row_id, graph_dist) in window {
+                // (storage_id, row_id) is the partition-disambiguated identity.
+                // A row judged by an earlier, narrower pass keeps its verdict.
+                if !seen.insert((sid, row_id)) {
+                    continue;
+                }
+                examined += 1;
+                // The batch's explicit heap handle already identifies its
+                // partition; restore graph order after page-coalesced reads.
+                let Some(values) = values.remove(&row_id) else {
+                    continue; // invisible / deleted under this snapshot
+                };
+                batch_charge.release_bytes(
+                    crate::engine::executor::mem_budget::estimate_row_bytes(&values),
+                );
+                // Re-rank by the row's *current* heap vector, not the graph copy.
+                // Score directly over the stored little-endian bytes — no per-
+                // candidate `Vec<f32>` decode.
+                let dist = match values.get(vector_position) {
+                    Some(Value::Vector(bytes)) => {
+                        if bytes.dimension != query_vector.dimension {
+                            continue; // dimension drift — skip defensively
+                        }
+                        vector::distance::typed_ordering_distance(query_vector, bytes, metric)?
+                    }
+                    _ => continue,
+                };
+                // A superseded version kept for older snapshots sits at its old
+                // graph position; the candidate order no longer matches the heap,
+                // so this statement must rank the whole pool exactly.
+                if exact_order
+                    && (dist - graph_dist).abs() > 1e-3 * dist.abs().max(graph_dist.abs()).max(1e-6)
+                {
+                    exact_order = false;
+                }
+                let mut row = projected_values_to_plan_row(table, &read_columns, values)?;
+                row.schema = row_schema.clone();
+                let keep = match filter {
+                    Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
+                    None => true,
+                };
+                if keep {
+                    retained_charge.add_non_spillable(
+                        super::nested_loop::materialized_plan_row_charge(&row)
+                            + std::mem::size_of::<f64>(),
+                    )?;
+                    scored.push((dist, row));
+                    // When the candidate ordering is *exact* (`exact_order`:
+                    // HNSW's f32 node vectors, or IVF's f32 Dot lists), candidates
+                    // arrive in exact ascending-distance order, so with no residual
+                    // filter to drop/reorder survivors the first `k` visible rows
+                    // ARE the answer — stop before reading (and MVCC-fetching) the
+                    // rest of the candidate pool. `read_row` dominated the fixed
+                    // cost of a low-ef KNN query; this cuts it from ~`rerank_want`
+                    // heap reads to ~`k`. For IVF L2/Cosine the pool order is only
+                    // SQ8-approximate, so we must exact-score the whole pool (no
+                    // early break) and let the final sort recover the true top-k.
+                    // With a filter we must keep scanning regardless (dropped rows
+                    // need replacements — the iterative widening below handles it).
+                    if filter.is_none() && exact_order && scored.len() >= k {
+                        break 'candidate_batches;
+                    }
                 }
             }
         }
@@ -5857,6 +5930,8 @@ pub(super) fn execute_vector_index_scan(
         }
     }
     if exact_fallback || db.vector_snapshot_requires_exact(txn) {
+        drop(scored);
+        retained_charge.release_bytes(retained_charge.charged());
         if order_by.len() > 1 {
             return execute_ordered_vector_fallback(db, txn, table, filter, order_by, k);
         }
@@ -5877,6 +5952,8 @@ pub(super) fn execute_vector_index_scan(
 
     if order_by.len() > 1 {
         let rows = scored.into_iter().map(|(_, row)| row).collect();
+        // The external sorter assumes ownership and charges its own rows.
+        retained_charge.release_bytes(retained_charge.charged());
         let mut rows = super::super::external_sort::sort_plan_rows_for_plan(
             db.data_dir(),
             rows,
@@ -5884,6 +5961,12 @@ pub(super) fn execute_vector_index_scan(
             None,
         )?;
         rows.truncate(k);
+        for row in &mut rows {
+            if row.fields.len() > output_columns.len() {
+                row.fields.truncate(output_columns.len());
+                row.schema = PlanRow::empty_schema();
+            }
+        }
         return Ok(rows);
     }
     // strict_order — keep ascending distance order (default). relaxed_order
@@ -5893,7 +5976,62 @@ pub(super) fn execute_vector_index_scan(
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
     }
     scored.truncate(k);
-    Ok(scored.into_iter().map(|(_, row)| row).collect())
+    Ok(scored
+        .into_iter()
+        .map(|(_, mut row)| {
+            if row.fields.len() > output_columns.len() {
+                row.fields.truncate(output_columns.len());
+                row.schema = PlanRow::empty_schema();
+            }
+            row
+        })
+        .collect())
+}
+
+/// Exact completion can return a full logical heap row. Keep every ANN,
+/// historical and budget-fallback result aligned with the scan's schema.
+pub(super) fn project_vector_scan_output(
+    table: &PlanTable,
+    projection: Option<&[usize]>,
+    mut rows: Vec<PlanRow>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let Some(projection) = projection else {
+        return Ok(rows);
+    };
+    let metas = cached_column_metas(table);
+    let wanted = projection
+        .iter()
+        .map(|index| {
+            metas.get(*index).cloned().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "projected column index out of bounds",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in &mut rows {
+        if row.fields.len() == wanted.len()
+            && row
+                .fields
+                .iter()
+                .zip(&wanted)
+                .all(|(field, meta)| field.meta.ptr_eq(meta))
+        {
+            continue;
+        }
+        let mut fields = Vec::with_capacity(wanted.len());
+        for meta in &wanted {
+            let index = row.schema.resolve_index(&row.fields, None, &meta.column)?;
+            fields.push(PlanField {
+                meta: meta.clone(),
+                value: std::mem::replace(&mut row.fields[index].value, Value::Null),
+            });
+        }
+        row.fields = fields;
+        row.schema = PlanRow::empty_schema();
+    }
+    Ok(rows)
 }
 
 /// Exact completion for a distance order with SQL tie-break columns.

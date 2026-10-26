@@ -430,10 +430,22 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<VectorValue, QueryError> {
     Ok(value)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEXT_PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn text_parse_calls() -> usize {
+    TEXT_PARSE_CALLS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn parse_typed_text(
     text: &str,
     datatype: VectorDataType,
 ) -> Result<VectorValue, QueryError> {
+    #[cfg(test)]
+    TEXT_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     if datatype == VectorDataType::Float32 {
         return parse_text(text);
     }
