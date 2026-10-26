@@ -949,12 +949,11 @@ impl Database {
                 if let Some(mut lease) =
                     HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), scratch)
                 {
-                    let topology = HnswIndex::new(
+                    let mut topology = HnswIndex::new(
                         meta.metric_enum(),
                         meta.m as usize,
                         meta.ef_construction as usize,
                     )
-                    .without_navigation_quantization()
                     .with_build_reservation(lease.take_charge(), rows);
                     self.vector_graph_append_from_heap(
                         table,
@@ -964,7 +963,7 @@ impl Database {
                         &topology,
                         threads,
                     )?;
-                    topology.link_all(threads);
+                    topology.link_all_frozen(threads);
                     graph.import_build_topology(&topology)?;
                     used_parallel = true;
                 }
@@ -1482,7 +1481,7 @@ impl Database {
         };
         match build_mode {
             HnswColdBuildMode::FullMemory => {
-                let graph = HnswIndex::new(metric, m, ef_construction)
+                let mut graph = HnswIndex::new(metric, m, ef_construction)
                     .without_navigation_quantization()
                     .with_build_reservation(
                         lease.as_mut().expect("admitted full build").take_charge(),
@@ -1499,7 +1498,7 @@ impl Database {
                     );
                 }
                 let link_started = Instant::now();
-                graph.link_all(threads);
+                graph.link_all_frozen(threads);
                 crate::engine::cancel::check_cancelled()?;
                 build_stats.link_ms = link_started.elapsed().as_millis() as u64;
                 let materialize_started = Instant::now();

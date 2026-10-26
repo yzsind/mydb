@@ -215,6 +215,15 @@ impl MappedVectorNavigation {
         Ok((page, offset))
     }
 
+    /// Borrow a native payload while the caller retains the mapping read guard.
+    pub(crate) fn native_payload(&self, vid: VecId) -> Result<&[u8], QueryError> {
+        let (datatype, dimension) = native_geometry(self.meta.dim as usize)
+            .ok_or_else(crate::engine::vector::persistence::corrupt)?;
+        let (page, offset) = self.record(vid)?;
+        let start = offset + 18;
+        Ok(&page[start..start + datatype.payload_len(dimension)])
+    }
+
     fn neighbors(&self, vid: VecId, level: usize, out: &mut Vec<VecId>) -> Result<(), QueryError> {
         let (page, offset) = self.record(vid)?;
         out.clear();

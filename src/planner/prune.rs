@@ -770,13 +770,30 @@ pub(super) fn apply_join_output_pruning(plan: &mut PhysicalPlan, select: &Select
 /// * `IndexLookup` / `IndexMultiLookup` / `IndexInLookup` / `CteScan`
 ///   gained `projected_columns` for this pass, so the IN-subquery
 ///   row-id fan-out and CTE reuse paths also benefit.
+fn vector_consumes_sole_order(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::VectorIndexScan { order_by, .. } => order_by.len() == 1,
+        PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Materialize { input, .. }
+        | PhysicalPlan::Filter { input, .. } => vector_consumes_sole_order(input),
+        _ => false,
+    }
+}
+
 pub(super) fn apply_column_pruning(plan: &mut PhysicalPlan, select: &Select) {
     let Some(mut refs) = ColumnPruningRefs::new(plan, false) else {
         return;
     };
     refs.collect_plan(plan, false);
     // Upper-pipeline nodes have not all been attached by finish_plan yet.
-    refs.collect_select(select, true);
+    refs.collect_select_with_order(
+        select,
+        true,
+        !(select.order_by.len() == 1
+            && vector_consumes_sole_order(plan)
+            && plan_satisfies_order_by(plan, &select.order_by)),
+    );
     refs.apply(plan);
 }
 
@@ -868,6 +885,15 @@ impl ColumnPruningRefs {
 
     /// Include AST join conditions only before the filter-only output pass.
     fn collect_select(&mut self, select: &Select, include_join_conditions: bool) {
+        self.collect_select_with_order(select, include_join_conditions, true);
+    }
+
+    fn collect_select_with_order(
+        &mut self,
+        select: &Select,
+        include_join_conditions: bool,
+        include_order: bool,
+    ) {
         self.collect_projection(&select.projection);
         for aggregate in collect_aggregate_calls(select) {
             self.collect_expr(&aggregate);
@@ -882,8 +908,10 @@ impl ColumnPruningRefs {
                 }
             }
         }
-        for ob in &select.order_by {
-            self.collect_expr(&ob.expr);
+        if include_order {
+            for ob in &select.order_by {
+                self.collect_expr(&ob.expr);
+            }
         }
         for g in &select.group_by {
             self.collect_expr(g);
@@ -944,23 +972,22 @@ impl ColumnPruningRefs {
                 }
             }
             PhysicalPlan::VectorIndexScan {
-                table,
-                index,
-                filter,
-                order_by,
-                ..
+                filter, order_by, ..
             } => {
                 if !skip_scan_filters {
                     if let Some(filter) = filter {
                         self.collect_expr(filter);
                     }
                 }
-                for order in order_by {
-                    self.collect_expr(&order.expr);
+                // A sole distance order is consumed inside VectorIndexScan.
+                // Its executor adds the authoritative vector to its private
+                // read projection; it need not escape into upper operators.
+                // Secondary ordering still evaluates complete candidate rows.
+                if order_by.len() > 1 {
+                    for order in order_by {
+                        self.collect_expr(&order.expr);
+                    }
                 }
-                // The live heap vector is authoritative even when it is not
-                // selected by an upper projection or an optimizer rewrite.
-                self.collect_index_probe_columns(table, index);
             }
             // VectorBruteScan carries no residual filter expression (it is only
             // emitted for the no-WHERE shape) and its query vector is a constant,

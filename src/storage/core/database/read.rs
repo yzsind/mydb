@@ -580,6 +580,115 @@ impl Database {
         Ok(complete.then_some(rows))
     }
 
+    /// Score every candidate under the authoritative snapshot without copying
+    /// resident fixed VECTOR payloads. Cold/forwarded/invisible/old-layout
+    /// windows use the ordinary undo-aware projected reader in bounded batches.
+    pub(crate) fn score_vector_rows_many_with_handle(
+        &self,
+        heap: &HeapHandle,
+        table: &TableSchema,
+        row_ids: &[RowId],
+        txn: TxnView,
+        column: usize,
+        query: &crate::vector::VectorValue,
+        metric: crate::engine::vector::Metric,
+    ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        self.check_primary_read_view(table, txn)?;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[column].data_type
+        else {
+            return Err(crate::engine::vector::vector_err(
+                "candidate scoring requires a fixed VECTOR column",
+            ));
+        };
+        let _metadata =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                row_ids.len().saturating_mul(
+                    std::mem::size_of::<RowId>() + std::mem::size_of::<(RowId, f64)>(),
+                ),
+            )?;
+        let mut ordered = row_ids.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        let mut out = Vec::with_capacity(ordered.len());
+        let mut vis_cache = ScanVisibilityCache::new();
+        for window in ordered.chunks(64) {
+            crate::engine::cancel::check_cancelled()?;
+            let base = out.len();
+            let complete = {
+                let heap_read = heap.read();
+                heap_read.with_lob(|| {
+                    heap_read.visit_mvcc_payloads_many_cached_with_plan(window, &[column], |row| {
+                        if row.layout_id != table.active_layout_id
+                            || !self.row_version_visible_cached(&mut vis_cache, row.header, txn)?
+                        {
+                            return Ok(false);
+                        }
+                        if row.header.is_deleted() {
+                            return Ok(true);
+                        }
+                        let body = &row.payload[row.body_offset..];
+                        let Some(range) = fixed_column_byte_range_in_body(
+                            body,
+                            row.codec,
+                            row.layout_id,
+                            row.has_external,
+                            column,
+                        )?
+                        else {
+                            return Ok(false);
+                        };
+                        if range.width != datatype.payload_len(dimension) {
+                            return Ok(false);
+                        }
+                        let value = crate::vector::VectorRef {
+                            datatype,
+                            dimension,
+                            payload: &body
+                                [range.offset_in_payload..range.offset_in_payload + range.width],
+                        };
+                        crate::engine::vector::validate_internal(&value)?;
+                        let score = crate::engine::vector::distance::typed_ordering_distance(
+                            query, &value, metric,
+                        )?;
+                        out.push((row.row_id, score));
+                        Ok(true)
+                    })
+                })?
+            };
+            if complete {
+                crate::engine::perf_events::record_rows_examined((out.len() - base) as u64);
+                continue;
+            }
+            out.truncate(base);
+            let _fallback_scratch =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    window
+                        .len()
+                        .saturating_mul(datatype.payload_len(dimension).saturating_add(128)),
+                )?;
+            for (row, values) in
+                self.read_row_columns_many_with_handle(heap, table, window, txn, &[column])?
+            {
+                if let Some(Value::Vector(value)) = values.first().filter(
+                    |v| matches!(v, Value::Vector(value) if value.dimension == query.dimension),
+                ) {
+                    out.push((
+                        row,
+                        crate::engine::vector::distance::typed_ordering_distance(
+                            query, value, metric,
+                        )?,
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Batch full-row counterpart of `read_row_with_handle`. Keeps the
     /// same page-local fast path and visibility semantics, but returns
     /// schema-aligned `StoredRow`s so callers that need the whole row
@@ -610,7 +719,6 @@ impl Database {
         self.check_primary_read_view(table, txn)?;
         Ok(self.read_row_columns(table, row_id, txn, &[])?.is_some())
     }
-
 
     /// Variant of [`is_row_id_visible_buffered`] that takes an
     /// already-locked `HeapFile` reference, letting the caller hoist
@@ -694,7 +802,8 @@ impl Database {
         if let Some(suspects) = suspects {
             for (visible, (key, row_id)) in mask.iter_mut().zip(entries) {
                 if *visible && suspects.contains(row_id) {
-                    *visible = self.is_index_entry_version_visible(table, index, key, *row_id, txn)?;
+                    *visible =
+                        self.is_index_entry_version_visible(table, index, key, *row_id, txn)?;
                 }
             }
         }
@@ -735,7 +844,8 @@ impl Database {
         if let Some(suspects) = suspects {
             for (visible, (key, row_id)) in mask.iter_mut().zip(entries) {
                 if *visible && suspects.contains(row_id) {
-                    *visible = self.is_index_entry_version_visible(table, index, key, *row_id, txn)?;
+                    *visible =
+                        self.is_index_entry_version_visible(table, index, key, *row_id, txn)?;
                 }
             }
         }
@@ -783,7 +893,9 @@ impl Database {
         self.check_primary_read_view(table, txn)?;
         entries
             .iter()
-            .map(|(key, row_id)| self.is_index_entry_version_visible(table, index, key, *row_id, txn))
+            .map(|(key, row_id)| {
+                self.is_index_entry_version_visible(table, index, key, *row_id, txn)
+            })
             .collect()
     }
 
@@ -800,7 +912,10 @@ impl Database {
             return Ok(false);
         };
         if index.is_fulltext() || index.has_multi_valued_parts() {
-            Ok(table.index_keys(index, &row.values)?.iter().any(|candidate| candidate == key))
+            Ok(table
+                .index_keys(index, &row.values)?
+                .iter()
+                .any(|candidate| candidate == key))
         } else {
             Ok(table.index_key(index, &row.values)? == *key)
         }

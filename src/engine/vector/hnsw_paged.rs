@@ -226,7 +226,6 @@ impl std::ops::Deref for QueryNavEdges {
 
 const QUERY_CACHE_ENTRIES: usize = 512;
 const QUERY_CACHE_WAYS: usize = 8;
-const QUERY_CACHE_SETS: usize = QUERY_CACHE_ENTRIES / QUERY_CACHE_WAYS;
 const QUERY_CACHE_MAX_K: usize = 128;
 
 #[derive(Debug)]
@@ -234,7 +233,7 @@ struct QueryCacheEntry {
     hash: u64,
     k: usize,
     ef: usize,
-    query_bits: Box<[u32]>,
+    query_bytes: Box<[u8]>,
     result: Arc<[(RowId, f64)]>,
 }
 
@@ -245,17 +244,27 @@ struct QueryCacheEntry {
 /// admission and capacity accounting deterministic.
 #[derive(Debug)]
 pub(crate) struct QueryNavCache {
+    max_k: usize,
     sets: parking_lot::RwLock<Vec<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]>>,
 }
 
 impl QueryNavCache {
     pub(crate) fn new() -> Self {
+        Self::with_max_k(QUERY_CACHE_MAX_K)
+    }
+
+    pub(crate) fn with_max_k(max_k: usize) -> Self {
+        Self::with_capacity(max_k, QUERY_CACHE_ENTRIES)
+    }
+
+    pub(crate) fn with_capacity(max_k: usize, entries: usize) -> Self {
         let mut sets: Vec<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]> =
             std::iter::repeat_with(|| std::array::from_fn(|_| None))
-                .take(QUERY_CACHE_SETS)
+                .take((entries / QUERY_CACHE_WAYS).max(1))
                 .collect();
         sets.shrink_to_fit();
         Self {
+            max_k,
             sets: parking_lot::RwLock::new(sets),
         }
     }
@@ -278,26 +287,40 @@ impl QueryNavCache {
     }
 
     pub(crate) fn get(&self, query: &[f32], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
-        if k > QUERY_CACHE_MAX_K {
+        // SAFETY: every f32 bit pattern may be borrowed as initialized bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
+        };
+        self.get_key(bytes, k, ef, Self::hash(query, k, ef))
+    }
+
+    pub(crate) fn get_bytes(&self, query: &[u8], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
+        self.get_key(query, k, ef, Self::hash_bytes(query, k, ef))
+    }
+
+    pub(crate) fn hash_bytes(query: &[u8], k: usize, ef: usize) -> u64 {
+        let mut hash = 0x9E37_79B9_7F4A_7C15u64
+            ^ (k as u64).rotate_left(17)
+            ^ (ef as u64).rotate_left(41)
+            ^ query.len() as u64;
+        for &byte in query.iter().step_by((query.len() / 32).max(1)).take(32) {
+            hash = (hash ^ byte as u64)
+                .rotate_left(27)
+                .wrapping_mul(0x9E37_79B1_85EB_CA87);
+        }
+        hash ^ (hash >> 32)
+    }
+
+    fn get_key(&self, query: &[u8], k: usize, ef: usize, hash: u64) -> Option<Vec<(RowId, f64)>> {
+        if k > self.max_k {
             return None;
         }
-        let hash = Self::hash(query, k, ef);
         let sets = self.sets.read();
-        for entry in sets[(hash as usize) % QUERY_CACHE_SETS].iter().flatten() {
+        for entry in sets[(hash as usize) % sets.len()].iter().flatten() {
             if entry.hash == hash
                 && entry.k == k
                 && entry.ef == ef
-                && entry.query_bits.len() == query.len()
-                // SAFETY: both allocations are valid for `len * 4` bytes;
-                // u32/f32 have identical size and alignment. The native
-                // in-memory representation is exactly the cache key.
-                && unsafe {
-                    libc::memcmp(
-                        entry.query_bits.as_ptr().cast(),
-                        query.as_ptr().cast(),
-                        query.len() * std::mem::size_of::<f32>(),
-                    ) == 0
-                }
+                && entry.query_bytes.as_ref() == query
             {
                 return Some(entry.result.to_vec());
             }
@@ -306,19 +329,31 @@ impl QueryNavCache {
     }
 
     pub(crate) fn insert(&self, query: &[f32], k: usize, ef: usize, result: &[(RowId, f64)]) {
-        if k > QUERY_CACHE_MAX_K || result.len() > QUERY_CACHE_MAX_K {
+        // SAFETY: the byte view is bounded by the initialized f32 slice.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
+        };
+        self.insert_key(bytes, k, ef, result, Self::hash(query, k, ef));
+    }
+
+    pub(crate) fn insert_bytes(&self, query: &[u8], k: usize, ef: usize, result: &[(RowId, f64)]) {
+        self.insert_key(query, k, ef, result, Self::hash_bytes(query, k, ef));
+    }
+
+    fn insert_key(&self, query: &[u8], k: usize, ef: usize, result: &[(RowId, f64)], hash: u64) {
+        if k > self.max_k || result.len() > self.max_k {
             return;
         }
-        let hash = Self::hash(query, k, ef);
+        let mut sets = self.sets.write();
         let entry = QueryCacheEntry {
             hash,
             k,
             ef,
-            query_bits: query.iter().map(|value| value.to_bits()).collect(),
+            query_bytes: query.into(),
             result: Arc::from(result),
         };
-        let mut sets = self.sets.write();
-        let set = &mut sets[(hash as usize) % QUERY_CACHE_SETS];
+        let index = (hash as usize) % sets.len();
+        let set = &mut sets[index];
         let slot = set
             .iter()
             .position(|current| current.is_none())
@@ -5014,6 +5049,56 @@ mod query_nav_allocation_tests {
     #[test]
     fn navigation_layout_rejects_overflow() {
         assert!(query_navigation_allocation(usize::MAX, 768, 32, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn native_memo_admits_wide_rerank_pools_with_an_explicit_bound() {
+        let cache = QueryNavCache::with_max_k(1024);
+        let key = vec![1u8; 777];
+        let result: Vec<_> = (0..400)
+            .map(|id| {
+                (
+                    crate::storage::RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    id as f64,
+                )
+            })
+            .collect();
+        cache.insert_bytes(&key, 400, 400, &result);
+        assert_eq!(cache.get_bytes(&key, 400, 400), Some(result.clone()));
+        assert!(cache.get_bytes(&key, 400, 800).is_none());
+        cache.insert_bytes(&key, 1025, 1025, &result);
+        assert!(cache.get_bytes(&key, 1025, 1025).is_none());
+        let small = QueryNavCache::new();
+        small.insert_bytes(&key, 400, 400, &result);
+        assert!(small.get_bytes(&key, 400, 400).is_none());
+    }
+
+    #[test]
+    fn native_query_cache_checks_unsampled_bytes_and_all_effort_parameters() {
+        let cache = QueryNavCache::new();
+        let key = vec![7u8; 1024];
+        let result = vec![(
+            crate::storage::RowId {
+                page_id: 3,
+                slot_id: 2,
+            },
+            1.25,
+        )];
+        cache.insert_bytes(&key, 10, 128, &result);
+        assert_eq!(cache.get_bytes(&key, 10, 128), Some(result));
+        let mut collision = key.clone();
+        collision[1] ^= 1;
+        assert_eq!(
+            QueryNavCache::hash_bytes(&key, 10, 128),
+            QueryNavCache::hash_bytes(&collision, 10, 128)
+        );
+        assert!(cache.get_bytes(&collision, 10, 128).is_none());
+        assert!(cache.get_bytes(&key, 11, 128).is_none());
+        assert!(cache.get_bytes(&key, 10, 64).is_none());
+        assert!(cache.get_bytes(&key[..1000], 10, 128).is_none());
     }
 
     #[test]

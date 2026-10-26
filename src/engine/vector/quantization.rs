@@ -126,10 +126,19 @@ impl Trainer {
             return Err(codec::vector_err("non-finite quantizer input"));
         }
         self.count += 1;
-        for (i, &x) in values.iter().enumerate() {
-            self.low[i] = self.low[i].min(x);
-            self.high[i] = self.high[i].max(x);
-            self.mean[i] += (x - self.mean[i]) / self.count as f64;
+        match self.config {
+            QuantizationConfig::Sq8 | QuantizationConfig::Sq4 => {
+                for (i, &x) in values.iter().enumerate() {
+                    self.low[i] = self.low[i].min(x);
+                    self.high[i] = self.high[i].max(x);
+                }
+            }
+            QuantizationConfig::Bq => {
+                for (i, &x) in values.iter().enumerate() {
+                    self.mean[i] += (x - self.mean[i]) / self.count as f64;
+                }
+            }
+            _ => {}
         }
         if let QuantizationConfig::Pq { train_samples, .. } = self.config {
             let limit = train_samples as usize;
@@ -275,8 +284,79 @@ pub(crate) struct QuantQuery {
     lut: Vec<[f64; 2]>,
     bq_lut: Vec<f64>,
     center_dot: f64,
+    sq_weights: Vec<f64>,
     _charge: ControlledMemoryCharge,
 }
+/// Independent reductions allow LLVM to vectorize byte-to-f64 scoring on
+/// NEON/AVX without reassociating a serial IEEE sum or narrowing native values.
+fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sq8_weighted_dot_neon(code, weights) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sq8_weighted_dot_portable(code, weights)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sq8_weighted_dot_neon(code: &[u8], weights: &[f64]) -> f64 {
+    use std::arch::aarch64::*;
+    let n = code.len().min(weights.len());
+    let mut sums = [vdupq_n_f64(0.0); 4];
+    let mut i = 0;
+    while i + 8 <= n {
+        // Widen whole groups instead of scalar lane extraction/shuffling.
+        // Both slices are in bounds; NEON permits these unaligned loads.
+        let bytes = vmovl_u8(vld1_u8(code.as_ptr().add(i)));
+        let low = vmovl_u16(vget_low_u16(bytes));
+        let high = vmovl_u16(vget_high_u16(bytes));
+        let values = [
+            vcvtq_f64_u64(vmovl_u32(vget_low_u32(low))),
+            vcvtq_f64_u64(vmovl_u32(vget_high_u32(low))),
+            vcvtq_f64_u64(vmovl_u32(vget_low_u32(high))),
+            vcvtq_f64_u64(vmovl_u32(vget_high_u32(high))),
+        ];
+        for lane in 0..4 {
+            sums[lane] = vfmaq_f64(
+                sums[lane],
+                values[lane],
+                vld1q_f64(weights.as_ptr().add(i + lane * 2)),
+            );
+        }
+        i += 8;
+    }
+    let mut result = vaddvq_f64(vaddq_f64(
+        vaddq_f64(sums[0], sums[1]),
+        vaddq_f64(sums[2], sums[3]),
+    ));
+    while i < n {
+        result += code[i] as f64 * weights[i];
+        i += 1;
+    }
+    result
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn sq8_weighted_dot_portable(code: &[u8], weights: &[f64]) -> f64 {
+    let mut sums = [0.0; 8];
+    let mut codes = code.chunks_exact(8);
+    let mut values = weights.chunks_exact(8);
+    for (code, weight) in codes.by_ref().zip(values.by_ref()) {
+        for lane in 0..8 {
+            sums[lane] += code[lane] as f64 * weight[lane];
+        }
+    }
+    let tail = codes
+        .remainder()
+        .iter()
+        .zip(values.remainder())
+        .map(|(&c, &w)| c as f64 * w)
+        .sum::<f64>();
+    sums.into_iter().sum::<f64>() + tail
+}
+
 impl Quantizer {
     pub(crate) fn code_len(&self) -> usize {
         self.model.config.code_len(self.model.dimension)
@@ -562,6 +642,7 @@ impl Quantizer {
         let extra = match self.model.config {
             QuantizationConfig::Pq { bits, .. } => self.model.centers.len() * (1usize << bits) * 16,
             QuantizationConfig::Bq => (self.model.dimension as usize).div_ceil(4) * 16 * 8,
+            QuantizationConfig::Sq8 => self.model.dimension as usize * 8,
             _ => 0,
         };
         let charge = ControlledMemoryCharge::try_new_recoverable(
@@ -576,8 +657,23 @@ impl Quantizer {
             lut: Vec::new(),
             bq_lut: Vec::new(),
             center_dot: 0.0,
+            sq_weights: Vec::new(),
             _charge: charge,
         };
+        if matches!(self.model.config, QuantizationConfig::Sq8) && self.metric() != Metric::L2 {
+            q.sq_weights = q
+                .values
+                .iter()
+                .zip(&self.model.scale)
+                .map(|(x, scale)| x * scale)
+                .collect();
+            q.center_dot = q
+                .values
+                .iter()
+                .zip(&self.model.low)
+                .map(|(x, lo)| x * lo)
+                .sum();
+        }
         if let QuantizationConfig::Pq { bits, .. } = self.model.config {
             q.lut = Vec::with_capacity(self.model.centers.len() * (1usize << bits));
             for (part, centers) in self.model.centers.iter().enumerate() {
@@ -777,6 +873,28 @@ impl Quantizer {
         let mut score = 0.0;
         let mut norm = 0.0;
         match self.model.config {
+            QuantizationConfig::Sq8 => {
+                // Keep per-dimension affine scales and full f64 range. Explicit
+                // independent lanes expose SIMD without a scalar component()
+                // call or a metric/config dispatch for every coordinate.
+                let mut scores = [0.0; 8];
+                let mut norms = [0.0; 8];
+                for (block, chunk) in code.chunks(8).enumerate() {
+                    for (lane, &c) in chunk.iter().enumerate() {
+                        let i = block * 8 + lane;
+                        let y = self.model.low[i] + self.model.scale[i] * c as f64;
+                        let x = query.values[i];
+                        scores[lane] += if metric == Metric::L2 {
+                            (x - y) * (x - y)
+                        } else {
+                            x * y
+                        };
+                        norms[lane] += y * y;
+                    }
+                }
+                score = scores.into_iter().sum();
+                norm = norms.into_iter().sum();
+            }
             QuantizationConfig::Pq { bits, .. } => {
                 let k = 1usize << bits;
                 for part in 0..self.model.centers.len() {
@@ -846,8 +964,31 @@ impl Quantizer {
             ControlledMemoryCategory::StorageScratch,
             self.model.dimension as usize * 8 + self.record_len() * 2 + value.len() + 12,
         )?;
+        self.store_with_reserved_scratch(value, file)
+    }
+
+    /// The caller must hold admission for dense values, payloads and encoding
+    /// workspace for the whole call. Bulk writers reuse that bounded workspace.
+    pub(crate) fn store_with_reserved_scratch(
+        &self,
+        value: &VectorValue,
+        file: Option<&Arc<VectorIndexFile>>,
+    ) -> Result<VectorValue, QueryError> {
         let mut bytes = vec![0; self.record_len()];
         if let Some(code) = self.encode(value) {
+            // The header's auxiliary word stores the reconstructed cosine norm.
+            // Exception records use the same word for their blob pointer.
+            if self.metric() == Metric::Cosine
+                && matches!(self.model.config, QuantizationConfig::Sq8)
+            {
+                let norm = code
+                    .iter()
+                    .zip(&self.model.low)
+                    .zip(&self.model.scale)
+                    .map(|((&c, &lo), &scale)| (lo + scale * c as f64).powi(2))
+                    .sum::<f64>();
+                bytes[1..9].copy_from_slice(&norm.to_le_bytes());
+            }
             bytes[9..].copy_from_slice(&code);
         } else {
             bytes[0] = 1;
@@ -935,11 +1076,29 @@ impl Quantizer {
                 "corrupt compressed vector record",
             ));
         }
+        let score = |prepared: &QuantQuery| {
+            if !prepared.sq_weights.is_empty() {
+                let norm = f64::from_le_bytes(bytes[1..9].try_into().unwrap());
+                // Older records have a zero auxiliary word. Keep their exact
+                // decoder as the fallback, including zero-norm validation.
+                if self.metric() == Metric::Dot || (norm > 0.0 && norm.is_finite()) {
+                    let dot =
+                        prepared.center_dot + sq8_weighted_dot(&bytes[9..], &prepared.sq_weights);
+                    return match self.metric() {
+                        Metric::Dot => -dot,
+                        Metric::Cosine if prepared.norm2 > 0.0 => {
+                            1.0 - (dot / (prepared.norm2 * norm).sqrt()).clamp(-1.0, 1.0)
+                        }
+                        _ => f64::INFINITY,
+                    };
+                }
+            }
+            self.score(&bytes[9..], prepared)
+        };
         if let Some(prepared) = prepared {
-            Ok(self.score(&bytes[9..], prepared))
+            Ok(score(prepared))
         } else {
-            let prepared = self.prepare(query)?;
-            Ok(self.score(&bytes[9..], &prepared))
+            Ok(score(&self.prepare(query)?))
         }
     }
     pub(crate) fn value_payload(
@@ -982,6 +1141,25 @@ mod tests {
             QuantizationConfig::Bq,
         ]
     }
+    #[test]
+    fn sq8_weighted_reduction_matches_scalar() {
+        for dimension in [1, 7, 8, 9, 31, 128, 769, 4096] {
+            let code: Vec<_> = (0..dimension).map(|i| (i * 71) as u8).collect();
+            for magnitude in [1e-100, 1.0, 1e100] {
+                let weights: Vec<_> = (0..dimension)
+                    .map(|i| ((i * 13 % 119) as f64 - 59.0) * magnitude)
+                    .collect();
+                let reference = code
+                    .iter()
+                    .zip(&weights)
+                    .map(|(&c, &w)| c as f64 * w)
+                    .sum::<f64>();
+                let actual = sq8_weighted_dot(&code, &weights);
+                assert!((actual - reference).abs() <= 1e-12 * magnitude * dimension as f64 * 255.0);
+            }
+        }
+    }
+
     #[test]
     fn quantized_asymmetric_scores_match_scalar_reconstruction() {
         for datatype in [
@@ -1046,6 +1224,11 @@ mod tests {
                                 }
                                 _ => unreachable!(),
                             };
+                            let stored = q.store(&value, None).unwrap();
+                            let payload_score = q
+                                .score_payload(&stored.payload, None, &query, Some(&prepared))
+                                .unwrap();
+                            assert!((payload_score - reference).abs() <= 1e-10 * reference.abs().max(1.0), "payload {datatype:?} {metric:?} {}: {payload_score} != {reference}", q.name());
                             let actual = q.score(&code, &prepared);
                             assert!(
                                 (actual - reference).abs() <= 1e-10 * reference.abs().max(1.0),

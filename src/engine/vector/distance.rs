@@ -446,6 +446,25 @@ pub(crate) fn ordering_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
     unsafe { ordering_distance_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len()), metric) }
 }
 
+/// Cache a cosine node's SIMD norm once while its vector is immutable.
+pub(crate) fn cosine_norm_squared(vector: &[f32]) -> f32 {
+    unsafe { cosine_parts_ptr(vector.as_ptr(), vector.as_ptr(), vector.len()).1 }
+}
+
+/// ANN edge geometry on original f32 payloads, reusing cached norms and
+/// the throughput-oriented dot kernel. Authoritative heap scoring remains
+/// unchanged; exceptional magnitudes retain the wide-distance fallback.
+#[inline]
+pub(crate) fn cosine_with_norms(a: &[f32], b: &[f32], na: f32, nb: f32) -> f64 {
+    if na.is_normal() && nb.is_normal() {
+        let dot = unsafe { dot_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len())) };
+        if dot.is_finite() {
+            return (1.0 - finish_cosine(dot, na, nb)) as f64;
+        }
+    }
+    ordering_distance(a, b, Metric::Cosine)
+}
+
 /// Keep ordinary SIMD reductions unchanged; exceptional magnitudes use f64
 /// before subtraction/multiplication. Finite f32 vectors have finite f64 norms.
 #[inline]
@@ -1778,6 +1797,32 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_cosine_norms_match_f32_geometry_and_preserve_wide_fallbacks() {
+        for dim in [1, 7, 8, 9, 31, 128, 769] {
+            for scale in [1e-30f32, 1.0, 1e30] {
+                let a: Vec<_> = (0..dim)
+                    .map(|i| ((i * 13 % 97) as f32 - 48.0) * scale)
+                    .collect();
+                let b: Vec<_> = (0..dim)
+                    .map(|i| ((i * 17 % 89) as f32 - 43.0) * scale)
+                    .collect();
+                let actual =
+                    cosine_with_norms(&a, &b, cosine_norm_squared(&a), cosine_norm_squared(&b));
+                let reference = ordering_distance(&a, &b, Metric::Cosine);
+                if scale == 1.0 {
+                    // ANN construction may use a different f32 dot reduction
+                    // order; its geometry stays within four f32 ulps.
+                    assert!(
+                        (actual - reference).abs() <= 4.0 * f32::EPSILON as f64,
+                        "dim={dim}: {actual} != {reference}"
+                    );
+                } else {
+                    assert_eq!(actual.to_bits(), reference.to_bits());
+                }
+            }
+        }
+    }
 
     #[test]
     fn prepared_f32_distance_preserves_bits_and_exceptional_domains() {

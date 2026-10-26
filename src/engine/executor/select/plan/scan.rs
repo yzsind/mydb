@@ -5684,6 +5684,18 @@ pub(super) fn execute_vector_index_scan(
     }
 
     let partition_budget = max_scan / storage_ids.len().max(1);
+    // Score the complete ANN pool in place, then decode output columns only
+    // for winners. Filter/secondary-order/relaxed-order paths retain their
+    // existing row oracle, as do transaction-local vector changes.
+    let mut late_materialize = quantized
+        && filter.is_none()
+        && order_by.len() == 1
+        && !matches!(iterative_scan, IterativeScan::RelaxedOrder)
+        && storage_ids.iter().all(|sid| {
+            db.pending_vector_upsert_row_ids(txn.txn_id, table.schema.id, *sid)
+                .is_empty()
+        });
+    let mut late_scores: Vec<(f64, u64, RowId, usize)> = Vec::new();
 
     // Candidates already heap-read and filtered, keyed by partition-qualified
     // row identity. Widening re-runs the graph search with a larger pool but
@@ -5755,6 +5767,63 @@ pub(super) fn execute_vector_index_scan(
         // Sort the merged pool by graph distance so subsequent dedup keeps
         // the closest copy in stale-graph cases.
         candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        if exact_order {
+            late_materialize = false;
+        }
+        if late_materialize {
+            let mut scoring_charge = retained_charge.sibling();
+            scoring_charge.add_non_spillable(candidates.len().saturating_mul(128))?;
+            let mut pending = crate::util::fast_hash::AhHashMap::default();
+            for &(sid, row, _) in &candidates {
+                if seen.contains(&(sid, row)) {
+                    continue;
+                }
+                if pending.len() >= max_scan.saturating_sub(examined) {
+                    break;
+                }
+                seen.insert((sid, row));
+                pending.insert((sid, row), examined + pending.len());
+            }
+            if candidates
+                .iter()
+                .any(|&(sid, row, _)| !seen.contains(&(sid, row)))
+            {
+                break true;
+            }
+            examined += pending.len();
+            crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                &mut late_scores,
+                pending.len(),
+                &mut retained_charge,
+                "vector candidate scores",
+            )?;
+            for &sid in &storage_ids {
+                let ids: Vec<_> = pending
+                    .keys()
+                    .filter_map(|&(part, row)| (part == sid).then_some(row))
+                    .collect();
+                if ids.is_empty() {
+                    continue;
+                }
+                let heap = db.cached_heap_handle(sid)?;
+                for (row, distance) in db.score_vector_rows_many_with_handle(
+                    &heap,
+                    &table.schema,
+                    &ids,
+                    txn,
+                    col_idx,
+                    query_vector,
+                    metric,
+                )? {
+                    if let Some(&rank) = pending.get(&(sid, row)) {
+                        late_scores.push((distance, sid, row, rank));
+                    }
+                }
+            }
+            if late_scores.len() >= k || matches!(iterative_scan, IterativeScan::Off) {
+                break false;
+            }
+        }
 
         let mut budget_exhausted = false;
         let mut candidates = candidates.into_iter().peekable();
@@ -5791,15 +5860,25 @@ pub(super) fn execute_vector_index_scan(
                 txn,
                 &read_columns,
             )?;
-            let mut batch_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+            let mut batch_charge = retained_charge.sibling();
+            // Values move into PlanFields. Admit their additional headers for
+            // this bounded window before allocation, then transfer ownership
+            // once per window instead of releasing/recharging every row.
+            let field_headers = read_columns
+                .len()
+                .saturating_mul(std::mem::size_of::<PlanField>() + 32)
+                .saturating_add(std::mem::size_of::<PlanRow>() + std::mem::size_of::<f64>());
             batch_charge.add_non_spillable(
                 values
                     .iter()
                     .map(|(_, values)| {
                         crate::engine::executor::mem_budget::estimate_row_bytes(values)
+                            .saturating_add(field_headers)
                     })
                     .sum(),
             )?;
+            let scored_start = scored.len();
+            let mut enough_exact = false;
             let mut values = values
                 .into_iter()
                 .collect::<crate::util::fast_hash::AhHashMap<_, _>>();
@@ -5815,9 +5894,6 @@ pub(super) fn execute_vector_index_scan(
                 let Some(values) = values.remove(&row_id) else {
                     continue; // invisible / deleted under this snapshot
                 };
-                batch_charge.release_bytes(
-                    crate::engine::executor::mem_budget::estimate_row_bytes(&values),
-                );
                 // Re-rank by the row's *current* heap vector, not the graph copy.
                 // Score directly over the stored little-endian bytes — no per-
                 // candidate `Vec<f32>` decode.
@@ -5845,10 +5921,6 @@ pub(super) fn execute_vector_index_scan(
                     None => true,
                 };
                 if keep {
-                    retained_charge.add_non_spillable(
-                        super::nested_loop::materialized_plan_row_charge(&row)
-                            + std::mem::size_of::<f64>(),
-                    )?;
                     scored.push((dist, row));
                     // When the candidate ordering is *exact* (`exact_order`:
                     // HNSW's f32 node vectors, or IVF's f32 Dot lists), candidates
@@ -5863,9 +5935,22 @@ pub(super) fn execute_vector_index_scan(
                     // With a filter we must keep scanning regardless (dropped rows
                     // need replacements — the iterative widening below handles it).
                     if filter.is_none() && exact_order && scored.len() >= k {
-                        break 'candidate_batches;
+                        enough_exact = true;
+                        break;
                     }
                 }
+            }
+            let retained_bytes = scored[scored_start..]
+                .iter()
+                .map(|(_, row)| {
+                    super::nested_loop::materialized_plan_row_charge(row)
+                        + std::mem::size_of::<f64>()
+                })
+                .sum();
+            let mut moved = batch_charge.split(retained_bytes);
+            retained_charge.absorb(&mut moved);
+            if enough_exact {
+                break 'candidate_batches;
             }
         }
         if budget_exhausted {
@@ -5933,6 +6018,7 @@ pub(super) fn execute_vector_index_scan(
     }
     if exact_fallback || db.vector_snapshot_requires_exact(txn) {
         drop(scored);
+        drop(late_scores);
         retained_charge.release_bytes(retained_charge.charged());
         if order_by.len() > 1 {
             return execute_ordered_vector_fallback(
@@ -5952,6 +6038,58 @@ pub(super) fn execute_vector_index_scan(
             ),
             None => execute_vector_brute_scan(db, txn, table, col_idx, query_vector, metric, k),
         };
+    }
+
+    if late_materialize {
+        late_scores.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.3.cmp(&b.3)));
+        late_scores.truncate(k);
+        let mut values_by_row = crate::util::fast_hash::AhHashMap::default();
+        for &sid in &storage_ids {
+            let ids: Vec<_> = late_scores
+                .iter()
+                .filter_map(|&(_, part, row, _)| (part == sid).then_some(row))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let heap = db.cached_heap_handle(sid)?;
+            let values = db.read_row_columns_many_with_handle(
+                &heap,
+                &table.schema,
+                &ids,
+                txn,
+                &output_columns,
+            )?;
+            let headers = output_columns
+                .len()
+                .saturating_mul(std::mem::size_of::<PlanField>() + 32)
+                .saturating_add(std::mem::size_of::<PlanRow>());
+            retained_charge.add_non_spillable(
+                values
+                    .iter()
+                    .map(|(_, row)| {
+                        crate::engine::executor::mem_budget::estimate_row_bytes(row)
+                            .saturating_add(headers)
+                    })
+                    .sum(),
+            )?;
+            values_by_row.extend(values.into_iter().map(|(row, values)| ((sid, row), values)));
+        }
+        let mut out = Vec::with_capacity(late_scores.len());
+        for (_, sid, row, _) in late_scores {
+            let Some(values) = values_by_row.remove(&(sid, row)) else {
+                if quantized {
+                    db.record_vector_query_work(&table.schema, index, sid, 0, true);
+                }
+                return execute_vector_brute_scan(db, txn, table, col_idx, query_vector, metric, k);
+            };
+            let mut row = projected_values_to_plan_row(table, &output_columns, values)?;
+            if output_columns == read_columns {
+                row.schema = row_schema.clone();
+            }
+            out.push(row);
+        }
+        return Ok(out);
     }
 
     if order_by.len() > 1 {

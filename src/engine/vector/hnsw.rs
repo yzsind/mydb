@@ -506,7 +506,7 @@ impl CompactHnswBuilder {
             mids: vec![self.mid; self.stats.dim],
             inv_scale: self.inv_scale,
         }));
-        self.graph.link_all(threads.max(1));
+        self.graph.link_all_frozen(threads.max(1));
         Ok(self.graph)
     }
 }
@@ -750,6 +750,9 @@ struct Node {
     /// Per-node vector latch lets small in-place UPDATEs proceed under the
     /// graph's shared structural guard instead of pausing every search.
     vector: RwLock<Vec<f32>>,
+    // Cosine payloads are immutable: in-place updates are L2-only. Re-links
+    // append a fresh node, so the norm needs no shared cache or extra latch.
+    cosine_norm: f32,
     /// `neighbors[l]` is the adjacency list at layer `l`, for `l` in
     /// `0..=node_level`. Each node has its own mutex so wiring at node A
     /// doesn't block wiring at node B.
@@ -1091,6 +1094,8 @@ pub(crate) struct HnswIndex {
     /// Topology-only graph built from SQ8 codes (paged cold build): nodes
     /// carry no exact vectors, so edge selection must use the codes.
     codes_only: bool,
+    // Set only by the exclusive cold builder, until all scoped readers join.
+    frozen_build_vectors: AtomicBool,
     // Temporary cold-build graphs own the caller's admitted workspace. Keep
     // this last so all graph allocations are freed before releasing admission.
     build_reservation: Option<BuildReservation>,
@@ -1162,6 +1167,7 @@ impl HnswIndex {
             next_seq: AtomicU64::new(0),
             identity_lineage: AtomicU64::new(0),
             codes_only: false,
+            frozen_build_vectors: AtomicBool::new(false),
             build_reservation: None,
         }
     }
@@ -1802,7 +1808,7 @@ impl HnswIndex {
                 }
             }
         }
-        replacement.link_all(threads);
+        replacement.link_all_frozen(threads);
         after_rebuild();
         let replay = |remap: &mut Vec<u32>| -> Result<usize, QueryError> {
             if self.compaction_cancelled.load(Ordering::Acquire) {
@@ -1990,7 +1996,16 @@ impl HnswIndex {
 
     #[inline]
     fn with_node_vector<T>(&self, id: u32, f: impl FnOnce(&[f32]) -> T) -> T {
-        f(&self.nodes.get(id).vector.read())
+        let node = self.nodes.get(id);
+        if self.frozen_build_vectors.load(Ordering::Acquire) {
+            // SAFETY: only link_all_frozen can set this flag. Its exclusive
+            // &mut self excludes external aliases; scoped construction workers
+            // mutate topology only. They all join before the flag is cleared,
+            // including during unwinding, so no vector writer can overlap.
+            f(unsafe { &*node.vector.data_ptr() })
+        } else {
+            f(&node.vector.read())
+        }
     }
 
     #[inline]
@@ -2447,9 +2462,17 @@ impl HnswIndex {
                 return l2_ssd_i8(ar.codes_for(a), ar.codes_for(b)) as f64 * (ar.scale_sq as f64);
             }
         }
-        let va = self.nodes.get(a).vector.read();
-        let vb = self.nodes.get(b).vector.read();
-        ordering_distance(&va, &vb, self.metric)
+        let left = self.nodes.get(a);
+        let right = self.nodes.get(b);
+        self.with_node_vector(a, |va| {
+            self.with_node_vector(b, |vb| {
+                if self.metric == Metric::Cosine {
+                    super::distance::cosine_with_norms(va, vb, left.cosine_norm, right.cosine_norm)
+                } else {
+                    ordering_distance(va, vb, self.metric)
+                }
+            })
+        })
     }
 
     /// Returns the selected candidates (id + distance-to-query), so callers that
@@ -2759,6 +2782,11 @@ impl HnswIndex {
                 update_epoch: AtomicU64::new(0),
                 seq,
                 row_id,
+                cosine_norm: if self.metric == Metric::Cosine {
+                    super::distance::cosine_norm_squared(&vector)
+                } else {
+                    0.0
+                },
                 vector: RwLock::new(vector),
                 neighbors: Mutex::new(vec![Vec::new(); level + 1]),
                 deleted: AtomicBool::new(false),
@@ -2793,6 +2821,7 @@ impl HnswIndex {
                 update_epoch: AtomicU64::new(0),
                 seq: id as u64,
                 row_id,
+                cosine_norm: 0.0,
                 vector: RwLock::new(Vec::new()),
                 neighbors: Mutex::new(neighbors),
                 deleted: AtomicBool::new(false),
@@ -2937,7 +2966,16 @@ impl HnswIndex {
                             .iter()
                             .map(|s| Scored {
                                 dist: self.with_node_vector(s.id, |v| {
-                                    ordering_distance(&node_vec, v, self.metric)
+                                    if self.metric == Metric::Cosine {
+                                        super::distance::cosine_with_norms(
+                                            &node_vec,
+                                            v,
+                                            node.cosine_norm,
+                                            self.nodes.get(s.id).cosine_norm,
+                                        )
+                                    } else {
+                                        ordering_distance(&node_vec, v, self.metric)
+                                    }
                                 }),
                                 id: s.id,
                             })
@@ -3016,6 +3054,21 @@ impl HnswIndex {
     /// workers (`link_node` is `&self` under the M3 per-node latches, so
     /// concurrent linking over disjoint id ranges is safe). Small graphs link
     /// serially — `thread::scope` spawn/join would dominate.
+    /// Owned cold graphs have immutable payloads throughout construction.
+    /// The exclusive receiver makes that precondition enforceable by callers;
+    /// only scoped read-only payload probes run until this method returns.
+    pub(crate) fn link_all_frozen(&mut self, threads: usize) {
+        struct Reset<'a>(&'a AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.frozen_build_vectors.store(true, Ordering::Release);
+        let _reset = Reset(&self.frozen_build_vectors);
+        self.link_all(threads);
+    }
+
     pub(crate) fn link_all(&self, threads: usize) {
         let len = self.nodes.len();
         if len == 0 {
@@ -3112,12 +3165,19 @@ impl HnswIndex {
                 eprintln!("[hnsw] PhaseD final prune: {:?} (n={len})", t_d.elapsed());
             }
         }
-        self.repair_build_connectivity();
+        let repair_started = std::time::Instant::now();
+        self.repair_build_connectivity(threads);
+        if timing {
+            eprintln!(
+                "[hnsw] connectivity repair: {:?} (n={len})",
+                repair_started.elapsed()
+            );
+        }
     }
 
     /// Repair only disconnected cold graphs. Ordinary connected graphs keep
     /// every selected edge. One spare slot per node bounds the repair degree.
-    fn repair_build_connectivity(&self) {
+    fn repair_build_connectivity(&self, threads: usize) {
         let count = self.nodes.len();
         let Some(entry) = self.topology.lock().entry_point else {
             return;
@@ -3150,7 +3210,9 @@ impl HnswIndex {
             return;
         }
         let arena = self.quant.read().clone();
-        for id in 0..count as u32 {
+        // Each prune changes only its own adjacency and reads immutable
+        // payloads. No cross-node adjacency latch is acquired here.
+        parallel_claim_ids(0, count as u32, threads.max(1), |id| {
             let mut neighbors = self.nodes.get(id).neighbors.lock();
             neighbors[0] = self.prune_select(
                 id,
@@ -3158,7 +3220,7 @@ impl HnswIndex {
                 self.m0 - 1,
                 self.selection_arena(arena.as_deref()),
             );
-        }
+        });
         seen.fill(false);
         visit(entry, &mut seen, &mut stack);
         let mut anchor = entry;
@@ -3602,6 +3664,11 @@ impl HnswIndex {
                     update_epoch: AtomicU64::new(0),
                     seq,
                     row_id,
+                    cosine_norm: if metric == Metric::Cosine {
+                        super::distance::cosine_norm_squared(&vector)
+                    } else {
+                        0.0
+                    },
                     vector: RwLock::new(vector),
                     neighbors: Mutex::new(neighbors),
                     deleted: AtomicBool::new(deleted),
@@ -3745,6 +3812,39 @@ mod tests {
             .live
             .store(vectors.len(), std::sync::atomic::Ordering::Release);
         searchable
+    }
+
+    #[test]
+    fn frozen_cold_payload_probes_preserve_serial_topology() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let ordinary = HnswIndex::new(metric, 4, 32);
+            let mut frozen = HnswIndex::new(metric, 4, 32);
+            for id in 0..128 {
+                let value: Vec<_> = (0..9)
+                    .map(|j| ((id * (j * 2 + 3) + j * j) % 97) as f32 - 48.0)
+                    .collect();
+                ordinary.append_node(rid(id), value.clone()).unwrap();
+                frozen.append_node(rid(id), value).unwrap();
+            }
+            ordinary.link_all(1);
+            frozen.link_all_frozen(1);
+            assert!(!frozen.frozen_build_vectors.load(Ordering::Acquire));
+            assert_eq!(ordinary.build_entry(), frozen.build_entry());
+            for id in 0..128 {
+                assert_eq!(
+                    *ordinary.nodes.get(id).neighbors.lock(),
+                    *frozen.nodes.get(id).neighbors.lock(),
+                    "{metric:?} node {id}"
+                );
+            }
+            if metric == Metric::L2 {
+                let update = [-47.99; 9];
+                // After thawing, ordinary mutation and scoring use their
+                // existing latches/epoch invalidation again.
+                let _ = frozen.try_update_in_place(rid(0), &update, 10000.0);
+                let _ = frozen.search(&update, 1, 128);
+            }
+        }
     }
 
     #[test]
@@ -4943,6 +5043,7 @@ mod source_audit_tests {
             update_epoch: AtomicU64::new(0),
             seq: id as u64,
             row_id: row(id),
+            cosine_norm: 5.0,
             vector: RwLock::new(vec![1.0, 2.0]),
             neighbors: Mutex::new(vec![vec![]]),
             deleted: AtomicBool::new(false),
