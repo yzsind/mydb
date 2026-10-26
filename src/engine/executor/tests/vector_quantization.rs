@@ -564,7 +564,7 @@ fn vector_quantization_copy_validates_type_and_dimension_before_publication() {
 }
 
 #[test]
-fn scalar_hnsw_parallel_paged_image_survives_restart_and_dml() {
+fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml() {
     let _env = HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", "paged"),
         ("MYDB_HNSW_BUILD_THREADS", "4"),
@@ -573,7 +573,7 @@ fn scalar_hnsw_parallel_paged_image_survives_restart_and_dml() {
     ]);
     for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
         for metric in ["L2", "COSINE", "DOT"] {
-            for quant in ["none", "sq8", "sq4", "pq"] {
+            for quant in ["none", "sq8", "sq4", "pq", "bq"] {
                 let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
                 let sql = format!("SELECT /*+ HNSW_EF(4096) */ id FROM items ORDER BY DISTANCE(v,'[1,2,3,4,5,6,7,8,9]','{metric}'),id LIMIT 11");
                 let expected;
@@ -602,10 +602,25 @@ fn scalar_hnsw_parallel_paged_image_survives_restart_and_dml() {
                             .execute("INSERT INTO items VALUES (3000,'[1,2,3,4,5,6,7,8,9]')")
                             .unwrap();
                         ",pq_bits=4,pq_train_samples=32,pq_iterations=3,rerank_mult=256"
+                    } else if quant == "bq" {
+                        // Enumerate every compressed candidate before comparing
+                        // with the exact oracle; BQ alone is deliberately lossy.
+                        ",rerank_mult=256"
                     } else {
                         ""
                     };
+                    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
                     engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric={metric},m=4,ef_construction=32,quantization={quant}{pq_options})")).unwrap();
+                    if quant == "bq" && metric != "DOT" {
+                        // Training, eligibility, construction codes and payload
+                        // publication each stream the heap once. A row-at-a-time
+                        // fallback skips the bounded topology's two extra scans.
+                        assert_eq!(
+                            crate::storage::Database::vector_build_heap_scans_for_test() - scans,
+                            4,
+                            "BQ must use bounded construction: {datatype} {metric}"
+                        );
+                    }
                     expected =
                         query_rows(&engine, &sql.replace("HNSW_EF(4096)", "NO_VECTOR_INDEX"));
                     assert_eq!(

@@ -999,7 +999,11 @@ impl Database {
         let mut used_parallel = false;
         if let (Some(q), Some(file)) = (&quantizer, graph.file()) {
             if q.trained_rows() >= 2048
-                && matches!(q.name(), "sq8" | "sq4" | "pq")
+                // Construction codes are independent of the published payload:
+                // BQ can use the same bounded SQ8 topology as SQ/PQ. The scan
+                // below rejects values requiring lossless exceptions before
+                // direct materialization is admitted.
+                && matches!(q.name(), "sq8" | "sq4" | "pq" | "bq")
                 && file.supports_direct_bulk_build()
             {
                 let mut stats = CompactHnswStats::new(meta.metric_enum());

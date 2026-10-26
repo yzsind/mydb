@@ -104,6 +104,15 @@ precedence over the index default. Explicit SET takes precedence even when
 the value equals the built-in default. Re-ranking uses an explicitly set
 session multiplier, otherwise the index `rerank_mult` captured at creation.
 
+This priority resolves the **base** HNSW ef. Dynamic scaling still applies
+after a hint, explicit SET, or index default has selected that base. With
+base ef=128, LIMIT 100 and the default dynamic factor of 4, the initial
+effective ef is 400. To keep the initial breadth at 128, set
+`mydb_hnsw_ef_dynamic_factor=0` as well as `mydb_hnsw_ef_search=128`.
+Filter/visibility-driven iterative scans can subsequently widen the search.
+Ef controls the retained search frontier; it is not a count or hard limit
+on all distance evaluations or physical page reads.
+
 | Session variable | Default | Effect |
 | --- | --- | --- |
 | `mydb_hnsw_ef_search` | 64 | Base HNSW search breadth |
@@ -253,7 +262,10 @@ quantization model or the stored column values.
 - BQ uses a shared center, one sign bit per dimension and per-row amplitude
   and norm corrections. L2 and DOT retain amplitude information; they do not
   substitute raw Hamming ordering. COSINE uses stable normalization. This is
-  scaled centered BQ, without a distribution-independent recall guarantee.
+  scaled centered BQ. Queries retain their original precision and score the
+  reconstructed compressed vectors through asymmetric distance lookup tables.
+  It is not equivalent to binarizing both operands and ranking by Hamming
+  distance, and has no distribution-independent recall guarantee.
 
 The executor retains a wider candidate pool, checks MVCC and residual filters,
 and ranks that pool by original visible heap values. Larger ef, nprobe and
@@ -266,6 +278,43 @@ lengths are d bytes (SQ8), ceil(d/2) (SQ4), ceil(pq_m*pq_bits/8) (PQ), and
 ceil(d/8) (BQ). BQ adds amplitude/norm metadata. The actual index also contains
 row identities, graph edges or lists, page overhead, codebooks, and lossless
 exceptions. Small datasets and INT8/SQ8 may not become smaller or faster.
+For example, a normal 768-dimensional BQ payload has 96 sign bytes,
+24 amplitude/correction bytes and a 9-byte record header: 129 bytes before
+graph and page overhead. Original heap vectors remain stored separately.
+
+### Interpreting recall
+
+`quantization` selects the persistent compressed representation, not a
+guaranteed recall level. The ordinary SQL path searches for candidates,
+checks visibility, and ranks them using original heap vectors. Similar final
+recall for none, SQ8, SQ4, PQ and BQ can therefore coexist with substantially
+different compressed-distance rankings. No strict recall ordering between
+these configurations is guaranteed; PQ codebook size/training, scalar ranges,
+data distribution and graph coverage all affect the result.
+
+By default, LIMIT 100 with a configured HNSW ef of 128 can explore with
+effective ef=400 and retain a rerank pool of 400. A high final recall then
+describes that complete retrieval pipeline, including exact scoring of the
+400 candidates. It does not describe the compressed top-100 ranking alone.
+Original vector reads can dominate latency when they miss the buffer cache.
+For 768-dimensional FLOAT32 vectors, scoring 400 candidates consumes about
+1.17 MiB of original vector values, before page and row overhead; this is
+logical data volume, not a measurement of physical I/O.
+
+Measure compressed-ranking recall, graph candidate coverage and final SQL
+recall separately when evaluating quantization. Use the same data snapshot,
+queries, ground truth and resolved search settings. For an application-level
+comparison, also compare latency, throughput, index size and heap/page reads
+at the required recall. `quantization=none` is an uncompressed persistent
+representation, but eligible FLOAT32 paths can still use auxiliary SQ8
+navigation; it is not a substitute for an exact-scan reference.
+
+Setting `rerank_mult=1` is not a general way to observe pre-rerank rankings:
+minimum pool sizes, filters, visibility and backend scoring can retain or
+reorder more than k candidates. Final SQL distances continue to use original
+visible values. A quantization-only experiment must scan compressed codes
+with the same trained model and scoring kernel, independently of graph
+traversal and heap reranking.
 
 Quantizer generations are immutable and replaced with their graph and coverage
 frontier. Significant scalar exceptions or PQ/BQ update growth request a
