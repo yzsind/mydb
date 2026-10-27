@@ -143,6 +143,131 @@ fn ai_json_unicode_duplicates_and_exact_depth_and_size_boundaries() {
     assert!(parse_json(text, text.len() - 1).is_err());
 }
 #[test]
+fn ai_default_policy_allows_all_networks_without_local_config() {
+    crate::util::env::with_vars(&[("MYDB_AI_LOCAL_CONFIG", None)], || {
+        let config = LocalConfig::load().unwrap();
+        for host in [
+            "8.8.8.8",
+            "169.254.169.254",
+            "0.0.0.0",
+            "239.1.2.3",
+            "255.255.255.255",
+            "198.18.0.1",
+            "192.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.10",
+            "100.64.0.1",
+            "100.127.255.254",
+            "[fd00::1]",
+            "[fe80::1]",
+            "[::]",
+            "[ff02::1]",
+            "[2001:db8::1]",
+            "[::ffff:169.254.169.254]",
+            "[::ffff:10.1.2.3]",
+        ] {
+            for scheme in ["http", "https"] {
+                let url = config
+                    .check_url(&format!("{scheme}://{host}:11434/v1"))
+                    .unwrap();
+                let ip = host.trim_matches(['[', ']']).parse().unwrap();
+                assert!(config.check_ip(ip).is_ok(), "{url}");
+            }
+        }
+        for hostname in ["models.internal", "models.example", "localhost"] {
+            assert!(config
+                .check_url(&format!("http://{hostname}:8000/v1"))
+                .is_ok());
+        }
+    });
+}
+
+#[test]
+fn ai_default_policy_preserves_url_validation_and_reload() {
+    crate::util::env::with_vars(&[("MYDB_AI_LOCAL_CONFIG", None)], || {
+        let config = LocalConfig::load().unwrap();
+        for url in [
+            "https://models.example/v1",
+            "http://models.internal:8000/v1",
+            "http://localhost:11434",
+            "http://LOCALHOST.:8080/v1",
+            "http://127.0.0.1:11434",
+            "http://127.0.0.2:8000",
+            "http://[::1]:11434",
+            "http://[::ffff:127.0.0.1]:8000",
+            "http://8.8.8.8/v1",
+            "http://169.254.169.254",
+        ] {
+            assert!(config.check_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "https://user:password@models.example/v1",
+            "https://models.example/v1?api_key=x",
+            "https://models.example/v1#fragment",
+            "file:///tmp/mydb/forbidden",
+        ] {
+            assert!(config.check_url(url).is_err(), "{url}");
+        }
+        LocalConfig::reload().unwrap();
+        assert!(!config.generation_is_current().unwrap());
+        assert!(config.current().unwrap().generation_is_current().unwrap());
+        assert!(LocalConfig::load()
+            .unwrap()
+            .generation_is_current()
+            .unwrap());
+    });
+}
+
+#[test]
+fn ai_optional_policy_preserves_defaults_and_explicit_errors() {
+    let dir = temp();
+    let path = dir.path().join("policy.json");
+    crate::util::env::with_vars(&[("MYDB_AI_LOCAL_CONFIG", path.to_str())], || {
+        assert!(LocalConfig::load().is_err());
+        std::fs::write(
+            &path,
+            r#"{"version":1,"user_limits":[{"user":"app","host":"%","max_inflight":2}]}"#,
+        )
+        .unwrap();
+        let config = LocalConfig::load().unwrap();
+        assert_eq!(config.user_limits[0].max_inflight, Some(2));
+        assert!(config.check_url("http://localhost:11434").is_ok());
+        assert!(config.check_ip("127.0.0.1".parse().unwrap()).is_ok());
+        assert!(config.check_url("http://models.internal:8000/v1").is_ok());
+        assert!(config.check_url("http://169.254.169.254").is_ok());
+        assert!(config.check_ip("169.254.169.254".parse().unwrap()).is_ok());
+        std::fs::write(&path, r#"{"version":1,"egress":{"allowed_origins":[]}}"#).unwrap();
+        let restricted = LocalConfig::reload().unwrap();
+        assert!(restricted.check_url("http://localhost:11434").is_err());
+        assert!(restricted.check_url("https://models.example").is_err());
+        assert!(restricted.check_ip("127.0.0.1".parse().unwrap()).is_err());
+        assert!(restricted.check_url("http://10.1.2.3:8000").is_err());
+        assert!(restricted.check_ip("10.1.2.3".parse().unwrap()).is_err());
+        for invalid in [
+            r#"{"version":2}"#,
+            r#"{"version":1,"unknown":true}"#,
+            "broken",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(LocalConfig::reload().is_err());
+            assert!(LocalConfig::load()
+                .unwrap()
+                .check_url("https://models.example")
+                .is_err());
+            assert!(restricted.generation_is_current().unwrap());
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(LocalConfig::reload().is_err());
+        assert!(restricted.generation_is_current().unwrap());
+    });
+    crate::util::env::with_vars(&[("MYDB_AI_LOCAL_CONFIG", Some(""))], || {
+        assert!(LocalConfig::load().is_err());
+    });
+}
+
+#[test]
 fn ai_egress_checks_canonical_origins_url_components_and_private_ranges() {
     let mut config:LocalConfig=serde_json::from_value(serde_json::json!({"version":1,"egress":{"allowed_origins":["https://models.example","http://127.0.0.1:11434"],"private_destinations":[],"allow_plaintext_origins":[]}})).unwrap();
     assert!(config.check_url("https://MODELS.example:443/v1").is_ok());
@@ -176,12 +301,16 @@ fn ai_egress_checks_canonical_origins_url_components_and_private_ranges() {
     assert!(config.check_ip("8.8.8.8".parse().unwrap()).is_ok());
     config
         .egress
+        .as_mut()
+        .unwrap()
         .private_destinations
         .push("127.0.0.1/32".parse().unwrap());
     assert!(config.check_ip("::ffff:127.0.0.1".parse().unwrap()).is_ok());
     assert!(config.check_ip("127.0.0.2".parse().unwrap()).is_err());
     config
         .egress
+        .as_mut()
+        .unwrap()
         .allow_plaintext_origins
         .push("http://127.0.0.1:11434".into());
     assert!(config.check_url("http://127.0.0.1:11434/api").is_ok());

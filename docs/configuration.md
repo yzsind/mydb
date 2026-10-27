@@ -1491,11 +1491,21 @@ See [backup procedures](backup-and-recovery.md) for diagnostics and recovery.
 
 ## External AI calls
 
-`ai_enabled` / `MYDB_AI_ENABLED` defaults to OFF. Configure `ai_local_config`
-(`MYDB_AI_LOCAL_CONFIG`) for explicit outbound origins and node-local quotas.
+`ai_enabled` / `MYDB_AI_ENABLED` defaults to ON. AI connections and models can
+be configured through SQL without a local policy file. By default, configured
+HTTP/HTTPS services have no outbound origin, IP address, network-range, or port
+restrictions, including public HTTP and link-local addresses. IPv4, IPv6, and
+DNS names are supported.
+`ai_local_config` (`MYDB_AI_LOCAL_CONFIG`) is optional, for explicit outbound
+origins, IP policies, private CAs, node-local account quotas, and historical
+encryption keys. An omitted `egress` leaves the network unrestricted;
+an explicit `egress` enables an allowlist. Invalid explicit files
+return errors rather than falling back to defaults.
 The startup capacity controls are `ai_max_inflight` (32), `ai_max_queue` (128),
 and `ai_memory_limit_mb` (128), with corresponding `MYDB_AI_*` environment names.
-`mydb_ai_enabled` is the privileged GLOBAL node switch.
+`mydb_ai_enabled` is the privileged GLOBAL node switch. Set `ai_enabled=OFF`
+at startup or `SET GLOBAL mydb_ai_enabled=OFF` to disable calls. AI_ADMIN and
+AI_USE privileges remain required for management and model use, respectively.
 
 API keys are encrypted database metadata. The master key comes from the
 **environment-only** `MYDB_AI_ENCRYPT_KEY`, or a randomly initialized

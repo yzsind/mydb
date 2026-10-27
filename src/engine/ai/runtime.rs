@@ -880,6 +880,8 @@ async fn http_inner(
     let host = base
         .host_str()
         .ok_or_else(|| error("ER_AI_EGRESS_DENIED", "missing hostname"))?;
+    // URL IPv6 literals include brackets; socket resolution expects the bare IP.
+    let host = host.trim_matches(['[', ']']);
     let cache_key = format!(
         "{}:{}:{}:{}",
         dispatch.namespace,

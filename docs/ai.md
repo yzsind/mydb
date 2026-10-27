@@ -11,14 +11,22 @@ VECTOR wire type with little-endian FLOAT32 coordinates; use
 Their `_DETAIL` variants return JSON containing the result, model revision,
 usage when reported by the provider, timing, and errors when explicitly requested.
 
-## Enable a node
+## Default setup
 
-AI calls are disabled by default. Configure an explicit outbound policy:
+AI calls are enabled by default. No node-local policy file is required: create
+connections and models through SQL, then call them with `AI_USE` privileges.
+AI object management still requires `AI_ADMIN`. By default, configured
+HTTP/HTTPS services have no outbound origin, IP address, network-range, or port
+restrictions. Public HTTP, private networks, loopback, and link-local addresses
+do not require a policy file. IPv4, IPv6, and DNS names are supported.
+The Ollama examples below work with the default settings.
+
+Optional startup settings:
 
 ```ini
 [mydb]
-ai_enabled = ON
-ai_local_config = /etc/mydb/ai-local.json
+# ai_enabled = OFF
+# ai_local_config = /etc/mydb/ai-local.json
 ai_max_inflight = 32
 ai_max_queue = 128
 ai_memory_limit_mb = 128
@@ -28,7 +36,16 @@ Equivalent startup environment variables are `MYDB_AI_ENABLED`,
 `MYDB_AI_LOCAL_CONFIG`, `MYDB_AI_MAX_INFLIGHT`, `MYDB_AI_MAX_QUEUE`, and
 `MYDB_AI_MEMORY_LIMIT_MB`. Capacity settings are startup settings.
 
-Example policy for a local Ollama service:
+## Optional node policy
+
+Use `ai_local_config` for optional network restrictions, private CA bindings,
+account quotas, or historical encryption keys. Omitting `egress` leaves the
+network unrestricted. Supplying `egress` opts into an explicit allowlist;
+an empty `allowed_origins` denies all outbound AI calls.
+An explicitly configured missing, unreadable, or invalid file returns an error
+and never falls back to the built-in policy.
+
+Example restrictive policy allowing only a local Ollama service:
 
 ```json
 {
@@ -44,11 +61,14 @@ Example policy for a local Ollama service:
 }
 ```
 
-Private destinations require both an allowed origin and an explicit IP network.
+With an explicit `egress` policy, private destinations (including loopback)
+require both an allowed origin and an explicit IP network.
 Plain HTTP additionally requires an entry in `allow_plaintext_origins`.
 Public HTTPS services also require their origin in `allowed_origins`.
-DNS results are checked and pinned to the resulting client connection;
-redirects and environment-configured proxies are disabled. Connection clients
+These allowlist requirements apply only when `egress` is explicitly configured.
+DNS results are checked against the IP policy only when `egress` is configured,
+and are pinned to the resulting client connection.
+Redirects and environment-configured proxies are disabled. Connection clients
 are pooled and periodically refreshed.
 
 Node policies are not database metadata. Deploy them separately on each node.
@@ -56,6 +76,10 @@ Node policies are not database metadata. Deploy them separately on each node.
 policy. A failed reload keeps the preceding policy. In-flight calls can fail
 when the policy generation changes; retry the statement after checking its
 external execution status. Policy reload never resends a model request.
+Without `ai_local_config`, reloading refreshes the unrestricted default. Startup
+settings, including the policy file path, require a restart to change.
+
+The node switch is available regardless of whether a policy file is configured:
 
 ```sql
 SET GLOBAL mydb_ai_enabled = OFF;
@@ -70,6 +94,9 @@ incur charges.
 ## Configure Ollama
 
 Install the desired models in Ollama before creating database model objects.
+For a service on another machine, use its private IP or internal DNS name in
+`base_url`, for example `http://192.168.1.10:11434` or
+`http://ollama.internal:11434`. Neither requires `ai_local_config`.
 The following examples use `qwen3:0.6b` and `all-minilm:latest`:
 
 ```sql

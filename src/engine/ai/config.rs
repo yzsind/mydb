@@ -118,7 +118,22 @@ pub(crate) struct LocalConfig {
     pub ca_bindings: BTreeMap<String, String>,
     #[serde(default)]
     pub user_limits: Vec<UserLimit>,
-    pub egress: Egress,
+    #[serde(default)]
+    pub egress: Option<Egress>,
+}
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            source_path: String::new(),
+            raw_bytes: 0,
+            version: 1,
+            encryption: Encryption::default(),
+            ca_bindings: BTreeMap::new(),
+            user_limits: Vec::new(),
+            egress: None,
+        }
+    }
 }
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,8 +162,7 @@ pub(crate) struct Egress {
 }
 impl LocalConfig {
     pub fn load() -> Result<Self, QueryError> {
-        let path = crate::util::env::var("MYDB_AI_LOCAL_CONFIG")
-            .map_err(|_| error("ER_AI_DISABLED", "ai_local_config is required"))?;
+        let path = local_config_path()?.unwrap_or_default();
         if let Some(entry) = config_cache()
             .lock()
             .map_err(|_| error("ER_AI_DISABLED", "config cache poisoned"))?
@@ -201,8 +215,9 @@ impl LocalConfig {
         Ok(candidate)
     }
     fn read() -> Result<Self, QueryError> {
-        let path = crate::util::env::var("MYDB_AI_LOCAL_CONFIG")
-            .map_err(|_| error("ER_AI_DISABLED", "ai_local_config is required"))?;
+        let Some(path) = local_config_path()? else {
+            return Ok(Self::default());
+        };
         let data = read_bounded(Path::new(&path), 1024 * 1024)
             .map_err(|_| error("ER_AI_INVALID_ARGUMENT", "cannot read ai_local_config"))?;
         let text = std::str::from_utf8(&data)
@@ -270,24 +285,27 @@ impl LocalConfig {
         {
             return Err(error("ER_AI_EGRESS_DENIED", "invalid URL components"));
         }
+        let Some(egress) = &self.egress else {
+            return Ok(u);
+        };
         let origin = u.origin().ascii_serialization();
         let same = |s: &String| {
             reqwest::Url::parse(s)
                 .ok()
                 .is_some_and(|x| x.origin().ascii_serialization() == origin)
         };
-        if !self.egress.allowed_origins.iter().any(same)
-            || (u.scheme() == "http" && !self.egress.allow_plaintext_origins.iter().any(same))
-        {
+        let allowed = egress.allowed_origins.iter().any(same)
+            && (u.scheme() == "https" || egress.allow_plaintext_origins.iter().any(same));
+        if !allowed {
             return Err(error("ER_AI_EGRESS_DENIED", "origin is not allowed"));
         }
         Ok(u)
     }
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), QueryError> {
-        let ip = match ip {
-            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-            _ => ip,
+        let Some(egress) = &self.egress else {
+            return Ok(());
         };
+        let ip = normalize_ip(ip);
         let restricted = match ip {
             IpAddr::V4(v) => {
                 v.is_private()
@@ -315,13 +333,11 @@ impl LocalConfig {
                     || v.segments()[..6] == [0, 0, 0, 0, 0, 0]
             }
         };
-        if restricted
-            && !self
-                .egress
-                .private_destinations
-                .iter()
-                .any(|n| n.contains(&ip))
-        {
+        if !restricted {
+            return Ok(());
+        }
+        let allowed = egress.private_destinations.iter().any(|n| n.contains(&ip));
+        if !allowed {
             return Err(error(
                 "ER_AI_EGRESS_DENIED",
                 "destination IP is not allowed",
@@ -330,12 +346,28 @@ impl LocalConfig {
         Ok(())
     }
 }
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
+}
+fn local_config_path() -> Result<Option<String>, QueryError> {
+    match crate::util::env::var("MYDB_AI_LOCAL_CONFIG") {
+        Ok(path) if !path.is_empty() => Ok(Some(path)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        _ => Err(error(
+            "ER_AI_INVALID_ARGUMENT",
+            "invalid ai_local_config path",
+        )),
+    }
+}
 static ENABLED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 pub(crate) fn enabled() -> bool {
     match ENABLED.load(std::sync::atomic::Ordering::Acquire) {
         0 => false,
         1 => true,
-        _ => crate::util::env::flag("MYDB_AI_ENABLED", false),
+        _ => crate::util::env::flag("MYDB_AI_ENABLED", true),
     }
 }
 pub(crate) fn dispatch_enabled() -> bool {

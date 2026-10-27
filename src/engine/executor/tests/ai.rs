@@ -28,6 +28,9 @@ impl Mock {
     }
     fn start(responder: Option<MockResponder>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::listening(listener, responder)
+    }
+    fn listening(listener: TcpListener, responder: Option<MockResponder>) -> Self {
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
@@ -217,6 +220,96 @@ fn exec(engine: &StorageQueryEngine, session: &mut SessionContext, sql: &str) ->
     engine
         .execute_with_session(session, sql)
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message()))
+}
+#[test]
+fn ai_default_enabled_without_local_config() {
+    let mock = Mock::new();
+    let dir = temp();
+    crate::util::env::with_vars(
+        &[("MYDB_AI_ENABLED", None), ("MYDB_AI_LOCAL_CONFIG", None)],
+        || {
+            let engine = open_test_engine(&dir.path().join("data"));
+            let mut session = SessionContext::default();
+            session.current_database = "test".into();
+            let rows = materialize(exec(
+                &engine,
+                &mut session,
+                "SELECT @@GLOBAL.mydb_ai_enabled",
+            ));
+            assert_eq!(rows.rows[0][0], Value::String("1".into()));
+            for (index, url) in [
+                "http://10.1.2.3:11434",
+                "http://192.168.1.10:8000/v1",
+                "https://[fd00::1]:8000/v1",
+                "http://models.internal:8000/v1",
+                "http://8.8.8.8:8000/v1",
+                "http://169.254.169.254:8000/v1",
+                "http://[fe80::1]:8000/v1",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                exec(
+                    &engine,
+                    &mut session,
+                    &format!(
+                        "CREATE AI CONNECTION endpoint_{index} WITH CONFIG '{}'",
+                        json!({"protocol":"ollama","base_url":url,"auth":{"type":"none"}})
+                    ),
+                );
+            }
+            exec(
+                &engine,
+                &mut session,
+                &format!(
+                    "CREATE AI CONNECTION local WITH CONFIG '{}'",
+                    json!({"protocol":"ollama","base_url":format!("http://127.0.0.1:{}",mock.port),"auth":{"type":"none"}})
+                ),
+            );
+            exec(
+                &engine,
+                &mut session,
+                r#"CREATE AI MODEL test.chat USING local WITH CONFIG '{"kind":"text_generation","remote_model":"mock-chat","model_revision":"v1"}'"#,
+            );
+            for sql in [
+                "SELECT AI_GENERATE('test.chat','hello')",
+                "SELECT AI_GENERATE('test.chat','after reload')",
+            ] {
+                exec(&engine, &mut session, "ALTER SYSTEM RELOAD AI CONFIG");
+                let rows = materialize(exec(&engine, &mut session, sql));
+                assert_eq!(rows.rows[0][0], Value::String("mock generated text".into()));
+            }
+            assert_eq!(mock.requests.lock().unwrap().len(), 2);
+            crate::util::env::with_vars(&[("MYDB_AI_ENABLED", Some("OFF"))], || {
+                let error = engine
+                    .execute_with_session(
+                        &mut session,
+                        "SELECT AI_GENERATE('test.chat','disabled')",
+                    )
+                    .unwrap_err();
+                assert!(error.is(crate::error::catalog::ER_AI_DISABLED));
+            });
+            assert_eq!(mock.requests.lock().unwrap().len(), 2);
+            if let Ok(listener) = TcpListener::bind("[::1]:0") {
+                let ipv6 = Mock::listening(listener, None);
+                exec(
+                    &engine,
+                    &mut session,
+                    &format!(
+                        "ALTER AI CONNECTION local WITH CONFIG '{}'",
+                        json!({"protocol":"ollama","base_url":format!("http://[::1]:{}",ipv6.port),"auth":{"type":"none"}})
+                    ),
+                );
+                let rows = materialize(exec(
+                    &engine,
+                    &mut session,
+                    "SELECT AI_GENERATE('test.chat','IPv6')",
+                ));
+                assert_eq!(rows.rows[0][0], Value::String("mock generated text".into()));
+                assert_eq!(ipv6.requests.lock().unwrap().len(), 1);
+            }
+        },
+    );
 }
 #[test]
 fn ai_sql_projection_null_short_circuit_batch_and_contexts() {

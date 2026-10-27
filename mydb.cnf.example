@@ -3,7 +3,8 @@ port = 8738
 data_dir = ./data
 memory_target = 1G
 
-# External AI calls are disabled by default. See docs/ai.md.
+# External AI calls are enabled by default; local policy is optional. See docs/ai.md.
+# Configured HTTP/HTTPS services have no network restrictions unless egress is set.
 # ai_enabled = OFF
 # ai_local_config = /etc/mydb/ai-local.json
 # ai_max_inflight = 32
