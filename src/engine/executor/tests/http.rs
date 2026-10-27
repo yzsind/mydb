@@ -869,6 +869,23 @@ fn http_trigger_dependencies_only_route_writes_and_writing_wrappers() {
     assert_eq!(m.count(), 0);
 }
 #[test]
+fn http_sensitivity_memo_follows_dependency_cache_changes() {
+    let dir = temp();
+    let e = open_test_engine(dir.path());
+    let sql = "SELECT later_wrapper('secret')";
+    let memo = crate::engine::http::SensitivityMemo::new(sql);
+    assert!(!crate::engine::http::may_call(&e.db, sql));
+    assert!(!memo.is_sensitive(sql));
+    e.execute("CREATE FUNCTION later_wrapper(p TEXT) RETURNS JSON RETURN HTTP_GET(p)")
+        .unwrap();
+    // Refreshing the dependency cache must invalidate the memoized verdict.
+    assert!(crate::engine::http::may_call(&e.db, sql));
+    assert!(memo.is_sensitive(sql));
+    assert_eq!(memo.is_sensitive(sql), crate::engine::http::sensitive(sql));
+    let direct = "SELECT HTTP_GET('http://127.0.0.1/')";
+    assert!(crate::engine::http::SensitivityMemo::new(direct).is_sensitive(direct));
+}
+#[test]
 fn http_top_level_batch_statements_have_independent_send_budgets() {
     let m = Mock::new();
     let dir = temp();

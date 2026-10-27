@@ -1301,16 +1301,17 @@ impl SessionHandle {
 
     /// The prepared handle owns and charges the immutable SQL text. This
     /// short-lived process-list reference disappears at the idle transition.
-    pub(crate) fn set_process_info_shared(&self, info: Arc<str>) {
-        self.entry.lock().info = Some(ProcessSqlText::Shared(
-            if crate::engine::ai::sql::sql_may_have_ai(&info)
-                || crate::engine::http::sensitive(&info)
-            {
-                Arc::from(crate::engine::http::redaction_marker(&info, false))
-            } else {
-                info
-            },
-        ));
+    /// The caller passes the text's redaction verdict, which a prepared
+    /// handle memoizes in its [`SensitivityMemo`].
+    ///
+    /// [`SensitivityMemo`]: crate::engine::http::SensitivityMemo
+    pub(crate) fn set_process_info_prechecked(&self, info: Arc<str>, sensitive: bool) {
+        let info = if sensitive {
+            Arc::from(crate::engine::http::redaction_marker(&info, false))
+        } else {
+            info
+        };
+        self.entry.lock().info = Some(ProcessSqlText::Shared(info));
     }
 
     pub(crate) fn set_time_reference_unix_secs(&self, reference: Option<u64>) {
@@ -1445,10 +1446,9 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn publish_pfs_prepared(&self, mut prepared: Vec<PreparedStatementSnapshot>) {
-        for row in &mut prepared {
-            redact_ai_prepared(row);
-        }
+    /// Replace the protocol prepared-statement rows. Every snapshot's
+    /// `sql_text` must already be redacted by the caller.
+    pub(crate) fn publish_pfs_redacted_prepared(&self, prepared: Vec<PreparedStatementSnapshot>) {
         let mut entry = self.entry.lock();
         entry
             .prepared_statements
@@ -1458,6 +1458,15 @@ impl SessionHandle {
 
     pub(crate) fn publish_pfs_prepared_statement(&self, mut prepared: PreparedStatementSnapshot) {
         redact_ai_prepared(&mut prepared);
+        self.publish_pfs_redacted_prepared_statement(prepared);
+    }
+
+    /// Like [`Self::publish_pfs_prepared_statement`], for a snapshot whose
+    /// `sql_text` the caller has already redacted.
+    pub(crate) fn publish_pfs_redacted_prepared_statement(
+        &self,
+        prepared: PreparedStatementSnapshot,
+    ) {
         let mut entry = self.entry.lock();
         if let Some(current) = entry.prepared_statements.iter_mut().find(|current| {
             current.statement_id == prepared.statement_id

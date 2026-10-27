@@ -80,7 +80,7 @@ struct StatementEvent {
     sql_text: Arc<str>,
     digest: Option<Arc<str>>,
     digest_text: Option<Arc<str>>,
-    current_schema: String,
+    current_schema: Arc<str>,
     mysql_errno: Option<u16>,
     returned_sqlstate: Option<String>,
     message_text: Option<String>,
@@ -116,6 +116,17 @@ impl ThreadEvents {
     fn next_event_id(&mut self) -> u64 {
         self.next_event_id = self.next_event_id.saturating_add(1).max(1);
         self.next_event_id
+    }
+
+    /// The session's schema rarely changes between statements; share the
+    /// previous event's text instead of allocating a copy per statement.
+    fn schema(&self, current: &str) -> Arc<str> {
+        match &self.current_statement {
+            Some(event) if event.current_schema.as_ref() == current => {
+                Arc::clone(&event.current_schema)
+            }
+            _ => Arc::from(current),
+        }
     }
 }
 
@@ -717,7 +728,9 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
     if trimmed.is_empty() {
         return;
     }
-    let event_class = statement_event_class(trimmed);
+    let event_class = prepared_texts
+        .as_ref()
+        .map_or_else(|| statement_event_class(trimmed), |texts| texts.1);
     let event_name = event_class.name;
     if !statement_instrument_enabled(event_class) {
         return;
@@ -729,6 +742,7 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
         .entry(session.connection_id as u64)
         .or_default();
     let event_id = thread.next_event_id();
+    let current_schema = thread.schema(&session.current_database);
     thread.current_statement = Some(StatementEvent {
         thread_id: session.connection_id as u64,
         event_id,
@@ -744,7 +758,7 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
         ),
         digest: None,
         digest_text: None,
-        current_schema: session.current_database.clone(),
+        current_schema,
         mysql_errno: None,
         returned_sqlstate: None,
         message_text: None,
@@ -776,7 +790,7 @@ struct StatementTexts {
 /// blocking-pool migration otherwise makes even a tiny per-thread cache pay
 /// the full SQL hash on every execution.
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedStatementTexts(Arc<StatementTexts>);
+pub(crate) struct PreparedStatementTexts(Arc<StatementTexts>, StatementEventClass);
 
 impl PreparedStatementTexts {
     pub(crate) fn estimated_memory_bytes(&self) -> usize {
@@ -825,13 +839,17 @@ pub(crate) fn prepared_statement_texts(sql: &str) -> PreparedStatementTexts {
     // borrow it without rescanning or allocating on every execution.
     let safe = crate::engine::logging::redact_sql_for_log(sql);
     let cached = statement_texts(safe.trim());
-    PreparedStatementTexts(Arc::new(StatementTexts {
-        sql_text: Arc::from(cached.sql_text.as_ref()),
-        digest: cached
-            .digest
-            .as_ref()
-            .map(|(text, digest)| (Arc::from(text.as_ref()), Arc::from(digest.as_ref()))),
-    }))
+    let event_class = statement_event_class(cached.sql_text.as_ref());
+    PreparedStatementTexts(
+        Arc::new(StatementTexts {
+            sql_text: Arc::from(cached.sql_text.as_ref()),
+            digest: cached
+                .digest
+                .as_ref()
+                .map(|(text, digest)| (Arc::from(text.as_ref()), Arc::from(digest.as_ref()))),
+        }),
+        event_class,
+    )
 }
 
 pub(crate) fn with_prepared_statement_texts<R>(
@@ -1032,7 +1050,9 @@ pub(crate) fn record_statement(
         return;
     }
 
-    let event_class = statement_event_class(trimmed);
+    let event_class = prepared_texts
+        .as_ref()
+        .map_or_else(|| statement_event_class(trimmed), |texts| texts.1);
     let event_name = event_class.name;
     let statement_instrumented = instrumentation_enabled
         && statement_instrument_enabled(event_class)
@@ -1123,7 +1143,7 @@ pub(crate) fn record_statement(
             sql_text: Arc::clone(&texts.sql_text),
             digest,
             digest_text,
-            current_schema: session.current_database.clone(),
+            current_schema: thread.schema(&session.current_database),
             mysql_errno: errno,
             returned_sqlstate: sql_state,
             message_text: message,
@@ -1166,10 +1186,20 @@ fn record_statement_event(
         .thread_accounts
         .entry(thread_id)
         .or_insert_with(|| (user.to_string(), host.to_string()));
-    let thread = state.threads.entry(thread_id).or_default();
-    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_CURRENT != 0 {
-        thread.current_statement = Some(event.clone());
+    upsert_statement(&mut state.statement_global, event.event_name, &event);
+    state
+        .statement_by_thread
+        .entry((thread_id, event.event_name))
+        .or_insert_with(|| LiveAggregate::new(StatementAggregate::new(event.event_name)))
+        .record(|aggregate| aggregate.record(&event));
+    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_HISTORY_LONG != 0
+        && crate::engine::perf_setup::thread_history_enabled(ONE_CONNECTION_THREAD)
+        && crate::engine::perf_setup::actor_history_enabled(user, host)
+    {
+        let limit = state.statement_history_long_limit;
+        push_bounded(&mut state.statement_history_long, event.clone(), limit);
     }
+    let thread = state.threads.entry(thread_id).or_default();
     if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_HISTORY != 0
         && crate::engine::perf_setup::thread_history_enabled(ONE_CONNECTION_THREAD)
         && crate::engine::perf_setup::actor_history_enabled(user, host)
@@ -1180,19 +1210,11 @@ fn record_statement_event(
             statement_history_limit(),
         );
     }
-    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_HISTORY_LONG != 0
-        && crate::engine::perf_setup::thread_history_enabled(ONE_CONNECTION_THREAD)
-        && crate::engine::perf_setup::actor_history_enabled(user, host)
-    {
-        let limit = state.statement_history_long_limit;
-        push_bounded(&mut state.statement_history_long, event.clone(), limit);
+    // The current-statement slot takes the event itself: one fewer deep
+    // clone per statement than cloning into every consumer.
+    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_CURRENT != 0 {
+        thread.current_statement = Some(event);
     }
-    upsert_statement(&mut state.statement_global, event.event_name, &event);
-    state
-        .statement_by_thread
-        .entry((thread_id, event.event_name))
-        .or_insert_with(|| LiveAggregate::new(StatementAggregate::new(event.event_name)))
-        .record(|aggregate| aggregate.record(&event));
 }
 
 fn record_wait_event(
@@ -1775,7 +1797,7 @@ fn wait_aggregate_tail(agg: &WaitAggregate) -> [Value; 5] {
     ]
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct StatementEventClass {
     name: &'static str,
     index: usize,
@@ -2313,7 +2335,7 @@ mod tests {
             sql_text: Arc::from("SELECT 1"),
             digest: None,
             digest_text: None,
-            current_schema: "test".to_string(),
+            current_schema: Arc::from("test"),
             mysql_errno: None,
             returned_sqlstate: None,
             message_text: None,
@@ -2520,3 +2542,4 @@ mod tests {
 #[cfg(test)]
 #[path = "perf_events/rollup_tests.rs"]
 mod rollup_tests;
+

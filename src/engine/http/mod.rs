@@ -6,7 +6,7 @@ mod runtime;
 mod scope;
 mod sql;
 pub(crate) use runtime::{admit_coordinator, admit_session, spawn_coordinator};
-pub(crate) use sql::{bound_sql, may_call, sensitive};
+pub(crate) use sql::{bound_sql, may_call, sensitive, SensitivityMemo};
 #[cfg(test)]
 mod tests;
 use crate::types::QueryError;

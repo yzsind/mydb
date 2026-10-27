@@ -4796,7 +4796,14 @@ impl StorageQueryEngine {
                             dp,
                             connection_id,
                         )
-                        .and_then(QueryResponse::materialize)
+                        .and_then(|response| match response {
+                            // A locking read's rows are already owned; only its
+                            // column metadata is shared. Deep-copying that here
+                            // also defeats the writer's pointer-identity check
+                            // against the prepared handle's cached metadata.
+                            QueryResponse::SharedResultSet(_) => Ok(response),
+                            response => response.materialize(),
+                        })
                     })
                 })
             };

@@ -567,6 +567,9 @@ impl<E: QueryEngine> Drop for Session<E> {
 struct PreparedStatement {
     /// Client text retained only for general/slow logging.
     original_sql: Arc<str>,
+    /// Redaction verdict for `original_sql`, which every EXECUTE publishes to
+    /// the process list and performance_schema.
+    original_sql_sensitivity: crate::engine::http::SensitivityMemo,
     /// Equal-length, version-gated SQL used by every semantic path. `Arc<str>`
     /// avoids a full text copy on each COM_STMT_EXECUTE.
     sql: Arc<str>,
@@ -850,14 +853,28 @@ where
     }
 
     fn result_fallback_collation_id(&self) -> u16 {
+        thread_local! {
+            /// Last resolved `character_set_results`; it rarely changes, while
+            /// every result set asks for its default collation.
+            static LAST: std::cell::RefCell<Option<(Box<str>, u16)>> =
+                const { std::cell::RefCell::new(None) };
+        }
         let Some(charset) = self.context.character_set_results.as_deref() else {
             return 0;
         };
-        crate::charset::default_collation_for_charset(charset)
-            .ok()
-            .and_then(|name| crate::charset::resolve_collation(name).ok())
-            .map(|collation| collation.id)
-            .unwrap_or(crate::charset::UTF8MB4_0900_AI_CI_ID)
+        LAST.with(|last| {
+            let mut last = last.borrow_mut();
+            if let Some((_, id)) = last.as_ref().filter(|(name, _)| name.as_ref() == charset) {
+                return *id;
+            }
+            let id = crate::charset::default_collation_for_charset(charset)
+                .ok()
+                .and_then(|name| crate::charset::resolve_collation(name).ok())
+                .map(|collation| collation.id)
+                .unwrap_or(crate::charset::UTF8MB4_0900_AI_CI_ID);
+            *last = Some((Box::from(charset), id));
+            id
+        })
     }
 
     fn server_status(&self) -> u16 {
@@ -935,7 +952,7 @@ where
                     self.prepared_statement_snapshot(statement_id, prepared)
                 })
                 .collect();
-            handle.publish_pfs_prepared(prepared);
+            handle.publish_pfs_redacted_prepared(prepared);
         }
     }
 
@@ -948,7 +965,17 @@ where
             statement_name: None,
             object_instance: ((self.connection_id as u64) << 32) | statement_id as u64,
             statement_id: statement_id as u64,
-            sql_text: Arc::clone(&prepared.original_sql),
+            sql_text: if prepared
+                .original_sql_sensitivity
+                .is_sensitive(&prepared.original_sql)
+            {
+                Arc::from(crate::engine::http::redaction_marker(
+                    &prepared.original_sql,
+                    false,
+                ))
+            } else {
+                Arc::clone(&prepared.original_sql)
+            },
             owner_thread_id: self.connection_id as u64,
             timer_prepare: prepared.timer_prepare,
             count_execute: prepared.count_execute,
@@ -972,7 +999,7 @@ where
             return;
         };
         handle.set_protocol_prepared_memory_bytes(self.prepared_memory_bytes);
-        handle.publish_pfs_prepared_statement(
+        handle.publish_pfs_redacted_prepared_statement(
             self.prepared_statement_snapshot(statement_id, prepared),
         );
     }
@@ -2392,16 +2419,18 @@ where
                         .await?;
                     if let Some(statement_id) = command_statement_id(&packet.payload) {
                         self.refresh_prepared_memory(statement_id);
+                        self.publish_prepared_statement(statement_id);
                     }
-                    self.publish_prepared_memory();
                 }
                 COM_STMT_CLOSE => self.handle_stmt_close(&packet.payload[1..]).await?,
                 COM_STMT_RESET => {
                     self.handle_stmt_reset(&packet.payload[1..]).await?;
+                    // A reset mutates exactly one handle; republishing every
+                    // handle rebuilt and rescanned the session's whole set.
                     if let Some(statement_id) = command_statement_id(&packet.payload) {
                         self.refresh_prepared_memory(statement_id);
+                        self.publish_prepared_statement(statement_id);
                     }
-                    self.publish_prepared_memory();
                 }
                 COM_STMT_FETCH => {
                     let _memory_activity =
@@ -4582,6 +4611,7 @@ where
             return Ok(());
         };
         let mut prepared = PreparedStatement {
+            original_sql_sensitivity: crate::engine::http::SensitivityMemo::new(&sql),
             original_sql: Arc::from(sql.as_str()),
             sql: Arc::from(effective_sql.as_str()),
             normalized_sql,
@@ -4765,6 +4795,7 @@ where
             parser_sql_mode_bits,
             perf_texts,
             com_kind,
+            original_sql_sensitive,
             parse_result,
         ) = {
             let Some(prepared) = self.prepared.get(&statement_id) else {
@@ -4805,6 +4836,9 @@ where
                 prepared.parser_sql_mode_bits,
                 prepared.perf_texts.clone(),
                 prepared.com_kind,
+                prepared
+                    .original_sql_sensitivity
+                    .is_sensitive(&prepared.original_sql),
                 parse_result,
             )
         };
@@ -4812,7 +4846,7 @@ where
             crate::engine::status_counters::record_session_com(&self.context, kind);
         }
         if let Some(handle) = &self.handle {
-            handle.set_process_info_shared(Arc::clone(&original_sql));
+            handle.set_process_info_prechecked(Arc::clone(&original_sql), original_sql_sensitive);
             handle.set_base_state(ProcessState::Executing);
         }
         self.engine
@@ -10233,6 +10267,7 @@ mod tests {
 
     fn empty_prepared_statement() -> PreparedStatement {
         PreparedStatement {
+            original_sql_sensitivity: crate::engine::http::SensitivityMemo::new("SELECT ?"),
             original_sql: Arc::from("SELECT ?"),
             sql: Arc::from("SELECT ?"),
             normalized_sql: Arc::from("select ?"),
