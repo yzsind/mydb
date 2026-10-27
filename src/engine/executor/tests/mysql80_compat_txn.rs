@@ -658,5 +658,9 @@ fn consistent_snapshot_ignored_with_warning_outside_repeatable_read() {
         "non-RR CONSISTENT SNAPSHOT must raise a warning, got {:?}",
         result.rows
     );
+    assert!(session
+        .warnings
+        .iter()
+        .any(|warning| warning.code() == crate::error::catalog::WARN_OPTION_IGNORED.code().get()));
     engine.execute_with_session(&mut session, "COMMIT").unwrap();
 }

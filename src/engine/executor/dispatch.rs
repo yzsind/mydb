@@ -7470,7 +7470,7 @@ pub(super) fn execute_qualified_statement(
         }
         Statement::Savepoint(name) => {
             // M1.2 - Named user savepoints
-            ensure_no_xa_branch_for_local_txn(session, "SAVEPOINT")?;
+            tx::ensure_xa_savepoint_allowed(session)?;
             if session.autocommit && !session.explicit_txn && session.current_txn.is_none() {
                 return Ok(QueryResponse::Ok);
             }
@@ -7481,7 +7481,7 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::RollbackToSavepoint(name) => {
-            ensure_no_xa_branch_for_local_txn(session, "ROLLBACK TO SAVEPOINT")?;
+            tx::ensure_xa_savepoint_allowed(session)?;
             let Some(txn_id) = session.current_txn else {
                 return Err(error(
                     crate::error::catalog::ER_SP_DOES_NOT_EXIST,
@@ -7492,7 +7492,7 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::ReleaseSavepoint(name) => {
-            ensure_no_xa_branch_for_local_txn(session, "RELEASE SAVEPOINT")?;
+            tx::ensure_xa_savepoint_allowed(session)?;
             let Some(txn_id) = session.current_txn else {
                 return Err(error(
                     crate::error::catalog::ER_SP_DOES_NOT_EXIST,
@@ -7551,8 +7551,21 @@ pub(super) fn execute_qualified_statement(
                 .iter()
                 .any(|a| super::prepared_dml::expr_contains_subquery(&a.value))
             {
+                let statement_owned_txn =
+                    session.autocommit && !session.explicit_txn && session.current_txn.is_none();
                 execute_in_transaction_with_session(db, session, |db, session, _| {
-                    execute_set_statement(db, session, &assignments)
+                    let result = execute_set_statement(db, session, &assignments);
+                    // SET may disable autocommit after reading its subqueries.
+                    // That read belongs to the old autocommit statement, not
+                    // to the next user transaction selected by the new value.
+                    if statement_owned_txn && !session.autocommit {
+                        if result.is_ok() {
+                            commit_session_txn(db, session)?;
+                        } else {
+                            rollback_session_txn(db, session)?;
+                        }
+                    }
+                    result
                 })
             } else {
                 execute_set_statement(db, session, &assignments)
@@ -9720,6 +9733,7 @@ pub(super) fn execute_qualified_statement(
         ),
         Statement::SetDefaultRole(stmt) => execute_set_default_role(db, session, stmt),
         Statement::FlushPrivileges => {
+            implicit_commit_for_ddl(db, session)?;
             // mydb does not read grants from `mysql.*` tables — the catalog
             // is the single source of truth — so FLUSH PRIVILEGES has no
             // "reload from table" semantics. We bump the auth epoch anyway

@@ -3506,8 +3506,8 @@ impl Database {
     ///
     /// The WAL write buffer is enabled for relaxed (see `facade.rs`), so
     /// appends only `memcpy` frames into the 256 KiB buffer under the log
-    /// mutex — cheap. This barrier then routes through the SAME group-commit
-    /// coordinator as strict, so a batch of N committers does ~one coalesced
+    /// mutex — cheap. A separate coordinator uses the same batching algorithm
+    /// as strict without sharing its fsync watermark. N committers do one coalesced
     /// `write()` instead of one-per-frame. That is what makes relaxed faster
     /// than strict again: identical batching, minus the fsync.
     ///
@@ -3521,7 +3521,7 @@ impl Database {
     fn flush_commit_lsn(&self, lsn: u64) -> Result<(), QueryError> {
         let target = self.current_group_commit_target();
         let (window, adaptive) = self.group_commit_window_and_adaptive();
-        self.group_commit
+        self.flush_group_commit
             .sync_lsn_with(lsn, window, target, adaptive, |sync_lsn| {
                 // `prepare_sync_to` drains `pending_write_bytes` to the fd
                 // (a coalesced write into the OS page cache) and returns the
@@ -4681,7 +4681,10 @@ impl Database {
         } else {
             buffer_stats.hits.saturating_mul(100) / buffer_accesses
         };
-        let group_commit_stats = self.group_commit.stats();
+        let group_commit_stats = self
+            .group_commit
+            .stats()
+            .combined(self.flush_group_commit.stats());
         let durability_worker_enabled = crate::storage::txn::durability_worker_enabled();
         let durability_stats = self.durability_worker.stats();
         let effective_batches = if durability_worker_enabled {
@@ -6893,4 +6896,26 @@ fn collect_prepared_locks(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod transaction_audit_tests {
+    use super::*;
+
+    #[test]
+    fn txn_audit_relaxed_flush_cannot_satisfy_strict_barrier() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Relaxed).unwrap();
+        db.buffer_pool.shutdown_flusher();
+        let txn = db.begin_txn().unwrap();
+        let lsn = db.log.lock().append(txn.txn_id, WalPayload::EndTxn).unwrap();
+        db.flush_commit_lsn(lsn).unwrap();
+        assert!(db.log.lock().durable_lsn() < lsn);
+        db.sync_commit_lsn(lsn).unwrap();
+        assert!(
+            db.log.lock().durable_lsn() >= lsn,
+            "strict barrier must fsync a previously flushed LSN"
+        );
+    }
 }

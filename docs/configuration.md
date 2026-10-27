@@ -183,6 +183,12 @@ necessary fallbacks, and pre-commit fsync overhead. `strict` mode provides the
 full commit crash-recovery guarantee; `relaxed`/`memory` still inherit their
 respective weaker durability semantics.
 
+External XA coordinators that require durable PREPARE acknowledgements must use
+`durability=strict`. In `relaxed` mode, XA PREPARE drains WAL to the OS page cache
+but does not require fsync; a power loss can erase an acknowledged prepare.
+`memory` mode does not persist XA prepare decisions. Enabling binlog does not
+upgrade the XA PREPARE barrier to strict durability.
+
 The durability boundary of `strict` is the successful return of `COMMIT` (or an
 autocommit write statement). For group commit, the engine first publishes
 in-memory transaction state and releases row locks, then completes the WAL flush,
@@ -963,6 +969,12 @@ than the WAL's committed references. This protects against silently losing
 transactions or publishing an incomplete history to replicas, including
 tail-loss scenarios with `sync_binlog=0`; emptying the binlog directory cannot be
 relied on to preserve the original replication continuity.
+For `sync_binlog=0` or values greater than `1`, a power loss may therefore require
+operator recovery before startup succeeds. Preserve the data, WAL, and binlog
+files; restore a mutually consistent backup and rebuild downstream replication
+when the missing binlog history cannot be recovered. Do not delete or truncate
+binlogs to bypass the check. Use `sync_binlog=1` to require a synchronized binlog
+commit group before acknowledgement.
 
 Binlog status, heartbeat positions, and persisted publication boundaries exclude
 staged transactions. A consistent snapshot saves the file position and GTID set

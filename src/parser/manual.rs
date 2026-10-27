@@ -3591,8 +3591,12 @@ fn parse_xa_xid<'a>(
     }
     // `iter.next()` may have consumed a non-comma token (the start of the
     // trailing keyword tail). Rebuild the slice off `consumed`.
-    let xid = Xid::new(format_id, gtrid, bqual)
-        .map_err(|err| unsupported_xa(&format!("invalid xid: {}", err.message()), sql))?;
+    // The parser entry validates lengths with the XA-specific error code.
+    let xid = Xid {
+        format_id,
+        gtrid,
+        bqual,
+    };
     Ok((xid, &tokens[consumed..]))
 }
 

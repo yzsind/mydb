@@ -1271,6 +1271,7 @@ pub struct Database {
     /// `wal::LogStateAtomics` doc for the rationale.
     log_state_atomics: Arc<crate::wal::LogStateAtomics>,
     group_commit: GroupCommitCoordinator,
+    flush_group_commit: GroupCommitCoordinator,
     durability_worker: DurabilityWorker,
     plan_cache_hits: AtomicU64,
     plan_cache_misses: AtomicU64,

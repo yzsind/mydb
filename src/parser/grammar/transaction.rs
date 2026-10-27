@@ -165,13 +165,13 @@ pub(in crate::parser) fn parse_set_session_statement(
             }
         }
         cursor.finish()?;
-        // The dedicated isolation form accepts exactly one level. Preserve
-        // that rule instead of expanding it to a last-value-wins list.
-        if characteristics
+        let isolation_count = characteristics
             .iter()
-            .all(|value| matches!(value, TransactionCharacteristic::Isolation(_)))
-        {
-            return Err(cursor.expected("one isolation level"));
+            .filter(|value| matches!(value, TransactionCharacteristic::Isolation(_)))
+            .count();
+        let access_count = characteristics.len() - isolation_count;
+        if isolation_count > 1 || access_count > 1 {
+            return Err(cursor.expected("at most one isolation level and one access mode"));
         }
         return Ok(Some(Statement::SetTransactionCharacteristics {
             scope,

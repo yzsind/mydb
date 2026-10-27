@@ -450,7 +450,16 @@ for mydb-specific behavior, see [Window Functions](function/aggregate-window/REA
 - `SET TRANSACTION` without SESSION/GLOBAL affects only the next transaction, including autocommit
   reads, and restores the session default afterwards; READ ONLY allows FOR SHARE and rejects FOR UPDATE and persistent-table writes.
   Historical validation of transaction/XA boundaries is archived in the project's internal engineering records (transaction-processing-fix-validation-2026-10-02).
-- **SAVEPOINT**, **`LOCK TABLES`**: ✅
+- **SAVEPOINT**, **`LOCK TABLES`**: ✅. Savepoints also operate inside ACTIVE XA branches;
+  IDLE branches reject savepoint operations.
+- Transaction statements such as BEGIN, SAVEPOINT, and XA RECOVER can be prepared in mydb.
+  This intentionally extends the set accepted by MySQL's prepared-statement protocol.
+- DDL rejected during pre-execution validation does not commit the user's existing transaction.
+  Successful implicit-commit statements retain their documented transaction boundaries.
+- Mixed SET statements validate system-variable assignments before applying them. Their expressions
+  therefore observe the pre-application state, including when autocommit is among the assignments;
+  this avoids partial system-variable changes on validation failure. A subquery evaluated by an
+  autocommit SET does not leave its temporary transaction open when that SET disables autocommit.
 
 ### EXPLAIN
 

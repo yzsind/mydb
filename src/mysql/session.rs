@@ -867,6 +867,9 @@ where
         }
         if self.context.in_transaction() {
             status |= SERVER_STATUS_IN_TRANS;
+            if self.context.read_only_txn {
+                status |= 0x2000; // SERVER_STATUS_IN_TRANS_READONLY
+            }
         }
         if self.context.temporal_sql_mode_bits & crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES
             != 0
@@ -2343,14 +2346,6 @@ where
                         1,
                     );
                     self.handle_query(sql_bytes).await?;
-                    // COMMIT/ROLLBACK ... RELEASE (or completion_type=RELEASE)
-                    // disconnects after the response is sent, like COM_QUIT.
-                    if self.context.close_after_response {
-                        self.context.close_after_response = false;
-                        self.engine.log_general_event(&self.context, "Quit", "");
-                        self.normal_close = true;
-                        return Ok(());
-                    }
                 }
                 COM_STMT_PREPARE => {
                     self.context.refresh_cancel_generations();
@@ -2456,6 +2451,15 @@ where
                         .write_packet(&mut self.stream, self.command_response_sequence, &err)
                         .await?;
                 }
+            }
+
+            // COMMIT/ROLLBACK ... RELEASE (or completion_type=RELEASE)
+            // disconnects after the response is sent, like COM_QUIT.
+            if self.context.close_after_response {
+                self.context.close_after_response = false;
+                self.engine.log_general_event(&self.context, "Quit", "");
+                self.normal_close = true;
+                return Ok(());
             }
 
             self.publish_pfs_variables();
@@ -6907,12 +6911,15 @@ where
     /// write transaction (commit / rollback). Keyed off `current_txn` rather
     /// than `in_transaction()` — the latter is permanently true whenever
     /// `autocommit=0` (as JDBC/BenchmarkSQL run), which would pin every permit
-    /// forever. `current_txn` is `None` exactly when no transaction is holding
-    /// row locks, so the permit is released the moment the transaction ends and
-    /// re-acquired (holding no locks) at the next transaction's first
+    /// forever. An IDLE XA branch still owns row locks after detaching
+    /// `current_txn`. Release only when both session transaction owners end.
+    /// Re-acquire (holding no locks) at the next transaction's first
     /// lock-taking statement — the invariant that keeps admission deadlock-free.
     fn release_txn_admission_if_idle(&mut self) {
-        if self.txn_admission.is_some() && self.context.current_txn.is_none() {
+        if self.txn_admission.is_some()
+            && self.context.current_txn.is_none()
+            && self.context.xa_branch.is_none()
+        {
             self.txn_admission = None;
         }
     }

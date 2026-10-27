@@ -20,31 +20,37 @@ pub struct Xid {
 
 impl Xid {
     pub fn new(format_id: i64, gtrid: Vec<u8>, bqual: Vec<u8>) -> Result<Self, QueryError> {
-        if gtrid.is_empty() || gtrid.len() > XID_GTRID_MAX {
+        let xid = Self {
+            format_id,
+            gtrid,
+            bqual,
+        };
+        xid.validate()?;
+        Ok(xid)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), QueryError> {
+        if self.gtrid.is_empty() || self.gtrid.len() > XID_GTRID_MAX {
             return Err(xa_error(
                 crate::error::catalog::ER_XAER_INVAL,
                 format!(
                     "XAER_INVAL: gtrid length must be 1..{} bytes (got {})",
                     XID_GTRID_MAX,
-                    gtrid.len()
+                    self.gtrid.len()
                 ),
             ));
         }
-        if bqual.len() > XID_BQUAL_MAX {
+        if self.bqual.len() > XID_BQUAL_MAX {
             return Err(xa_error(
                 crate::error::catalog::ER_XAER_INVAL,
                 format!(
                     "XAER_INVAL: bqual length must be 0..{} bytes (got {})",
                     XID_BQUAL_MAX,
-                    bqual.len()
+                    self.bqual.len()
                 ),
             ));
         }
-        Ok(Self {
-            format_id,
-            gtrid,
-            bqual,
-        })
+        Ok(())
     }
 
     pub fn gtrid_len(&self) -> i64 {

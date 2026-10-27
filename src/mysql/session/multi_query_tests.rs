@@ -476,3 +476,58 @@ async fn audit1022_self_kill_connection_sends_a_final_ok_packet() {
     h.ok(1, 0, 0, false).await;
     assert!(h.session.context.close_after_response);
 }
+
+#[tokio::test]
+async fn txn_audit_prepared_release_closes_before_next_command() {
+    use tokio::io::AsyncWriteExt;
+    let mut h = Harness::new(0).await;
+    h.session
+        .handle_stmt_prepare(b"COMMIT RELEASE")
+        .await
+        .unwrap();
+    let packet = h.packet(1).await;
+    assert_eq!(packet.payload[0], 0);
+    let id = &packet.payload[1..5];
+    let mut execute = vec![COM_STMT_EXECUTE];
+    execute.extend_from_slice(id);
+    execute.extend_from_slice(&[0, 1, 0, 0, 0]);
+    let mut command = vec![execute.len() as u8, 0, 0, 0];
+    command.extend_from_slice(&execute);
+    h.client.write_all(&command).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), h.session.command_loop())
+        .await
+        .expect("RELEASE must end the command loop immediately")
+        .unwrap();
+    assert_eq!(h.packet(1).await.payload[0], 0);
+    assert!(h.session.normal_close);
+}
+
+#[tokio::test]
+async fn txn_audit_read_only_status() {
+    let mut h = Harness::new(0).await;
+    h.setup("START TRANSACTION READ ONLY");
+    assert_ne!(h.session.server_status() & 0x2000, 0);
+    h.setup("COMMIT");
+    assert_eq!(h.session.server_status() & 0x2000, 0);
+    h.setup("START TRANSACTION READ WRITE");
+    assert_eq!(h.session.server_status() & 0x2000, 0);
+    h.setup("ROLLBACK");
+}
+
+#[tokio::test]
+async fn txn_audit_idle_xa_retains_admission() {
+    let mut h = Harness::new(0).await;
+    h.setup("XA START 'admission'");
+    h.session.acquire_txn_admission().await;
+    if crate::util::exec_permit::global().is_none() {
+        h.setup("XA ROLLBACK 'admission'");
+        return;
+    }
+    assert!(h.session.txn_admission.is_some());
+    h.setup("XA END 'admission'");
+    h.session.release_txn_admission_if_idle();
+    assert!(h.session.txn_admission.is_some());
+    h.setup("XA ROLLBACK 'admission'");
+    h.session.release_txn_admission_if_idle();
+    assert!(h.session.txn_admission.is_none());
+}

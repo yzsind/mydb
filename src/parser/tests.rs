@@ -4656,16 +4656,16 @@ fn xa_accepts_hex_xid_literal() {
 
 #[test]
 fn xa_rejects_empty_gtrid() {
-    let stmt = parse_statement("XA START ''").unwrap();
-    assert!(matches!(stmt, Statement::Unsupported { .. }));
+    let err = parse_statement("XA START ''").unwrap_err();
+    assert_eq!(err.spec, crate::error::catalog::ER_XAER_INVAL);
 }
 
 #[test]
 fn xa_rejects_oversized_gtrid() {
     let payload = "x".repeat(65);
     let sql = format!("XA START '{}'", payload);
-    let stmt = parse_statement(&sql).unwrap();
-    assert!(matches!(stmt, Statement::Unsupported { .. }));
+    let err = parse_statement(&sql).unwrap_err();
+    assert_eq!(err.spec, crate::error::catalog::ER_XAER_INVAL);
 }
 
 #[test]

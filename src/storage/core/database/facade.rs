@@ -682,6 +682,7 @@ impl Database {
             log,
             log_state_atomics,
             group_commit: GroupCommitCoordinator::default(),
+            flush_group_commit: GroupCommitCoordinator::default(),
             durability_worker,
             plan_cache_hits: AtomicU64::new(0),
             plan_cache_misses: AtomicU64::new(0),

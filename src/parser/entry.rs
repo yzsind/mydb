@@ -1555,6 +1555,18 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
         }
         if head_is(b"XA") {
             if let Some(statement) = parse_xa_statement(sql) {
+                if let Statement::XaStart { xid }
+                | Statement::XaEnd { xid }
+                | Statement::XaPrepare { xid }
+                | Statement::XaCommit { xid, .. }
+                | Statement::XaRollback { xid } = &statement
+                {
+                    xid.validate().map_err(|err| {
+                        let mut parsed = ParseError::at_zero(err.message());
+                        parsed.spec = crate::error::catalog::ER_XAER_INVAL;
+                        parsed
+                    })?;
+                }
                 return Ok(statement);
             }
         }

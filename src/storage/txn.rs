@@ -1868,6 +1868,41 @@ pub struct GroupCommitStats {
     pub batch_size_buckets: [u64; 6],
 }
 
+impl GroupCommitStats {
+    pub(crate) fn combined(mut self, other: Self) -> Self {
+        let total_batches = self.batches.saturating_add(other.batches);
+        if total_batches != 0 {
+            self.recent_avg_batch_size = (self.recent_avg_batch_size * self.batches as f64
+                + other.recent_avg_batch_size * other.batches as f64)
+                / total_batches as f64;
+        }
+        self.batches = total_batches;
+        self.waiters = self.waiters.saturating_add(other.waiters);
+        self.total_batch_size = self.total_batch_size.saturating_add(other.total_batch_size);
+        self.leader_wait_total_us = self
+            .leader_wait_total_us
+            .saturating_add(other.leader_wait_total_us);
+        self.follower_wait_total_us = self
+            .follower_wait_total_us
+            .saturating_add(other.follower_wait_total_us);
+        self.sync_op_total_us = self.sync_op_total_us.saturating_add(other.sync_op_total_us);
+        self.high_water_released = self
+            .high_water_released
+            .saturating_add(other.high_water_released);
+        self.leader_wait_max_us = self.leader_wait_max_us.max(other.leader_wait_max_us);
+        self.follower_wait_max_us = self.follower_wait_max_us.max(other.follower_wait_max_us);
+        self.sync_op_max_us = self.sync_op_max_us.max(other.sync_op_max_us);
+        for (count, other_count) in self
+            .batch_size_buckets
+            .iter_mut()
+            .zip(other.batch_size_buckets)
+        {
+            *count = count.saturating_add(other_count);
+        }
+        self
+    }
+}
+
 /// M5/B8 — Compute the wait-window the group-commit leader should use,
 /// given the configured static value and the EMA of recent batch sizes.
 ///

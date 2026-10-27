@@ -339,8 +339,8 @@ fn xa_state_error_begin_in_active() {
     let mut s = fresh_root_session();
     expect_ok(&engine, &mut s, "CREATE TABLE t(id INT PRIMARY KEY)");
     expect_ok(&engine, &mut s, "XA START 'g1'");
-    // BEGIN inside XA branch is XAER_OUTSIDE.
-    expect_err_code(&engine, &mut s, "BEGIN", 1400);
+    // Local transaction control is invalid in the XA branch state.
+    expect_err_code(&engine, &mut s, "BEGIN", 1399);
     expect_ok(&engine, &mut s, "XA END 'g1'");
     expect_ok(&engine, &mut s, "XA ROLLBACK 'g1'");
 }
@@ -352,9 +352,9 @@ fn xa_state_error_commit_in_active() {
     let mut s = fresh_root_session();
     expect_ok(&engine, &mut s, "CREATE TABLE t(id INT PRIMARY KEY)");
     expect_ok(&engine, &mut s, "XA START 'g2'");
-    expect_err_code(&engine, &mut s, "COMMIT", 1400);
-    expect_err_code(&engine, &mut s, "ROLLBACK", 1400);
-    expect_err_code(&engine, &mut s, "SAVEPOINT s1", 1400);
+    expect_err_code(&engine, &mut s, "COMMIT", 1399);
+    expect_err_code(&engine, &mut s, "ROLLBACK", 1399);
+    expect_ok(&engine, &mut s, "SAVEPOINT s1");
     expect_ok(&engine, &mut s, "XA END 'g2'");
     expect_ok(&engine, &mut s, "XA ROLLBACK 'g2'");
 }
@@ -981,4 +981,147 @@ fn audit_prepared_select_respects_idle_xa() {
     expect_ok(&engine, &mut s, "ROLLBACK");
     expect_ok(&engine, &mut s, "INSERT INTO t VALUES (2)");
     expect_ok(&engine, &mut s, "ROLLBACK");
+}
+
+#[test]
+fn txn_audit_xa_savepoints_and_mdl_transfer() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut s = fresh_root_session();
+    expect_ok(&engine, &mut s, "CREATE TABLE audit_sp(id INT PRIMARY KEY)");
+    expect_ok(&engine, &mut s, "XA START 'audit_sp'");
+    expect_ok(&engine, &mut s, "INSERT INTO audit_sp VALUES (1)");
+    expect_ok(&engine, &mut s, "SAVEPOINT a");
+    expect_ok(&engine, &mut s, "INSERT INTO audit_sp VALUES (2)");
+    expect_ok(&engine, &mut s, "ROLLBACK TO a");
+    expect_ok(&engine, &mut s, "RELEASE SAVEPOINT a");
+    expect_ok(&engine, &mut s, "XA END 'audit_sp'");
+    for sql in ["SAVEPOINT b", "ROLLBACK TO a", "RELEASE SAVEPOINT a"] {
+        expect_err_code(&engine, &mut s, sql, 1399);
+    }
+    expect_ok(&engine, &mut s, "XA PREPARE 'audit_sp'");
+    expect_ok(&engine, &mut s, "XA COMMIT 'audit_sp'");
+    assert_eq!(
+        fetch_int_rows(&engine, &mut s, "SELECT id FROM audit_sp"),
+        vec![1]
+    );
+}
+
+#[test]
+fn txn_audit_prepare_clears_mdl_memo_on_id_collision() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut s = fresh_root_session();
+    expect_ok(
+        &engine,
+        &mut s,
+        "CREATE TABLE audit_mdl(id INT PRIMARY KEY)",
+    );
+    expect_ok(&engine, &mut s, "SET autocommit=0");
+    expect_ok(&engine, &mut s, "XA START 'audit_mdl'");
+    s.mdl_txn_generation = s.current_txn.unwrap();
+    expect_ok(&engine, &mut s, "INSERT INTO audit_mdl VALUES (1)");
+    assert!(!s.mdl_txn_grants.borrow().1.is_empty());
+    expect_ok(&engine, &mut s, "XA END 'audit_mdl'");
+    expect_ok(&engine, &mut s, "XA PREPARE 'audit_mdl'");
+    assert!(s.mdl_txn_grants.borrow().1.is_empty());
+    expect_ok(&engine, &mut s, "SELECT * FROM audit_mdl");
+    let mut other = fresh_root_session();
+    other.connection_id = s.connection_id + 1;
+    expect_ok(&engine, &mut other, "XA ROLLBACK 'audit_mdl'");
+    expect_ok(&engine, &mut other, "SET lock_wait_timeout=1");
+    expect_err_code(&engine, &mut other, "DROP TABLE audit_mdl", 1205);
+    expect_ok(&engine, &mut s, "COMMIT");
+    expect_ok(&engine, &mut other, "DROP TABLE audit_mdl");
+}
+
+#[test]
+fn txn_audit_duplicate_characteristics_rejected() {
+    for sql in [
+        "SET TRANSACTION READ ONLY, READ WRITE",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+        "SET SESSION TRANSACTION READ ONLY, READ ONLY",
+    ] {
+        assert!(crate::parser::parse_statement(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn txn_audit_flush_privileges_commits() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut s = fresh_root_session();
+    expect_ok(
+        &engine,
+        &mut s,
+        "CREATE TABLE audit_flush(id INT PRIMARY KEY)",
+    );
+    expect_ok(&engine, &mut s, "BEGIN");
+    expect_ok(&engine, &mut s, "INSERT INTO audit_flush VALUES (1)");
+    expect_ok(&engine, &mut s, "FLUSH PRIVILEGES");
+    expect_ok(&engine, &mut s, "ROLLBACK");
+    assert_eq!(
+        fetch_int_rows(&engine, &mut s, "SELECT id FROM audit_flush"),
+        vec![1]
+    );
+}
+
+#[test]
+fn txn_audit_invalid_xid_keeps_xa_error_family() {
+    for verb in ["START", "END", "PREPARE", "COMMIT", "ROLLBACK"] {
+        for xid in [
+            "''".to_string(),
+            format!("'{}'", "a".repeat(65)),
+            format!("'a','{}'", "b".repeat(65)),
+        ] {
+            let err = crate::parser::parse_statement(&format!("XA {verb} {xid}")).unwrap_err();
+            assert_eq!(err.code(), 1398);
+        }
+        assert!(crate::parser::parse_statement(&format!(
+            "XA {verb} '{}','{}'",
+            "a".repeat(64),
+            "b".repeat(64)
+        ))
+        .is_ok());
+    }
+}
+
+#[test]
+fn txn_audit_mixed_set_does_not_leave_autocommit_read_open() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut s = fresh_root_session();
+    expect_ok(&engine, &mut s, "SET @a=(SELECT 1), autocommit=0");
+    assert!(!s.in_transaction());
+    assert!(s.current_txn.is_none());
+    assert!(!s.autocommit);
+    expect_ok(&engine, &mut s, "SET autocommit=1");
+    expect_err_code(
+        &engine,
+        &mut s,
+        "SET @b=(SELECT 1), autocommit=0, transaction_isolation='invalid'",
+        1231,
+    );
+    assert!(s.autocommit);
+    assert!(!s.in_transaction());
+    expect_ok(
+        &engine,
+        &mut s,
+        "CREATE TABLE set_lifetime(id INT PRIMARY KEY)",
+    );
+    expect_ok(&engine, &mut s, "BEGIN");
+    expect_ok(&engine, &mut s, "INSERT INTO set_lifetime VALUES (1)");
+    let txn = s.current_txn;
+    expect_ok(
+        &engine,
+        &mut s,
+        "SET @c=(SELECT id FROM set_lifetime), autocommit=0",
+    );
+    assert_eq!(s.current_txn, txn);
+    expect_ok(&engine, &mut s, "ROLLBACK");
+    assert!(fetch_int_rows(&engine, &mut s, "SELECT id FROM set_lifetime").is_empty());
 }
