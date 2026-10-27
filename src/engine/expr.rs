@@ -25904,11 +25904,9 @@ fn json_path_remove(doc: &mut OwnedJsonb, path: &str) -> Result<(), QueryError> 
     Ok(())
 }
 
-#[cfg(any(test, feature = "mysql-replica"))]
 /// Apply the logical operations carried by a MySQL PARTIAL_JSON row event to
 /// a full before-image. The caller owns row-image pairing; this helper owns
 /// MySQL JSON path and mutation semantics.
-#[cfg_attr(not(feature = "mysql-replica"), allow(dead_code))]
 pub(crate) fn apply_replication_json_diffs(
     base: &Value,
     diffs: &[(u8, String, Option<serde_json::Value>)],

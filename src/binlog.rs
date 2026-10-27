@@ -7198,7 +7198,7 @@ mod tests {
 
     /// Port of `mysql_common::binlog::misc::my_time_packed_from_binary` — the
     /// exact decoder a real MySQL replica uses — so we can assert TIME2
-    /// round-trips without the `mysql-client` feature. Returns signed micros.
+    /// round-trips. Returns signed micros.
     fn decode_time2(bytes: &[u8], fsp: u8) -> i64 {
         const TIMEF_INT_OFS: i64 = 0x800000;
         const TIMEF_OFS: i64 = 0x800000000000;
@@ -8187,7 +8187,6 @@ mod tests {
         .expect("2040 is within TIMESTAMP2's u32 range");
     }
 
-    #[cfg(feature = "mysql-client")]
     #[test]
     fn mysql_common_decodes_committed_row_events() {
         use mysql_common::binlog::consts::BinlogVersion;
@@ -8255,7 +8254,6 @@ mod tests {
         assert_eq!(decoded_images, 4);
     }
 
-    #[cfg(feature = "mysql-client")]
     #[test]
     fn table_map_full_metadata_exposes_column_names_and_unsigned_flags() {
         use mysql_common::binlog::consts::BinlogVersion;
@@ -8612,7 +8610,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mysql-client")]
     #[test]
     fn encodes_decimal_date_and_bit_rows() {
         let mut table = test_table();
@@ -8806,7 +8803,6 @@ mod tests {
         assert_eq!(err.code(), 1235);
     }
 
-    #[cfg(feature = "mysql-replica")]
     #[test]
     fn explicit_crc32_check_rejects_corrupted_event() {
         // We assert mydb's slave verifier (`verify_binlog_event_crc32`)
@@ -9697,7 +9693,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "mysql-client")]
     #[test]
     fn query_event_status_vars_roundtrip_via_mysql_common() {
         use mysql_common::binlog::events::StatusVarVal;
@@ -9791,7 +9786,6 @@ mod tests {
         assert!(got_query);
     }
 
-    #[cfg(feature = "mysql-client")]
     #[test]
     fn encodes_temporal_fsp_roundtrip_via_mysql_common() {
         // Build a table with TIME(3), DATETIME(6), TIMESTAMP(3) and verify
@@ -9985,10 +9979,6 @@ mod tests {
         assert!(saw_rows);
     }
 
-    // Decodes via mysql_common's EventStreamReader, which is only linked under
-    // the mysql-client feature — gate the test so a default `cargo test`
-    // (no feature) still compiles.
-    #[cfg(feature = "mysql-client")]
     #[test]
     fn short_varchar_row_prefix_roundtrips_with_trailing_column() {
         // Regression: a VARCHAR whose declared byte length is < 256 must use a

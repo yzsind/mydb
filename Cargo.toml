@@ -13,17 +13,16 @@ default-run = "mydb"
 autobins = false
 
 [features]
-default = ["tls", "fast-alloc", "mysql-replica"]
-tools = ["mysql-client"]
-mysql-client = ["dep:mysql", "dep:mysql_common"]
-mysql-replica = ["mysql-client", "zstd-compression"]
+default = ["tls", "fast-alloc", "zstd-compression"]
+tools = []
 tls = []
-zstd-compression = ["dep:zstd"]
+# Control protocol negotiation; the replica receiver also needs zstd for binlog payloads.
+zstd-compression = []
 fuzzing = []
 # Default fast global allocator (mimalloc), reducing malloc/free CPU on the
 # high-churn OLTP path. To use the platform fallback allocator while keeping
-# TLS and MySQL replica support:
-#   cargo build --no-default-features --features tls,mysql-replica
+# TLS and zstd protocol compression:
+#   cargo build --no-default-features --features tls,zstd-compression
 fast-alloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [build-dependencies]
@@ -82,9 +81,9 @@ itoa = "1"
 ryu = "1"
 encoding_rs = "0.8"
 unicode-normalization = "0.1"
-mysql = { version = "28.0.4", path = "vendor/mysql", default-features = false, features = ["minimal-rust", "binlog", "rustls-tls-ring"], optional = true }
-mysql_common = { version = "0.37", default-features = false, features = ["binlog"], optional = true }
-zstd = { version = "0.13", optional = true }
+mysql = { version = "28.0.4", path = "vendor/mysql", default-features = false, features = ["minimal-rust", "binlog", "rustls-tls-ring"] }
+mysql_common = { version = "0.37", path = "vendor/mysql_common", default-features = false, features = ["binlog"] }
+zstd = "0.14.3"
 imbl = { version = "7.0.1", features = ["serde"] }
 geo = { version = "0.31", default-features = false }
 

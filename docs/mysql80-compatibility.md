@@ -76,7 +76,7 @@ production-grade MySQL replacement.
 - **Prepared statements**: strict single-statement PREPARE, full parameter typing, the global `max_prepared_stmt_count`, long data, server-side read-only cursors (process-level registry, throttled by `MYDB_CURSOR_*`), and prepared CALL with multiple result sets/OUT parameters. Input that cannot be prepared or contains multiple statements fails explicitly at the PREPARE stage and is never executed via text substitution.
 - **`CLIENT_OPTIONAL_RESULTSET_METADATA`**: a real session-only `resultset_metadata={FULL|NONE}`; both PREPARE_OK and text/binary result sets carry `metadata_follows`.
 - **Capability negotiation**: client flags are intersected with the server's advertisement; FOUND_ROWS, INTERACTIVE, MULTI_RESULTS, PS_MULTI_RESULTS, QUERY_ATTRIBUTES, and SESSION_TRACK are supported. Multi-factor authentication is not implemented, so the MFA bit is not advertised.
-- **Protocol compression**: zlib and feature-gated zstd are supported; the default `mysql-replica` feature also enables `zstd-compression`, so both are available in the default build. The master switch is `MYDB_COMPRESS_PROTOCOL` and the per-algorithm switches are `MYDB_COMPRESS_ZLIB` / `MYDB_COMPRESS_ZSTD`; when disabled, the corresponding capability is not advertised, and when both algorithms are negotiated, zstd is preferred.
+- **Protocol compression**: zlib and feature-gated zstd are supported; `zstd-compression` is enabled by default, so both are available in the default build. The master switch is `MYDB_COMPRESS_PROTOCOL` and the per-algorithm switches are `MYDB_COMPRESS_ZLIB` / `MYDB_COMPRESS_ZSTD`; when disabled, the corresponding capability is not advertised, and when both algorithms are negotiated, zstd is preferred.
 - **Query attributes**: text/binary command parsing carries typed statement-level attributes readable via `MYSQL_QUERY_ATTRIBUTE_STRING(name)`; each new command clears the previous attributes.
 - **Session tracking**: schema, configured system variables, and the state-change channel have real notifications; `session_track_gtids` / `session_track_transaction_info` accept only `OFF` and provide no GTID or transaction state/characteristics notifications.
 - **Multi-statement responses**: with `CLIENT_MULTI_STATEMENTS` (including dynamic enablement via `COM_SET_OPTION`), statements execute one by one and return results with consecutive packet sequence numbers, and intermediate results set `SERVER_MORE_RESULTS_EXISTS`; affected rows, insert ID, warnings, and transaction state are preserved statement by statement. Syntax or execution errors keep the responses of already-succeeded statements and stop subsequent ones; mixes of DML, SELECT, CALL, and LOCAL INFILE are supported, and semicolon splitting respects quotes, comments, stored-program statement bodies, and the session `sql_mode`.
@@ -901,7 +901,7 @@ mydb ships **two fully independent** replication stacks, distinguished in the SQ
 
 ### MySQL → mydb (as a Replica Receiver)
 
-**◑ Row-based replica receiver.** This capability depends on the `mysql-replica` feature, which is enabled in the default build.
+**◑ Row-based replica receiver.** The receiver is a core capability included in every build.
 
 - **IO / SQL threads physically separated**: the IO thread pulls the source binlog into the relay log, and the SQL thread tails the relay and applies per transaction; `START|STOP REPLICA [IO_THREAD|SQL_THREAD]` start/stop them independently.
 - `CHANGE REPLICATION SOURCE TO` / `RESET REPLICA`; file/position, GTID auto-positioning, filtering, `SOURCE_DELAY`, `SOURCE_CONNECT_RETRY`, TLS/mTLS, and `START REPLICA UNTIL` genuinely work. `SOURCE_RETRY_COUNT`, custom heartbeats, connection compression, and TLS version/ciphersuite are △ accepted with warnings.
@@ -1126,9 +1126,9 @@ degenerate into no-ops.
 - **Default account**: `'root'@'localhost'` / `root` (bootstrap only; changeable via `MYDB_ROOT_PASSWORD`);
   the local TCP loopback matches localhost, and no remote root account is created by default.
 - **Default authentication plugin**: `caching_sha2_password`.
-- **Default build**: `tls`, `fast-alloc` (mimalloc), `mysql-replica`; the last also enables
-  the MySQL client and zstd. Capabilities of a `--no-default-features` build must be judged
-  by the actual features; tool binaries additionally need `--features tools`.
+- **Default build**: `tls`, `fast-alloc` (mimalloc), and `zstd-compression`. The MySQL
+  replica receiver and its client dependencies are included even with
+  `--no-default-features`; tool binaries additionally need `--features tools`.
 
 ```bash
 # Start the server

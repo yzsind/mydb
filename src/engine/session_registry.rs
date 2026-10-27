@@ -1281,7 +1281,6 @@ impl SessionHandle {
         }
     }
 
-    #[cfg(feature = "mysql-replica")]
     pub(crate) fn set_process_info(&self, info: Option<String>) {
         self.entry.lock().info = info.map(|sql| {
             ProcessSqlText::Owned(if crate::engine::ai::sql::sql_may_have_ai(&sql) {
@@ -1304,7 +1303,6 @@ impl SessionHandle {
         ));
     }
 
-    #[cfg(feature = "mysql-replica")]
     pub(crate) fn set_time_reference_unix_secs(&self, reference: Option<u64>) {
         self.entry.lock().time_reference_unix_secs = reference;
     }

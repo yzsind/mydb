@@ -313,7 +313,6 @@ fn sqlfix_native_math_preserves_argument_domains() {
     assert_eq!(result[2], vec![Value::Null; 3]);
 }
 
-#[cfg(feature = "mysql-replica")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlfix_binary_prepared_minmax_union_and_multi_update() {
     let (_dir, engine) = setup(&[

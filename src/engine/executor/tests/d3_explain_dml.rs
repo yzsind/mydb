@@ -546,7 +546,6 @@ fn static_explain_is_allowed_but_analyze_is_rejected_in_read_only_transaction() 
 }
 
 #[test]
-#[cfg(feature = "mysql-replica")]
 #[ignore = "requires a running local mydb server; set MYDB_EXPLAIN_PROTOCOL_TEST_PORT"]
 fn mysql_protocol_prepared_dml_explain_metadata_and_repeat_execute() {
     let port = std::env::var("MYDB_EXPLAIN_PROTOCOL_TEST_PORT")

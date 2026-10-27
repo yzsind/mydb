@@ -1,5 +1,5 @@
-//! Column-name aliasing shared by the (feature-gated) real replication module
-//! and its stub. `SHOW REPLICA STATUS` reports the MySQL 8.0.22+ column names
+//! Column-name aliasing for replication status.
+//! `SHOW REPLICA STATUS` reports the MySQL 8.0.22+ column names
 //! (`Replica_*` / `Source_*`); the deprecated `SHOW SLAVE STATUS` reports the
 //! historical names (`Slave_*` / `Master_*`). The row *values* are identical —
 //! only the header differs. Schema construction and the compatibility adapter

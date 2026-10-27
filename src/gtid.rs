@@ -48,7 +48,6 @@ pub(crate) fn append_gtid(set: &str, gtid: &str) -> String {
 }
 
 // Used by the receiver and the standalone lookup comparison benchmark.
-#[cfg_attr(not(feature = "mysql-replica"), allow(dead_code))]
 pub(crate) fn gtid_set_contains(set: &str, gtid: &str) -> bool {
     let Some((uuid, gno)) = parse_single_gtid(gtid) else {
         return false;

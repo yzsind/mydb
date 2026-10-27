@@ -289,7 +289,7 @@ See [sequences](docs/statements/ddl/create-sequence.md), [series generation](doc
 
 - **MySQL compatibility has explicit scope**: the classic protocol is supported, X Protocol is not; the native storage engine is not file- or plugin-ABI-compatible with InnoDB.
 - **Transaction semantics differ**: the default isolation level is `READ COMMITTED`; `REPEATABLE READ` is snapshot isolation without InnoDB gap/next-key locks; `SERIALIZABLE` range-insert prevention uses table-level shared locks.
-- **Replication has prerequisites**: MySQL → MyDB replication (the `mysql-replica` feature, enabled by default) requires ROW/FULL binlog on the source; native physical replication uses controlled, manual role switching with no automatic leader election.
+- **Replication has prerequisites**: MySQL → MyDB replication is built into every server build and requires ROW/FULL binlog on the source; native physical replication uses controlled, manual role switching with no automatic leader election.
 - **Time travel has a window**: table-level `FOR SYSTEM_TIME AS OF` depends on undo retention settings, and the default retention window is `0`; queries across schema DDL boundaries are explicitly rejected.
 
 Unimplemented SQL or protocol capabilities return clear errors rather than failing silently. The detailed scope is defined by the [compatibility matrix](docs/mysql80-compatibility.md), the source, and the tests.

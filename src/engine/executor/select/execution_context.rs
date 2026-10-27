@@ -113,6 +113,69 @@ mod tests {
             "terminal OOM must retain precedence over cancellation"
         );
     }
+
+    #[test]
+    fn deferred_cursor_warnings_survive_coordinator_diagnostics_finalization() {
+        use crate::engine::api;
+        use crate::error::{catalog, ConditionLevel};
+
+        api::clear_statement_warnings();
+        let _statement = api::StatementWarningSinkScope::enter();
+        api::push_statement_warning(
+            ConditionLevel::Warning,
+            catalog::ER_WARN_TOO_MANY_RECORDS,
+            "coordinator warning",
+        );
+        let context = ExecutionContext::capture(TxnView::read_only(
+            0,
+            crate::storage::IsolationLevel::ReadCommitted,
+        ))
+        .fork_cursor_warnings();
+        let sink = context.warning_sink().clone();
+        let ready = std::sync::Barrier::new(2);
+        let finalized = std::sync::Barrier::new(2);
+        let synchronous = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                api::with_statement_warning_sink(sink.clone(), || {
+                    for _ in 0..5 {
+                        api::push_statement_warning(
+                            ConditionLevel::Warning,
+                            catalog::ER_CUT_VALUE_GROUP_CONCAT,
+                            "Row was cut by GROUP_CONCAT()",
+                        );
+                    }
+                    ready.wait();
+                    finalized.wait();
+                    api::cap_statement_warnings_since(
+                        0,
+                        catalog::ER_CUT_VALUE_GROUP_CONCAT.code().get(),
+                        3,
+                    );
+                });
+            });
+            ready.wait();
+            let synchronous = api::take_statement_warnings();
+            finalized.wait();
+            worker.join().unwrap();
+            synchronous
+        });
+        assert_eq!(
+            synchronous.len(),
+            1,
+            "cursor diagnostics must remain deferred"
+        );
+        assert_eq!(synchronous[0].message(), "coordinator warning");
+        let deferred = std::mem::take(&mut *sink.lock());
+        assert_eq!(
+            deferred.len(),
+            3,
+            "LIMIT must cap before cursor warnings drain"
+        );
+        assert!(deferred
+            .iter()
+            .all(|warning| { warning.code() == catalog::ER_CUT_VALUE_GROUP_CONCAT.code().get() }));
+        assert!(api::take_statement_warnings().is_empty());
+    }
 }
 
 impl ExecutionContext {
@@ -180,6 +243,14 @@ impl ExecutionContext {
     /// token usable for normal LIMIT/TopN completion and sibling operators.
     pub(super) fn fork_worker_cancellation(mut self) -> Self {
         self.cancellation = self.cancellation.fork_local();
+        self
+    }
+
+    /// Deferred result diagnostics belong to the cursor until its producer
+    /// finishes applying LIMIT and other output semantics. The dispatcher
+    /// finalizes synchronous diagnostics while that producer can still run.
+    pub(super) fn fork_cursor_warnings(mut self) -> Self {
+        self.warning_sink = Default::default();
         self
     }
 

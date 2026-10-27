@@ -2709,7 +2709,6 @@ impl StorageQueryEngine {
         &self.db
     }
 
-    #[cfg(feature = "mysql-replica")]
     pub(crate) fn session_registry(&self) -> &Arc<SessionRegistry> {
         &self.registry
     }

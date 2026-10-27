@@ -133,10 +133,9 @@ disabled by default. When `long_query_time` is not set, the threshold falls back
 to `slow_sql_ms` (default 1000 milliseconds).
 
 Finer-grained storage, memory, execution, vector, and replication configuration
-uses the option file, `MYDB_*` environment variables, or writable sysvars. Build
-features are not runtime configuration: the `mysql-replica` feature for the
-MySQL→mydb replica receiver is enabled by default, and tool binaries use
-`--features tools`.
+uses the option file, `MYDB_*` environment variables, or writable sysvars. The
+MySQL→mydb replica receiver is a core capability included in every build. Build
+features are not runtime configuration; tool binaries use `--features tools`.
 
 `MYDB_EVENT_SCHEDULER` sets the startup state to `on` (default), `off`, or
 `disabled`. ON/OFF can be toggled dynamically with `SET GLOBAL event_scheduler`;

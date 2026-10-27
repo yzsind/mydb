@@ -51,14 +51,8 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
 
   test-build:
-    name: Build tests (${{ matrix.features }})
+    name: Build tests
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-          - default
-          - no-mysql-replica
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -66,18 +60,15 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ matrix.features }}-test
+          shared-key: default-test
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.149
       - run: mkdir -p /tmp/mydb
-      - if: matrix.features == 'default'
-        run: cargo nextest archive --locked --archive-file /tmp/mydb/tests.tar.zst
-      - if: matrix.features == 'no-mysql-replica'
-        run: cargo nextest archive --locked --no-default-features --features tls,fast-alloc --archive-file /tmp/mydb/tests.tar.zst
+      - run: cargo nextest archive --locked --archive-file /tmp/mydb/tests.tar.zst
       - uses: actions/upload-artifact@v4
         with:
-          name: tests-${{ matrix.features }}
+          name: tests-default
           path: /tmp/mydb/tests.tar.zst
           if-no-files-found: error
           overwrite: true
@@ -85,13 +76,12 @@ jobs:
           retention-days: 1
 
   test-shard:
-    name: Test (${{ matrix.features }}, shard ${{ matrix.shard }}/3)
+    name: Test (shard ${{ matrix.shard }}/3)
     needs: test-build
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        features: [default, no-mysql-replica]
         shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
@@ -100,7 +90,7 @@ jobs:
           tool: cargo-nextest@0.9.149
       - uses: actions/download-artifact@v4
         with:
-          name: tests-${{ matrix.features }}
+          name: tests-default
           path: /tmp/mydb/test-archive
       - run: >-
           python3 scripts/run_ci_tests.py
@@ -108,16 +98,12 @@ jobs:
           --output /tmp/mydb/test-run
           -- --no-fail-fast --partition hash:${{ matrix.shard }}/3
 
-  # Retain the feature-level status checks, including when a build/shard fails.
+  # Retain the aggregate status check, including when a build/shard fails.
   test:
-    name: Test (${{ matrix.features }})
+    name: Test
     if: always()
     needs: [test-build, test-shard]
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [default, no-mysql-replica]
     steps:
       - name: Require all test builds and partitions
         env:

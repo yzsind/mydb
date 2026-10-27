@@ -47,7 +47,6 @@ fn decimal_encoding_appends_exact_bytes_and_keeps_prefix_on_errors() {
     }
 }
 
-#[cfg(feature = "mysql-client")]
 #[test]
 fn decimal_groups_and_value_lanes_round_trip_through_mysql_decoder() {
     use mysql_common::binlog::decimal::Decimal;

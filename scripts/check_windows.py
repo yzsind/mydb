@@ -18,7 +18,7 @@ TARGET = "x86_64-pc-windows-msvc"
 FEATURES = {
     "default": [],
     "no-default": ["--no-default-features"],
-    "tls-replica": ["--no-default-features", "--features", "tls,mysql-replica"],
+    "tls": ["--no-default-features", "--features", "tls"],
     "tools": ["--features", "tools"],
     "all-features": ["--all-features"],
 }

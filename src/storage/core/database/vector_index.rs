@@ -1715,7 +1715,6 @@ impl Database {
                 )
                 .map(|_| Vec::new())
             };
-            drop(next);
             drop(outputs);
             let scanned = scanner
                 .join()

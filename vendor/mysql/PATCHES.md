@@ -17,3 +17,6 @@ and release inventories include its notices and upstream provenance rather
 than treating it as first-party code. Upstream updates must reapply and review
 this patch and refresh the recorded source identity; do not silently replace
 the patched source with an unverified registry or Git snapshot.
+
+The mysql_common dependency resolves to `../mysql_common`, whose manifest
+uses the fixed zstd compression dependency chain. See its `PATCHES.md`.

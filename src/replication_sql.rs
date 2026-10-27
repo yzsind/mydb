@@ -1,8 +1,8 @@
-//! Shared syntax for replication administration in both feature configurations.
+//! Syntax and result metadata for MySQL replication administration.
 use crate::storage::error;
 use crate::types::{Column, ColumnType, QueryError};
 
-/// SHOW response kind shared by enabled/disabled backends and PREPARE.
+/// SHOW response kind shared by replication execution and PREPARE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplicationShow {
     Status { legacy: bool },
@@ -53,7 +53,6 @@ pub(crate) fn admin_result_columns(sql: &str) -> Vec<Column> {
         .unwrap_or_default()
 }
 
-#[cfg_attr(not(feature = "mysql-replica"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ShowRelaylogEventsRequest {
     pub(crate) log_name: Option<String>,

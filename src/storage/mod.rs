@@ -45,7 +45,6 @@ pub(crate) use core::quantize_time_text_micros;
 pub(crate) use core::set_update_delta_enabled_for_test;
 #[cfg(test)]
 pub(crate) use core::source_audit_vector_file;
-#[cfg(feature = "mysql-replica")]
 pub(crate) use core::DeferredCommit;
 pub(crate) use core::DmlIgnoreCoercionGuard;
 pub(crate) use core::ExactIndexVisibility;

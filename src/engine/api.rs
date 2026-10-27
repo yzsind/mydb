@@ -683,8 +683,8 @@ pub(crate) fn with_statement_warning_sink<R>(
 
 /// Root statement scope shared by every nested execution context. This is
 /// deliberately a guard rather than a closure so the dispatcher can leave it
-/// installed until diagnostics are finalized while a streaming response can
-/// retain the same Arc after the guard restores the connection TLS.
+/// installed until synchronous diagnostics are finalized. Deferred result
+/// cursors own a separate sink so this scope cannot drain unfinished warnings.
 pub(crate) struct StatementWarningSinkScope {
     previous: Option<StatementWarningSink>,
     sink: StatementWarningSink,
