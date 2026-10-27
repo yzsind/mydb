@@ -120,6 +120,8 @@ pub struct QueryResult<'c, 't, 'tc, T: crate::prelude::Protocol> {
     state: SetIteratorState,
     set_index: usize,
     protocol: PhantomData<T>,
+    capture_metadata: bool,
+    completed_result: Option<OkPacket<'static>>,
 }
 
 impl<'c, 't, 'tc, T: crate::prelude::Protocol> QueryResult<'c, 't, 'tc, T> {
@@ -132,6 +134,8 @@ impl<'c, 't, 'tc, T: crate::prelude::Protocol> QueryResult<'c, 't, 'tc, T> {
             state,
             set_index: 0,
             protocol: PhantomData,
+            capture_metadata: false,
+            completed_result: None,
         }
     }
 
@@ -140,6 +144,30 @@ impl<'c, 't, 'tc, T: crate::prelude::Protocol> QueryResult<'c, 't, 'tc, T> {
         meta: ResultSetMeta,
     ) -> QueryResult<'c, 't, 'tc, T> {
         Self::from_state(conn, meta.into())
+    }
+
+    /// Capture the terminator before advancing to the next result set.
+    /// Disabled by default to avoid copies for existing driver consumers.
+    pub fn enable_result_metadata(&mut self) {
+        self.capture_metadata = true;
+    }
+
+    /// The OK/EOF packet for the last successfully completed result set.
+    /// Unlike `warnings`, this is stable after the result iterator advances.
+    pub fn completed_result(&self) -> Option<&OkPacket<'static>> {
+        self.completed_result.as_ref()
+    }
+
+    /// Close immediately without draining rows or sending further commands.
+    pub fn abort(&mut self) {
+        self.state = SetIteratorState::Done;
+        self.conn.abort();
+    }
+
+    fn capture_completed(&mut self) {
+        if self.capture_metadata {
+            self.completed_result = self.conn.0.ok_packet.clone();
+        }
     }
 
     /// Updates state with the next result set, if any.
@@ -312,6 +340,13 @@ pub struct ResultSet<'a, 'b, 'c, 'd, T: crate::prelude::Protocol> {
     inner: &'d mut QueryResult<'a, 'b, 'c, T>,
 }
 
+impl<T: crate::prelude::Protocol> ResultSet<'_, '_, '_, '_, T> {
+    /// Abort the owning connection without draining unread rows.
+    pub fn abort(&mut self) {
+        self.inner.abort();
+    }
+}
+
 impl<'a, 'b, 'c, T: crate::prelude::Protocol> std::ops::Deref for ResultSet<'a, 'b, 'c, '_, T> {
     type Target = QueryResult<'a, 'b, 'c, T>;
 
@@ -347,19 +382,23 @@ impl<T: crate::prelude::Protocol> Iterator for QueryResult<'_, '_, '_, T> {
                     Some(Ok(row))
                 }
                 Ok(None) => {
+                    self.capture_completed();
                     self.handle_next();
                     None
                 }
                 Err(e) => {
+                    self.completed_result = None;
                     self.handle_next();
                     Some(Err(e))
                 }
             },
             InEmptySet(_) => {
+                self.capture_completed();
                 self.handle_next();
                 None
             }
             Errored(err) => {
+                self.completed_result = None;
                 self.handle_next();
                 Some(Err(err))
             }

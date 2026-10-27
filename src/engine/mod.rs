@@ -1,5 +1,4 @@
 pub(crate) mod ai;
-pub(crate) mod http;
 pub mod api;
 pub mod audit_log;
 pub mod auth;
@@ -12,6 +11,7 @@ pub(crate) mod cancel;
 pub mod cbo;
 pub mod cursor_registry;
 pub(crate) mod executor;
+pub(crate) mod http;
 pub use executor::mem_budget::controlled_memory_snapshot;
 pub mod vector_maintenance;
 pub mod zone_map_maintenance;

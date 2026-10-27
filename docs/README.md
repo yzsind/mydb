@@ -1,6 +1,6 @@
 # mydb Documentation Index
 
-Last updated: 2026-10-25. This directory contains public product, SQL, deployment,
+Last updated: 2026-10-27. This directory contains public product, SQL, deployment,
 execution, and storage documentation.
 
 ## Product and SQL
@@ -31,6 +31,7 @@ execution, and storage documentation.
 
 | Document | Contents |
 | --- | --- |
+| [MyDB CLI](mydb-cli.md) | Rust interactive SQL monitor, scripts, output, TLS and client configuration |
 | [Startup Configuration](configuration.md) | Configuration file, CLI, environment variables, sysvars, and precedence |
 | [Hardware and OS Requirements](hardware-and-os-requirements.md) | Supported operating systems, CPU, memory and storage expectations, and sizing guidance |
 | [Server Limits and Specifications](limits.md) | Hard-coded and configurable capacity limits: schema objects, storage, connections, memory, parallelism, and subsystem caps |

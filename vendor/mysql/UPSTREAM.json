@@ -6,6 +6,9 @@
   "repository": "https://github.com/blackbeam/rust-mysql-simple",
   "patches": [
     "Replace rustls-pemfile with rustls::pki_types::pem::PemObject; preserve TLS trust and client identity behavior.",
-    "Resolve mysql_common to the verified local copy with the fixed zstd dependency."
+    "Resolve mysql_common to the verified local copy with the fixed zstd dependency.",
+    "Add opt-in completed result metadata snapshots and immediate abort for CLI consumers; expose TLS connection state.",
+    "Honor CLIENT_DEPRECATE_EOF when reading column metadata; do not discard the first row.",
+    "Try remaining resolved TCP addresses after a connection refusal instead of stopping at the first address."
   ]
 }

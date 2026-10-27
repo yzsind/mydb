@@ -38,7 +38,7 @@ def file_sha256(path):
 def source_hash(root):
     digest = hashlib.sha256()
     files = [root / name for name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs')]
-    for directory in ('src', 'assets/mysql80', 'tests', '.config', 'vendor'):
+    for directory in ('src', 'assets/mysql80', 'tests', '.config', 'vendor', 'clients'):
         for parent, directories, names in os.walk(root / directory):
             relative = Path(parent).relative_to(root)
             directories[:] = [name for name in directories if name not in ('target', '__pycache__')
@@ -140,7 +140,12 @@ def build_release_notices(source, artifacts):
         'cargo', 'metadata', '--locked', '--features', 'tools',
         '--filter-platform', 'x86_64-unknown-linux-gnu', '--format-version', '1',
     ], cwd=source, text=True))
-    collect_third_party(source, artifacts, metadata)
+    client_metadata = json.loads(subprocess.check_output([
+        'cargo', 'metadata', '--manifest-path', 'clients/mydb-cli/Cargo.toml', '--locked',
+        '--filter-platform', 'x86_64-unknown-linux-gnu', '--format-version', '1',
+    ], cwd=source, text=True))
+    collect_third_party(source, artifacts, metadata, extra_metadata=[client_metadata],
+                        extra_lockfiles=[source / 'clients/mydb-cli/Cargo.lock'])
 
 
 def inside(args):
@@ -174,6 +179,9 @@ def inside(args):
     for binary in binaries:
         command.extend(['--bin', binary])
     call(command, cwd=args.source)
+    call(['cargo', 'build', '--manifest-path', 'clients/mydb-cli/Cargo.toml', '--release',
+          '--locked', *(['--offline'] if args.offline else [])], cwd=args.source)
+    binaries.append('mydb-cli')
     artifacts = args.output / 'bin'
     artifacts.mkdir(exist_ok=True)
     for binary in binaries:
@@ -204,7 +212,7 @@ def inside(args):
     manifest = {'schema_version': 1, 'image': args.image, 'rust': rust, 'perl': perl, 'gcc': subprocess.check_output(['gcc', '--version'], text=True),
                 'source_sha256': fingerprint, 'cargo_lock_sha256': hashlib.sha256((args.source / 'Cargo.lock').read_bytes()).hexdigest(),
                 'features': ['default', 'tools'], 'profile': 'release', 'build_timezone': 'UTC',
-                'release_binaries': ['mydb', 'mydb-backup'],
+                'release_binaries': ['mydb', 'mydb-backup', 'mydb-cli'],
                 'test_artifacts': test_artifacts,
                 'test_build': test_build,
                 'builder_sha256': file_sha256(Path(__file__)),
@@ -214,11 +222,12 @@ def inside(args):
     (args.output / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     version = re.search(r'^version\s*=\s*"([^"]+)"', (args.source / 'Cargo.toml').read_text(), re.M)[1]
     package = args.output / f'mydb-{version}-x86-linux.tar.gz'
-    contents = {binary: artifacts / binary for binary in ('mydb', 'mydb-backup')}
+    contents = {binary: artifacts / binary for binary in ('mydb', 'mydb-backup', 'mydb-cli')}
     contents.update({'LICENSE': args.source / 'LICENSE', 'build-manifest.json': args.output / 'build-manifest.json',
                      'abi.json': args.output / 'abi.json'})
     contents.update({name: args.source / name for name in ('README.md', 'Cargo.lock')
                      if (args.source / name).is_file()})
+    contents['mydb-cli.Cargo.lock'] = args.source / 'clients/mydb-cli/Cargo.lock'
     contents['assets/mydb-architecture.svg'] = args.source / 'assets/mydb-architecture.svg'
     contents.update({'docs/' + str(path.relative_to(args.source / 'docs')): path
                      for path in (args.source / 'docs').rglob('*') if path.is_file()})

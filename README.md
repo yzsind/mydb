@@ -76,6 +76,18 @@ with password `root`. Run `SELECT 1;` to check the connection. Enter `quit` to
 exit the client, then press **Ctrl+C** in the server terminal to stop it. Restart
 with the same data directory to reopen your data.
 
+### Native Rust client
+
+Build the independent client from a source checkout:
+
+```bash
+cargo build --release --locked --manifest-path clients/mydb-cli/Cargo.toml
+./clients/mydb-cli/target/release/mydb-cli -h127.0.0.1 -P8738 -uroot -p test
+```
+
+The client provides interactive editing and completion, SQL scripts, table/TSV/
+vertical output, TLS, and query cancellation. See the [client manual](docs/mydb-cli.md).
+
 ### Build and connect
 
 Install Rust 1.95 or newer, a native C toolchain, Perl, and a MySQL 8.0 client;

@@ -134,6 +134,7 @@ class Case:
                  '--user', '10001:10001', '--cpus', '2', '--memory', '1g',
                  '-v', f'{self.args.binary}:/opt/mydb/mydb:ro',
                  '-v', f'{self.args.backup_binary}:/opt/mydb/mydb-backup:ro',
+                 '-v', f'{self.args.cli_binary}:/opt/mydb/mydb-cli:ro',
                  *mounts, *timezone, *budget,
                  '-e', 'MYDB_ROOT_PASSWORD=root',
                  '-e', 'MYDB_MEMORY_TARGET=256M', '-e', 'MYDB_DURABILITY=strict',
@@ -197,6 +198,12 @@ class Case:
         checked(['docker', 'run', '--rm', *self.storage_mount(), self.image,
                  'sh', '-ec', 'chown 10001:10001 /tmp/mydb; chmod 0755 /tmp/mydb'])
         name = self.start('server', self.port)
+        cli_output = checked(['docker', 'exec', name, '/opt/mydb/mydb-cli', '--no-config',
+                              '-h127.0.0.1', f'-P{self.port}', '-uroot', '-proot', 'test', '-N',
+                              '-e', 'SELECT 42'])
+        if cli_output.strip() != '42':
+            raise AssertionError('native CLI returned unexpected rows: ' + repr(cli_output))
+        self.result['checks']['mydb_cli_tls_query'] = True
         self.result['version'] = repr(query(self.port, 'SELECT VERSION(),@@version_compile_machine'))
         query(self.port, 'CREATE TABLE compat(id BIGINT PRIMARY KEY,n DECIMAL(12,2),txt VARCHAR(100),j JSON,b VARBINARY(20),dt DATETIME(6));')
         query(self.port, 'CREATE INDEX idx_n ON compat(n)')
@@ -475,6 +482,7 @@ def main():
     args.output = args.output.resolve()
     args.binary = args.build / 'bin/mydb'
     args.backup_binary = args.build / 'bin/mydb-backup'
+    args.cli_binary = args.build / 'bin/mydb-cli'
     args.test_archive = args.build / 'tests.tar.zst' if args.full_tests else None
     args.nextest = (args.nextest or args.build / 'tools/cargo-nextest').resolve()
     manifest = json.loads((args.build / 'build-manifest.json').read_text())
@@ -485,7 +493,7 @@ def main():
             raise SystemExit('artifact differs from the successful build manifest: ' + name)
     if args.full_tests:
         verify_test_artifacts(args.build, manifest, args.nextest)
-    checked([os.sys.executable, ROOT / 'scripts/check_elf_abi.py', args.binary, args.backup_binary])
+    checked([os.sys.executable, ROOT / 'scripts/check_elf_abi.py', args.binary, args.backup_binary, args.cli_binary])
     args.output.mkdir(parents=True, exist_ok=False)
     results = {}
     for label in labels:
