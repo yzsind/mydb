@@ -2,7 +2,13 @@
 
 ## Description
 
-Calls a configured model with one nonempty text string. Returns A native FLOAT32 VECTOR of the model-configured dimension.
+Calls a configured model with one nonempty text string. Returns a native FLOAT32 VECTOR of the model-configured dimension.
+
+The `mysql` command-line client displays native VECTOR payloads as hex. Run
+`SET SESSION vector_result_format = 'TEXT'` once per connection to display
+coordinate lists for text-protocol queries, or wrap an individual result in
+`VECTOR_TO_STRING`. The default `NATIVE` format and prepared-statement binary
+results use the native VECTOR wire type.
 
 ## Syntax
 
@@ -29,4 +35,7 @@ The example requires the local models created in the setup guide.
 
 ```sql
 SELECT VECTOR_DIM(AI_EMBED('test.local_embed', 'Database transactions'));
+
+SET SESSION vector_result_format = 'TEXT';
+SELECT AI_EMBED('test.local_embed', 'Database transactions') AS embedding;
 ```

@@ -7,7 +7,10 @@ remain outside the database.
 
 `AI_GENERATE` returns text. `AI_EMBED` returns a native FLOAT32 `VECTOR`. Direct results use the native
 VECTOR wire type with little-endian FLOAT32 coordinates; use
-`VECTOR_TO_STRING` for readable SQL-client output.
+`VECTOR_TO_STRING` for readable SQL-client output, or set
+`SET SESSION vector_result_format = 'TEXT'` once per connection to display
+all VECTOR results as coordinate lists on the text protocol. The default is
+`NATIVE`; prepared-statement binary results always retain the native wire type.
 Their `_DETAIL` variants return JSON containing the result, model revision,
 usage when reported by the provider, timing, and errors when explicitly requested.
 

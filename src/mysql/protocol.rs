@@ -1024,13 +1024,45 @@ pub fn text_row_packet_into_with_columns_info(
     charset: Option<&'static crate::charset::CharsetInfo>,
     columns: Option<&[Column]>,
 ) {
+    write_text_row::<false>(row, payload, charset, columns);
+}
+
+pub(crate) fn vector_text_row_packet_into(
+    row: &[Value],
+    payload: &mut Vec<u8>,
+    charset: Option<&'static crate::charset::CharsetInfo>,
+    columns: &[Column],
+) {
+    write_text_row::<true>(row, payload, charset, Some(columns));
+}
+
+fn write_text_row<const VECTOR_TEXT: bool>(
+    row: &[Value],
+    payload: &mut Vec<u8>,
+    charset: Option<&'static crate::charset::CharsetInfo>,
+    columns: Option<&[Column]>,
+) {
     payload.clear();
-    let estimate = estimate_text_row_packet_bytes(row);
+    let estimate = if VECTOR_TEXT {
+        estimate_vector_text_row_packet_bytes(row, charset, columns)
+    } else {
+        estimate_text_row_packet_bytes(row)
+    };
     payload.reserve(estimate);
     for (idx, value) in row.iter().enumerate() {
         let col = columns.and_then(|c| c.get(idx));
         let fsp = col.and_then(|c| c.source.decimals);
         let col_type = col.map(|c| c.column_type);
+        if VECTOR_TEXT {
+            if let Value::Vector(vector) = value {
+                ROW_TEXT_SCRATCH.with(|scratch| {
+                    let mut scratch = scratch.borrow_mut();
+                    crate::engine::vector::codec::to_text_into(vector, &mut scratch);
+                    write_text_string(payload, &scratch, result_charset_for_column(charset, col));
+                });
+                continue;
+            }
+        }
         write_text_value(
             payload,
             value,
@@ -1079,6 +1111,67 @@ pub(crate) fn estimate_text_row_packet_bytes(row: &[Value]) -> usize {
     row.iter().fold(0usize, |total, value| {
         total.saturating_add(estimate_text_value_bytes(value))
     })
+}
+
+pub(crate) fn estimate_vector_text_row_packet_bytes(
+    row: &[Value],
+    charset: Option<&'static crate::charset::CharsetInfo>,
+    columns: Option<&[Column]>,
+) -> usize {
+    row.iter()
+        .enumerate()
+        .fold(0usize, |total, (index, value)| {
+            let bytes = match value {
+                Value::Vector(vector) => {
+                    let width = match vector.datatype {
+                        crate::vector::VectorDataType::Binary => 2,
+                        crate::vector::VectorDataType::Int8 => 5,
+                        // Include the separator and sign of subnormal FLOAT32 text.
+                        _ => 50,
+                    };
+                    let charset =
+                        result_charset_for_column(charset, columns.and_then(|c| c.get(index)));
+                    let unit = match charset.map(|c| c.name) {
+                        Some("ucs2" | "utf16" | "utf16le") => 2,
+                        Some("utf32") => 4,
+                        _ => 1,
+                    };
+                    9 + (2 + vector.dimension as usize * width) * unit
+                }
+                _ => estimate_text_value_bytes(value),
+            };
+            total.saturating_add(bytes)
+        })
+}
+
+/// Adapt only outgoing text-protocol metadata; execution keeps native vectors.
+pub(crate) fn vector_text_result_columns(
+    columns: &[Column],
+    enabled: bool,
+) -> std::borrow::Cow<'_, [Column]> {
+    if !enabled
+        || !columns
+            .iter()
+            .any(|c| matches!(c.column_type, ColumnType::Vector))
+    {
+        return std::borrow::Cow::Borrowed(columns);
+    }
+    let mut columns = columns.to_vec();
+    for column in &mut columns {
+        if matches!(column.column_type, ColumnType::Vector) {
+            column.column_type = ColumnType::VarString;
+            column.source = crate::types::ColumnSource {
+                schema: column.source.schema.clone(),
+                table: column.source.table.clone(),
+                org_table: column.source.org_table.clone(),
+                org_name: column.source.org_name.clone(),
+                flags: column.source.flags & NOT_NULL_FLAG,
+                length: Some(u32::MAX),
+                ..Default::default()
+            };
+        }
+    }
+    std::borrow::Cow::Owned(columns)
 }
 
 /// Tight upper-bound byte estimate for a `Value` written by
@@ -3242,7 +3335,93 @@ mod tests {
             assert_eq!(&text[1..], expected);
             assert!(estimate_binary_row_packet_bytes(&row) >= binary.len());
             assert!(estimate_text_row_packet_bytes(&row) >= text.len());
+
+            let text_columns = vector_text_result_columns(&columns, true);
+            vector_text_row_packet_into(&row, &mut text, None, &text_columns);
+            let expected = if datatype == T::Binary {
+                "[1,0,1]"
+            } else {
+                "[1,-2,3]"
+            };
+            assert_eq!(text[0] as usize, expected.len());
+            assert_eq!(&text[1..], expected.as_bytes());
+            assert!(
+                estimate_vector_text_row_packet_bytes(&row, None, Some(&text_columns))
+                    >= text.len()
+            );
         }
+    }
+
+    #[test]
+    fn vector_text_encoding_handles_extremes_without_changing_native_strings() {
+        let values = [f32::MAX, f32::MIN, f32::MIN_POSITIVE, -f32::from_bits(1)];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let row = [Value::Vector(bytes.clone().into())];
+        // Mixed expressions may declare VARCHAR while retaining a VECTOR value.
+        // Their default wire representation must remain unchanged.
+        let columns = [Column {
+            column_type: ColumnType::VarString,
+            ..Default::default()
+        }];
+        let mut packet = Vec::new();
+        text_row_packet_into_with_columns(&row, &mut packet, None, Some(&columns));
+        assert_eq!(Cursor::new(&packet).read_lenenc_bytes().unwrap(), bytes);
+        for name in ["utf8mb4", "latin1", "ucs2", "utf16", "utf16le", "utf32"] {
+            let charset = crate::charset::resolve_result_charset(Some(name));
+            vector_text_row_packet_into(&row, &mut packet, charset, &columns);
+            assert!(
+                estimate_vector_text_row_packet_bytes(&row, charset, Some(&columns))
+                    >= packet.len()
+            );
+            let mut cursor = Cursor::new(&packet);
+            let text =
+                crate::charset::decode_bytes(name, cursor.read_lenenc_bytes().unwrap()).unwrap();
+            let decoded: Vec<f32> = serde_json::from_str(&text).unwrap();
+            assert_eq!(decoded, values);
+        }
+    }
+
+    #[test]
+    fn vector_text_result_metadata_and_nulls_are_consistent() {
+        let columns = [Column {
+            name: "embedding".into(),
+            column_type: ColumnType::Vector,
+            source: crate::types::ColumnSource {
+                schema: "test".into(),
+                table: "t".into(),
+                org_table: "t".into(),
+                org_name: "v".into(),
+                wire_type: Some(MYSQL_TYPE_VECTOR),
+                collation_id: Some(BINARY_COLLATION),
+                flags: BLOB_FLAG | BINARY_FLAG | NOT_NULL_FLAG,
+                length: Some(12),
+                vector_type: Some((crate::vector::VectorDataType::Float32, Some(3))),
+                ..Default::default()
+            },
+        }];
+        assert!(matches!(
+            vector_text_result_columns(&columns, false),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let converted = vector_text_result_columns(&columns, true);
+        assert_eq!(converted[0].source.org_name, "v");
+        assert_eq!(columns[0].column_type, ColumnType::Vector);
+        let packet = column_definition_packet_full_with_fallback(
+            &converted[0].name,
+            converted[0].column_type,
+            &converted[0].source,
+            45,
+        );
+        assert_eq!(extract_type_byte(&packet), MYSQL_TYPE_VAR_STRING);
+        assert_eq!(extract_flags(&packet), NOT_NULL_FLAG);
+        assert_eq!(converted[0].source.collation_id, None);
+        let mut payload = Vec::new();
+        vector_text_row_packet_into(&[Value::Null], &mut payload, None, &converted);
+        assert_eq!(payload, [0xfb]);
+        assert!(matches!(
+            vector_text_result_columns(&converted, true),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
     #[test]
     fn bit_value_binary_and_text_encode_as_bytes_not_truncated() {

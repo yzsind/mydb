@@ -5407,6 +5407,12 @@ where
         first_sequence_id: u8,
         encoding: StreamRowEncoding,
     ) -> io::Result<u8> {
+        let encoding = encoding.with_vector_text(self.context.vector_result_format_text);
+        let columns = crate::mysql::protocol::vector_text_result_columns(
+            columns,
+            matches!(encoding, StreamRowEncoding::VectorText(_)),
+        );
+        let columns = columns.as_ref();
         let client_capabilities = self.client_capabilities();
         let fallback_collation = self.result_fallback_collation_id();
         let mut batch = self.codec.batch_writer(&mut self.stream);
@@ -5423,7 +5429,9 @@ where
 
         let mut row_payload = Vec::new();
         let zerofill_spec = match encoding {
-            StreamRowEncoding::Text(_) => crate::mysql::protocol::zerofill_pad_spec(columns),
+            StreamRowEncoding::Text(_) | StreamRowEncoding::VectorText(_) => {
+                crate::mysql::protocol::zerofill_pad_spec(columns)
+            }
             StreamRowEncoding::Binary(_) => None,
         };
         for row in rows {
@@ -5659,6 +5667,13 @@ where
         first_sequence_id: u8,
         encoding: StreamRowEncoding,
     ) -> io::Result<u8> {
+        let encoding = encoding.with_vector_text(self.context.vector_result_format_text);
+        if let std::borrow::Cow::Owned(columns) = crate::mysql::protocol::vector_text_result_columns(
+            &result.columns,
+            matches!(encoding, StreamRowEncoding::VectorText(_)),
+        ) {
+            result.columns = columns;
+        }
         let client_capabilities = self.client_capabilities();
         // Clone the session handle up front so the per-row `select!`
         // below can race the write against `KILL [CONNECTION|QUERY]`
@@ -5685,7 +5700,7 @@ where
         let mut row_payload = Vec::new();
         let mut sent_rows = 0_u64;
         let zerofill_spec = match encoding {
-            StreamRowEncoding::Text(_) => {
+            StreamRowEncoding::Text(_) | StreamRowEncoding::VectorText(_) => {
                 crate::mysql::protocol::zerofill_pad_spec(&result.columns)
             }
             StreamRowEncoding::Binary(_) => None,
@@ -5741,6 +5756,13 @@ where
         first_sequence_id: u8,
         encoding: StreamRowEncoding,
     ) -> io::Result<u8> {
+        let encoding = encoding.with_vector_text(self.context.vector_result_format_text);
+        if let std::borrow::Cow::Owned(columns) = crate::mysql::protocol::vector_text_result_columns(
+            &result.columns,
+            matches!(encoding, StreamRowEncoding::VectorText(_)),
+        ) {
+            result.columns = columns;
+        }
         let client_capabilities = self.client_capabilities();
         let kill_notify = self.handle.as_ref().map(Arc::clone);
         let fallback_collation = self.result_fallback_collation_id();
@@ -5809,7 +5831,7 @@ where
                 while encoded.len() < batch_rows {
                     match cursor.next_row() {
                         Ok(Some(row)) => {
-                            let estimate = estimate_stream_row_bytes(&row, encoding);
+                            let estimate = estimate_stream_row_bytes(&row, &cols, encoding);
                             if let Err(e) = memory_charge.try_grow(estimate) {
                                 err = Some(e);
                                 break;
@@ -8164,8 +8186,19 @@ async fn finish_failed_stream<W: AsyncWrite + Unpin>(
 enum StreamRowEncoding {
     /// Text protocol; carries the once-resolved result charset descriptor.
     Text(Option<&'static crate::charset::CharsetInfo>),
+    /// Text protocol with coordinate-list VECTOR results.
+    VectorText(Option<&'static crate::charset::CharsetInfo>),
     /// Binary (prepared-statement) protocol.
     Binary(Option<&'static crate::charset::CharsetInfo>),
+}
+
+impl StreamRowEncoding {
+    fn with_vector_text(self, enabled: bool) -> Self {
+        match self {
+            Self::Text(charset) if enabled => Self::VectorText(charset),
+            _ => self,
+        }
+    }
 }
 
 struct ReusableByteScratch<'a> {
@@ -8228,9 +8261,20 @@ fn ensure_governed_scratch_capacity(
     Ok(())
 }
 
-fn estimate_stream_row_bytes(row: &[crate::types::Value], encoding: StreamRowEncoding) -> usize {
+fn estimate_stream_row_bytes(
+    row: &[crate::types::Value],
+    columns: &[Column],
+    encoding: StreamRowEncoding,
+) -> usize {
     match encoding {
         StreamRowEncoding::Text(_) => crate::mysql::protocol::estimate_text_row_packet_bytes(row),
+        StreamRowEncoding::VectorText(charset) => {
+            crate::mysql::protocol::estimate_vector_text_row_packet_bytes(
+                row,
+                charset,
+                Some(columns),
+            )
+        }
         StreamRowEncoding::Binary(_) => {
             crate::mysql::protocol::estimate_binary_row_packet_bytes(row)
         }
@@ -8264,6 +8308,9 @@ fn encode_stream_row(
                 charset,
                 Some(columns),
             );
+        }
+        StreamRowEncoding::VectorText(charset) => {
+            crate::mysql::protocol::vector_text_row_packet_into(row, out, charset, columns);
         }
         StreamRowEncoding::Binary(charset) => {
             crate::mysql::protocol::binary_row_packet_into_with_charset(columns, row, out, charset);

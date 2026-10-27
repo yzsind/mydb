@@ -16,6 +16,17 @@ async fn capture_result(
     encoding: StreamRowEncoding,
     flags: u32,
 ) -> (u8, Vec<u8>) {
+    capture_result_with_vector_format(result, streaming.then_some(false), encoding, flags, false)
+        .await
+}
+
+async fn capture_result_with_vector_format(
+    result: ResultSet,
+    streaming: Option<bool>,
+    encoding: StreamRowEncoding,
+    flags: u32,
+    vector_text: bool,
+) -> (u8, Vec<u8>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap())
         .await
@@ -31,21 +42,34 @@ async fn capture_result(
     );
     session.capabilities = NegotiatedCapabilities::new(flags, flags);
     session.context.character_set_results = Some("utf8mb4".into());
-    let next = if streaming {
+    session.context.vector_result_format_text = vector_text;
+    let next = if let Some(offloaded) = streaming {
         let result = StreamingResultSet {
             columns: result.columns,
             found_rows: Some(77),
             cursor: Box::new(VecResultCursor::new(result.rows)),
         };
-        let next = session
-            .write_streaming_result_set_inline(result, SERVER_STATUS_AUTOCOMMIT, 250, encoding)
-            .await
-            .unwrap();
+        let next = if offloaded {
+            session
+                .write_streaming_result_set_offloaded(
+                    result,
+                    SERVER_STATUS_AUTOCOMMIT,
+                    250,
+                    encoding,
+                )
+                .await
+                .unwrap()
+        } else {
+            session
+                .write_streaming_result_set_inline(result, SERVER_STATUS_AUTOCOMMIT, 250, encoding)
+                .await
+                .unwrap()
+        };
         assert_eq!(session.context.found_rows, 77);
         next
     } else {
         match encoding {
-            StreamRowEncoding::Text(_) => session
+            StreamRowEncoding::Text(_) | StreamRowEncoding::VectorText(_) => session
                 .write_text_result_set_parts_with_status_seq(
                     &result.columns,
                     &result.rows,
@@ -70,6 +94,56 @@ async fn capture_result(
     .unwrap()
     .unwrap();
     (next, bytes)
+}
+
+#[tokio::test]
+async fn vector_result_format_matches_all_text_writers_and_preserves_binary() {
+    let vector: Value = Value::Vector(crate::vector::VectorValue::from(
+        [1.0f32, -2.5, 3.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    ));
+    let result = ResultSet {
+        columns: vec![Column {
+            name: "v".into(),
+            column_type: ColumnType::Vector,
+            source: Default::default(),
+        }],
+        rows: vec![vec![vector], vec![Value::Null]],
+    };
+    for flags in [
+        CLIENT_PROTOCOL_41,
+        CLIENT_PROTOCOL_41 | CLIENT_DEPRECATE_EOF,
+    ] {
+        let encoding =
+            StreamRowEncoding::Text(crate::charset::resolve_result_charset(Some("utf8mb4")));
+        let mut expected_text = result.clone();
+        expected_text.columns =
+            crate::mysql::protocol::vector_text_result_columns(&result.columns, true).into_owned();
+        expected_text.rows[0][0] = Value::String("[1,-2.5,3]".into());
+        let text_packets = capture_result(expected_text, false, encoding, flags).await;
+        let native_packets = capture_result(result.clone(), false, encoding, flags).await;
+        assert_ne!(text_packets, native_packets);
+        for mode in [None, Some(false), Some(true)] {
+            assert_eq!(
+                capture_result_with_vector_format(result.clone(), mode, encoding, flags, true)
+                    .await,
+                text_packets
+            );
+            assert_eq!(
+                capture_result_with_vector_format(result.clone(), mode, encoding, flags, false)
+                    .await,
+                native_packets
+            );
+            let binary = StreamRowEncoding::Binary(None);
+            let expected_binary = capture_result(result.clone(), false, binary, flags).await;
+            assert_eq!(
+                capture_result_with_vector_format(result.clone(), mode, binary, flags, true).await,
+                expected_binary
+            );
+        }
+    }
 }
 
 #[tokio::test]

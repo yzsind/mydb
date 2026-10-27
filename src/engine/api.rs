@@ -2310,6 +2310,8 @@ pub struct SessionContext {
     pub statement_query_attributes: std::collections::BTreeMap<String, Value>,
     /// MySQL `resultset_metadata` session enum: true=FULL, false=NONE.
     pub resultset_metadata_full: bool,
+    /// Render VECTOR results as readable strings on the MySQL text protocol.
+    pub vector_result_format_text: bool,
     pub(crate) temp_tables: HashMap<String, SessionTempTable>,
     pub(crate) temp_quota: Arc<crate::storage::temp_quota::SessionTempQuota>,
     pub(crate) temp_table_journal: Vec<TempTableJournalEntry>,
@@ -3070,6 +3072,7 @@ impl SessionContext {
             connection_attrs: std::collections::BTreeMap::new(),
             statement_query_attributes: std::collections::BTreeMap::new(),
             resultset_metadata_full: true,
+            vector_result_format_text: false,
             temp_tables: HashMap::new(),
             temp_quota: Arc::new(crate::storage::temp_quota::SessionTempQuota::default()),
             temp_table_journal: Vec::new(),

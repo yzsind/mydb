@@ -41,6 +41,33 @@ metric/type combinations raise an error. `IVF` with `quantization=none` stores
 and scores native payloads. Hamming IVF uses binary majority centers; Jaccard
 IVF uses sampled medoids scored with Jaccard distance.
 
+## Displaying vectors in SQL clients
+
+Native VECTOR results use MySQL's VECTOR wire type with little-endian FLOAT32
+coordinates. The `mysql` command-line client displays these bytes as hex.
+Set the session-only `vector_result_format` variable once to display coordinate
+lists for all text-protocol VECTOR results, including table columns and functions:
+
+```sql
+SET SESSION vector_result_format = 'TEXT';
+SELECT TO_VECTOR('[1,-2.5,3]') AS embedding; -- [1,-2.5,3]
+SET SESSION vector_result_format = 'NATIVE'; -- restore the default
+```
+
+To enable this when connecting:
+
+```bash
+mysql -h127.0.0.1 -P4837 -uroot -p \
+  --init-command="SET SESSION vector_result_format='TEXT'"
+```
+
+`TEXT` results advertise a string column and use the same coordinate formatting
+as `VECTOR_TO_STRING`. Values remain native vectors during SQL execution,
+storage, and distance calculations. Prepared-statement binary results, including
+cursor fetches, always retain the native VECTOR format. New or reset sessions
+default to `NATIVE`. Unsupported format names and GLOBAL assignments are errors.
+For a single readable result without changing the session, use `VECTOR_TO_STRING`.
+
 ## Distances and queries
 
 Numeric operands may have different datatypes. Distance uses the actual
