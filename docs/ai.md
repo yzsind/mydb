@@ -313,7 +313,10 @@ outputs are rejected even when accompanied by text.
 `on_error='return'` is available only on DETAIL functions and returns
 `ok=false` with structured call errors. It does not catch invalid SQL, access
 denials, unsupported contexts, resource-budget failures, KILL, or the query's
-execution deadline. Missing usage is JSON null, rather than an invented zero.
+execution deadline. In error envelopes, `finish_reason` is `length` only when
+the provider explicitly reports an output-token limit; other unfinished
+generations use `incomplete`, and refusals use `refusal`.
+Missing usage is JSON null, rather than an invented zero.
 
 ## Execution boundaries
 
@@ -373,6 +376,8 @@ Default hard bounds include 100 logical call items and 100 HTTP attempts per
 statement, 64 items per explicit embedding batch, 256 KiB per input text, 64 KiB
 options JSON, JSON depth 32, and 8 MiB request/response bodies. FLOAT32 embeddings
 must have their configured dimension in 1..16383 and finite coordinates.
+Receive buffers are reserved before dispatch; parsing and result storage are
+reserved from the actual response size and JSON structure before decoding.
 Memory reservations, result-window limits, model limits, and provider limits
 can reject a smaller request. Embedding dimensions and normalization are
 model properties, not per-call overrides. Inputs are never truncated by mydb;

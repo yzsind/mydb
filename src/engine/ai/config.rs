@@ -7,6 +7,15 @@ use std::path::Path;
 
 /// Enforce duplicate-key and nesting limits before creating a JSON DOM.
 pub(crate) fn parse_json(input: &str, max: usize) -> Result<Json, QueryError> {
+    parse_json_budgeted(input, max, |_| Ok(()))
+}
+
+/// Reserve DOM and result storage after lexical validation, before allocation.
+pub(crate) fn parse_json_budgeted(
+    input: &str,
+    max: usize,
+    reserve: impl FnOnce(usize) -> Result<(), QueryError>,
+) -> Result<Json, QueryError> {
     if input.len() > max {
         return Err(error("ER_AI_INVALID_ARGUMENT", "JSON exceeds byte limit"));
     }
@@ -66,6 +75,7 @@ pub(crate) fn parse_json(input: &str, max: usize) -> Result<Json, QueryError> {
     }
     // Count lexical nesting before recursively invoking serde.
     let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    let (mut nodes, mut objects, mut scalar) = (0usize, 0usize, false);
     for c in input.bytes() {
         if quoted {
             if escaped {
@@ -77,18 +87,43 @@ pub(crate) fn parse_json(input: &str, max: usize) -> Result<Json, QueryError> {
             }
         } else {
             match c {
-                b'"' => quoted = true,
+                b'"' => {
+                    nodes += 1;
+                    quoted = true;
+                    scalar = false;
+                }
                 b'[' | b'{' => {
+                    nodes += 1;
+                    objects += usize::from(c == b'{');
+                    scalar = false;
                     depth += 1;
                     if depth > 32 {
                         return Err(error("ER_AI_INVALID_ARGUMENT", "JSON nesting exceeds 32"));
                     }
                 }
-                b']' | b'}' => depth = depth.saturating_sub(1),
+                b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                    scalar = false;
+                }
+                b',' | b':' | b' ' | b'\n' | b'\r' | b'\t' => scalar = false,
+                _ if !scalar => {
+                    nodes += 1;
+                    scalar = true;
+                }
                 _ => {}
             }
         }
     }
+    // Each token includes keys and containers. Allow for vector capacity growth,
+    // tree entries, decoded FLOAT32 arrays, the output DOM and JSONB encoding.
+    // Small objects also reserve a B-tree node even when only one entry is used.
+    // Strings additionally need space proportional to their encoded bytes.
+    reserve(
+        nodes
+            .saturating_mul(160)
+            .saturating_add(objects.saturating_mul(512))
+            .saturating_add(input.len().saturating_mul(4)),
+    )?;
     let mut de = serde_json::Deserializer::from_str(input);
     let value = Strict::deserialize(&mut de)
         .map_err(|_| {
@@ -328,6 +363,7 @@ impl LocalConfig {
                     || v.is_unicast_link_local()
                     || (v.segments()[0] & 0xffc0) == 0xfec0
                     || (v.segments()[0] == 0x2001 && v.segments()[1] == 0x0db8)
+                    || (v.segments()[0] == 0x2001 && v.segments()[1] == 0)
                     || v.segments()[0] == 0x2002
                     || v.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
                     || v.segments()[..6] == [0, 0, 0, 0, 0, 0]

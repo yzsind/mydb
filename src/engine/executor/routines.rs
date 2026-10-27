@@ -1443,6 +1443,18 @@ fn compile_static_statements(
 ) -> Result<HashMap<String, CompiledStaticStatement>, QueryError> {
     let mut statements = HashMap::new();
     collect_static_statements(&body.statements, &mut statements)?;
+    if crate::parser::collect_routine_expression_function_names(&body.statements)
+        .iter()
+        .any(|name| crate::engine::ai::is_function(name))
+        || statements
+            .values()
+            .any(|compiled| crate::engine::ai::sql::statement_has_ai(&compiled.statement))
+    {
+        return Err(crate::engine::ai::error(
+            "ER_AI_UNSUPPORTED_CONTEXT",
+            "AI calls are not allowed in stored programs or triggers",
+        ));
+    }
     Ok(statements)
 }
 

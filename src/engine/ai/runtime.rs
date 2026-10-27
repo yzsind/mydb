@@ -831,7 +831,7 @@ async fn http(
     credential: Option<Zeroizing<Vec<u8>>>,
     dispatch: Dispatch,
     response_limit: usize,
-    _memory: Arc<super::admission::Memory>,
+    memory: Arc<super::admission::Memory>,
 ) -> Result<ProviderReply, ProviderFailure> {
     let queued = Instant::now();
     let breaker =
@@ -846,6 +846,7 @@ async fn http(
         credential,
         dispatch,
         response_limit,
+        &memory,
         queued,
         &breaker,
         &mut quotas,
@@ -870,6 +871,7 @@ async fn http_inner(
     credential: Option<Zeroizing<Vec<u8>>>,
     dispatch: Dispatch,
     response_limit: usize,
+    memory: &super::admission::Memory,
     queued: Instant,
     breaker: &super::admission::BreakerPermit,
     quotas: &mut super::admission::Permit,
@@ -1041,8 +1043,23 @@ async fn http_inner(
     }
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| error("ER_AI_INVALID_RESPONSE", "provider response is not UTF-8"))?;
-    let body = parse_json(text, response_limit)
-        .map_err(|_| error("ER_AI_INVALID_RESPONSE", "invalid provider JSON"))?;
+    let body = parse_json_budgeted(text, response_limit, |bytes| {
+        // Generated text may itself be JSON decoded for schema validation. Keep
+        // the conservative expansion allowance for that second DOM as well.
+        let bytes = if dispatch.model.kind == "embedding" {
+            bytes
+        } else {
+            bytes.max(text.len().saturating_mul(32))
+        };
+        memory.reserve_response(bytes)
+    })
+    .map_err(|e| {
+        if e.is(crate::error::catalog::ER_AI_INVALID_ARGUMENT) {
+            error("ER_AI_INVALID_RESPONSE", "invalid provider JSON")
+        } else {
+            e
+        }
+    })?;
     Ok(ProviderReply {
         body,
         request_id: provider_request_id,
@@ -1518,6 +1535,23 @@ fn count_attempt(scope: &mut CallScope, dispatch: &Dispatch) -> Result<(), Query
     }
     Ok(())
 }
+fn incomplete_finish_reason(response: &Json, connection: &Connection) -> &'static str {
+    let length = match connection.protocol.as_str() {
+        "ollama" => response["done_reason"] == "length",
+        "openai_chat" => response["choices"][0]["finish_reason"] == "length",
+        "openai_responses" => {
+            response["status"] == "incomplete"
+                && response["incomplete_details"]["reason"] == "max_output_tokens"
+        }
+        _ => false,
+    };
+    if length {
+        "length"
+    } else {
+        "incomplete"
+    }
+}
+
 fn finish_reply(
     call: &mut PreparedCall,
     reply: ProviderReply,
@@ -1531,7 +1565,14 @@ fn finish_reply(
         call.count,
         &call.options,
         call.detail,
-    )?;
+    )
+    .map_err(|e| {
+        if e.is(crate::error::catalog::ER_AI_INCOMPLETE) {
+            call.envelope["finish_reason"] =
+                json!(incomplete_finish_reason(response, &call.connection));
+        }
+        e
+    })?;
     let usage = usage(response, &call.connection, call.embed)?;
     if response
         .get("model")
@@ -1573,7 +1614,7 @@ fn finish_call(
             call.envelope["attempts"] = json!(attempts);
             call.envelope["error"] = json!({"code":e.symbol(),"message":e.message(),"retryable":failure.is_some_and(|f|f.retryable),"ambiguous":failure.is_some_and(|f|f.ambiguous),"http_status":failure.and_then(|f|f.status)});
             call.envelope["finish_reason"] = if e.is(crate::error::catalog::ER_AI_INCOMPLETE) {
-                json!("length")
+                call.envelope["finish_reason"].clone()
             } else if e.is(crate::error::catalog::ER_AI_REFUSED) {
                 json!("refusal")
             } else {
@@ -1850,9 +1891,11 @@ fn prepare_call(
             + 65536
     }
     .min(8 * 1024 * 1024);
+    // Bound the receive buffer and overlapping old/new allocations during growth.
+    // DOM and result storage are charged from the actual JSON before parsing.
     let reserved = request_bytes
         .saturating_mul(4)
-        .saturating_add(response_limit.saturating_mul(32));
+        .saturating_add(response_limit.saturating_mul(3));
     let memory = super::admission::Memory::reserve(reserved)?;
     let timeout = positive(&options, "timeout_ms", 30000, 60000)?;
     let deadline = scope.deadline.min(started + Duration::from_millis(timeout));

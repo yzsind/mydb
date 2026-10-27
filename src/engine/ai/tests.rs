@@ -426,3 +426,26 @@ fn ai_failed_master_rotation_does_not_partially_rewrap_any_secret() {
         );
     });
 }
+
+#[test]
+fn ai_audit_teredo_policy() {
+    let mut config: LocalConfig =
+        serde_json::from_value(serde_json::json!({"version":1,"egress":{"allowed_origins":[]}}))
+            .unwrap();
+    for ip in ["2001::", "2001:0:ffff:ffff:ffff:ffff:ffff:ffff"] {
+        assert!(config.check_ip(ip.parse().unwrap()).is_err(), "{ip}");
+    }
+    assert!(config
+        .check_ip("2001:4860:4860::8888".parse().unwrap())
+        .is_ok());
+    config
+        .egress
+        .as_mut()
+        .unwrap()
+        .private_destinations
+        .push("2001::/32".parse().unwrap());
+    assert!(config.check_ip("2001::1".parse().unwrap()).is_ok());
+    assert!(LocalConfig::default()
+        .check_ip("2001::1".parse().unwrap())
+        .is_ok());
+}
