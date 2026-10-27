@@ -454,7 +454,7 @@ In addition, the process environment variable
 `SELECT`. `LOAD DATA/XML` also supports `PARALLEL` and `NO_PARALLEL`;
 its small-file detection may still choose the synchronous path.
 
-### 6.3 B-tree Index Creation
+### 6.3 B-tree and Fulltext Index Creation
 
 Offline B-tree builds accept a hint written after the first keyword of
 the DDL:
@@ -462,20 +462,25 @@ the DDL:
 ```sql
 CREATE /*+ PARALLEL(8) */ INDEX ix_ab ON t(a, b);
 ALTER /*+ PARALLEL(8) */ TABLE t ADD INDEX ix_a(a), ADD INDEX ix_b(b);
+CREATE /*+ PARALLEL(8) */ FULLTEXT INDEX ft_body ON articles(body);
 ```
 
 `PARALLEL` / `PARALLEL()` / `PARALLEL(0)` use `MYDB_PARALLEL_DEGREE`;
 `PARALLEL(1)` and `NO_PARALLEL` force serial execution. The precedence is
 `MYDB_PARALLEL_DISABLE`, `NO_PARALLEL`, `PARALLEL(n)`,
-`MYDB_PARALLEL_DEGREE`, and the built-in default of 4. The effective
+`MYDB_PARALLEL_DEGREE`, and the built-in default of 2. The effective
 degree of parallelism is further limited by the number of physical pages,
 the number of indexes, file descriptors, and `StorageScratch` reservations
 already acquired; multi-index builds share one worker budget and never
 form an outer × inner thread pool.
 
-Explicit `PARALLEL` currently supports only BTREE; FULLTEXT, SPATIAL,
-HNSW, and IVF return `ER_NOT_SUPPORTED_YET`. Without a hint, those
-indexes keep using their existing build strategies.
+Explicit `PARALLEL` supports BTREE and FULLTEXT. Persistent offline FULLTEXT
+builds parallelize projected heap scans, tokenization, bounded sort runs,
+spill consolidation, and leaf-page writes. Their dictionary representation
+is selected from the data; high-cardinality inputs retain the external merge
+path. Final root publication and durability barriers follow completed writes.
+Memory-only and online FULLTEXT builds retain their existing backfill path.
+SPATIAL, HNSW, and IVF return `ER_NOT_SUPPORTED_YET` for explicit `PARALLEL`.
 
 ## 7. Query Runtime Hints
 

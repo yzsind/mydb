@@ -650,6 +650,25 @@ fn reclaim_controlled_admission_once(
     if category != ControlledMemoryCategory::BufferRaw {
         let owned_database = database.is_none().then(current_reclaim_database).flatten();
         if let Some(database) = database.or(owned_database.as_ref()) {
+            let (used, _, categories, _) = controlled_memory_snapshot();
+            let floor =
+                (effective_memory_limit_bytes() / 50).clamp(16 * 1024 * 1024, 256 * 1024 * 1024);
+            let physical = crate::engine::memory_reclaimer::process_headroom_reclaim_bytes(
+                bytes.saturating_add(ADMISSION_RECLAIM_HEADROOM_BYTES),
+                operational_memory_limit_bytes(),
+            );
+            // Small allocations should first replace raw pages. Retiring a
+            // whole navigator for an ordinary parser/scratch charge causes
+            // repeated graph reconstruction between sequential queries.
+            if used
+                .saturating_sub(categories[0])
+                .saturating_add(bytes)
+                .saturating_add(floor)
+                > operational_memory_limit_bytes()
+                || physical > categories[0].saturating_sub(floor)
+            {
+                database.reclaim_vector_navigation_caches();
+            }
             let before_buffer = controlled_memory_snapshot().0;
             let (_, _, categories, _) = controlled_memory_snapshot();
             let raw = categories[0];
@@ -658,7 +677,11 @@ fn reclaim_controlled_admission_once(
             let min_buffer = (effective / 50)
                 .clamp(16 * 1024 * 1024, 256 * 1024 * 1024)
                 .min(raw);
-            let desired = operational_memory_limit_bytes().saturating_sub(bytes);
+            let desired = logical_admission_reclaim_target(
+                operational_memory_limit_bytes(),
+                before_buffer,
+                bytes,
+            );
             let physical_reclaim = crate::engine::memory_reclaimer::process_headroom_reclaim_bytes(
                 bytes,
                 operational_memory_limit_bytes(),
@@ -733,6 +756,21 @@ fn decorate_reclaim_error(
     } else {
         error
     }
+}
+
+#[inline]
+fn logical_admission_reclaim_target(limit: usize, used: usize, requested: usize) -> usize {
+    let target = limit.saturating_sub(requested);
+    if used <= target {
+        return target;
+    }
+    // A page prefetch/cleaner can refill the exact reclaimed deficit before
+    // the allocating thread retries. Retain a bounded admission window for
+    // mandatory work, just as physical-pressure reclamation already does.
+    // This returns cache residency; it does not increase either hard ceiling.
+    target.saturating_sub(
+        (limit / 32).clamp(crate::storage::PAGE_SIZE, ADMISSION_RECLAIM_HEADROOM_BYTES),
+    )
 }
 
 #[inline]
@@ -960,6 +998,62 @@ impl ControlledMemoryCharge {
         charge_controlled_impl(category, bytes, false, false)
             .ok()
             .map(|()| Self { category, bytes })
+    }
+
+    /// Optional read accelerators may replace raw pages with a denser
+    /// representation. Keep admission bounded and preserve the buffer floor;
+    /// refusal still leaves the existing durable read path available.
+    pub(crate) fn try_new_optional_with_cache_reclaim(
+        category: ControlledMemoryCategory,
+        bytes: usize,
+        mut reclaim: impl FnMut(usize),
+    ) -> Option<Self> {
+        if let Some(charge) = Self::try_new_optional(category, bytes) {
+            return Some(charge);
+        }
+        if storage_latch_admission_active() {
+            return None;
+        }
+        // A completed bulk build can release its leases while allocator
+        // arenas still retain the pages. Return those pages on their owning
+        // workers before deciding that a large optional image must spill.
+        if bytes >= ADMISSION_RECLAIM_HEADROOM_BYTES {
+            crate::engine::memory_reclaimer::release_allocator_cached_memory();
+            crate::engine::memory_reclaimer::reset_pressure_allowance();
+            if let Some(charge) = Self::try_new_optional(category, bytes) {
+                return Some(charge);
+            }
+        }
+        let admission = RECLAIM_ADMISSION.get_or_init(|| Mutex::new(()));
+        let _guard = admission.try_lock().ok()?;
+        for _ in 0..3 {
+            let (before, _, categories, _) = controlled_memory_snapshot();
+            let non_buffer = before.saturating_sub(categories[0]);
+            let floor =
+                (effective_memory_limit_bytes() / 50).clamp(16 * 1024 * 1024, 256 * 1024 * 1024);
+            let physical = crate::engine::memory_reclaimer::process_headroom_reclaim_bytes(
+                bytes.saturating_add(ADMISSION_RECLAIM_HEADROOM_BYTES),
+                operational_memory_limit_bytes(),
+            );
+            let target = operational_memory_limit_bytes()
+                .saturating_sub(bytes)
+                .saturating_sub(ADMISSION_RECLAIM_HEADROOM_BYTES)
+                .min(before.saturating_sub(physical))
+                .max(non_buffer.saturating_add(floor));
+            if target >= before {
+                return None;
+            }
+            RECLAIM_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            reclaim(target);
+            RECLAIM_BUFFER_BYTES.fetch_add(
+                before.saturating_sub(controlled_memory_snapshot().0) as u64,
+                Ordering::Relaxed,
+            );
+            if let Some(charge) = Self::try_new_optional(category, bytes) {
+                return Some(charge);
+            }
+        }
+        None
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -2832,6 +2926,28 @@ mod tests {
     }
 
     #[test]
+    fn logical_admission_reclaim_survives_concurrent_page_refill() {
+        let limit = 2usize * 1024 * 1024 * 1024 / 10 * 8;
+        let used = limit - 3065;
+        let requested = 102400;
+        let target = logical_admission_reclaim_target(limit, used, requested);
+        let released =
+            (used - target).div_ceil(crate::storage::PAGE_SIZE) * crate::storage::PAGE_SIZE;
+        // Reproduce the observed 1037: an exact-deficit reclaim lost its
+        // reservation race to just one background 16 KiB page allocation.
+        let exact = limit - requested;
+        let exact_released =
+            (used - exact).div_ceil(crate::storage::PAGE_SIZE) * crate::storage::PAGE_SIZE;
+        assert!(used - exact_released + crate::storage::PAGE_SIZE + requested > limit);
+        assert!(used - released + crate::storage::PAGE_SIZE + requested <= limit);
+        assert_eq!(
+            logical_admission_reclaim_target(limit, 0, requested),
+            limit - requested
+        );
+        assert!(limit - requested - target <= ADMISSION_RECLAIM_HEADROOM_BYTES);
+    }
+
+    #[test]
     fn admission_reclaim_target_honors_physical_pressure_below_logical_limit() {
         let mib = 1024 * 1024;
         // The regression shape: only 6.6 GiB is logically controlled, so the
@@ -3142,6 +3258,57 @@ mod tests {
         MEMORY_TARGET_BYTES.store(prior_target, Ordering::Release);
         EFFECTIVE_MEMORY_LIMIT_BYTES.store(prior_effective, Ordering::Release);
         reset_controlled_test_counters();
+    }
+
+    #[test]
+    fn optional_cache_reclaim_preserves_admission_limits_and_storage_latches() {
+        let _serial = GLOBAL_MEMORY_TEST_LOCK.lock().unwrap();
+        let prior_target = MEMORY_TARGET_BYTES.swap(100 * 1024 * 1024, Ordering::AcqRel);
+        let prior_effective =
+            EFFECTIVE_MEMORY_LIMIT_BYTES.swap(100 * 1024 * 1024, Ordering::AcqRel);
+        reset_controlled_test_counters();
+        let prior_raw = CONTROLLED_BUFFER_RAW_LIMIT_BYTES.swap(60 * 1024 * 1024, Ordering::AcqRel);
+        let prior_buffer = CONTROLLED_BUFFER_LIMIT_BYTES.swap(60 * 1024 * 1024, Ordering::AcqRel);
+        let mut raw = Some(
+            ControlledMemoryCharge::try_new(ControlledMemoryCategory::BufferRaw, 50 * 1024 * 1024)
+                .unwrap(),
+        );
+        let metadata = ControlledMemoryCharge::try_new(
+            ControlledMemoryCategory::SystemMetadata,
+            10 * 1024 * 1024,
+        )
+        .unwrap();
+        {
+            let _latch = StorageLatchAdmissionScope::enter();
+            assert!(ControlledMemoryCharge::try_new_optional_with_cache_reclaim(
+                ControlledMemoryCategory::DerivedCache,
+                30 * 1024 * 1024,
+                |_| panic!("reclaim under a storage latch"),
+            )
+            .is_none());
+        }
+        let mut calls = 0;
+        let cache = ControlledMemoryCharge::try_new_optional_with_cache_reclaim(
+            ControlledMemoryCategory::DerivedCache,
+            30 * 1024 * 1024,
+            |target| {
+                calls += 1;
+                assert!(target >= 26 * 1024 * 1024);
+                drop(raw.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(controlled_memory_snapshot().0, 40 * 1024 * 1024);
+        assert_eq!(operational_memory_limit_bytes(), 80 * 1024 * 1024);
+        assert_eq!(CONTROLLED_REJECTIONS.load(Ordering::Relaxed), 0);
+        drop((cache, metadata));
+        assert_eq!(controlled_memory_snapshot().0, 0);
+        MEMORY_TARGET_BYTES.store(prior_target, Ordering::Release);
+        EFFECTIVE_MEMORY_LIMIT_BYTES.store(prior_effective, Ordering::Release);
+        reset_controlled_test_counters();
+        CONTROLLED_BUFFER_RAW_LIMIT_BYTES.store(prior_raw, Ordering::Release);
+        CONTROLLED_BUFFER_LIMIT_BYTES.store(prior_buffer, Ordering::Release);
     }
 
     #[test]

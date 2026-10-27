@@ -589,6 +589,9 @@ fn parse_statement_source(
     sql: &str,
     lex_mode: crate::sql_lex::SqlLexMode,
 ) -> Result<Statement, ParseError> {
+    if let Some(result) = crate::engine::ai::sql::parse(sql) {
+        return result;
+    }
     // PreparedSql preserves byte offsets and line layout, so downstream spans
     // continue to identify the effective source token exactly.
     let _raw_sql_guard = ParserRawSqlGuard::activate(sql);

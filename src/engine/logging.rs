@@ -970,6 +970,9 @@ fn user_host(session: &SessionContext) -> String {
 }
 
 pub(crate) fn redact_sql_for_log(sql: &str) -> String {
+    if crate::engine::ai::sql::sql_may_have_ai(sql) {
+        return "[redacted AI statement]".to_string();
+    }
     fn starts_with_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
         haystack
             .as_bytes()

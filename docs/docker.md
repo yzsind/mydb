@@ -1,7 +1,7 @@
 # Docker Build and Deployment
 
 The repository root provides the local image build files. The image enables TLS,
-`fast-alloc`, and `mysql-replica` by default, and the database process runs as
+`fast-alloc`, and `zstd-compression` by default, and the database process runs as
 the non-root user with UID/GID `10001:10001`. It contains the server, backup CLI,
 SQL client, timezone data, and third-party license/source notices:
 

@@ -737,6 +737,31 @@ impl VectorPurgeQueue {
                 })
             })
     }
+
+    fn remove_index_snapshot(&mut self, index: VectorPurgeIndexIdentity) -> usize {
+        let generations: Vec<_> = self
+            .by_index
+            .range((index.0, index.1, 0, 0, 0)..=(index.0, index.1, u64::MAX, u64::MAX, u64::MAX))
+            .map(|(old, _)| *old)
+            .filter(|old| old.3 == index.3)
+            .collect();
+        let mut bytes = 0usize;
+        for index in generations {
+            for time in self.by_index.remove(&index).unwrap_or_default() {
+                if let Some(purge) = self
+                    .by_time
+                    .remove(&(time, index.0, index.1, index.2, index.3, index.4))
+                {
+                    bytes = bytes.saturating_add(512 + purge.rows.len() * 192);
+                    for (row, versions) in purge.rows {
+                        bytes = bytes.saturating_add(versions.len() * 16);
+                        self.latest_retired.remove(&(index, row));
+                    }
+                }
+            }
+        }
+        bytes
+    }
 }
 
 impl VectorPurge {
@@ -4388,6 +4413,7 @@ include!("core/database/guards.rs");
 include!("core/database/facade.rs");
 include!("core/database/catalog_store.rs");
 include!("core/database/catalog_ops.rs");
+include!("core/database/ai.rs");
 include!("core/database/txn_ops.rs");
 include!("core/database/vector_index_paths.rs");
 include!("core/database/ddl.rs");
@@ -4408,6 +4434,7 @@ include!("core/database/index_access.rs");
 include!("core/database/constraints_dml.rs");
 include!("core/database/foreign_keys.rs");
 include!("core/database/index_build_encoded.rs");
+include!("core/database/index_build_fulltext.rs");
 include!("core/database/index_maintenance.rs");
 include!("core/database/shadow_generation.rs");
 include!("core/database/vector_index.rs");
@@ -4779,6 +4806,8 @@ mod tests;
 mod btree_bug_audit_tests;
 #[cfg(test)]
 mod btree_lookup_tests;
+#[cfg(test)]
+mod read_ahead_tests;
 
 #[cfg(test)]
 mod dml_audit_1015_tests;

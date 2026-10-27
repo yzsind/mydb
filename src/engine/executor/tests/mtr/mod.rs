@@ -1816,10 +1816,9 @@ fn mtr_protocol() {
     );
 }
 
-/// Feature-gated binary-protocol acceptance. Unlike `mtr_protocol` this uses
+/// Binary-protocol acceptance. Unlike `mtr_protocol` this uses
 /// the Rust client driver's `prep`/`exec` API, guaranteeing COM_STMT_* rather
 /// than COM_QUERY.
-#[cfg(feature = "mysql-client")]
 #[test]
 #[ignore = "requires a built mydb server for COM_STMT binary protocol acceptance"]
 fn mtr_binary_prepared_protocol() {
@@ -2512,7 +2511,7 @@ struct Runner {
     abort_on_error: bool,
     /// Whether subsequent statements should be exercised through prepared
     /// statement semantics. The in-process backend records the state; the
-    /// feature-gated wire backend performs the actual binary protocol switch.
+    /// wire backend performs the actual binary protocol switch.
     ps_protocol: bool,
     /// Persistent mysqltest output mode toggled by `--vertical_results` /
     /// `--horizontal_results`.
@@ -2606,7 +2605,7 @@ impl Runner {
 
     /// Execute an ordinary mysqltest SQL statement under the currently
     /// selected protocol mode. The in-process backend exercises the same
-    /// named prepared-statement AST/bind path; the feature-gated protocol
+    /// named prepared-statement AST/bind path; the protocol
     /// suite separately verifies COM_STMT_* packet behaviour.
     fn exec_sql_statement(&mut self, sql: &str) -> Result<QueryResponse, QueryError> {
         // mysql-test exposes the same read-only fixture directory through

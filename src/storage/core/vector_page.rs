@@ -1000,6 +1000,23 @@ struct VectorMetaState {
 }
 
 impl VectorIndexFile {
+    pub(crate) fn reserve_navigation_cache(
+        &self,
+        bytes: usize,
+    ) -> Option<crate::engine::executor::mem_budget::ControlledMemoryCharge> {
+        use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+        ControlledMemoryCharge::try_new_optional_with_cache_reclaim(
+            ControlledMemoryCategory::DerivedCache,
+            bytes,
+            |target| {
+                if let Some(database) = crate::engine::executor::mem_budget::current_reclaim_database() {
+                    database.reclaim_vector_navigation_caches();
+                }
+                let _ = self.buffer_pool.reclaim_for_memory_target(target, Duration::from_millis(100));
+            },
+        )
+    }
+
     /// Flush every dirty frame belonging to this vector file. Atomic rebuild
     /// uses this before publishing the temporary file with `rename(2)`.
     pub(crate) fn flush(&self) -> Result<(), QueryError> {
@@ -1027,12 +1044,61 @@ impl VectorIndexFile {
         &self,
         node_count: usize,
         entry: Option<(u32, usize)>,
-        mut top_layer: FT,
+        top_layer: FT,
         mut fetch: FF,
     ) -> Result<(), QueryError>
     where
         FT: FnMut(usize) -> usize,
         FF: FnMut(usize, &mut Vec<f32>, &mut Vec<Vec<u32>>) -> Result<RowId, QueryError>,
+    {
+        self.bulk_build_image(
+            node_count,
+            entry,
+            top_layer,
+            |id, vector, _, links| fetch(id, vector, links),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// Pack compressed native nodes and links once, preserving preceding model
+    /// blobs and the same data-before-finalized-meta durability contract.
+    pub(crate) fn bulk_build_native_direct<FT, FF>(
+        &self,
+        node_count: usize,
+        entry: Option<(u32, usize)>,
+        top_layer: FT,
+        mut fetch: FF,
+    ) -> Result<Vec<VecId>, QueryError>
+    where
+        FT: FnMut(usize) -> usize,
+        FF: FnMut(usize, &mut Vec<u8>, &mut Vec<Vec<u32>>) -> Result<RowId, QueryError>,
+    {
+        self.bulk_build_image(
+            node_count,
+            entry,
+            top_layer,
+            |id, _, payload, links| fetch(id, payload, links),
+            true,
+        )
+    }
+
+    fn bulk_build_image<FT, FF>(
+        &self,
+        node_count: usize,
+        entry: Option<(u32, usize)>,
+        mut top_layer: FT,
+        mut fetch: FF,
+        native: bool,
+    ) -> Result<Vec<VecId>, QueryError>
+    where
+        FT: FnMut(usize) -> usize,
+        FF: FnMut(
+            usize,
+            &mut Vec<f32>,
+            &mut Vec<u8>,
+            &mut Vec<Vec<u32>>,
+        ) -> Result<RowId, QueryError>,
     {
         let _mapping_write = self.navigation_write();
         if !self.supports_direct_bulk_build() {
@@ -1047,7 +1113,13 @@ impl VectorIndexFile {
         let usable = PAGE_SIZE - NODE_OFF_DIRECTORY;
         let mut vids = Vec::with_capacity(node_count);
         let mut levels = Vec::with_capacity(node_count);
-        let mut page_id = 1u64;
+        // Native model/definition blob pages precede the node image.
+        let first_page = if native {
+            self.meta().node_next_page_id
+        } else {
+            1
+        };
+        let mut page_id = first_page;
         let mut slot = 0u16;
         let mut free = usable;
         for id in 0..node_count {
@@ -1075,12 +1147,19 @@ impl VectorIndexFile {
             slot = slot.saturating_add(1);
             free -= record + 2;
         }
-        let last_page = if node_count == 0 { 0 } else { page_id };
+        let last_page = if node_count == 0 {
+            first_page - 1
+        } else {
+            page_id
+        };
 
         // No stale buffer frame may race a later cleaner flush over the direct
         // image. The freshly opened meta page is reconstructed below.
         self.build_mode.store(false, Ordering::Release);
         self.touched_pages.lock().clear();
+        if native {
+            self.buffer_pool.flush_file(&self.file_key)?;
+        }
         self.buffer_pool.discard_file(&self.file_key)?;
 
         if node_count > 0 {
@@ -1094,12 +1173,13 @@ impl VectorIndexFile {
             })?;
             let mut image = vec![0u8; PAGE_SIZE];
             format_empty_node_page(&mut image);
-            let mut image_page = 1u64;
-            let mut vector = Vec::with_capacity(dim);
+            let mut image_page = first_page;
+            let mut vector = Vec::new();
+            let mut payload = Vec::new();
             let mut dense_neighbors: Vec<Vec<u32>> = Vec::new();
             let mut mapped = Vec::<VecId>::with_capacity(m0.max(m));
             let mut write_batch = Vec::with_capacity(WRITE_BATCH_PAGES * PAGE_SIZE);
-            let mut batch_first_page = 1u64;
+            let mut batch_first_page = first_page;
             let mut nav_exact_nodes = 0u64;
 
             let flush_page = |page: &mut Vec<u8>,
@@ -1135,11 +1215,20 @@ impl VectorIndexFile {
                     image_page = expected_page;
                     format_empty_node_page(&mut image);
                 }
-                let row_id = fetch(id, &mut vector, &mut dense_neighbors)?;
-                nav_exact_nodes += u64::from(persisted_nav_is_exact(&vector, nav_quant));
-                let actual_slot = node_page_append(
-                    &mut image, row_id, levels[id], &vector, dim, m, m0, nav_quant,
-                )
+                let row_id = fetch(id, &mut vector, &mut payload, &mut dense_neighbors)?;
+                let actual_slot = if native {
+                    if payload.len() + 8 != vector_record_lanes(dim) {
+                        return Err(crate::engine::vector::persistence::corrupt());
+                    }
+                    node_page_append_native(
+                        &mut image, row_id, levels[id], &payload, id as u64, dim, m, m0,
+                    )
+                } else {
+                    nav_exact_nodes += u64::from(persisted_nav_is_exact(&vector, nav_quant));
+                    node_page_append(
+                        &mut image, row_id, levels[id], &vector, dim, m, m0, nav_quant,
+                    )
+                }
                 .ok_or_else(|| {
                     error(
                         crate::error::catalog::ER_GET_ERRNO,
@@ -1151,6 +1240,10 @@ impl VectorIndexFile {
                         crate::error::catalog::ER_GET_ERRNO,
                         "vector bulk vid packing mismatch",
                     ));
+                }
+                if native {
+                    let offset = node_record_offset(&image, actual_slot)?;
+                    image[offset] |= REC_FLAG_LINKED;
                 }
                 for (level, dense) in dense_neighbors.iter().enumerate() {
                     mapped.clear();
@@ -1186,7 +1279,8 @@ impl VectorIndexFile {
             }
             self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes;
         } else if let Some(file) = self.file.lock().as_mut() {
-            file.set_len(PAGE_SIZE as u64).map_err(io_err)?;
+            file.set_len((last_page + 1) * PAGE_SIZE as u64)
+                .map_err(io_err)?;
             file.flush().map_err(io_err)?;
             if self.durability == DurabilityMode::Strict {
                 file.sync_data().map_err(io_err)?;
@@ -1207,7 +1301,8 @@ impl VectorIndexFile {
             state.pristine_pages.clear();
         }
         self.append_hint.store(last_page, Ordering::Release);
-        self.write_meta_page(txn_id_for_ddl())
+        self.write_meta_page(txn_id_for_ddl())?;
+        Ok(vids)
     }
 
     #[allow(private_interfaces)]
@@ -2191,6 +2286,19 @@ impl VectorIndexFile {
                 Ok(Some(read_u32(bytes, start + self.dim_fixed) as i32))
             },
         )
+    }
+
+    /// Inspect visibility without decoding a vector or its adjacency.
+    pub(crate) fn is_live_node(&self, vid: VecId) -> Result<bool, QueryError> {
+        self.buffer_pool
+            .with_raw_page(self.page_key(vid_page(vid)), |bytes| {
+                if read_u32(bytes, 0) != VEC_NODE_MAGIC {
+                    return Err(crate::engine::vector::persistence::corrupt());
+                }
+                let offset = node_record_offset(bytes, vid_slot(vid))?;
+                Ok(bytes[offset] & (REC_FLAG_INITIALIZED | REC_FLAG_TOMBSTONE)
+                    == REC_FLAG_INITIALIZED)
+            })
     }
 
     /// Read `vid`'s f32 vector into `out` plus its `(row_id, deleted)` metadata,
@@ -3755,6 +3863,46 @@ mod vector_page_tests {
                 .count(),
             0
         );
+        struct RestoreQuota(u64);
+        impl Drop for RestoreQuota {
+            fn drop(&mut self) {
+                crate::engine::executor::spill_quota::set_global_limit_bytes(self.0);
+            }
+        }
+        let _quota = RestoreQuota(crate::engine::executor::spill_quota::global_limit_bytes());
+        crate::engine::executor::spill_quota::set_global_limit_bytes(1);
+        graph.refresh_query_navigation().unwrap();
+        assert!(!graph.has_query_navigation_for_test());
+        assert_eq!(graph.search(&vectors[0], 10, 64).unwrap(), expected[0]);
+        assert_eq!(std::fs::read_dir(crate::storage::naming::system_tmp_dir(dir.path())).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn compact_navigation_pool_matches_exact_rerank_and_tracks_deleted_rows() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let vectors = gen_clustered(128, 24, 12, 0xA12CE);
+        let (graph, vids) = build_paged(dir.path(), "candidate-pool", 24, 0, &vectors);
+        graph.file().disable_navigation_mapping();
+        graph.refresh_query_navigation().unwrap();
+        for query in &vectors[..8] {
+            let candidates = graph.search_navigation_candidates(query, 64, 64).unwrap().unwrap();
+            let mut exact = Vec::new();
+            for (row, _) in candidates {
+                let vid = vids[row.page_id as usize];
+                let (_, deleted, distance) = graph.file().read_vector_meta_distance(vid, query, crate::engine::vector::Metric::L2).unwrap().unwrap();
+                assert!(!deleted);
+                exact.push((row, distance));
+            }
+            exact.sort_unstable_by(|a,b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            exact.truncate(10);
+            assert_eq!(exact, graph.search(query, 10, 64).unwrap());
+        }
+        let deleted = RowId { page_id: 0, slot_id: 0 };
+        graph.mark_deleted_by_row_id(deleted).unwrap();
+        graph.refresh_query_navigation().unwrap();
+        assert!(!graph.search_navigation_candidates(&vectors[0], 64, 64).unwrap().unwrap().iter().any(|(row,_)| *row == deleted));
+        assert!(graph.search_navigation_candidates(&vectors[0], 128, 128).unwrap().is_none());
+        assert!(graph.search_navigation_candidates(&vec![1e20; 24], 64, 64).unwrap().is_none());
     }
 
     #[test]

@@ -710,7 +710,7 @@ fn dd_properties_table() -> TableSchema {
         "dd_properties",
         vec![
             col("name", varchar(64), false),
-            col("value", DataTypeKind::Text { max_len: 65_535 }, false),
+            col("value", DataTypeKind::Text { max_len: 1_048_576 }, false),
         ],
     )
 }
@@ -1213,6 +1213,8 @@ pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> DdRowSet {
             jsonv(restriction),
         ]);
     }
+    set.dd_properties
+        .push(vec![sv("ai_catalog"), jsonv(catalog.ai.as_ref())]);
     set.dd_properties
         .push(vec![sv("auth_epoch"), sv(catalog.auth.epoch.to_string())]);
     set.dd_properties
@@ -1844,6 +1846,20 @@ fn catalog_from_dd_rows_with_auth(
         triggers,
         events,
         sequences,
+        ai: std::sync::Arc::new({
+            let mut ai: crate::engine::ai::AiCatalog = match set
+                .dd_properties
+                .iter()
+                .find(|row| r_str(row, 0) == "ai_catalog")
+            {
+                Some(row) => serde_json::from_str(&r_str(row, 1)).map_err(|_| {
+                    crate::engine::ai::error("ER_AI_INVALID_ARGUMENT", "corrupt AI catalog")
+                })?,
+                None => Default::default(),
+            };
+            ai.install_charge()?;
+            ai
+        }),
         auth: std::sync::Arc::new(auth),
     })
 }
@@ -2610,6 +2626,7 @@ mod tests {
             events: BTreeMap::new(),
             sequences: BTreeMap::new(),
             auth: std::sync::Arc::new(AuthCatalog::default()),
+            ai: Default::default(),
         }
     }
 

@@ -9,4 +9,4 @@
 | mydb→mydb control | [CHANGE MASTER](change-mydb-master.md) · [CHANGE SEQUENCE SYNC](change-mydb-sequence-sync.md) · [START](start-mydb-replication.md) · [STOP](stop-mydb-replication.md) · [RESET](reset-mydb-replication.md) |
 | mydb role switching | [STOP WRITES](stop-master-writes.md) · [RESUME WRITES](resume-master-writes.md) · [PROMOTE](promote-to-master.md) · [DEMOTE](demote-to-replica.md) · [DROP REPLICA](drop-mydb-replica.md) |
 
-The MySQL→mydb receiver requires `--features mysql-replica`; mydb→mydb uses a separate protocol v2, LSN, timeline, and slot, and is not mixed with MySQL binlog commands.
+The MySQL→mydb receiver is included in every build; mydb→mydb uses a separate protocol v2, LSN, timeline, and slot, and is not mixed with MySQL binlog commands.

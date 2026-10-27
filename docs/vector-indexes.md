@@ -41,6 +41,33 @@ metric/type combinations raise an error. `IVF` with `quantization=none` stores
 and scores native payloads. Hamming IVF uses binary majority centers; Jaccard
 IVF uses sampled medoids scored with Jaccard distance.
 
+## Displaying vectors in SQL clients
+
+Native VECTOR results use MySQL's VECTOR wire type with little-endian FLOAT32
+coordinates. The `mysql` command-line client displays these bytes as hex.
+Set the session-only `vector_result_format` variable once to display coordinate
+lists for all text-protocol VECTOR results, including table columns and functions:
+
+```sql
+SET SESSION vector_result_format = 'TEXT';
+SELECT TO_VECTOR('[1,-2.5,3]') AS embedding; -- [1,-2.5,3]
+SET SESSION vector_result_format = 'NATIVE'; -- restore the default
+```
+
+To enable this when connecting:
+
+```bash
+mysql -h127.0.0.1 -P4837 -uroot -p \
+  --init-command="SET SESSION vector_result_format='TEXT'"
+```
+
+`TEXT` results advertise a string column and use the same coordinate formatting
+as `VECTOR_TO_STRING`. Values remain native vectors during SQL execution,
+storage, and distance calculations. Prepared-statement binary results, including
+cursor fetches, always retain the native VECTOR format. New or reset sessions
+default to `NATIVE`. Unsupported format names and GLOBAL assignments are errors.
+For a single readable result without changing the session, use `VECTOR_TO_STRING`.
+
 ## Distances and queries
 
 Numeric operands may have different datatypes. Distance uses the actual
@@ -74,6 +101,16 @@ neighbors. Full probing of unquantized IVF evaluates all lists with exact native
 scores. Quantized IVF still uses approximate candidate scores: full probing
 with a finite candidate pool does not guarantee global exact TopK.
 
+Large cold HNSW builds can use temporary calibrated SQ8 codes for construction
+navigation and neighbor selection, independently of persistent quantization.
+Compact topology and buffers have governed memory reservations; large construction
+code images use quota-accounted, reclaimable read-only file mappings. Final pages
+are written sequentially. `quantization=none` still persists original
+vectors, and declared quantized indexes retain their requested model and payload.
+Construction navigation is approximate and can affect candidate coverage; visible
+heap values still determine final query distances. Unsupported calibrations and
+insufficient memory retain the ordinary construction path.
+
 Eligible single-table distance ordering can use KNN truncation. JOIN,
 aggregation, DISTINCT and window queries retain their complete relational
 input. Old snapshots, unusable indexes and selective filters may require an
@@ -94,6 +131,15 @@ precedence over the index default. Explicit SET takes precedence even when
 the value equals the built-in default. Re-ranking uses an explicitly set
 session multiplier, otherwise the index `rerank_mult` captured at creation.
 
+This priority resolves the **base** HNSW ef. Dynamic scaling still applies
+after a hint, explicit SET, or index default has selected that base. With
+base ef=128, LIMIT 100 and the default dynamic factor of 4, the initial
+effective ef is 400. To keep the initial breadth at 128, set
+`mydb_hnsw_ef_dynamic_factor=0` as well as `mydb_hnsw_ef_search=128`.
+Filter/visibility-driven iterative scans can subsequently widen the search.
+Ef controls the retained search frontier; it is not a count or hard limit
+on all distance evaluations or physical page reads.
+
 | Session variable | Default | Effect |
 | --- | --- | --- |
 | `mydb_hnsw_ef_search` | 64 | Base HNSW search breadth |
@@ -110,6 +156,12 @@ pool sizes and memory limits, so `rerank_mult*k` alone does not describe the
 effective pool. Larger ef or nprobe explores more candidates; a larger
 re-ranking pool can retain more of them for exact heap scoring. Check the
 effective values in `EXPLAIN` rather than inferring them from one option.
+
+For unquantized HNSW inner-product searches, iterative scanning also widens
+a mixed-distance candidate pool when the LIMIT boundary lies in its final tied plateau.
+This prevents repeated default coordinates from hiding other regions behind
+an apparently sufficient row count. The same scan budget applies; an entirely
+tied pool does not trigger this widening.
 
 ```sql
 SET SESSION mydb_hnsw_ef_search = 200;
@@ -225,7 +277,13 @@ CREATE INDEX pq_search ON embeddings(embedding) USING IVF
 SQ8, SQ4, PQ and BQ support FLOAT32, FLOAT16, BFLOAT16 and INT8 with L2,
 COSINE and DOT. BINARY supports only quantization=none. Quantization changes
 index payloads, not the column datatype, heap values or SQL distance functions.
-There is no implicit SQ8 navigation for quantization=none.
+For paged FLOAT32 HNSW with L2 or COSINE, `quantization=none` preserves
+original index vectors and may use auxiliary SQ8 codes for graph navigation.
+The compact navigation cache keeps the complete rerank pool; final distances
+come from the MVCC-visible heap values. Navigation remains approximate and
+can change ANN candidate coverage. DOT and unrepresentable probes retain
+exact navigation. This auxiliary cache does not change the declared persistent
+quantization model or the stored column values.
 
 - SQ8 and SQ4 use per-dimension affine calibration over the complete build
   snapshot, with 8-bit or packed 4-bit codes. Updates outside the calibrated
@@ -237,7 +295,10 @@ There is no implicit SQ8 navigation for quantization=none.
 - BQ uses a shared center, one sign bit per dimension and per-row amplitude
   and norm corrections. L2 and DOT retain amplitude information; they do not
   substitute raw Hamming ordering. COSINE uses stable normalization. This is
-  scaled centered BQ, without a distribution-independent recall guarantee.
+  scaled centered BQ. Queries retain their original precision and score the
+  reconstructed compressed vectors through asymmetric distance lookup tables.
+  It is not equivalent to binarizing both operands and ranking by Hamming
+  distance, and has no distribution-independent recall guarantee.
 
 The executor retains a wider candidate pool, checks MVCC and residual filters,
 and ranks that pool by original visible heap values. Larger ef, nprobe and
@@ -250,6 +311,43 @@ lengths are d bytes (SQ8), ceil(d/2) (SQ4), ceil(pq_m*pq_bits/8) (PQ), and
 ceil(d/8) (BQ). BQ adds amplitude/norm metadata. The actual index also contains
 row identities, graph edges or lists, page overhead, codebooks, and lossless
 exceptions. Small datasets and INT8/SQ8 may not become smaller or faster.
+For example, a normal 768-dimensional BQ payload has 96 sign bytes,
+24 amplitude/correction bytes and a 9-byte record header: 129 bytes before
+graph and page overhead. Original heap vectors remain stored separately.
+
+### Interpreting recall
+
+`quantization` selects the persistent compressed representation, not a
+guaranteed recall level. The ordinary SQL path searches for candidates,
+checks visibility, and ranks them using original heap vectors. Similar final
+recall for none, SQ8, SQ4, PQ and BQ can therefore coexist with substantially
+different compressed-distance rankings. No strict recall ordering between
+these configurations is guaranteed; PQ codebook size/training, scalar ranges,
+data distribution and graph coverage all affect the result.
+
+By default, LIMIT 100 with a configured HNSW ef of 128 can explore with
+effective ef=400 and retain a rerank pool of 400. A high final recall then
+describes that complete retrieval pipeline, including exact scoring of the
+400 candidates. It does not describe the compressed top-100 ranking alone.
+Original vector reads can dominate latency when they miss the buffer cache.
+For 768-dimensional FLOAT32 vectors, scoring 400 candidates consumes about
+1.17 MiB of original vector values, before page and row overhead; this is
+logical data volume, not a measurement of physical I/O.
+
+Measure compressed-ranking recall, graph candidate coverage and final SQL
+recall separately when evaluating quantization. Use the same data snapshot,
+queries, ground truth and resolved search settings. For an application-level
+comparison, also compare latency, throughput, index size and heap/page reads
+at the required recall. `quantization=none` is an uncompressed persistent
+representation, but eligible FLOAT32 paths can still use auxiliary SQ8
+navigation; it is not a substitute for an exact-scan reference.
+
+Setting `rerank_mult=1` is not a general way to observe pre-rerank rankings:
+minimum pool sizes, filters, visibility and backend scoring can retain or
+reorder more than k candidates. Final SQL distances continue to use original
+visible values. A quantization-only experiment must scan compressed codes
+with the same trained model and scoring kernel, independently of graph
+traversal and heap reranking.
 
 Quantizer generations are immutable and replaced with their graph and coverage
 frontier. Significant scalar exceptions or PQ/BQ update growth request a
@@ -288,3 +386,12 @@ unquantized index do not mean it has served no queries. `HEAP_RERANKS` counts
 heap scoring work and `EXACT_FALLBACKS` counts recorded exact fallback events;
 neither is a recall measurement. Compare results with `NO_VECTOR_INDEX` to
 measure recall on the application's actual data and queries.
+
+## Result protocol
+
+Direct VECTOR results use MySQL's native VECTOR wire type and little-endian
+FLOAT32 coordinates in both text and binary result protocols. FLOAT16,
+BFLOAT16, INT8, and BINARY storage values are exported as their exactly
+representable FLOAT32 coordinates; this does not change stored payloads.
+Use `VECTOR_TO_STRING(value)` for readable SQL-client output, or
+`VECTOR_TO_BINARY(value)` when the native storage payload is required.

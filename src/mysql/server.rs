@@ -1,6 +1,6 @@
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 
-#[cfg(all(test, feature = "mysql-client"))]
+#[cfg(test)]
 #[path = "tls_client_tests.rs"]
 mod tls_client_tests;
 use std::net::SocketAddr;

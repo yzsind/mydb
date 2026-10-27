@@ -113,6 +113,27 @@ macro_rules! spec {
 // it a supported option-file setting.  Registered GLOBAL sysvars are handled
 // separately below, using their registry metadata as the whitelist.
 static OPTION_SPECS: &[OptionSpec] = &[
+    spec!("ai_enabled", "MYDB_AI_ENABLED", OptionKind::Bool),
+    spec!(
+        "ai_local_config",
+        "MYDB_AI_LOCAL_CONFIG",
+        OptionKind::String
+    ),
+    spec!(
+        "ai_max_inflight",
+        "MYDB_AI_MAX_INFLIGHT",
+        OptionKind::U64Range(1, 256)
+    ),
+    spec!(
+        "ai_max_queue",
+        "MYDB_AI_MAX_QUEUE",
+        OptionKind::U64Range(1, 4096)
+    ),
+    spec!(
+        "ai_memory_limit_mb",
+        "MYDB_AI_MEMORY_LIMIT_MB",
+        OptionKind::U64Range(1, 65536)
+    ),
     OptionSpec {
         name: "init_connect",
         env: "MYDB_INIT_CONNECT",

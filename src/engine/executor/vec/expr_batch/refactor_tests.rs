@@ -41,6 +41,147 @@ fn scalar_values(program: &ExprProgram, batch: &Batch) -> Result<Vec<Value>, Que
 }
 
 #[test]
+fn vector_at_open_binds_once_across_batches_and_rebinds() {
+    use crate::engine::vector::codec::{parse_typed_text, text_parse_calls};
+    use crate::vector::VectorDataType;
+    let schema = schema(ColumnType::Vector);
+    for datatype in [
+        VectorDataType::Float32,
+        VectorDataType::Float16,
+        VectorDataType::BFloat16,
+        VectorDataType::Int8,
+        VectorDataType::Binary,
+    ] {
+        let vector = Value::Vector(parse_typed_text("[1,0,1,0]", datatype).unwrap());
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![vector; 130])],
+        );
+        let metrics: &[&str] = if datatype == VectorDataType::Binary {
+            &["hamming", "jaccard"]
+        } else {
+            &["l2", "cosine", "dot"]
+        };
+        for constructor in ["TO_VECTOR", "STRING_TO_VECTOR"] {
+            for metric in metrics {
+                let expression = expr(&format!("DISTANCE(x,{constructor}(?,?),'{metric}')"));
+                for text in ["[0,1,1,0]", "[1,0,0,1]"] {
+                    crate::engine::params::with_params(
+                        vec![
+                            Value::String(text.into()),
+                            Value::String(datatype.name().into()),
+                        ],
+                        || {
+                            let oracle = compile_for_batch(&expression, &schema).unwrap().unwrap();
+                            let expected = scalar_values(&oracle, &batch).unwrap();
+                            let before = text_parse_calls();
+                            let program = compile_for_batch_at_open(&expression, &schema)
+                                .unwrap()
+                                .unwrap();
+                            for _ in 0..3 {
+                                assert_eq!(eval_value_per_row(&program, &batch).unwrap(), expected);
+                                let selected = batch
+                                    .clone()
+                                    .with_selection(Selection::Indices(vec![0, 65, 129]));
+                                let actual = eval_value_per_row(&program, &selected).unwrap();
+                                for row in 0..130 {
+                                    assert_eq!(
+                                        actual[row],
+                                        if [0, 65, 129].contains(&row) {
+                                            expected[row].clone()
+                                        } else {
+                                            Value::Null
+                                        }
+                                    );
+                                }
+                            }
+                            assert_eq!(
+                                text_parse_calls() - before,
+                                1,
+                                "{datatype}/{metric}/{text}"
+                            );
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_at_open_preserves_selection_errors_and_warning_counts() {
+    let schema = schema(ColumnType::LongLong);
+    let batch = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::Int(-1),
+            Value::Int(1),
+            Value::Int(-2),
+        ])],
+    );
+    let expression = expr("IF(x>0,L2_DISTANCE(TO_VECTOR('[1,0]'),TO_VECTOR('[bad]')),0)");
+    crate::engine::api::clear_statement_warnings();
+    let program = compile_for_batch_at_open(&expression, &schema)
+        .unwrap()
+        .unwrap();
+    assert!(crate::engine::api::statement_warnings_snapshot().is_empty());
+    let selected = batch.clone().with_selection(Selection::Indices(vec![0, 2]));
+    assert_eq!(
+        eval_value_per_row(&program, &selected).unwrap(),
+        vec![Value::Double(0.0), Value::Null, Value::Double(0.0)]
+    );
+    let oracle = compile_for_batch(&expression, &schema).unwrap().unwrap();
+    assert_eq!(
+        eval_value_per_row(&program, &batch).unwrap_err().code(),
+        scalar_values(&oracle, &batch).unwrap_err().code()
+    );
+
+    let expression = expr(
+        "L2_DISTANCE(TO_VECTOR(CONCAT('[',CAST('1tail' AS SIGNED),',0]')),TO_VECTOR('[0,1]'))",
+    );
+    let oracle = compile_for_batch(&expression, &schema).unwrap().unwrap();
+    crate::engine::api::clear_statement_warnings();
+    let program = compile_for_batch_at_open(&expression, &schema)
+        .unwrap()
+        .unwrap();
+    assert!(crate::engine::api::statement_warnings_snapshot().is_empty());
+    for batch in [&batch, &selected] {
+        crate::engine::api::clear_statement_warnings();
+        let expected = scalar_values(&oracle, batch).unwrap();
+        let warnings = crate::engine::api::statement_warnings_snapshot();
+        assert_eq!(warnings.len(), batch.visible_rows());
+        crate::engine::api::clear_statement_warnings();
+        assert_eq!(eval_value_per_row(&program, batch).unwrap(), expected);
+        assert_eq!(crate::engine::api::statement_warnings_snapshot(), warnings);
+    }
+    crate::engine::api::clear_statement_warnings();
+}
+
+#[test]
+fn ordinary_vector_batch_program_keeps_dynamic_parameters() {
+    let schema = schema(ColumnType::LongLong);
+    let expression = expr("TO_VECTOR(?)");
+    let batch = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![Value::Int(0)])],
+    );
+    let program = crate::engine::params::with_params(vec![Value::String("[1,0]".into())], || {
+        compile_for_batch(&expression, &schema).unwrap().unwrap()
+    });
+    for text in ["[1,0]", "[0,1]"] {
+        crate::engine::params::with_params(vec![Value::String(text.into())], || {
+            let current = compile_for_batch_at_open(&expression, &schema)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                eval_value_per_row(&program, &batch).unwrap(),
+                eval_value_per_row(&current, &batch).unwrap()
+            );
+        });
+    }
+}
+
+#[test]
 fn streaming_predicate_preserves_selection_nulls_and_diagnostics() {
     for (column_type, expression, column) in [
         (

@@ -7,6 +7,67 @@ use crate::engine::api::SessionContext;
 use crate::types::Value;
 
 #[test]
+fn vector_result_format_is_validated_and_session_local() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    let mut other = SessionContext::default();
+    assert_eq!(
+        one_row(&engine, &mut session, "SELECT @@vector_result_format"),
+        vec![Value::String("NATIVE".into())]
+    );
+    engine
+        .execute_with_session(&mut session, "SET SESSION vector_result_format='text'")
+        .unwrap();
+    assert!(session.vector_result_format_text);
+    assert_eq!(
+        one_row(
+            &engine,
+            &mut session,
+            "SHOW VARIABLES LIKE 'vector_result_format'"
+        ),
+        vec![
+            Value::String("vector_result_format".into()),
+            Value::String("TEXT".into())
+        ]
+    );
+    assert_eq!(
+        one_row(&engine, &mut other, "SELECT @@vector_result_format"),
+        vec![Value::String("NATIVE".into())]
+    );
+    for sql in [
+        "SET vector_result_format='HEX'",
+        "SET vector_result_format=NULL",
+    ] {
+        assert_eq!(
+            engine
+                .execute_with_session(&mut session, sql)
+                .unwrap_err()
+                .code(),
+            1231
+        );
+        assert!(session.vector_result_format_text);
+    }
+    assert_eq!(
+        engine
+            .execute_with_session(&mut session, "SET GLOBAL vector_result_format='TEXT'")
+            .unwrap_err()
+            .code(),
+        1228
+    );
+    let result = one_row(&engine, &mut session, "SELECT TO_VECTOR('[1,2,3]')");
+    assert!(
+        matches!(&result[0], Value::Vector(_)),
+        "the engine must retain the native value"
+    );
+    engine
+        .execute_with_session(&mut session, "SET vector_result_format=DEFAULT")
+        .unwrap();
+    assert!(!session.vector_result_format_text);
+}
+
+#[test]
 fn init_connect_global_string_scope_privileges_and_persistence() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();

@@ -301,7 +301,13 @@ fn acquire_statement_mdl_with_routines(
         )?;
         return Ok(PreparedMdlGuard::Statement);
     }
-    acquire_prepared_mdl_requests(db, session, &requests, is_ddl_statement(statement))
+    acquire_prepared_mdl_requests(
+        db,
+        session,
+        &requests,
+        is_ddl_statement(statement)
+            || matches!(statement,Statement::Ai(command) if command.kind=="model" && matches!(command.action.as_str(),"create"|"alter"|"drop")),
+    )
 }
 
 pub(in crate::engine::executor) fn prepared_statement_mdl_requests(
@@ -510,6 +516,21 @@ fn mdl_requests_for_statement(
             })
         })
         .collect();
+    if let Statement::Ai(command) = statement {
+        if command.kind == "model" && matches!(command.action.as_str(), "create" | "alter" | "drop")
+        {
+            let schema = command
+                .name
+                .rsplit_once('.')
+                .map(|(schema, _)| schema)
+                .unwrap_or(&session.current_database)
+                .to_owned();
+            requests.push(MdlRequest {
+                key: MdlObjectKey::schema(&schema),
+                lock_type: MdlLockType::IntentionExclusive,
+            });
+        }
+    }
     if let Statement::DropDatabase { name, .. } = statement {
         requests.extend(drop_database_mdl_requests(db, name));
     }

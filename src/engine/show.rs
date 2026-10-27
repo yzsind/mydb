@@ -4466,6 +4466,29 @@ pub(crate) fn show_grants_result(
         }
     }
 
+    for row in &mut rows {
+        if let Some(Value::String(sql)) = row.first_mut() {
+            if let Some((privilege, tail)) = sql
+                .strip_prefix("GRANT ")
+                .and_then(|s| s.split_once(" ON *.* "))
+            {
+                if let Some(id) = crate::engine::auth::ai_model_privilege_id(privilege) {
+                    if let Some((name, _)) =
+                        db.ai_catalog()?.models.iter().find(|(_, m)| m.id == id)
+                    {
+                        if let Some((schema, model)) = name.rsplit_once('.') {
+                            *sql = format!(
+                                "GRANT AI_USE ON AI MODEL `{}`.`{}` {}",
+                                schema.replace('`', "``"),
+                                model.replace('`', "``"),
+                                tail
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     if rows.is_empty() {
         rows.push(vec![Value::String(format!(
             "GRANT USAGE ON *.* TO {}",

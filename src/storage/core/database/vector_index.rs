@@ -31,7 +31,57 @@ struct HnswBuildMemoryLease {
     charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
 }
 
+// Field order keeps the topology's allocations governed until after they drop,
+// including failed materialization and cancellation paths.
+struct BoundedHnswBuild {
+    graph: vector::bulk_hnsw::BulkHnsw,
+    _lease: HnswBuildMemoryLease,
+    encode_ms: u64,
+    link_ms: u64,
+    peak_scratch_bytes: usize,
+}
+
 impl HnswBuildMemoryLease {
+    fn try_acquire_streaming(buffer_pool: Arc<BufferPool>, scratch_bytes: usize) -> Option<Self> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let old_capacity_pages = buffer_pool.capacity_pages();
+        let target = crate::engine::executor::mem_budget::memory_target_bytes();
+        let floor = (16 * 1024 * 1024).min(target / 4).max(PAGE_SIZE);
+        if scratch_bytes.saturating_add(floor) > target {
+            return None;
+        }
+        if buffer_pool
+            .set_capacity((floor / PAGE_SIZE) as u64, Duration::from_secs(30))
+            .is_err()
+        {
+            let _ = buffer_pool.set_capacity(old_capacity_pages, Duration::from_secs(30));
+            return None;
+        }
+        crate::engine::memory_reclaimer::release_allocator_cached_memory();
+        // Bulk scratch is mandatory once this route is selected. Use bounded
+        // physical reclamation, rather than a cache's one-shot admission probe.
+        // Recoverable refusal still leaves the existing construction route.
+        match ControlledMemoryCharge::try_new_recoverable(
+            ControlledMemoryCategory::StorageScratch,
+            scratch_bytes,
+        ) {
+            Ok(charge) => Some(Self {
+                buffer_pool,
+                old_capacity_pages,
+                charge: Some(charge),
+            }),
+            Err(error) => {
+                if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+                    eprintln!("[hnsw] streaming reservation refused: {error}");
+                }
+                let _ = buffer_pool.set_capacity(old_capacity_pages, Duration::from_secs(30));
+                None
+            }
+        }
+    }
+
     fn try_acquire(buffer_pool: Arc<BufferPool>, scratch_bytes: usize) -> Option<Self> {
         use crate::engine::executor::mem_budget::{
             controlled_memory_snapshot, managed_memory_limit_bytes, memory_target_bytes,
@@ -484,6 +534,13 @@ impl BruteTopK {
 }
 
 impl Database {
+    pub(crate) fn reclaim_vector_navigation_caches(&self) {
+        if let Some(graphs) = self.vector_indexes.try_read() {
+            for graph in graphs.values() {
+                graph.evict_query_navigation();
+            }
+        }
+    }
     fn note_vector_snapshot_change(&self, graph: &VectorGraph) {
         if !graph.is_paged_storage() && self.durability_mode() != DurabilityMode::Memory {
             self.vector_snapshot_dirty
@@ -818,6 +875,7 @@ impl Database {
                 "quantization requires fixed-dimension VECTOR",
             ));
         };
+        let started = Instant::now();
         let mut trainer = vector::quantization::Trainer::new(
             config.quantization.clone(),
             datatype,
@@ -830,7 +888,14 @@ impl Database {
             }
             Ok(false)
         })?;
-        trainer.finish()
+        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+            eprintln!("[quantization] training scan: {:?}", started.elapsed());
+        }
+        let model = trainer.finish()?;
+        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+            eprintln!("[quantization] training total: {:?}", started.elapsed());
+        }
+        Ok(model)
     }
 
     fn vector_native_hnsw_load_or_build(
@@ -932,7 +997,68 @@ impl Database {
             file.write_quantization_model(&data, txn.snapshot_scn.max(1))?;
         }
         let mut used_parallel = false;
-        if let Some(q) = &quantizer {
+        if let (Some(q), Some(file)) = (&quantizer, graph.file()) {
+            if q.trained_rows() >= 2048
+                // Construction codes are independent of the published payload:
+                // BQ can use the same bounded SQ8 topology as SQ/PQ. The scan
+                // below rejects values requiring lossless exceptions before
+                // direct materialization is admitted.
+                && matches!(q.name(), "sq8" | "sq4" | "pq" | "bq")
+                && file.supports_direct_bulk_build()
+            {
+                let mut stats = CompactHnswStats::new(meta.metric_enum());
+                let mut encodable = true;
+                self.scan_hnsw_build_rows(
+                    table,
+                    storage_id,
+                    txn,
+                    &[col],
+                    0,
+                    u64::MAX,
+                    |_, values| {
+                        if let Some(Value::Vector(value)) = values.first() {
+                            stats.observe(&vector::to_f32(value));
+                            encodable &= q.name() == "pq" || q.encode(value).is_some();
+                        }
+                        Ok(false)
+                    },
+                )?;
+                let _gate = hnsw_build_memory_gate()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if encodable {
+                    if let Some(build) = self.try_bounded_hnsw_topology(
+                        table,
+                        txn,
+                        storage_id,
+                        col,
+                        &stats,
+                        meta.metric_enum(),
+                        meta.m as usize,
+                        meta.ef_construction as usize,
+                        hnsw_build_threads(),
+                    )? {
+                        let started = Instant::now();
+                        let vids = self.materialize_bounded_hnsw(
+                            table,
+                            txn,
+                            storage_id,
+                            col,
+                            &build.graph,
+                            file,
+                            Some(q),
+                        )?;
+                        graph.import_bulk_layout(&build.graph, vids)?;
+                        drop(build);
+                        used_parallel = true;
+                        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+                            eprintln!("[hnsw] native bounded materialize: {:?}", started.elapsed());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(q) = quantizer.as_ref().filter(|_| !used_parallel) {
             let rows = q.trained_rows();
             let threads = hnsw_build_threads();
             let scratch = rows
@@ -949,12 +1075,11 @@ impl Database {
                 if let Some(mut lease) =
                     HnswBuildMemoryLease::try_acquire(self.buffer_pool.clone(), scratch)
                 {
-                    let topology = HnswIndex::new(
+                    let mut topology = HnswIndex::new(
                         meta.metric_enum(),
                         meta.m as usize,
                         meta.ef_construction as usize,
                     )
-                    .without_navigation_quantization()
                     .with_build_reservation(lease.take_charge(), rows);
                     self.vector_graph_append_from_heap(
                         table,
@@ -964,7 +1089,7 @@ impl Database {
                         &topology,
                         threads,
                     )?;
-                    topology.link_all(threads);
+                    topology.link_all_frozen(threads);
                     graph.import_build_topology(&topology)?;
                     used_parallel = true;
                 }
@@ -1240,7 +1365,12 @@ impl Database {
         if self.physical_replica_mode() {
             file.disable_navigation_mapping();
         }
-        let graph = PagedHnsw::new(Arc::new(file)).without_navigation_quantization();
+        let graph = PagedHnsw::new(Arc::new(file));
+        let graph = if self.is_snapshot_read_only() || self.physical_replica_mode() {
+            graph.with_persisted_navigation_only()
+        } else {
+            graph
+        };
         if build {
             self.vector_graph_paged_build_from_heap(table, storage_id, &[col], &graph)?;
         }
@@ -1310,6 +1440,299 @@ impl Database {
             m0,
             ef,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_bounded_hnsw_topology(
+        &self,
+        table: &TableSchema,
+        txn: TxnView,
+        storage_id: u64,
+        col: usize,
+        stats: &CompactHnswStats,
+        metric: vector::Metric,
+        m: usize,
+        ef: usize,
+        threads: usize,
+    ) -> Result<Option<BoundedHnswBuild>, QueryError> {
+        let Some(calibration) = stats.quantization_params() else {
+            return Ok(None);
+        };
+        if stats.rows() < 2048 {
+            return Ok(None);
+        }
+        let Some(bytes) =
+            vector::bulk_hnsw::BulkHnsw::estimated_bytes(stats.rows(), stats.dim(), m, threads, ef)
+        else {
+            return Ok(None);
+        };
+        if bytes as u64 > hnsw_bulk_memory_budget_bytes()? {
+            return Ok(None);
+        }
+        // Reclaimable, immutable code pages must not require a second full
+        // anonymous working-set reservation. Keep all resident metadata and
+        // bounded I/O buffers governed; the spill owns its disk quota and the
+        // kernel accounts mapped pages against the unchanged cgroup ceiling.
+        let spilled_codes = stats.rows().saturating_mul(stats.dim())
+            > crate::engine::executor::mem_budget::memory_target_bytes() / 4;
+        let scratch_bytes = if spilled_codes {
+            bytes.saturating_sub(stats.rows().saturating_mul(stats.dim()))
+        } else {
+            bytes
+        };
+        let Some(mut lease) =
+            HnswBuildMemoryLease::try_acquire_streaming(self.buffer_pool.clone(), scratch_bytes)
+        else {
+            if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+                eprintln!(
+                    "[hnsw] bounded admission refused: bytes={bytes} controlled={:?} private={:?}",
+                    crate::engine::executor::mem_budget::controlled_memory_snapshot(),
+                    crate::engine::memory_reclaimer::current_private_footprint_bytes()
+                );
+            }
+            return Ok(None);
+        };
+        lease.use_streaming_buffer()?;
+        let mut graph = vector::bulk_hnsw::BulkHnsw::new(
+            stats.rows(),
+            stats.dim(),
+            metric,
+            m,
+            ef,
+            calibration,
+            spilled_codes.then_some(self.data_dir.as_path()),
+        )?;
+        let started = Instant::now();
+        self.scan_hnsw_build_rows(
+            table,
+            storage_id,
+            txn,
+            &[col],
+            0,
+            u64::MAX,
+            |row, values| {
+                if let Some(Value::Vector(value)) = values.first() {
+                    graph.push(row, &vector::to_f32(value))?;
+                }
+                Ok(false)
+            },
+        )?;
+        let encode_ms = started.elapsed().as_millis() as u64;
+        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+            eprintln!(
+                "[hnsw] bounded encode: rows={} reserved={} mapped_codes={} elapsed={:?}",
+                stats.rows(),
+                scratch_bytes,
+                spilled_codes,
+                started.elapsed()
+            );
+        }
+        let started = Instant::now();
+        graph.build(threads)?;
+        let link_ms = started.elapsed().as_millis() as u64;
+        graph.release_codes();
+        if let Some(charge) = &mut lease.charge {
+            charge.shrink(stats.rows().saturating_mul(if spilled_codes {
+                4
+            } else {
+                stats.dim() + 4
+            }));
+        }
+        if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
+            eprintln!("[hnsw] bounded link: {:?}", started.elapsed());
+        }
+        Ok(Some(BoundedHnswBuild {
+            graph,
+            _lease: lease,
+            encode_ms,
+            link_ms,
+            peak_scratch_bytes: scratch_bytes,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_bounded_hnsw(
+        &self,
+        table: &TableSchema,
+        txn: TxnView,
+        storage_id: u64,
+        col: usize,
+        graph: &vector::bulk_hnsw::BulkHnsw,
+        file: &VectorIndexFile,
+        quantizer: Option<&Arc<vector::quantization::Quantizer>>,
+    ) -> Result<Vec<VecId>, QueryError> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let mut threads = if quantizer.is_some_and(|q| q.name() == "pq") {
+            hnsw_build_threads().max(1)
+        } else {
+            1
+        };
+        let batch_rows = 64;
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[col].data_type
+        else {
+            return Err(vector::vector_err(
+                "HNSW materialization requires a fixed dimension",
+            ));
+        };
+        let input_bytes = datatype.payload_len(dimension);
+        let output_bytes = quantizer.map_or(input_bytes, |q| q.record_len());
+        // Cover queued, in-flight and consumed batches, dense encoding scratch
+        // and worker stacks before starting the bounded pipeline.
+        let worker_bytes = 4 * batch_rows * (input_bytes + output_bytes + 128)
+            + dimension as usize * 8
+            + 1024 * 1024;
+        let _scratch = loop {
+            match ControlledMemoryCharge::try_new_recoverable(
+                ControlledMemoryCategory::StorageScratch,
+                threads * worker_bytes,
+            ) {
+                Ok(charge) => break charge,
+                Err(_) if threads > 1 => threads = threads.div_ceil(2),
+                Err(error) => return Err(error),
+            }
+        };
+        std::thread::scope(|scope| {
+            let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut workers = Vec::new();
+            for _ in 0..threads {
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<Vec<(RowId, crate::vector::VectorValue)>>(1);
+                let (output, result) = std::sync::mpsc::sync_channel(1);
+                inputs.push(sender);
+                outputs.push(result);
+                let cancellation = cancellation.clone();
+                workers.push(scope.spawn(move || {
+                    let _scope = cancellation.enter();
+                    while let Ok(batch) = receiver.recv() {
+                        let encoded = batch.into_iter().map(|(row, value)| {
+                            crate::engine::cancel::check_cancelled()?;
+                            let value = if let Some(q) = quantizer {
+                                let encoded = q.store_with_reserved_scratch(&value, None)?;
+                                if encoded.payload.first() != Some(&0) {
+                                    return Err(vector::vector_err(
+                                        "HNSW bulk input requires a lossless quantization exception",
+                                    ));
+                                }
+                                encoded
+                            } else {
+                                value
+                            };
+                            Ok((row, value))
+                        }).collect::<Result<Vec<_>, QueryError>>();
+                        if output.send(encoded).is_err() { break; }
+                    }
+                }));
+            }
+            let scanner = scope.spawn(move || -> Result<usize, QueryError> {
+                let _scope = cancellation.enter();
+                let mut sent = 0;
+                let mut batch = Vec::with_capacity(batch_rows);
+                let mut worker = 0;
+                self.scan_hnsw_build_rows(
+                    table,
+                    storage_id,
+                    txn,
+                    &[col],
+                    0,
+                    u64::MAX,
+                    |row, values| {
+                        if let Some(Value::Vector(value)) = values.first() {
+                            batch.push((row, value.clone()));
+                            sent += 1;
+                            if batch.len() == batch_rows {
+                                if inputs[worker]
+                                    .send(std::mem::replace(
+                                        &mut batch,
+                                        Vec::with_capacity(batch_rows),
+                                    ))
+                                    .is_err()
+                                {
+                                    return Ok(true);
+                                }
+                                worker = (worker + 1) % threads;
+                            }
+                        }
+                        Ok(false)
+                    },
+                )?;
+                if !batch.is_empty() {
+                    let _ = inputs[worker].send(batch);
+                }
+                Ok(sent)
+            });
+            let mut received = 0;
+            let mut worker = 0;
+            let mut batch = Vec::new().into_iter();
+            let mut next = |id: usize| -> Result<crate::vector::VectorValue, QueryError> {
+                crate::engine::cancel::check_cancelled()?;
+                if batch.len() == 0 {
+                    batch = outputs[worker]
+                        .recv()
+                        .map_err(|_| vector::vector_err("HNSW materialization scan ended early"))??
+                        .into_iter();
+                    worker = (worker + 1) % threads;
+                }
+                let (row, value) = batch
+                    .next()
+                    .ok_or_else(|| vector::vector_err("empty HNSW materialization batch"))?;
+                if id != received || row != graph.row(id) {
+                    return Err(vector::vector_err("HNSW materialization input changed"));
+                }
+                received += 1;
+                Ok(value)
+            };
+            let result = if quantizer.is_some() {
+                file.bulk_build_native_direct(
+                    graph.len(),
+                    graph.entry(),
+                    |id| graph.level(id),
+                    |id, payload, links| {
+                        let encoded = next(id)?;
+                        payload.clear();
+                        payload.extend_from_slice(&encoded.payload);
+                        graph.copy_links(id, links);
+                        Ok(graph.row(id))
+                    },
+                )
+            } else {
+                file.bulk_build_direct(
+                    graph.len(),
+                    graph.entry(),
+                    |id| graph.level(id),
+                    |id, payload, links| {
+                        let value = next(id)?;
+                        *payload = vector::to_f32(&value);
+                        graph.copy_links(id, links);
+                        Ok(graph.row(id))
+                    },
+                )
+                .map(|_| Vec::new())
+            };
+            drop(outputs);
+            let scanned = scanner
+                .join()
+                .map_err(|_| vector::vector_err("HNSW materialization scanner panicked"));
+            let mut worker_failed = false;
+            for worker in workers {
+                worker_failed |= worker.join().is_err();
+            }
+            if worker_failed {
+                return Err(vector::vector_err("HNSW materialization encoder panicked"));
+            }
+            let scanned = scanned??;
+            let vids = result?;
+            if scanned != graph.len() || received != graph.len() {
+                return Err(vector::vector_err("HNSW materialization row count changed"));
+            }
+            Ok(vids)
+        })
     }
 
     /// Cold-build a paged graph from one partition's heap. A statistics pass
@@ -1417,6 +1840,55 @@ impl Database {
         let _build_gate = hnsw_build_memory_gate()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if raw_mode == "auto" && paged.supports_direct_bulk_build() {
+            if let Some(build) = self.try_bounded_hnsw_topology(
+                table,
+                txn,
+                storage_id,
+                cols[0],
+                &stats,
+                metric,
+                m,
+                ef_construction,
+                threads,
+            )? {
+                let materialize_started = Instant::now();
+                self.materialize_bounded_hnsw(
+                    table,
+                    txn,
+                    storage_id,
+                    cols[0],
+                    &build.graph,
+                    paged.file(),
+                    None,
+                )?;
+                let materialize_ms = materialize_started.elapsed().as_millis() as u64;
+                let rows = build.graph.len() as u64;
+                paged.record_build_stats(HnswBuildStats {
+                    mode: "bounded-topology",
+                    rows,
+                    stats_ms: stats_started.elapsed().as_millis() as u64
+                        - build.encode_ms
+                        - build.link_ms
+                        - materialize_ms,
+                    encode_ms: build.encode_ms,
+                    link_ms: build.link_ms,
+                    peak_scratch_bytes: build.peak_scratch_bytes as u64,
+                    materialize_ms,
+                    total_ms: total_started.elapsed().as_millis() as u64,
+                    ..HnswBuildStats::default()
+                });
+                drop(build);
+                if timing {
+                    eprintln!(
+                        "[hnsw] bounded materialize: {}ms total={:?}",
+                        materialize_ms,
+                        total_started.elapsed()
+                    );
+                }
+                return Ok(());
+            }
+        }
         let mut lease: Option<HnswBuildMemoryLease> = None;
         let preferred =
             hnsw_preferred_cold_build_mode(&raw_mode, full_bytes, compact_bytes, budget, false);
@@ -1482,7 +1954,7 @@ impl Database {
         };
         match build_mode {
             HnswColdBuildMode::FullMemory => {
-                let graph = HnswIndex::new(metric, m, ef_construction)
+                let mut graph = HnswIndex::new(metric, m, ef_construction)
                     .without_navigation_quantization()
                     .with_build_reservation(
                         lease.as_mut().expect("admitted full build").take_charge(),
@@ -1499,7 +1971,7 @@ impl Database {
                     );
                 }
                 let link_started = Instant::now();
-                graph.link_all(threads);
+                graph.link_all_frozen(threads);
                 crate::engine::cancel::check_cancelled()?;
                 build_stats.link_ms = link_started.elapsed().as_millis() as u64;
                 let materialize_started = Instant::now();
@@ -1715,7 +2187,9 @@ impl Database {
         // rather than current length, is governed for the whole build lifetime.
         let sidecar_meta_bytes = stats
             .rows()
-            .saturating_mul(BUILD_NODE_METADATA_BYTES)
+            // Final reachability validation retains VecIds, a seen byte and
+            // a worst-case pending VecId per node after link scratch is freed.
+            .saturating_mul(BUILD_NODE_METADATA_BYTES + 17)
             .saturating_add(2 * 1024 * 1024);
         let usable_bytes = scratch_bytes.checked_sub(sidecar_meta_bytes).ok_or_else(|| {
             error(
@@ -2541,6 +3015,7 @@ impl Database {
         let mut build_guard = VectorGraphBuildGuard {
             graph: &graph,
             published: false,
+            invalidate_persistent: build,
         };
         #[cfg(test)]
         {
@@ -2558,6 +3033,7 @@ impl Database {
                 }
                 applied = next;
                 for (row_id, vector) in batch {
+                    build_guard.invalidate_persistent = true;
                     graph.replace_row(row_id, vector)?;
                 }
                 crate::engine::cancel::check_cancelled()?;
@@ -2588,6 +3064,7 @@ impl Database {
                 ));
             }
             for (row_id, vector) in batch {
+                build_guard.invalidate_persistent = true;
                 graph.replace_row(row_id, vector)?;
             }
         }
@@ -2653,14 +3130,12 @@ impl Database {
                 );
             }
         }
-        let old = map.get(&key).cloned();
         build_guard.published = true;
         drop(build_guard);
         let graph = Arc::new(graph);
         map.insert(key, graph.clone());
-        if let Some(old) = old {
-            old.invalidate();
-        }
+        // Readers own the previous immutable generation through their Arc.
+        // Publication changes future lookups, not the validity of those reads.
         Ok(graph)
     }
 
@@ -4206,8 +4681,19 @@ impl Database {
             dirty.retain(|lineage| active.contains(lineage));
             (entries, std::mem::take(&mut *dirty))
         };
+        #[cfg(test)]
+        if let Some(hook) = VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK.lock().take() {
+            hook();
+        }
         let result = (|| -> Result<(), QueryError> {
-            for ((table_id, storage_id, _generation, index_name), graph) in &entries {
+            for (key @ (table_id, storage_id, _generation, index_name), graph) in &entries {
+                let current = self.vector_indexes.read();
+                if !current
+                    .get(key)
+                    .is_some_and(|active| Arc::ptr_eq(active, graph))
+                {
+                    continue;
+                }
                 graph.ensure_valid()?;
                 #[cfg(test)]
                 if graph.is_paged_storage() {
@@ -4227,11 +4713,13 @@ impl Database {
                 if table.active_generation.max(1) != generation {
                     continue;
                 }
-                let index = table
+                let Some(index) = table
                     .indexes
                     .iter()
                     .find(|index| index.name.eq_ignore_ascii_case(&index_name))
-                    .ok_or_else(vector::persistence::corrupt)?;
+                else {
+                    continue;
+                };
                 let current = self.vector_indexes.read();
                 if !current
                     .get(&(table_id, storage_id, generation, index_name.clone()))
@@ -4500,14 +4988,17 @@ impl<'a> VectorRetire<'a> {
 struct VectorGraphBuildGuard<'a> {
     graph: &'a VectorGraph,
     published: bool,
+    invalidate_persistent: bool,
 }
 impl Drop for VectorGraphBuildGuard<'_> {
     fn drop(&mut self) {
         if !self.published {
             self.graph.invalidate();
-            if let VectorGraph::Paged(paged) = self.graph {
-                if let Err(err) = paged.file().invalidate_build(0) {
-                    log_message(format!("HNSW failed build invalidation: {err:?}"));
+            if self.invalidate_persistent {
+                if let VectorGraph::Paged(paged) = self.graph {
+                    if let Err(err) = paged.file().invalidate_build(0) {
+                        log_message(format!("HNSW failed build invalidation: {err:?}"));
+                    }
                 }
             }
         }
@@ -4578,6 +5069,11 @@ impl Drop for VectorBuildRegistration<'_> {
 /// it is published, to interleave concurrent DML with the publication window.
 #[cfg(test)]
 pub(crate) static VECTOR_BUILD_BEFORE_PUBLISH_HOOK: parking_lot::Mutex<
+    Option<Box<dyn FnOnce() + Send>>,
+> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK: parking_lot::Mutex<
     Option<Box<dyn FnOnce() + Send>>,
 > = parking_lot::Mutex::new(None);
 

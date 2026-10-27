@@ -52,6 +52,23 @@ pub fn set_global_redo_enabled(enabled: bool) {
 
 pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
+        SysVarDef::new("mydb_ai_enabled", Scope::Global, DataType::Bool)
+            .with_doc("Enable external AI calls on this node; requires AI_ADMIN."),
+        |_| SysVarValue::Bool(crate::engine::ai::enabled()),
+        |ctx: &mut WriteCtx<'_>, value: SysVarValue| {
+            let db = ctx.db.ok_or_else(|| {
+                crate::engine::ai::error("ER_AI_DISABLED", "AI requires a storage database")
+            })?;
+            crate::engine::ai::runtime::authorize(
+                db,
+                &ctx.session.authorization_context(),
+                "AI_ADMIN",
+            )?;
+            crate::engine::ai::set_enabled(value.as_bool().unwrap_or(false))
+        },
+    ));
+
+    reg.register(SysVar::settable(
         SysVarDef::new(
             "mydb_parallel_degree",
             Scope::Session,

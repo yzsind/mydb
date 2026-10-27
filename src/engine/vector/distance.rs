@@ -446,6 +446,25 @@ pub(crate) fn ordering_distance(a: &[f32], b: &[f32], metric: Metric) -> f64 {
     unsafe { ordering_distance_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len()), metric) }
 }
 
+/// Cache a cosine node's SIMD norm once while its vector is immutable.
+pub(crate) fn cosine_norm_squared(vector: &[f32]) -> f32 {
+    unsafe { cosine_parts_ptr(vector.as_ptr(), vector.as_ptr(), vector.len()).1 }
+}
+
+/// ANN edge geometry on original f32 payloads, reusing cached norms and
+/// the throughput-oriented dot kernel. Authoritative heap scoring remains
+/// unchanged; exceptional magnitudes retain the wide-distance fallback.
+#[inline]
+pub(crate) fn cosine_with_norms(a: &[f32], b: &[f32], na: f32, nb: f32) -> f64 {
+    if na.is_normal() && nb.is_normal() {
+        let dot = unsafe { dot_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len())) };
+        if dot.is_finite() {
+            return (1.0 - finish_cosine(dot, na, nb)) as f64;
+        }
+    }
+    ordering_distance(a, b, Metric::Cosine)
+}
+
 /// Keep ordinary SIMD reductions unchanged; exceptional magnitudes use f64
 /// before subtraction/multiplication. Finite f32 vectors have finite f64 norms.
 #[inline]
@@ -563,6 +582,104 @@ pub(crate) fn ordering_distance_f32_bytes(a: &[f32], b: &[u8], metric: Metric) -
             .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
             .collect();
         ordering_distance(&a[..n], &decoded, metric)
+    }
+}
+
+/// One query's exact FLOAT32 scorer. Cosine reuses the query reduction while
+/// retaining the existing SIMD lane order and exceptional-value fallback.
+pub(crate) struct PreparedF32Distance<'a> {
+    query: &'a [f32],
+    metric: Metric,
+    cosine: Option<(f32, f32)>,
+}
+
+impl<'a> PreparedF32Distance<'a> {
+    pub(crate) fn new(query: &'a [f32], metric: Metric) -> Self {
+        let cosine = if metric == Metric::Cosine {
+            // This must use cosine's reduction, not dot(query, query): those
+            // kernels have different accumulator layouts on SIMD targets.
+            let (_, squared, _) =
+                unsafe { cosine_parts_ptr(query.as_ptr(), query.as_ptr(), query.len()) };
+            squared.is_normal().then(|| (squared, squared.sqrt()))
+        } else {
+            None
+        };
+        Self {
+            query,
+            metric,
+            cosine,
+        }
+    }
+
+    pub(crate) fn dimension(&self) -> usize {
+        self.query.len()
+    }
+
+    #[inline]
+    pub(crate) fn score_bytes(&self, row: &[u8]) -> f64 {
+        #[cfg(target_endian = "little")]
+        if row.len() / 4 == self.query.len() {
+            if let Some((query_squared, query_norm)) = self.cosine {
+                // SAFETY: both operands contain query.len() unaligned f32s.
+                let (dot, row_squared) = unsafe {
+                    cosine_dot_norm_ptr(self.query.as_ptr(), row.as_ptr().cast(), self.query.len())
+                };
+                if dot.is_finite() && row_squared.is_normal() {
+                    let similarity = if dot == query_squared && query_squared == row_squared {
+                        1.0
+                    } else {
+                        (dot / (query_norm * row_squared.sqrt())).clamp(-1.0, 1.0)
+                    };
+                    return (1.0 - similarity) as f64;
+                }
+                return unsafe {
+                    wide_ordering_distance_ptr(
+                        self.query.as_ptr(),
+                        row.as_ptr().cast(),
+                        self.query.len(),
+                        Metric::Cosine,
+                    )
+                };
+            }
+        }
+        ordering_distance_f32_bytes(self.query, row, self.metric)
+    }
+
+    /// Interleave four independent rows without reassociating any row's
+    /// reduction. This exposes SIMD parallelism beyond a single FMA chain.
+    pub(crate) fn score_batch4(&self, rows: [&[u8]; 4]) -> [f64; 4] {
+        #[cfg(target_endian = "little")]
+        if rows.iter().all(|row| row.len() / 4 == self.query.len()) {
+            if let Some((query_squared, query_norm)) = self.cosine {
+                let pointers = rows.map(|row| row.as_ptr().cast::<f32>());
+                // SAFETY: each row and the query contain query.len() f32s.
+                let parts = unsafe {
+                    cosine_dot_norm_batch4_ptr(self.query.as_ptr(), pointers, self.query.len())
+                };
+                return std::array::from_fn(|j| {
+                    let (dot, row_squared) = parts[j];
+                    if dot.is_finite() && row_squared.is_normal() {
+                        let similarity = if dot == query_squared && query_squared == row_squared {
+                            1.0
+                        } else {
+                            (dot / (query_norm * row_squared.sqrt())).clamp(-1.0, 1.0)
+                        };
+                        (1.0 - similarity) as f64
+                    } else {
+                        // Preserve the established wide exceptional-domain path.
+                        unsafe {
+                            wide_ordering_distance_ptr(
+                                self.query.as_ptr(),
+                                pointers[j],
+                                self.query.len(),
+                                Metric::Cosine,
+                            )
+                        }
+                    }
+                });
+            }
+        }
+        rows.map(|row| self.score_bytes(row))
     }
 }
 
@@ -1201,6 +1318,83 @@ unsafe fn cosine_parts_ptr(pa: *const f32, pb: *const f32, n: usize) -> (f32, f3
     }
 }
 
+#[inline]
+unsafe fn cosine_dot_norm_ptr(pa: *const f32, pb: *const f32, n: usize) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Inlining removes the unused query-norm chains without changing the
+        // dot/row-norm accumulation order of the established NEON kernel.
+        let (dot, _, norm) = cosine_parts_neon(pa, pb, n);
+        return (dot, norm);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return cosine_dot_norm_avx2(pa, pb, n);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let (dot, _, norm) = cosine_parts_scalar_ptr(pa, pb, n);
+        (dot, norm)
+    }
+}
+
+unsafe fn cosine_dot_norm_batch4_ptr(
+    query: *const f32,
+    rows: [*const f32; 4],
+    n: usize,
+) -> [(f32, f32); 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let mut dot0 = [vdupq_n_f32(0.0); 4];
+        let mut dot1 = [vdupq_n_f32(0.0); 4];
+        let mut norm0 = [vdupq_n_f32(0.0); 4];
+        let mut norm1 = [vdupq_n_f32(0.0); 4];
+        let mut i = 0;
+        while i + 8 <= n {
+            let q0 = vld1q_f32(query.add(i));
+            let q1 = vld1q_f32(query.add(i + 4));
+            macro_rules! row {
+                ($j:literal) => {{
+                    let a = vld1q_f32(rows[$j].add(i));
+                    let b = vld1q_f32(rows[$j].add(i + 4));
+                    dot0[$j] = vfmaq_f32(dot0[$j], q0, a);
+                    dot1[$j] = vfmaq_f32(dot1[$j], q1, b);
+                    norm0[$j] = vfmaq_f32(norm0[$j], a, a);
+                    norm1[$j] = vfmaq_f32(norm1[$j], b, b);
+                }};
+            }
+            row!(0);
+            row!(1);
+            row!(2);
+            row!(3);
+            i += 8;
+        }
+        let mut out = std::array::from_fn(|j| {
+            (
+                vaddvq_f32(vaddq_f32(dot0[j], dot1[j])),
+                vaddvq_f32(vaddq_f32(norm0[j], norm1[j])),
+            )
+        });
+        while i < n {
+            let q = read_unaligned(query.add(i));
+            for j in 0..4 {
+                let row = read_unaligned(rows[j].add(i));
+                out[j].0 += q * row;
+                out[j].1 += row * row;
+            }
+            i += 1;
+        }
+        return out;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return cosine_dot_norm_batch4_avx2(query, rows, n);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    std::array::from_fn(|j| cosine_dot_norm_ptr(query, rows[j], n))
+}
+
 // ── Scalar reference kernels (correctness oracle + portable fallback) ───────
 
 #[allow(dead_code)]
@@ -1521,6 +1715,71 @@ unsafe fn cosine_parts_avx2(pa: *const f32, pb: *const f32, n: usize) -> (f32, f
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cosine_dot_norm_avx2(pa: *const f32, pb: *const f32, n: usize) -> (f32, f32) {
+    use std::arch::x86_64::*;
+    let mut dot = _mm256_setzero_ps();
+    let mut norm = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = _mm256_loadu_ps(pa.add(i));
+        let b = _mm256_loadu_ps(pb.add(i));
+        dot = _mm256_fmadd_ps(a, b, dot);
+        norm = _mm256_fmadd_ps(b, b, norm);
+        i += 8;
+    }
+    let mut dot = hsum256(dot);
+    let mut norm = hsum256(norm);
+    while i < n {
+        let a = read_unaligned(pa.add(i));
+        let b = read_unaligned(pb.add(i));
+        dot += a * b;
+        norm += b * b;
+        i += 1;
+    }
+    (dot, norm)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cosine_dot_norm_batch4_avx2(
+    query: *const f32,
+    rows: [*const f32; 4],
+    n: usize,
+) -> [(f32, f32); 4] {
+    use std::arch::x86_64::*;
+    let mut dots = [_mm256_setzero_ps(); 4];
+    let mut norms = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= n {
+        let q = _mm256_loadu_ps(query.add(i));
+        macro_rules! row {
+            ($j:literal) => {{
+                let r = _mm256_loadu_ps(rows[$j].add(i));
+                dots[$j] = _mm256_fmadd_ps(q, r, dots[$j]);
+                norms[$j] = _mm256_fmadd_ps(r, r, norms[$j]);
+            }};
+        }
+        row!(0);
+        row!(1);
+        row!(2);
+        row!(3);
+        i += 8;
+    }
+    let mut out = std::array::from_fn(|j| (hsum256(dots[j]), hsum256(norms[j])));
+    while i < n {
+        let q = read_unaligned(query.add(i));
+        for j in 0..4 {
+            let r = read_unaligned(rows[j].add(i));
+            out[j].0 += q * r;
+            out[j].1 += r * r;
+        }
+        i += 1;
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
@@ -1538,6 +1797,123 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_cosine_norms_match_f32_geometry_and_preserve_wide_fallbacks() {
+        for dim in [1, 7, 8, 9, 31, 128, 769] {
+            for scale in [1e-30f32, 1.0, 1e30] {
+                let a: Vec<_> = (0..dim)
+                    .map(|i| ((i * 13 % 97) as f32 - 48.0) * scale)
+                    .collect();
+                let b: Vec<_> = (0..dim)
+                    .map(|i| ((i * 17 % 89) as f32 - 43.0) * scale)
+                    .collect();
+                let actual =
+                    cosine_with_norms(&a, &b, cosine_norm_squared(&a), cosine_norm_squared(&b));
+                let reference = ordering_distance(&a, &b, Metric::Cosine);
+                if scale == 1.0 {
+                    // ANN construction may use a different f32 dot reduction
+                    // order; its geometry stays within four f32 ulps.
+                    assert!(
+                        (actual - reference).abs() <= 4.0 * f32::EPSILON as f64,
+                        "dim={dim}: {actual} != {reference}"
+                    );
+                } else {
+                    assert_eq!(actual.to_bits(), reference.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_f32_distance_preserves_bits_and_exceptional_domains() {
+        for n in [0, 1, 3, 7, 8, 9, 16, 31, 32, 33, 64, 127, 384, 768, 1536] {
+            let base = pseudo(n, 7);
+            let other = pseudo(n, 13);
+            let values = [
+                base.clone(),
+                other,
+                vec![0.0; n],
+                vec![-0.0; n],
+                vec![f32::from_bits(1); n],
+                vec![f32::MAX; n],
+                vec![f32::MIN_POSITIVE; n],
+                vec![f32::INFINITY; n],
+                vec![f32::NAN; n],
+            ];
+            for query in &values {
+                for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                    let prepared = PreparedF32Distance::new(query, metric);
+                    for row in &values {
+                        for offset in [0, 1, 3] {
+                            let mut bytes = vec![0u8; offset];
+                            for value in row {
+                                bytes.extend_from_slice(&value.to_le_bytes());
+                            }
+                            let bytes = &bytes[offset..];
+                            let expected = ordering_distance_f32_bytes(query, bytes, metric);
+                            let actual = prepared.score_bytes(bytes);
+                            assert_eq!(
+                                actual.to_bits(),
+                                expected.to_bits(),
+                                "n={n} metric={metric:?} offset={offset}"
+                            );
+                        }
+                    }
+                    if n > 0 {
+                        let bytes = to_bytes(&base[..n - 1]);
+                        assert_eq!(
+                            prepared.score_bytes(&bytes).to_bits(),
+                            ordering_distance_f32_bytes(query, &bytes, metric).to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_f32_batch4_preserves_each_rows_reduction_order() {
+        for n in [0, 1, 3, 7, 8, 9, 16, 31, 32, 33, 127, 384, 768, 1536] {
+            for scenario in 0..5 {
+                let mut query = pseudo(n, 17);
+                let mut rows: [Vec<f32>; 4] = std::array::from_fn(|j| pseudo(n, 21 + j as u64));
+                if scenario == 1 {
+                    rows[1].fill(0.0);
+                    rows[2].fill(f32::MAX);
+                    rows[3].fill(f32::NAN);
+                }
+                if scenario == 2 {
+                    query.fill(f32::MIN_POSITIVE);
+                    rows[0].fill(f32::from_bits(1));
+                    rows[1].fill(f32::INFINITY);
+                }
+                if scenario == 3 {
+                    query.fill(f32::MAX);
+                    rows[1].fill(-f32::MAX);
+                }
+                if scenario == 4 && n > 0 {
+                    rows[3].pop();
+                }
+                let storage: [Vec<u8>; 4] = std::array::from_fn(|j| {
+                    let mut bytes = vec![0; j];
+                    bytes.extend(to_bytes(&rows[j]));
+                    bytes
+                });
+                let bytes = std::array::from_fn(|j| &storage[j][j..]);
+                for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+                    let actual = PreparedF32Distance::new(&query, metric).score_batch4(bytes);
+                    for j in 0..4 {
+                        let expected = ordering_distance_f32_bytes(&query, bytes[j], metric);
+                        assert_eq!(
+                            actual[j].to_bits(),
+                            expected.to_bits(),
+                            "n={n} case={scenario} row={j} metric={metric:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn pseudo(n: usize, seed: u64) -> Vec<f32> {
         // SplitMix64 → f32 in [-1, 1], deterministic.

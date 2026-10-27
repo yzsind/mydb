@@ -1792,6 +1792,77 @@ impl HeapFile {
         Ok(true)
     }
 
+    /// Large-heap sparse probes have little cache reuse. Read bounded windows
+    /// through the coherent scan reader instead of cycling raw CLOCK frames.
+    pub(crate) fn try_read_mvcc_columns_sparse_probe(
+        &self,
+        row_ids: &[RowId],
+        columns: &[usize],
+        plan: Option<&RowDecodePlan>,
+        out: &mut Vec<(RowId, RowHeader, Vec<Value>, usize)>,
+    ) -> Result<bool, QueryError> {
+        if row_ids.len() < 8
+            || self.page_count()? <= self.buffer_pool.capacity_pages().saturating_mul(4)
+        {
+            return Ok(false);
+        }
+        let base = out.len();
+        let owned_plan;
+        let plan = match plan {
+            Some(plan) => plan,
+            None => {
+                owned_plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+                &owned_plan
+            }
+        };
+        for rows in row_ids.chunks(64) {
+            crate::engine::cancel::check_cancelled()?;
+            let mut pages: Vec<_> = rows.iter().map(|row| row.page_id as u64).collect();
+            pages.dedup();
+            let mut position = 0;
+            let complete =
+                self.buffer_pool
+                    .with_raw_probe_pages(&self.file_key, &pages, |id, bytes| {
+                        let valid = self.validate_heap_page_header_for_direct_scan(id, bytes)?;
+                        let page = HeapPageView::from_validated(bytes);
+                        while position < rows.len() && rows[position].page_id as u64 == id {
+                            let row = rows[position];
+                            position += 1;
+                            if !valid {
+                                continue;
+                            }
+                            let Some(payload) = page.payload(row.slot_id as usize)? else {
+                                continue;
+                            };
+                            match decode_heap_payload_columns_with_plan(payload, plan, &self.codec)?
+                            {
+                                HeapPayload::RowColumns(header, values, count) => {
+                                    out.push((row, header, values, count))
+                                }
+                                HeapPayload::Row(header, values) => {
+                                    let count = values.len();
+                                    out.push((row, header, values, count));
+                                }
+                                HeapPayload::Forward(_) => {
+                                    if let Some((header, values, count)) =
+                                        self.read_mvcc_columns_following_with_plan(row, plan, 0)?
+                                    {
+                                        out.push((row, header, values, count));
+                                    }
+                                }
+                                HeapPayload::RowPiece(_, _) | HeapPayload::RowPieceColumns(..) => {}
+                            }
+                        }
+                        Ok(())
+                    })?;
+            if !complete {
+                out.truncate(base);
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Page-batched random read that evaluates a narrow predicate projection
     /// before decoding the output projection.  Accepted rows are decoded from
     /// the same pinned payload, so selective INLJ residuals avoid both a

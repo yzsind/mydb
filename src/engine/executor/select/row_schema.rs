@@ -67,7 +67,7 @@ impl From<std::sync::Arc<RowSchema>> for RowSchemaRef {
     }
 }
 
-const LOOKUP_THRESHOLD: usize = 8;
+pub(super) const LOOKUP_THRESHOLD: usize = 8;
 
 impl RowSchema {
     pub(super) fn empty() -> std::sync::Arc<Self> {

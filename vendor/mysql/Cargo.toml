@@ -115,6 +115,7 @@ default-features = false
 
 [dependencies.mysql_common]
 version = "0.37.0"
+path = "../mysql_common"
 default-features = false
 
 [dependencies.native-tls]
@@ -157,6 +158,7 @@ version = "0.4"
 
 [dev-dependencies.mysql_common]
 version = "0.37.0"
+path = "../mysql_common"
 features = [
     "time",
     "frunk",

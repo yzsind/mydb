@@ -85,6 +85,13 @@ const LOCKING_READ: StatementEffects = StatementEffects {
 pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
     use Statement as S;
     match statement {
+        S::Ai(command) => {
+            if matches!(command.action.as_str(), "show" | "show_create" | "reload") {
+                READ_ONLY
+            } else {
+                CATALOG_NONDISPATCH
+            }
+        }
         S::CreateTable(_)
         | S::CreateTableLike { .. }
         | S::AlterTable(_)

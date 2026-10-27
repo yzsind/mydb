@@ -495,7 +495,9 @@ impl PlanStreamCursor {
             )
         });
         let grouping_stage = grouping_stage.flatten();
-        let execution_context = execution_context.fork_worker_cancellation();
+        let execution_context = execution_context
+            .fork_worker_cancellation()
+            .fork_cursor_warnings();
         let txn = execution_context.txn();
         let batch_rows = stream_batch_rows();
         let channel_batches = stream_channel_batches();

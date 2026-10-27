@@ -1,6 +1,5 @@
-// Shared declarations for the two alternative replication backends.
-// Included in their module so public paths, generic scope functions and TLS
-// keep their original identity without an additional runtime abstraction.
+// Receiver state and scoped applier privileges, included in the replication
+// module to share its types and thread-local recovery state.
 
 static REPLICA_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // STRICT by default; crash recovery retains its separate idempotent override.
@@ -69,7 +68,6 @@ pub(crate) fn with_replication_applier_pub<T>(
     crate::util::scoped_cell::with_value(&REPLICATION_APPLIER, true, f)
 }
 
-#[cfg(feature = "mysql-replica")]
 use self::with_replication_applier_pub as with_replication_applier;
 
 #[cfg(test)]
@@ -91,7 +89,6 @@ mod scope_tests {
         assert!(!leaked, "applier privilege must not survive unwinding");
     }
 
-    #[cfg(feature = "mysql-replica")]
     #[test]
     fn recovery_scope_preserves_outer_override_and_restores_after_panic() {
         assert!(!RECOVERY_IDEMPOTENT.with(Cell::get));

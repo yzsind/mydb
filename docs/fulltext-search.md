@@ -26,6 +26,16 @@ Column order does not matter. A missing matching index returns error 1191.
 `CREATE FULLTEXT INDEX` and `ALTER TABLE ... ADD FULLTEXT KEY` can also build
 indexes over existing rows. Prepared statements support `AGAINST(?)`.
 
+Persistent offline builds use the index-build worker budget for projected
+scanning, tokenization, sorting, spill consolidation, and leaf-page writes.
+Use `CREATE /*+ PARALLEL(8) */ FULLTEXT INDEX ft ON articles(body)` to request
+a degree, or `NO_PARALLEL` to force serial execution. The default degree is
+`MYDB_PARALLEL_DEGREE` (2 when unset); `MYDB_PARALLEL_DISABLE` takes precedence.
+Workers share a governed scratch envelope and spill bounded runs when it is
+exhausted. Repeated posting keys can use compact dictionary records, while
+high-cardinality inputs use the external merge path. Query execution, online
+backfills, and memory-only builds keep their existing execution strategies.
+
 ## Search modes
 
 Natural-language mode returns the union of indexed query terms. Repeated query
@@ -104,6 +114,11 @@ change that index's key encoding or tokenizer. The inter-column position gap
 is at least one. Indexes without stored positions verify phrases against
 visible row text. `MYDB_FT_BM25_K1` and `MYDB_FT_BM25_B` configure process-wide
 ranking parameters, defaulting to 1.2 and 0.75.
+
+Document lengths and stored token positions use unsigned 32-bit fields.
+Writes and index builds return error 1690 when a document exceeds these
+limits, including through a large inter-column gap. They do not saturate or
+wrap positions into an invalid posting or a cross-column phrase match.
 
 ## Execution paths and limits
 

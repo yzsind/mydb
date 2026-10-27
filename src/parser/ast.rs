@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Statement {
+    Ai(crate::engine::ai::sql::AiStatement),
     /// `START TRANSACTION`/`BEGIN` with the MySQL 8.0 characteristic list.
     /// `read_only`: `None` = session default access mode, `Some(true)` =
     /// `READ ONLY`, `Some(false)` = `READ WRITE`. `consistent_snapshot` =

@@ -1723,10 +1723,7 @@ impl Database {
     where
         F: FnOnce(&mut crate::engine::auth::AuthCatalog) -> Result<(), QueryError>,
     {
-        static AUTH_MUTATION_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        let _auth_mutation = AUTH_MUTATION_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
+        let _auth_mutation = crate::engine::auth::catalog_mutation_lock()
             .lock()
             .map_err(|_| {
                 error(
@@ -1755,6 +1752,12 @@ impl Database {
         candidate.default_roles.begin_mutation();
         candidate.restrictions.begin_mutation();
         f(&mut candidate)?;
+        let model_ids: Vec<_> = candidate.grants.iter().filter_map(|g| match &g.privilege { crate::engine::auth::Privilege::Dynamic(name)=>crate::engine::auth::ai_model_privilege_id(name),_=>None }).collect();
+        if !model_ids.is_empty() {
+            let models=self.ai_catalog()?;
+            if model_ids.iter().any(|id|!models.models.values().any(|m|m.id==*id)) { return Err(crate::engine::ai::error("ER_AI_MODEL_NOT_FOUND","model grants require an existing stable model identity")); }
+        }
+
         crate::engine::cancel::check_cancelled()?;
         candidate.grants.reconcile_bytes(&snapshot.grants);
         candidate.role_edges.reconcile_bytes(&snapshot.role_edges);

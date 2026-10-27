@@ -133,10 +133,9 @@ disabled by default. When `long_query_time` is not set, the threshold falls back
 to `slow_sql_ms` (default 1000 milliseconds).
 
 Finer-grained storage, memory, execution, vector, and replication configuration
-uses the option file, `MYDB_*` environment variables, or writable sysvars. Build
-features are not runtime configuration: the `mysql-replica` feature for the
-MySQL→mydb replica receiver is enabled by default, and tool binaries use
-`--features tools`.
+uses the option file, `MYDB_*` environment variables, or writable sysvars. The
+MySQL→mydb replica receiver is a core capability included in every build. Build
+features are not runtime configuration; tool binaries use `--features tools`.
 
 `MYDB_EVENT_SCHEDULER` sets the startup state to `on` (default), `off`, or
 `disabled`. ON/OFF can be toggled dynamically with `SET GLOBAL event_scheduler`;
@@ -406,10 +405,15 @@ construction graph is admitted; only compressed payloads survive publication. Th
 - `MYDB_HNSW_MAPPED_NAVIGATION=0` disables direct mapping for differential
   diagnostics. Memory-only durability also bypasses mapping.
 - `MYDB_HNSW_QUERY_CACHE_MB` controls optional HNSW navigation caches, not the
-  direct file mapping. The native CSR cache defaults to 25% of the memory
-  target; the FLOAT32 compact-cache path additionally caps its default at 1 GiB.
+  direct file mapping. Compact graph and payload caches default to two thirds
+  of the memory target, capped at 1 GiB per index; aggregate admission still
+  follows the shared process limits. Dense navigation may replace raw buffer
+  pages under both logical and physical memory admission.
   `0` disables the cache. Admission failure uses live persistent pages.
-  `quantization=none` does not enable implicit SQ8 navigation.
+  Paged FLOAT32 L2/COSINE indexes can use auxiliary SQ8 navigation with
+  `quantization=none`, while retaining original index vectors and exact heap
+  reranking. Native compressed HNSW can cache its existing encoded payloads
+  together with adjacency; this cache never changes the requested encoding.
 - `MYDB_HNSW_PRELOAD=eager|lazy` controls startup opening, default `lazy`.
   `eager` opens Public vector indexes and prepares the admitted query paths
   before accepting connections; it does not fault every mapped page into RAM.
@@ -1483,3 +1487,28 @@ process-local counters and bandwidth limiters; their copy concurrency is jointly
 reserved. Synchronous filesystem operations cannot always be interrupted at the
 freeze deadline; an over-budget operation fails and reports the measured phases.
 See [backup procedures](backup-and-recovery.md) for diagnostics and recovery.
+
+## External AI calls
+
+`ai_enabled` / `MYDB_AI_ENABLED` defaults to ON. AI connections and models can
+be configured through SQL without a local policy file. By default, configured
+HTTP/HTTPS services have no outbound origin, IP address, network-range, or port
+restrictions, including public HTTP and link-local addresses. IPv4, IPv6, and
+DNS names are supported.
+`ai_local_config` (`MYDB_AI_LOCAL_CONFIG`) is optional, for explicit outbound
+origins, IP policies, private CAs, node-local account quotas, and historical
+encryption keys. An omitted `egress` leaves the network unrestricted;
+an explicit `egress` enables an allowlist. Invalid explicit files
+return errors rather than falling back to defaults.
+The startup capacity controls are `ai_max_inflight` (32), `ai_max_queue` (128),
+and `ai_memory_limit_mb` (128), with corresponding `MYDB_AI_*` environment names.
+`mydb_ai_enabled` is the privileged GLOBAL node switch. Set `ai_enabled=OFF`
+at startup or `SET GLOBAL mydb_ai_enabled=OFF` to disable calls. AI_ADMIN and
+AI_USE privileges remain required for management and model use, respectively.
+
+API keys are encrypted database metadata. The master key comes from the
+**environment-only** `MYDB_AI_ENCRYPT_KEY`, or a randomly initialized
+`<data_dir>/apikey.mydb` keyring. The filename is not a default password.
+Keep master keys separate from database backups and deploy matching keys to
+replicas independently. See [LLM and Embedding Calls](ai.md) for the exact key
+format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.

@@ -606,6 +606,32 @@ pub(crate) fn register(reg: &mut Registry) {
         },
     ));
 
+    reg.register(SysVar::settable(
+        SysVarDef::new(
+            "vector_result_format",
+            Scope::Session,
+            DataType::Enum {
+                values: &["NATIVE", "TEXT"],
+            },
+        )
+        .with_doc("VECTOR output on the text protocol; prepared binary results remain native."),
+        |ctx| {
+            SysVarValue::String(
+                if ctx.session.is_some_and(|s| s.vector_result_format_text) {
+                    "TEXT"
+                } else {
+                    "NATIVE"
+                }
+                .into(),
+            )
+        },
+        |ctx: &mut WriteCtx<'_>, value: SysVarValue| -> Result<(), QueryError> {
+            ctx.session.vector_result_format_text =
+                value.to_display_string().eq_ignore_ascii_case("TEXT");
+            Ok(())
+        },
+    ));
+
     // event_scheduler — Global only. Real backing via events module.
     reg.register(SysVar::settable(
         SysVarDef::new(

@@ -5515,3 +5515,8 @@ fn collect_static_calls_from_statements(
     }
     Ok(())
 }
+
+pub(in crate::engine::executor) fn external_calls_forbidden() -> bool {
+    ROUTINE_DEPTH.with(|depth| depth.get() != 0)
+        || TRIGGER_STACK.with(|stack| !stack.borrow().is_empty())
+}

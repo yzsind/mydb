@@ -53,5 +53,6 @@ pub(crate) fn empty_catalog() -> Catalog {
         events: BTreeMap::new(),
         sequences: BTreeMap::new(),
         auth: std::sync::Arc::new(AuthCatalog::empty()),
+        ai: Default::default(),
     }
 }

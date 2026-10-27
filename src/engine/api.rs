@@ -683,8 +683,8 @@ pub(crate) fn with_statement_warning_sink<R>(
 
 /// Root statement scope shared by every nested execution context. This is
 /// deliberately a guard rather than a closure so the dispatcher can leave it
-/// installed until diagnostics are finalized while a streaming response can
-/// retain the same Arc after the guard restores the connection TLS.
+/// installed until synchronous diagnostics are finalized. Deferred result
+/// cursors own a separate sink so this scope cannot drain unfinished warnings.
 pub(crate) struct StatementWarningSinkScope {
     previous: Option<StatementWarningSink>,
     sink: StatementWarningSink,
@@ -1048,6 +1048,14 @@ impl std::fmt::Debug for ResultBatch {
 }
 
 pub trait ResultCursor: Send + std::fmt::Debug {
+    /// External streams own their relational input and need a dedicated worker.
+    fn external_io(&self) -> bool {
+        false
+    }
+    fn external_batch_rows(&self) -> usize {
+        1
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError>;
 
     fn next_chunk(&mut self) -> Result<Option<ResultChunk>, QueryError> {
@@ -1089,6 +1097,13 @@ struct TimestampLocalizingCursor {
 }
 
 impl ResultCursor for TimestampLocalizingCursor {
+    fn external_io(&self) -> bool {
+        self.inner.external_io()
+    }
+    fn external_batch_rows(&self) -> usize {
+        self.inner.external_batch_rows()
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let Some(mut row) = self.inner.next_row()? else {
             return Ok(None);
@@ -2295,6 +2310,8 @@ pub struct SessionContext {
     pub statement_query_attributes: std::collections::BTreeMap<String, Value>,
     /// MySQL `resultset_metadata` session enum: true=FULL, false=NONE.
     pub resultset_metadata_full: bool,
+    /// Render VECTOR results as readable strings on the MySQL text protocol.
+    pub vector_result_format_text: bool,
     pub(crate) temp_tables: HashMap<String, SessionTempTable>,
     pub(crate) temp_quota: Arc<crate::storage::temp_quota::SessionTempQuota>,
     pub(crate) temp_table_journal: Vec<TempTableJournalEntry>,
@@ -3055,6 +3072,7 @@ impl SessionContext {
             connection_attrs: std::collections::BTreeMap::new(),
             statement_query_attributes: std::collections::BTreeMap::new(),
             resultset_metadata_full: true,
+            vector_result_format_text: false,
             temp_tables: HashMap::new(),
             temp_quota: Arc::new(crate::storage::temp_quota::SessionTempQuota::default()),
             temp_table_journal: Vec::new(),
@@ -3624,4 +3642,15 @@ impl SessionContext {
 
 pub(crate) fn normalize_user_variable_name(name: &str) -> String {
     name.trim_start_matches('@').to_ascii_lowercase()
+}
+
+pub(crate) fn with_frozen_statement_time<R>(micros: i64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STMT_NOW_MICROS.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(STMT_NOW_MICROS.with(|c| c.replace(Some(micros))));
+    f()
 }

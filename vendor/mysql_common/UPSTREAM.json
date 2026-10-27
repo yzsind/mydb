@@ -1,0 +1,10 @@
+{
+  "name": "mysql_common",
+  "version": "0.37.3",
+  "crate_sha256": "0f27695f286b461da077b8c2f72f47feaa04ce3c3f9c0976257410e90e21208a",
+  "registry": "registry+https://github.com/rust-lang/crates.io-index",
+  "repository": "https://github.com/blackbeam/rust_mysql_common",
+  "patches": [
+    "Upgrade the binlog zstd dependency to 0.14.3 to use the fixed zstd, zstd-safe, and zstd-sys releases."
+  ]
+}

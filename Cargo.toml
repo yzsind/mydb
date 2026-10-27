@@ -13,17 +13,16 @@ default-run = "mydb"
 autobins = false
 
 [features]
-default = ["tls", "fast-alloc", "mysql-replica"]
-tools = ["mysql-client"]
-mysql-client = ["dep:mysql", "dep:mysql_common"]
-mysql-replica = ["mysql-client", "zstd-compression"]
+default = ["tls", "fast-alloc", "zstd-compression"]
+tools = []
 tls = []
-zstd-compression = ["dep:zstd"]
+# Control protocol negotiation; the replica receiver also needs zstd for binlog payloads.
+zstd-compression = []
 fuzzing = []
 # Default fast global allocator (mimalloc), reducing malloc/free CPU on the
 # high-churn OLTP path. To use the platform fallback allocator while keeping
-# TLS and MySQL replica support:
-#   cargo build --no-default-features --features tls,mysql-replica
+# TLS and zstd protocol compression:
+#   cargo build --no-default-features --features tls,zstd-compression
 fast-alloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [build-dependencies]
@@ -35,6 +34,10 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["unbounded_depth"] }
 jsonschema = { version = "0.49.2", default-features = false }
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+ipnet = { version = "2", features = ["serde"] }
+zeroize = "1"
+httpdate = "1"
 flate2 = "1"
 aes = "0.8"
 aes-gcm = "0.10"
@@ -78,15 +81,18 @@ itoa = "1"
 ryu = "1"
 encoding_rs = "0.8"
 unicode-normalization = "0.1"
-mysql = { version = "28.0.4", path = "vendor/mysql", default-features = false, features = ["minimal-rust", "binlog", "rustls-tls-ring"], optional = true }
-mysql_common = { version = "0.37", default-features = false, features = ["binlog"], optional = true }
-zstd = { version = "0.13", optional = true }
+mysql = { version = "28.0.4", path = "vendor/mysql", default-features = false, features = ["minimal-rust", "binlog", "rustls-tls-ring"] }
+mysql_common = { version = "0.37", path = "vendor/mysql_common", default-features = false, features = ["binlog"] }
+zstd = "0.14.3"
 imbl = { version = "7.0.1", features = ["serde"] }
 geo = { version = "0.31", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 jiff-tzdb = "0.1.9"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"

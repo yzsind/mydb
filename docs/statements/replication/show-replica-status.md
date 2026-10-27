@@ -15,7 +15,7 @@ Shows the thread, source, position, GTID, filter, and error state of a MySQL→m
 
 - When the manager is not initialized, a canonical empty result set is returned, matching a fresh-server probe.
 - The legacy spelling uses Slave_*/Master_* column names and produces a deprecation warning.
-- Full receiving capability depends on the mysql-replica feature.
+- The replica receiver is included in every build.
 
 ## Examples
 

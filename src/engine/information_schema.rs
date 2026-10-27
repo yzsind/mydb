@@ -1779,6 +1779,92 @@ const ZONE_MAP_STORAGE_COLUMNS: &[SystemColumn] = &[
     i64c!("MEMORY_FALLBACKS_GLOBAL"),
 ];
 
+const AI_MODELS_COLUMNS: &[SystemColumn] = &[
+    varchar_column!("MODEL_SCHEMA", 64, 256, false),
+    varchar_column!("MODEL_NAME", 64, 256, false),
+    SystemColumn::new(
+        "MODEL_ID",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+    varchar_column!("KIND", 32, 128, false),
+    varchar_column!("REMOTE_MODEL", 256, 1024, false),
+    varchar_column!("MODEL_REVISION", 128, 512, false),
+    SystemColumn::new(
+        "GENERATION",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+    SystemColumn::new("ENABLED", ColumnType::LongLong, "bigint", "bigint", false),
+    SystemColumn::new(
+        "DIMENSIONS",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        true,
+    ),
+];
+const AI_CONNECTIONS_COLUMNS: &[SystemColumn] = &[
+    varchar_column!("CONNECTION_NAME", 64, 256, false),
+    varchar_column!("PROTOCOL", 32, 128, false),
+    varchar_column!("BASE_URL", 2048, 8192, false),
+    SystemColumn::new(
+        "GENERATION",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+    SystemColumn::new("ENABLED", ColumnType::LongLong, "bigint", "bigint", false),
+    SystemColumn::new(
+        "CREDENTIAL_AVAILABLE",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint",
+        false,
+    ),
+];
+const AI_SECRETS_COLUMNS: &[SystemColumn] = &[
+    varchar_column!("SECRET_NAME", 64, 256, false),
+    SystemColumn::new(
+        "SECRET_ID",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+    SystemColumn::new(
+        "GENERATION",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+    SystemColumn::new(
+        "CRYPTO_GENERATION",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+    varchar_column!("KEY_ID", 64, 256, false),
+    SystemColumn::new("AVAILABLE", ColumnType::LongLong, "bigint", "bigint", false),
+];
+const AI_RUNTIME_COLUMNS: &[SystemColumn] = &[
+    varchar_column!("METRIC", 64, 256, false),
+    SystemColumn::new(
+        "VALUE",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint unsigned",
+        false,
+    ),
+];
+
 const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
     def("SCHEMATA", SCHEMATA_COLUMNS),
     def("TABLES", TABLES_COLUMNS),
@@ -1843,6 +1929,10 @@ const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
     def("USER_ATTRIBUTES", USER_ATTRIBUTES_COLUMNS),
     legacy_def("global_variables", VARIABLES_COLUMNS),
     legacy_def("session_variables", VARIABLES_COLUMNS),
+    mydb_def("ai_models", AI_MODELS_COLUMNS),
+    mydb_def("ai_connections", AI_CONNECTIONS_COLUMNS),
+    mydb_def("ai_secrets", AI_SECRETS_COLUMNS),
+    mydb_def("ai_runtime_status", AI_RUNTIME_COLUMNS),
     mydb_def("mydb_sequences", SEQUENCES_COLUMNS),
     mydb_def("mydb_ddl_jobs", MYDB_DDL_JOBS_COLUMNS),
     mydb_def("mydb_xa_recover", MYDB_XA_RECOVER_COLUMNS),
@@ -2488,6 +2578,7 @@ fn rows(
         ("information_schema", "innodb_temp_table_info") => {
             Ok(innodb_temp_table_info_rows(db))
         }
+        ("information_schema", "ai_models" | "ai_connections" | "ai_secrets" | "ai_runtime_status") => crate::engine::ai::metadata::rows(db, table),
         ("information_schema", "mydb_sequences") => sequence_rows(db),
         ("information_schema", "mydb_ddl_jobs") => Ok(mydb_ddl_jobs_rows(db)),
         ("information_schema", "mydb_xa_recover") => Ok(mydb_xa_recover_rows(db)),
@@ -7986,7 +8077,7 @@ mod tests {
 
     #[test]
     fn information_schema_registry_uses_namespaced_native_tables() {
-        assert_eq!(INFORMATION_SCHEMA_REGISTRY.len(), 99);
+        assert_eq!(INFORMATION_SCHEMA_REGISTRY.len(), 103);
         let mut names = std::collections::BTreeSet::new();
         let mut class_counts = [0usize; 4];
         for registration in INFORMATION_SCHEMA_REGISTRY {
@@ -8001,7 +8092,10 @@ mod tests {
                 InformationSchemaCompatibility::MysqlOptionalPlugin => class_counts[2] += 1,
                 InformationSchemaCompatibility::MydbNative => {
                     class_counts[3] += 1;
-                    assert!(registration.table.name.starts_with("mydb_"));
+                    assert!(
+                        (registration.table.name.starts_with("mydb_")
+                            || registration.table.name.starts_with("ai_"))
+                    );
                 }
             }
             if let InformationSchemaProducer::HonestEmpty(reason) = registration.producer {
@@ -8013,7 +8107,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(class_counts, [76, 3, 7, 13]);
+        assert_eq!(class_counts, [76, 3, 7, 17]);
         assert!(!names.contains("zone_maps"));
         assert!(!names.contains("zone_map_storage"));
         assert!(names.contains("mydb_zone_maps"));

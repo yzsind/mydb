@@ -172,6 +172,17 @@ fn session_login_identity(session: &crate::engine::api::SessionContext) -> Strin
 }
 
 fn capture_session_expr_info(session: &crate::engine::api::SessionContext) -> SessionExprInfo {
+    capture_session_expr_info_with_variables(session, session.user_variables.clone())
+}
+pub(crate) fn capture_external_expr_info(
+    session: &crate::engine::api::SessionContext,
+) -> SessionExprInfo {
+    capture_session_expr_info_with_variables(session, HashMap::new())
+}
+fn capture_session_expr_info_with_variables(
+    session: &crate::engine::api::SessionContext,
+    user_variables: HashMap<String, Value>,
+) -> SessionExprInfo {
     let strict_mode = session.temporal_sql_mode_bits & crate::engine::api::TEMPORAL_MODE_STRICT
         != 0
         || session.temporal_sql_mode_bits & crate::engine::api::TEMPORAL_MODE_EXPLICIT == 0;
@@ -198,7 +209,7 @@ fn capture_session_expr_info(session: &crate::engine::api::SessionContext) -> Se
         character_set_client: session.character_set_client.clone(),
         character_set_connection: session.character_set_connection.clone(),
         collation_connection: session.collation_connection.clone(),
-        user_variables: session.user_variables.clone(),
+        user_variables,
         query_attributes: session.statement_query_attributes.clone(),
         sql_mode: session.sql_mode.clone(),
         temporal_sql_mode_bits: session.temporal_sql_mode_bits,
@@ -4860,6 +4871,10 @@ fn eval_function_inner<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
+    if crate::engine::ai::is_function(name) {
+        let values = eval_args(args, &mut eval_arg)?;
+        return crate::engine::ai::call(name, &values);
+    }
     let upper_name = crate::engine::sys_schema::NormalizedFuncName::new(name);
     let upper = upper_name.as_str();
     if let Some(function) = math::MathFunction::from_name(upper) {
@@ -25889,11 +25904,9 @@ fn json_path_remove(doc: &mut OwnedJsonb, path: &str) -> Result<(), QueryError> 
     Ok(())
 }
 
-#[cfg(any(test, feature = "mysql-replica"))]
 /// Apply the logical operations carried by a MySQL PARTIAL_JSON row event to
 /// a full before-image. The caller owns row-image pairing; this helper owns
 /// MySQL JSON path and mutation semantics.
-#[cfg_attr(not(feature = "mysql-replica"), allow(dead_code))]
 pub(crate) fn apply_replication_json_diffs(
     base: &Value,
     diffs: &[(u8, String, Option<serde_json::Value>)],
@@ -28180,4 +28193,30 @@ fn uuid_sql_decoder_preserves_strict_spelling_rules() {
     ] {
         assert_eq!(parse_uuid_bytes(&invalid), None, "{invalid}");
     }
+}
+
+/// Move an owned expression snapshot through TLS without cloning it per row.
+pub(crate) fn with_saved_expr_info<R>(
+    info: &mut Option<SessionExprInfo>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore<'a> {
+        target: &'a mut Option<SessionExprInfo>,
+        ptr: Option<NonNull<crate::engine::api::SessionContext>>,
+        previous: Option<SessionExprInfo>,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            SESSION_CTX_PTR.with(|c| c.set(self.ptr));
+            SESSION_INFO_OWNED.with(|c| *self.target = c.replace(self.previous.take()));
+        }
+    }
+    let ptr = SESSION_CTX_PTR.with(|c| c.replace(None));
+    let previous = SESSION_INFO_OWNED.with(|c| c.replace(info.take()));
+    let _restore = Restore {
+        target: info,
+        ptr,
+        previous,
+    };
+    f()
 }

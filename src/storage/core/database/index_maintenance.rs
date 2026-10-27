@@ -4088,6 +4088,9 @@ impl Database {
         if self.config.durability == crate::storage::DurabilityMode::Memory {
             return self.rebuild_index_with_options(table, index, options);
         }
+        if index.is_fulltext() {
+            return self.rebuild_fulltext_index_parallel(table, index, options);
+        }
         if encoded_btree_build_eligible(index) {
             return self.rebuild_indexes_offline_encoded_batch(
                 table,
@@ -4204,7 +4207,7 @@ impl Database {
             );
         }
         if index.is_fulltext() || index.has_multi_valued_parts() {
-            return self.collect_sorted_multi_key_entries(table, index, scratch_bytes);
+            return self.collect_sorted_multi_key_entries(table, index, degree, scratch_bytes);
         }
         let data_dir = self.data_dir();
         let mut sorter = IndexEntryExternalSorter::with_exact_run_bytes(scratch_bytes);
@@ -4312,6 +4315,7 @@ impl Database {
         &self,
         table: &TableSchema,
         index: &IndexSchema,
+        degree: usize,
         scratch_bytes: usize,
     ) -> Result<SortedIndexEntries, QueryError> {
         let data_dir = self.data_dir();
@@ -4322,12 +4326,13 @@ impl Database {
                 |row| {
                     if !row.header.is_deleted() {
                         for key in table.index_keys(index, row.values)? {
-                            sorter.push(
+                            sorter.push_with_sort_degree(
                                 data_dir,
                                 IndexEntry {
                                     key,
                                     row_id: row.row_id,
                                 },
+                                Some(degree),
                             )?;
                         }
                     }
@@ -4335,7 +4340,7 @@ impl Database {
                 },
             )
         })?;
-        sorter.finish(data_dir)
+        sorter.finish_with_degree(data_dir, degree)
     }
 
     fn collect_sorted_index_entries_direct_with_degree(

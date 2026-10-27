@@ -107,16 +107,18 @@ pub fn streaming_param_source_active() -> bool {
 /// `None` to `ER_NO_DATA_FOR_BIND_PARAMETER (1210)`.
 #[inline]
 pub fn current_param(idx: usize) -> Option<Value> {
+    with_current_param(idx, |value| value.cloned())
+}
+
+#[inline]
+pub(crate) fn with_current_param<R>(idx: usize, f: impl FnOnce(Option<&Value>) -> R) -> R {
     let slice = PARAMS.with(|c| c.get());
     if slice.ptr.is_null() || idx >= slice.len {
-        return None;
+        return f(None);
     }
-    // SAFETY: `with_params` / `with_params_slice` install a pointer that
-    // remains valid for `len` consecutive `Value`s for the entire
-    // surrounding scope. The RAII guards restore the previous slice ref
-    // before the owning storage is dropped, so any `current_param` call
-    // we observe targets live memory. `idx < len` was checked above.
-    Some(unsafe { (*slice.ptr.add(idx)).clone() })
+    // SAFETY: the binding guard owns the slice throughout this callback;
+    // nested installations restore their predecessor before freeing storage.
+    f(Some(unsafe { &*slice.ptr.add(idx) }))
 }
 
 #[inline]
@@ -445,4 +447,30 @@ pub(crate) fn validate_limit(
         _ => Err(crate::error::catalog::ER_WRONG_ARGUMENTS
             .error("LIMIT/OFFSET parameter must be a non-negative integer")),
     }
+}
+
+pub(crate) fn snapshot_selected_context(
+    indices: &std::collections::BTreeSet<usize>,
+) -> Result<Option<ParamContextSnapshot>, crate::types::QueryError> {
+    let Some(last) = indices.last() else {
+        return Ok(None);
+    };
+    if indices.iter().any(|i| !has_active_param(*i)) {
+        return Err(crate::error::catalog::ER_WRONG_ARGUMENTS.error("parameter is not bound"));
+    }
+    let mut params = vec![
+        Value::Null;
+        last.checked_add(1).ok_or_else(|| {
+            crate::error::catalog::ER_WRONG_ARGUMENTS.error("parameter index overflow")
+        })?
+    ];
+    for index in indices {
+        params[*index] = current_param(*index).ok_or_else(|| {
+            crate::error::catalog::ER_WRONG_ARGUMENTS.error("parameter is not bound")
+        })?;
+    }
+    Ok(Some(ParamContextSnapshot {
+        params,
+        auto_parameterized: auto_parameterized_active(),
+    }))
 }

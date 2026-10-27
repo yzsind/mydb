@@ -2551,11 +2551,91 @@ impl BulkIndexPageWriter {
     }
 }
 
+/// Streamed external merges retain one producer and a bounded page queue.
+/// Positional writes can overlap both the merge and one another; no worker
+/// publishes a root or performs the final durability barrier.
+fn with_parallel_bulk_image_writes<T>(
+    index: &IndexFile,
+    file: &File,
+    degree: usize,
+    produce: impl FnOnce(
+        &mut dyn FnMut(u64, &mut Vec<u8>) -> Result<(), QueryError>,
+    ) -> Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    let degree = degree.max(1);
+    if degree == 1 {
+        return produce(&mut |page, images| {
+            write_bulk_pages_at(index.durability, file, images, page * PAGE_SIZE as u64)
+                .map_err(io_err)?;
+            images.clear();
+            Ok(())
+        });
+    }
+    let _scratch = index.reserve_direct_build_scratch(
+        // Active writes, one queued batch, and the producer's blocked send
+        // coexist with the producer buffer covered by the caller's lease.
+        (degree + 2).saturating_mul(BulkIndexPageWriter::RUN_BYTES),
+    )?;
+    let cancel = crate::engine::cancel::CancellationSnapshot::capture();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(1);
+    let receiver = Mutex::new(receiver);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(degree);
+        for _ in 0..degree {
+            let receiver = &receiver;
+            let cancel = cancel.clone();
+            handles.push(scope.spawn(move || -> Result<(), QueryError> {
+                let _worker = enter_index_build_worker();
+                let _cancel = cancel.enter();
+                loop {
+                    let item = receiver.lock().map_err(|_| poisoned_sorter_error())?.recv();
+                    let Ok((page, images)) = item else {
+                        return Ok(());
+                    };
+                    crate::engine::cancel::check_cancelled()?;
+                    write_bulk_pages_at(index.durability, file, &images, page * PAGE_SIZE as u64)
+                        .map_err(io_err)?;
+                }
+            }));
+        }
+        let result = produce(&mut |page, images| {
+            let batch =
+                std::mem::replace(images, Vec::with_capacity(BulkIndexPageWriter::RUN_BYTES));
+            sender.send((page, batch)).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "bulk index page writer stopped",
+                )
+            })
+        });
+        drop(sender);
+        let mut failure = None;
+        for handle in handles {
+            if let Err(err) = handle.join().map_err(|_| fulltext_build_worker_panic())? {
+                failure.get_or_insert(err);
+            }
+        }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        result
+    })
+}
+
 impl IndexFile {
     fn check_rebuild_marker(path: &Path) -> Result<(), QueryError> {
-        if path.with_extension("idx.corrupt").try_exists().map_err(io_err)? {
-            return Err(error(crate::error::catalog::ER_INDEX_CORRUPT,
-                format!("index is fenced after persistent corruption: {}", path.display())));
+        if path
+            .with_extension("idx.corrupt")
+            .try_exists()
+            .map_err(io_err)?
+        {
+            return Err(error(
+                crate::error::catalog::ER_INDEX_CORRUPT,
+                format!(
+                    "index is fenced after persistent corruption: {}",
+                    path.display()
+                ),
+            ));
         }
 
         if path
@@ -2582,9 +2662,13 @@ impl IndexFile {
 
     pub(super) fn persist_planned_rebuild_marker(path: &Path) -> Result<(), QueryError> {
         let mut marker = File::create(path.with_extension("idx.failed")).map_err(io_err)?;
-        marker.write_all(b"planned logical redo rebuild").map_err(io_err)?;
+        marker
+            .write_all(b"planned logical redo rebuild")
+            .map_err(io_err)?;
         marker.sync_all().map_err(io_err)?;
-        if let Some(parent) = path.parent() { crate::platform::fs::sync_path(parent).map_err(io_err)?; }
+        if let Some(parent) = path.parent() {
+            crate::platform::fs::sync_path(parent).map_err(io_err)?;
+        }
         Ok(())
     }
 
@@ -2598,12 +2682,18 @@ impl IndexFile {
 
     fn fence_persistent_corruption(&self, err: QueryError) -> QueryError {
         self.failed.store(true, Ordering::Release);
-        if self.durability == DurabilityMode::Memory || crate::storage::image_io::immutable_path(&self.path) {
+        if self.durability == DurabilityMode::Memory
+            || crate::storage::image_io::immutable_path(&self.path)
+        {
             return err;
         }
         let marker = self.path.with_extension("idx.corrupt");
         let persist = (|| -> std::io::Result<()> {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
                 Ok(mut file) => {
                     std::io::Write::write_all(&mut file, err.message().as_bytes())?;
                     file.sync_all()?;
@@ -2615,7 +2705,9 @@ impl IndexFile {
         })();
         match persist {
             Ok(()) => err,
-            Err(persist_err) => err.map_message(|message| format!("{message}; failed to persist index corruption fence: {persist_err}")),
+            Err(persist_err) => err.map_message(|message| {
+                format!("{message}; failed to persist index corruption fence: {persist_err}")
+            }),
         }
     }
 
@@ -3211,6 +3303,7 @@ impl IndexFile {
         log: Arc<crate::wal::LogMutex>,
         durability: DurabilityMode,
         buffer_pool: Arc<BufferPool>,
+        degree: usize,
     ) -> Result<Self, QueryError> {
         let _ = fs::remove_file(&path);
         let index = Self::open_rebuilt_with_durability(path, log, durability, buffer_pool)?;
@@ -3221,12 +3314,19 @@ impl IndexFile {
                 "interned direct index build requires persistent durability",
             ));
         }
-        index.bulk_load_sorted_interned_direct_with_lsn(
-            txn_id_for_ddl(),
-            &keys,
-            &records,
-            index_schema,
-        )?;
+        if index_schema.is_fulltext() && degree > 1 && records.len() >= 256 * 1024 {
+            let lsn = index.prepare_direct_bulk_load()?;
+            let level =
+                index.bulk_load_fulltext_leaf_level_parallel(&keys, &records, degree, lsn)?;
+            index.finish_fixed_direct_stream_level(level, lsn)?;
+        } else {
+            index.bulk_load_sorted_interned_direct_with_lsn(
+                txn_id_for_ddl(),
+                &keys,
+                &records,
+                index_schema,
+            )?;
+        }
         record_bulk_index_build(&index, true, started);
         Ok(index)
     }
@@ -3241,6 +3341,7 @@ impl IndexFile {
         log: Arc<crate::wal::LogMutex>,
         durability: DurabilityMode,
         buffer_pool: Arc<BufferPool>,
+        degree: usize,
     ) -> Result<Self, QueryError>
     where
         F: FnOnce(&mut dyn FnMut(&[u8], RowId) -> Result<(), QueryError>) -> Result<(), QueryError>,
@@ -3263,57 +3364,56 @@ impl IndexFile {
             })?
             .try_clone()
             .map_err(io_err)?;
-        let mut images = Vec::with_capacity(RUN_PAGES * PAGE_SIZE);
-        let mut run_first = None;
-        let mut level = Vec::new();
-        let mut page_id = index.reserve_page_id()?;
-        let mut leaf = EncodedLeafPageBuilder::new();
-        let flush = |images: &mut Vec<u8>, first: &mut Option<u64>| -> Result<(), QueryError> {
-            if !images.is_empty() {
-                write_bulk_pages_at(
-                    durability,
-                    &file,
-                    images,
-                    first.take().unwrap() * PAGE_SIZE as u64,
-                )
-                .map_err(io_err)?;
-                images.clear();
-            }
-            Ok(())
-        };
-        produce(&mut |key, row_id| {
-            let entry_bytes = key.len() + row_id_v7_encoded_len(row_id) + SLOT_OFFSET_BYTES;
-            if LEAF_HEADER_BYTES.saturating_add(entry_bytes) > PAGE_SIZE {
-                return Err(error(
-                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
-                    "index entry exceeds page size",
-                ));
-            }
-            if !leaf.slots.is_empty()
-                && leaf.offset + leaf.slots.len() * SLOT_OFFSET_BYTES + entry_bytes > PAGE_SIZE
-            {
-                let next = index.reserve_page_id()?;
+        let leaf_started = Instant::now();
+        let level = with_parallel_bulk_image_writes(&index, &file, degree, |output| {
+            let mut images = Vec::with_capacity(RUN_PAGES * PAGE_SIZE);
+            let mut run_first = None;
+            let mut level = Vec::new();
+            let mut page_id = index.reserve_page_id()?;
+            let mut leaf = EncodedLeafPageBuilder::new();
+            let mut flush =
+                |images: &mut Vec<u8>, first: &mut Option<u64>| -> Result<(), QueryError> {
+                    if !images.is_empty() {
+                        output(first.take().unwrap(), images)?;
+                    }
+                    Ok(())
+                };
+            produce(&mut |key, row_id| {
+                let entry_bytes = key.len() + row_id_v7_encoded_len(row_id) + SLOT_OFFSET_BYTES;
+                if LEAF_HEADER_BYTES.saturating_add(entry_bytes) > PAGE_SIZE {
+                    return Err(error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "index entry exceeds page size",
+                    ));
+                }
+                if !leaf.slots.is_empty()
+                    && leaf.offset + leaf.slots.len() * SLOT_OFFSET_BYTES + entry_bytes > PAGE_SIZE
+                {
+                    let next = index.reserve_page_id()?;
+                    let first = leaf.first.take().unwrap();
+                    let image = leaf.finish(Some(next), lsn)?;
+                    run_first.get_or_insert(page_id);
+                    images.extend_from_slice(&image);
+                    level.push((page_id, first));
+                    page_id = next;
+                    if images.len() == RUN_PAGES * PAGE_SIZE {
+                        flush(&mut images, &mut run_first)?;
+                        crate::engine::cancel::check_cancelled()?;
+                    }
+                }
+                leaf.push(key, row_id)
+            })?;
+            if !leaf.slots.is_empty() {
                 let first = leaf.first.take().unwrap();
-                let image = leaf.finish(Some(next), lsn)?;
+                let image = leaf.finish(None, lsn)?;
                 run_first.get_or_insert(page_id);
                 images.extend_from_slice(&image);
                 level.push((page_id, first));
-                page_id = next;
-                if images.len() == RUN_PAGES * PAGE_SIZE {
-                    flush(&mut images, &mut run_first)?;
-                    crate::engine::cancel::check_cancelled()?;
-                }
             }
-            leaf.push(key, row_id)
+            flush(&mut images, &mut run_first)?;
+            Ok(level)
         })?;
-        if !leaf.slots.is_empty() {
-            let first = leaf.first.take().unwrap();
-            let image = leaf.finish(None, lsn)?;
-            run_first.get_or_insert(page_id);
-            images.extend_from_slice(&image);
-            level.push((page_id, first));
-        }
-        flush(&mut images, &mut run_first)?;
+        INDEX_BUILD_LEAF_US.fetch_add(leaf_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         index.finish_fixed_direct_stream_level(level, lsn)?;
         record_bulk_index_build(&index, true, started);
         Ok(index)
@@ -5006,7 +5106,9 @@ impl IndexFile {
             .map_err(io_err)?;
         file.flush().map_err(io_err)?;
         if self.durability == DurabilityMode::Strict && !btree_logical_wal::bulk_sync_deferred() {
+            let started = Instant::now();
             crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
+            INDEX_BUILD_FSYNC_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         drop(file_guard);
         // A prefetch already dequeued before the first discard may admit
@@ -5099,8 +5201,134 @@ impl IndexFile {
         index: &IndexSchema,
     ) -> Result<(), QueryError> {
         let lsn = self.prepare_direct_bulk_load()?;
+        let started = Instant::now();
         let level = self.bulk_load_interned_leaf_level_direct(keys, records, index, lsn, txn_id)?;
+        INDEX_BUILD_LEAF_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_fixed_direct_stream_level(level, lsn)
+    }
+
+    /// Disjoint leaf ranges are encoded and written by independent workers.
+    /// Plan page boundaries before allocating ids so every last leaf links to
+    /// the next worker's first page. Root publication and fsync remain after
+    /// all workers have joined, using the ordinary direct-build protocol.
+    fn bulk_load_fulltext_leaf_level_parallel(
+        &self,
+        keys: &[EncodedInternedKey],
+        records: &[u128],
+        degree: usize,
+        lsn: u64,
+    ) -> Result<Vec<(u64, IndexEntry)>, QueryError> {
+        let started = Instant::now();
+        let key_bytes = keys
+            .iter()
+            .map(|key| {
+                let payload = key.materialized_key.as_deref().ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "FULLTEXT dictionary payload missing",
+                    )
+                })?;
+                let len = encoded_materialized_leaf_key_len(payload)?;
+                if LEAF_HEADER_BYTES + len + ROW_ID_V7_ENCODED_LEN + SLOT_OFFSET_BYTES > PAGE_SIZE {
+                    return Err(error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "index entry exceeds page size",
+                    ));
+                }
+                Ok(len)
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        let degree = degree.min(records.len().div_ceil(128 * 1024)).max(1);
+        let chunk = records.len().div_ceil(degree);
+        let cancel = crate::engine::cancel::CancellationSnapshot::capture();
+        let plans = std::thread::scope(|scope| -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
+            let mut handles = Vec::new();
+            for (worker, slice) in records.chunks(chunk).enumerate() {
+                let key_bytes = &key_bytes;
+                handles.push(scope.spawn(move || {
+                    let mut pages = Vec::new();
+                    let mut start = 0usize;
+                    let mut bytes = LEAF_HEADER_BYTES;
+                    for (offset, record) in slice.iter().copied().enumerate() {
+                        let len = key_bytes[interned_record_key_id(record) as usize]
+                            + row_id_v7_encoded_len(interned_record_row_id(record))
+                            + SLOT_OFFSET_BYTES;
+                        if bytes + len > PAGE_SIZE {
+                            pages.push((worker * chunk + start, worker * chunk + offset));
+                            start = offset;
+                            bytes = LEAF_HEADER_BYTES;
+                        }
+                        bytes += len;
+                    }
+                    if start < slice.len() {
+                        pages.push((worker * chunk + start, worker * chunk + slice.len()));
+                    }
+                    pages
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().map_err(|_| fulltext_build_worker_panic()))
+                .collect()
+        })?;
+        let count = plans.iter().map(Vec::len).sum::<usize>();
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(self.reserve_page_id()?);
+        }
+        let level = std::thread::scope(|scope| -> Result<Vec<(u64, IndexEntry)>, QueryError> {
+            let mut handles = Vec::new();
+            let mut offset = 0usize;
+            for pages in plans {
+                let first = offset;
+                offset += pages.len();
+                let ids = &ids;
+                let cancel = cancel.clone();
+                handles.push(
+                    scope.spawn(move || -> Result<Vec<(u64, IndexEntry)>, QueryError> {
+                        let _worker = enter_index_build_worker();
+                        let _cancel = cancel.enter();
+                        let mut writer =
+                            BulkIndexPageWriter::new(self, "FULLTEXT bulk file is closed")?;
+                        let mut level = Vec::with_capacity(pages.len());
+                        for (page, (start, end)) in pages.into_iter().enumerate() {
+                            crate::engine::cancel::check_cancelled()?;
+                            let position = first + page;
+                            let record = records[start];
+                            let key = &keys[interned_record_key_id(record) as usize];
+                            let mut cursor = 0;
+                            let separator = decode_index_key_from(
+                                key.materialized_key.as_deref().unwrap(),
+                                &mut cursor,
+                            )?;
+                            level.push((
+                                ids[position],
+                                IndexEntry {
+                                    key: separator,
+                                    row_id: interned_record_row_id(record),
+                                },
+                            ));
+                            let mut image = encode_interned_leaf_page(
+                                keys,
+                                &records[start..end],
+                                ids.get(position + 1).copied(),
+                            )?;
+                            writer.append_leaf(ids[position], &mut image, txn_id_for_ddl(), lsn);
+                            writer.flush_full()?;
+                        }
+                        writer.flush()?;
+                        Ok(level)
+                    }),
+                );
+            }
+            let mut level = Vec::with_capacity(count);
+            for handle in handles {
+                level.extend(handle.join().map_err(|_| fulltext_build_worker_panic())??);
+            }
+            Ok(level)
+        })?;
+        INDEX_BUILD_LEAF_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        Ok(level)
     }
 
     fn bulk_load_interned_leaf_level_direct(
@@ -5654,9 +5882,12 @@ impl IndexFile {
         children: Vec<(u64, IndexEntry)>,
         lsn: u64,
     ) -> Result<Vec<(u64, IndexEntry)>, QueryError> {
-        self.build_internal_level(children, |page_id, page| {
+        let started = Instant::now();
+        let result = self.build_internal_level(children, |page_id, page| {
             self.write_page_direct(page_id, page, lsn)
-        })
+        });
+        INDEX_BUILD_INTERNAL_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        result
     }
 
     fn build_internal_level(
@@ -6861,7 +7092,9 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                self.prefetch_next_leaves(next);
+                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), token, None, true) {
+                    self.prefetch_fulltext_leaves(next, token, None, true);
+                }
             }
             let start = leaf.entries.partition_point(|entry| entry.key < prefix);
             for entry in &leaf.entries[start..] {
@@ -6916,7 +7149,9 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                self.prefetch_next_leaves(next);
+                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), prefix, prefix_upper, false) {
+                    self.prefetch_fulltext_leaves(next, prefix, prefix_upper, false);
+                }
             }
             // Later leaves are already above the routed lower bound.
             let start = if first_leaf {
@@ -10358,19 +10593,58 @@ impl IndexFile {
     /// and on the next call to this helper (one leaf later) the chain
     /// extends a step deeper, so steady-state we keep
     /// `prefetch_pages` leaves in flight ahead of the cursor.
-    fn prefetch_next_leaves(&self, mut start: u64) {
-        let depth = self.buffer_pool.effective_prefetch_window();
-        if depth == 0 {
-            return;
+    fn prefetch_next_leaves(&self, start: u64) {
+        self.prefetch_leaves_while(start, |_| Ok(true));
+    }
+
+    fn fulltext_prefetch_may_continue(
+        last: Option<&IndexKey>,
+        prefix: &str,
+        upper: Option<&str>,
+        exact: bool,
+    ) -> bool {
+        let Some(KeyPart::String(token)) = last.and_then(|key| key.0.first()) else {
+            // Empty or unfamiliar layouts retain conservative read-ahead.
+            return true;
+        };
+        if exact {
+            token.as_str() <= prefix
+        } else {
+            token.as_str() < prefix
+                || (token.starts_with(prefix) && upper.is_none_or(|upper| token.as_str() < upper))
         }
+    }
+
+    fn prefetch_fulltext_leaves(&self, start: u64, prefix: &str, upper: Option<&str>, exact: bool) {
+        self.prefetch_leaves_while(start, |header| {
+            if header.count == 0 {
+                return Ok(true);
+            }
+            let mut cursor = header.read_slot_offset(header.count - 1);
+            let last = header.decode_key_at(&mut cursor)?;
+            Ok(Self::fulltext_prefetch_may_continue(Some(&last), prefix, upper, exact))
+        });
+    }
+
+    fn prefetch_leaves_while(
+        &self,
+        mut start: u64,
+        mut continues: impl FnMut(&LeafPayloadHeader<'_>) -> Result<bool, QueryError>,
+    ) {
+        let depth = self.buffer_pool.effective_prefetch_window();
         for _ in 0..depth {
-            self.buffer_pool.prefetch_page(self.page_key(start));
-            match self
-                .buffer_pool
-                .with_cached_bytes(&self.page_key(start), |bytes| {
-                    Ok(parse_leaf_payload_header(bytes)?.next_leaf)
-                }) {
+            let key = self.page_key(start);
+            // One resident lookup, with no demand-hit promotion. Queue only a
+            // missing/loading page, then let asynchronous I/O extend the chain.
+            match self.buffer_pool.with_cached_prefetch_bytes(&key, |bytes| {
+                let header = parse_leaf_payload_header(bytes)?;
+                Ok(if continues(&header)? { header.next_leaf } else { None })
+            }) {
                 Ok(Some(Some(next))) => start = next,
+                Ok(None) => {
+                    self.buffer_pool.prefetch_page(key);
+                    return;
+                }
                 _ => return,
             }
         }

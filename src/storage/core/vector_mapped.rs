@@ -215,6 +215,15 @@ impl MappedVectorNavigation {
         Ok((page, offset))
     }
 
+    /// Borrow a native payload while the caller retains the mapping read guard.
+    pub(crate) fn native_payload(&self, vid: VecId) -> Result<&[u8], QueryError> {
+        let (datatype, dimension) = native_geometry(self.meta.dim as usize)
+            .ok_or_else(crate::engine::vector::persistence::corrupt)?;
+        let (page, offset) = self.record(vid)?;
+        let start = offset + 18;
+        Ok(&page[start..start + datatype.payload_len(dimension)])
+    }
+
     fn neighbors(&self, vid: VecId, level: usize, out: &mut Vec<VecId>) -> Result<(), QueryError> {
         let (page, offset) = self.record(vid)?;
         out.clear();
@@ -239,24 +248,39 @@ impl MappedVectorNavigation {
         Ok(())
     }
 
-    fn exact(
-        &self,
-        vid: VecId,
-        query: &[f32],
-        metric: crate::engine::vector::Metric,
-    ) -> Result<(RowId, bool, f64), QueryError> {
+    #[inline]
+    fn exact_row(&self, vid: VecId, dimension: usize) -> Result<(RowId, bool, &[u8]), QueryError> {
         let (page, offset) = self.record(vid)?;
         let start = offset + 10;
-        let distance = crate::engine::vector::distance::ordering_distance_f32_bytes(
-            query,
-            &page[start..start + query.len() * 4],
-            metric,
-        );
         Ok((
             vec_unpack_row(read_u64(page, offset + 2)),
             page[offset] & REC_FLAG_TOMBSTONE != 0,
-            distance,
+            &page[start..start + dimension * 4],
         ))
+    }
+
+    fn exact(
+        &self,
+        vid: VecId,
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+    ) -> Result<(RowId, bool, f64), QueryError> {
+        let (row, deleted, bytes) = self.exact_row(vid, query.dimension())?;
+        Ok((row, deleted, query.score_bytes(bytes)))
+    }
+
+    fn exact_batch4(
+        &self,
+        vids: &[VecId],
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+    ) -> Result<[(RowId, bool, f64); 4], QueryError> {
+        let rows = [
+            self.exact_row(vids[0], query.dimension())?,
+            self.exact_row(vids[1], query.dimension())?,
+            self.exact_row(vids[2], query.dimension())?,
+            self.exact_row(vids[3], query.dimension())?,
+        ];
+        let scores = query.score_batch4(rows.map(|row| row.2));
+        Ok(std::array::from_fn(|j| (rows[j].0, rows[j].1, scores[j])))
     }
 
     #[inline]
@@ -277,8 +301,7 @@ impl MappedVectorNavigation {
     fn distance(
         &self,
         vid: VecId,
-        query: &[f32],
-        metric: crate::engine::vector::Metric,
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
         codes: &[i8],
         norm: i32,
     ) -> Result<f64, QueryError> {
@@ -290,14 +313,13 @@ impl MappedVectorNavigation {
                     * (self.meta.nav_dist_mul as f64));
             }
         }
-        Ok(self.exact(vid, query, metric)?.2)
+        Ok(self.exact(vid, query)?.2)
     }
 
     fn distances(
         &self,
         vids: &[VecId],
-        query: &[f32],
-        metric: crate::engine::vector::Metric,
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
         codes: &[i8],
         norm: i32,
         out: &mut Vec<f64>,
@@ -316,6 +338,12 @@ impl MappedVectorNavigation {
         }
         let mut chunks = vids.chunks_exact(4);
         for chunk in &mut chunks {
+            if codes.is_empty() {
+                for (_, _, score) in self.exact_batch4(chunk, query)? {
+                    out.push(score);
+                }
+                continue;
+            }
             if !codes.is_empty() {
                 let rows = [
                     self.codes(chunk[0])?,
@@ -330,13 +358,19 @@ impl MappedVectorNavigation {
                     }
                     continue;
                 }
+                if rows.iter().all(Option::is_none) {
+                    for (_, _, score) in self.exact_batch4(chunk, query)? {
+                        out.push(score);
+                    }
+                    continue;
+                }
             }
             for &vid in chunk {
-                out.push(self.distance(vid, query, metric, codes, norm)?);
+                out.push(self.distance(vid, query, codes, norm)?);
             }
         }
         for &vid in chunks.remainder() {
-            out.push(self.distance(vid, query, metric, codes, norm)?);
+            out.push(self.distance(vid, query, codes, norm)?);
         }
         Ok(())
     }
@@ -365,6 +399,7 @@ impl MappedVectorNavigation {
             2 => Metric::Dot,
             _ => Metric::L2,
         };
+        let explore_ties = metric != Metric::Dot || query.iter().any(|value| *value != 0.0);
         let mut normalized = Vec::new();
         let src = if metric == Metric::Cosine {
             normalized.extend_from_slice(query);
@@ -383,7 +418,8 @@ impl MappedVectorNavigation {
             quantize_into(src, self.meta.nav_mid, self.meta.nav_inv_scale, &mut codes);
         }
         let norm = dot_i8(&codes, &codes);
-        let distance = |vid| self.distance(vid, query, metric, &codes, norm);
+        let prepared = crate::engine::vector::distance::PreparedF32Distance::new(query, metric);
+        let distance = |vid| self.distance(vid, &prepared, &codes, norm);
         let mut current = self.meta.entry_vid;
         if current == VEC_NO_VID || k == 0 {
             return Ok(Vec::new());
@@ -456,9 +492,24 @@ impl MappedVectorNavigation {
             id: current,
         };
         frontier.push(Reverse(first));
-        results.push(first);
+        let live_only = self.meta.tombstone_count != 0;
+        let live = |vid| -> Result<bool, QueryError> {
+            if !live_only {
+                return Ok(true);
+            }
+            let (page, offset) = self.record(vid)?;
+            Ok(page[offset] & REC_FLAG_TOMBSTONE == 0)
+        };
+        if live(current)? {
+            results.push(first);
+        }
         visit(current)?;
+        let mut steps = 0usize;
         while let Some(Reverse(candidate)) = frontier.pop() {
+            if steps & 63 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            steps += 1;
             let furthest = results
                 .peek()
                 .map(|s: &Scored<VecId>| s.dist)
@@ -473,28 +524,49 @@ impl MappedVectorNavigation {
                     fresh.push(vid);
                 }
             }
-            self.distances(&fresh, query, metric, &codes, norm, &mut distances)?;
+            self.distances(&fresh, &prepared, &codes, norm, &mut distances)?;
             for (&vid, &score) in fresh.iter().zip(&distances) {
                 let furthest = results
                     .peek()
                     .map(|s: &Scored<VecId>| s.dist)
                     .unwrap_or(f64::INFINITY);
-                if results.len() < ef || score < furthest {
+                if results.len() >= ef
+                    && explore_ties
+                    && score == furthest
+                    && (score != 0.0 || metric == Metric::Dot)
+                {
+                    frontier.push(Reverse(Scored {
+                        dist: score,
+                        id: vid,
+                    }));
+                } else if results.len() < ef || score < furthest {
                     let entry = Scored {
                         dist: score,
                         id: vid,
                     };
                     frontier.push(Reverse(entry));
-                    if results.len() == ef {
-                        results.pop();
+                    if live(vid)? {
+                        if results.len() == ef {
+                            results.pop();
+                        }
+                        results.push(entry);
                     }
-                    results.push(entry);
                 }
             }
         }
-        let mut out = Vec::with_capacity(results.len());
-        for candidate in results {
-            let (row, deleted, distance) = self.exact(candidate.id, query, metric)?;
+        let candidates = results.into_vec();
+        let mut out = Vec::with_capacity(candidates.len());
+        let mut chunks = candidates.chunks_exact(4);
+        for chunk in &mut chunks {
+            let ids = [chunk[0].id, chunk[1].id, chunk[2].id, chunk[3].id];
+            for (row, deleted, distance) in self.exact_batch4(&ids, &prepared)? {
+                if !deleted {
+                    out.push((row, distance));
+                }
+            }
+        }
+        for candidate in chunks.remainder() {
+            let (row, deleted, distance) = self.exact(candidate.id, &prepared)?;
             if !deleted {
                 out.push((row, distance));
             }

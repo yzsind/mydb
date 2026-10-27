@@ -2348,6 +2348,15 @@ impl ObservedStreamCursor {
 }
 
 impl ResultCursor for ObservedStreamCursor {
+    fn external_io(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.external_io())
+    }
+    fn external_batch_rows(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(1, |inner| inner.external_batch_rows())
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(None);
@@ -2700,7 +2709,6 @@ impl StorageQueryEngine {
         &self.db
     }
 
-    #[cfg(feature = "mysql-replica")]
     pub(crate) fn session_registry(&self) -> &Arc<SessionRegistry> {
         &self.registry
     }
@@ -3166,6 +3174,7 @@ impl StorageQueryEngine {
     }
 
     pub fn shutdown(&self) -> Result<(), QueryError> {
+        crate::engine::ai::runtime::shutdown_database(&self.db)?;
         crate::backup::shutdown_jobs(&self.db)?;
         // No background writer may race the final checkpoint. In
         // particular, auto-analyze / zone-map maintenance / undo purge can
@@ -3350,6 +3359,23 @@ impl QueryEngine for StorageQueryEngine {
         if self.plan_cache_enabled {
             self.db.record_plan_cache_miss();
         }
+        dispatch::ai::validate_shape(&statement)?;
+        if let Statement::Ai(command) = &statement {
+            if command.kind == "secret" && command.value.is_some() {
+                if session.ssl_cipher.is_none() {
+                    return Err(crate::engine::ai::error(
+                        "ER_AI_ACCESS_DENIED",
+                        "Secret VALUE requires TLS before PREPARE",
+                    ));
+                }
+                if !matches!(command.value, Some(Expr::Placeholder(_))) {
+                    return Err(crate::engine::ai::error(
+                        "ER_AI_INVALID_ARGUMENT",
+                        "prepared Secret DDL requires VALUE ?",
+                    ));
+                }
+            }
+        }
         // Templates bind the database, never a temporary table's physical key.
         // EXECUTE resolves the logical name against the current session registry.
         if session.temp_tables.is_empty() {
@@ -3369,6 +3395,12 @@ impl QueryEngine for StorageQueryEngine {
     ) -> Result<Arc<Statement>, QueryError> {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let parse_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
+        if crate::engine::ai::sql::sql_may_have_ai(sql) {
+            let _mode = crate::parser::ParserSqlModeGuard::activate(parse_bits);
+            return parse_statement(sql)
+                .map(Arc::new)
+                .map_err(parse_error_to_query_error);
+        }
         let key = crate::engine::cache::ParsedStatementKey::new(sql, parse_bits);
         if let Some(ast) = self.statement_cache.get(&key) {
             self.db.record_select_parse_cache_hit();
@@ -3890,7 +3922,8 @@ impl QueryEngine for StorageQueryEngine {
         .then(crate::planner::force_serial_scope);
         let (result, metadata) = match statement.as_ref() {
             Statement::Select(select)
-                if crate::engine::executor::select::const_operator_supported(select)
+                if !crate::engine::ai::sql::sql_may_have_ai(sql)
+                    && crate::engine::executor::select::const_operator_supported(select)
                     && !routines::select_references_stored_function(
                         &self.db,
                         &session.current_database,
@@ -4128,7 +4161,9 @@ impl QueryEngine for StorageQueryEngine {
         // Sequence evaluation mutates live session/durable state. Route it
         // through the ordinary statement lane, which drains under that scope,
         // and keep the read-only prepared fast path unchanged.
-        if crate::planner::sql_mentions_sequence_fn(sql) {
+        if crate::planner::sql_mentions_sequence_fn(sql)
+            || crate::engine::ai::sql::sql_may_have_ai(sql)
+        {
             return None;
         }
         use crate::engine::api::PreparedSelectMemoState;
@@ -6195,7 +6230,7 @@ impl StorageQueryEngine {
                     session.current_database,
                     err.code(),
                     err.sql_state(),
-                    err.message(),
+                    if crate::engine::ai::sql::sql_may_have_ai(sql) { "[redacted AI statement error]" } else { err.message() },
                 ));
             }
         }

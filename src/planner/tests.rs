@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn vector_audit_folded_query_values_preserve_text_and_binary_domains() {
+    for text in ["abcd", "abcdefghijklmnop", "1,2,3,4", "[1,nan]"] {
+        for value in [
+            Value::String(text.into()),
+            Value::SmallString(crate::types::SmallStringBuf::from_slice(text.as_bytes())),
+            Value::Bytes(text.as_bytes().to_vec()),
+        ] {
+            assert!(value_to_vector_bytes(&value).is_none(), "{value:?}");
+        }
+    }
+    let vector = crate::engine::vector::codec::from_f32(&[1.0, 2.0]);
+    for value in [
+        Value::Vector(vector.clone()),
+        Value::String("[1,2]".into()),
+        Value::Bytes(b"[1,2]".to_vec()),
+    ] {
+        assert_eq!(value_to_vector_bytes(&value), Some(vector.clone()));
+    }
+    assert!(value_to_vector_bytes(&Value::Bytes(vector.payload)).is_none());
+}
+
+#[test]
 fn sqlproc_sus_streaming_group_contiguity_does_not_imply_order() {
     let input = PhysicalPlan::ValuesScan {
         rows: vec![],

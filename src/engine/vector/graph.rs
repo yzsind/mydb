@@ -220,6 +220,13 @@ impl VectorIndexRuntimeStats {
 }
 
 impl VectorGraph {
+    pub(crate) fn evict_query_navigation(&self) {
+        match self {
+            Self::Paged(graph) => graph.evict_query_navigation(),
+            Self::NativeHnsw(graph) => graph.evict_query_navigation(),
+            _ => {}
+        }
+    }
     /// Prepare the optional read-optimized query image synchronously. Paged
     /// HNSW uses this during eager startup so the first user query never races
     /// the background cache build; other backends are already query-ready.
@@ -481,8 +488,8 @@ impl VectorGraph {
         // A short result proves exhaustion only if widening `ef` cannot reach
         // more live nodes. The slab search keeps tombstones out of its result
         // pool, so it stops early only after draining its reachable frontier.
-        // Paged traversal still lets tombstones fill the pool; it is exhausted
-        // only once `ef` already spans every node.
+        // Paged exhaustion stays conservative because a bounded navigation
+        // candidate pool can still be truncated before the heap recheck.
         let (candidates, exhausted) = match (self, request.effort) {
             (VectorGraph::Memory(g), VectorSearchEffort::Hnsw { ef }) => {
                 let mut candidates =
@@ -493,6 +500,18 @@ impl VectorGraph {
             }
             (VectorGraph::Paged(p), VectorSearchEffort::Hnsw { ef }) => {
                 let ef = ef.max(request.rerank_limit);
+                if request.candidate_limit >= request.rerank_limit {
+                    if let Some(candidates) =
+                        p.search_navigation_candidates(query, request.candidate_limit, ef)?
+                    {
+                        self.ensure_valid()?;
+                        return Ok(VectorSearchResult {
+                            candidates,
+                            exact_order: false,
+                            exhausted: false,
+                        });
+                    }
+                }
                 let candidates = p.search(query, request.candidate_limit, ef)?;
                 let exhausted = candidates.len() < request.candidate_limit
                     && ef.max(request.candidate_limit) as u64 >= p.node_count();

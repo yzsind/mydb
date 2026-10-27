@@ -166,9 +166,12 @@ type Scored = super::hnsw_core::Scored<VecId>;
 #[derive(Debug)]
 struct QueryNavArena {
     epoch: u64,
+    limit_bytes: usize,
     dim: usize,
     dist_mul: f32,
     vids: Vec<VecId>,
+    rows: Vec<RowId>,
+    deleted: Vec<bool>,
     // First dense ordinal per physical page. Sparse slots are verified and
     // fall back to binary search; the common packed layout resolves in O(1).
     page_starts: Vec<u32>,
@@ -226,7 +229,6 @@ impl std::ops::Deref for QueryNavEdges {
 
 const QUERY_CACHE_ENTRIES: usize = 512;
 const QUERY_CACHE_WAYS: usize = 8;
-const QUERY_CACHE_SETS: usize = QUERY_CACHE_ENTRIES / QUERY_CACHE_WAYS;
 const QUERY_CACHE_MAX_K: usize = 128;
 
 #[derive(Debug)]
@@ -234,7 +236,7 @@ struct QueryCacheEntry {
     hash: u64,
     k: usize,
     ef: usize,
-    query_bits: Box<[u32]>,
+    query_bytes: Box<[u8]>,
     result: Arc<[(RowId, f64)]>,
 }
 
@@ -245,17 +247,27 @@ struct QueryCacheEntry {
 /// admission and capacity accounting deterministic.
 #[derive(Debug)]
 pub(crate) struct QueryNavCache {
+    max_k: usize,
     sets: parking_lot::RwLock<Vec<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]>>,
 }
 
 impl QueryNavCache {
     pub(crate) fn new() -> Self {
+        Self::with_max_k(QUERY_CACHE_MAX_K)
+    }
+
+    pub(crate) fn with_max_k(max_k: usize) -> Self {
+        Self::with_capacity(max_k, QUERY_CACHE_ENTRIES)
+    }
+
+    pub(crate) fn with_capacity(max_k: usize, entries: usize) -> Self {
         let mut sets: Vec<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]> =
             std::iter::repeat_with(|| std::array::from_fn(|_| None))
-                .take(QUERY_CACHE_SETS)
+                .take((entries / QUERY_CACHE_WAYS).max(1))
                 .collect();
         sets.shrink_to_fit();
         Self {
+            max_k,
             sets: parking_lot::RwLock::new(sets),
         }
     }
@@ -278,26 +290,40 @@ impl QueryNavCache {
     }
 
     pub(crate) fn get(&self, query: &[f32], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
-        if k > QUERY_CACHE_MAX_K {
+        // SAFETY: every f32 bit pattern may be borrowed as initialized bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
+        };
+        self.get_key(bytes, k, ef, Self::hash(query, k, ef))
+    }
+
+    pub(crate) fn get_bytes(&self, query: &[u8], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
+        self.get_key(query, k, ef, Self::hash_bytes(query, k, ef))
+    }
+
+    pub(crate) fn hash_bytes(query: &[u8], k: usize, ef: usize) -> u64 {
+        let mut hash = 0x9E37_79B9_7F4A_7C15u64
+            ^ (k as u64).rotate_left(17)
+            ^ (ef as u64).rotate_left(41)
+            ^ query.len() as u64;
+        for &byte in query.iter().step_by((query.len() / 32).max(1)).take(32) {
+            hash = (hash ^ byte as u64)
+                .rotate_left(27)
+                .wrapping_mul(0x9E37_79B1_85EB_CA87);
+        }
+        hash ^ (hash >> 32)
+    }
+
+    fn get_key(&self, query: &[u8], k: usize, ef: usize, hash: u64) -> Option<Vec<(RowId, f64)>> {
+        if k > self.max_k {
             return None;
         }
-        let hash = Self::hash(query, k, ef);
         let sets = self.sets.read();
-        for entry in sets[(hash as usize) % QUERY_CACHE_SETS].iter().flatten() {
+        for entry in sets[(hash as usize) % sets.len()].iter().flatten() {
             if entry.hash == hash
                 && entry.k == k
                 && entry.ef == ef
-                && entry.query_bits.len() == query.len()
-                // SAFETY: both allocations are valid for `len * 4` bytes;
-                // u32/f32 have identical size and alignment. The native
-                // in-memory representation is exactly the cache key.
-                && unsafe {
-                    libc::memcmp(
-                        entry.query_bits.as_ptr().cast(),
-                        query.as_ptr().cast(),
-                        query.len() * std::mem::size_of::<f32>(),
-                    ) == 0
-                }
+                && entry.query_bytes.as_ref() == query
             {
                 return Some(entry.result.to_vec());
             }
@@ -306,19 +332,31 @@ impl QueryNavCache {
     }
 
     pub(crate) fn insert(&self, query: &[f32], k: usize, ef: usize, result: &[(RowId, f64)]) {
-        if k > QUERY_CACHE_MAX_K || result.len() > QUERY_CACHE_MAX_K {
+        // SAFETY: the byte view is bounded by the initialized f32 slice.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
+        };
+        self.insert_key(bytes, k, ef, result, Self::hash(query, k, ef));
+    }
+
+    pub(crate) fn insert_bytes(&self, query: &[u8], k: usize, ef: usize, result: &[(RowId, f64)]) {
+        self.insert_key(query, k, ef, result, Self::hash_bytes(query, k, ef));
+    }
+
+    fn insert_key(&self, query: &[u8], k: usize, ef: usize, result: &[(RowId, f64)], hash: u64) {
+        if k > self.max_k || result.len() > self.max_k {
             return;
         }
-        let hash = Self::hash(query, k, ef);
+        let mut sets = self.sets.write();
         let entry = QueryCacheEntry {
             hash,
             k,
             ef,
-            query_bits: query.iter().map(|value| value.to_bits()).collect(),
+            query_bytes: query.into(),
             result: Arc::from(result),
         };
-        let mut sets = self.sets.write();
-        let set = &mut sets[(hash as usize) % QUERY_CACHE_SETS];
+        let index = (hash as usize) % sets.len();
+        let set = &mut sets[index];
         let slot = set
             .iter()
             .position(|current| current.is_none())
@@ -338,6 +376,13 @@ struct QueryNavAllocation {
     row_seed_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryNavStorage {
+    Resident,
+    SpilledEdges,
+    Spilled,
+}
+
 impl QueryNavAllocation {
     /// Cache-local quota and process-wide pressure both permit a spill
     /// transition. A failed optional resident admission must not discard a
@@ -346,10 +391,21 @@ impl QueryNavAllocation {
         &self,
         limit: usize,
         mut reserve: impl FnMut(usize) -> Option<T>,
-    ) -> Option<(bool, T)> {
+    ) -> Option<(QueryNavStorage, T)> {
         if self.peak_bytes <= limit {
             if let Some(charge) = reserve(self.peak_bytes) {
-                return Some((false, charge));
+                return Some((QueryNavStorage::Resident, charge));
+            }
+        }
+        // Distance probes visit many more codes than adjacency lists. Keep
+        // codes resident when the smaller edge mapping can remain reclaimable.
+        let edges_peak = self
+            .peak_bytes
+            .checked_sub(self.edge_capacity.checked_mul(4)?)?
+            .checked_add(64 * 1024)?;
+        if edges_peak < self.peak_bytes && edges_peak <= limit {
+            if let Some(charge) = reserve(edges_peak) {
+                return Some((QueryNavStorage::SpilledEdges, charge));
             }
         }
         let spilled_peak = self
@@ -359,7 +415,7 @@ impl QueryNavAllocation {
             .checked_add(128 * 1024)?;
         // Tiny images gain nothing by adding two spill writer buffers.
         if spilled_peak < self.peak_bytes && spilled_peak <= limit {
-            reserve(spilled_peak).map(|charge| (true, charge))
+            reserve(spilled_peak).map(|charge| (QueryNavStorage::Spilled, charge))
         } else {
             None
         }
@@ -389,6 +445,7 @@ fn query_navigation_allocation(
         .checked_add(QUERY_CACHE_ENTRIES.checked_mul(2 * std::mem::size_of::<usize>())?)?;
     let row_seed_bytes = RowLookup::reserved_bytes(nodes)?;
     let final_bytes = codes_bytes
+        .checked_add(nodes.checked_mul(std::mem::size_of::<RowId>() + 1)?)?
         .checked_add(pages.checked_mul(std::mem::size_of::<u32>())?)?
         .checked_add(nodes.checked_mul(std::mem::size_of::<i32>())?)?
         .checked_add(nodes.checked_mul(std::mem::size_of::<VecId>())?)?
@@ -576,12 +633,14 @@ impl QueryNavScratch {
     }
 
     #[inline]
-    fn consider(&mut self, scored: Scored, ef: usize) -> Result<(), QueryError> {
+    fn consider(&mut self, scored: Scored, ef: usize, live: bool) -> Result<(), QueryError> {
         if self.results.len() < ef {
             reserve_query_heap(&mut self.frontier, &mut self.charge)?;
-            reserve_query_heap(&mut self.results, &mut self.charge)?;
             self.frontier.push(Reverse(scored));
-            self.results.push(scored);
+            if live {
+                reserve_query_heap(&mut self.results, &mut self.charge)?;
+                self.results.push(scored);
+            }
             return Ok(());
         }
         let furthest = self
@@ -589,10 +648,15 @@ impl QueryNavScratch {
             .peek()
             .map(|item| item.dist)
             .unwrap_or(f64::INFINITY);
-        if scored.dist < furthest {
+        if scored.dist == furthest && furthest != 0.0 {
             reserve_query_heap(&mut self.frontier, &mut self.charge)?;
-            if let Some(mut top) = self.results.peek_mut() {
-                *top = scored;
+            self.frontier.push(Reverse(scored));
+        } else if scored.dist < furthest {
+            reserve_query_heap(&mut self.frontier, &mut self.charge)?;
+            if live {
+                if let Some(mut top) = self.results.peek_mut() {
+                    *top = scored;
+                }
             }
             self.frontier.push(Reverse(scored));
         }
@@ -1978,12 +2042,15 @@ pub(crate) struct PagedHnsw {
 }
 
 impl PagedHnsw {
-    /// Wrap an open vector index file, reading its parameters from the meta
-    /// page.
-    pub(crate) fn without_navigation_quantization(mut self) -> Self {
+    /// Immutable images and physical replicas may read persisted navigation
+    /// codes, but may not rewrite their calibration during query preparation.
+    pub(crate) fn with_persisted_navigation_only(mut self) -> Self {
         self.navigation_quant_enabled = false;
         self
     }
+
+    /// Wrap an open vector index file, reading its parameters from the meta
+    /// page.
     pub(crate) fn new(file: Arc<VectorIndexFile>) -> Self {
         let meta = file.meta();
         let m = (meta.m as usize).max(2);
@@ -2159,14 +2226,15 @@ impl PagedHnsw {
         scratch.qnorm = dot_i8(&scratch.qcodes, &scratch.qcodes);
     }
 
-    fn query_navigation_limit_bytes() -> usize {
+    pub(crate) fn query_navigation_limit_bytes() -> usize {
         std::env::var("MYDB_HNSW_QUERY_CACHE_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .map(|mb| mb.saturating_mul(1024 * 1024))
             .unwrap_or_else(|| {
                 crate::engine::executor::mem_budget::memory_target_bytes()
-                    .saturating_div(4)
+                    .saturating_mul(2)
+                    .saturating_div(3)
                     .min(1024 * 1024 * 1024)
             })
     }
@@ -2205,16 +2273,14 @@ impl PagedHnsw {
         // One temporary offset vector is retained while on-disk NodeIds are
         // translated in place to dense ordinals. It is charged for the build
         // peak and released before publication.
-        let Some((spill_codes, mut charge)) =
-            allocation.try_reserve(Self::query_navigation_limit_bytes(), |bytes| {
-                ControlledMemoryCharge::try_new_optional(
-                    ControlledMemoryCategory::DerivedCache,
-                    bytes,
-                )
-            })
+        let limit_bytes = Self::query_navigation_limit_bytes();
+        let Some((storage, mut charge)) =
+            allocation.try_reserve(limit_bytes, |bytes| file.reserve_navigation_cache(bytes))
         else {
             return Ok(None);
         };
+        let spill_codes = storage == QueryNavStorage::Spilled;
+        let spill_edges = storage != QueryNavStorage::Resident;
         let code_tmp = if spill_codes {
             Some(
                 crate::engine::executor::select::grace::SpillTmpDir::create_kind(
@@ -2236,7 +2302,7 @@ impl PagedHnsw {
             })
             .transpose()?;
 
-        let edge_tmp = if spill_codes {
+        let edge_tmp = if spill_edges {
             Some(
                 crate::engine::executor::select::grace::SpillTmpDir::create_kind(
                     file.spill_data_dir(),
@@ -2259,6 +2325,8 @@ impl PagedHnsw {
         let mut row_seed = RowLookup::new(nodes, charge.split(allocation.row_seed_bytes));
         let mut edge_count = 0usize;
         let mut vids = Vec::with_capacity(nodes);
+        let mut rows = Vec::with_capacity(nodes);
+        let mut deleted = Vec::with_capacity(nodes);
         let mut page_starts = vec![u32::MAX; pages];
         let mut codes = Vec::with_capacity(if spill_codes {
             0
@@ -2267,7 +2335,7 @@ impl PagedHnsw {
         });
         let mut norms = Vec::with_capacity(nodes);
         let mut raw_offsets = Vec::with_capacity(nodes + 1);
-        let mut neighbors = Vec::with_capacity(if spill_codes {
+        let mut neighbors = Vec::with_capacity(if spill_edges {
             0
         } else {
             allocation.edge_capacity
@@ -2292,6 +2360,8 @@ impl PagedHnsw {
                     })?;
                 }
                 vids.push(vid);
+                rows.push(row_id);
+                deleted.push(row_deleted);
                 if !row_deleted {
                     row_seed.rows.push((row_id, vid));
                 }
@@ -2353,7 +2423,7 @@ impl PagedHnsw {
         let mut offsets = Vec::with_capacity(nodes + 1);
         offsets.push(0u32);
         let mut write = 0usize;
-        for ordinal in 0..if spill_codes { 0 } else { nodes } {
+        for ordinal in 0..if spill_edges { 0 } else { nodes } {
             let begin = raw_offsets[ordinal] as usize;
             let end = raw_offsets[ordinal + 1] as usize;
             for read in begin..end {
@@ -2414,9 +2484,12 @@ impl PagedHnsw {
         row_seed.seal();
         Ok(Some(QueryNavArena {
             epoch,
+            limit_bytes,
             dim,
             dist_mul,
             vids,
+            rows,
+            deleted,
             page_starts,
             codes,
             norms,
@@ -2433,6 +2506,13 @@ impl PagedHnsw {
     /// optional cache and leaves the paged implementation as the oracle.
     pub(crate) fn refresh_query_navigation(&self) -> Result<(), QueryError> {
         let _gate = self.navigation_gate.write();
+        if self.query_nav.read().as_ref().is_some_and(|arena| {
+            arena.epoch == self.query_nav_epoch.load(Ordering::Acquire)
+                && arena.vids.len() == self.file.node_count() as usize
+                && arena.limit_bytes == Self::query_navigation_limit_bytes()
+        }) {
+            return Ok(());
+        }
         if self.metric != Metric::Dot
             && (self.navigation_quant_enabled && paged_quant_enabled())
             && (self.file.navigation_quantization().is_none()
@@ -2445,13 +2525,35 @@ impl PagedHnsw {
             self.query_nav.write().take();
             return Ok(());
         }
+        // Searches have drained under navigation_gate. Retire the old image
+        // before reserving its replacement rather than charging two copies.
+        self.query_nav.write().take();
         let epoch = self.query_nav_epoch.load(Ordering::Acquire);
-        let arena = Self::build_query_navigation_for(&self.file, self.m0, epoch)?;
+        let arena = match Self::build_query_navigation_for(&self.file, self.m0, epoch) {
+            Ok(arena) => arena,
+            // Derived acceleration must not make a valid durable index
+            // unusable when optional temporary-file quota is exhausted.
+            Err(err) if err.message().starts_with("out of temp disk space:") => None,
+            Err(err) => return Err(err),
+        };
         let mut published = self.query_nav.write();
         if self.query_nav_epoch.load(Ordering::Acquire) == epoch {
             *published = arena.map(Arc::new);
         }
         Ok(())
+    }
+
+    pub(crate) fn evict_query_navigation(&self) {
+        // Readers retain the Arc and its charge through their last borrow.
+        // Retire ownership now so new readers cannot extend its residency
+        // while admission waits for existing readers to finish.
+        let Some(mut arena) = self.query_nav.try_write() else {
+            return;
+        };
+        if arena.take().is_some() {
+            self.query_nav_rebuild_requested
+                .store(true, Ordering::Release);
+        }
     }
 
     fn start_query_navigation_build(&self) {
@@ -2475,6 +2577,15 @@ impl PagedHnsw {
             crate::engine::executor::mem_budget::with_query_budget(budget, || {
                 let _gate = navigation_gate.read();
                 let _mutation = mutation_gate.write();
+                if query_nav.read().as_ref().is_some_and(|arena| {
+                    arena.epoch == epoch_source.load(Ordering::Acquire)
+                        && arena.vids.len() == file.node_count() as usize
+                        && arena.limit_bytes == Self::query_navigation_limit_bytes()
+                }) {
+                    requested.store(false, Ordering::Release);
+                    building.store(false, Ordering::Release);
+                    return;
+                }
                 if file.prepare_navigation_mapping().unwrap_or(false) {
                     requested.store(false, Ordering::Release);
                     building.store(false, Ordering::Release);
@@ -2880,8 +2991,14 @@ impl PagedHnsw {
                     for upper in ((level + 1)..=top as usize).rev() {
                         cur = self.greedy_descend(vector, cur, upper, scratch)?;
                     }
-                    let found =
-                        self.search_layer(vector, &[cur], self.ef_construction, level, scratch)?;
+                    let found = self.search_layer(
+                        vector,
+                        &[cur],
+                        self.ef_construction,
+                        level,
+                        None,
+                        scratch,
+                    )?;
                     candidates.extend(
                         found
                             .iter()
@@ -3531,20 +3648,39 @@ impl PagedHnsw {
         entries: &[VecId],
         ef: usize,
         level: usize,
+        live_only: Option<&std::collections::HashSet<VecId>>,
         scratch: &mut Scratch,
     ) -> Result<Vec<Scored>, QueryError> {
+        let tombstones = self.tombstones.load(Ordering::Acquire) != 0;
+        let explore_ties = live_only.is_some()
+            && !(self.metric == Metric::Dot && query.iter().all(|value| *value == 0.0));
+        let admits = |vid| -> Result<bool, QueryError> {
+            match live_only {
+                None => Ok(true),
+                Some(retired) => {
+                    Ok(!retired.contains(&vid) && (!tombstones || self.file.is_live_node(vid)?))
+                }
+            }
+        };
         scratch.clear_layer();
         for &e in entries {
             if scratch.visited.insert(self.file.node_id(e)?) {
                 let d = self.dist_q(query, e, scratch)?;
                 scratch.frontier.push(Reverse(Scored { dist: d, id: e }));
-                scratch.results.push(Scored { dist: d, id: e });
+                if admits(e)? {
+                    scratch.results.push(Scored { dist: d, id: e });
+                }
             }
         }
         while scratch.results.len() > ef {
             scratch.results.pop();
         }
+        let mut steps = 0usize;
         while let Some(Reverse(c)) = scratch.frontier.pop() {
+            if steps & 63 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            steps += 1;
             let furthest = scratch
                 .results
                 .peek()
@@ -3571,16 +3707,22 @@ impl PagedHnsw {
                 let s = Scored { dist: d, id: nb };
                 if scratch.results.len() < ef {
                     scratch.frontier.push(Reverse(s));
-                    scratch.results.push(s);
+                    if admits(nb)? {
+                        scratch.results.push(s);
+                    }
                 } else {
                     let furthest = scratch
                         .results
                         .peek()
                         .map(|x| x.dist)
                         .unwrap_or(f64::INFINITY);
-                    if d < furthest {
-                        if let Some(mut top) = scratch.results.peek_mut() {
-                            *top = s;
+                    if explore_ties && d == furthest && (d != 0.0 || self.metric == Metric::Dot) {
+                        scratch.frontier.push(Reverse(s));
+                    } else if d < furthest {
+                        if admits(nb)? {
+                            if let Some(mut top) = scratch.results.peek_mut() {
+                                *top = s;
+                            }
                         }
                         scratch.frontier.push(Reverse(s));
                     }
@@ -3617,13 +3759,11 @@ impl PagedHnsw {
                 .collect();
             if let Some(codes) = codes {
                 let selected =
-                    super::hnsw_core::select_diverse_by(0..candidates.len(), m, |i, j| {
+                    super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, j| {
                         let (a, na) = codes[i];
                         let (b, nb) = codes[j];
-                        Ok::<_, QueryError>(
-                            (na + nb - 2 * dot_i8(a, b)) as f64 * (params.dist_mul as f64)
-                                < candidates[i].dist,
-                        )
+                        let pair = (na + nb - 2 * dot_i8(a, b)) as f64 * params.dist_mul as f64;
+                        Ok::<_, QueryError>((pair < candidates[i].dist, pair == 0.0))
                     })?;
                 return Ok(selected.into_iter().map(|i| candidates[i]).collect());
             }
@@ -3648,7 +3788,38 @@ impl PagedHnsw {
                 }
             }
         }
-        super::hnsw_core::select_diverse(candidates, m, |a, b| self.dist_nodes(a, b, scratch))
+        if self.metric == Metric::Dot {
+            if !candidates
+                .windows(2)
+                .any(|pair| pair[0].dist == pair[1].dist)
+            {
+                return super::hnsw_core::select_diverse(candidates, m, |a, b| {
+                    self.dist_nodes(a, b, scratch)
+                });
+            }
+            return super::hnsw_core::select_diverse_ties_by(
+                candidates.iter().copied(),
+                m,
+                |a, b| {
+                    let pair = self.dist_nodes(a.id, b.id, scratch)?;
+                    let coincident = if a.dist == b.dist && pair == a.dist {
+                        match (
+                            self.read_and_maybe_cache(a.id, scratch)?,
+                            self.read_and_maybe_cache(b.id, scratch)?,
+                        ) {
+                            (Some(CachedVector::Exact(a)), Some(CachedVector::Exact(b))) => a == b,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    Ok::<_, QueryError>((pair < a.dist, coincident))
+                },
+            );
+        }
+        super::hnsw_core::select_diverse_ties(candidates, m, true, |a, b| {
+            self.dist_nodes(a, b, scratch)
+        })
     }
 
     /// Resolve old-node cache entries once per candidate, not once per
@@ -3682,16 +3853,14 @@ impl PagedHnsw {
                 Source::Missing
             });
         }
-        let selected = super::hnsw_core::select_diverse_by(0..candidates.len(), m, |i, r| {
-            Ok::<_, QueryError>(
-                match (parts(&sources[i], arena), parts(&sources[r], arena)) {
-                    (Some((a, na)), Some((b, nb))) => {
-                        (na + nb - 2 * dot_i8(a, b)) as f64 * (arena.dist_mul as f64)
-                            < candidates[i].dist
-                    }
-                    _ => false,
-                },
-            )
+        let selected = super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, r| {
+            let pair = match (parts(&sources[i], arena), parts(&sources[r], arena)) {
+                (Some((a, na)), Some((b, nb))) => {
+                    (na + nb - 2 * dot_i8(a, b)) as f64 * arena.dist_mul as f64
+                }
+                _ => return Ok::<_, QueryError>((false, false)),
+            };
+            Ok((pair < candidates[i].dist, pair == 0.0))
         })?;
         Ok(selected.into_iter().map(|i| candidates[i]).collect())
     }
@@ -3714,28 +3883,16 @@ impl PagedHnsw {
         {
             return None;
         }
-        let mut selected: Vec<Scored> = Vec::with_capacity(m);
-        let mut sel_ords: Vec<usize> = Vec::with_capacity(m);
-        for c in candidates {
-            if selected.len() >= m {
-                break;
-            }
-            let co = arena
-                .ord_of(c.id)
-                .expect("candidate coverage checked above");
-            let mut keep = true;
-            for &ro in &sel_ords {
-                if arena.ssd_nodes(co, ro) < c.dist {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                selected.push(*c);
-                sel_ords.push(co);
-            }
-        }
-        Some(selected)
+        let ordinals: Vec<_> = candidates
+            .iter()
+            .map(|c| arena.ord_of(c.id).unwrap())
+            .collect();
+        let selected = super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, j| {
+            let pair = arena.ssd_nodes(ordinals[i], ordinals[j]);
+            Ok::<_, std::convert::Infallible>((pair < candidates[i].dist, pair == 0.0))
+        })
+        .unwrap();
+        Some(selected.into_iter().map(|i| candidates[i]).collect())
     }
 
     /// Re-select `node`'s adjacency at a layer down to at most `m`.
@@ -3866,9 +4023,8 @@ impl PagedHnsw {
         let result = self.insert_with_scratch(txn_id, row_id, vector, &mut scratch);
         drop(_mutation);
         drop(_gate);
-        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
-            self.start_query_navigation_build();
-        }
+        // A write burst must not reconstruct the complete optional image
+        // between row updates. The next search services the rebuild hint.
         result
     }
 
@@ -3989,8 +4145,88 @@ impl PagedHnsw {
         &self,
         session: &PagedHnswBuildSession,
     ) -> Result<(), QueryError> {
+        self.repair_build_connectivity(session)?;
         if let Some(store) = session.build_adj.as_deref() {
             store.materialize(&self.file)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve one bridge slot only when the completed directed graph has
+    /// unreachable components. Scratch is covered by the chunk reservation.
+    fn repair_build_connectivity(&self, session: &PagedHnswBuildSession) -> Result<(), QueryError> {
+        let Some((entry, _)) = self.file.entry_with_level() else {
+            return Ok(());
+        };
+        let mut vids = Vec::with_capacity(self.node_count() as usize);
+        if let Some(store) = &session.build_adj {
+            vids.extend(
+                store
+                    .published_vids()
+                    .iter()
+                    .map(|vid| vid.load(Ordering::Relaxed)),
+            );
+        } else {
+            self.file.for_each_node(|vid, _, _| vids.push(vid))?;
+        }
+        let ordinal = |vid| {
+            if let Some(store) = &session.build_adj {
+                store
+                    .ordinal_in(store.published_vids(), vid)
+                    .ok_or_else(super::persistence::corrupt)
+            } else {
+                vids.binary_search(&vid)
+                    .map_err(|_| super::persistence::corrupt())
+            }
+        };
+        let mut scratch = Scratch::default();
+        scratch.build_adj = session.build_adj.clone();
+        let mut seen = vec![false; vids.len()];
+        let mut pending = Vec::with_capacity(vids.len());
+        let mut neighbors = Vec::new();
+        let visit = |root: VecId,
+                     seen: &mut [bool],
+                     pending: &mut Vec<VecId>,
+                     neighbors: &mut Vec<VecId>,
+                     scratch: &mut Scratch|
+         -> Result<(), QueryError> {
+            seen[ordinal(root)?] = true;
+            pending.push(root);
+            while let Some(vid) = pending.pop() {
+                crate::engine::cancel::check_cancelled()?;
+                self.neighbors_at_into(vid, 0, scratch, neighbors)?;
+                for &next in neighbors.iter() {
+                    let id = ordinal(next)?;
+                    if !seen[id] {
+                        seen[id] = true;
+                        pending.push(next);
+                    }
+                }
+            }
+            Ok(())
+        };
+        visit(entry, &mut seen, &mut pending, &mut neighbors, &mut scratch)?;
+        if seen.iter().all(|&visited| visited) {
+            return Ok(());
+        }
+        for &vid in &vids {
+            self.neighbors_at_into(vid, 0, &mut scratch, &mut neighbors)?;
+            if neighbors.len() >= self.m0 {
+                neighbors.pop();
+                self.set_neighbors_for_build(VEC_DDL_TXN, vid, 0, &neighbors, &mut scratch)?;
+            }
+        }
+        seen.fill(false);
+        visit(entry, &mut seen, &mut pending, &mut neighbors, &mut scratch)?;
+        let mut anchor = entry;
+        for (id, &vid) in vids.iter().enumerate() {
+            if !seen[id] {
+                self.neighbors_at_into(anchor, 0, &mut scratch, &mut neighbors)?;
+                neighbors.push(vid);
+                self.set_neighbors_for_build(VEC_DDL_TXN, anchor, 0, &neighbors, &mut scratch)?;
+                visit(vid, &mut seen, &mut pending, &mut neighbors, &mut scratch)?;
+                anchor = vid;
+            }
         }
         Ok(())
     }
@@ -4206,7 +4442,8 @@ impl PagedHnsw {
         let mut entries = vec![cur];
         let start = level.min(max_level);
         for lc in (0..=start).rev() {
-            let found = self.search_layer(node_vec, &entries, self.ef_construction, lc, scratch)?;
+            let found =
+                self.search_layer(node_vec, &entries, self.ef_construction, lc, None, scratch)?;
             let m_layer = if lc == 0 { self.m0 } else { self.m };
             // M is insertion fanout; m0 is the layer-0 capacity for reverse
             // edges. Filling that capacity on birth doubled maintenance work.
@@ -4271,7 +4508,9 @@ impl PagedHnsw {
                 id: entry as u64,
             };
             scratch.frontier.push(Reverse(first));
-            scratch.results.push(first);
+            if !arena.deleted[entry] {
+                scratch.results.push(first);
+            }
             // Keep CPU lookahead small for resident images. Disk-backed probes
             // need a wider bounded I/O window to overlap random page misses.
             let prefetch_ahead = if matches!(&arena.codes, QueryNavCodes::Spilled(_))
@@ -4282,7 +4521,12 @@ impl PagedHnsw {
             } else {
                 8
             };
+            let mut steps = 0usize;
             while let Some(Reverse(candidate)) = scratch.frontier.pop() {
+                if steps & 63 == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
+                steps += 1;
                 let furthest = scratch
                     .results
                     .peek()
@@ -4340,6 +4584,7 @@ impl PagedHnsw {
                                 id: u64::from(neighbors[offset]),
                             },
                             ef,
+                            !arena.deleted[ordinals[offset]],
                         )?;
                     }
                     index += 4;
@@ -4353,6 +4598,7 @@ impl PagedHnsw {
                             id: u64::from(neighbor),
                         },
                         ef,
+                        !arena.deleted[ordinal],
                     )?;
                     index += 1;
                 }
@@ -4369,6 +4615,69 @@ impl PagedHnsw {
         })
     }
 
+    /// Return the complete compact-navigation pool for one authoritative heap
+    /// rerank. Exact vectors need not be fetched twice from separate files.
+    pub(crate) fn search_navigation_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
+        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
+            self.start_query_navigation_build();
+        }
+        let _gate = self.navigation_gate.read();
+        let retired = self.restored_retirements.read();
+        let ef = ef.max(k).min(self.node_count() as usize);
+        if ef == self.node_count() as usize || k == 0 || !retired.0.is_empty() {
+            return Ok(None);
+        }
+        let Some(arena) = self.query_nav.read().clone().filter(|arena| {
+            arena.epoch == self.query_nav_epoch.load(Ordering::Acquire)
+                && arena.vids.len() == self.node_count() as usize
+                && arena.dim == query.len()
+        }) else {
+            return Ok(None);
+        };
+        let mut scratch = Scratch::default();
+        scratch.vec_cache_limit = 1;
+        self.configure_persisted_query(query, &mut scratch);
+        if scratch.qcodes.is_empty() {
+            return Ok(None);
+        }
+        scratch.navigation = Some(Arc::clone(&arena));
+        let Some((mut current, top)) = self.file.entry_with_level() else {
+            return Ok(Some(Vec::new()));
+        };
+        for level in (1..=top as usize).rev() {
+            current = self.greedy_descend(query, current, level, &mut scratch)?;
+        }
+        let Some(entry) = arena.ordinal(current) else {
+            return Ok(None);
+        };
+        let found = Self::search_layer_query_navigation(
+            &arena,
+            &self.file,
+            &scratch.qcodes,
+            scratch.qnorm,
+            entry,
+            ef,
+        )?;
+        Ok(Some(
+            found
+                .into_iter()
+                .filter(|&id| !arena.deleted[id])
+                .take(k)
+                .map(|id| {
+                    (
+                        arena.rows[id],
+                        arena.distance(&scratch.qcodes, scratch.qnorm, id),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
     /// k-NN search. Returns up to `k` `(row_id, exact_distance)` for live
     /// (non-tombstoned) nodes, ascending by distance. MVCC visibility of the
     /// row is the caller's responsibility.
@@ -4378,6 +4687,9 @@ impl PagedHnsw {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
+            self.start_query_navigation_build();
+        }
         let _gate = self.navigation_gate.read();
         let retired = self.restored_retirements.read();
         if k == 0 {
@@ -4501,7 +4813,7 @@ impl PagedHnsw {
             return Ok(out);
         }
         let cand: Vec<VecId> = self
-            .search_layer(query, &[cur], ef, 0, &mut scratch)?
+            .search_layer(query, &[cur], ef, 0, Some(&retired.0), &mut scratch)?
             .iter()
             .map(|s| s.id)
             .collect();
@@ -4530,7 +4842,7 @@ impl PagedHnsw {
         // Return the top-`k` in ascending distance order: the executor's stable
         // re-sort breaks equal-distance ties by this order, so a deterministic
         // ascending sort here keeps LIMIT/OFFSET windowing stable.
-        out.sort_by(|a, b| a.1.total_cmp(&b.1));
+        out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         out.truncate(k);
         Ok(out)
     }
@@ -4957,7 +5269,7 @@ mod build_adj_tests {
 
 #[cfg(test)]
 mod query_nav_allocation_tests {
-    use super::{query_navigation_allocation, QueryNavCache, QUERY_CACHE_MAX_K};
+    use super::{query_navigation_allocation, QueryNavCache, QueryNavStorage, QUERY_CACHE_MAX_K};
     use crate::storage::RowId;
 
     #[test]
@@ -4965,12 +5277,16 @@ mod query_nav_allocation_tests {
         let layout = query_navigation_allocation(1_000_000, 768, 32, 333_334).unwrap();
         assert_eq!(
             layout.final_bytes,
-            912_000_004 + 333_334 * 4 + layout.query_cache_bytes + layout.row_seed_bytes
+            912_000_004
+                + 1_000_000 * (std::mem::size_of::<crate::storage::RowId>() + 1)
+                + 333_334 * 4
+                + layout.query_cache_bytes
+                + layout.row_seed_bytes
         );
         assert_eq!(layout.peak_bytes, layout.final_bytes + 4_000_004);
         assert!(layout.query_cache_bytes < 4 * 1024 * 1024);
         let (spilled, bytes) = layout.try_reserve(500 * 1024 * 1024 / 4, Some).unwrap();
-        assert!(spilled);
+        assert_eq!(spilled, QueryNavStorage::Spilled);
         assert!(
             bytes < 48 * 1024 * 1024,
             "million-row metadata must fit the unchanged 500 MiB target"
@@ -4996,13 +5312,28 @@ mod query_nav_allocation_tests {
             attempts.push(bytes);
             (bytes == spilled).then_some(bytes)
         });
-        assert_eq!(result, Some((true, spilled)));
-        assert_eq!(attempts, vec![layout.peak_bytes, spilled]);
+        assert_eq!(result, Some((QueryNavStorage::Spilled, spilled)));
+        assert_eq!(
+            attempts,
+            vec![
+                layout.peak_bytes,
+                layout.peak_bytes - layout.edge_capacity * 4 + 64 * 1024,
+                spilled
+            ]
+        );
         assert_eq!(
             layout.try_reserve(layout.peak_bytes, Some),
-            Some((false, layout.peak_bytes))
+            Some((QueryNavStorage::Resident, layout.peak_bytes))
         );
-        assert_eq!(layout.try_reserve(spilled, Some), Some((true, spilled)));
+        let edges = layout.peak_bytes - layout.edge_capacity * 4 + 64 * 1024;
+        assert_eq!(
+            layout.try_reserve(edges, Some),
+            Some((QueryNavStorage::SpilledEdges, edges))
+        );
+        assert_eq!(
+            layout.try_reserve(spilled, Some),
+            Some((QueryNavStorage::Spilled, spilled))
+        );
         assert!(layout
             .try_reserve::<usize>(spilled - 1, |_| panic!("over quota"))
             .is_none());
@@ -5014,6 +5345,56 @@ mod query_nav_allocation_tests {
     #[test]
     fn navigation_layout_rejects_overflow() {
         assert!(query_navigation_allocation(usize::MAX, 768, 32, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn native_memo_admits_wide_rerank_pools_with_an_explicit_bound() {
+        let cache = QueryNavCache::with_max_k(1024);
+        let key = vec![1u8; 777];
+        let result: Vec<_> = (0..400)
+            .map(|id| {
+                (
+                    crate::storage::RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    id as f64,
+                )
+            })
+            .collect();
+        cache.insert_bytes(&key, 400, 400, &result);
+        assert_eq!(cache.get_bytes(&key, 400, 400), Some(result.clone()));
+        assert!(cache.get_bytes(&key, 400, 800).is_none());
+        cache.insert_bytes(&key, 1025, 1025, &result);
+        assert!(cache.get_bytes(&key, 1025, 1025).is_none());
+        let small = QueryNavCache::new();
+        small.insert_bytes(&key, 400, 400, &result);
+        assert!(small.get_bytes(&key, 400, 400).is_none());
+    }
+
+    #[test]
+    fn native_query_cache_checks_unsampled_bytes_and_all_effort_parameters() {
+        let cache = QueryNavCache::new();
+        let key = vec![7u8; 1024];
+        let result = vec![(
+            crate::storage::RowId {
+                page_id: 3,
+                slot_id: 2,
+            },
+            1.25,
+        )];
+        cache.insert_bytes(&key, 10, 128, &result);
+        assert_eq!(cache.get_bytes(&key, 10, 128), Some(result));
+        let mut collision = key.clone();
+        collision[1] ^= 1;
+        assert_eq!(
+            QueryNavCache::hash_bytes(&key, 10, 128),
+            QueryNavCache::hash_bytes(&collision, 10, 128)
+        );
+        assert!(cache.get_bytes(&collision, 10, 128).is_none());
+        assert!(cache.get_bytes(&key, 11, 128).is_none());
+        assert!(cache.get_bytes(&key, 10, 64).is_none());
+        assert!(cache.get_bytes(&key[..1000], 10, 128).is_none());
     }
 
     #[test]
@@ -5051,6 +5432,72 @@ mod query_nav_allocation_tests {
 #[cfg(test)]
 mod source_audit_tests {
     use super::*;
+    #[test]
+    fn vector_audit_fallback_breaks_distance_ties_by_row_id() {
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        let mut graph = PagedHnsw::new(file);
+        graph.navigation_quant_enabled = false;
+        for id in [9, 5, 7, 8] {
+            graph.insert_ddl(row(id), &[1.0, 1.0]).unwrap();
+        }
+        graph
+            .query_nav_rebuild_requested
+            .store(false, Ordering::Release);
+        let found = graph.search(&[1.0, 1.0], 2, 3).unwrap();
+        assert_eq!(
+            found.iter().map(|(row, _)| row.page_id).collect::<Vec<_>>(),
+            [5, 7]
+        );
+    }
+
+    #[test]
+    fn vector_audit_tombstones_do_not_consume_live_search_budget() {
+        for compact in [false, true] {
+            let (_dir, file) = crate::storage::source_audit_vector_file();
+            let graph = PagedHnsw::new(file);
+            for id in 0..200 {
+                graph.insert_ddl(row(id), &[id as f32, 1.0]).unwrap();
+            }
+            for id in 0..100 {
+                graph.mark_deleted_by_row_id(row(id)).unwrap();
+            }
+            if compact {
+                graph.refresh_query_navigation().unwrap();
+            } else {
+                graph
+                    .query_nav_rebuild_requested
+                    .store(false, Ordering::Release);
+            }
+            let found = graph.search(&[0.0, 1.0], 10, 32).unwrap();
+            assert_eq!(found.len(), 10, "compact={compact}");
+            assert!(found.iter().all(|(row, _)| row.page_id >= 100));
+        }
+    }
+
+    #[test]
+    fn pressure_eviction_keeps_reader_memory_charged_until_last_arc() {
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        let graph = PagedHnsw::new(file);
+        for n in 0..16 {
+            graph.insert_ddl(row(n), &[n as f32, 1.0]).unwrap();
+        }
+        graph.refresh_query_navigation().unwrap();
+        let held = graph.query_nav.read().clone().unwrap();
+        let bytes = held._charge.bytes();
+        let before = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        graph.evict_query_navigation();
+        assert!(graph.query_nav.read().is_none());
+        assert_eq!(Arc::strong_count(&held), 1);
+        assert_eq!(
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().0,
+            before
+        );
+        drop(held);
+        assert!(
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().0 <= before - bytes
+        );
+        assert_eq!(graph.search(&[3.0, 1.0], 1, 32).unwrap()[0], (row(3), 0.0));
+    }
     fn row(n: u32) -> RowId {
         RowId {
             page_id: n,
@@ -5080,6 +5527,13 @@ mod source_audit_tests {
         graph.insert_ddl(row(64), &[10000.0, 10000.0]).unwrap();
         graph.next_calibration.store(65, Ordering::Release);
         graph.insert_ddl(row(65), &[20000.0, 20000.0]).unwrap();
+        assert!(!graph.query_nav_building.load(Ordering::Acquire));
+        // Write bursts defer optional reconstruction until a reader needs it.
+        // The first read still sees the complete, authoritative graph.
+        assert_eq!(
+            graph.search(&[20000.0, 20000.0], 1, 100).unwrap()[0],
+            (row(65), 0.0)
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !graph.has_query_navigation_for_test() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));

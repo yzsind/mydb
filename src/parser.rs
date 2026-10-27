@@ -52,6 +52,7 @@ use convert::*;
 pub use convert::{is_aggregate_function, parse_expr_fragment, render_table_option};
 #[cfg(test)]
 pub(crate) use entry::parse_statement_calls_for_test;
+pub(crate) use entry::MydbDialect;
 use entry::*;
 pub(crate) use entry::{
     current_parser_sql_mode_bits, extract_first_keyword, split_query_statements,

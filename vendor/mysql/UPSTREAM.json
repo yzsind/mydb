@@ -5,6 +5,7 @@
   "registry": "registry+https://github.com/rust-lang/crates.io-index",
   "repository": "https://github.com/blackbeam/rust-mysql-simple",
   "patches": [
-    "Replace rustls-pemfile with rustls::pki_types::pem::PemObject; preserve TLS trust and client identity behavior."
+    "Replace rustls-pemfile with rustls::pki_types::pem::PemObject; preserve TLS trust and client identity behavior.",
+    "Resolve mysql_common to the verified local copy with the fixed zstd dependency."
   ]
 }

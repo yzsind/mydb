@@ -143,6 +143,97 @@ pub const CR_CONN_HOST_ERROR: ErrorSpec = ErrorSpec::new(
 pub const CR_SERVER_LOST: ErrorSpec =
     ErrorSpec::new(ErrorDomain::MysqlClient, 2013, *b"HY000", "CR_SERVER_LOST");
 
+pub const ER_AI_ACCESS_DENIED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50050, *b"42000", "ER_AI_ACCESS_DENIED");
+pub const ER_AI_BUDGET_EXCEEDED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50051, *b"HY000", "ER_AI_BUDGET_EXCEEDED");
+pub const ER_AI_CREDENTIAL_UNAVAILABLE: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50052,
+    *b"HY000",
+    "ER_AI_CREDENTIAL_UNAVAILABLE",
+);
+pub const ER_AI_DIMENSION_MISMATCH: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50053,
+    *b"HY000",
+    "ER_AI_DIMENSION_MISMATCH",
+);
+pub const ER_AI_DISABLED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50054, *b"HY000", "ER_AI_DISABLED");
+pub const ER_AI_EGRESS_DENIED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50055, *b"42000", "ER_AI_EGRESS_DENIED");
+pub const ER_AI_ENCRYPTION_KEY_INVALID: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50056,
+    *b"HY000",
+    "ER_AI_ENCRYPTION_KEY_INVALID",
+);
+pub const ER_AI_ENCRYPTION_KEY_MISSING: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50057,
+    *b"HY000",
+    "ER_AI_ENCRYPTION_KEY_MISSING",
+);
+pub const ER_AI_INCOMPLETE: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50058, *b"HY000", "ER_AI_INCOMPLETE");
+pub const ER_AI_INVALID_ARGUMENT: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50059,
+    *b"22023",
+    "ER_AI_INVALID_ARGUMENT",
+);
+pub const ER_AI_INVALID_RESPONSE: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50060,
+    *b"HY000",
+    "ER_AI_INVALID_RESPONSE",
+);
+pub const ER_AI_MODEL_NOT_FOUND: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50061, *b"HY000", "ER_AI_MODEL_NOT_FOUND");
+pub const ER_AI_OUTPUT_SCHEMA: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50062, *b"HY000", "ER_AI_OUTPUT_SCHEMA");
+pub const ER_AI_QUEUE_FULL: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50063, *b"HY000", "ER_AI_QUEUE_FULL");
+pub const ER_AI_REFUSED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50064, *b"HY000", "ER_AI_REFUSED");
+pub const ER_AI_SECRET_DECRYPT_FAILED: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50065,
+    *b"HY000",
+    "ER_AI_SECRET_DECRYPT_FAILED",
+);
+pub const ER_AI_TIMEOUT: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50066, *b"HY000", "ER_AI_TIMEOUT");
+pub const ER_AI_UNSUPPORTED_CONTEXT: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50067,
+    *b"0A000",
+    "ER_AI_UNSUPPORTED_CONTEXT",
+);
+pub const ER_AI_UPSTREAM_: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50068, *b"HY000", "ER_AI_UPSTREAM_");
+pub const ER_AI_UPSTREAM_AUTH: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50069, *b"HY000", "ER_AI_UPSTREAM_AUTH");
+pub const ER_AI_UPSTREAM_ERROR: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50070, *b"HY000", "ER_AI_UPSTREAM_ERROR");
+pub const ER_AI_WRONG_MODEL_KIND: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50071,
+    *b"HY000",
+    "ER_AI_WRONG_MODEL_KIND",
+);
+
+pub const ER_AI_CIRCUIT_OPEN: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50090, *b"HY000", "ER_AI_CIRCUIT_OPEN");
+
+pub const ER_AI_KEY_ROTATION_INCOMPLETE: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50091,
+    *b"HY000",
+    "ER_AI_KEY_ROTATION_INCOMPLETE",
+);
+
 pub const MYDB_ERROR_SPECS: &[ErrorSpec] = &[
     MYDB_ER_INVALID_VECTOR_VALUE,
     MYDB_ER_VECTOR_DIMENSION_MISMATCH,
@@ -165,6 +256,30 @@ pub const MYDB_ERROR_SPECS: &[ErrorSpec] = &[
     MYDB_ER_SYSTEM_TIME_SCHEMA_CHANGED,
     MYDB_ER_INVALID_SYSTEM_TIME,
     MYDB_ER_SNAPSHOT_TOO_OLD,
+    ER_AI_ACCESS_DENIED,
+    ER_AI_BUDGET_EXCEEDED,
+    ER_AI_CREDENTIAL_UNAVAILABLE,
+    ER_AI_DIMENSION_MISMATCH,
+    ER_AI_DISABLED,
+    ER_AI_EGRESS_DENIED,
+    ER_AI_ENCRYPTION_KEY_INVALID,
+    ER_AI_ENCRYPTION_KEY_MISSING,
+    ER_AI_INCOMPLETE,
+    ER_AI_INVALID_ARGUMENT,
+    ER_AI_INVALID_RESPONSE,
+    ER_AI_MODEL_NOT_FOUND,
+    ER_AI_OUTPUT_SCHEMA,
+    ER_AI_QUEUE_FULL,
+    ER_AI_REFUSED,
+    ER_AI_SECRET_DECRYPT_FAILED,
+    ER_AI_TIMEOUT,
+    ER_AI_UNSUPPORTED_CONTEXT,
+    ER_AI_UPSTREAM_,
+    ER_AI_UPSTREAM_AUTH,
+    ER_AI_UPSTREAM_ERROR,
+    ER_AI_WRONG_MODEL_KIND,
+    ER_AI_CIRCUIT_OPEN,
+    ER_AI_KEY_ROTATION_INCOMPLETE,
 ];
 
 pub fn lookup_by_code(code: u16) -> Option<&'static ErrorSpec> {

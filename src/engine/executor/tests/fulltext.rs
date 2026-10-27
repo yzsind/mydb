@@ -216,6 +216,116 @@ fn fulltext_payload_settings_are_part_of_the_persisted_index_definition() {
 }
 
 #[test]
+fn fulltext_position_limits_reject_writes_and_backfill_without_corruption() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_ft_engine(dir.path());
+    for backfill in [false, true] {
+        let name = if backfill {
+            "limit_build"
+        } else {
+            "limit_write"
+        };
+        engine
+            .execute(&format!(
+                "CREATE TABLE {name}(id INT PRIMARY KEY,a TEXT,b TEXT,FULLTEXT KEY ft(a,b))"
+            ))
+            .unwrap();
+        let table = engine.database().table(name).unwrap();
+        let mut index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_fulltext())
+            .unwrap()
+            .clone();
+        index.index_id = 0;
+        let meta = index.fulltext.as_mut().unwrap();
+        meta.position_gap = Some(u32::MAX - 1);
+        meta.positions = Some(true);
+        engine.execute(&format!("DROP INDEX ft ON {name}")).unwrap();
+        if backfill {
+            engine
+                .execute(&format!("INSERT INTO {name} VALUES(1,'alpha','beta beta')"))
+                .unwrap();
+            let error = engine
+                .database()
+                .add_index(name, index.clone())
+                .unwrap_err();
+            assert_eq!(error.code(), 1690, "{error}");
+            assert!(!engine
+                .database()
+                .table(name)
+                .unwrap()
+                .indexes
+                .iter()
+                .any(|index| index.is_fulltext()));
+            engine
+                .execute(&format!("UPDATE {name} SET b='beta' WHERE id=1"))
+                .unwrap();
+            engine.database().add_index(name, index).unwrap();
+        } else {
+            engine.database().add_index(name, index).unwrap();
+            engine
+                .execute(&format!("INSERT INTO {name} VALUES(1,'alpha','beta')"))
+                .unwrap();
+            let error = engine
+                .execute(&format!("UPDATE {name} SET b='beta beta' WHERE id=1"))
+                .unwrap_err();
+            assert_eq!(error.code(), 1690, "{error}");
+            assert_eq!(
+                rows_to_strings(exec_set(
+                    &engine,
+                    &format!("SELECT b FROM {name} WHERE id=1")
+                )),
+                vec![vec!["beta"]]
+            );
+            let error = engine
+                .execute(&format!("INSERT INTO {name} VALUES(2,'alpha','beta beta')"))
+                .unwrap_err();
+            assert_eq!(error.code(), 1690, "{error}");
+            assert_eq!(
+                first_col(exec_set(
+                    &engine,
+                    &format!("SELECT id FROM {name} ORDER BY id")
+                )),
+                vec!["1"]
+            );
+        }
+        assert!(first_col(exec_set(
+            &engine,
+            &format!(
+                "SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('\"beta alpha\"' IN BOOLEAN MODE)"
+            )
+        ))
+        .is_empty());
+        assert_eq!(
+            first_col(exec_set(
+                &engine,
+                &format!("SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('beta')")
+            )),
+            vec!["1"]
+        );
+    }
+    drop(engine);
+    let engine = open_strict_ft_engine(dir.path());
+    for name in ["limit_write", "limit_build"] {
+        assert_eq!(
+            first_col(exec_set(
+                &engine,
+                &format!("SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('beta')")
+            )),
+            vec!["1"]
+        );
+        assert!(first_col(exec_set(
+            &engine,
+            &format!(
+                "SELECT id FROM {name} WHERE MATCH(a,b) AGAINST('\"beta alpha\"' IN BOOLEAN MODE)"
+            )
+        ))
+        .is_empty());
+    }
+}
+
+#[test]
 fn fulltext_shared_phrase_postings_match_with_and_without_positions_after_restart() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     {
@@ -1658,4 +1768,96 @@ fn fulltext_audit_ddl_rejects_ignored_options() {
     engine
         .execute("CREATE FULLTEXT INDEX ft ON docs(body) WITH PARSER NGRAM")
         .unwrap();
+}
+
+#[test]
+fn fulltext_small_limit_bounds_heap_reads_after_matching() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE ft_limit(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+        .unwrap();
+    let values = (0..2049)
+        .map(|id| format!("({id},'alpha beta gamma')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO ft_limit VALUES {values}"))
+        .unwrap();
+    let mut session = SessionContext::default();
+    let sql = "SELECT id FROM ft_limit WHERE MATCH(body) AGAINST('alpha') LIMIT 5 OFFSET 7";
+    let response = engine.execute_with_session(&mut session, sql).unwrap();
+    let QueryResponse::ResultSet(result) = response.materialize().unwrap() else {
+        panic!("expected result set");
+    };
+    assert_eq!(result.rows.len(), 5);
+    // Statement completion transfers the thread counter into PFS history.
+    let QueryResponse::ResultSet(events) = engine
+        .execute_with_session(&mut session, &format!("SELECT ROWS_EXAMINED FROM performance_schema.events_statements_history WHERE SQL_TEXT = '{escaped}'", escaped = sql.replace('\'', "''")))
+        .unwrap()
+        .materialize()
+        .unwrap()
+    else {
+        panic!("expected statement history");
+    };
+    assert_eq!(events.rows.len(), 1);
+    let examined = events.rows[0][0]
+        .to_display_string()
+        .parse::<u64>()
+        .unwrap();
+    // Posting membership still scans all matches; a small unordered LIMIT
+    // must not fetch every matching heap row before its first output.
+    assert!(
+        examined > 0 && examined <= 512,
+        "heap rows read: {examined}"
+    );
+}
+
+#[test]
+fn fulltext_stream_windows_preserve_filters_scores_and_column_types() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE ft_windows(id INT PRIMARY KEY,body TEXT,amount DECIMAL(12,2),day DATE,extra JSON,FULLTEXT KEY ft(body))").unwrap();
+    let values = (0..777)
+        .map(|id| {
+            let body = if id % 3 == 0 {
+                "alpha beta alpha"
+            } else {
+                "alpha gamma"
+            };
+            format!("({id},'{body}',{id}.25,'2026-10-26','{{\"id\":{id}}}')")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO ft_windows VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE ft_windows").unwrap();
+    for search in ["alpha", "+alpha -beta", "\"alpha beta\"", "alp*"] {
+        let expression = format!("MATCH(body) AGAINST('{search}' IN BOOLEAN MODE)");
+        for predicate in [
+            format!("{expression} AND id>=260 AND id%2=0"),
+            format!("{expression} OR id=1"),
+            format!("{expression} AND MATCH(body) AGAINST('gamma')"),
+        ] {
+            for order in ["id DESC", "score DESC,id", "amount,day,id"] {
+                let sql = format!("SELECT id,amount,day,extra,{expression} AS score FROM ft_windows WHERE {predicate} ORDER BY {order}");
+                let complete = rows_to_strings(exec_set(&engine, &sql));
+                for (offset, limit) in [(0, 1), (17, 20), (251, 31), (1000, 5)] {
+                    let limited = format!("{sql} LIMIT {limit} OFFSET {offset}");
+                    let expected = complete
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        rows_to_strings(exec_set(&engine, &limited)),
+                        expected,
+                        "{limited}"
+                    );
+                }
+            }
+        }
+    }
 }

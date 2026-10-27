@@ -54,15 +54,9 @@ pub(crate) fn validate_internal<T: VectorInput + ?Sized>(value: &T) -> Result<()
         )));
     }
     let finite = match datatype {
-        VectorDataType::Float32 => bytes
-            .chunks_exact(4)
-            .all(|c| u32::from_le_bytes(c.try_into().unwrap()) & 0x7f80_0000 != 0x7f80_0000),
-        VectorDataType::Float16 => bytes
-            .chunks_exact(2)
-            .all(|c| u16::from_le_bytes(c.try_into().unwrap()) & 0x7c00 != 0x7c00),
-        VectorDataType::BFloat16 => bytes
-            .chunks_exact(2)
-            .all(|c| u16::from_le_bytes(c.try_into().unwrap()) & 0x7f80 != 0x7f80),
+        VectorDataType::Float32 => finite_float32_payload(bytes),
+        VectorDataType::Float16 => finite_float16_payload::<0x7c00>(bytes),
+        VectorDataType::BFloat16 => finite_float16_payload::<0x7f80>(bytes),
         VectorDataType::Int8 => true,
         VectorDataType::Binary => {
             dimension % 8 == 0 || bytes.last().is_some_and(|b| b >> (dimension % 8) == 0)
@@ -74,6 +68,75 @@ pub(crate) fn validate_internal<T: VectorInput + ?Sized>(value: &T) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// SIMD checks preserve the exact IEEE exponent-bit predicate and accept
+/// unaligned borrowed heap payloads. Byte loads avoid alignment assumptions.
+fn finite_float32_payload(bytes: &[u8]) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mask = vdupq_n_u32(0x7f80_0000);
+        let mut i = 0;
+        while i + 64 <= bytes.len() {
+            let mut invalid = vdupq_n_u32(0);
+            for offset in [0, 16, 32, 48] {
+                let value = vreinterpretq_u32_u8(vld1q_u8(bytes.as_ptr().add(i + offset)));
+                invalid = vorrq_u32(invalid, vceqq_u32(vandq_u32(value, mask), mask));
+            }
+            if vmaxvq_u32(invalid) != 0 {
+                return false;
+            }
+            i += 64;
+        }
+        while i + 16 <= bytes.len() {
+            let value = vreinterpretq_u32_u8(vld1q_u8(bytes.as_ptr().add(i)));
+            if vmaxvq_u32(vceqq_u32(vandq_u32(value, mask), mask)) != 0 {
+                return false;
+            }
+            i += 16;
+        }
+        return finite_float32_scalar(&bytes[i..]);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    {
+        finite_float32_scalar(bytes)
+    }
+}
+fn finite_float32_scalar(bytes: &[u8]) -> bool {
+    bytes
+        .chunks_exact(4)
+        .all(|c| u32::from_le_bytes(c.try_into().unwrap()) & 0x7f80_0000 != 0x7f80_0000)
+}
+fn finite_float16_payload<const MASK: u16>(bytes: &[u8]) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mask = vdupq_n_u16(MASK);
+        let mut i = 0;
+        while i + 32 <= bytes.len() {
+            let a = vreinterpretq_u16_u8(vld1q_u8(bytes.as_ptr().add(i)));
+            let b = vreinterpretq_u16_u8(vld1q_u8(bytes.as_ptr().add(i + 16)));
+            let invalid = vorrq_u16(
+                vceqq_u16(vandq_u16(a, mask), mask),
+                vceqq_u16(vandq_u16(b, mask), mask),
+            );
+            if vmaxvq_u16(invalid) != 0 {
+                return false;
+            }
+            i += 32;
+        }
+        return finite_float16_scalar::<MASK>(&bytes[i..]);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    {
+        finite_float16_scalar::<MASK>(bytes)
+    }
+}
+fn finite_float16_scalar<const MASK: u16>(bytes: &[u8]) -> bool {
+    bytes
+        .chunks_exact(2)
+        .all(|c| u16::from_le_bytes(c.try_into().unwrap()) & MASK != MASK)
 }
 
 pub(crate) fn normalize_internal<T: VectorInput + ?Sized>(
@@ -430,10 +493,22 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<VectorValue, QueryError> {
     Ok(value)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEXT_PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn text_parse_calls() -> usize {
+    TEXT_PARSE_CALLS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn parse_typed_text(
     text: &str,
     datatype: VectorDataType,
 ) -> Result<VectorValue, QueryError> {
+    #[cfg(test)]
+    TEXT_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     if datatype == VectorDataType::Float32 {
         return parse_text(text);
     }
@@ -832,6 +907,53 @@ pub(crate) fn coerce_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_payload_simd_matches_scalar_at_unaligned_boundaries() {
+        for dimension in [1, 7, 8, 9, 15, 16, 17, 31, 128, 769] {
+            for offset in [0, 1, 3] {
+                for bad in [0x7f80_0000u32, 0xff80_0000, 0x7fc0_0001] {
+                    let mut bytes = vec![0u8; offset + dimension * 4];
+                    for index in [0, dimension / 2, dimension - 1] {
+                        let start = offset + index * 4;
+                        bytes[start..start + 4].copy_from_slice(&bad.to_le_bytes());
+                        assert_eq!(
+                            finite_float32_payload(&bytes[offset..]),
+                            finite_float32_scalar(&bytes[offset..])
+                        );
+                        assert!(!finite_float32_payload(&bytes[offset..]));
+                        bytes[start..start + 4].fill(0);
+                    }
+                    assert!(finite_float32_payload(&bytes[offset..]));
+                }
+                for (mask, bad) in [(0x7c00u16, 0x7e01u16), (0x7f80, 0x7fc1)] {
+                    let mut bytes = vec![0u8; offset + dimension * 2];
+                    for index in [0, dimension / 2, dimension - 1] {
+                        let start = offset + index * 2;
+                        bytes[start..start + 2].copy_from_slice(&bad.to_le_bytes());
+                        let actual = if mask == 0x7c00 {
+                            finite_float16_payload::<0x7c00>(&bytes[offset..])
+                        } else {
+                            finite_float16_payload::<0x7f80>(&bytes[offset..])
+                        };
+                        assert!(!actual);
+                        bytes[start..start + 2].fill(0);
+                    }
+                }
+            }
+        }
+        for bits in 0..=u16::MAX {
+            let bytes = bits.to_le_bytes().repeat(32);
+            assert_eq!(
+                finite_float16_payload::<0x7c00>(&bytes),
+                finite_float16_scalar::<0x7c00>(&bytes)
+            );
+            assert_eq!(
+                finite_float16_payload::<0x7f80>(&bytes),
+                finite_float16_scalar::<0x7f80>(&bytes)
+            );
+        }
+    }
 
     #[test]
     fn validate_internal_accepts_finite_rejects_non_finite() {

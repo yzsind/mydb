@@ -174,6 +174,8 @@ pub struct Catalog {
     pub sequences: BTreeMap<String, Arc<SequenceSchema>>,
     #[serde(default)]
     pub auth: Arc<AuthCatalog>,
+    #[serde(default)]
+    pub(crate) ai: Arc<crate::engine::ai::AiCatalog>,
 }
 
 /// Rebuild every table's foreign-key runtime caches from the persisted
@@ -4745,8 +4747,8 @@ impl TableSchema {
         // token -> its position list in this row (ascending, with inter-column gaps). doc_len is the total token count.
         let mut positions_by_token: std::collections::HashMap<String, Vec<u32>> =
             std::collections::HashMap::new();
-        let mut doc_len: u32 = 0;
-        let mut next_pos: u32 = 0;
+        let mut doc_len: u64 = 0;
+        let mut next_pos: u64 = 0;
         for (col_ord, col_name) in index.columns.iter().enumerate() {
             let idx = self.column_index(col_name)?;
             let text: std::borrow::Cow<'_, str> = match values.get(idx) {
@@ -4759,19 +4761,26 @@ impl TableSchema {
             };
             if col_ord > 0 {
                 // Leave a gap between columns: tokens in different columns are not adjacent, so phrases never match across columns.
-                next_pos = next_pos.saturating_add(cfg.position_gap);
+                next_pos = next_pos.saturating_add(u64::from(cfg.position_gap));
             }
-            for token in tokenizer.tokenize(&text) {
-                positions_by_token.entry(token).or_default().push(next_pos);
+            let tokens = tokenizer.tokenize(&text);
+            doc_len = doc_len.saturating_add(tokens.len() as u64);
+            let last_position = (cfg.positions && !tokens.is_empty())
+                .then(|| next_pos.saturating_add(tokens.len() as u64 - 1));
+            crate::storage::fulltext::payload::validate_document_extent(doc_len, last_position)?;
+            for token in tokens {
+                positions_by_token
+                    .entry(token)
+                    .or_default()
+                    .push(next_pos as u32);
                 next_pos = next_pos.saturating_add(1);
-                doc_len = doc_len.saturating_add(1);
             }
         }
         Ok(positions_by_token
             .into_iter()
             .map(|(token, positions)| {
                 let payload = FtPayload {
-                    doc_len,
+                    doc_len: doc_len as u32,
                     tf: positions.len() as u32,
                     positions,
                 };

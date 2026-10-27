@@ -2,6 +2,37 @@
 use super::*;
 
 #[test]
+fn hybrid_rrf_compiled_projection_keeps_computed_aggregate_identities_and_order_values() {
+    let (_dir, engine) = table_engine();
+    engine
+        .execute("CREATE TABLE projection_groups(g INT,n INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO projection_groups VALUES(1,1),(1,2),(2,1),(2,2),(3,4),(4,7)")
+        .unwrap();
+    let result = query(&engine, "SELECT k,rrf_score,best_rank,match_count,rrf_details FROM ((SELECT CAST(SUM(n) AS DECIMAL(20,2)) AS k FROM projection_groups GROUP BY g ORDER BY g LIMIT 4) RRF (SELECT CAST(SUM(n) AS DECIMAL(20,2)) AS k FROM projection_groups GROUP BY g ORDER BY SUM(n) DESC,g DESC LIMIT 4) WITH(WEIGHTS=(1,2),SCORE_DETAILS=TRUE)) h ORDER BY k");
+    assert_eq!(result.rows.len(), 3);
+    for (row, (key, ranks, groups)) in result.rows.iter().zip([
+        (3.0, [1u64, 3], [1, 2]),
+        (4.0, [3, 2], [3, 3]),
+        (7.0, [4, 1], [4, 4]),
+    ]) {
+        assert_eq!(row[0].to_display_string().parse::<f64>().unwrap(), key);
+        assert_eq!(
+            row[1],
+            Value::Double(1.0 / (60.0 + ranks[0] as f64) + 2.0 / (60.0 + ranks[1] as f64))
+        );
+        assert_eq!(row[2], Value::UInt(*ranks.iter().min().unwrap()));
+        assert_eq!(row[3], Value::UInt(2));
+        let details: serde_json::Value = serde_json::from_str(&row[4].to_display_string()).unwrap();
+        assert_eq!(details[0]["rank"], ranks[0]);
+        assert_eq!(details[1]["rank"], ranks[1]);
+        assert_eq!(details[0]["ordered_values"][0]["value"], groups[0]);
+        assert_eq!(details[1]["ordered_values"][1]["value"], groups[1]);
+    }
+}
+
+#[test]
 fn hybrid_rrf_details_conserve_scores_and_keep_best_duplicate_rank() {
     let (_dir, engine) = table_engine();
     engine

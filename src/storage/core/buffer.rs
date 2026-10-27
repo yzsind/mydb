@@ -360,6 +360,15 @@ struct OrderedReadWork {
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
+struct RawProbeWork {
+    file: Arc<BufferPageFileKey>,
+    pages: Vec<(u64, usize, parking_lot::Mutex<Vec<u8>>)>,
+    next: AtomicUsize,
+    state: parking_lot::Mutex<(usize, Option<QueryError>)>,
+    done: parking_lot::Condvar,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
 impl BufferPool {
     const EVICTING_PIN: usize = usize::MAX;
 
@@ -2324,21 +2333,46 @@ impl BufferPool {
         key: &PageKey,
         f: impl FnOnce(&[u8]) -> Result<T, QueryError>,
     ) -> Result<Option<T>, QueryError> {
+        self.with_cached_bytes_with_intent(key, AccessIntent::Normal, f)
+    }
+
+    /// A speculative leaf-chain probe must not promote unconsumed pages or
+    /// charge a demand hit. Missing/loading pages remain asynchronous hints.
+    fn with_cached_prefetch_bytes<T>(
+        &self,
+        key: &PageKey,
+        f: impl FnOnce(&[u8]) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
+        self.with_cached_bytes_with_intent(key, AccessIntent::Prefetch, f)
+    }
+
+    fn with_cached_bytes_with_intent<T>(
+        &self,
+        key: &PageKey,
+        intent: AccessIntent,
+        f: impl FnOnce(&[u8]) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
         let Some(frame) = self.lookup_frame(key)? else {
             return Ok(None);
         };
-        if !self.try_pin_existing(&frame, AccessIntent::Normal) {
+        if !self.try_pin_existing(&frame, intent) {
             return Ok(None);
         }
+        struct UnpinOnDrop<'a>(&'a BufferPool, &'a Frame);
+        impl Drop for UnpinOnDrop<'_> {
+            fn drop(&mut self) {
+                self.1.unpin();
+                self.0.notify_frame_waiters();
+            }
+        }
+        let _pin = UnpinOnDrop(self, &frame);
         if !frame.is_ready() {
-            frame.unpin();
-            self.notify_frame_waiters();
             return Ok(None);
         }
-        self.note_normal_access(&frame);
+        if intent == AccessIntent::Normal {
+            self.note_normal_access(&frame);
+        }
         let result = self.with_finalized_frame_bytes(&frame, f);
-        frame.unpin();
-        self.notify_frame_waiters();
         result.map(Some)
     }
 
@@ -2395,14 +2429,143 @@ impl BufferPool {
         }
     }
 
-    /// Read a bounded sequential run without admitting cold pages. As in
-    /// direct heap scans, copy dirty residents before reading the clean gaps;
-    /// unflushed WAL-backed images must never be replaced by stale disk data.
+    /// Bounded sparse one-pass reads reuse the scan reader's dirty overlay.
+    /// They do not duplicate cold pages in both raw buffers and the OS cache.
+    fn with_raw_probe_pages(
+        self: &Arc<Self>,
+        file: &Arc<BufferPageFileKey>,
+        pages: &[u64],
+        mut visit: impl FnMut(u64, &[u8]) -> Result<(), QueryError>,
+    ) -> Result<bool, QueryError> {
+        if pages.len() < 8
+            || pages.len() > 64
+            || self.durability == DurabilityMode::Memory
+            || crate::engine::executor::mem_budget::critical_memory_reservations_active()
+        {
+            return Ok(false);
+        }
+        let Some(charge) =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                pages
+                    .len()
+                    .saturating_mul(PAGE_SIZE + 4095 + 64)
+                    .saturating_add(256),
+            )
+        else {
+            return Ok(false);
+        };
+        self.open_cached_file(file)?;
+        let work = Arc::new(RawProbeWork {
+            file: Arc::clone(file),
+            pages: pages
+                .iter()
+                .map(|&id| {
+                    let bytes = vec![0u8; PAGE_SIZE + 4095];
+                    let start = bytes.as_ptr().align_offset(4096);
+                    (id, start, parking_lot::Mutex::new(bytes))
+                })
+                .collect(),
+            next: AtomicUsize::new(0),
+            state: parking_lot::Mutex::new((pages.len(), None)),
+            done: parking_lot::Condvar::new(),
+            _charge: charge,
+        });
+        let mut active = self.ordered_read_helpers.load(Ordering::Acquire);
+        let helpers = loop {
+            let count = self
+                .io_threads
+                .saturating_sub(1)
+                .min(pages.len() - 1)
+                .min(self.io_threads.saturating_sub(active));
+            match self.ordered_read_helpers.compare_exchange_weak(
+                active,
+                active + count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break count,
+                Err(now) => active = now,
+            }
+        };
+        for _ in 0..helpers {
+            let pool = Arc::clone(self);
+            let work = Arc::clone(&work);
+            drop(crate::util::blocking_pool::spawn(move || {
+                struct Release<'a>(&'a AtomicUsize);
+                impl Drop for Release<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Release);
+                    }
+                }
+                let _slot = Release(&pool.ordered_read_helpers);
+                pool.run_raw_probe_work(&work);
+            }));
+        }
+        self.run_raw_probe_work(&work);
+        let mut state = work.state.lock();
+        while state.0 != 0 {
+            work.done.wait(&mut state);
+        }
+        if let Some(error) = state.1.take() {
+            return Err(error);
+        }
+        drop(state);
+        for (id, start, bytes) in &work.pages {
+            visit(*id, &bytes.lock()[*start..*start + PAGE_SIZE])?;
+        }
+        Ok(true)
+    }
+
+    fn run_raw_probe_work(&self, work: &RawProbeWork) {
+        loop {
+            let next = work.next.fetch_add(1, Ordering::Relaxed);
+            let Some((id, start, bytes)) = work.pages.get(next) else {
+                return;
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.read_raw_scan_batch_inner(
+                    &work.file,
+                    *id,
+                    &mut bytes.lock()[*start..*start + PAGE_SIZE],
+                    true,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "raw probe worker panicked",
+                ))
+            });
+            let mut state = work.state.lock();
+            if state.1.is_none() {
+                state.1 = result.err();
+            }
+            state.0 -= 1;
+            if state.0 == 0 {
+                work.done.notify_all();
+            }
+        }
+    }
+
+    /// Read a bounded sequential run without admitting cold pages. Copy dirty
+    /// residents before reading clean gaps so unflushed WAL-backed images are
+    /// never replaced by stale disk data.
     fn read_raw_scan_batch(
         &self,
         file_key: &Arc<BufferPageFileKey>,
         first: u64,
         bytes: &mut [u8],
+    ) -> Result<(), QueryError> {
+        self.read_raw_scan_batch_inner(file_key, first, bytes, false)
+    }
+
+    fn read_raw_scan_batch_inner(
+        &self,
+        file_key: &Arc<BufferPageFileKey>,
+        first: u64,
+        bytes: &mut [u8],
+        sparse: bool,
     ) -> Result<(), QueryError> {
         assert!(bytes.len().is_multiple_of(PAGE_SIZE));
         let count = bytes.len() / PAGE_SIZE;
@@ -2434,11 +2597,13 @@ impl BufferPool {
             while position < count && cached & (1u64 << position) == 0 {
                 position += 1;
             }
-            let calls = read_exact_at_counted(
-                &file.file,
-                &mut bytes[start * PAGE_SIZE..position * PAGE_SIZE],
-                (first + start as u64) * PAGE_SIZE as u64,
-            )
+            let target = &mut bytes[start * PAGE_SIZE..position * PAGE_SIZE];
+            let offset = (first + start as u64) * PAGE_SIZE as u64;
+            let calls = if sparse {
+                read_cached_page_at(&file, target, offset)
+            } else {
+                read_exact_at_counted(&file.file, target, offset)
+            }
             .map_err(io_err)?;
             let pages = (position - start) as u64;
             self.read_ios.fetch_add(pages, Ordering::Relaxed);
@@ -8423,6 +8588,68 @@ mod oldest_dirty_tests {
             }
             assert!(pool.ordered_read_helpers.load(Ordering::Acquire) <= pool.io_threads);
         }
+    }
+
+    #[test]
+    fn raw_sparse_probes_overlay_dirty_pages_and_propagate_io_errors() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("raw-sparse.heap");
+        let bytes: Vec<_> = (0..16u8)
+            .flat_map(|id| {
+                let mut page = Page::new();
+                page.data[128] = id;
+                page.encode()
+            })
+            .collect();
+        fs::write(&path, bytes).unwrap();
+        let pool = BufferPool::new_with_options(
+            32,
+            Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            )),
+            DurabilityMode::Strict,
+            Duration::from_secs(1),
+            4,
+            0,
+        );
+        pool.shutdown_flusher();
+        let file = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
+        let dirty = PageKey {
+            file: Arc::clone(&file),
+            page_id: 2,
+        };
+        pool.with_raw_page_mut(dirty.clone(), 0, |bytes| {
+            bytes[128] = 99;
+            Ok(())
+        })
+        .unwrap();
+        let mut visited = Vec::new();
+        assert!(pool
+            .with_raw_probe_pages(&file, &[0, 2, 4, 6, 8, 10, 12, 14], |id, bytes| {
+                assert_eq!(bytes[128], if id == 2 { 99 } else { id as u8 });
+                visited.push(id);
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(visited, [0, 2, 4, 6, 8, 10, 12, 14]);
+        assert!(pool
+            .lookup_frame(&PageKey {
+                file: Arc::clone(&file),
+                page_id: 14
+            })
+            .unwrap()
+            .is_none());
+        assert_eq!(pool.snapshot().pinned_pages, 0);
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(8 * PAGE_SIZE as u64)
+            .unwrap();
+        assert!(pool
+            .with_raw_probe_pages(&file, &[0, 2, 4, 6, 8, 10, 12, 14], |_, _| Ok(()))
+            .is_err());
+        assert_eq!(pool.snapshot().pinned_pages, 0);
     }
 
     #[test]

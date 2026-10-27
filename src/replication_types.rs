@@ -1,9 +1,8 @@
-//! Replication metadata shared by enabled and disabled receiver builds.
+//! MySQL replication channel configuration and status metadata.
 
 use crate::types::{Column, ColumnType};
 use serde::{Deserialize, Serialize};
 
-#[cfg_attr(not(feature = "mysql-replica"), derive(Default))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationChannelConfig {
     pub channel: String,
@@ -151,7 +150,6 @@ pub struct ReplThreadError {
 }
 
 impl ReplicationSslMode {
-    #[cfg(feature = "mysql-replica")]
     pub(crate) fn from_label(s: &str) -> Option<Self> {
         match s.trim().to_ascii_uppercase().as_str() {
             "DISABLED" => Some(Self::Disabled),

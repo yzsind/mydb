@@ -45,12 +45,13 @@ pub(crate) use core::quantize_time_text_micros;
 pub(crate) use core::set_update_delta_enabled_for_test;
 #[cfg(test)]
 pub(crate) use core::source_audit_vector_file;
-#[cfg(feature = "mysql-replica")]
 pub(crate) use core::DeferredCommit;
 pub(crate) use core::DmlIgnoreCoercionGuard;
 pub(crate) use core::ExactIndexVisibility;
 #[cfg(test)]
 pub(crate) use core::VECTOR_BUILD_BEFORE_PUBLISH_HOOK;
+#[cfg(test)]
+pub(crate) use core::VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK;
 pub(crate) use core::{
     canonicalize_loaded_timestamp_value, coerce_routine_typed_value, ignorable_update_error,
     with_enum_field_copy_coercion, LoadDataIndexBuilders, LoadDataIndexKeyBatch,

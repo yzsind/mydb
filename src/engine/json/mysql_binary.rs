@@ -476,7 +476,7 @@ fn write_offset(value: usize, large: bool, out: &mut Vec<u8>) -> Option<()> {
     Some(())
 }
 
-#[cfg(all(test, feature = "mysql-client"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use mysql_common::io::ParseBuf;

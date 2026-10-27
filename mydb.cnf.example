@@ -2,3 +2,12 @@
 port = 8738
 data_dir = ./data
 memory_target = 1G
+
+# External AI calls are enabled by default; local policy is optional. See docs/ai.md.
+# Configured HTTP/HTTPS services have no network restrictions unless egress is set.
+# ai_enabled = OFF
+# ai_local_config = /etc/mydb/ai-local.json
+# ai_max_inflight = 32
+# ai_max_queue = 128
+# ai_memory_limit_mb = 128
+# MYDB_AI_ENCRYPT_KEY is environment-only; never put it in this file.

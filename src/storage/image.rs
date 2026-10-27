@@ -74,6 +74,8 @@ pub struct BackupManifest {
     pub final_barrier_ms: u64,
     #[serde(default)]
     pub capture_stats: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ai_key_ids: Vec<String>,
     pub start_lsn: u64,
     pub end_lsn: u64,
     pub end_commit_unix_us: u64,
@@ -339,6 +341,17 @@ pub(crate) fn validate_files(files: &[BackupFile]) -> Result<(), QueryError> {
 }
 
 pub(crate) fn validate_manifest(manifest: &BackupManifest) -> Result<(), QueryError> {
+    if manifest.ai_key_ids.len() > 16384
+        || manifest
+            .ai_key_ids
+            .iter()
+            .any(|id| id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(crate::engine::ai::error(
+            "ER_AI_ENCRYPTION_KEY_INVALID",
+            "invalid master-key identifiers in backup manifest",
+        ));
+    }
     validate_id(&manifest.backup_id)?;
     validate_id(&manifest.source_id)?;
     if manifest.backup_format_version != BACKUP_FORMAT_VERSION

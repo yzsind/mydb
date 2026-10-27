@@ -1,6 +1,294 @@
 //! Regression coverage for HNSW semantics, snapshots and lifecycle boundaries.
 use super::*;
 
+#[test]
+fn vector_audit_duplicate_cluster_preserves_distinct_directions() {
+    for (metric, distance) in [
+        ("l2", "L2_DISTANCE"),
+        ("cosine", "COSINE_DISTANCE"),
+        ("dot", "MAX_INNER_PRODUCT_DISTANCE"),
+    ] {
+        for (backend, mode, incremental) in [
+            ("memory", "auto", false),
+            ("memory", "auto", true),
+            ("paged", "auto", false),
+            ("paged", "chunked", false),
+            ("paged", "auto", true),
+        ] {
+            let _env = HnswEnv::set(&[
+                ("MYDB_VECTOR_STORAGE", backend),
+                ("MYDB_HNSW_BULK_MODE", mode),
+                ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+            ]);
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let engine = open_strict_test_engine(dir.path());
+            engine
+                .execute("CREATE TABLE audit_dup(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+                .unwrap();
+            let create =
+                format!("CREATE INDEX vi ON audit_dup(v) USING HNSW WITH(metric={metric})");
+            if incremental {
+                engine.execute(&create).unwrap();
+            }
+            for start in (0..2400).step_by(200) {
+                let values = (start..start + 200)
+                    .map(|id| {
+                        let vector = if id < 2280 {
+                            "1,0,0,0".into()
+                        } else {
+                            format!("0,{},{},{}", 50 + id % 40, 51 + id % 30, 52 + id % 20)
+                        };
+                        format!("({id},'[{vector}]')")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute(&format!("INSERT INTO audit_dup VALUES{values}"))
+                    .unwrap();
+            }
+            if !incremental {
+                engine.execute(&create).unwrap();
+            }
+            let mut session = SessionContext::default();
+            engine
+                .execute_with_session(&mut session, "SET mydb_hnsw_ef_search=256")
+                .unwrap();
+            engine
+                .execute_with_session(&mut session, "SET mydb_hnsw_ef_dynamic_factor=0")
+                .unwrap();
+            let query =
+                format!("SELECT id FROM audit_dup ORDER BY {distance}(v,'[0,60,60,60]') LIMIT 100");
+            for rebuilt in [false, true] {
+                if rebuilt {
+                    engine.execute("OPTIMIZE TABLE audit_dup").unwrap();
+                }
+                let found = id_list_session(&engine, &mut session, &query);
+                assert_eq!(found.len(), 100);
+                assert!(
+                    found.iter().all(|&id| id >= 2280),
+                    "{backend}/{mode}/{incremental}/{rebuilt}: {found:?}"
+                );
+            }
+            engine.checkpoint().unwrap();
+            drop(engine);
+            let engine = open_strict_test_engine(dir.path());
+            assert!(id_list_session(&engine, &mut session, &query)
+                .iter()
+                .all(|&id| id >= 2280));
+        }
+    }
+}
+
+#[test]
+fn vector_audit_query_text_and_null_order_follow_scalar_semantics() {
+    for backend in ["memory", "paged"] {
+        let _env = environment(backend, false);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE audit_query(id INT PRIMARY KEY,v VECTOR(4))")
+            .unwrap();
+        engine.execute("INSERT INTO audit_query VALUES(1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,NULL),(4,'[0,0,0,0]')").unwrap();
+        for indexed in [false, true] {
+            if indexed {
+                engine
+                    .execute("DELETE FROM audit_query WHERE v IS NULL")
+                    .unwrap();
+                engine
+                    .execute("ALTER TABLE audit_query MODIFY v VECTOR(4) NOT NULL")
+                    .unwrap();
+                engine
+                    .execute("CREATE INDEX vi ON audit_query(v) USING HNSW")
+                    .unwrap();
+            }
+            for hint in ["", "/*+ NO_VECTOR_INDEX() */"] {
+                assert!(engine.execute(&format!("SELECT {hint} id FROM audit_query ORDER BY L2_DISTANCE(v,'abcdefghijklmnop') LIMIT 2")).is_err(), "{backend}/{indexed}/{hint}: invalid text accepted");
+                for distance in ["L2_DISTANCE", "COSINE_DISTANCE"] {
+                    for nulls in ["FIRST", "LAST"] {
+                        let order = format!("{distance}(v,'[1,0,0,0]') NULLS {nulls}");
+                        let actual = id_list(
+                            &engine,
+                            &format!("SELECT {hint} id FROM audit_query ORDER BY {order} LIMIT 2"),
+                        );
+                        let expected = id_list(
+                            &engine,
+                            &format!(
+                                "SELECT id FROM audit_query WHERE id>0 ORDER BY {order} LIMIT 2"
+                            ),
+                        );
+                        assert_eq!(actual, expected, "{backend}/{indexed}/{hint}/{order}");
+                    }
+                }
+            }
+        }
+        for sql in [
+            "DROP INDEX vi ON audit_query",
+            "DELETE FROM audit_query WHERE id=4",
+            "CREATE INDEX vi ON audit_query(v) USING HNSW WITH(metric=cosine)",
+        ] {
+            engine.execute(sql).unwrap();
+        }
+        let cosine =
+            "SELECT id FROM audit_query ORDER BY COSINE_DISTANCE(v,'[1,0,0,0]') NULLS LAST LIMIT 2";
+        assert!(explain_mentions_vector_index(&engine, cosine));
+        assert_eq!(id_list(&engine, cosine), [1, 2]);
+    }
+}
+
+#[test]
+fn vector_audit_rebuild_keeps_existing_reader_handle_valid() {
+    for backend in ["memory", "paged"] {
+        let _env = environment(backend, false);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE audit_rebuild(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO audit_rebuild VALUES(1,'[1,0]'),(2,'[2,0]')")
+            .unwrap();
+        engine
+            .execute("CREATE INDEX vi ON audit_rebuild(v) USING HNSW")
+            .unwrap();
+        let table = engine.database().table("audit_rebuild").unwrap();
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_vector())
+            .unwrap();
+        let old = engine
+            .database()
+            .vector_graph_get_or_build(&table, index)
+            .unwrap();
+        engine
+            .database()
+            .rebuild_vector_for_test(&table, index, table.id)
+            .unwrap();
+        old.ensure_valid().unwrap();
+        engine.checkpoint().unwrap();
+        let found = old
+            .search(
+                &crate::engine::vector::codec::from_f32(&[1.0, 0.0]),
+                crate::engine::vector::VectorSearchRequest {
+                    candidate_limit: 1,
+                    rerank_limit: 1,
+                    effort: crate::engine::vector::VectorSearchEffort::Hnsw { ef: 64 },
+                },
+            )
+            .unwrap();
+        assert_eq!(found.candidates.len(), 1);
+        assert_eq!(found.candidates[0].1, 0.0);
+    }
+}
+
+#[test]
+fn vector_audit_cancelled_cold_load_preserves_finalized_file() {
+    let _env = environment("paged", false);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = std::sync::Arc::new(open_strict_test_engine(dir.path()));
+    engine
+        .execute("CREATE TABLE audit_cold(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO audit_cold VALUES(1,'[1,0]'),(2,'[2,0]')")
+        .unwrap();
+    engine
+        .execute("CREATE INDEX vi ON audit_cold(v) USING HNSW")
+        .unwrap();
+    let table = engine.database().table("audit_cold").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    engine.database().evict_table_vector_graphs(table.id);
+    let db = engine.database().clone();
+    let table_id = table.id;
+    *crate::storage::VECTOR_BUILD_BEFORE_PUBLISH_HOOK.lock() = Some(Box::new(move || {
+        db.evict_table_vector_graphs(table_id);
+    }));
+    assert!(engine
+        .database()
+        .vector_graph_get_or_build(&table, index)
+        .is_err());
+    engine.checkpoint().unwrap();
+    engine
+        .database()
+        .vector_graph_get_or_build(&table, index)
+        .unwrap();
+    drop(engine);
+    let engine = open_strict_test_engine(dir.path());
+    assert_eq!(
+        id_list(
+            &engine,
+            "SELECT id FROM audit_cold ORDER BY L2_DISTANCE(v,'[1,0]') LIMIT 1"
+        ),
+        [1]
+    );
+}
+
+#[test]
+fn vector_audit_replica_replaces_retirement_snapshots() {
+    let _env = environment("paged", false);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine.database().vector_reader_timeout_for_test();
+    engine
+        .execute("CREATE TABLE audit_retire(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+        .unwrap();
+    engine
+        .execute("CREATE INDEX vi ON audit_retire(v) USING HNSW")
+        .unwrap();
+    let table = engine.database().table("audit_retire").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    engine.database().set_physical_replica_mode(true).unwrap();
+    for scn in 1..=64 {
+        engine
+            .database()
+            .install_vector_retirement_snapshot_for_test(&table, index, scn / 8 + 1, Some(scn))
+            .unwrap();
+        assert_eq!(engine.database().pending_vector_retirements_for_test(), 1);
+    }
+    engine
+        .database()
+        .install_vector_retirement_snapshot_for_test(&table, index, 1, None)
+        .unwrap();
+    assert_eq!(engine.database().pending_vector_retirements_for_test(), 0);
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let engine = open_strict_test_engine(dir.path());
+    assert_eq!(engine.database().pending_vector_retirements_for_test(), 0);
+}
+
+#[test]
+fn vector_audit_checkpoint_skips_index_dropped_after_capture() {
+    for backend in ["memory", "paged"] {
+        let _env = environment(backend, false);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = std::sync::Arc::new(open_strict_test_engine(dir.path()));
+        engine
+            .execute("CREATE TABLE audit_checkpoint(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO audit_checkpoint VALUES(1,'[1,0]')")
+            .unwrap();
+        engine
+            .execute("CREATE INDEX vi ON audit_checkpoint(v) USING HNSW")
+            .unwrap();
+        let ddl = engine.clone();
+        *crate::storage::VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK.lock() = Some(Box::new(move || {
+            ddl.execute("DROP INDEX vi ON audit_checkpoint").unwrap();
+        }));
+        engine.database().vector_graph_persist_all_dirty(0).unwrap();
+        engine.checkpoint().unwrap();
+    }
+}
+
 fn environment(backend: &str, cold: bool) -> HnswEnv {
     HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", backend),

@@ -562,3 +562,278 @@ fn vector_quantization_copy_validates_type_and_dimension_before_publication() {
         }
     }
 }
+
+#[test]
+fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_BUILD_THREADS", "4"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
+        for metric in ["L2", "COSINE", "DOT"] {
+            for quant in ["none", "sq8", "sq4", "pq", "bq"] {
+                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let sql = format!("SELECT /*+ HNSW_EF(4096) */ id FROM items ORDER BY DISTANCE(v,'[1,2,3,4,5,6,7,8,9]','{metric}'),id LIMIT 11");
+                let expected;
+                {
+                    let engine = open_strict_test_engine(dir.path());
+                    engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(9,{datatype}) NOT NULL)")).unwrap();
+                    for start in (0..2048).step_by(128) {
+                        let rows = (start..start + 128)
+                            .map(|id| {
+                                let values = (0..9)
+                                    .map(|j| {
+                                        (((id * (j * 2 + 3) + id / (j + 1)) % 113) - 56).to_string()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("({id},'[{values}]')")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        engine
+                            .execute(&format!("INSERT INTO items VALUES{rows}"))
+                            .unwrap();
+                    }
+                    let pq_options = if quant == "pq" {
+                        engine
+                            .execute("INSERT INTO items VALUES (3000,'[1,2,3,4,5,6,7,8,9]')")
+                            .unwrap();
+                        ",pq_bits=4,pq_train_samples=32,pq_iterations=3,rerank_mult=256"
+                    } else if quant == "bq" {
+                        // Enumerate every compressed candidate before comparing
+                        // with the exact oracle; BQ alone is deliberately lossy.
+                        ",rerank_mult=256"
+                    } else {
+                        ""
+                    };
+                    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+                    engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric={metric},m=4,ef_construction=32,quantization={quant}{pq_options})")).unwrap();
+                    if quant == "bq" && metric != "DOT" {
+                        // Training, eligibility, construction codes and payload
+                        // publication each stream the heap once. A row-at-a-time
+                        // fallback skips the bounded topology's two extra scans.
+                        assert_eq!(
+                            crate::storage::Database::vector_build_heap_scans_for_test() - scans,
+                            4,
+                            "BQ must use bounded construction: {datatype} {metric}"
+                        );
+                    }
+                    expected =
+                        query_rows(&engine, &sql.replace("HNSW_EF(4096)", "NO_VECTOR_INDEX"));
+                    assert_eq!(
+                        query_rows(&engine, &sql),
+                        expected,
+                        "{datatype} {metric} {quant}"
+                    );
+                }
+                let engine = open_strict_test_engine(dir.path());
+                assert_eq!(
+                    query_rows(&engine, &sql),
+                    expected,
+                    "reopen {datatype} {metric} {quant}"
+                );
+                engine
+                    .execute("UPDATE items SET v='[1,2,3,4,5,6,7,8,9]' WHERE id=2047")
+                    .unwrap();
+                engine.execute("DELETE FROM items WHERE id<10").unwrap();
+                assert_eq!(
+                    query_rows(&engine, &sql),
+                    query_rows(&engine, &sql.replace("HNSW_EF(4096)", "NO_VECTOR_INDEX")),
+                    "DML {datatype} {metric} {quant}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quantized_rerank_batch_transfers_wide_values_and_handles_empty_filters() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE wide(id INT PRIMARY KEY,v VECTOR(3) NOT NULL,s TEXT,b BLOB)")
+        .unwrap();
+    engine.execute("INSERT INTO wide SELECT i,CONCAT('[',i,',1,2]'),REPEAT('宽',2048),REPEAT('x',8192) FROM (SELECT 1 i UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) t").unwrap();
+    engine
+        .execute(
+            "CREATE INDEX vx ON wide(v) USING HNSW WITH(quantization=sq8,m=4,ef_construction=64)",
+        )
+        .unwrap();
+    for filter in ["", " WHERE id>1", " WHERE id<0"] {
+        let sql = format!("SELECT /*+ HNSW_EF(64) */ id,s,b FROM wide{filter} ORDER BY L2_DISTANCE(v,'[2.1,1,2]') LIMIT 2");
+        assert_eq!(
+            query_rows(&engine, &sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(64)", "NO_VECTOR_INDEX")),
+            "{filter}"
+        );
+    }
+}
+
+#[test]
+fn quantized_late_materialization_matches_oracle_across_native_types_and_layouts() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut engine = open_strict_test_engine(dir.path());
+        engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(9,{datatype}) NOT NULL,pad VARCHAR(20) DEFAULT 'x')")).unwrap();
+        let rows = (0..64)
+            .map(|id| {
+                let values = (0..9)
+                    .map(|j| ((id * (2 * j + 3) + j * j * j) % 97 - 48).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("({id},'[{values}]')")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO items(id,v) VALUES{rows}"))
+            .unwrap();
+        for (i, metric) in ["L2", "COSINE", "DOT"].into_iter().enumerate() {
+            if i > 0 {
+                engine.execute("DROP INDEX vx ON items").unwrap();
+            }
+            engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric={metric},quantization=sq8,m=4,ef_construction=64)")).unwrap();
+            let sql = format!("SELECT /*+ HNSW_EF(128) */ id FROM items ORDER BY DISTANCE(v,'[0.123,1.937,-2.781,3.619,-4.483,5.271,-6.157,7.149,-8.047]','{metric}') LIMIT 7");
+            let expected = query_rows(&engine, &sql.replace("HNSW_EF(128)", "NO_VECTOR_INDEX"));
+            assert_eq!(
+                query_rows(&engine, &sql),
+                expected,
+                "hot {datatype} {metric}"
+            );
+            drop(engine);
+            engine = open_strict_test_engine(dir.path());
+            assert_eq!(
+                query_rows(&engine, &sql),
+                expected,
+                "cold {datatype} {metric}"
+            );
+            assert_eq!(
+                query_rows(&engine, &sql),
+                expected,
+                "warm {datatype} {metric}"
+            );
+        }
+        engine
+            .execute("ALTER TABLE items ADD COLUMN extra INT NOT NULL DEFAULT 21")
+            .unwrap();
+        let sql = "SELECT /*+ HNSW_EF(128) */ id,extra FROM items ORDER BY DISTANCE(v,'[0.123,1.937,-2.781,3.619,-4.483,5.271,-6.157,7.149,-8.047]','DOT') LIMIT 7";
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(128)", "NO_VECTOR_INDEX")),
+            "old layout {datatype}"
+        );
+    }
+}
+
+#[test]
+fn narrow_rerank_projection_preserves_scalars_nulls_and_transaction_values() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_MAPPED_NAVIGATION", "0"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for quantization in ["none", "sq4"] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine.execute("CREATE TABLE projected(id INT PRIMARY KEY,v VECTOR(3) NOT NULL,n DECIMAL(18,6),flag BOOLEAN,d DATE,ts DATETIME,pad TEXT)").unwrap();
+        let rows = (0..128)
+            .map(|id| {
+                format!(
+                    "({id},'[{id},1,2]',{},1,'2026-10-26','2026-10-26 12:34:56','wide')",
+                    if id % 7 == 0 { "NULL" } else { "12.345678" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO projected VALUES{rows}"))
+            .unwrap();
+        engine.execute(&format!("CREATE INDEX vx ON projected(v) USING HNSW WITH(metric=L2,quantization={quantization},m=4,ef_construction=64)")).unwrap();
+        for projection in ["id,n,flag,d,ts", "id,id,n", "id,v", "id,v,pad"] {
+            let sql = format!("SELECT /*+ HNSW_EF(32) */ {projection} FROM projected ORDER BY L2_DISTANCE(v,'[17.123,1,2]') LIMIT 7");
+            assert_eq!(
+                query_rows(&engine, &sql),
+                query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX")),
+                "{quantization} {projection}"
+            );
+        }
+        engine
+            .execute("ALTER TABLE projected ADD COLUMN extra BIGINT NOT NULL DEFAULT 123456789")
+            .unwrap();
+        let sql = "SELECT /*+ HNSW_EF(32) */ id,n,flag,d,ts,extra FROM projected ORDER BY L2_DISTANCE(v,'[17.123,1,2]') LIMIT 7";
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX"))
+        );
+        engine.execute("BEGIN").unwrap();
+        engine
+            .execute("UPDATE projected SET n=NULL,flag=0,extra=9 WHERE id=17")
+            .unwrap();
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX"))
+        );
+        engine.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            query_rows(&engine, sql),
+            query_rows(&engine, &sql.replace("HNSW_EF(32)", "NO_VECTOR_INDEX"))
+        );
+    }
+}
+
+#[test]
+fn vector_internal_order_does_not_escape_into_output_projection() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(3) NOT NULL)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO items VALUES(1,'[1,2,3]'),(2,'[2,3,4]'),(3,'[3,4,5]'),(4,'[4,5,6]')")
+        .unwrap();
+    engine
+        .execute(
+            "CREATE INDEX vx ON items(v) USING HNSW WITH(quantization=sq8,m=4,ef_construction=32)",
+        )
+        .unwrap();
+    for (projection, order, expected) in [
+        ("id", "L2_DISTANCE(v,'[2,3,4]')", vec![0usize]),
+        ("id,L2_DISTANCE(v,'[2,3,4]') AS d", "d", vec![0, 1]),
+        ("id", "L2_DISTANCE(v,'[2,3,4]'),id", vec![0, 1]),
+    ] {
+        let sql =
+            format!("SELECT /*+ HNSW_EF(64) */ {projection} FROM items ORDER BY {order} LIMIT 2");
+        let crate::parser::Statement::Select(select) =
+            crate::parser::parse_statement(&sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let plan = crate::planner::plan_select(engine.db_for_tests(), &select).unwrap();
+        assert!(plan.physical.any(|node| matches!(node, crate::planner::PhysicalPlan::VectorIndexScan { projected_columns: columns, table, .. } if columns.as_ref().map_or_else(|| expected == (0..table.schema.columns.len()).collect::<Vec<_>>(), |columns| columns.as_slice() == expected.as_slice()))), "{sql}: {:?}", plan.physical);
+        assert_eq!(
+            query_rows(&engine, &sql),
+            query_rows(
+                &engine,
+                &sql.replacen("SELECT", "SELECT /*+ NO_VECTOR_INDEX */", 1)
+            )
+        );
+    }
+}

@@ -209,7 +209,7 @@ MyDB minimizes DDL locking and query waiting by coordinating schema versions, in
 - **Explicit quantization**: `WITH (quantization=sq8|sq4|pq|bq)` compresses numeric index payloads, with final re-ranking against visible heap values. The default is `none`; search breadth and re-ranking budgets determine the recall, memory, and latency tradeoff.
 - **Unified SQL**: the optimizer recognizes `ORDER BY distance LIMIT k` and supports parameterized queries; vector writes participate in transaction commit and rollback.
 
-Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. See [vector datatypes and indexes](docs/vector-indexes.md) for options, training, limits, and recovery, and the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
+Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. Start with the [vector data and similarity search guide](docs/vector-search.md), then see [vector datatypes and indexes](docs/vector-indexes.md) for options, training, limits, and recovery, and the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
 
 ### Try vector retrieval and RETURNING
 
@@ -289,7 +289,7 @@ See [sequences](docs/statements/ddl/create-sequence.md), [series generation](doc
 
 - **MySQL compatibility has explicit scope**: the classic protocol is supported, X Protocol is not; the native storage engine is not file- or plugin-ABI-compatible with InnoDB.
 - **Transaction semantics differ**: the default isolation level is `READ COMMITTED`; `REPEATABLE READ` is snapshot isolation without InnoDB gap/next-key locks; `SERIALIZABLE` range-insert prevention uses table-level shared locks.
-- **Replication has prerequisites**: MySQL → MyDB replication (the `mysql-replica` feature, enabled by default) requires ROW/FULL binlog on the source; native physical replication uses controlled, manual role switching with no automatic leader election.
+- **Replication has prerequisites**: MySQL → MyDB replication is built into every server build and requires ROW/FULL binlog on the source; native physical replication uses controlled, manual role switching with no automatic leader election.
 - **Time travel has a window**: table-level `FOR SYSTEM_TIME AS OF` depends on undo retention settings, and the default retention window is `0`; queries across schema DDL boundaries are explicitly rejected.
 
 Unimplemented SQL or protocol capabilities return clear errors rather than failing silently. The detailed scope is defined by the [compatibility matrix](docs/mysql80-compatibility.md), the source, and the tests.

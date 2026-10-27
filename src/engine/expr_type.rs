@@ -151,6 +151,9 @@ pub(crate) struct BuiltinSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BuiltinId {
+    AiGenerate,
+    AiDetail,
+    AiEmbed,
     ConnectionId,
     UuidShort,
     Crc32,
@@ -233,6 +236,24 @@ pub(crate) fn fixed_string_result(max_octets: Option<u32>, nullable: bool) -> Ex
     );
     result.max_octets = max_octets;
     result
+}
+
+fn fixed_ai_text_result() -> ExprType {
+    let mut result = fixed_string_result(Some(8 * 1024 * 1024), true);
+    result.kind = ExprTypeKind::String {
+        kind: StringKind::Text,
+    };
+    result.collation_id = Some(46);
+    result
+}
+fn fixed_ai_vector_result() -> ExprType {
+    ExprType::new(
+        ExprTypeKind::Vector {
+            dim: None,
+            datatype: crate::vector::VectorDataType::Float32,
+        },
+        true,
+    )
 }
 
 // Fixed bind-time contracts are emitted from the shared declarations;

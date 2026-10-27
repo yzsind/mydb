@@ -14,7 +14,7 @@ mydb is a single-node general-purpose relational database serving clients over t
 | Query execution | CBO, statistics/histograms, join order selection, Hash Join/INLJ/Adaptive Join, parallel execution, row-wise and vectorized execution, spill |
 | Transactions and storage | MVCC, WAL/redo, undo, checkpoint, buffer pool, row locks/deadlock detection, SAVEPOINT, XA 2PC, crash recovery, table-level time travel |
 | Security and administration | Accounts, roles, static/dynamic privileges, column-level privileges, password policies, system variable persistence, system schemas, logging, diagnostics, and graceful restart |
-| Replication | mydb as a MySQL ROW/FULL binlog source; MySQL→mydb replica receiver enabled by default (feature-gated); a separate mydb→mydb physical replication path |
+| Replication | mydb as a MySQL ROW/FULL binlog source; MySQL→mydb replica receiver included in every build; a separate mydb→mydb physical replication path |
 
 ## 2. SQL and Database Objects
 
@@ -133,7 +133,7 @@ The default build can emit MySQL row-based binlog, supporting GTID, checksums, r
 
 ### 7.2 MySQL as source, mydb as replica
 
-The default build enables `mysql-replica`. The IO thread pulls binlog into the relay log and the SQL thread applies it in order; they can be started and stopped independently and support file/position and GTID sources, filtering, `SOURCE_DELAY`, UNTIL, TLS, and status queries. The source must use ROW/FULL with `binlog_row_value_options=''`. There is currently a single SQL applier; MySQL MTS parallel apply is not implemented.
+Every build includes the MySQL replica receiver. The IO thread pulls binlog into the relay log and the SQL thread applies it in order; they can be started and stopped independently and support file/position and GTID sources, filtering, `SOURCE_DELAY`, UNTIL, TLS, and status queries. The source must use ROW/FULL with `binlog_row_value_options=''`. There is currently a single SQL applier; MySQL MTS parallel apply is not implemented.
 
 ### 7.3 Native mydb physical replication
 
@@ -145,8 +145,7 @@ mydb provides online physical backup independent of the replication topology: fu
 
 ## 8. Build, Runtime, and Maturity
 
-The default features are `tls`, `fast-alloc`, and `mysql-replica`: `fast-alloc` uses the mimalloc global memory allocator, while `mysql-replica` provides the MySQL replica receiver and enables `mysql-client` and `zstd-compression`; `tools` adds tool binaries and must be enabled explicitly. To disable `fast-alloc` while keeping TLS and the MySQL replication receiver, use `--no-default-features --features tls,mysql-replica`.
-To disable the MySQL replication receiver while keeping TLS and mimalloc, use `--no-default-features --features tls,fast-alloc`.
+The default features are `tls`, `fast-alloc`, and `zstd-compression`: `fast-alloc` uses the mimalloc global memory allocator, and `zstd-compression` enables zstd protocol compression. The MySQL replica receiver and its client dependencies are included in every build; `tools` adds tool binaries and must be enabled explicitly. To disable `fast-alloc` while keeping TLS and zstd protocol compression, use `--no-default-features --features tls,zstd-compression`.
 
 ```bash
 cargo build

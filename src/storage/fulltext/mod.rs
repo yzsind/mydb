@@ -42,9 +42,9 @@ use crate::storage::RowId;
 /// `range` is a slice `arena[range]`. Scan APIs that build a batch of
 /// postings for one query share a single arena across all postings, so
 /// `df ≈ 22k` postings cost one `Vec<u32>` growth instead of `df` heap
-/// allocations. When positions were not stored (payload built with
-/// `MYDB_FT_POSITIONS=0`, or the entry is corrupt/truncated), `range` is
-/// empty; callers that need positions fall back to re-tokenising the row.
+/// allocations. When positions were not stored (`MYDB_FT_POSITIONS=0`),
+/// the range is empty and phrases fall back to re-tokenising the visible
+/// row. Malformed or truncated payloads return an index corruption error.
 #[derive(Debug, Clone, Copy)]
 pub struct FtPosting {
     pub row_id: RowId,

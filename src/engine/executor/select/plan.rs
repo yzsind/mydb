@@ -20,9 +20,13 @@ mod window;
 pub(in crate::engine::executor) use window::WINDOW_RANK_PREFILTER_REJECTED;
 pub(super) use window::*;
 mod fulltext_source;
+mod fulltext_stream;
+pub(super) use fulltext_stream::FULLTEXT_BATCH_ROWS;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;
+#[cfg(test)]
+mod vector_scan_tests;
 pub(crate) use scan::*;
 mod nested_loop;
 pub(super) use nested_loop::*;
@@ -2123,42 +2127,13 @@ pub(super) fn execute_plan_rows_inner(
                 })
             }
         }
-        PhysicalPlan::FulltextScan {
-            table,
-            index,
-            mode,
-            query,
-            query_param,
-            columns,
-            match_fingerprint,
-            filter,
-            projected_columns,
-            needs_score,
-            restrict_to_matches,
-            additional_matches,
-            like_prefilter,
-            base_access,
-            ..
-        } => {
-            let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
-            execute_fulltext_scan(
-                db,
-                txn,
-                table,
-                index,
-                *mode,
-                query,
-                *query_param,
-                columns,
-                *match_fingerprint,
-                filter,
-                projected_columns.as_ref(),
-                *needs_score,
-                *restrict_to_matches,
-                additional_matches,
-                like_prefilter.as_ref(),
-                base_access.as_ref(),
-            )
+        PhysicalPlan::FulltextScan { .. } => {
+            let mut stream = fulltext_stream::open(db, txn, plan)?;
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next()? {
+                rows.push(row);
+            }
+            Ok(rows)
         }
         PhysicalPlan::SpatialScan {
             table,
@@ -2183,6 +2158,7 @@ pub(super) fn execute_plan_rows_inner(
             ef_hint,
             filter,
             order_by,
+            projected_columns,
             ..
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
@@ -2233,7 +2209,19 @@ pub(super) fn execute_plan_rows_inner(
                 ef,
                 filter,
                 order_by,
+                projected_columns
+                    .as_deref()
+                    .map(|columns| columns.as_slice()),
             )
+            .and_then(|rows| {
+                project_vector_scan_output(
+                    table,
+                    projected_columns
+                        .as_deref()
+                        .map(|columns| columns.as_slice()),
+                    rows,
+                )
+            })
         }
         PhysicalPlan::VectorBruteScan {
             table,
@@ -3848,6 +3836,7 @@ fn execute_plan_stream_inner(
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
     match plan {
+        PhysicalPlan::FulltextScan { .. } => fulltext_stream::open(db, txn, plan),
         PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),
         PhysicalPlan::CteScan { .. } => open_cte_scan_stream(plan),
         PhysicalPlan::ParallelSeqScan {
@@ -4592,19 +4581,21 @@ fn try_execute_index_ordered_limit_window(
             if table.schema.is_partitioned() {
                 return Ok(None);
             }
-            read_plan_table_entries_windowed(
-                db,
-                txn,
-                table,
-                index,
-                low.clone(),
-                high.clone(),
-                *reverse,
-                filter,
-                projected_columns.as_deref().map(|v| v.as_slice()),
-                offset,
-                limit,
-            )
+            super::analyze_stats::with_range_scan_plan(input, || {
+                read_plan_table_entries_windowed(
+                    db,
+                    txn,
+                    table,
+                    index,
+                    low.clone(),
+                    high.clone(),
+                    *reverse,
+                    filter,
+                    projected_columns.as_deref().map(|v| v.as_slice()),
+                    offset,
+                    limit,
+                )
+            })
             .map(Some)
         }
         PhysicalPlan::IndexRangeScan {
@@ -4626,19 +4617,21 @@ fn try_execute_index_ordered_limit_window(
             }
             let projection = projected_columns.as_deref().map(|v| v.as_slice());
             if *covering {
-                return read_plan_table_entries_windowed(
-                    db,
-                    txn,
-                    table,
-                    index,
-                    low.clone(),
-                    high.clone(),
-                    *reverse,
-                    filter,
-                    projection,
-                    offset,
-                    limit,
-                )
+                return super::analyze_stats::with_range_scan_plan(input, || {
+                    read_plan_table_entries_windowed(
+                        db,
+                        txn,
+                        table,
+                        index,
+                        low.clone(),
+                        high.clone(),
+                        *reverse,
+                        filter,
+                        projection,
+                        offset,
+                        limit,
+                    )
+                })
                 .map(Some);
             }
             if index_window_filter_blocks_fast_path(table, filter) {

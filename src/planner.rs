@@ -535,7 +535,7 @@ pub enum PhysicalPlan {
         table: PlanTable,
         index: IndexSchema,
         /// Search mode (natural language vs boolean). Both modes are fully
-        /// executed by `execute_fulltext_scan`; `WITH QUERY EXPANSION` is
+        /// executed by `open_fulltext_scan`; `WITH QUERY EXPANSION` is
         /// rejected at parse time.
         mode: crate::parser::FtMode,
         /// Raw AGAINST query text, tokenised at execution time.
@@ -1834,7 +1834,7 @@ pub(crate) fn plan_prepared_physical_select(
 /// upstream of a `FulltextScan` (i.e. in any expression that could ever
 /// read back the `__ft_score_<fingerprint>` pseudo-column), then flip the
 /// scan's `needs_score` off when its fingerprint isn't in that set. Lets
-/// `execute_fulltext_scan` skip the per-term `by_row` hashmaps, the
+/// `open_fulltext_scan` skip the per-term `by_row` hashmaps, the
 /// `doc_len_of` map, and BM25 arithmetic for the common
 /// `WHERE MATCH() … ORDER BY <non-score>` shape.
 ///
@@ -9662,23 +9662,19 @@ fn match_dot_similarity_call(expr: &Expr) -> Option<(&str, &Expr, crate::engine:
 }
 
 /// Coerce a folded constant `Value` into internal vector bytes (little-endian
-/// `f32`). Accepts an existing `Value::Vector` or a `[a,b,c]` text / raw-byte
-/// form; returns `None` for anything else (the KNN path then falls back).
+/// `f32`). Text and byte strings use the same strict conversion as scalar
+/// expressions; raw payloads require an explicit VECTOR_FROM_BINARY call.
+/// Returns `None` for anything else (the KNN path then falls back).
 pub(crate) fn value_to_vector_bytes(value: &Value) -> Option<crate::vector::VectorValue> {
     match value {
         Value::Vector(b) => crate::engine::vector::normalize_internal(b).ok(),
-        Value::String(s) | Value::Decimal(s) => {
-            crate::engine::vector::coerce_bytes_to_internal(s.as_bytes()).ok()
-        }
-        Value::Bytes(b) => crate::engine::vector::codec::coerce_value(
-            Value::Bytes(b.clone()),
-            crate::vector::VectorDataType::Float32,
-            None,
-        )
-        .ok(),
-        Value::SmallString(_) => {
-            crate::engine::vector::coerce_bytes_to_internal(value.to_display_string().as_bytes())
-                .ok()
+        Value::String(_) | Value::SmallString(_) | Value::Decimal(_) | Value::Bytes(_) => {
+            crate::engine::vector::codec::coerce_value(
+                value.clone(),
+                crate::vector::VectorDataType::Float32,
+                None,
+            )
+            .ok()
         }
         _ => None,
     }
@@ -9784,6 +9780,24 @@ fn try_knn_vector_scan(
         None
     };
     let (col, query_const, metric) = matched?;
+    // A truncated NULLs-first pool cannot provide NULLs-last semantics.
+    // Preserve the fast path when the column and metric cannot produce NULL,
+    // including descending DOT similarity on NOT NULL vector columns.
+    let column = &table.schema.columns[table.schema.column_index(col).ok()?];
+    let cosine_nonzero = metric == crate::engine::vector::Metric::Cosine
+        && table.schema.iter_queryable_indexes().any(|index| {
+            index.is_vector()
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+                && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
+        });
+    if !select.order_by[0].nulls_first_effective()
+        && (column.nullable || (metric == crate::engine::vector::Metric::Cosine && !cosine_nonzero))
+    {
+        return None;
+    }
     // Fold the constant operand to internal bytes. `&[]` is safe — the matcher
     // confirmed it carries no column reference. If it contains a placeholder,
     // keep the expression for execution-time resolution so prepared KNN plans
@@ -19971,6 +19985,9 @@ pub(crate) fn expr_is_deterministic(expr: &Expr) -> bool {
     crate::parser::visit::try_inspect_value_expr(expr, |node| {
         match node {
             Expr::Function { name, .. } => {
+                if crate::engine::ai::is_function(name) {
+                    return Err(());
+                }
                 let upper = name.to_ascii_uppercase();
                 if matches!(
                     upper.as_str(),
@@ -24433,6 +24450,7 @@ fn collect_scan_targets(
         | PhysicalPlan::IndexLookup { table, .. }
         | PhysicalPlan::IndexMultiLookup { table, .. }
         | PhysicalPlan::IndexInLookup { table, .. }
+        | PhysicalPlan::VectorIndexScan { table, .. }
         | PhysicalPlan::FulltextScan { table, .. } => push_if_new(out, table),
         PhysicalPlan::IndexNestedLoopJoin {
             left, right_table, ..

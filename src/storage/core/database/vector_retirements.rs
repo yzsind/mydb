@@ -293,7 +293,7 @@ impl Database {
                 return Err(vector::persistence::corrupt());
             }
             maximum_scn = maximum_scn.max(commit_scn);
-            let mut estimate = 512 + index.name.len() + rows_count.saturating_mul(192);
+            let mut estimate = 512 + rows_count.saturating_mul(192);
             charge.try_grow_recoverable(estimate)?;
             let mut rows = Vec::new();
             rows.try_reserve_exact(rows_count).map_err(|_| {
@@ -337,6 +337,20 @@ impl Database {
         }
         reader.finish()?;
         let mut queue = self.vector_purge_queue.lock();
+        // A replica's source image is authoritative for this lineage. Keeping
+        // obligations absent from its replacement snapshot leaks every past
+        // retirement, since replicas must never purge source-owned pages.
+        let removed = if self.physical_replica_mode() || self.is_snapshot_read_only() {
+            queue.remove_index_snapshot((
+                table.id,
+                storage_id,
+                table.active_generation.max(1),
+                index.index_id,
+                lineage,
+            ))
+        } else {
+            0
+        };
         let mut accepted = 0usize;
         for (purge, estimate) in decoded {
             if queue.insert_if_absent(purge) {
@@ -346,6 +360,7 @@ impl Database {
         let mut retained = charge.split(accepted);
         let mut holder = self.vector_purge_recovery_charge.lock();
         if let Some(holder) = holder.as_mut() {
+            holder.shrink(removed);
             holder.absorb(&mut retained);
         } else {
             *holder = Some(retained);
@@ -376,5 +391,35 @@ impl Database {
             paged.file().flush()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Database {
+    pub(crate) fn install_vector_retirement_snapshot_for_test(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        lineage: u64,
+        scn: Option<u64>,
+    ) -> Result<(), QueryError> {
+        let mut bytes = Vec::new();
+        let mut writer = vector::persistence::Writer::new(&mut bytes, 10).map_err(io_err)?;
+        writer.u64(lineage).map_err(io_err)?;
+        writer.count(usize::from(scn.is_some())).map_err(io_err)?;
+        if let Some(scn) = scn {
+            writer.u64(scn).map_err(io_err)?;
+            writer.count(1).map_err(io_err)?;
+            writer
+                .row(RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                })
+                .map_err(io_err)?;
+            writer.count(1).map_err(io_err)?;
+            writer.u64(scn).map_err(io_err)?;
+        }
+        writer.finish().map_err(io_err)?;
+        self.merge_index_retirement_snapshot(table, index, table.id, lineage, &bytes)
     }
 }

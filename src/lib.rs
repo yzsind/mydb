@@ -36,10 +36,6 @@ pub mod planner;
 pub mod planner_decorrelate;
 pub(crate) mod platform;
 pub mod repl;
-#[cfg(feature = "mysql-replica")]
-pub mod replication;
-#[cfg(not(feature = "mysql-replica"))]
-#[path = "replication_stub.rs"]
 pub mod replication;
 pub mod replication_columns;
 mod replication_sql;
