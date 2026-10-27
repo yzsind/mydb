@@ -626,6 +626,8 @@ struct CatalogTxn<'a> {
     delta_invalidate_all: bool,
     #[cfg(test)]
     auth_mutation: bool,
+    #[cfg(test)]
+    ai_mutation: bool,
 }
 
 fn auth_json_value<T: serde::Serialize>(value: &T) -> Result<Value, QueryError> {
@@ -650,9 +652,18 @@ impl<'a> CatalogTxn<'a> {
             delta_invalidate_all: false,
             #[cfg(test)]
             auth_mutation: false,
+            #[cfg(test)]
+            ai_mutation: false,
         }
     }
 
+    #[inline(always)]
+    fn mark_ai_catalog(&mut self) {
+        #[cfg(test)]
+        {
+            self.ai_mutation = true;
+        }
+    }
     fn set_delta(&mut self, mut object_ids: Vec<u64>, invalidate_all: bool) {
         object_ids.sort_unstable();
         object_ids.dedup();
@@ -747,6 +758,10 @@ impl<'a> CatalogTxn<'a> {
             #[cfg(test)]
             if self.auth_mutation {
                 crate::engine::auth::test_faults::hit("after_dd_rows")?;
+            }
+            #[cfg(test)]
+            if self.ai_mutation {
+                crate::engine::ai::catalog_faults::hit("after_dd_rows")?;
             }
             self.db.append_wal(
                 txn.txn_id,

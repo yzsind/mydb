@@ -503,6 +503,9 @@ scalar_catalog! {
             [("RAND", "rand")] => (Volatile, Double, None, false);
             [("UUID", "uuid")] => (Volatile, VarString, ( Uuid, 0, 0, Volatile, fixed_string_result(Some(36 * 3), false)), false);
             [("UUID_SHORT", "uuid_short")] => (Volatile, VarString, ( UuidShort, 0, 0, Volatile, fixed_integer_result(Big, true, false)), false);
+            [("AI_GENERATE", "ai_generate")] => (Volatile, VarString, ( AiGenerate, 2, 3, Volatile, fixed_ai_text_result()), false);
+            [("AI_GENERATE_DETAIL", "ai_generate_detail"), ("AI_EMBED_DETAIL", "ai_embed_detail")] => (Volatile, Json, ( AiDetail, 2, 3, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
+            [("AI_EMBED", "ai_embed")] => (Volatile, Vector, ( AiEmbed, 2, 3, Volatile, fixed_ai_vector_result()), false);
             [("SLEEP", "sleep"), ("BENCHMARK", "benchmark")] => (Volatile, LongLong, None, false);
             [("GET_LOCK", "get_lock"), ("RELEASE_LOCK", "release_lock"), ("IS_FREE_LOCK", "is_free_lock"), ("IS_USED_LOCK", "is_used_lock"), ("RELEASE_ALL_LOCKS", "release_all_locks")] => (Volatile, VarString, None, false);
             [("LOAD_FILE", "load_file")] => (Volatile, Blob, None, false);

@@ -195,7 +195,13 @@ pub fn record_statement(
         sql: truncated,
         status: if err.is_some() { "error" } else { "ok" },
         error_code: err.map(|e| e.code()),
-        error_message: err.map(QueryError::message),
+        error_message: err.map(|e| {
+            if crate::engine::ai::sql::sql_may_have_ai(sql) {
+                "[redacted AI statement error]"
+            } else {
+                e.message()
+            }
+        }),
         elapsed_ms,
     });
 }
@@ -241,5 +247,14 @@ mod tests {
         assert!(body.contains("\"event\":\"disconnect\""));
         assert!(body.contains("\"user\":\"alice\""));
         assert!(body.contains("\"connection_id\":42"));
+    }
+}
+
+/// Only bounded metadata is accepted here; request/response bodies stay out of audit logs.
+pub(crate) fn record_ai_call(metadata: &serde_json::Value) {
+    if let Some(service) = active() {
+        let mut record = metadata.clone();
+        record["event_time"] = serde_json::Value::String(now_iso());
+        service.append_line(&record);
     }
 }

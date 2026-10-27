@@ -5638,7 +5638,7 @@ where
         first_sequence_id: u8,
         encoding: StreamRowEncoding,
     ) -> io::Result<u8> {
-        if stream_blocking_offload_enabled() {
+        if result.cursor.external_io() || stream_blocking_offload_enabled() {
             return self
                 .write_streaming_result_set_offloaded(
                     result,
@@ -5769,13 +5769,32 @@ where
         ));
         let found_rows = result.found_rows;
         let mut cursor = result.cursor;
-        let batch_rows = stream_offload_batch_rows();
+        let external = cursor.external_io();
+        let batch_rows = if external {
+            cursor
+                .external_batch_rows()
+                .max(1)
+                .min(stream_offload_batch_rows())
+        } else {
+            stream_offload_batch_rows()
+        };
         let batch_bytes = stream_offload_batch_bytes();
 
         loop {
             let cols = Arc::clone(&columns);
             let zf = Arc::clone(&zerofill);
-            let pulled = crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), move || {
+            let _admission = if external {
+                match crate::engine::ai::runtime::admit_coordinator() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        return finish_failed_stream(batch, sequence_id, &e, &mut self.text_batch)
+                            .await
+                    }
+                }
+            } else {
+                None
+            };
+            let work = move || {
                 let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(batch_rows);
                 let mut encoded_bytes = 0usize;
                 let mut memory_charge =
@@ -5811,7 +5830,9 @@ where
                                 &mut scratch,
                             );
                             if scratch.capacity() > estimate {
-                                if let Err(e) = memory_charge.try_grow(scratch.capacity() - estimate) {
+                                if let Err(e) =
+                                    memory_charge.try_grow(scratch.capacity() - estimate)
+                                {
                                     err = Some(e);
                                     break;
                                 }
@@ -5833,7 +5854,12 @@ where
                     }
                 }
                 (cursor, encoded, err, exhausted, memory_charge)
-            })
+            };
+            let pulled = if external {
+                crate::engine::ai::runtime::spawn_coordinator(work)
+            } else {
+                crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
+            }
             .await;
             let (ret_cursor, encoded, pull_err, exhausted, _encoded_charge) = match pulled {
                 Ok(tuple) => tuple,
@@ -6161,12 +6187,29 @@ where
             .current_cancel_token()
             .cloned()
             .unwrap_or_else(crate::engine::cancel::QueryCancelToken::noop);
-        let peek =
-            crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), move || {
-                let first = cancel.check().and_then(|()| cursor.next_row());
-                (cursor, first)
-            })
-            .await;
+        let external = cursor.external_io();
+        let _admission = if external {
+            match crate::engine::ai::runtime::admit_coordinator() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.write_error_packet(self.command_response_sequence, &e)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        let work = move || {
+            let first = cancel.check().and_then(|()| cursor.next_row());
+            (cursor, first)
+        };
+        let peek = if external {
+            crate::engine::ai::runtime::spawn_coordinator(work)
+        } else {
+            crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
+        }
+        .await;
         let first = match peek {
             Ok((returned_cursor, first)) => {
                 cursor = returned_cursor;
@@ -6381,9 +6424,25 @@ where
         let mut exhausted = false;
         while remaining != 0 && !exhausted {
             let cols = columns.clone();
-            let chunk_rows = remaining.min(stream_offload_batch_rows());
+            let external = prepared_cursor.inner.external_io();
+            let _admission = if external {
+                match crate::engine::ai::runtime::admit_coordinator() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        fetch_err = Some(e);
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let chunk_rows = remaining.min(stream_offload_batch_rows()).min(if external {
+                prepared_cursor.inner.external_batch_rows().max(1)
+            } else {
+                usize::MAX
+            });
             let chunk_bytes = stream_offload_batch_bytes();
-            let join_result = crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), move || {
+            let work = move || {
                 let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(chunk_rows);
                 let mut encoded_bytes = 0usize;
                 let mut memory_charge =
@@ -6418,7 +6477,8 @@ where
                                 result_charset,
                             );
                             if packet.capacity() > estimate {
-                                if let Err(e) = memory_charge.try_grow(packet.capacity() - estimate) {
+                                if let Err(e) = memory_charge.try_grow(packet.capacity() - estimate)
+                                {
                                     err = Some(e);
                                     break;
                                 }
@@ -6440,7 +6500,12 @@ where
                     prepared_cursor.record_fetch(encoded.len() as u64);
                 }
                 (prepared_cursor, encoded, err, memory_charge)
-            })
+            };
+            let join_result = if external {
+                crate::engine::ai::runtime::spawn_coordinator(work)
+            } else {
+                crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
+            }
             .await;
             let (returned_cursor, encoded, err, _encoded_charge) = match join_result {
                 Ok(tuple) => tuple,
@@ -6799,15 +6864,24 @@ where
         // synchronous dispatch + scan setup; the rows themselves are
         // pulled lazily during socket writeback, so server memory stays
         // bounded even on a `SELECT * FROM huge_table`.
+        let ai = crate::engine::ai::sql::sql_may_have_ai(&sql);
+        let _admission = if ai {
+            Some(crate::engine::ai::runtime::admit_coordinator()?)
+        } else {
+            None
+        };
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
-        let (context, result) =
-            crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), move || {
-                let result = engine.execute(&mut context, &sql);
-                (context, result)
-            })
-            .await
-            .map_err(|err| self.recover_join_error(err))?;
+        let work = move || {
+            let result = engine.execute(&mut context, &sql);
+            (context, result)
+        };
+        let job = if ai {
+            crate::engine::ai::runtime::spawn_coordinator(work)
+        } else {
+            crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
+        };
+        let (context, result) = job.await.map_err(|err| self.recover_join_error(err))?;
         self.restore_context(context);
 
         result
@@ -6823,6 +6897,12 @@ where
         // run inline. Locking reads still belong on the blocking pool, but
         // there is no reason to throw away that authoritative AST and parse
         // the identical COM_QUERY a second time on the worker.
+        let ai = crate::engine::ai::sql::statement_has_ai(&statement);
+        let _admission = if ai {
+            Some(crate::engine::ai::runtime::admit_coordinator()?)
+        } else {
+            None
+        };
         let engine = Arc::clone(&self.engine);
         // Fusion and blocking functions need independent transport progress.
         // Retain ordinary request-worker scheduling for other SELECTs.
@@ -6842,7 +6922,9 @@ where
             };
             (context, result)
         };
-        let job = if needs_async_progress {
+        let job = if ai {
+            crate::engine::ai::runtime::spawn_coordinator(work)
+        } else if needs_async_progress {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
         } else {
             crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -7214,9 +7296,18 @@ where
         {
             self.acquire_txn_admission().await;
         }
+        let ai = crate::engine::ai::sql::statement_has_ai(&statement);
+        let _admission = if ai {
+            match crate::engine::ai::runtime::admit_coordinator() {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            None
+        };
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
-        match crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), move || {
+        let work = move || {
             let result =
                 crate::engine::perf_events::with_prepared_statement_texts(&perf_texts, || {
                     crate::engine::params::with_params(params, || {
@@ -7237,9 +7328,13 @@ where
                     })
                 });
             (context, result)
-        })
-        .await
-        {
+        };
+        let job = if ai {
+            crate::engine::ai::runtime::spawn_coordinator(work)
+        } else {
+            crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
+        };
+        match job.await {
             Ok((context, result)) => {
                 self.restore_context(context);
 
@@ -9556,7 +9651,8 @@ fn expr_contains_blocking_function(expr: &Expr) -> bool {
     crate::parser::visit::any_expr(expr, |expr| match expr {
         Expr::WindowFunction { .. } => true,
         Expr::Function { name, .. } => {
-            name.eq_ignore_ascii_case("SLEEP")
+            crate::engine::ai::is_function(name)
+                || name.eq_ignore_ascii_case("SLEEP")
                 || name.eq_ignore_ascii_case("GET_LOCK")
                 || name.eq_ignore_ascii_case("NEXTVAL")
                 || name.eq_ignore_ascii_case("SETVAL")

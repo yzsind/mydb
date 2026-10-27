@@ -465,6 +465,12 @@ fn capture_database(
         completed_unix_ms: now,
         final_barrier_ms,
         capture_stats,
+        ai_key_ids: db
+            .ai_catalog()?
+            .encryption_key_ids
+            .iter()
+            .cloned()
+            .collect(),
         start_lsn,
         end_lsn,
         end_commit_unix_us,

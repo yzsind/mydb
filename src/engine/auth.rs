@@ -2026,6 +2026,17 @@ impl AuthCatalog {
         required: &RequiredPrivilege,
         need_grant_option: bool,
     ) -> bool {
+        if let Privilege::Dynamic(name) = &required.privilege {
+            if name.starts_with("AI_MODEL_") && name.ends_with("_USE") {
+                let global_ai = RequiredPrivilege {
+                    privilege: Privilege::Dynamic("AI_USE".into()),
+                    scope: PrivilegeScope::Global,
+                };
+                if self.account_has_privilege(ctx, &global_ai, need_grant_option) {
+                    return true;
+                }
+            }
+        }
         if need_grant_option
             && !matches!(
                 required.privilege,
@@ -2543,6 +2554,22 @@ pub(crate) fn require_database_access(
         || db
             .auth_catalog()
             .account_can_use_database(&session.authorization_context(), database)
+    {
+        return Ok(());
+    }
+    let context = session.authorization_context();
+    if crate::engine::ai::runtime::authorize(db, &context, "AI_USE").is_ok()
+        || crate::engine::ai::runtime::authorize(db, &context, "AI_ADMIN").is_ok()
+        || db.ai_catalog()?.models.iter().any(|(name, model)| {
+            name.rsplit_once('.')
+                .is_some_and(|(schema, _)| schema.eq_ignore_ascii_case(database))
+                && crate::engine::ai::runtime::authorize(
+                    db,
+                    &context,
+                    &format!("AI_MODEL_{}_USE", model.id),
+                )
+                .is_ok()
+        })
     {
         return Ok(());
     }
@@ -3318,6 +3345,8 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
     static SET: std::sync::OnceLock<Vec<Privilege>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         [
+            "AI_ADMIN",
+            "AI_USE",
             "APPLICATION_PASSWORD_ADMIN",
             "AUDIT_ABORT_EXEMPT",
             "AUDIT_ADMIN",
@@ -3365,7 +3394,21 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
 /// server/component set. GRANT/REVOKE must reject arbitrary identifiers;
 /// accepting every unknown name as a dynamic privilege makes typos look like
 /// successful security configuration.
+pub(crate) fn ai_model_privilege_id(name: &str) -> Option<u64> {
+    name.strip_prefix("AI_MODEL_")?
+        .strip_suffix("_USE")?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+pub(crate) fn catalog_mutation_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
 pub fn is_registered_dynamic_privilege(name: &str) -> bool {
+    if ai_model_privilege_id(name).is_some() {
+        return true;
+    }
     default_dynamic_privileges().iter().any(|privilege| {
         matches!(privilege, Privilege::Dynamic(registered) if registered.eq_ignore_ascii_case(name))
     })

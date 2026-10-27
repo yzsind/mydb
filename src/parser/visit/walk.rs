@@ -10,6 +10,7 @@ macro_rules! define_walk {
         ) {
             visitor.enter_statement(statement);
             match statement {
+                Statement::Ai(command) => { if let Some(value) = & $($mutable)* command.value { walk_expr(visitor, value); } },
                 Statement::CreateView { query, .. } | Statement::AlterView { query, .. } => {
                     walk_query(visitor, query)
                 }

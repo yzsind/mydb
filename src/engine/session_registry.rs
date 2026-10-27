@@ -1233,7 +1233,13 @@ impl SessionHandle {
     pub fn mark_busy(&self, command: &'static str, info: Option<String>, database: &str) {
         let mut entry = self.entry.lock();
         entry.command = command;
-        entry.info = info.map(ProcessSqlText::Owned);
+        entry.info = info.map(|sql| {
+            ProcessSqlText::Owned(if crate::engine::ai::sql::sql_may_have_ai(&sql) {
+                "[redacted AI statement]".to_owned()
+            } else {
+                sql
+            })
+        });
         entry.killed = false;
         entry.active_stages.fill(0);
         entry.active_stage_total = 0;
@@ -1277,13 +1283,25 @@ impl SessionHandle {
 
     #[cfg(feature = "mysql-replica")]
     pub(crate) fn set_process_info(&self, info: Option<String>) {
-        self.entry.lock().info = info.map(ProcessSqlText::Owned);
+        self.entry.lock().info = info.map(|sql| {
+            ProcessSqlText::Owned(if crate::engine::ai::sql::sql_may_have_ai(&sql) {
+                "[redacted AI statement]".to_owned()
+            } else {
+                sql
+            })
+        });
     }
 
     /// The prepared handle owns and charges the immutable SQL text. This
     /// short-lived process-list reference disappears at the idle transition.
     pub(crate) fn set_process_info_shared(&self, info: Arc<str>) {
-        self.entry.lock().info = Some(ProcessSqlText::Shared(info));
+        self.entry.lock().info = Some(ProcessSqlText::Shared(
+            if crate::engine::ai::sql::sql_may_have_ai(&info) {
+                Arc::from("[redacted AI statement]")
+            } else {
+                info
+            },
+        ));
     }
 
     #[cfg(feature = "mysql-replica")]
@@ -1419,7 +1437,10 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn publish_pfs_prepared(&self, prepared: Vec<PreparedStatementSnapshot>) {
+    pub(crate) fn publish_pfs_prepared(&self, mut prepared: Vec<PreparedStatementSnapshot>) {
+        for row in &mut prepared {
+            redact_ai_prepared(row);
+        }
         let mut entry = self.entry.lock();
         entry
             .prepared_statements
@@ -1427,7 +1448,8 @@ impl SessionHandle {
         entry.prepared_statements.extend(prepared);
     }
 
-    pub(crate) fn publish_pfs_prepared_statement(&self, prepared: PreparedStatementSnapshot) {
+    pub(crate) fn publish_pfs_prepared_statement(&self, mut prepared: PreparedStatementSnapshot) {
+        redact_ai_prepared(&mut prepared);
         let mut entry = self.entry.lock();
         if let Some(current) = entry.prepared_statements.iter_mut().find(|current| {
             current.statement_id == prepared.statement_id
@@ -1439,7 +1461,10 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn publish_pfs_sql_prepared(&self, prepared: Vec<PreparedStatementSnapshot>) {
+    pub(crate) fn publish_pfs_sql_prepared(&self, mut prepared: Vec<PreparedStatementSnapshot>) {
+        for row in &mut prepared {
+            redact_ai_prepared(row);
+        }
         let mut entry = self.entry.lock();
         entry
             .prepared_statements
@@ -1892,3 +1917,9 @@ mod tests {
 #[cfg(test)]
 #[path = "session_registry/status_tests.rs"]
 mod status_tests;
+
+fn redact_ai_prepared(row: &mut PreparedStatementSnapshot) {
+    if crate::engine::ai::sql::sql_may_have_ai(&row.sql_text) {
+        row.sql_text = Arc::from("[redacted AI statement]");
+    }
+}

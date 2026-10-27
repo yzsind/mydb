@@ -1099,7 +1099,11 @@ pub(crate) fn record_statement(
             Err(err) => (
                 Some(err.code()),
                 Some(err.sql_state().to_string()),
-                Some(char_prefix(&err.message(), 128).to_owned()),
+                Some(if texts.sql_text.contains("[redacted AI statement]") {
+                    "[redacted AI statement error]".into()
+                } else {
+                    char_prefix(&err.message(), 128).to_owned()
+                }),
             ),
             Ok(_) => (None, None, None),
         };

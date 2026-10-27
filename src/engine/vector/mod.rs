@@ -26,8 +26,8 @@ mod hnsw_nav_recall_tests;
 use crate::types::QueryError;
 
 pub(crate) use codec::{
-    coerce_bytes_to_internal, compare, normalize_internal, to_f32, to_text, to_text_into,
-    validate_internal, vector_err,
+    coerce_bytes_to_internal, compare, normalize_internal, to_f32, to_text, validate_internal,
+    vector_err,
 };
 pub(crate) use distance::Metric;
 pub(crate) use graph::{

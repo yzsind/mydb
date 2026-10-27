@@ -1488,3 +1488,18 @@ process-local counters and bandwidth limiters; their copy concurrency is jointly
 reserved. Synchronous filesystem operations cannot always be interrupted at the
 freeze deadline; an over-budget operation fails and reports the measured phases.
 See [backup procedures](backup-and-recovery.md) for diagnostics and recovery.
+
+## External AI calls
+
+`ai_enabled` / `MYDB_AI_ENABLED` defaults to OFF. Configure `ai_local_config`
+(`MYDB_AI_LOCAL_CONFIG`) for explicit outbound origins and node-local quotas.
+The startup capacity controls are `ai_max_inflight` (32), `ai_max_queue` (128),
+and `ai_memory_limit_mb` (128), with corresponding `MYDB_AI_*` environment names.
+`mydb_ai_enabled` is the privileged GLOBAL node switch.
+
+API keys are encrypted database metadata. The master key comes from the
+**environment-only** `MYDB_AI_ENCRYPT_KEY`, or a randomly initialized
+`<data_dir>/apikey.mydb` keyring. The filename is not a default password.
+Keep master keys separate from database backups and deploy matching keys to
+replicas independently. See [LLM and Embedding Calls](ai.md) for the exact key
+format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.

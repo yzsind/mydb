@@ -4388,6 +4388,7 @@ include!("core/database/guards.rs");
 include!("core/database/facade.rs");
 include!("core/database/catalog_store.rs");
 include!("core/database/catalog_ops.rs");
+include!("core/database/ai.rs");
 include!("core/database/txn_ops.rs");
 include!("core/database/vector_index_paths.rs");
 include!("core/database/ddl.rs");

@@ -353,3 +353,12 @@ unquantized index do not mean it has served no queries. `HEAP_RERANKS` counts
 heap scoring work and `EXACT_FALLBACKS` counts recorded exact fallback events;
 neither is a recall measurement. Compare results with `NO_VECTOR_INDEX` to
 measure recall on the application's actual data and queries.
+
+## Result protocol
+
+Direct VECTOR results use MySQL's native VECTOR wire type and little-endian
+FLOAT32 coordinates in both text and binary result protocols. FLOAT16,
+BFLOAT16, INT8, and BINARY storage values are exported as their exactly
+representable FLOAT32 coordinates; this does not change stored payloads.
+Use `VECTOR_TO_STRING(value)` for readable SQL-client output, or
+`VECTOR_TO_BINARY(value)` when the native storage payload is required.

@@ -1048,6 +1048,14 @@ impl std::fmt::Debug for ResultBatch {
 }
 
 pub trait ResultCursor: Send + std::fmt::Debug {
+    /// External streams own their relational input and need a dedicated worker.
+    fn external_io(&self) -> bool {
+        false
+    }
+    fn external_batch_rows(&self) -> usize {
+        1
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError>;
 
     fn next_chunk(&mut self) -> Result<Option<ResultChunk>, QueryError> {
@@ -1089,6 +1097,13 @@ struct TimestampLocalizingCursor {
 }
 
 impl ResultCursor for TimestampLocalizingCursor {
+    fn external_io(&self) -> bool {
+        self.inner.external_io()
+    }
+    fn external_batch_rows(&self) -> usize {
+        self.inner.external_batch_rows()
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let Some(mut row) = self.inner.next_row()? else {
             return Ok(None);
@@ -3624,4 +3639,15 @@ impl SessionContext {
 
 pub(crate) fn normalize_user_variable_name(name: &str) -> String {
     name.trim_start_matches('@').to_ascii_lowercase()
+}
+
+pub(crate) fn with_frozen_statement_time<R>(micros: i64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STMT_NOW_MICROS.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(STMT_NOW_MICROS.with(|c| c.replace(Some(micros))));
+    f()
 }

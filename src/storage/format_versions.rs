@@ -25,7 +25,8 @@
 /// v62 removes the retired quantized IVF algorithm and its page format.
 /// v63 persists vector WITH configuration independently from index comments.
 /// v64: persistent vector manifests, snapshot identities and retirement ledger.
-pub const CATALOG_VERSION: u32 = 64;
+/// v65: encrypted AI Secret, Connection and Model catalog metadata.
+pub const CATALOG_VERSION: u32 = 65;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.

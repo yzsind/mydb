@@ -39,6 +39,7 @@ pub(super) use setop::{
     execute_subquery_response, response_into_cursor,
 };
 use setop::{inline_single_use_with_in_select, synthetic_set_op_schema};
+pub(super) mod ai;
 mod session;
 use session::{
     apply_autocommit, apply_transaction_characteristics, apply_transaction_isolation_scope,
@@ -618,6 +619,7 @@ fn execute_statement_inner(
                 .map_err(crate::engine::executor::mem_budget::terminal_oom)
         });
     }
+    ai::validate(session, &statement)?;
     publish_optimizer_hint_diagnostics(&statement);
     let _backup_ddl_admission = crate::backup::ddl_admission(db, &statement)?;
     {
@@ -3460,6 +3462,7 @@ fn auth_required_privileges(
         }
     };
     match statement {
+        Statement::Ai(_) => Vec::new(),
         Statement::CreateDatabase { name, .. } => vec![database(Privilege::Create, name)],
         Statement::AlterDatabase { name, .. } => vec![database(
             Privilege::Alter,
@@ -7358,6 +7361,25 @@ pub(super) fn execute_qualified_statement(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     authorize_statement(db, session, &statement)?;
+    if crate::binlog::enabled() {
+        let kind = match &statement {
+            Statement::Grant(g) => Some(&g.kind),
+            Statement::Revoke(r) => Some(&r.kind),
+            _ => None,
+        };
+        if kind.is_some_and(|kind|matches!(kind,GrantKind::Privileges{privileges,..} if privileges.iter().any(|p|p.name.to_ascii_uppercase().starts_with("AI_")))) {return Err(crate::engine::ai::error("ER_AI_UNSUPPORTED_CONTEXT","AI privileges cannot be written to MySQL binlog"));}
+    }
+    if let Statement::DropDatabase { name, .. } = &statement {
+        if db.ai_catalog()?.models.keys().any(|m| {
+            m.rsplit_once('.')
+                .is_some_and(|(schema, _)| schema == name.to_ascii_lowercase())
+        }) {
+            return Err(crate::engine::ai::error(
+                "ER_AI_UNSUPPORTED_CONTEXT",
+                "drop schema AI models explicitly before DROP DATABASE",
+            ));
+        }
+    }
     crate::planner::rewrite_enum_set_dml(db, &mut statement);
     if matches!(
         &statement,
@@ -7382,6 +7404,7 @@ pub(super) fn execute_qualified_statement(
     let temporal_context = super::temporal::preflight_statement(db, &statement)?;
     let _temporal_scope = temporal_context.map(|context| super::temporal::enter(Some(context)));
     match statement {
+        Statement::Ai(command) => ai::admin(db, session, command, registry),
         Statement::Begin {
             read_only,
             consistent_snapshot,
@@ -7467,6 +7490,18 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::Set(assignments) => {
+            if assignments
+                .iter()
+                .any(|a| crate::engine::ai::sql::expr_has_ai(&a.value))
+            {
+                let value = crate::engine::ai::with_calls(db.clone(), session, || {
+                    crate::engine::expr::with_session_expr_info(session, || {
+                        crate::engine::expr::eval_const(&assignments[0].value)
+                    })
+                })?;
+                session.set_user_variable(assignments[0].name.trim_start_matches('@'), value);
+                return Ok(QueryResponse::Ok);
+            }
             if assignments
                 .iter()
                 .any(|a| super::prepared_dml::expr_contains_subquery(&a.value))
@@ -9210,6 +9245,7 @@ pub(super) fn execute_qualified_statement(
             let _deadline = crate::engine::cancel::install_query_deadline(
                 std::time::Duration::from_millis(deadline_ms),
             );
+            if stmt.projection.iter().any(|item| matches!(item, SelectItem::Expr { expr, .. } if crate::engine::ai::sql::expr_has_ai(expr))) { return ai::project(db, session, stmt, registry); }
             refresh_select_stats(db, &stmt)?;
             if let Some((user_limit, user_offset)) = calc_window {
                 execute_select_calc_found_rows(db, session, stmt, registry, user_limit, user_offset)
@@ -9240,6 +9276,9 @@ pub(super) fn execute_qualified_statement(
             // extension.
             let resolved_format =
                 super::select::resolve_explain_format(format, analyze, session.explain_format);
+            if crate::engine::ai::sql::statement_has_ai(&target) {
+                return ai::explain(db, session, *target, resolved_format, analyze, registry);
+            }
             if analyze {
                 execute_explain(db, session, *target, resolved_format, true, registry)
             } else {

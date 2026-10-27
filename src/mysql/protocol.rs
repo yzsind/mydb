@@ -1068,12 +1068,10 @@ fn estimate_text_value_bytes(value: &Value) -> usize {
         Value::Date(_) | Value::Year(_) => 12,
         Value::Time(_) => 18,
         Value::DateTime(_) | Value::Timestamp(_) => 28,
-        // JSON / Vector serialise to text; estimate generously to absorb
-        // expansion (`true`/`false`/quoting/etc. in JSON; `[a,b,c]` for
-        // VECTOR adds ~4× per f32 vs. the raw byte length).
+        // JSON uses canonical text; VECTOR exports FLOAT32 coordinates.
         Value::Json(b) => 9 + b.len(),
         Value::Geometry(b) => 9 + b.len(),
-        Value::Vector(b) => 9 + b.len() * 4,
+        Value::Vector(b) => 9 + b.dimension as usize * 4,
     }
 }
 
@@ -1108,7 +1106,7 @@ fn estimate_binary_value_bytes(value: &Value) -> usize {
         Value::DateTime(_) | Value::Timestamp(_) => 12,
         Value::Json(b) => 9 + b.len(),
         Value::Geometry(b) => 9 + b.len(),
-        Value::Vector(b) => 9 + b.len() * 4,
+        Value::Vector(b) => 9 + b.dimension as usize * 4,
     }
 }
 
@@ -1311,9 +1309,8 @@ pub fn binary_row_packet_into_with_charset(
             // GEOMETRY: length-encoded internal `SRID + WKB` bytes (clients
             // parse them or call ST_AsText), like a BLOB.
             Value::Geometry(b) => write_lenenc_string(payload, b),
-            // VECTOR: length-encoded canonical `[a,b,c]` text (friendly
-            // display, like JSON); VECTOR_TO_STRING gives the same form.
-            Value::Vector(b) => write_lenenc_vector_text(payload, b),
+            // Native VECTOR clients expect little-endian FLOAT32 coordinates.
+            Value::Vector(b) => write_lenenc_vector(payload, b),
         }
     }
 }
@@ -2307,9 +2304,9 @@ fn result_set_packets(
 }
 
 thread_local! {
-    /// Reused scratch for JSON / VECTOR cell text. These types serialise to
+    /// Reused scratch for JSON cell text. These values serialise to
     /// a `String` before the lenenc copy into the payload; without a shared
-    /// buffer that is one heap allocation per JSON/VECTOR cell on the
+    /// buffer that is one heap allocation per JSON cell on the
     /// result-set hot path. The buffer is cleared by `to_text_into` on each
     /// use and never held across a call that re-enters these encoders, so
     /// the `borrow_mut` cannot alias.
@@ -2328,15 +2325,18 @@ fn write_lenenc_json_text(payload: &mut Vec<u8>, jsonb: &[u8]) {
     });
 }
 
-/// Write a VECTOR cell as canonical `[a,b,c]` lenenc text, reusing the
-/// per-thread scratch buffer.
+/// MySQL's VECTOR wire value contains little-endian FLOAT32 coordinates.
+/// Other native storage datatypes have exactly representable FLOAT32 values.
 #[inline]
-fn write_lenenc_vector_text(payload: &mut Vec<u8>, internal: &crate::vector::VectorValue) {
-    ROW_TEXT_SCRATCH.with(|s| {
-        let mut s = s.borrow_mut();
-        crate::engine::vector::to_text_into(internal, &mut s);
-        write_lenenc_string(payload, s.as_bytes());
-    });
+fn write_lenenc_vector(payload: &mut Vec<u8>, internal: &crate::vector::VectorValue) {
+    if internal.datatype == crate::vector::VectorDataType::Float32 {
+        write_lenenc_string(payload, &internal.payload);
+    } else {
+        write_lenenc_int(payload, internal.dimension as u64 * 4);
+        for index in 0..internal.dimension as usize {
+            payload.extend_from_slice(&(internal.element(index) as f32).to_le_bytes());
+        }
+    }
 }
 
 fn write_text_value(
@@ -2487,9 +2487,7 @@ fn write_text_value_inner(
         // GEOMETRY is sent as its raw internal `SRID + WKB` bytes (MySQL does
         // the same; clients render via ST_AsText / ST_AsWKB).
         Value::Geometry(b) => write_lenenc_string(payload, b),
-        // VECTOR is sent as canonical `[a,b,c]` text (friendly display, like
-        // JSON); VECTOR_TO_STRING produces the same form.
-        Value::Vector(b) => write_lenenc_vector_text(payload, b),
+        Value::Vector(b) => write_lenenc_vector(payload, b),
     }
 }
 
@@ -3190,6 +3188,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vector_wire_payload_matches_native_float32_clients_for_all_storage_types() {
+        use crate::vector::{VectorDataType as T, VectorValue};
+        let columns = [Column {
+            name: "v".into(),
+            column_type: ColumnType::Vector,
+            source: Default::default(),
+        }];
+        let cases = [
+            (
+                T::Float32,
+                vec![
+                    1.0f32.to_le_bytes(),
+                    (-2.0f32).to_le_bytes(),
+                    3.0f32.to_le_bytes(),
+                ]
+                .concat(),
+                vec![1.0f32, -2.0, 3.0],
+            ),
+            (
+                T::Float16,
+                vec![
+                    half::f16::from_f32(1.0).to_le_bytes(),
+                    half::f16::from_f32(-2.0).to_le_bytes(),
+                    half::f16::from_f32(3.0).to_le_bytes(),
+                ]
+                .concat(),
+                vec![1.0f32, -2.0, 3.0],
+            ),
+            (
+                T::BFloat16,
+                vec![
+                    half::bf16::from_f32(1.0).to_le_bytes(),
+                    half::bf16::from_f32(-2.0).to_le_bytes(),
+                    half::bf16::from_f32(3.0).to_le_bytes(),
+                ]
+                .concat(),
+                vec![1.0f32, -2.0, 3.0],
+            ),
+            (T::Int8, vec![1, 254, 3], vec![1.0f32, -2.0, 3.0]),
+            (T::Binary, vec![5], vec![1.0f32, 0.0, 1.0]),
+        ];
+        for (datatype, payload, values) in cases {
+            let row = [Value::Vector(VectorValue::new(datatype, 3, payload))];
+            let expected: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+            let binary = binary_row_packet(&columns, &row);
+            assert_eq!(&binary[..3], &[0, 0, 12]);
+            assert_eq!(&binary[3..], expected);
+            let mut text = Vec::new();
+            text_row_packet_into_with_columns(&row, &mut text, None, Some(&columns));
+            assert_eq!(text[0], 12);
+            assert_eq!(&text[1..], expected);
+            assert!(estimate_binary_row_packet_bytes(&row) >= binary.len());
+            assert!(estimate_text_row_packet_bytes(&row) >= text.len());
+        }
+    }
     #[test]
     fn bit_value_binary_and_text_encode_as_bytes_not_truncated() {
         // B2: BIT(40) value 0x01_0000_0005 must survive the binary protocol

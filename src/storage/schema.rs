@@ -174,6 +174,8 @@ pub struct Catalog {
     pub sequences: BTreeMap<String, Arc<SequenceSchema>>,
     #[serde(default)]
     pub auth: Arc<AuthCatalog>,
+    #[serde(default)]
+    pub(crate) ai: Arc<crate::engine::ai::AiCatalog>,
 }
 
 /// Rebuild every table's foreign-key runtime caches from the persisted

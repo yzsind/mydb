@@ -82,7 +82,11 @@ pub(crate) fn begin(query: &str) {
     traces.working.insert(
         connection_id,
         WorkingTrace {
-            query: query.to_owned(),
+            query: if crate::engine::ai::sql::sql_may_have_ai(query) {
+                "[redacted AI statement]".into()
+            } else {
+                query.to_owned()
+            },
             events: vec![json!({
                 "stage": "planning_started",
                 "cbo_epoch": crate::engine::cbo::cbo_epoch(),

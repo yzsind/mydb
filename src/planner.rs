@@ -19971,6 +19971,9 @@ pub(crate) fn expr_is_deterministic(expr: &Expr) -> bool {
     crate::parser::visit::try_inspect_value_expr(expr, |node| {
         match node {
             Expr::Function { name, .. } => {
+                if crate::engine::ai::is_function(name) {
+                    return Err(());
+                }
                 let upper = name.to_ascii_uppercase();
                 if matches!(
                     upper.as_str(),

@@ -362,6 +362,7 @@ impl Staging {
                     completed_unix_ms: 0,
                     final_barrier_ms: 0,
                     capture_stats: BTreeMap::new(),
+                    ai_key_ids: Vec::new(),
                     start_lsn: 0,
                     end_lsn: 0,
                     end_commit_unix_us: 0,

@@ -19,6 +19,7 @@ The `README.md` in each category directory lists one function per line and links
 | [Data Masking and Keyring Functions](masking-keyring/README.md) | Data masking, password strength, and keyring operations |
 | [Locking Functions](locking/README.md) | User-level named locks |
 | [Spatial Functions](spatial/README.md) | GIS construction, conversion, properties, measurement, and spatial predicates |
+| [AI Functions](ai/README.md) | LLM text generation, structured responses, and native embedding calls |
 | [Vector Functions](vector/README.md) | Vector conversion, distance, inner product, normalization, and slicing |
 
 Example result blocks show the text-protocol values for the stated inputs.

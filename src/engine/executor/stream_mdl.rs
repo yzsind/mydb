@@ -114,6 +114,15 @@ impl Drop for Cursor {
     }
 }
 impl ResultCursor for Cursor {
+    fn external_io(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.external_io())
+    }
+    fn external_batch_rows(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(1, |inner| inner.external_batch_rows())
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let result = match self.inner.as_mut() {
             Some(inner) => inner.next_row(),
@@ -135,14 +144,14 @@ impl ResultCursor for Cursor {
 
 fn has_stream(response: &QueryResponse) -> bool {
     match response {
-        QueryResponse::StreamingResultSet(_) => true,
+        QueryResponse::StreamingResultSet(stream) => !stream.cursor.external_io(),
         QueryResponse::MultiResult(results) => results.iter().any(has_stream),
         _ => false,
     }
 }
 fn attach(response: &mut QueryResponse, lease: &Arc<Lease>) {
     match response {
-        QueryResponse::StreamingResultSet(stream) => {
+        QueryResponse::StreamingResultSet(stream) if !stream.cursor.external_io() => {
             let inner = std::mem::replace(
                 &mut stream.cursor,
                 Box::new(VecResultCursor::new(Vec::new())),
