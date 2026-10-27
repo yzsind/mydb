@@ -209,7 +209,7 @@ MyDB minimizes DDL locking and query waiting by coordinating schema versions, in
 - **Explicit quantization**: `WITH (quantization=sq8|sq4|pq|bq)` compresses numeric index payloads, with final re-ranking against visible heap values. The default is `none`; search breadth and re-ranking budgets determine the recall, memory, and latency tradeoff.
 - **Unified SQL**: the optimizer recognizes `ORDER BY distance LIMIT k` and supports parameterized queries; vector writes participate in transaction commit and rollback.
 
-Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. See [vector datatypes and indexes](docs/vector-indexes.md) for options, training, limits, and recovery, and the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
+Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. Start with the [vector data and similarity search guide](docs/vector-search.md), then see [vector datatypes and indexes](docs/vector-indexes.md) for options, training, limits, and recovery, and the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
 
 ### Try vector retrieval and RETURNING
 

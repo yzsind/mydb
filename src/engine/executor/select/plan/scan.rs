@@ -5870,7 +5870,14 @@ pub(super) fn execute_vector_index_scan(
                     }
                 }
             }
-            if late_scores.len() >= k || matches!(iterative_scan, IterativeScan::Off) {
+            let boundary_ties = !is_ivf
+                && metric == vector::Metric::Dot
+                && !quantized
+                && !matches!(iterative_scan, IterativeScan::Off)
+                && vector_pool_boundary_ties(k, late_scores.iter().map(|score| score.0));
+            if (late_scores.len() >= k && !boundary_ties)
+                || matches!(iterative_scan, IterativeScan::Off)
+            {
                 break false;
             }
         }
@@ -6006,7 +6013,12 @@ pub(super) fn execute_vector_index_scan(
         if budget_exhausted {
             break true;
         }
-        if scored.len() >= k || matches!(iterative_scan, IterativeScan::Off) {
+        let boundary_ties = !is_ivf
+            && metric == vector::Metric::Dot
+            && !quantized
+            && !matches!(iterative_scan, IterativeScan::Off)
+            && vector_pool_boundary_ties(k, scored.iter().map(|score| score.0));
+        if (scored.len() >= k && !boundary_ties) || matches!(iterative_scan, IterativeScan::Off) {
             break false;
         }
         // Every backend proved it holds no further candidates: a short
@@ -6269,6 +6281,59 @@ pub(super) fn ordered_vector_fallback_input(
         runtime_filters: Vec::new(),
         hint_note: None,
         projected_columns: projection.map(|columns| Arc::new(columns.to_vec())),
+    }
+}
+
+/// A mixed-distance pool whose k-th row lies in its final tied plateau may
+/// have been filled by coincident coordinates before reaching other regions.
+/// Widen under the ordinary iterative budget. An entirely tied pool already
+/// supplies interchangeable rows and must not turn a constant-distance query
+/// into an exhaustive scan.
+fn vector_pool_boundary_ties(k: usize, distances: impl Iterator<Item = f64>) -> bool {
+    let mut best = f64::INFINITY;
+    let mut worst = f64::NEG_INFINITY;
+    let mut tied_worst = 0usize;
+    let mut count = 0usize;
+    for distance in distances {
+        if !distance.is_finite() {
+            return false;
+        }
+        best = best.min(distance);
+        if distance > worst {
+            worst = distance;
+            tied_worst = 1;
+        } else if distance == worst {
+            tied_worst += 1;
+        }
+        count += 1;
+    }
+    count >= k && best < worst && tied_worst > 1 && count - tied_worst < k
+}
+
+#[cfg(test)]
+mod vector_pool_boundary_tests {
+    use super::vector_pool_boundary_ties;
+
+    #[test]
+    fn vector_audit_widens_only_mixed_ties_crossing_the_limit() {
+        assert!(vector_pool_boundary_ties(
+            3,
+            [-9.0, -8.0, 0.0, 0.0].into_iter()
+        ));
+        assert!(!vector_pool_boundary_ties(
+            2,
+            [-9.0, -8.0, 0.0, 0.0].into_iter()
+        ));
+        assert!(!vector_pool_boundary_ties(3, [0.0; 32].into_iter()));
+        assert!(!vector_pool_boundary_ties(
+            3,
+            [-9.0, -8.0, -7.0].into_iter()
+        ));
+        assert!(!vector_pool_boundary_ties(4, [-9.0, 0.0, 0.0].into_iter()));
+        assert!(!vector_pool_boundary_ties(
+            3,
+            [-9.0, 0.0, f64::NAN].into_iter()
+        ));
     }
 }
 

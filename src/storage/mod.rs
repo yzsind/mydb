@@ -51,6 +51,8 @@ pub(crate) use core::DmlIgnoreCoercionGuard;
 pub(crate) use core::ExactIndexVisibility;
 #[cfg(test)]
 pub(crate) use core::VECTOR_BUILD_BEFORE_PUBLISH_HOOK;
+#[cfg(test)]
+pub(crate) use core::VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK;
 pub(crate) use core::{
     canonicalize_loaded_timestamp_value, coerce_routine_typed_value, ignorable_update_error,
     with_enum_field_copy_coercion, LoadDataIndexBuilders, LoadDataIndexKeyBatch,

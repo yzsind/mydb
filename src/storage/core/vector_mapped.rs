@@ -399,6 +399,7 @@ impl MappedVectorNavigation {
             2 => Metric::Dot,
             _ => Metric::L2,
         };
+        let explore_ties = metric != Metric::Dot || query.iter().any(|value| *value != 0.0);
         let mut normalized = Vec::new();
         let src = if metric == Metric::Cosine {
             normalized.extend_from_slice(query);
@@ -491,9 +492,24 @@ impl MappedVectorNavigation {
             id: current,
         };
         frontier.push(Reverse(first));
-        results.push(first);
+        let live_only = self.meta.tombstone_count != 0;
+        let live = |vid| -> Result<bool, QueryError> {
+            if !live_only {
+                return Ok(true);
+            }
+            let (page, offset) = self.record(vid)?;
+            Ok(page[offset] & REC_FLAG_TOMBSTONE == 0)
+        };
+        if live(current)? {
+            results.push(first);
+        }
         visit(current)?;
+        let mut steps = 0usize;
         while let Some(Reverse(candidate)) = frontier.pop() {
+            if steps & 63 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            steps += 1;
             let furthest = results
                 .peek()
                 .map(|s: &Scored<VecId>| s.dist)
@@ -514,16 +530,27 @@ impl MappedVectorNavigation {
                     .peek()
                     .map(|s: &Scored<VecId>| s.dist)
                     .unwrap_or(f64::INFINITY);
-                if results.len() < ef || score < furthest {
+                if results.len() >= ef
+                    && explore_ties
+                    && score == furthest
+                    && (score != 0.0 || metric == Metric::Dot)
+                {
+                    frontier.push(Reverse(Scored {
+                        dist: score,
+                        id: vid,
+                    }));
+                } else if results.len() < ef || score < furthest {
                     let entry = Scored {
                         dist: score,
                         id: vid,
                     };
                     frontier.push(Reverse(entry));
-                    if results.len() == ef {
-                        results.pop();
+                    if live(vid)? {
+                        if results.len() == ef {
+                            results.pop();
+                        }
+                        results.push(entry);
                     }
-                    results.push(entry);
                 }
             }
         }

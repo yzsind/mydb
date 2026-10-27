@@ -737,6 +737,31 @@ impl VectorPurgeQueue {
                 })
             })
     }
+
+    fn remove_index_snapshot(&mut self, index: VectorPurgeIndexIdentity) -> usize {
+        let generations: Vec<_> = self
+            .by_index
+            .range((index.0, index.1, 0, 0, 0)..=(index.0, index.1, u64::MAX, u64::MAX, u64::MAX))
+            .map(|(old, _)| *old)
+            .filter(|old| old.3 == index.3)
+            .collect();
+        let mut bytes = 0usize;
+        for index in generations {
+            for time in self.by_index.remove(&index).unwrap_or_default() {
+                if let Some(purge) = self
+                    .by_time
+                    .remove(&(time, index.0, index.1, index.2, index.3, index.4))
+                {
+                    bytes = bytes.saturating_add(512 + purge.rows.len() * 192);
+                    for (row, versions) in purge.rows {
+                        bytes = bytes.saturating_add(versions.len() * 16);
+                        self.latest_retired.remove(&(index, row));
+                    }
+                }
+            }
+        }
+        bytes
+    }
 }
 
 impl VectorPurge {

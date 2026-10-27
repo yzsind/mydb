@@ -85,7 +85,7 @@ impl NativeSearchScratch {
         Ok(fresh)
     }
 
-    fn push(&mut self, score: Scored<usize>, ef: usize) -> Result<(), QueryError> {
+    fn push(&mut self, score: Scored<usize>, ef: usize, admit: bool) -> Result<(), QueryError> {
         if self.todo.len() == self.todo.capacity() {
             let extra = self.todo.capacity().max(64);
             self.charge
@@ -94,7 +94,7 @@ impl NativeSearchScratch {
                 .try_reserve_exact(extra)
                 .map_err(|_| codec::vector_err("native HNSW frontier allocation failed"))?;
         }
-        if self.best.len() < ef && self.best.len() == self.best.capacity() {
+        if admit && self.best.len() < ef && self.best.len() == self.best.capacity() {
             let extra = ef - self.best.capacity();
             self.charge
                 .try_grow_recoverable(extra.saturating_mul(std::mem::size_of::<Scored<usize>>()))?;
@@ -103,6 +103,9 @@ impl NativeSearchScratch {
                 .map_err(|_| codec::vector_err("native HNSW results allocation failed"))?;
         }
         self.todo.push(Reverse(score));
+        if !admit {
+            return Ok(());
+        }
         if self.best.len() == ef {
             self.best.pop();
         }
@@ -1395,9 +1398,21 @@ impl NativeHnsw {
         level: usize,
         query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<Vec<Scored<usize>>, QueryError> {
-        self.layer_scored(state, entries, ef, level, |id| {
-            self.navigation_score(state, id, query, query_code)
-        })
+        self.layer_scored(
+            state,
+            entries,
+            ef,
+            level,
+            self.explore_query_ties(query),
+            |id| self.navigation_score(state, id, query, query_code),
+        )
+    }
+
+    fn explore_query_ties(&self, query: &VectorValue) -> bool {
+        matches!(self.metric, Metric::L2 | Metric::Cosine | Metric::Dot)
+            && !(self.metric == Metric::Dot
+                && query.dimension > 0
+                && (0..query.dimension as usize).all(|index| query.element(index) == 0.0))
     }
 
     fn layer_scored(
@@ -1406,6 +1421,7 @@ impl NativeHnsw {
         entries: &[usize],
         ef: usize,
         level: usize,
+        explore_ties: bool,
         mut score_node: impl FnMut(usize) -> Result<f64, QueryError>,
     ) -> Result<Vec<Scored<usize>>, QueryError> {
         let ef = ef.max(1).min(state.nodes.len());
@@ -1435,7 +1451,16 @@ impl NativeHnsw {
                     if scratch.best.len() < ef
                         || scratch.best.peek().is_some_and(|worst| score < *worst)
                     {
-                        scratch.push(score, ef)?;
+                        scratch.push(score, ef, true)?;
+                    } else if explore_ties
+                        && level == 0
+                        && (score.dist != 0.0 || self.metric == Metric::Dot)
+                        && scratch
+                            .best
+                            .peek()
+                            .is_some_and(|worst| score.dist == worst.dist)
+                    {
+                        scratch.push(score, ef, false)?;
                     }
                 }
             }
@@ -1473,7 +1498,16 @@ impl NativeHnsw {
                     if scratch.best.len() < ef
                         || scratch.best.peek().is_some_and(|worst| score < *worst)
                     {
-                        scratch.push(score, ef)?;
+                        scratch.push(score, ef, true)?;
+                    } else if explore_ties
+                        && level == 0
+                        && (score.dist != 0.0 || self.metric == Metric::Dot)
+                        && scratch
+                            .best
+                            .peek()
+                            .is_some_and(|worst| score.dist == worst.dist)
+                    {
+                        scratch.push(score, ef, false)?;
                     }
                 }
                 steps += 1;
@@ -1944,14 +1978,21 @@ impl NativeHnsw {
         let mapped = if state.csr.as_ref().is_some_and(|csr| csr.payloads.is_none()) {
             if let (Some(file), Some(quant)) = (&self.file, self.quantizer()) {
                 file.with_navigation_mapping(|view| {
-                    self.layer_scored(&state, &[entry], ef, 0, |id| {
-                        quant.score_payload(
-                            view.native_payload(state.nodes[id].vid)?,
-                            self.file.as_ref(),
-                            query,
-                            query_code.as_ref(),
-                        )
-                    })
+                    self.layer_scored(
+                        &state,
+                        &[entry],
+                        ef,
+                        0,
+                        self.explore_query_ties(query),
+                        |id| {
+                            quant.score_payload(
+                                view.native_payload(state.nodes[id].vid)?,
+                                self.file.as_ref(),
+                                query,
+                                query_code.as_ref(),
+                            )
+                        },
+                    )
                 })
             } else {
                 None
@@ -2090,6 +2131,7 @@ mod duplicate_regressions {
                         dist: -(id as f64),
                     },
                     16,
+                    true,
                 )
                 .unwrap();
         }

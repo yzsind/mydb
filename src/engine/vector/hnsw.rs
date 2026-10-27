@@ -2330,6 +2330,8 @@ impl HnswIndex {
     ) -> Vec<Scored> {
         // Without tombstones every node is live; skip the per-admission flag
         // load so the common path is unchanged.
+        let explore_ties = live_only
+            && !(self.metric == Metric::Dot && probe.query.iter().all(|value| *value == 0.0));
         let live_only = live_only && self.stale_count() > 0;
         let admits = |id: u32| !live_only || !self.nodes.get(id).deleted.load(Ordering::Acquire);
         scratch.begin(self.nodes.len());
@@ -2419,6 +2421,14 @@ impl HnswIndex {
                             .map(|x| x.dist)
                             .unwrap_or(f64::INFINITY);
                         if d >= furthest {
+                            // Equal-distance hops can lead out of a coincident
+                            // coordinate component without entering the ef pool.
+                            if explore_ties
+                                && d == furthest
+                                && (d != 0.0 || self.metric == Metric::Dot)
+                            {
+                                scratch.frontier.push(Reverse(s));
+                            }
                             continue;
                         }
                     }
@@ -2484,7 +2494,31 @@ impl HnswIndex {
         m: usize,
         arena: Option<&QuantArena>,
     ) -> Vec<Scored> {
-        super::hnsw_core::select_diverse(candidates, m, |a, b| {
+        if self.metric == Metric::Dot {
+            if !candidates
+                .windows(2)
+                .any(|pair| pair[0].dist == pair[1].dist)
+            {
+                return super::hnsw_core::select_diverse(candidates, m, |a, b| {
+                    Ok::<_, std::convert::Infallible>(self.build_node_dist(arena, a, b))
+                })
+                .unwrap();
+            }
+            return super::hnsw_core::select_diverse_ties_by(
+                candidates.iter().copied(),
+                m,
+                |a, b| {
+                    let pair = self.build_node_dist(arena, a.id, b.id);
+                    let coincident = a.dist == b.dist
+                        && pair == a.dist
+                        && *self.nodes.get(a.id).vector.read()
+                            == *self.nodes.get(b.id).vector.read();
+                    Ok::<_, std::convert::Infallible>((pair < a.dist, coincident))
+                },
+            )
+            .unwrap();
+        }
+        super::hnsw_core::select_diverse_ties(candidates, m, self.metric != Metric::Dot, |a, b| {
             Ok::<_, std::convert::Infallible>(self.build_node_dist(arena, a, b))
         })
         .unwrap_or_else(|never| match never {})

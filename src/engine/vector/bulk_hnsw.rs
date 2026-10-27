@@ -3,7 +3,7 @@
 //! vector pages. Original/declared payloads are streamed only during publication.
 
 use super::distance::{dot_i8, normalize_in_place, prefetch_read, quantize_into, Metric};
-use super::hnsw_core::{random_level, select_diverse, Scored};
+use super::hnsw_core::{random_level, select_diverse_ties, Scored};
 use crate::engine::executor::select::grace::SpillTmpDir;
 use crate::engine::executor::spill_quota::TrackedSpillWriter;
 use crate::storage::RowId;
@@ -301,7 +301,7 @@ impl BulkHnsw {
             .store(neighbors.len() as u16, Ordering::Relaxed);
     }
     fn select(&self, ranked: &[Scored<u32>], maximum: usize) -> Vec<u32> {
-        select_diverse(ranked, maximum, |a, b| {
+        select_diverse_ties(ranked, maximum, true, |a, b| {
             Ok::<_, std::convert::Infallible>(self.distance(a, b))
         })
         .unwrap()

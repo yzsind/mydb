@@ -67,6 +67,68 @@ pub(super) fn select_diverse<Id: Copy, E>(
     )
 }
 
+/// Coincident coordinates must not consume every edge before a distinct
+/// direction is examined. Keep their row identities as deferred fill edges.
+#[inline]
+pub(super) fn select_diverse_ties<Id: Copy, E>(
+    candidates: &[Scored<Id>],
+    maximum: usize,
+    zero_is_coincident: bool,
+    mut distance: impl FnMut(Id, Id) -> Result<f64, E>,
+) -> Result<Vec<Scored<Id>>, E> {
+    // Ordered nonnegative scores need deferred fill only when at least two
+    // candidates coincide with the query. Preserve Algorithm 4's hot path
+    // without a second accumulator for ordinary construction candidates.
+    if !zero_is_coincident
+        || candidates
+            .get(1)
+            .is_none_or(|candidate| candidate.dist > 0.0)
+    {
+        return select_diverse(candidates, maximum, distance);
+    }
+    select_diverse_ties_by(candidates.iter().copied(), maximum, |a, b| {
+        let pair = distance(a.id, b.id)?;
+        Ok((pair < a.dist, zero_is_coincident && pair == 0.0))
+    })
+}
+
+#[inline]
+pub(super) fn select_diverse_ties_by<C: Copy, E>(
+    candidates: impl IntoIterator<Item = C>,
+    maximum: usize,
+    mut relation: impl FnMut(C, C) -> Result<(bool, bool), E>,
+) -> Result<Vec<C>, E> {
+    let mut selected = Vec::with_capacity(maximum);
+    let mut coincident = Vec::new();
+    for candidate in candidates {
+        if selected.len() == maximum {
+            break;
+        }
+        let mut keep = true;
+        for previous in &selected {
+            let (redundant, duplicate) = relation(candidate, *previous)?;
+            if redundant {
+                keep = false;
+                break;
+            }
+            if duplicate {
+                if coincident.len() < maximum {
+                    coincident.push(candidate);
+                }
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            selected.push(candidate);
+        }
+    }
+    if !coincident.is_empty() {
+        selected.extend(coincident.into_iter().take(maximum - selected.len()));
+    }
+    Ok(selected)
+}
+
 /// Apply the same ordered selection to pre-resolved candidate positions.
 /// The predicate reports redundancy, preserving strict comparisons (including
 /// unordered distances) and allowing backends to retain their cached lookups.
@@ -103,6 +165,24 @@ pub(super) fn permits_in_place_update(drift_sq: f64, nearest_sq: f64, ratio_sq: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_audit_coincident_edges_leave_room_for_distinct_directions() {
+        let candidates = [
+            Scored { dist: 0.0, id: 0 },
+            Scored { dist: 0.0, id: 1 },
+            Scored { dist: 0.0, id: 2 },
+            Scored { dist: 9.0, id: 3 },
+        ];
+        let selected = select_diverse_ties(&candidates, 3, true, |a, b| {
+            Ok::<_, ()>(if a < 3 && b < 3 { 0.0 } else { 9.0 })
+        })
+        .unwrap();
+        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [0, 3, 1]);
+        let duplicates =
+            select_diverse_ties(&candidates[..3], 3, true, |_, _| Ok::<_, ()>(0.0)).unwrap();
+        assert_eq!(duplicates.len(), 3);
+    }
 
     #[test]
     fn diversity_stops_at_capacity_and_first_redundant_neighbor() {

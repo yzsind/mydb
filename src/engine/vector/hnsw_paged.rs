@@ -633,12 +633,14 @@ impl QueryNavScratch {
     }
 
     #[inline]
-    fn consider(&mut self, scored: Scored, ef: usize) -> Result<(), QueryError> {
+    fn consider(&mut self, scored: Scored, ef: usize, live: bool) -> Result<(), QueryError> {
         if self.results.len() < ef {
             reserve_query_heap(&mut self.frontier, &mut self.charge)?;
-            reserve_query_heap(&mut self.results, &mut self.charge)?;
             self.frontier.push(Reverse(scored));
-            self.results.push(scored);
+            if live {
+                reserve_query_heap(&mut self.results, &mut self.charge)?;
+                self.results.push(scored);
+            }
             return Ok(());
         }
         let furthest = self
@@ -646,10 +648,15 @@ impl QueryNavScratch {
             .peek()
             .map(|item| item.dist)
             .unwrap_or(f64::INFINITY);
-        if scored.dist < furthest {
+        if scored.dist == furthest && furthest != 0.0 {
             reserve_query_heap(&mut self.frontier, &mut self.charge)?;
-            if let Some(mut top) = self.results.peek_mut() {
-                *top = scored;
+            self.frontier.push(Reverse(scored));
+        } else if scored.dist < furthest {
+            reserve_query_heap(&mut self.frontier, &mut self.charge)?;
+            if live {
+                if let Some(mut top) = self.results.peek_mut() {
+                    *top = scored;
+                }
             }
             self.frontier.push(Reverse(scored));
         }
@@ -2984,8 +2991,14 @@ impl PagedHnsw {
                     for upper in ((level + 1)..=top as usize).rev() {
                         cur = self.greedy_descend(vector, cur, upper, scratch)?;
                     }
-                    let found =
-                        self.search_layer(vector, &[cur], self.ef_construction, level, scratch)?;
+                    let found = self.search_layer(
+                        vector,
+                        &[cur],
+                        self.ef_construction,
+                        level,
+                        None,
+                        scratch,
+                    )?;
                     candidates.extend(
                         found
                             .iter()
@@ -3635,20 +3648,39 @@ impl PagedHnsw {
         entries: &[VecId],
         ef: usize,
         level: usize,
+        live_only: Option<&std::collections::HashSet<VecId>>,
         scratch: &mut Scratch,
     ) -> Result<Vec<Scored>, QueryError> {
+        let tombstones = self.tombstones.load(Ordering::Acquire) != 0;
+        let explore_ties = live_only.is_some()
+            && !(self.metric == Metric::Dot && query.iter().all(|value| *value == 0.0));
+        let admits = |vid| -> Result<bool, QueryError> {
+            match live_only {
+                None => Ok(true),
+                Some(retired) => {
+                    Ok(!retired.contains(&vid) && (!tombstones || self.file.is_live_node(vid)?))
+                }
+            }
+        };
         scratch.clear_layer();
         for &e in entries {
             if scratch.visited.insert(self.file.node_id(e)?) {
                 let d = self.dist_q(query, e, scratch)?;
                 scratch.frontier.push(Reverse(Scored { dist: d, id: e }));
-                scratch.results.push(Scored { dist: d, id: e });
+                if admits(e)? {
+                    scratch.results.push(Scored { dist: d, id: e });
+                }
             }
         }
         while scratch.results.len() > ef {
             scratch.results.pop();
         }
+        let mut steps = 0usize;
         while let Some(Reverse(c)) = scratch.frontier.pop() {
+            if steps & 63 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            steps += 1;
             let furthest = scratch
                 .results
                 .peek()
@@ -3675,16 +3707,22 @@ impl PagedHnsw {
                 let s = Scored { dist: d, id: nb };
                 if scratch.results.len() < ef {
                     scratch.frontier.push(Reverse(s));
-                    scratch.results.push(s);
+                    if admits(nb)? {
+                        scratch.results.push(s);
+                    }
                 } else {
                     let furthest = scratch
                         .results
                         .peek()
                         .map(|x| x.dist)
                         .unwrap_or(f64::INFINITY);
-                    if d < furthest {
-                        if let Some(mut top) = scratch.results.peek_mut() {
-                            *top = s;
+                    if explore_ties && d == furthest && (d != 0.0 || self.metric == Metric::Dot) {
+                        scratch.frontier.push(Reverse(s));
+                    } else if d < furthest {
+                        if admits(nb)? {
+                            if let Some(mut top) = scratch.results.peek_mut() {
+                                *top = s;
+                            }
                         }
                         scratch.frontier.push(Reverse(s));
                     }
@@ -3721,13 +3759,11 @@ impl PagedHnsw {
                 .collect();
             if let Some(codes) = codes {
                 let selected =
-                    super::hnsw_core::select_diverse_by(0..candidates.len(), m, |i, j| {
+                    super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, j| {
                         let (a, na) = codes[i];
                         let (b, nb) = codes[j];
-                        Ok::<_, QueryError>(
-                            (na + nb - 2 * dot_i8(a, b)) as f64 * (params.dist_mul as f64)
-                                < candidates[i].dist,
-                        )
+                        let pair = (na + nb - 2 * dot_i8(a, b)) as f64 * params.dist_mul as f64;
+                        Ok::<_, QueryError>((pair < candidates[i].dist, pair == 0.0))
                     })?;
                 return Ok(selected.into_iter().map(|i| candidates[i]).collect());
             }
@@ -3752,7 +3788,38 @@ impl PagedHnsw {
                 }
             }
         }
-        super::hnsw_core::select_diverse(candidates, m, |a, b| self.dist_nodes(a, b, scratch))
+        if self.metric == Metric::Dot {
+            if !candidates
+                .windows(2)
+                .any(|pair| pair[0].dist == pair[1].dist)
+            {
+                return super::hnsw_core::select_diverse(candidates, m, |a, b| {
+                    self.dist_nodes(a, b, scratch)
+                });
+            }
+            return super::hnsw_core::select_diverse_ties_by(
+                candidates.iter().copied(),
+                m,
+                |a, b| {
+                    let pair = self.dist_nodes(a.id, b.id, scratch)?;
+                    let coincident = if a.dist == b.dist && pair == a.dist {
+                        match (
+                            self.read_and_maybe_cache(a.id, scratch)?,
+                            self.read_and_maybe_cache(b.id, scratch)?,
+                        ) {
+                            (Some(CachedVector::Exact(a)), Some(CachedVector::Exact(b))) => a == b,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    Ok::<_, QueryError>((pair < a.dist, coincident))
+                },
+            );
+        }
+        super::hnsw_core::select_diverse_ties(candidates, m, true, |a, b| {
+            self.dist_nodes(a, b, scratch)
+        })
     }
 
     /// Resolve old-node cache entries once per candidate, not once per
@@ -3786,16 +3853,14 @@ impl PagedHnsw {
                 Source::Missing
             });
         }
-        let selected = super::hnsw_core::select_diverse_by(0..candidates.len(), m, |i, r| {
-            Ok::<_, QueryError>(
-                match (parts(&sources[i], arena), parts(&sources[r], arena)) {
-                    (Some((a, na)), Some((b, nb))) => {
-                        (na + nb - 2 * dot_i8(a, b)) as f64 * (arena.dist_mul as f64)
-                            < candidates[i].dist
-                    }
-                    _ => false,
-                },
-            )
+        let selected = super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, r| {
+            let pair = match (parts(&sources[i], arena), parts(&sources[r], arena)) {
+                (Some((a, na)), Some((b, nb))) => {
+                    (na + nb - 2 * dot_i8(a, b)) as f64 * arena.dist_mul as f64
+                }
+                _ => return Ok::<_, QueryError>((false, false)),
+            };
+            Ok((pair < candidates[i].dist, pair == 0.0))
         })?;
         Ok(selected.into_iter().map(|i| candidates[i]).collect())
     }
@@ -3818,28 +3883,16 @@ impl PagedHnsw {
         {
             return None;
         }
-        let mut selected: Vec<Scored> = Vec::with_capacity(m);
-        let mut sel_ords: Vec<usize> = Vec::with_capacity(m);
-        for c in candidates {
-            if selected.len() >= m {
-                break;
-            }
-            let co = arena
-                .ord_of(c.id)
-                .expect("candidate coverage checked above");
-            let mut keep = true;
-            for &ro in &sel_ords {
-                if arena.ssd_nodes(co, ro) < c.dist {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                selected.push(*c);
-                sel_ords.push(co);
-            }
-        }
-        Some(selected)
+        let ordinals: Vec<_> = candidates
+            .iter()
+            .map(|c| arena.ord_of(c.id).unwrap())
+            .collect();
+        let selected = super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, j| {
+            let pair = arena.ssd_nodes(ordinals[i], ordinals[j]);
+            Ok::<_, std::convert::Infallible>((pair < candidates[i].dist, pair == 0.0))
+        })
+        .unwrap();
+        Some(selected.into_iter().map(|i| candidates[i]).collect())
     }
 
     /// Re-select `node`'s adjacency at a layer down to at most `m`.
@@ -4092,8 +4145,88 @@ impl PagedHnsw {
         &self,
         session: &PagedHnswBuildSession,
     ) -> Result<(), QueryError> {
+        self.repair_build_connectivity(session)?;
         if let Some(store) = session.build_adj.as_deref() {
             store.materialize(&self.file)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve one bridge slot only when the completed directed graph has
+    /// unreachable components. Scratch is covered by the chunk reservation.
+    fn repair_build_connectivity(&self, session: &PagedHnswBuildSession) -> Result<(), QueryError> {
+        let Some((entry, _)) = self.file.entry_with_level() else {
+            return Ok(());
+        };
+        let mut vids = Vec::with_capacity(self.node_count() as usize);
+        if let Some(store) = &session.build_adj {
+            vids.extend(
+                store
+                    .published_vids()
+                    .iter()
+                    .map(|vid| vid.load(Ordering::Relaxed)),
+            );
+        } else {
+            self.file.for_each_node(|vid, _, _| vids.push(vid))?;
+        }
+        let ordinal = |vid| {
+            if let Some(store) = &session.build_adj {
+                store
+                    .ordinal_in(store.published_vids(), vid)
+                    .ok_or_else(super::persistence::corrupt)
+            } else {
+                vids.binary_search(&vid)
+                    .map_err(|_| super::persistence::corrupt())
+            }
+        };
+        let mut scratch = Scratch::default();
+        scratch.build_adj = session.build_adj.clone();
+        let mut seen = vec![false; vids.len()];
+        let mut pending = Vec::with_capacity(vids.len());
+        let mut neighbors = Vec::new();
+        let visit = |root: VecId,
+                     seen: &mut [bool],
+                     pending: &mut Vec<VecId>,
+                     neighbors: &mut Vec<VecId>,
+                     scratch: &mut Scratch|
+         -> Result<(), QueryError> {
+            seen[ordinal(root)?] = true;
+            pending.push(root);
+            while let Some(vid) = pending.pop() {
+                crate::engine::cancel::check_cancelled()?;
+                self.neighbors_at_into(vid, 0, scratch, neighbors)?;
+                for &next in neighbors.iter() {
+                    let id = ordinal(next)?;
+                    if !seen[id] {
+                        seen[id] = true;
+                        pending.push(next);
+                    }
+                }
+            }
+            Ok(())
+        };
+        visit(entry, &mut seen, &mut pending, &mut neighbors, &mut scratch)?;
+        if seen.iter().all(|&visited| visited) {
+            return Ok(());
+        }
+        for &vid in &vids {
+            self.neighbors_at_into(vid, 0, &mut scratch, &mut neighbors)?;
+            if neighbors.len() >= self.m0 {
+                neighbors.pop();
+                self.set_neighbors_for_build(VEC_DDL_TXN, vid, 0, &neighbors, &mut scratch)?;
+            }
+        }
+        seen.fill(false);
+        visit(entry, &mut seen, &mut pending, &mut neighbors, &mut scratch)?;
+        let mut anchor = entry;
+        for (id, &vid) in vids.iter().enumerate() {
+            if !seen[id] {
+                self.neighbors_at_into(anchor, 0, &mut scratch, &mut neighbors)?;
+                neighbors.push(vid);
+                self.set_neighbors_for_build(VEC_DDL_TXN, anchor, 0, &neighbors, &mut scratch)?;
+                visit(vid, &mut seen, &mut pending, &mut neighbors, &mut scratch)?;
+                anchor = vid;
+            }
         }
         Ok(())
     }
@@ -4309,7 +4442,8 @@ impl PagedHnsw {
         let mut entries = vec![cur];
         let start = level.min(max_level);
         for lc in (0..=start).rev() {
-            let found = self.search_layer(node_vec, &entries, self.ef_construction, lc, scratch)?;
+            let found =
+                self.search_layer(node_vec, &entries, self.ef_construction, lc, None, scratch)?;
             let m_layer = if lc == 0 { self.m0 } else { self.m };
             // M is insertion fanout; m0 is the layer-0 capacity for reverse
             // edges. Filling that capacity on birth doubled maintenance work.
@@ -4374,7 +4508,9 @@ impl PagedHnsw {
                 id: entry as u64,
             };
             scratch.frontier.push(Reverse(first));
-            scratch.results.push(first);
+            if !arena.deleted[entry] {
+                scratch.results.push(first);
+            }
             // Keep CPU lookahead small for resident images. Disk-backed probes
             // need a wider bounded I/O window to overlap random page misses.
             let prefetch_ahead = if matches!(&arena.codes, QueryNavCodes::Spilled(_))
@@ -4385,7 +4521,12 @@ impl PagedHnsw {
             } else {
                 8
             };
+            let mut steps = 0usize;
             while let Some(Reverse(candidate)) = scratch.frontier.pop() {
+                if steps & 63 == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
+                steps += 1;
                 let furthest = scratch
                     .results
                     .peek()
@@ -4443,6 +4584,7 @@ impl PagedHnsw {
                                 id: u64::from(neighbors[offset]),
                             },
                             ef,
+                            !arena.deleted[ordinals[offset]],
                         )?;
                     }
                     index += 4;
@@ -4456,6 +4598,7 @@ impl PagedHnsw {
                             id: u64::from(neighbor),
                         },
                         ef,
+                        !arena.deleted[ordinal],
                     )?;
                     index += 1;
                 }
@@ -4670,7 +4813,7 @@ impl PagedHnsw {
             return Ok(out);
         }
         let cand: Vec<VecId> = self
-            .search_layer(query, &[cur], ef, 0, &mut scratch)?
+            .search_layer(query, &[cur], ef, 0, Some(&retired.0), &mut scratch)?
             .iter()
             .map(|s| s.id)
             .collect();
@@ -4699,7 +4842,7 @@ impl PagedHnsw {
         // Return the top-`k` in ascending distance order: the executor's stable
         // re-sort breaks equal-distance ties by this order, so a deterministic
         // ascending sort here keeps LIMIT/OFFSET windowing stable.
-        out.sort_by(|a, b| a.1.total_cmp(&b.1));
+        out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         out.truncate(k);
         Ok(out)
     }
@@ -5289,6 +5432,48 @@ mod query_nav_allocation_tests {
 #[cfg(test)]
 mod source_audit_tests {
     use super::*;
+    #[test]
+    fn vector_audit_fallback_breaks_distance_ties_by_row_id() {
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        let mut graph = PagedHnsw::new(file);
+        graph.navigation_quant_enabled = false;
+        for id in [9, 5, 7, 8] {
+            graph.insert_ddl(row(id), &[1.0, 1.0]).unwrap();
+        }
+        graph
+            .query_nav_rebuild_requested
+            .store(false, Ordering::Release);
+        let found = graph.search(&[1.0, 1.0], 2, 3).unwrap();
+        assert_eq!(
+            found.iter().map(|(row, _)| row.page_id).collect::<Vec<_>>(),
+            [5, 7]
+        );
+    }
+
+    #[test]
+    fn vector_audit_tombstones_do_not_consume_live_search_budget() {
+        for compact in [false, true] {
+            let (_dir, file) = crate::storage::source_audit_vector_file();
+            let graph = PagedHnsw::new(file);
+            for id in 0..200 {
+                graph.insert_ddl(row(id), &[id as f32, 1.0]).unwrap();
+            }
+            for id in 0..100 {
+                graph.mark_deleted_by_row_id(row(id)).unwrap();
+            }
+            if compact {
+                graph.refresh_query_navigation().unwrap();
+            } else {
+                graph
+                    .query_nav_rebuild_requested
+                    .store(false, Ordering::Release);
+            }
+            let found = graph.search(&[0.0, 1.0], 10, 32).unwrap();
+            assert_eq!(found.len(), 10, "compact={compact}");
+            assert!(found.iter().all(|(row, _)| row.page_id >= 100));
+        }
+    }
+
     #[test]
     fn pressure_eviction_keeps_reader_memory_charged_until_last_arc() {
         let (_dir, file) = crate::storage::source_audit_vector_file();

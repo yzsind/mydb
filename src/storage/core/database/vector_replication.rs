@@ -31,6 +31,31 @@ impl Drop for VectorReadLease<'_> {
     }
 }
 impl Database {
+    fn wait_for_vector_readers(
+        &self,
+        state: &mut parking_lot::MutexGuard<'_, ReplicaVectorState>,
+        tables: &BTreeSet<u64>,
+        timeout: std::time::Duration,
+    ) -> Result<(), QueryError> {
+        let deadline = std::time::Instant::now() + timeout;
+        while tables
+            .iter()
+            .any(|table| state.readers.get(table).is_some_and(|count| *count != 0))
+        {
+            crate::engine::cancel::check_cancelled()?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(error(
+                    crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                    "replica vector maintenance timed out waiting for active readers",
+                ));
+            }
+            self.replica_vector_signal
+                .wait_for(state, remaining.min(std::time::Duration::from_millis(100)));
+        }
+        Ok(())
+    }
+
     fn acquire_vector_read(&self, table: u64) -> Result<Option<VectorReadLease<'_>>, QueryError> {
         let mut state = self.replica_vector_state.lock();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -107,13 +132,7 @@ impl Database {
         };
         txn.completing = true;
         let tables = txn.tables.clone();
-        while tables
-            .iter()
-            .any(|table| state.readers.get(table).is_some_and(|count| *count != 0))
-        {
-            self.replica_vector_signal.wait(&mut state);
-        }
-        Ok(())
+        self.wait_for_vector_readers(&mut state, &tables, std::time::Duration::from_secs(30))
     }
 
     fn complete_replica_vector_transaction(&self, txn_id: u64, scn: u64) -> Result<(), QueryError> {
@@ -318,20 +337,45 @@ impl Database {
         }
         let mut state = self.replica_vector_state.lock();
         state.physical_writes.extend(tables.iter().copied());
-        while tables
-            .iter()
-            .any(|table| state.readers.get(table).is_some_and(|count| *count != 0))
-        {
-            self.replica_vector_signal.wait(&mut state);
-        }
-        drop(state);
         let lease = VectorPhysicalRedoLease { db: self, tables };
+        let waited = self.wait_for_vector_readers(
+            &mut state,
+            &lease.tables,
+            std::time::Duration::from_secs(30),
+        );
+        drop(state);
+        waited?;
         self.buffer_pool.discard_pages_for_path(&path)?;
         let mut graphs = self.vector_indexes.write();
         for key in keys {
             graphs.remove(&key);
         }
         Ok(Some(lease))
+    }
+}
+
+#[cfg(test)]
+impl Database {
+    pub(crate) fn vector_reader_timeout_for_test(&self) {
+        let mut state = self.replica_vector_state.lock();
+        state.readers.insert(42, 1);
+        let tables = BTreeSet::from([42]);
+        state.physical_writes.extend(&tables);
+        let lease = VectorPhysicalRedoLease {
+            db: self,
+            tables: tables.clone(),
+        };
+        let err = self
+            .wait_for_vector_readers(&mut state, &tables, std::time::Duration::from_millis(5))
+            .unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT));
+        drop(state);
+        drop(lease);
+        let mut state = self.replica_vector_state.lock();
+        assert!(!state.physical_writes.contains(&42));
+        state.readers.remove(&42);
+        self.wait_for_vector_readers(&mut state, &tables, std::time::Duration::ZERO)
+            .unwrap();
     }
 }
 

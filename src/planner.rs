@@ -9662,23 +9662,19 @@ fn match_dot_similarity_call(expr: &Expr) -> Option<(&str, &Expr, crate::engine:
 }
 
 /// Coerce a folded constant `Value` into internal vector bytes (little-endian
-/// `f32`). Accepts an existing `Value::Vector` or a `[a,b,c]` text / raw-byte
-/// form; returns `None` for anything else (the KNN path then falls back).
+/// `f32`). Text and byte strings use the same strict conversion as scalar
+/// expressions; raw payloads require an explicit VECTOR_FROM_BINARY call.
+/// Returns `None` for anything else (the KNN path then falls back).
 pub(crate) fn value_to_vector_bytes(value: &Value) -> Option<crate::vector::VectorValue> {
     match value {
         Value::Vector(b) => crate::engine::vector::normalize_internal(b).ok(),
-        Value::String(s) | Value::Decimal(s) => {
-            crate::engine::vector::coerce_bytes_to_internal(s.as_bytes()).ok()
-        }
-        Value::Bytes(b) => crate::engine::vector::codec::coerce_value(
-            Value::Bytes(b.clone()),
-            crate::vector::VectorDataType::Float32,
-            None,
-        )
-        .ok(),
-        Value::SmallString(_) => {
-            crate::engine::vector::coerce_bytes_to_internal(value.to_display_string().as_bytes())
-                .ok()
+        Value::String(_) | Value::SmallString(_) | Value::Decimal(_) | Value::Bytes(_) => {
+            crate::engine::vector::codec::coerce_value(
+                value.clone(),
+                crate::vector::VectorDataType::Float32,
+                None,
+            )
+            .ok()
         }
         _ => None,
     }
@@ -9784,6 +9780,24 @@ fn try_knn_vector_scan(
         None
     };
     let (col, query_const, metric) = matched?;
+    // A truncated NULLs-first pool cannot provide NULLs-last semantics.
+    // Preserve the fast path when the column and metric cannot produce NULL,
+    // including descending DOT similarity on NOT NULL vector columns.
+    let column = &table.schema.columns[table.schema.column_index(col).ok()?];
+    let cosine_nonzero = metric == crate::engine::vector::Metric::Cosine
+        && table.schema.iter_queryable_indexes().any(|index| {
+            index.is_vector()
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+                && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
+        });
+    if !select.order_by[0].nulls_first_effective()
+        && (column.nullable || (metric == crate::engine::vector::Metric::Cosine && !cosine_nonzero))
+    {
+        return None;
+    }
     // Fold the constant operand to internal bytes. `&[]` is safe — the matcher
     // confirmed it carries no column reference. If it contains a placeholder,
     // keep the expression for execution-time resolution so prepared KNN plans

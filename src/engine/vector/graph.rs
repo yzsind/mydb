@@ -488,8 +488,8 @@ impl VectorGraph {
         // A short result proves exhaustion only if widening `ef` cannot reach
         // more live nodes. The slab search keeps tombstones out of its result
         // pool, so it stops early only after draining its reachable frontier.
-        // Paged traversal still lets tombstones fill the pool; it is exhausted
-        // only once `ef` already spans every node.
+        // Paged exhaustion stays conservative because a bounded navigation
+        // candidate pool can still be truncated before the heap recheck.
         let (candidates, exhausted) = match (self, request.effort) {
             (VectorGraph::Memory(g), VectorSearchEffort::Hnsw { ef }) => {
                 let mut candidates =

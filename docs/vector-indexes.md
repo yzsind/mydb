@@ -157,6 +157,12 @@ effective pool. Larger ef or nprobe explores more candidates; a larger
 re-ranking pool can retain more of them for exact heap scoring. Check the
 effective values in `EXPLAIN` rather than inferring them from one option.
 
+For unquantized HNSW inner-product searches, iterative scanning also widens a mixed-distance
+candidate pool when the LIMIT boundary lies in its final tied plateau.
+This prevents repeated default coordinates from hiding other regions behind
+an apparently sufficient row count. The same scan budget applies; an entirely
+tied pool does not trigger this widening.
+
 ```sql
 SET SESSION mydb_hnsw_ef_search = 200;
 SET SESSION mydb_hnsw_rerank_mult = 8;

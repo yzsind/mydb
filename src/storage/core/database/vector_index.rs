@@ -2188,7 +2188,9 @@ impl Database {
         // rather than current length, is governed for the whole build lifetime.
         let sidecar_meta_bytes = stats
             .rows()
-            .saturating_mul(BUILD_NODE_METADATA_BYTES)
+            // Final reachability validation retains VecIds, a seen byte and
+            // a worst-case pending VecId per node after link scratch is freed.
+            .saturating_mul(BUILD_NODE_METADATA_BYTES + 17)
             .saturating_add(2 * 1024 * 1024);
         let usable_bytes = scratch_bytes.checked_sub(sidecar_meta_bytes).ok_or_else(|| {
             error(
@@ -3014,6 +3016,7 @@ impl Database {
         let mut build_guard = VectorGraphBuildGuard {
             graph: &graph,
             published: false,
+            invalidate_persistent: build,
         };
         #[cfg(test)]
         {
@@ -3031,6 +3034,7 @@ impl Database {
                 }
                 applied = next;
                 for (row_id, vector) in batch {
+                    build_guard.invalidate_persistent = true;
                     graph.replace_row(row_id, vector)?;
                 }
                 crate::engine::cancel::check_cancelled()?;
@@ -3061,6 +3065,7 @@ impl Database {
                 ));
             }
             for (row_id, vector) in batch {
+                build_guard.invalidate_persistent = true;
                 graph.replace_row(row_id, vector)?;
             }
         }
@@ -3126,14 +3131,12 @@ impl Database {
                 );
             }
         }
-        let old = map.get(&key).cloned();
         build_guard.published = true;
         drop(build_guard);
         let graph = Arc::new(graph);
         map.insert(key, graph.clone());
-        if let Some(old) = old {
-            old.invalidate();
-        }
+        // Readers own the previous immutable generation through their Arc.
+        // Publication changes future lookups, not the validity of those reads.
         Ok(graph)
     }
 
@@ -4679,8 +4682,19 @@ impl Database {
             dirty.retain(|lineage| active.contains(lineage));
             (entries, std::mem::take(&mut *dirty))
         };
+        #[cfg(test)]
+        if let Some(hook) = VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK.lock().take() {
+            hook();
+        }
         let result = (|| -> Result<(), QueryError> {
-            for ((table_id, storage_id, _generation, index_name), graph) in &entries {
+            for (key @ (table_id, storage_id, _generation, index_name), graph) in &entries {
+                let current = self.vector_indexes.read();
+                if !current
+                    .get(key)
+                    .is_some_and(|active| Arc::ptr_eq(active, graph))
+                {
+                    continue;
+                }
                 graph.ensure_valid()?;
                 #[cfg(test)]
                 if graph.is_paged_storage() {
@@ -4700,11 +4714,13 @@ impl Database {
                 if table.active_generation.max(1) != generation {
                     continue;
                 }
-                let index = table
+                let Some(index) = table
                     .indexes
                     .iter()
                     .find(|index| index.name.eq_ignore_ascii_case(&index_name))
-                    .ok_or_else(vector::persistence::corrupt)?;
+                else {
+                    continue;
+                };
                 let current = self.vector_indexes.read();
                 if !current
                     .get(&(table_id, storage_id, generation, index_name.clone()))
@@ -4973,14 +4989,17 @@ impl<'a> VectorRetire<'a> {
 struct VectorGraphBuildGuard<'a> {
     graph: &'a VectorGraph,
     published: bool,
+    invalidate_persistent: bool,
 }
 impl Drop for VectorGraphBuildGuard<'_> {
     fn drop(&mut self) {
         if !self.published {
             self.graph.invalidate();
-            if let VectorGraph::Paged(paged) = self.graph {
-                if let Err(err) = paged.file().invalidate_build(0) {
-                    log_message(format!("HNSW failed build invalidation: {err:?}"));
+            if self.invalidate_persistent {
+                if let VectorGraph::Paged(paged) = self.graph {
+                    if let Err(err) = paged.file().invalidate_build(0) {
+                        log_message(format!("HNSW failed build invalidation: {err:?}"));
+                    }
                 }
             }
         }
@@ -5051,6 +5070,11 @@ impl Drop for VectorBuildRegistration<'_> {
 /// it is published, to interleave concurrent DML with the publication window.
 #[cfg(test)]
 pub(crate) static VECTOR_BUILD_BEFORE_PUBLISH_HOOK: parking_lot::Mutex<
+    Option<Box<dyn FnOnce() + Send>>,
+> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK: parking_lot::Mutex<
     Option<Box<dyn FnOnce() + Send>>,
 > = parking_lot::Mutex::new(None);
 

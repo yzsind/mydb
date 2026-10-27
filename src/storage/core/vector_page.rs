@@ -2288,6 +2288,19 @@ impl VectorIndexFile {
         )
     }
 
+    /// Inspect visibility without decoding a vector or its adjacency.
+    pub(crate) fn is_live_node(&self, vid: VecId) -> Result<bool, QueryError> {
+        self.buffer_pool
+            .with_raw_page(self.page_key(vid_page(vid)), |bytes| {
+                if read_u32(bytes, 0) != VEC_NODE_MAGIC {
+                    return Err(crate::engine::vector::persistence::corrupt());
+                }
+                let offset = node_record_offset(bytes, vid_slot(vid))?;
+                Ok(bytes[offset] & (REC_FLAG_INITIALIZED | REC_FLAG_TOMBSTONE)
+                    == REC_FLAG_INITIALIZED)
+            })
+    }
+
     /// Read `vid`'s f32 vector into `out` plus its `(row_id, deleted)` metadata,
     /// borrowing the pinned page and skipping the per-layer neighbour decode +
     /// `NodeView` allocation. Returns `None` for a missing / uninitialised slot.
