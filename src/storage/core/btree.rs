@@ -21719,6 +21719,9 @@ impl CompactChunkAccum {
     }
 }
 
+// A row ID consists of two checked fixed-width fields. Keep those checks
+// visible to the cursor so validated entry bounds eliminate redundant work.
+#[inline(always)]
 fn decode_row_id_v7_from(
     buf: &[u8],
     offset: &mut usize,

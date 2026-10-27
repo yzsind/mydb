@@ -1234,11 +1234,15 @@ impl SessionHandle {
         let mut entry = self.entry.lock();
         entry.command = command;
         entry.info = info.map(|sql| {
-            ProcessSqlText::Owned(if crate::engine::ai::sql::sql_may_have_ai(&sql) {
-                "[redacted AI statement]".to_owned()
-            } else {
-                sql
-            })
+            ProcessSqlText::Owned(
+                if crate::engine::ai::sql::sql_may_have_ai(&sql)
+                    || crate::engine::http::sensitive(&sql)
+                {
+                    crate::engine::http::redaction_marker(&sql, false).to_owned()
+                } else {
+                    sql
+                },
+            )
         });
         entry.killed = false;
         entry.active_stages.fill(0);
@@ -1283,11 +1287,15 @@ impl SessionHandle {
 
     pub(crate) fn set_process_info(&self, info: Option<String>) {
         self.entry.lock().info = info.map(|sql| {
-            ProcessSqlText::Owned(if crate::engine::ai::sql::sql_may_have_ai(&sql) {
-                "[redacted AI statement]".to_owned()
-            } else {
-                sql
-            })
+            ProcessSqlText::Owned(
+                if crate::engine::ai::sql::sql_may_have_ai(&sql)
+                    || crate::engine::http::sensitive(&sql)
+                {
+                    crate::engine::http::redaction_marker(&sql, false).to_owned()
+                } else {
+                    sql
+                },
+            )
         });
     }
 
@@ -1295,8 +1303,10 @@ impl SessionHandle {
     /// short-lived process-list reference disappears at the idle transition.
     pub(crate) fn set_process_info_shared(&self, info: Arc<str>) {
         self.entry.lock().info = Some(ProcessSqlText::Shared(
-            if crate::engine::ai::sql::sql_may_have_ai(&info) {
-                Arc::from("[redacted AI statement]")
+            if crate::engine::ai::sql::sql_may_have_ai(&info)
+                || crate::engine::http::sensitive(&info)
+            {
+                Arc::from(crate::engine::http::redaction_marker(&info, false))
             } else {
                 info
             },
@@ -1917,7 +1927,9 @@ mod tests {
 mod status_tests;
 
 fn redact_ai_prepared(row: &mut PreparedStatementSnapshot) {
-    if crate::engine::ai::sql::sql_may_have_ai(&row.sql_text) {
-        row.sql_text = Arc::from("[redacted AI statement]");
+    if crate::engine::ai::sql::sql_may_have_ai(&row.sql_text)
+        || crate::engine::http::sensitive(&row.sql_text)
+    {
+        row.sql_text = Arc::from(crate::engine::http::redaction_marker(&row.sql_text, false));
     }
 }

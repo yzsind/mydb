@@ -575,6 +575,7 @@ fn execute_statement_inner(
     inherit_view_security: bool,
 ) -> Result<QueryResponse, QueryError> {
     use crate::engine::session_registry::ProcessState;
+    let _http_scope = crate::engine::http::enter(db);
 
     if session.current_database.is_empty()
         && auth_required_privileges(session, &statement)
@@ -759,8 +760,13 @@ fn execute_statement_inner(
         let sequence_dependent = crate::parser::collect_statement_function_names(&statement)
             .iter()
             .any(|name| crate::storage::sequence::is_sequence_function(name));
-        let _serial_guard = (function_resolution.needs_serial || sequence_dependent)
-            .then(crate::planner::force_serial_scope);
+        let http_dependent = crate::engine::http::statement_has_http(&statement);
+        if http_dependent {
+            crate::engine::http::activate();
+        }
+        let _serial_guard =
+            (function_resolution.needs_serial || sequence_dependent || http_dependent)
+                .then(crate::planner::force_serial_scope);
         // Even a read-only stored function may execute nested DO/SELECT
         // statements. Hold their transaction finalization until the owning
         // statement boundary; otherwise an inner autocommit statement can
@@ -792,6 +798,8 @@ fn execute_statement_inner(
         };
         if sequence_dependent {
             response.and_then(QueryResponse::materialize)
+        } else if http_dependent {
+            response.map(crate::engine::http::wrap_response)
         } else {
             response
         }
@@ -3300,6 +3308,7 @@ pub(super) fn execute_statement_with_qualification(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     if already_qualified
+        && !crate::engine::http::statement_has_http(&statement)
         && !matches!(statement, Statement::Call(_))
         && !super::routines::statement_references_stored_function(
             db,
@@ -3463,6 +3472,9 @@ fn auth_required_privileges(
     };
     match statement {
         Statement::Ai(_) => Vec::new(),
+        Statement::AlterSystemReloadHttpConfig | Statement::ShowHttpStatus => {
+            vec![global(Privilege::Dynamic("HTTP_ADMIN".into()))]
+        }
         Statement::CreateDatabase { name, .. } => vec![database(Privilege::Create, name)],
         Statement::AlterDatabase { name, .. } => vec![database(
             Privilege::Alter,
@@ -7212,6 +7224,10 @@ fn execute_sql_prepared(
                 format!("Unknown prepared statement handler ({name}) given to EXECUTE"),
             )
         })?;
+    if crate::engine::http::may_call(db, &prepared.original_sql) {
+        crate::engine::http::activate();
+        crate::engine::cbo::trace::redact_external();
+    }
     let execute_started = std::time::Instant::now();
     if using.len() != prepared.parameter_count {
         session.record_sql_prepared_execute(name, execute_started.elapsed(), true);
@@ -7367,6 +7383,9 @@ pub(super) fn execute_qualified_statement(
             Statement::Revoke(r) => Some(&r.kind),
             _ => None,
         };
+        if session.sql_log_bin && kind.is_some_and(|kind| matches!(kind, GrantKind::Privileges { privileges, .. } if privileges.iter().any(|p| p.name.to_ascii_uppercase().starts_with("HTTP_")))) {
+            return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP privileges cannot be written to MySQL binlog"));
+        }
         if kind.is_some_and(|kind|matches!(kind,GrantKind::Privileges{privileges,..} if privileges.iter().any(|p|p.name.to_ascii_uppercase().starts_with("AI_")))) {return Err(crate::engine::ai::error("ER_AI_UNSUPPORTED_CONTEXT","AI privileges cannot be written to MySQL binlog"));}
     }
     if let Statement::DropDatabase { name, .. } = &statement {
@@ -7404,6 +7423,32 @@ pub(super) fn execute_qualified_statement(
     let temporal_context = super::temporal::preflight_statement(db, &statement)?;
     let _temporal_scope = temporal_context.map(|context| super::temporal::enter(Some(context)));
     match statement {
+        Statement::AlterSystemReloadHttpConfig => {
+            crate::engine::http::authorize(db, &session.authorization_context(), "HTTP_ADMIN")?;
+            crate::engine::http::reload()?;
+            Ok(QueryResponse::Ok)
+        }
+        Statement::ShowHttpStatus => {
+            crate::engine::http::authorize(db, &session.authorization_context(), "HTTP_ADMIN")?;
+            Ok(QueryResponse::ResultSet(ResultSet {
+                columns: vec![
+                    Column {
+                        name: "Variable_name".into(),
+                        column_type: ColumnType::VarString,
+                        source: Default::default(),
+                    },
+                    Column {
+                        name: "Value".into(),
+                        column_type: ColumnType::LongLong,
+                        source: Default::default(),
+                    },
+                ],
+                rows: crate::engine::http::status()
+                    .into_iter()
+                    .map(|(k, v)| vec![Value::String(k), Value::UInt(v)])
+                    .collect(),
+            }))
+        }
         Statement::Ai(command) => ai::admin(db, session, command, registry),
         Statement::Begin {
             read_only,

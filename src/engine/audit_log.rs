@@ -196,8 +196,8 @@ pub fn record_statement(
         status: if err.is_some() { "error" } else { "ok" },
         error_code: err.map(|e| e.code()),
         error_message: err.map(|e| {
-            if crate::engine::ai::sql::sql_may_have_ai(sql) {
-                "[redacted AI statement error]"
+            if crate::engine::ai::sql::sql_may_have_ai(sql) || crate::engine::http::sensitive(sql) {
+                crate::engine::http::redaction_marker(sql, true)
             } else {
                 e.message()
             }

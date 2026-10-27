@@ -475,6 +475,8 @@ scalar_catalog! {
             [("CONV", "conv"), ("GREATEST", "greatest"), ("LEAST", "least"), ("INSERT", "insert"), ("BIN_TO_UUID", "bin_to_uuid"), ("INET6_NTOA", "inet6_ntoa"), ("CONVERT_USING", "convert_using"), ("COLLATE", "collate")] => (Unknown, VarString, None, false);
         }
         LegacySession {
+            [("HTTP_GET", "http_get"), ("HTTP_HEAD", "http_head"), ("HTTP_OPTIONS", "http_options"), ("HTTP_DELETE", "http_delete")] => (Volatile, Json, ( HttpRead, 1, 2, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
+            [("HTTP_REQUEST", "http_request"), ("HTTP_POST", "http_post"), ("HTTP_PUT", "http_put"), ("HTTP_PATCH", "http_patch")] => (Volatile, Json, ( HttpWrite, 2, 3, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
             [("__TIMESTAMP_LITERAL", "__timestamp_literal")] => (Unknown, DateTime, None, true);
         }
         None {

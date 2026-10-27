@@ -5865,6 +5865,7 @@ fn validate_functional_index_expression(expr: &Expr, source: &str) -> Result<(),
 }
 
 pub(crate) fn is_nondeterministic_function(name: &str) -> bool {
+    if crate::engine::http::is_function(name) { return true; }
     matches!(
         name.to_ascii_uppercase().as_str(),
         "NOW"

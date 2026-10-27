@@ -1512,3 +1512,9 @@ API keys are encrypted database metadata. The master key comes from the
 Keep master keys separate from database backups and deploy matching keys to
 replicas independently. See [LLM and Embedding Calls](ai.md) for the exact key
 format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.
+
+## HTTP SQL calls
+
+HTTP client SQL functions are enabled by default and require `HTTP_USE`. See
+[HTTP SQL Functions](http.md#node-configuration) for the `http_*` startup options,
+node egress policy, private CA bindings, account quotas, and runtime controls.

@@ -435,6 +435,8 @@ pub enum Statement {
     AlterSystemCheckpoint,
     AlterSystemFlushDataCache,
     AlterSystemFlushSqlCache,
+    AlterSystemReloadHttpConfig,
+    ShowHttpStatus,
     ShowPrivileges,
     CreateUser(CreateUser),
     AlterUser(AlterUser),

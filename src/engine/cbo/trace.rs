@@ -20,6 +20,7 @@ struct TraceRow {
 #[derive(Default)]
 struct WorkingTrace {
     query: String,
+    redact_details: bool,
     events: Vec<JsonValue>,
 }
 
@@ -82,8 +83,11 @@ pub(crate) fn begin(query: &str) {
     traces.working.insert(
         connection_id,
         WorkingTrace {
-            query: if crate::engine::ai::sql::sql_may_have_ai(query) {
-                "[redacted AI statement]".into()
+            redact_details: crate::engine::http::sensitive(query),
+            query: if crate::engine::ai::sql::sql_may_have_ai(query)
+                || crate::engine::http::sensitive(query)
+            {
+                crate::engine::http::redaction_marker(query, false).into()
             } else {
                 query.to_owned()
             },
@@ -96,6 +100,28 @@ pub(crate) fn begin(query: &str) {
     );
 }
 
+/// A prepared or dynamic statement can reveal external effects after the
+/// outer SQL text was published. Redact before executing its bound body.
+pub(crate) fn redact_external() {
+    let Some(connection_id) = event_connection() else {
+        return;
+    };
+    let mut traces = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(trace) = traces.working.get_mut(&connection_id) {
+        trace.query = "[redacted HTTP statement]".into();
+        trace.redact_details = true;
+        for event in &mut trace.events {
+            if event.get("detail").is_some() {
+                event["detail"] = json!({"redacted":true});
+            }
+        }
+    } else if let Some(trace) = traces.last.get_mut(&connection_id) {
+        trace.query = "[redacted HTTP statement]".into();
+        trace.trace = json!({"redacted":true}).to_string();
+        trace.missing_bytes = 0;
+    }
+}
+
 pub(crate) fn event(stage: &'static str, detail: JsonValue) {
     let Some(connection_id) = event_connection() else {
         return;
@@ -105,6 +131,11 @@ pub(crate) fn event(stage: &'static str, detail: JsonValue) {
         return;
     };
     if trace.events.len() < MAX_EVENTS {
+        let detail = if trace.redact_details {
+            json!({"redacted": true})
+        } else {
+            detail
+        };
         trace.events.push(json!({"stage": stage, "detail": detail}));
     }
 }

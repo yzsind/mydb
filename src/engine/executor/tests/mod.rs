@@ -1,4 +1,5 @@
 mod ai;
+mod http;
 mod critical_audit;
 mod ddl_lock_contract;
 mod fresh_release_audit;

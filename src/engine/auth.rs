@@ -3345,6 +3345,8 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
     static SET: std::sync::OnceLock<Vec<Privilege>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         [
+            "HTTP_ADMIN",
+            "HTTP_USE",
             "AI_ADMIN",
             "AI_USE",
             "APPLICATION_PASSWORD_ADMIN",

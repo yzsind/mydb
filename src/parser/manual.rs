@@ -2104,6 +2104,8 @@ pub(super) fn parse_manual_mysql_admin_statement(sql: &str) -> Option<Statement>
         }
         "SHOW PRIVILEGES" => return Some(Statement::ShowPrivileges),
         "SHOW PLUGINS" => return Some(Statement::ShowPlugins),
+        "ALTER SYSTEM RELOAD HTTP CONFIG" => return Some(Statement::AlterSystemReloadHttpConfig),
+        "SHOW HTTP STATUS" => return Some(Statement::ShowHttpStatus),
         "ALTER SYSTEM CHECKPOINT" => return Some(Statement::AlterSystemCheckpoint),
         "ALTER SYSTEM FLUSH DATA_CACHE" => return Some(Statement::AlterSystemFlushDataCache),
         "ALTER SYSTEM FLUSH SQL_CACHE" => return Some(Statement::AlterSystemFlushSqlCache),

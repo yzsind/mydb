@@ -1,4 +1,5 @@
 pub(crate) mod ai;
+pub(crate) mod http;
 pub mod api;
 pub mod audit_log;
 pub mod auth;

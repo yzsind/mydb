@@ -7615,6 +7615,11 @@ fn placeholder_table_ref(alias: String) -> TableRef {
 /// body containing one of these must not let flatten duplicate it across outer
 /// references, so we force `no_merge` (materialise once).
 fn function_is_nondeterministic(name: &str) -> bool {
+    if crate::engine::http::is_function(name)
+        || crate::engine::expr::function_has_external_effect(name)
+    {
+        return true;
+    }
     matches!(
         name.to_ascii_uppercase().as_str(),
         "RAND"

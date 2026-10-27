@@ -4034,17 +4034,20 @@ fn derived_inner_expr_unsafe(expr: &Expr) -> bool {
 fn expr_has_observable_side_effect(expr: &Expr) -> bool {
     match expr {
         Expr::Function { name, args, .. } => {
-            matches!(
-                name.to_ascii_uppercase().as_str(),
-                "__SET_USER_VAR"
-                    | "NEXTVAL"
-                    | "SETVAL"
-                    | "SLEEP"
-                    | "GET_LOCK"
-                    | "RELEASE_LOCK"
-                    | "RELEASE_ALL_LOCKS"
-                    | "LOAD_FILE"
-            ) || args.iter().any(expr_has_observable_side_effect)
+            crate::engine::http::is_function(name)
+                || crate::engine::expr::function_has_external_effect(name)
+                || matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "__SET_USER_VAR"
+                        | "NEXTVAL"
+                        | "SETVAL"
+                        | "SLEEP"
+                        | "GET_LOCK"
+                        | "RELEASE_LOCK"
+                        | "RELEASE_ALL_LOCKS"
+                        | "LOAD_FILE"
+                )
+                || args.iter().any(expr_has_observable_side_effect)
         }
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)

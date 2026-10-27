@@ -140,6 +140,8 @@ macro_rules! define_walk {
                 | Statement::AlterSystemCheckpoint
                 | Statement::AlterSystemFlushDataCache
                 | Statement::AlterSystemFlushSqlCache
+                | Statement::AlterSystemReloadHttpConfig
+                | Statement::ShowHttpStatus
                 | Statement::ShowPrivileges
                 | Statement::CreateUser(_)
                 | Statement::AlterUser(_)

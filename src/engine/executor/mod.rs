@@ -2585,6 +2585,7 @@ impl StorageQueryEngine {
         ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata),
     ) -> Result<QueryResponse, QueryError> {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         self.db.ensure_operational()?;
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
@@ -2604,6 +2605,10 @@ impl StorageQueryEngine {
             ),
         );
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         crate::engine::cancel::set_process_base_state(process_state_for_sql(sql));
         // LOAD_FILE is evaluated only on this connection thread and reads the
@@ -2637,7 +2642,8 @@ impl StorageQueryEngine {
         // the statement serial when it references a sequence function.
         let _force_serial = (sequence_dependent
             || crate::planner::sql_mentions_user_var_assign(sql)
-            || crate::planner::sql_mentions_load_file_fn(sql))
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
         // Publish the session's `group_concat_max_len` to the
         // thread-local that `GroupConcatAcc::new` reads. Scoped via
@@ -3174,6 +3180,7 @@ impl StorageQueryEngine {
     }
 
     pub fn shutdown(&self) -> Result<(), QueryError> {
+        crate::engine::http::shutdown_database(&self.db)?;
         crate::engine::ai::runtime::shutdown_database(&self.db)?;
         crate::backup::shutdown_jobs(&self.db)?;
         // No background writer may race the final checkpoint. In
@@ -3270,6 +3277,10 @@ impl StorageQueryEngine {
 }
 
 impl QueryEngine for StorageQueryEngine {
+    fn sql_may_call_http(&self, sql: &str) -> bool {
+        crate::engine::http::may_call(&self.db, sql)
+    }
+
     fn enter_memory_reclaim_scope(&self) -> Option<mem_budget::ReclaimDatabaseScope> {
         Some(mem_budget::ReclaimDatabaseScope::enter(&self.db))
     }
@@ -3307,6 +3318,9 @@ impl QueryEngine for StorageQueryEngine {
         Vec<crate::engine::api::DmlStatementResult>,
         Result<QueryResponse, QueryError>,
     )> {
+        if crate::engine::http::may_call(&self.db, sql) {
+            return None;
+        }
         // The compiled batch bypasses execute_with_log_metadata, which normally
         // installs the session timeout for the coalesced row-lock acquisition.
         let _lock_wait = crate::storage::LockWaitTimeoutGuard::new(Some(
@@ -3425,6 +3439,7 @@ impl QueryEngine for StorageQueryEngine {
         expected_param_count: usize,
     ) -> Result<Arc<Statement>, QueryError> {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         // The parser cache owns an unqualified immutable AST. Qualification is
         // intentionally repeated at PREPARE time so temporary-table shadowing
@@ -3439,6 +3454,10 @@ impl QueryEngine for StorageQueryEngine {
                     "placeholder count mismatch: parsed {next}, expected {expected_param_count}"
                 ),
             ));
+        }
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
         }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         crate::engine::cancel::set_process_base_state(
@@ -3483,6 +3502,7 @@ impl QueryEngine for StorageQueryEngine {
                     format!("placeholder count mismatch: parsed {count}, expected {expected_param_count}"),
                 ));
             }
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             crate::engine::cancel::set_process_base_state(
                 crate::engine::session_registry::ProcessState::Preparing,
@@ -3767,6 +3787,7 @@ impl QueryEngine for StorageQueryEngine {
             return result;
         }
         if let Statement::LoadData(stmt) = statement {
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             // Install the session expr view so storage-side `coerce_row`
             // and the general LOAD path see the real sql_mode (G4). The
@@ -3835,6 +3856,7 @@ impl QueryEngine for StorageQueryEngine {
             )
         };
         let result = if let Statement::LoadData(stmt) = statement {
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             let session_ptr = std::ptr::NonNull::from(&*session);
             let result = unsafe {
@@ -3897,9 +3919,14 @@ impl QueryEngine for StorageQueryEngine {
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         let preserve_warnings = begin_statement_diagnostics(session, sql);
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         // SAFETY: db/session outlive this statement, including the constant
         // SELECT lane that bypasses dispatch. Sequence calls remain serial.
@@ -3918,7 +3945,8 @@ impl QueryEngine for StorageQueryEngine {
         };
         let _force_serial = (sequence_dependent
             || crate::planner::sql_mentions_user_var_assign(sql)
-            || crate::planner::sql_mentions_load_file_fn(sql))
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
         let (result, metadata) = match statement.as_ref() {
             Statement::Select(select)
@@ -4058,8 +4086,10 @@ impl QueryEngine for StorageQueryEngine {
                 std::ptr::NonNull::from(&*session),
             )
         };
-        let _force_serial = (sequence_dependent || crate::planner::sql_mentions_load_file_fn(sql))
-            .then(crate::planner::force_serial_scope);
+        let _force_serial = (sequence_dependent
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
+        .then(crate::planner::force_serial_scope);
         // Prepared-statement EXECUTE bypasses `execute_statement` (which is
         // where L8 quota enforcement normally runs). Charge the per-account
         // budget here so sqlx / Connector/J prepared-binding apps don't sneak
@@ -4102,6 +4132,10 @@ impl QueryEngine for StorageQueryEngine {
         }
         let use_shared_plan_cache =
             should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement);
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if crate::engine::http::may_call(&self.db, sql) {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         let result = if use_shared_plan_cache && !statement_skips_plan_cache_hint(&statement) {
             // Prepared statements feed the plan cache through the same hint
@@ -4163,6 +4197,7 @@ impl QueryEngine for StorageQueryEngine {
         // and keep the read-only prepared fast path unchanged.
         if crate::planner::sql_mentions_sequence_fn(sql)
             || crate::engine::ai::sql::sql_may_have_ai(sql)
+            || crate::engine::http::may_call(&self.db, sql)
         {
             return None;
         }
@@ -4311,6 +4346,9 @@ impl QueryEngine for StorageQueryEngine {
         session: &mut SessionContext,
         sql: &str,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if crate::engine::http::may_call(&self.db, sql) {
+            return None;
+        }
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let parse_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
         let statement = {
@@ -4370,10 +4408,15 @@ impl QueryEngine for StorageQueryEngine {
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         self.db.ensure_operational()?;
         let preserve_warnings = begin_statement_diagnostics(session, sql);
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         // SAFETY: db/session outlive this statement, including the constant
         // SELECT lane that bypasses dispatch. Sequence calls remain serial.
@@ -4392,7 +4435,8 @@ impl QueryEngine for StorageQueryEngine {
         };
         let _force_serial = (sequence_dependent
             || crate::planner::sql_mentions_user_var_assign(sql)
-            || crate::planner::sql_mentions_load_file_fn(sql))
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
         let Statement::Select(select) = statement.as_ref() else {
             return self.execute_parsed(session, sql, statement);
@@ -4440,6 +4484,7 @@ impl StorageQueryEngine {
         }
         let preserve_warnings = begin_statement_diagnostics(session, sql);
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         // SAFETY: db/session outlive this statement, including the constant
         // SELECT lane that bypasses dispatch. Sequence calls remain serial.
@@ -4554,6 +4599,7 @@ impl StorageQueryEngine {
         // the session into the shared-borrow execution closure below.
         let (txn, _snapshot_guard) = tx::prepared_select_read_view(&self.db, session, select)?;
         let connection_id = session.connection_id as u64;
+        let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         let result = crate::engine::params::with_params_slice(params, || {
             crate::engine::expr::with_session_expr_info(session, || {
@@ -4602,6 +4648,9 @@ impl StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if crate::engine::http::may_call(&self.db, sql) {
+            return None;
+        }
         use crate::engine::api::PreparedDmlState;
         if !self.plan_cache_enabled || !prepared_dml_cache_enabled() {
             return None;
@@ -4725,6 +4774,7 @@ impl StorageQueryEngine {
             if let Err(err) = session.check_cancelled() {
                 return (Err(err), wait_stats);
             }
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             // SAFETY: `session` lives for the entire duration of this
             // function — we hold the `&mut SessionContext` parameter on
@@ -4757,6 +4807,16 @@ impl StorageQueryEngine {
                         clear_session_lock_wait(&self.db, session);
                     }
                     return (Ok(resp), wait_stats);
+                }
+                Err(err) if is_lock_wait_pending(&err) && crate::engine::http::sent() => {
+                    clear_session_lock_wait(&self.db, session);
+                    let failure = crate::engine::http::error("ER_HTTP_REPLAY_FORBIDDEN", "lock wait requires replay after an HTTP send; external effects may have occurred");
+                    if let Err(cleanup) =
+                        self.finalize_failed_statement_transaction(session, &failure)
+                    {
+                        return (Err(cleanup), wait_stats);
+                    }
+                    return (Err(failure), wait_stats);
                 }
                 Err(err) if is_lock_wait_pending(&err) => {
                     waited_for_lock = true;
@@ -5517,6 +5577,7 @@ impl StorageQueryEngine {
         let mut metadata = QueryLogMetadata::default();
         let mut response = QueryResponse::Ok;
         while index < ranges.len() {
+            let _http_statement = crate::engine::http::fresh_statement();
             let range = ranges[index].clone();
             let _mode = crate::parser::ParserSqlModeGuard::activate(mode);
             let child_sql = &effective[range.clone()];
@@ -5944,6 +6005,16 @@ impl StorageQueryEngine {
                     }
                     return (Ok(response), wait_stats);
                 }
+                Err(err) if is_lock_wait_pending(&err) && crate::engine::http::sent() => {
+                    clear_session_lock_wait(&self.db, session);
+                    let failure = crate::engine::http::error("ER_HTTP_REPLAY_FORBIDDEN", "lock wait requires replay after an HTTP send; external effects may have occurred");
+                    if let Err(cleanup) =
+                        self.finalize_failed_statement_transaction(session, &failure)
+                    {
+                        return (Err(cleanup), wait_stats);
+                    }
+                    return (Err(failure), wait_stats);
+                }
                 Err(err) if is_lock_wait_pending(&err) => {
                     waited_for_lock = true;
                     next_statement = retry_clone;
@@ -6230,7 +6301,7 @@ impl StorageQueryEngine {
                     session.current_database,
                     err.code(),
                     err.sql_state(),
-                    if crate::engine::ai::sql::sql_may_have_ai(sql) { "[redacted AI statement error]" } else { err.message() },
+                    if crate::engine::ai::sql::sql_may_have_ai(sql) || crate::engine::http::sensitive(sql) { crate::engine::http::redaction_marker(sql, true) } else { err.message() },
                 ));
             }
         }

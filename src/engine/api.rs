@@ -1048,6 +1048,9 @@ impl std::fmt::Debug for ResultBatch {
 }
 
 pub trait ResultCursor: Send + std::fmt::Debug {
+    fn external_http_io(&self) -> bool {
+        false
+    }
     /// External streams own their relational input and need a dedicated worker.
     fn external_io(&self) -> bool {
         false
@@ -1097,6 +1100,9 @@ struct TimestampLocalizingCursor {
 }
 
 impl ResultCursor for TimestampLocalizingCursor {
+    fn external_http_io(&self) -> bool {
+        self.inner.external_http_io()
+    }
     fn external_io(&self) -> bool {
         self.inner.external_io()
     }
@@ -1158,6 +1164,18 @@ impl ChainedCursor {
 }
 
 impl ResultCursor for ChainedCursor {
+    fn external_io(&self) -> bool {
+        self.current
+            .iter()
+            .chain(self.remaining.iter())
+            .any(|c| c.external_io())
+    }
+    fn external_http_io(&self) -> bool {
+        self.current
+            .iter()
+            .chain(self.remaining.iter())
+            .any(|c| c.external_http_io())
+    }
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         while let Some(cursor) = self.current.as_mut() {
             match cursor.next_row()? {
@@ -1596,6 +1614,11 @@ pub struct DmlStatementResult {
 }
 
 pub trait QueryEngine: Send + Sync + 'static {
+    /// Conservative catalog-aware scheduling hint, never an execution step.
+    fn sql_may_call_http(&self, sql: &str) -> bool {
+        crate::engine::http::mentions(sql)
+    }
+
     fn execute(&self, session: &mut SessionContext, sql: &str)
         -> Result<QueryResponse, QueryError>;
 

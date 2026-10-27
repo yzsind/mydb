@@ -59,3 +59,5 @@ execution, and storage documentation.
 - The [metadata compatibility matrix](mysql80-metadata-compat-matrix.json) and the [protocol compatibility matrix](mysql80-protocol-compat-matrix.json).
 - Pinned MySQL 8.0.46 baselines: [INFORMATION_SCHEMA](fixtures/mysql80-information-schema-8.0.46.json), [Performance Schema](fixtures/mysql80-performance-schema-8.0.46.json), [SHOW STATUS](fixtures/mysql80-show-status-8.0.46.json).
 - [Unicode license](UNICODE-LICENSE.txt).
+
+- [HTTP SQL Functions](http.md): bounded outbound HTTP/HTTPS calls from SQL.

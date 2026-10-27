@@ -138,6 +138,17 @@ def main() -> int:
     documented = documented_names()
     tests = test_names()
     fixtures = fixture_functions(errors)
+    # External HTTP functions have deterministic loopback integration tests,
+    # rather than MySQL oracle fixtures (MySQL has no corresponding functions).
+    catalog = (ROOT / "src/engine/builtin_catalog.rs").read_text()
+    external = set(re.findall(r'\("(HTTP_[A-Z_]+)",\s*"http_[a-z_]+"\)', catalog))
+    external_tests = names_from_const(ROOT / "src/engine/executor/tests/http.rs", "HTTP_TEST_FUNCTIONS")
+    if external_tests != external:
+        errors.append("HTTP function registrations and live integration coverage differ")
+    if not external.issubset(documented):
+        errors.append("HTTP function documentation is incomplete")
+    documented -= external
+    registered -= external
 
     if len(tests) != len(set(tests)):
         errors.append("duplicate function_fixture_test invocation")

@@ -594,7 +594,11 @@ fn fire_event(inner: &Arc<EventSchedulerInner>, event: &EventSchema, fire_ms: u6
             "event scheduler: event '{}.{}' failed: {}",
             event.database,
             event.name,
-            err.message()
+            if crate::engine::http::may_call(&inner.db, &event.body_sql) {
+                "[redacted HTTP event error]"
+            } else {
+                err.message()
+            }
         ));
     }
     // A worker may finish after ALTER. Only its claimed definition may
@@ -654,6 +658,12 @@ fn run_event_body_with_tracking(
         ));
     }
 
+    let http_dependent = crate::engine::http::may_call(db, &event.body_sql);
+    let _http_scope = crate::engine::http::enter(db);
+    if http_dependent {
+        crate::engine::http::activate();
+    }
+    let _http_serial = http_dependent.then(crate::planner::force_serial_scope);
     let mut session = SessionContext::default();
     let process = registry.register_background(
         "event_scheduler".to_string(),
@@ -661,7 +671,7 @@ fn run_event_body_with_tracking(
         Some(event.database.clone()),
         "Query",
         crate::engine::session_registry::ProcessState::Executing,
-        Some(event.body_sql.clone()),
+        Some(crate::engine::logging::redact_sql_for_log(&event.body_sql)),
     );
     let _active_process = process.as_ref().and_then(|process| {
         let active = active_processes?;
@@ -707,17 +717,26 @@ fn run_event_body_with_tracking(
 
     // Keep the ordinary SQL path lightweight. Stored-program statements
     // (BEGIN blocks, IF, WHILE, ...) use the compiled routine executor.
+    let _cancel_scope = crate::engine::cancel::install_session_cancel_context(&session);
+    let session_ptr = std::ptr::NonNull::from(&session);
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Ok(statements) = parse_statements(&event.body_sql) {
-            for statement in statements {
-                crate::mysql::connection_manager::record_internal_query();
-                super::authorize_statement(db, &session, &statement)?;
-                super::dispatch_execute_statement(db, &mut session, statement, registry)?
-                    .materialize()?;
-            }
-            Ok(())
-        } else {
-            super::routines::execute_event_body(db, &mut session, event, registry)
+        // SAFETY: the event owns this pinned session on one worker. Every
+        // result is drained before the scope ends; nested security/session
+        // changes must be visible to expression evaluation on that worker.
+        unsafe {
+            crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
+                if let Ok(statements) = parse_statements(&event.body_sql) {
+                    for statement in statements {
+                        crate::mysql::connection_manager::record_internal_query();
+                        super::authorize_statement(db, &session, &statement)?;
+                        super::dispatch_execute_statement(db, &mut session, statement, registry)?
+                            .materialize()?;
+                    }
+                    Ok(())
+                } else {
+                    super::routines::execute_event_body(db, &mut session, event, registry)
+                }
+            })
         }
     }));
     // The background session is not a protocol Session and therefore has no

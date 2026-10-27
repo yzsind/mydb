@@ -718,7 +718,8 @@ fn collect_generated_expr_columns(
                 collect_generated_expr_column(table, generated_idx, column, out)?;
             }
             Expr::Function { name, distinct, .. } => {
-                if name.eq_ignore_ascii_case("STATEMENT_DIGEST")
+                if crate::engine::http::is_function(name)
+                    || name.eq_ignore_ascii_case("STATEMENT_DIGEST")
                     || name.eq_ignore_ascii_case("STATEMENT_DIGEST_TEXT")
                 {
                     return Err(error(
@@ -4736,6 +4737,9 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
                 "generated column cannot be AUTO_INCREMENT",
             ));
         }
+    }
+    if column.default.as_ref().is_some_and(|expr| crate::parser::visit::any_expr(expr, |node| matches!(node, crate::parser::Expr::Function {name,..} if crate::engine::http::is_function(name) || (name != crate::parser::DEFAULT_EXPR_SENTINEL && !crate::engine::cbo::function_cost::is_known_builtin_function(name))))) {
+        return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP calls are forbidden in column defaults"));
     }
     if let Some(crate::parser::Expr::Function { name, args, .. }) = column.default.as_ref() {
         if name == crate::parser::DEFAULT_EXPR_SENTINEL

@@ -151,6 +151,8 @@ pub(crate) struct BuiltinSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BuiltinId {
+    HttpRead,
+    HttpWrite,
     AiGenerate,
     AiDetail,
     AiEmbed,

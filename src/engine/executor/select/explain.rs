@@ -2728,6 +2728,7 @@ fn expr_is_nondeterministic(expr: &Expr) -> bool {
                         | "__SET_USER_VAR"
                 );
                 volatile
+                    || crate::engine::expr::function_has_external_effect(name)
                     || crate::engine::expr_type::builtin_spec(name).is_some_and(|spec| {
                         spec.volatility == crate::engine::expr_type::Volatility::Volatile
                     })

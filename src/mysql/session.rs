@@ -2102,7 +2102,15 @@ where
         }
     }
 
+    fn sql_may_call_http(&self, sql: &str) -> bool {
+        self.engine
+            .sql_may_call_http(crate::engine::http::bound_sql(&self.context, sql))
+    }
+
     fn mark_busy(&self, command: &'static str, info: Option<String>) {
+        if let Some(sql) = &info {
+            self.sql_may_call_http(sql);
+        }
         if let Some(handle) = &self.handle {
             handle.mark_busy(
                 command,
@@ -3656,6 +3664,15 @@ where
             DdlCacheScope::Global => {
                 self.engine.invalidate_statement_cache();
             }
+        }
+
+        // Catalog-aware dispatch includes HTTP hidden behind views, routines,
+        // or triggers before any inline SQL path can block a Tokio worker.
+        if self.sql_may_call_http(sql.as_str())
+            && !looks_like_load_data_local(sql.as_str(), lex_mode)
+        {
+            let result = self.execute_engine_blocking(sql.to_string()).await;
+            return self.write_query_response(result).await;
         }
 
         // Bare transaction control never waits for a row lock: COMMIT
@@ -5792,6 +5809,7 @@ where
         let found_rows = result.found_rows;
         let mut cursor = result.cursor;
         let external = cursor.external_io();
+        let http = cursor.external_http_io();
         let batch_rows = if external {
             cursor
                 .external_batch_rows()
@@ -5806,7 +5824,11 @@ where
             let cols = Arc::clone(&columns);
             let zf = Arc::clone(&zerofill);
             let _admission = if external {
-                match crate::engine::ai::runtime::admit_coordinator() {
+                match if http {
+                    crate::engine::http::admit_coordinator()
+                } else {
+                    crate::engine::ai::runtime::admit_coordinator()
+                } {
                     Ok(p) => Some(p),
                     Err(e) => {
                         return finish_failed_stream(batch, sequence_id, &e, &mut self.text_batch)
@@ -5877,7 +5899,9 @@ where
                 }
                 (cursor, encoded, err, exhausted, memory_charge)
             };
-            let pulled = if external {
+            let pulled = if http {
+                crate::engine::http::spawn_coordinator(work)
+            } else if external {
                 crate::engine::ai::runtime::spawn_coordinator(work)
             } else {
                 crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -6210,8 +6234,13 @@ where
             .cloned()
             .unwrap_or_else(crate::engine::cancel::QueryCancelToken::noop);
         let external = cursor.external_io();
+        let http = cursor.external_http_io();
         let _admission = if external {
-            match crate::engine::ai::runtime::admit_coordinator() {
+            match if http {
+                crate::engine::http::admit_coordinator()
+            } else {
+                crate::engine::ai::runtime::admit_coordinator()
+            } {
                 Ok(p) => Some(p),
                 Err(e) => {
                     self.write_error_packet(self.command_response_sequence, &e)
@@ -6226,7 +6255,9 @@ where
             let first = cancel.check().and_then(|()| cursor.next_row());
             (cursor, first)
         };
-        let peek = if external {
+        let peek = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if external {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else {
             crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -6447,8 +6478,13 @@ where
         while remaining != 0 && !exhausted {
             let cols = columns.clone();
             let external = prepared_cursor.inner.external_io();
+            let http = prepared_cursor.inner.external_http_io();
             let _admission = if external {
-                match crate::engine::ai::runtime::admit_coordinator() {
+                match if http {
+                    crate::engine::http::admit_coordinator()
+                } else {
+                    crate::engine::ai::runtime::admit_coordinator()
+                } {
                     Ok(p) => Some(p),
                     Err(e) => {
                         fetch_err = Some(e);
@@ -6523,7 +6559,9 @@ where
                 }
                 (prepared_cursor, encoded, err, memory_charge)
             };
-            let join_result = if external {
+            let join_result = if http {
+                crate::engine::http::spawn_coordinator(work)
+            } else if external {
                 crate::engine::ai::runtime::spawn_coordinator(work)
             } else {
                 crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -6887,7 +6925,15 @@ where
         // pulled lazily during socket writeback, so server memory stays
         // bounded even on a `SELECT * FROM huge_table`.
         let ai = crate::engine::ai::sql::sql_may_have_ai(&sql);
-        let _admission = if ai {
+        let http = self.sql_may_call_http(&sql);
+        let _http_session = if http {
+            Some(crate::engine::http::admit_session(&self.context).await?)
+        } else {
+            None
+        };
+        let _admission = if http {
+            Some(crate::engine::http::admit_coordinator()?)
+        } else if ai {
             Some(crate::engine::ai::runtime::admit_coordinator()?)
         } else {
             None
@@ -6898,7 +6944,9 @@ where
             let result = engine.execute(&mut context, &sql);
             (context, result)
         };
-        let job = if ai {
+        let job = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
@@ -6920,7 +6968,15 @@ where
         // there is no reason to throw away that authoritative AST and parse
         // the identical COM_QUERY a second time on the worker.
         let ai = crate::engine::ai::sql::statement_has_ai(&statement);
-        let _admission = if ai {
+        let http = self.sql_may_call_http(&sql);
+        let _http_session = if http {
+            Some(crate::engine::http::admit_session(&self.context).await?)
+        } else {
+            None
+        };
+        let _admission = if http {
+            Some(crate::engine::http::admit_coordinator()?)
+        } else if ai {
             Some(crate::engine::ai::runtime::admit_coordinator()?)
         } else {
             None
@@ -6944,7 +7000,9 @@ where
             };
             (context, result)
         };
-        let job = if ai {
+        let job = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else if needs_async_progress {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
@@ -7283,7 +7341,8 @@ where
         // demand. Materializing up front would defeat server-side cursor
         // fetching (`useCursorFetch=true`) by buffering the full result
         // set in memory before the FETCH loop even starts.
-        if statement_is_lock_safe_read(&statement)
+        if !self.sql_may_call_http(&sql)
+            && statement_is_lock_safe_read(&statement)
             && !statement_has_computed_ordering(&statement)
             && context_allows_inline_lock_safe_read(&self.context)
         {
@@ -7319,8 +7378,26 @@ where
             self.acquire_txn_admission().await;
         }
         let ai = crate::engine::ai::sql::statement_has_ai(&statement);
-        let _admission = if ai {
-            match crate::engine::ai::runtime::admit_coordinator() {
+        let http = self.sql_may_call_http(&sql);
+        let _http_session = if http {
+            match crate::engine::http::admit_session(&self.context).await {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            None
+        };
+        let _admission = if http {
+            match crate::engine::http::admit_coordinator() {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(e)),
+            }
+        } else if ai {
+            match if http {
+                crate::engine::http::admit_coordinator()
+            } else {
+                crate::engine::ai::runtime::admit_coordinator()
+            } {
                 Ok(p) => Some(p),
                 Err(e) => return Some(Err(e)),
             }
@@ -7351,7 +7428,9 @@ where
                 });
             (context, result)
         };
-        let job = if ai {
+        let job = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
@@ -7499,6 +7578,9 @@ where
         crate::engine::api::PreparedDmlState,
         Option<Result<QueryResponse, QueryError>>,
     ) {
+        if self.sql_may_call_http(sql) {
+            return (dml_state, None);
+        }
         // The storage engine is synchronous: even an uncontended autocommit
         // DML reaches WAL pwrite/fsync and group-commit Condvar waits. Tokio's
         // `block_in_place` can compensate for that by starting replacement
@@ -7598,7 +7680,9 @@ fn prepared_dml_inline_enabled() -> bool {
 /// That matches MySQL, where a rolled-back INSERT likewise leaves an
 /// auto-increment gap.
 fn prepared_dml_transactional_inline_retry_allowed(statement: &Statement) -> bool {
-    prepared_dml_inline_enabled() && prepared_dml_statement_candidate(statement)
+    prepared_dml_inline_enabled()
+        && !crate::engine::http::statement_has_http(statement)
+        && prepared_dml_statement_candidate(statement)
 }
 
 fn prepared_dml_statement_candidate(statement: &Statement) -> bool {
@@ -9699,6 +9783,7 @@ fn expr_contains_blocking_function(expr: &Expr) -> bool {
         Expr::WindowFunction { .. } => true,
         Expr::Function { name, .. } => {
             crate::engine::ai::is_function(name)
+                || crate::engine::http::is_function(name)
                 || name.eq_ignore_ascii_case("SLEEP")
                 || name.eq_ignore_ascii_case("GET_LOCK")
                 || name.eq_ignore_ascii_case("NEXTVAL")

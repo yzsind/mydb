@@ -680,6 +680,33 @@ fn eval_stored_function(name: &str, arg_values: Vec<Value>) -> Option<Result<Val
     })
 }
 
+/// External effects of resolved stored functions must survive relational
+/// rewrites just like direct HTTP calls. User DETERMINISTIC declarations are
+/// not a proof that a body (or a transitively called routine) has no I/O.
+pub(crate) fn function_has_external_effect(name: &str) -> bool {
+    let routine = RESOLVED_STORED_FUNCTIONS.with(|functions| {
+        let functions = functions.borrow();
+        if functions.is_empty() {
+            return None;
+        }
+        functions
+            .get(&name.to_ascii_lowercase())
+            .map(|binding| binding.routine.clone())
+    });
+    let Some(routine) = routine else {
+        return false;
+    };
+    if crate::engine::http::mentions(&routine.body_sql) {
+        return true;
+    }
+    STORED_FN_CTX.with(|cell| cell.get()).is_some_and(|ctx| {
+        // SAFETY: the stored-function context owns this Arc reference for the
+        // current serial statement; this path only reads catalog metadata.
+        let db = unsafe { ctx.db.as_ref() };
+        crate::engine::http::may_call(db, &routine.body_sql)
+    })
+}
+
 /// Whether `name` resolves to a stored function in the owning statement
 /// context. Constant folding runs after stored-function resolution but still
 /// sees the generic `Expr::Function` shape, so it must consult this context
@@ -4871,6 +4898,10 @@ fn eval_function_inner<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
+    if crate::engine::http::is_function(name) {
+        let values = eval_args(args, &mut eval_arg)?;
+        return crate::engine::http::call(name, &values);
+    }
     if crate::engine::ai::is_function(name) {
         let values = eval_args(args, &mut eval_arg)?;
         return crate::engine::ai::call(name, &values);
@@ -19246,6 +19277,9 @@ pub(crate) fn expr_is_constant(expr: &Expr) -> bool {
 }
 
 fn function_is_runtime_dependent(upper: &str) -> bool {
+    if crate::engine::http::is_function(upper) {
+        return true;
+    }
     matches!(
         upper,
         "NOW"
