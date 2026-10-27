@@ -374,7 +374,11 @@ fallback or cross-statement response cache. Connection health failures open a
 bounded circuit breaker; authentication failures require a credential or
 configuration generation change before retrying. Each logical connection uses
 one versioned health entry; responses from an older version cannot change the
-new version's state. Closing and reopening a database instance starts a new
+new version's state. Queued requests recheck health before sending. Health
+results are recorded before releasing slots, so waiting requests observe a
+newly opened circuit or authentication latch. Reservations that never reach
+dispatch return their rate credit when the quota version still matches;
+already dispatched attempts keep their charge. Closing and reopening a database instance starts a new
 runtime identity and does not inherit the previous instance's health cache.
 
 Connection `transport` can name a `ca_file` from local `ca_bindings` and set
