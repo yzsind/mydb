@@ -1046,12 +1046,11 @@ impl Database {
             return self.lookup_index(table, index, key);
         }
         if index.unique {
-            self.lock_manager().check_unique_key_lock(
+            self.check_unique_key_reservation(
                 txn.txn_id,
                 table.id,
                 &index.name,
                 &key,
-                &self.lock_owner_status(),
             )?;
         }
         let ids = self.lookup_index(table, index, key.clone())?;
@@ -1146,12 +1145,11 @@ impl Database {
         // Write-path probe keys are concrete; unsatisfiable is always false.
         let (key, _) = resolve_index_key(index, key)?;
         if index.unique {
-            self.lock_manager().check_unique_key_lock(
+            self.check_unique_key_reservation(
                 txn.txn_id,
                 table.id,
                 &index.name,
                 &key,
-                &self.lock_owner_status(),
             )?;
         }
         self.lookup_index(&table, index, key).map(Some)

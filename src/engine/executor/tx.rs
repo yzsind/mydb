@@ -39,22 +39,24 @@ pub(super) fn can_use_lazy_read_only_transaction_select(
     session: &SessionContext,
     stmt: &Select,
 ) -> bool {
-    !select_has_locking_read(stmt)
-        && session.effective_isolation() != IsolationLevel::Serializable
-        && session.current_txn.is_none()
+    // Session checks first: the locking-read probe walks the whole AST and
+    // runs on every prepared SELECT execution.
+    session.current_txn.is_none()
         && session.xa_branch.is_none()
         && (session.explicit_txn || !session.autocommit)
+        && session.effective_isolation() != IsolationLevel::Serializable
+        && !select_has_locking_read(stmt)
 }
 
 pub(super) fn can_use_current_transaction_read_select(
     session: &SessionContext,
     stmt: &Select,
 ) -> bool {
-    !select_has_locking_read(stmt)
+    session.current_txn.is_some()
+        && session.xa_branch.is_none()
         && stmt.lock_clause.is_none()
         && session.effective_isolation() != IsolationLevel::Serializable
-        && session.current_txn.is_some()
-        && session.xa_branch.is_none()
+        && !select_has_locking_read(stmt)
 }
 
 /// Shared view policy for cached and uncached prepared reads. Keep the

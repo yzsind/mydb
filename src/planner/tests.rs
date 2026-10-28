@@ -614,6 +614,43 @@ fn cost_frontier_prunes_zone_expansion_for_cheap_nonunique_and_range_indexes() {
 }
 
 #[test]
+fn zone_map_costing_skips_when_one_matching_zone_outcosts_the_index() {
+    // Default cost constants: the metadata-only bound of a two-zone table is
+    // negligible, but any zone holding the expected match is scanned whole.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE zm_match_floor (id BIGINT, pad VARCHAR(4096), INDEX idx_id(id))")
+        .unwrap();
+    let pad = "x".repeat(3000);
+    let rows = (0..600)
+        .map(|id| format!("({id},'{pad}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO zm_match_floor VALUES {rows}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE zm_match_floor").unwrap();
+    let Statement::Select(select) =
+        parse_statement("SELECT id FROM zm_match_floor WHERE id = 7").unwrap()
+    else {
+        panic!("expected SELECT");
+    };
+    let table = engine.db_for_tests().table("zm_match_floor").unwrap();
+    let preview = engine
+        .db_for_tests()
+        .zone_map_cost_lower_bound(&table, select.selection.as_ref().unwrap())
+        .unwrap();
+    assert!(preview.total_pages > u64::from(table.zone_pages()));
+    crate::storage::reset_zone_map_cost_estimate_calls();
+    let physical = plan_select(engine.db_for_tests(), &select)
+        .unwrap()
+        .physical;
+    assert_eq!(crate::storage::zone_map_cost_estimate_calls(), 0);
+    assert!(format!("{:?}", explain_rows(&physical)).contains("idx_id"));
+}
+
+#[test]
 fn prepared_physical_point_lookup_matches_standalone_planner() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

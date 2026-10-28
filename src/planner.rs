@@ -10528,8 +10528,41 @@ fn choose_scan(
             } else if let Some(lower_bound) = db.zone_map_cost_lower_bound(&table.schema, expr) {
                 let metadata_cpu = lower_bound.zones_examined as f64
                     * crate::engine::cbo::cbo_consts().cpu_operator_cost();
+                // The candidate is costed below as a sequential scan of its
+                // surviving fraction plus this metadata work. Price the pages
+                // it cannot avoid too: sampling hundreds of zones only to lose
+                // to a short index range was a large share of the planning
+                // CPU of statements that are re-planned on every execution.
+                // A sampled estimate never reports less than one stride.
+                // Rows the predicate is expected to return must sit in some
+                // zone, and a surviving zone is scanned whole.
+                let matching_zone_pages = if seq_output_rows >= 1.0 {
+                    u64::from(table.schema.zone_pages()).min(lower_bound.total_pages)
+                } else {
+                    0
+                };
+                let min_fraction = if lower_bound.total_pages > 0 {
+                    (lower_bound.min_surviving_pages.max(matching_zone_pages) as f64
+                        / lower_bound.total_pages as f64)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let scan_floor = if min_fraction > 0.0 {
+                    operator_cost::seq_scan(
+                        &ctx,
+                        seq_pages * min_fraction,
+                        seq_access_rows * min_fraction,
+                        seq_output_rows,
+                        row_width,
+                        qual_cpu,
+                    )
+                    .weighted_total()
+                } else {
+                    0.0
+                };
                 frontier
-                    .should_expand(metadata_cpu, false)
+                    .should_expand(scan_floor + metadata_cpu, false)
                     .then(|| db.zone_map_cost_details(&table.schema, expr))
                     .flatten()
             } else {

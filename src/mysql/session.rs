@@ -595,6 +595,9 @@ struct PreparedStatement {
     /// `statement_has_computed_ordering(parsed)`, derived once: the parsed
     /// template never changes for the lifetime of the handle.
     computed_ordering: bool,
+    /// `prepared_dml_transactional_inline_retry_allowed(parsed)`, derived once
+    /// for the same reason: its HTTP probe walks the whole statement.
+    dml_inline_retry: bool,
     /// `Com_*` status classification of `sql`, derived once at PREPARE.
     com_kind: Option<crate::engine::status_counters::ComKind>,
     long_data: Vec<Option<Vec<u8>>>,
@@ -4613,7 +4616,7 @@ where
         let mut prepared = PreparedStatement {
             original_sql_sensitivity: crate::engine::http::SensitivityMemo::new(&sql),
             original_sql: Arc::from(sql.as_str()),
-            sql: Arc::from(effective_sql.as_str()),
+            sql: crate::engine::perf_events::prepared_statement_sql(&perf_texts),
             normalized_sql,
             database,
             parser_sql_mode_bits: mode_bits,
@@ -4623,6 +4626,9 @@ where
             computed_ordering: parsed
                 .as_deref()
                 .is_some_and(|statement| statement_has_computed_ordering(statement)),
+            dml_inline_retry: parsed
+                .as_deref()
+                .is_some_and(prepared_dml_transactional_inline_retry_allowed),
             com_kind: crate::engine::status_counters::classify_query_com(&effective_sql),
             parsed,
             long_data: vec![None; param_count],
@@ -5108,12 +5114,16 @@ where
             // the blocking pool; they must never park a Tokio worker while
             // waiting for another connection to commit and release its lock.
             if !cursor_requested {
-                let (parsed_arc, dml_state) = {
+                let (parsed_arc, dml_inline_retry, dml_state) = {
                     let entry = self
                         .prepared
                         .get_mut(&statement_id)
                         .expect("prepared entry present moments ago");
-                    (entry.parsed.clone(), std::mem::take(&mut entry.dml_state))
+                    (
+                        entry.parsed.clone(),
+                        entry.dml_inline_retry,
+                        std::mem::take(&mut entry.dml_state),
+                    )
                 };
                 let (dml_state, dml_result) = if let Some(arc) = parsed_arc {
                     if prepared_dml_inline_allowed(&self.context)
@@ -5126,7 +5136,7 @@ where
                             &values,
                             &perf_texts,
                         )
-                    } else if prepared_dml_transactional_inline_retry_allowed(arc.as_ref()) {
+                    } else if dml_inline_retry {
                         // Explicit / autocommit-off transaction: attempt
                         // inline with nonblocking lock waits. On conflict,
                         // the savepoint path rolls back cleanly before the
@@ -7722,8 +7732,8 @@ fn prepared_dml_inline_enabled() -> bool {
 /// auto-increment gap.
 fn prepared_dml_transactional_inline_retry_allowed(statement: &Statement) -> bool {
     prepared_dml_inline_enabled()
-        && !crate::engine::http::statement_has_http(statement)
         && prepared_dml_statement_candidate(statement)
+        && !crate::engine::http::statement_has_http(statement)
 }
 
 fn prepared_dml_statement_candidate(statement: &Statement) -> bool {
@@ -10278,6 +10288,7 @@ mod tests {
             value_scratch: Vec::with_capacity(1),
             parsed: None,
             computed_ordering: false,
+            dml_inline_retry: false,
             com_kind: None,
             long_data: vec![None],
             long_data_error: None,

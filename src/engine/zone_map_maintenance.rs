@@ -23,6 +23,10 @@ impl ZoneMapMaintenanceHandle {
             return Self::disabled();
         }
         let worker = BackgroundWorker::spawn("mydb-zone-map", move |worker_shutdown| {
+            // Rebuilds rescan whole zones. After a bulk load that backlog can
+            // keep this thread busy for minutes; it must not take CPU from
+            // request workers on a saturated server.
+            crate::util::thread_priority::lower_current_thread_priority();
             let _reclaim = super::executor::mem_budget::ReclaimDatabaseScope::enter(&db);
             let _cleanup = PartitionCleanupBackgroundGuard::enter(&db);
             while !worker_shutdown.is_requested() {

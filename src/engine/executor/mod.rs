@@ -4195,9 +4195,9 @@ impl QueryEngine for StorageQueryEngine {
         // Sequence evaluation mutates live session/durable state. Route it
         // through the ordinary statement lane, which drains under that scope,
         // and keep the read-only prepared fast path unchanged.
-        if crate::planner::sql_mentions_sequence_fn(sql)
-            || crate::engine::ai::sql::sql_may_have_ai(sql)
-            || crate::engine::http::may_call(&self.db, sql)
+        let traits = crate::engine::perf_events::prepared_sql_traits(sql)
+            .unwrap_or_else(|| crate::engine::perf_events::SqlTextTraits::of(sql));
+        if traits.sequence_fn || traits.may_have_ai || crate::engine::http::may_call(&self.db, sql)
         {
             return None;
         }

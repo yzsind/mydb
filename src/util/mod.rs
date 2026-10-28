@@ -32,3 +32,5 @@ pub(crate) mod hex;
 pub(crate) mod scoped_cell;
 
 pub(crate) mod ordered_float;
+
+pub(crate) mod thread_priority;

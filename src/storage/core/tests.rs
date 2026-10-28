@@ -9688,6 +9688,94 @@ fn create_concurrent_index_update_table(db: &Database, rows: i64) {
 }
 
 #[test]
+fn combined_undo_publication_preserves_commits_and_rollbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        Database::open_with_config(
+            dir.path(),
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .unwrap(),
+    );
+    let workers = 16i64;
+    let rows_per_worker = 4i64;
+    let rounds = 40i64;
+    db.create_table(
+        "undo_combine",
+        vec![
+            concurrent_index_test_column("id", true),
+            concurrent_index_test_column("v", false),
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let txn = db.begin_txn().unwrap();
+    db.insert_rows(
+        txn,
+        "test.undo_combine",
+        (0..workers * rows_per_worker)
+            .map(|id| vec![Value::Int(id), Value::Int(0)])
+            .collect(),
+    )
+    .unwrap();
+    db.commit_txn(txn.txn_id).unwrap();
+    let table = db.table("test.undo_combine").unwrap();
+    let snapshot = db.begin_txn().unwrap();
+    let ids: std::collections::HashMap<i64, RowId> = db
+        .scan_rows("test.undo_combine", snapshot)
+        .unwrap()
+        .into_iter()
+        .map(|row| match row.values[0] {
+            Value::Int(id) => (id, row.row_id),
+            ref other => panic!("unexpected id {other:?}"),
+        })
+        .collect();
+    db.commit_txn(snapshot.txn_id).unwrap();
+    // Every update publishes one undo record; many writers publish at once,
+    // so most records go through the combiner on another thread. Rolled-back
+    // rounds must restore exactly the published before-images.
+    std::thread::scope(|scope| {
+        for worker in 0..workers {
+            let db = &db;
+            let table = &table;
+            let ids = &ids;
+            scope.spawn(move || {
+                for round in 0..rounds {
+                    let txn = db.begin_txn().unwrap();
+                    for offset in 0..rows_per_worker {
+                        let row_id = ids[&(worker * rows_per_worker + offset)];
+                        db.update_row_by_id(txn, table, row_id, |values| {
+                            let mut values = values.to_vec();
+                            let Value::Int(v) = values[1] else {
+                                panic!("unexpected value");
+                            };
+                            values[1] = Value::Int(v + 1);
+                            Ok(values)
+                        })
+                        .unwrap();
+                    }
+                    if round % 2 == 0 {
+                        db.commit_txn(txn.txn_id).unwrap();
+                    } else {
+                        db.rollback_txn(txn.txn_id).unwrap();
+                    }
+                }
+            });
+        }
+    });
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let rows = db.scan_rows("test.undo_combine", view).unwrap();
+    assert_eq!(rows.len() as i64, workers * rows_per_worker);
+    for row in rows {
+        assert_eq!(row.values[1], Value::Int(rounds / 2), "row {:?}", row.values[0]);
+    }
+    assert!(db.undo_publish.pending.lock().is_empty());
+    assert!(!db.undo_publish.combining.load(Ordering::SeqCst));
+    db.check_consistency().unwrap();
+}
+
+#[test]
 fn concurrent_secondary_index_updates_recover_consistently() {
     let dir = tempfile::tempdir().unwrap();
     let rows = 64i64;

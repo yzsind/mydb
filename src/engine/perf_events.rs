@@ -718,19 +718,17 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
             return;
         }
     }
-    let safe = prepared_texts
+    let text = prepared_texts
         .is_none()
-        .then(|| crate::engine::logging::redact_sql_for_log(sql));
-    let trimmed = prepared_texts.as_ref().map_or_else(
-        || safe.as_deref().unwrap_or_default().trim(),
-        |texts| texts.0.sql_text.as_ref(),
-    );
+        .then(|| text_statement_identity(sql));
+    let (trimmed, event_class) = match (&prepared_texts, &text) {
+        (Some(texts), _) => (texts.0.sql_text.as_ref(), texts.1),
+        (None, Some((trimmed, class))) => (trimmed.as_ref(), *class),
+        (None, None) => return,
+    };
     if trimmed.is_empty() {
         return;
     }
-    let event_class = prepared_texts
-        .as_ref()
-        .map_or_else(|| statement_event_class(trimmed), |texts| texts.1);
     let event_name = event_class.name;
     if !statement_instrument_enabled(event_class) {
         return;
@@ -790,7 +788,39 @@ struct StatementTexts {
 /// blocking-pool migration otherwise makes even a tiny per-thread cache pay
 /// the full SQL hash on every execution.
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedStatementTexts(Arc<StatementTexts>, StatementEventClass);
+pub(crate) struct PreparedStatementTexts(
+    Arc<StatementTexts>,
+    StatementEventClass,
+    PreparedSqlSource,
+);
+
+/// Text-only facts about a prepared statement's SQL. Each one is a scan of
+/// the immutable text that every EXECUTE used to repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SqlTextTraits {
+    pub(crate) sequence_fn: bool,
+    pub(crate) may_have_ai: bool,
+    pub(crate) http_mentions: bool,
+}
+
+impl SqlTextTraits {
+    pub(crate) fn of(sql: &str) -> Self {
+        Self {
+            sequence_fn: crate::planner::sql_mentions_sequence_fn(sql),
+            may_have_ai: crate::engine::ai::sql::sql_may_have_ai(sql),
+            http_mentions: crate::engine::http::mentions(sql),
+        }
+    }
+}
+
+/// The executable SQL a prepared handle runs and its [`SqlTextTraits`].
+/// The handle executes this same allocation, so an EXECUTE recognises it by
+/// pointer; any other text (nested routine statements, fallbacks) misses.
+#[derive(Clone, Debug)]
+struct PreparedSqlSource {
+    sql: Arc<str>,
+    traits: SqlTextTraits,
+}
 
 impl PreparedStatementTexts {
     pub(crate) fn estimated_memory_bytes(&self) -> usize {
@@ -826,6 +856,74 @@ thread_local! {
     static PREPARED_STATEMENT_TEXTS: RefCell<Option<PreparedStatementTexts>> = const { RefCell::new(None) };
 }
 
+struct TextStatementMemo {
+    raw: Box<str>,
+    generation: u64,
+    trimmed: Arc<str>,
+    class: StatementEventClass,
+}
+
+thread_local! {
+    static TEXT_STATEMENT_MEMO: RefCell<Option<TextStatementMemo>> = const { RefCell::new(None) };
+}
+
+/// Longer texts are literal-heavy batches that never repeat verbatim.
+const TEXT_STATEMENT_MEMO_MAX_LEN: usize = 1024;
+
+/// Redacted, trimmed text and instrument class of a text-protocol statement.
+/// `begin_statement` and `record_statement` both need them for the same
+/// text, and drivers resend a few short texts (COMMIT, session-variable
+/// probes) many times per transaction. Redaction rescans the text and reads
+/// the shared HTTP dependency cache, so its verdict is keyed by that cache's
+/// generation as well as the exact text.
+fn text_statement_identity(sql: &str) -> (Arc<str>, StatementEventClass) {
+    let generation = crate::engine::http::dependency_generation();
+    let memoizable = sql.len() <= TEXT_STATEMENT_MEMO_MAX_LEN;
+    if memoizable {
+        let hit = TEXT_STATEMENT_MEMO.with(|memo| {
+            memo.borrow()
+                .as_ref()
+                .filter(|memo| memo.generation == generation && memo.raw.as_ref() == sql)
+                .map(|memo| (Arc::clone(&memo.trimmed), memo.class))
+        });
+        if let Some(hit) = hit {
+            return hit;
+        }
+    }
+    let safe = crate::engine::logging::redact_sql_for_log(sql);
+    let trimmed: Arc<str> = Arc::from(safe.trim());
+    let class = statement_event_class(&trimmed);
+    if memoizable {
+        TEXT_STATEMENT_MEMO.with(|memo| {
+            *memo.borrow_mut() = Some(TextStatementMemo {
+                raw: Box::from(sql),
+                generation,
+                trimmed: Arc::clone(&trimmed),
+                class,
+            });
+        });
+    }
+    (trimmed, class)
+}
+
+/// Traits of `sql` when it is the executable text of the prepared statement
+/// currently running on this thread.
+pub(crate) fn prepared_sql_traits(sql: &str) -> Option<SqlTextTraits> {
+    PREPARED_STATEMENT_TEXTS.with(|slot| {
+        slot.borrow().as_ref().and_then(|texts| {
+            let source = &texts.2;
+            (std::ptr::eq(source.sql.as_ptr(), sql.as_ptr()) && source.sql.len() == sql.len())
+                .then_some(source.traits)
+        })
+    })
+}
+
+/// Executable text shared with the prepared handle, so that EXECUTE passes
+/// the very allocation [`prepared_sql_traits`] recognises.
+pub(crate) fn prepared_statement_sql(texts: &PreparedStatementTexts) -> Arc<str> {
+    Arc::clone(&texts.2.sql)
+}
+
 pub(crate) fn prepared_statement_texts(sql: &str) -> PreparedStatementTexts {
     // PREPARE is frequently repeated for byte-identical SQL even when the
     // client closes the server-side handle after each transaction. Reuse the
@@ -849,6 +947,10 @@ pub(crate) fn prepared_statement_texts(sql: &str) -> PreparedStatementTexts {
                 .map(|(text, digest)| (Arc::from(text.as_ref()), Arc::from(digest.as_ref()))),
         }),
         event_class,
+        PreparedSqlSource {
+            sql: Arc::from(sql),
+            traits: SqlTextTraits::of(sql),
+        },
     )
 }
 
@@ -1039,20 +1141,18 @@ pub(crate) fn record_statement(
     }
 
     let prepared_texts = PREPARED_STATEMENT_TEXTS.with(|slot| slot.borrow().clone());
-    let safe_sql = prepared_texts
+    let text = prepared_texts
         .is_none()
-        .then(|| crate::engine::logging::redact_sql_for_log(sql));
-    let trimmed = prepared_texts.as_ref().map_or_else(
-        || safe_sql.as_deref().unwrap_or_default().trim(),
-        |texts| texts.0.sql_text.as_ref(),
-    );
+        .then(|| text_statement_identity(sql));
+    let (trimmed, event_class) = match (&prepared_texts, &text) {
+        (Some(texts), _) => (texts.0.sql_text.as_ref(), texts.1),
+        (None, Some((trimmed, class))) => (trimmed.as_ref(), *class),
+        (None, None) => return,
+    };
     if trimmed.is_empty() {
         return;
     }
 
-    let event_class = prepared_texts
-        .as_ref()
-        .map_or_else(|| statement_event_class(trimmed), |texts| texts.1);
     let event_name = event_class.name;
     let statement_instrumented = instrumentation_enabled
         && statement_instrument_enabled(event_class)
@@ -2494,6 +2594,44 @@ mod tests {
         let prepared = prepared_statement_texts(raw);
         assert!(!prepared.0.sql_text.contains("secret-value"));
         assert_ne!(prepared.0.sql_text.as_ref(), raw);
+    }
+
+    #[test]
+    fn prepared_sql_traits_match_only_the_running_handle_text() {
+        let raw = "SELECT NEXTVAL(s), http_get('x') FROM t";
+        let prepared = prepared_statement_texts(raw);
+        let sql = prepared_statement_sql(&prepared);
+        assert_eq!(prepared_sql_traits(&sql), None);
+        with_prepared_statement_texts(&prepared, || {
+            let traits = prepared_sql_traits(&sql).expect("handle text is recognised");
+            assert_eq!(traits, SqlTextTraits::of(raw));
+            assert!(traits.sequence_fn && traits.http_mentions && !traits.may_have_ai);
+            // Equal text in another allocation, e.g. a nested statement, is
+            // scanned on its own.
+            let copy = String::from(raw);
+            assert_eq!(prepared_sql_traits(&copy), None);
+            assert_eq!(prepared_sql_traits(&sql[..6]), None);
+        });
+        assert_eq!(prepared_sql_traits(&sql), None);
+    }
+
+    #[test]
+    fn text_statement_identity_memo_matches_uncached_redaction() {
+        TEXT_STATEMENT_MEMO.with(|memo| memo.borrow_mut().take());
+        for raw in [
+            "  COMMIT ",
+            "  COMMIT ",
+            "ALTER USER u IDENTIFIED BY 'secret-value'",
+            "ALTER USER u IDENTIFIED BY 'secret-value'",
+            "SELECT @@session.transaction_read_only",
+        ] {
+            let (trimmed, class) = text_statement_identity(raw);
+            let expected = crate::engine::logging::redact_sql_for_log(raw);
+            assert_eq!(trimmed.as_ref(), expected.trim());
+            assert_eq!(class.name, statement_event_class(expected.trim()).name);
+        }
+        let (trimmed, _) = text_statement_identity("ALTER USER u IDENTIFIED BY 'secret-value'");
+        assert!(!trimmed.contains("secret-value"));
     }
 
     #[test]

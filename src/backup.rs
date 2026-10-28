@@ -887,26 +887,7 @@ fn reserve_chunk_workers(
 
 fn configure_chunk_worker_priority() {
     // Bulk checksums must yield CPU scheduling priority to request workers.
-    // These are best-effort hints; admission and correctness never depend on
-    // the operating system accepting a scheduling preference.
-    #[cfg(target_os = "macos")]
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        // Linux niceness is per thread. Use the explicit TID so this cannot
-        // lower the priority of the server's foreground request threads.
-        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
-    }
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-        };
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
+    crate::util::thread_priority::lower_current_thread_priority();
 }
 
 /// Share one bounded pool across capture, sealed-image hashing and verification.
