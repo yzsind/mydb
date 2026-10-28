@@ -3079,6 +3079,7 @@ impl IndexFile {
         let mut file = OpenOptions::new().read(true).open(path).map_err(io_err)?;
         let meta = decode_index_meta(&read_index_page(&mut file, INDEX_META_PAGE)?)?;
         validate_index_page_tree(&mut file, meta.root_page)?;
+        validate_index_freelist(&mut file, meta.free_page_head)?;
         Ok(())
     }
 
@@ -3127,12 +3128,19 @@ impl IndexFile {
         rec_lsn: u64,
     ) -> Result<Self, QueryError> {
         Self::check_rebuild_marker(&path)?;
-        let buffer_pool = BufferPool::new(
+        // Each replay partition has one owner and already supplies file-level
+        // parallelism. Use synchronous eviction without speculative readers:
+        // background workers can retain this private pool after IndexFile drops,
+        // stranding raw-page charges before the live database pool is admitted.
+        let buffer_pool = BufferPool::new_with_options(
             DEFAULT_BUFFER_POOL_PAGES,
             log.clone(),
             DurabilityMode::Strict,
-            Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+            Duration::ZERO,
+            1,
+            0,
         );
+        buffer_pool.shutdown_flusher();
         let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
         if len > 0 && len < PAGE_SIZE as u64 {
@@ -3155,6 +3163,14 @@ impl IndexFile {
             set_page_lsn_if_formatted(&mut meta_image, rec_lsn);
             (meta, meta_image, true)
         };
+        if initialized {
+            // Logical redo is idempotent on a complete tree, not on a torn
+            // split/merge whose parent and leaf-chain views disagree. Validate
+            // before publishing any replay mutation; the caller fences failures
+            // and rebuilds the derived index from its authoritative heap.
+            validate_index_page_tree(&mut file, meta.root_page)?;
+            validate_index_freelist(&mut file, meta.free_page_head)?;
+        }
         // Data pages can reach disk before the allocation watermark in the
         // meta page. Reusing such a page ID during logical REDO overwrites a
         // live leaf/internal node and manufactures corruption. The physical
@@ -3963,39 +3979,6 @@ impl IndexFile {
             return self.apply_batch_with_lsn(txn_id, entries, Some(lsn));
         }
         self.apply_batch_with_lsn(txn_id, entries, Some(lsn))
-    }
-
-    /// Native recovery can omit a complete logical batch when every routed
-    /// leaf's durable image already covers it. A page stamped at/above the
-    /// recovery ceiling was changed by this replay (normal logical writes use
-    /// next_lsn); it is not proof that later historical batches were applied.
-    /// Decide for the whole batch before any mutation, never per operation.
-    fn recovery_batch_already_persisted(
-        &self,
-        entries: &[IndexBatchEntry],
-        lsn: u64,
-        recovery_ceiling: u64,
-    ) -> Result<bool, QueryError> {
-        let _structure = self.structure_lock.read();
-        let mut path = smallvec::SmallVec::<[PinnedFrame; 4]>::new();
-        for entry in entries {
-            let target = IndexEntry {
-                key: entry.key.clone(),
-                row_id: entry.row_id,
-            };
-            let leaf = self.find_leaf_for_insert_cached(&target, &mut path)?;
-            if !leaf.with_index_raw_bytes(|bytes| {
-                let covered = page_lsn(bytes);
-                // open_for_recovery may synthesize an empty root stamped
-                // with this batch's LSN; that is not a durable-applied proof.
-                Ok(parse_leaf_payload_header(bytes)?.count != 0
-                    && covered >= lsn
-                    && covered < recovery_ceiling)
-            })? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     fn try_apply_two_op_update_batch_fast(
@@ -6045,9 +6028,25 @@ impl IndexFile {
 
     fn reserve_page_id(&self) -> Result<u64, QueryError> {
         let mut state = self.meta_state.lock();
+        self.extend_page_range(&mut state)
+    }
+
+    fn extend_page_range(&self, state: &mut IndexMetaState) -> Result<u64, QueryError> {
         let page_id = state.meta.next_page_id;
-        crate::storage::temp_quota::reserve_extent(&self.path, (page_id + 1) * PAGE_SIZE as u64)?;
-        state.meta.next_page_id += 1;
+        let next = page_id.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "index page range overflow",
+            )
+        })?;
+        let bytes = next.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "index page range overflow",
+            )
+        })?;
+        crate::storage::temp_quota::reserve_extent(&self.path, bytes)?;
+        state.meta.next_page_id = next;
         Ok(page_id)
     }
 
@@ -9116,6 +9115,7 @@ impl IndexFile {
     /// A discarded frame must be re-pinned even if its page id was recycled.
     /// Pins retain governed buffer frames; no page bytes or key vectors are
     /// copied, and the cache is bounded by this tree's current height.
+    #[cfg(test)]
     fn find_leaf_for_insert_cached<'a>(
         &self,
         entry: &IndexEntry,
@@ -10004,13 +10004,7 @@ impl IndexFile {
                 // Lost the race — fall through to the extend branch.
             }
             let mut state = self.meta_state.lock();
-            let page_id = state.meta.next_page_id;
-            crate::storage::temp_quota::reserve_extent(
-                &self.path,
-                (page_id + 1) * PAGE_SIZE as u64,
-            )?;
-            state.meta.next_page_id += 1;
-            page_id
+            self.extend_page_range(&mut state)?
         };
         self.write_or_defer_meta_page(txn_id)?;
         Ok(page_id)
@@ -19752,6 +19746,30 @@ fn decode_validated_index_tree_page(buf: &[u8]) -> Result<IndexPage, QueryError>
             "corrupt index: unknown page type",
         )),
     }
+}
+
+fn validate_index_freelist(file: &mut File, head: Option<u64>) -> Result<(), QueryError> {
+    let page_count = file.metadata().map_err(io_err)?.len() / PAGE_SIZE as u64;
+    let mut visited = HashSet::new();
+    let mut current = head;
+    while let Some(page_id) = current {
+        if page_id == INDEX_META_PAGE || page_id >= page_count || !visited.insert(page_id) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt index: invalid freelist link",
+            ));
+        }
+        current = match decode_index_tree_page(&read_index_page(file, page_id)?)? {
+            IndexPage::Free(page) => page.next_free,
+            _ => {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt index: freelist contains a live page",
+                ))
+            }
+        };
+    }
+    Ok(())
 }
 
 fn validate_index_page_tree(file: &mut File, root_page: u64) -> Result<(), QueryError> {

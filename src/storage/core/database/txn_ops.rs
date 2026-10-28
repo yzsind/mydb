@@ -3609,9 +3609,9 @@ impl Database {
         let result = (|| -> Result<Option<(u64, u64)>, QueryError> {
             #[cfg(test)]
             if FAIL_TXN_WAL_BUFFER_FLUSH.with(|fail| fail.replace(false)) {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "injected transaction WAL flush failure",
+                return Err(crate::util::io_error::map_io_error(
+                    "transaction WAL flush",
+                    std::io::Error::other("injected transaction WAL flush failure"),
                 ));
             }
             let mut finalize: Vec<(PageKey, u64)> = Vec::with_capacity(entries.len());
@@ -3717,6 +3717,11 @@ impl Database {
         match result {
             Ok(lsn) => Ok(lsn),
             Err(err) => {
+                if let Some(detail) = err.diagnostic_detail() {
+                    crate::util::logging::log_message(format_args!(
+                        "transaction {txn_id} WAL append failure diagnostic: {detail}"
+                    ));
+                }
                 self.quarantine_mvcc(format!(
                     "transaction {txn_id} WAL append failed: {}; restart recovery required",
                     err.message()

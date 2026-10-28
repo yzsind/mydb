@@ -514,8 +514,6 @@ mod recovery_io_tests {
             77,
             1,
             &ops,
-            None,
-            RecoveryContext::restore(10, 100).unwrap()
         )
         .is_err());
         assert_eq!(btree_logical_wal::current(), Some(123));
@@ -602,8 +600,6 @@ mod recovery_io_tests {
                 lsn,
                 0,
                 &ops,
-                None,
-                RecoveryContext::default(),
             )
             .unwrap_or_else(|err| panic!("batch at lsn {lsn}: {err}"));
             let _routing = btree_logical_wal::LsnScope::new(None);
@@ -824,6 +820,247 @@ mod recovery_index_allocation_tests {
 mod recovery_index_lsn_tests {
     use super::*;
     #[test]
+    fn btree_release_recovery_pool_releases_raw_pages_before_live_admission() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let _routing = btree_logical_wal::LsnScope::new(None);
+        let before = crate::engine::executor::mem_budget::controlled_buffer_used_bytes();
+        for ordinal in 0..4 {
+            let index = IndexFile::open_for_recovery(
+                dir.path().join(format!("{ordinal}.idx")),
+                Arc::clone(&log),
+                10,
+            )
+            .unwrap();
+            let pool = Arc::downgrade(&index.buffer_pool);
+            assert!(crate::engine::executor::mem_budget::controlled_buffer_used_bytes() > before);
+            drop(index);
+            assert!(
+                pool.upgrade().is_none(),
+                "recovery workers must not retain a retired private pool"
+            );
+            assert_eq!(
+                crate::engine::executor::mem_budget::controlled_buffer_used_bytes(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn btree_release_redo_cannot_infer_batch_coverage_from_leaf_lsn() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let relative = "native.idx";
+        let path = dir.path().join(relative);
+        let key = |n| IndexKey::from(vec![KeyPart::Int(n)]);
+        let row = |n| RowId {
+            page_id: n,
+            slot_id: 0,
+        };
+        let mut file = File::create(&path).unwrap();
+        write_index_page(
+            &mut file,
+            0,
+            &encode_index_meta(&IndexMeta {
+                root_page: 1,
+                next_page_id: 2,
+                free_page_head: None,
+            }),
+        )
+        .unwrap();
+        let mut leaf = encode_index_tree_page(&IndexPage::Leaf(IndexLeafPage::new(
+            vec![IndexEntry {
+                key: key(2),
+                row_id: row(2),
+            }],
+            None,
+        )))
+        .unwrap();
+        set_page_lsn_if_formatted(&mut leaf, 20);
+        write_index_page(&mut file, 1, &leaf).unwrap();
+        drop(file);
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let mut state = RedoState::new(Some(log));
+        let record = WalRecord {
+            source_time_us: 0,
+            lsn: 10,
+            prev_txn_lsn: 0,
+            txn_id: 0,
+            payload: WalPayload::IndexBatch {
+                path: relative.into(),
+                ops: vec![WalIndexOp {
+                    kind: WalIndexOpKind::Insert,
+                    key: {
+                        let mut bytes = Vec::new();
+                        encode_index_key_into(&key(1), &mut bytes).unwrap();
+                        bytes
+                    },
+                    row_id: WalRowId {
+                        page_id: 1,
+                        slot_id: 0,
+                    },
+                }],
+            },
+        };
+        apply_redo_record(
+            dir.path(),
+            &record,
+            &RecoveryTxnSet::from_iter([]),
+            0,
+            false,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            state.recovery_indexes[relative]
+                .get(&key(1), false)
+                .unwrap(),
+            vec![row(1)]
+        );
+        let mut deletion = record.clone();
+        deletion.lsn = 11;
+        if let WalPayload::IndexBatch { ops, .. } = &mut deletion.payload {
+            ops[0].kind = WalIndexOpKind::Delete;
+            ops[0].key.clear();
+            encode_index_key_into(&key(2), &mut ops[0].key).unwrap();
+            ops[0].row_id.page_id = 2;
+        }
+        for record in [&deletion, &record, &deletion] {
+            apply_redo_record(
+                dir.path(),
+                record,
+                &RecoveryTxnSet::from_iter([]),
+                0,
+                false,
+                &mut state,
+            )
+            .unwrap();
+        }
+        let index = &state.recovery_indexes[relative];
+        assert!(index.get(&key(2), false).unwrap().is_empty());
+        assert_eq!(index.range_entries(None, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn btree_release_torn_split_is_fenced_before_logical_replay() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let relative = "split.idx";
+        let path = dir.path().join(relative);
+        let key = |n| IndexKey::from(vec![KeyPart::Int(n)]);
+        let mut file = File::create(&path).unwrap();
+        write_index_page(
+            &mut file,
+            0,
+            &encode_index_meta(&IndexMeta {
+                root_page: 1,
+                next_page_id: 3,
+                free_page_head: None,
+            }),
+        )
+        .unwrap();
+        for (id, next) in [(1, Some(2)), (2, None)] {
+            let mut leaf = encode_index_tree_page(&IndexPage::Leaf(IndexLeafPage::new(
+                vec![IndexEntry {
+                    key: key(id as i64),
+                    row_id: RowId {
+                        page_id: id as u32,
+                        slot_id: 0,
+                    },
+                }],
+                next,
+            )))
+            .unwrap();
+            set_page_lsn_if_formatted(&mut leaf, 20);
+            write_index_page(&mut file, id, &leaf).unwrap();
+        }
+        drop(file);
+        assert!(IndexFile::validate(path.clone()).is_err());
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let mut state = RedoState::new(Some(log));
+        let mut bytes = Vec::new();
+        encode_index_key_into(&key(2), &mut bytes).unwrap();
+        let record = WalRecord {
+            source_time_us: 0,
+            lsn: 10,
+            prev_txn_lsn: 0,
+            txn_id: 0,
+            payload: WalPayload::IndexBatch {
+                path: relative.into(),
+                ops: vec![WalIndexOp {
+                    kind: WalIndexOpKind::Insert,
+                    key: bytes,
+                    row_id: WalRowId {
+                        page_id: 2,
+                        slot_id: 0,
+                    },
+                }],
+            },
+        };
+        apply_redo_record(
+            dir.path(),
+            &record,
+            &RecoveryTxnSet::from_iter([]),
+            0,
+            false,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.skipped_index_redo_records, 1);
+        assert!(path.with_extension("idx.failed").exists());
+        assert!(state.recovery_indexes.is_empty());
+    }
+
+    #[test]
+    fn btree_release_freelist_validation_rejects_live_pages_and_cycles() {
+        for (head, next, valid) in [
+            (Some(1), None, false),
+            (Some(2), Some(2), false),
+            (Some(3), None, false),
+            (Some(2), None, true),
+        ] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let path = dir.path().join("freelist.idx");
+            let mut file = File::create(&path).unwrap();
+            write_index_page(
+                &mut file,
+                0,
+                &encode_index_meta(&IndexMeta {
+                    root_page: 1,
+                    next_page_id: 3,
+                    free_page_head: head,
+                }),
+            )
+            .unwrap();
+            write_index_page(
+                &mut file,
+                1,
+                &encode_index_tree_page(&IndexPage::Leaf(IndexLeafPage::new(vec![], None)))
+                    .unwrap(),
+            )
+            .unwrap();
+            write_index_page(
+                &mut file,
+                2,
+                &encode_index_tree_page(&IndexPage::Free(IndexFreePage { next_free: next }))
+                    .unwrap(),
+            )
+            .unwrap();
+            drop(file);
+            assert_eq!(IndexFile::validate(path.clone()).is_ok(), valid);
+            let log = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            ));
+            let _routing = btree_logical_wal::LsnScope::new(None);
+            assert_eq!(IndexFile::open_for_recovery(path, log, 10).is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn native_index_batch_does_not_skip_a_synthesized_empty_root() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(parking_lot::Mutex::new(
@@ -840,79 +1077,10 @@ mod recovery_index_lsn_tests {
             key: key.clone(),
             row_id: row,
         }];
-        assert!(!index
-            .recovery_batch_already_persisted(&batch, 10, 30)
-            .unwrap());
         index.apply_replicated_batch(1, batch, 10).unwrap();
         assert_eq!(index.get(&key, false).unwrap(), vec![row]);
     }
-
-    #[test]
-    fn native_index_batch_uses_durable_lsn_not_replay_stamps() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("native.idx");
-        let mut file = File::create(&path).unwrap();
-        let key = |n| IndexKey::from(vec![KeyPart::Int(n)]);
-        let row = |n| RowId {
-            page_id: n,
-            slot_id: 0,
-        };
-        let meta = IndexMeta {
-            root_page: 1,
-            next_page_id: 2,
-            free_page_head: None,
-        };
-        write_index_page(&mut file, 0, &encode_index_meta(&meta)).unwrap();
-        let mut leaf = encode_index_tree_page(&IndexPage::Leaf(IndexLeafPage::new(
-            vec![IndexEntry {
-                key: key(2),
-                row_id: row(2),
-            }],
-            None,
-        )))
-        .unwrap();
-        set_page_lsn_if_formatted(&mut leaf, 20);
-        write_index_page(&mut file, 1, &leaf).unwrap();
-        drop(file);
-        let log = Arc::new(parking_lot::Mutex::new(
-            LogManager::open(dir.path()).unwrap(),
-        ));
-        let index = IndexFile::open_for_recovery(path, log, 10).unwrap();
-        let batch = vec![IndexBatchEntry {
-            kind: WalIndexOpKind::Insert,
-            key: key(1),
-            row_id: row(1),
-        }];
-        assert!(index
-            .recovery_batch_already_persisted(&batch, 10, 30)
-            .unwrap());
-        assert!(!index
-            .recovery_batch_already_persisted(&batch, 25, 30)
-            .unwrap());
-        assert!(!index
-            .recovery_batch_already_persisted(&batch, 10, 20)
-            .unwrap());
-        let batch = vec![
-            IndexBatchEntry {
-                kind: WalIndexOpKind::Insert,
-                key: key(3),
-                row_id: row(3),
-            },
-            IndexBatchEntry {
-                kind: WalIndexOpKind::Insert,
-                key: key(4),
-                row_id: row(4),
-            },
-        ];
-        assert!(!index
-            .recovery_batch_already_persisted(&batch, 25, 30)
-            .unwrap());
-        index.apply_replicated_batch(1, batch, 25).unwrap();
-        assert_eq!(index.get(&key(3), false).unwrap(), vec![row(3)]);
-        assert_eq!(index.get(&key(4), false).unwrap(), vec![row(4)]);
-    }
 }
-
 fn set_recovery_undo_log(log: &Arc<crate::wal::LogMutex>) {
     RECOVERY_PAGE_IO.with(|slot| {
         if let Some(io) = slot.borrow_mut().as_mut() {

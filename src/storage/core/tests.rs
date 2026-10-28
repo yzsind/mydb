@@ -8469,9 +8469,9 @@ fn txn_wal_buffer_follows_transaction_across_worker_threads() {
 }
 
 #[test]
-fn failed_txn_wal_flush_detaches_unlogged_dirty_frames_and_requires_recovery() {
+fn btree_release_failed_txn_wal_flush_logs_diagnostic_and_requires_recovery() {
     std::env::set_var("MYDB_WAL_TXN_BUFFER", "1");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let db = open_relaxed_test_db(dir.path());
     let column = |name: &str, primary_key: bool| ColumnDef {
         name: name.into(),
@@ -8532,8 +8532,31 @@ fn failed_txn_wal_flush_detaches_unlogged_dirty_frames_and_requires_recovery() {
     };
     assert!(deferred() > 0, "test must exercise deferred WAL pins");
     FAIL_TXN_WAL_BUFFER_FLUSH.with(|fail| fail.set(true));
-    assert!(db.commit_txn(txn.txn_id).is_err());
-    assert!(db.ensure_operational().is_err());
+    let err = db.commit_txn(txn.txn_id).unwrap_err();
+    assert!(err
+        .diagnostic_detail()
+        .unwrap()
+        .contains("injected transaction WAL flush failure"));
+    assert!(!db
+        .ensure_operational()
+        .unwrap_err()
+        .message()
+        .contains("injected transaction WAL flush failure"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logged = crate::engine::logging::error_log_rows().iter().any(|row| {
+            matches!(row.get(5), Some(Value::String(data))
+                if data.contains("transaction WAL flush: injected transaction WAL flush failure"))
+        });
+        if logged {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server log must retain the underlying I/O diagnostic"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(!txn_wal_buffering_active(&db.log, txn.txn_id));
     assert_eq!(deferred(), 0);
     drop(db);
@@ -26751,6 +26774,60 @@ fn ddl_copy_swap_keeps_recovery_bases_until_commit() {
     db.unregister_reorg_storage_locs(&[shadow]);
 }
 
+#[test]
+fn btree_release_unfenced_dictionary_index_is_validated_before_startup_probes() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let config = test_storage_config(DurabilityMode::Strict, true);
+    let db = Database::open_with_config(dir.path(), config.clone()).unwrap();
+    let table = crate::storage::data_dictionary::dd_table_schema(
+        crate::storage::data_dictionary::DD_DD_PROPERTIES,
+    )
+    .unwrap();
+    let index = table.indexes.iter().find(|index| index.primary).unwrap();
+    let properties = db.scan_dd_table(table.id).unwrap();
+    let path = db.index_path(table.id, &index.name);
+    db.checkpoint().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let meta = decode_index_meta(&read_index_page(&mut file, 0).unwrap()).unwrap();
+    // A valid root publishes a child that did not reach disk before the crash.
+    let child = meta.next_page_id;
+    write_index_page(
+        &mut file,
+        meta.root_page,
+        &encode_index_tree_page(&IndexPage::Internal(IndexInternalPage::new_generic(
+            vec![],
+            vec![child],
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    drop(file);
+    assert!(!path.with_extension("idx.failed").exists());
+    for _ in 0..2 {
+        let reopened = Database::open_with_config(dir.path(), config.clone()).unwrap();
+        assert_eq!(reopened.scan_dd_table(table.id).unwrap(), properties);
+        assert!(IndexFile::validate(path.clone()).is_ok());
+        assert!(!path.with_extension("idx.failed").exists());
+        for property in &properties {
+            assert_eq!(
+                reopened
+                    .catalog_rows_for_selector(
+                        table.id,
+                        CatalogRowSelector::PrimaryValues(vec![property[0].clone()]),
+                    )
+                    .unwrap(),
+                vec![property.clone()]
+            );
+        }
+        reopened.checkpoint().unwrap();
+    }
+}
 #[test]
 fn failed_dictionary_index_is_rebuilt_before_startup_property_lookup() {
     let dir = tempfile::tempdir().unwrap();

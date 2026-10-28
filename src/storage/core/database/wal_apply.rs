@@ -1646,8 +1646,6 @@ impl Database {
             lsn,
             txn_id,
             ops,
-            None, // Replica page LSNs describe a different physical layout.
-            RecoveryContext::default(),
         )?;
         let _routing = btree_logical_wal::LsnScope::new(None);
         for index in recovery_indexes.values_mut() {

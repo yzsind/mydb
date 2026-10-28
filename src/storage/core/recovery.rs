@@ -366,7 +366,6 @@ fn recover_from_wal_with_options(
         summary.redone_records += redone_total.load(std::sync::atomic::Ordering::Relaxed);
     }
 
-    let native_recovery_ceiling = (!physical_replica).then_some(scan.next_lsn);
     let precheck_indexes = precheck_indexes
         && !physical_replica
         && prepared.len() == 0
@@ -381,7 +380,6 @@ fn recover_from_wal_with_options(
             )?));
             log.lock().set_local_recovery(context.is_restore());
             let mut state = RedoState::with_context(Some(log), context);
-            state.native_recovery_ceiling = native_recovery_ceiling;
             if precheck_indexes {
                 for partition in index_partitions.values() {
                     precheck_recovery_index(data_dir, &scan.records, partition, &mut state)?;
@@ -440,7 +438,6 @@ fn recover_from_wal_with_options(
                                 }
                             };
                         let mut state = RedoState::with_context(Some(shared_log), context);
-                        state.native_recovery_ceiling = native_recovery_ceiling;
                         'outer: loop {
                             let work_index =
                                 next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -690,14 +687,20 @@ fn recover_from_wal_with_options(
                     continue;
                 }
             }
-            let record = scan.records.find_lsn(lsn)?.ok_or_else(|| {
-                error(
+            let Some(record) = scan.records.find_lsn(lsn)? else {
+                if !context.is_restore() && crate::wal::wal_force_recover_enabled() {
+                    log_message(format_args!(
+                        "WARNING: WAL force-recover: transaction {txn_id} references missing undo LSN {lsn}; terminating its undo chain after the retained suffix; data may be incomplete"
+                    ));
+                    continue;
+                }
+                return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
                     format!(
-                        "corrupt WAL undo chain: transaction {txn_id} references missing LSN {lsn}"
+                        "corrupt WAL undo chain: transaction {txn_id} references missing LSN {lsn}; restore a verified backup, or explicitly use MYDB_WAL_FORCE_RECOVER=1 for salvage (may lose data)"
                     ),
-                )
-            })?;
+                ));
+            };
             if record.txn_id != txn_id || record.prev_txn_lsn >= lsn {
                 return Err(error(crate::error::catalog::ER_GET_ERRNO,
                     format!("corrupt WAL undo chain at LSN {lsn}: expected transaction {txn_id}, found {}, predecessor {}", record.txn_id, record.prev_txn_lsn)));
@@ -1161,7 +1164,6 @@ fn skip_prechecked_index_record(
 struct RedoState {
     context: RecoveryContext,
     recovery_log: Option<Arc<crate::wal::LogMutex>>,
-    native_recovery_ceiling: Option<u64>,
     recovery_indexes: HashMap<String, IndexFile>,
     skipped_index_redo_paths: HashSet<String>,
     redone_records: usize,
@@ -1181,7 +1183,6 @@ impl RedoState {
         Self {
             context,
             recovery_log,
-            native_recovery_ceiling: None,
             recovery_indexes: HashMap::new(),
             skipped_index_redo_paths: HashSet::new(),
             redone_records: 0,
@@ -1493,13 +1494,15 @@ fn apply_redo_record_inner(
                 record.lsn,
                 record.txn_id,
                 ops,
-                state.native_recovery_ceiling,
-                state.context,
             ) {
                 Ok(()) => {
                     state.redone_records += 1;
                 }
                 Err(err) if is_rebuildable_index_redo_error(&err) => {
+                    // An open/validation failure has no IndexFile on which to
+                    // set the fence. Persist it here before advancing recovery,
+                    // including for DD indexes and a second crash during redo.
+                    IndexFile::persist_rebuild_marker(&data_dir.join(path))?;
                     state.skipped_index_redo_paths.insert(path.clone());
                     state.recovery_indexes.remove(path);
                     state.skipped_index_redo_records += 1;
@@ -2201,8 +2204,6 @@ fn redo_index_batch(
     lsn: u64,
     txn_id: u64,
     ops: &[WalIndexOp],
-    native_recovery_ceiling: Option<u64>,
-    context: RecoveryContext,
 ) -> Result<(), QueryError> {
     let _routing = btree_logical_wal::LsnScope::new(Some(lsn));
     let index = match indexes.entry(relative.to_string()) {
@@ -2219,11 +2220,11 @@ fn redo_index_batch(
             row_id: wal_row_id_to_row_id(op.row_id),
         });
     }
-    if let Some(ceiling) = native_recovery_ceiling.filter(|_| !context.must_redo(lsn)) {
-        if index.recovery_batch_already_persisted(&entries, lsn, ceiling)? {
-            return Ok(());
-        }
-    }
+    // Leaf LSNs are flush watermarks, not proof that all earlier logical
+    // batches were applied. Concurrent append/apply order can differ and a
+    // structural operation publishes several independent pages. Replay every
+    // retained batch on the validated tree; duplicate inserts/missing deletes
+    // are idempotent. Cost-based skips require a durable heap-rebuild marker.
     // Shared with online physical replication: empty all-insert batches build
     // bottom-up, later strictly increasing chunks append at the right edge,
     // and mixed/unsorted batches retain the per-op correctness oracle.
@@ -2260,6 +2261,81 @@ fn wal_row_id_to_row_id(row_id: WalRowId) -> RowId {
 #[cfg(test)]
 mod undo_audit_recovery_tests {
     use super::*;
+
+    #[test]
+    fn btree_release_missing_undo_predecessor_requires_explicit_salvage() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let relative = "objects/tables/101/1.heap";
+        let mut page = Page::new();
+        let slot = page.insert(b"uncommitted").unwrap();
+        let mut log = LogManager::open(dir.path()).unwrap();
+        let first_path = log.path().to_owned();
+        log.append(7, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        log.rotate_segment().unwrap();
+        let lsn = log
+            .append(
+                7,
+                WalPayload::HeapInsert {
+                    path: relative.into(),
+                    page_id: 0,
+                    slot_id: slot,
+                    payload: b"uncommitted".to_vec(),
+                    undo_lsn: None,
+                },
+            )
+            .unwrap();
+        log.flush().unwrap();
+        drop(log);
+        write_recovery_heap_page(dir.path(), relative, 0, lsn, page).unwrap();
+        fs::remove_file(first_path).unwrap();
+        crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", None)], || {
+            let err = recover_from_wal(dir.path(), DurabilityMode::Strict)
+                .err()
+                .unwrap();
+            assert!(err.message().contains("references missing LSN"));
+        });
+        crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", Some("1"))], || {
+            recover_from_wal(dir.path(), DurabilityMode::Strict).unwrap();
+        });
+        let page = Page::decode(&fs::read(dir.path().join(relative)).unwrap()).unwrap();
+        assert!(
+            page.read(slot).is_none(),
+            "the retained undo suffix must still be applied"
+        );
+        crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", None)], || {
+            recover_from_wal(dir.path(), DurabilityMode::Strict).unwrap();
+        });
+    }
+
+    #[test]
+    fn btree_release_force_recover_preserves_undo_chain_integrity_checks() {
+        for predecessor in [1u64, 2] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(dir.path()).unwrap();
+            log.append(8, WalPayload::BeginTxn { start_scn: 1 })
+                .unwrap();
+            log.append(7, WalPayload::BeginTxn { start_scn: 1 })
+                .unwrap();
+            log.flush().unwrap();
+            let path = log.path().to_owned();
+            drop(log);
+            let mut bytes = fs::read(&path).unwrap();
+            let frame = crate::wal::WAL_HEADER_LEN + crate::wal::WAL_FRAME_HEADER_LEN + 8;
+            bytes[frame + 16..frame + 24].copy_from_slice(&predecessor.to_le_bytes());
+            let mut checksum = crc32fast::Hasher::new();
+            checksum.update(&bytes[frame..frame + 44]);
+            checksum.update(&bytes[frame + 48..frame + 56]);
+            bytes[frame + 44..frame + 48].copy_from_slice(&checksum.finalize().to_le_bytes());
+            fs::write(path, bytes).unwrap();
+            crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", Some("1"))], || {
+                let err = recover_from_wal(dir.path(), DurabilityMode::Strict)
+                    .err()
+                    .unwrap();
+                assert!(err.message().contains("corrupt WAL undo chain at LSN"));
+            });
+        }
+    }
 
     #[test]
     fn audit1022_heap_update_replays_at_absolute_slot_after_skipped_inserts() {

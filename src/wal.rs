@@ -2008,19 +2008,6 @@ impl LogManager {
         // immediate truncate is not required for correctness.
         self.flush_pending_writes()?;
         self.active_file.flush().map_err(io_err)?;
-        self.pending_sealed_sync.push(PendingSealedSync {
-            file: Arc::clone(&self.active_file),
-            last_lsn: self.active_info.last_lsn,
-        });
-        let mut sealed = self.active_info.clone();
-        sealed.status = WalSegmentStatus::Reclaimable;
-        let sealed_bytes = sealed.size_bytes;
-        self.segments.push(sealed);
-        // Sealed list grew by sealed_bytes; mirror to atomic.
-        self.state_atomics
-            .sealed_size_bytes
-            .fetch_add(sealed_bytes, Ordering::AcqRel);
-
         let next_id = self.active_info.segment_id.saturating_add(1);
         let path = segment_path(&self.dir, next_id).with_extension("log.pending");
         // Fast path: the background preparer (`ensure_next_segment`) already
@@ -2055,6 +2042,20 @@ impl LogManager {
                 (Arc::new(file), SegmentFill::Reserve)
             }
         };
+        // Preparing the successor can fail. Until it succeeds, the current
+        // descriptor is still active and must never enter the reclaimable
+        // list: checkpoint cleanup could otherwise unlink a live WAL file.
+        self.pending_sealed_sync.push(PendingSealedSync {
+            file: Arc::clone(&self.active_file),
+            last_lsn: self.active_info.last_lsn,
+        });
+        let mut sealed = self.active_info.clone();
+        sealed.status = WalSegmentStatus::Reclaimable;
+        let sealed_bytes = sealed.size_bytes;
+        self.segments.push(sealed);
+        self.state_atomics
+            .sealed_size_bytes
+            .fetch_add(sealed_bytes, Ordering::AcqRel);
         // Active-segment size tracks valid bytes, not the preallocated
         // extent.
         let size_bytes = WAL_HEADER_LEN as u64;
@@ -6997,11 +6998,11 @@ fn wal_preallocate_enabled() -> bool {
 /// is traded for completeness, identical in spirit to undo's
 /// `MYDB_UNDO_FORCE_RECOVER`. Default off: corruption is fatal so silent
 /// data loss never happens without an explicit opt-in.
-fn wal_force_recover_enabled() -> bool {
+pub(crate) fn wal_force_recover_enabled() -> bool {
     // Read fresh (not cached): this is only consulted on the cold
     // recovery/scan path, never in a hot loop, and a fresh read keeps the
     // flag deterministically toggleable in tests.
-    std::env::var_os("MYDB_WAL_FORCE_RECOVER")
+    crate::util::env::var_os("MYDB_WAL_FORCE_RECOVER")
         .map(|v| {
             !matches!(
                 v.to_string_lossy().to_ascii_lowercase().as_str(),
@@ -8652,6 +8653,35 @@ mod tests {
         drop(log);
         let reopened = LogManager::open(dir.path()).unwrap();
         assert_log_state_atomics_match(&reopened);
+    }
+
+    #[test]
+    fn btree_release_failed_rotation_cannot_publish_active_as_reclaimable() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = LogManager::open(dir.path()).unwrap();
+        let begin = log
+            .append(7, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        log.flush().unwrap();
+        let pending =
+            segment_path(&log.dir, log.active_segment_id() + 1).with_extension("log.pending");
+        fs::create_dir(&pending).unwrap();
+        assert!(log.rotate_segment().is_err());
+        assert!(
+            log.segments.is_empty(),
+            "a failed rotation must not make the active WAL reclaimable"
+        );
+        assert!(log.pending_sealed_sync.is_empty());
+        fs::remove_dir(&pending).unwrap();
+        log.rotate_segment().unwrap();
+        let end = log.append(7, WalPayload::AbortTxn).unwrap();
+        log.flush().unwrap();
+        let scan = LogManager::scan(dir.path()).unwrap();
+        assert_eq!(
+            scan.records.iter().map(|r| r.lsn).collect::<Vec<_>>(),
+            vec![begin, end]
+        );
+        assert_eq!(scan.records[1].prev_txn_lsn, begin);
     }
 
     #[test]

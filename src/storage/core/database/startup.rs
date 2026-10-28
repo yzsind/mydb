@@ -154,8 +154,10 @@ impl Database {
         }
         // Dictionary heaps are authoritative too. The ordinary index pass
         // below only visits user tables, but later startup steps already use
-        // indexed DD property/sequence probes. Repair fenced dictionary trees
-        // before those probes, including after a previously interrupted repair.
+        // indexed DD property/sequence probes. Validate dictionary trees even
+        // without a fence: a torn structural flush may never have been opened
+        // by index REDO. Repair them before those probes and preserve repair
+        // intent across an interrupted rebuild.
         recovery.repaired_indexes += self.rebuild_failed_dictionary_indexes()?;
         recovery.startup_validation_mode = Some(self.config.startup_validation);
         let path = match self.config.startup_validation {
@@ -249,9 +251,18 @@ impl Database {
         for table in crate::storage::data_dictionary::dd_tables() {
             let mut markers = Vec::new();
             for index in &table.indexes {
-                let marker = self
-                    .index_path(table.id, &index.name)
-                    .with_extension("idx.failed");
+                let path = self.index_path(table.id, &index.name);
+                let marker = path.with_extension("idx.failed");
+                if !marker.try_exists().map_err(io_err)? {
+                    match IndexFile::validate(path.clone()) {
+                        Ok(()) => continue,
+                        Err(err) if is_rebuildable_index_redo_error(&err) => {
+                            self.ensure_writable()?;
+                            IndexFile::persist_rebuild_marker(&path)?;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
                 if marker.try_exists().map_err(io_err)? {
                     markers.push(marker);
                 }

@@ -1183,6 +1183,11 @@ or other writes; it is recommended to be owned by the service account with mode
   `*.log.force-recover-<pid>-<offset>.bak` in the same directory before
   truncating and logging the discarded byte range. This option cannot recover
   already-corrupted transactions and is not suitable for permanent configuration.
+  During crash recovery it also permits a missing undo predecessor to terminate
+  that transaction's undo chain after the retained suffix has been undone. A
+  warning identifies the transaction and missing LSN; changes in missing history
+  cannot be verified or undone. Transaction mismatches and non-backward undo
+  links remain fatal. Backup restore does not permit this undo salvage mode.
 - A corrupted `role.json` refuses startup by default and reports the path.
   Restoring a trusted backup is preferred; explicitly setting
   `MYDB_REPAIR_ROLE=replica` backs up the corrupted metadata and atomically writes
