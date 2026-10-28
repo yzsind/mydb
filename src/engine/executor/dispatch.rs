@@ -19,14 +19,13 @@ use mdl::{
 };
 mod views;
 use views::{
-    effective_view_security_account, expand_views, materialize_alter_view_options,
-    materialize_view_options, reject_unsupported_view_query, revalidate_altered_table_views,
-    stored_view_query, trail_key, validate_view_definition, view_query_from_query,
-    warn_if_view_definer_missing,
+    effective_view_security_account, materialize_alter_view_options, materialize_view_options,
+    reject_unsupported_view_query, revalidate_altered_table_views, stored_view_query, trail_key,
+    validate_view_definition, view_query_from_query, warn_if_view_definer_missing,
 };
 pub(super) use views::{
-    revalidate_routine_views, rewrite_delete_through_view, rewrite_insert_through_view,
-    rewrite_update_through_view,
+    expand_views, revalidate_routine_views, rewrite_delete_through_view,
+    rewrite_insert_through_view, rewrite_update_through_view,
 };
 mod setop;
 pub(in crate::engine::executor) use setop::{coerce_setop_value, set_row_key};
@@ -3310,6 +3309,11 @@ pub(super) fn execute_statement_with_qualification(
     if already_qualified
         && !crate::engine::http::statement_has_http(&statement)
         && !matches!(statement, Statement::Call(_))
+        // PREPARE qualifies names but leaves stored views unexpanded. Such
+        // executions still need the full security and expansion lifecycle.
+        && !collect_statement_table_uses(&statement).iter().any(|usage| {
+            db.view_definition(&session.current_database, &usage.table).is_some()
+        })
         && !super::routines::statement_references_stored_function(
             db,
             &session.current_database,
@@ -4350,6 +4354,11 @@ pub(super) fn authorize_prepared_statement_with_epoch(
         }
         Ok(auth.epoch)
     })??;
+    // Keep the EXPLAIN-only catalog walk and its stack frame off normal
+    // SELECT/DML authorization paths, including unoptimized builds.
+    if matches!(statement, Statement::Explain { .. }) {
+        authorize_explain_view_dependencies(db, session, statement)?;
+    }
     // Trigger-privilege check runs after the auth-catalog read lock is
     // released because `trigger_definition` itself takes the catalog
     // read lock, and `std::sync::RwLock` is not re-entrant on the same
@@ -4371,6 +4380,75 @@ pub(super) fn authorize_prepared_statement_with_epoch(
         }
     }
     Ok(generation)
+}
+
+fn authorize_explain_view_dependencies(
+    db: &Arc<Database>,
+    session: &SessionContext,
+    statement: &Statement,
+) -> Result<(), QueryError> {
+    let Statement::Explain { target, .. } = statement else {
+        return Ok(());
+    };
+    let mut pending = Vec::new();
+    for usage in collect_statement_table_uses(target) {
+        if !session.has_temp_table(&usage.table) {
+            if let Some(view) = db.view_definition(&session.current_database, &usage.table) {
+                pending.push(view);
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let auth = db.auth_catalog();
+    let caller = session.authorization_context();
+    let mut visited = BTreeSet::new();
+    let denied = || {
+        error(
+            crate::error::catalog::ER_VIEW_NO_EXPLAIN,
+            "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table",
+        )
+    };
+    while let Some(view) = pending.pop() {
+        if !visited.insert((
+            view.database.to_ascii_lowercase(),
+            view.name.to_ascii_lowercase(),
+        )) {
+            continue;
+        }
+        let required = RequiredPrivilege {
+            privilege: Privilege::ShowView,
+            scope: PrivilegeScope::Table {
+                database: view.database.clone(),
+                table: view.name.clone(),
+            },
+        };
+        if !auth.account_has_privilege(&caller, &required, false) {
+            return Err(denied());
+        }
+        for dependency in &view.dependencies {
+            let required = RequiredPrivilege {
+                privilege: Privilege::Select,
+                scope: PrivilegeScope::Table {
+                    database: dependency.database.clone(),
+                    table: dependency.name.clone(),
+                },
+            };
+            // EXPLAIN exposes the implementation of a DEFINER view. Its
+            // dependencies must be authorized as the caller, never via the
+            // execution-only security overrides.
+            if !auth.account_has_privilege(&caller, &required, false) {
+                return Err(denied());
+            }
+            if dependency.is_view {
+                if let Some(nested) = db.view_definition(&dependency.database, &dependency.name) {
+                    pending.push(nested);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn explain_dml_view_privileges(

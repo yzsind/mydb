@@ -3735,8 +3735,8 @@ fn simple_order_expr_column_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// Preserve row-lock identity when a simple derived query (including an
-/// inlined CTE) is a projection/filter over exactly one base table.
+/// Preserve row-lock identity when a mergeable derived query (including an
+/// inlined view or CTE) is a projection/filter over base tables.
 pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select) -> Option<Select> {
     if !select.for_update
         || !select.group_by.is_empty()
@@ -3751,7 +3751,17 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
     let SubQuery::Select(inner) = candidate.derived.as_mut()? else {
         return None;
     };
-    if inner.from.len() != 1 || !inner.joins.is_empty() || inner.derived.is_some() {
+    if inner.from.len() != 1 || inner.derived.is_some() {
+        return None;
+    }
+    // A view-level OF target cannot be copied verbatim to flattened base
+    // aliases. Keep such queries on the explicit unsupported path.
+    if !inner.joins.is_empty()
+        && select
+            .lock_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.targets.is_empty())
+    {
         return None;
     }
     let table_ref = &inner.from[0];
@@ -3764,6 +3774,9 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
     for item in &inner.projection {
         match item {
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                if !inner.joins.is_empty() {
+                    return None;
+                }
                 for (_, column) in table.iter_select_columns() {
                     projection.push(SelectItem::Expr {
                         expr: Expr::CompoundIdentifier(vec![
@@ -3813,7 +3826,11 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
         }
     }
     candidate.projection = projection;
+    let limit = candidate.limit.take();
+    let offset = candidate.offset.take();
     let mut flat = try_flatten_simple_derived_select(&candidate)?;
+    flat.limit = limit;
+    flat.offset = offset;
     flat.for_update = select.for_update;
     flat.lock_clause = select.lock_clause.clone();
     Some(flat)

@@ -14,7 +14,7 @@ Lists the visible tables and views in a database.
 
 ## Behavior, Privileges, and Results
 
-- The current database is used when the database is omitted; FULL adds Table_type.
+- The current database is used when the database is omitted. Plain SHOW TABLES returns one `Tables_in_<db>` column. FULL adds `Table_type` and the mydb extension columns `TABLE_ROWS`, `DATA_LENGTH`, `INDEX_LENGTH`, `CREATE_TIME`, and `TABLE_COMMENT` (seven columns in total). This extended shape applies to user and system schemas; clients requiring MySQL's two-column listing can query `information_schema.TABLES` with an explicit projection.
 - Session temporary tables are presented according to name resolution and visibility rules.
 
 ## Examples

@@ -512,7 +512,7 @@ fn view_0929_aggregate_lock_is_explicit_error() {
         exec(&e, &mut s, "SELECT * FROM v FOR UPDATE")
             .unwrap_err()
             .code(),
-        1288
+        1235
     );
 }
 

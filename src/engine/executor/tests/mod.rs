@@ -475,6 +475,7 @@ mod schema_show_audit;
 
 mod mysql_schema_audit;
 mod sys_schema_audit;
+mod view_audit_20261028;
 mod view_source_audit;
 
 mod table_ddl_audit;

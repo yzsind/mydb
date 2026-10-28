@@ -264,7 +264,17 @@ pub(crate) fn show_columns(
                             | DataTypeKind::Text { .. }
                             | DataTypeKind::Enum { .. }
                             | DataTypeKind::Set { .. } => {
-                                Value::String(crate::charset::DEFAULT_COLLATION.to_string())
+                                Value::String(column.collation.clone().unwrap_or_else(|| {
+                                    column
+                                        .charset
+                                        .as_deref()
+                                        .and_then(|charset| {
+                                            crate::charset::default_collation_for_charset(charset)
+                                                .ok()
+                                        })
+                                        .unwrap_or(crate::charset::DEFAULT_COLLATION)
+                                        .to_string()
+                                }))
                             }
                             _ => Value::Null,
                         })
