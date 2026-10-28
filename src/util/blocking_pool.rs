@@ -16,13 +16,12 @@
 //! The replacement here uses:
 //!
 //! * a `crossbeam_deque::Injector` MPMC queue (lockless push + steal)
-//! * `MYDB_BLOCKING_POOL_SIZE` pre-spawned baseline worker threads (default
-//!   CPU-scaled — enough row-lock condvar headroom without waking a
-//!   256-thread pool on small OLTP boxes; tokio's hidden default is 512
-//!   grown lazily, we pre-spawn so the steady-state spawn path never
-//!   allocates a thread). The pool then grows on demand up to
-//!   `MYDB_BLOCKING_POOL_MAX` (default 2× the CPU-scaled baseline) whenever
-//!   a task is queued with zero idle workers. This is a correctness
+//! * `MYDB_BLOCKING_POOL_SIZE` baseline capacity (default CPU-scaled) and
+//!   `MYDB_BLOCKING_POOL_MAX` funded ceiling (default 2× that baseline).
+//!   Threads are created only when a submission cannot claim a parked
+//!   worker, and remain available for reuse afterward. Neither the configured
+//!   capacity nor its complete stack reservation depends on physical thread
+//!   creation. Growing on unmet demand is a correctness
 //!   requirement, not just a tuning knob: lock-taking statements — including
 //!   the COMMIT that releases a transaction's row locks — run here and park
 //!   on a row-lock condvar. If a fixed-size pool is fully occupied by workers
@@ -97,7 +96,7 @@ pub struct BlockingPool {
     idle: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
-    /// Current worker-thread count (baseline + on-demand overflow). Read on
+    /// Current physical worker count. Read on
     /// the grow path to bound growth at `max_workers`.
     total: Arc<AtomicUsize>,
     /// Hard ceiling on the worker count. Growth stops here.
@@ -213,8 +212,8 @@ impl BlockingPool {
         Self::with_limits(num_workers, configured_max(num_workers))
     }
 
-    /// `baseline` workers are pre-spawned; the pool may grow on demand up to
-    /// `max_workers` (clamped to at least `baseline`).
+    /// Preserve the configured baseline and ceiling, but create OS workers
+    /// only on demand. `max_workers` is clamped to at least `baseline`.
     pub fn with_limits(baseline: usize, max_workers: usize) -> Self {
         let baseline = baseline.max(1);
         let max_workers = max_workers.max(baseline);
@@ -225,16 +224,7 @@ impl BlockingPool {
         let total = Arc::new(AtomicUsize::new(0));
 
         let stack_size = configured_stack_size();
-        let mut workers = Vec::with_capacity(baseline);
-        for _ in 0..baseline {
-            workers.push(spawn_worker(
-                &injector, &sleepers, &idle, &shutdown, stack_size,
-            ));
-        }
-        // Account for the pre-spawned baseline; on-demand growth bumps this
-        // further via `maybe_grow`. Set after spawning — no `maybe_grow` can
-        // race here because the pool isn't published yet.
-        total.store(baseline, Ordering::Release);
+        let workers = Vec::with_capacity(baseline);
         Self {
             injector,
             sleepers,
@@ -275,7 +265,7 @@ impl BlockingPool {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    // Overflow workers park forever like the baseline (no
+                    // Created workers park forever between tasks (no
                     // reaping): the pool converges to the true concurrency
                     // high-water mark, and idle parked threads cost ~0 CPU and
                     // ~0 committed stack. They exit on pool shutdown via the
@@ -332,18 +322,12 @@ impl BlockingPool {
         let woke_preferred = preferred
             .as_ref()
             .is_some_and(|worker| wake_sleeper(worker));
-        if !woke_preferred
-            && !wake_one_sleeper(&self.sleepers)
-            && self.idle.load(Ordering::Acquire) == 0
-        {
-            // No worker is idle to pick this task up. Either the existing
-            // workers are busy with short tasks (they will drain it in a
-            // moment) or they are all parked inside a row-lock wait and will
-            // NOT — the starvation-deadlock case. We can't tell the two apart
-            // cheaply, so grow when below the ceiling: a spurious extra worker
-            // parks harmlessly, while the needed one breaks the deadlock. The
-            // pool converges to the real concurrency high-water mark because
-            // growth only fires while zero workers are parked.
+        if !woke_preferred && !wake_one_sleeper(&self.sleepers) {
+            // Park tokens describe available capacity. The physical idle
+            // counter can still include already claimed/notified workers;
+            // trusting it would strand a queued lock-releasing continuation.
+            // A racing park publication can cause one extra funded worker,
+            // which is harmless and remains bounded by the same ceiling.
             self.maybe_grow();
         }
         BlockingHandle {
@@ -373,7 +357,7 @@ impl BlockingPool {
         });
         self.injector.push(task);
         std::sync::atomic::fence(Ordering::SeqCst);
-        if !wake_one_sleeper(&self.sleepers) && self.idle.load(Ordering::Acquire) == 0 {
+        if !wake_one_sleeper(&self.sleepers) {
             self.maybe_grow();
         }
         BlockingJoinHandle { rx, finished }
@@ -390,11 +374,9 @@ impl Drop for BlockingPool {
     }
 }
 
-/// Spawn one worker thread. Shared by the baseline pre-spawn
-/// ([`BlockingPool::with_limits`]) and on-demand growth
-/// ([`BlockingPool::maybe_grow`]). The live worker count (`total`) is managed
-/// by the callers — the baseline via a single `store`, growth via a CAS
-/// reservation — so this function only handles thread creation. A monotonic
+/// Spawn one worker thread after an on-demand CAS reservation in
+/// [`BlockingPool::maybe_grow`]. This function only handles creation; it does
+/// not change the count or ceiling. A monotonic
 /// sequence gives each worker a unique, stable name across growth.
 fn spawn_worker(
     injector: &Arc<Injector<Task>>,
@@ -779,7 +761,7 @@ fn configured_size() -> usize {
 }
 
 fn cpu_scaled_baseline() -> usize {
-    // Scale the baseline to the machine instead of pre-spawning 256 workers
+    // Scale the baseline capacity to the machine instead of budgeting 256 workers
     // everywhere. Prepared-write OLTP workloads with tens of active sessions
     // spend measurable time in scheduler/park wakeups when the pool is far
     // wider than the active demand. Under heavier concurrency the pool now
@@ -876,6 +858,103 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "workers did not park");
             std::thread::yield_now();
         }
+    }
+
+    #[tokio::test]
+    async fn cold_pool_creates_no_idle_threads_before_first_demand() {
+        let pool = BlockingPool::with_limits(8, 16);
+        assert_eq!(pool.total.load(Ordering::Acquire), 0);
+        assert!(pool.workers.lock().is_empty());
+        assert_eq!(pool.max_workers, 16);
+        assert_eq!(pool.spawn(|| 42).await.unwrap(), 42);
+        assert_eq!(pool.total.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_pool_reaches_the_unchanged_ceiling_without_overshoot() {
+        let pool = BlockingPool::with_limits(2, 8);
+        let release = Arc::new(AtomicBool::new(false));
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _release_on_failure = ReleaseOnDrop(release.clone());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let mut pending = Vec::new();
+        for _ in 0..8 {
+            let release = release.clone();
+            let entered = entered_tx.clone();
+            pending.push(pool.spawn(move || {
+                entered.send(()).unwrap();
+                while !release.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        }
+        for _ in 0..8 {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let queued = pool.spawn(|| 9);
+        assert_eq!(pool.total.load(Ordering::Acquire), 8);
+        assert_eq!(pool.max_workers, 8);
+        release.store(true, Ordering::Release);
+        for task in pending {
+            task.await.unwrap();
+        }
+        assert_eq!(queued.await.unwrap(), 9);
+        assert_eq!(pool.total.load(Ordering::Acquire), 8);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_sleeper_does_not_hide_demand_from_pool_growth() {
+        let pool = BlockingPool::with_limits(1, 2);
+        if pool.total.load(Ordering::Acquire) == 0 {
+            pool.maybe_grow();
+        }
+        wait_until_parked(&pool);
+        assert_eq!(pool.total.load(Ordering::Acquire), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let sleeper = loop {
+            match pool.sleepers.steal() {
+                Steal::Success(worker) => break worker,
+                _ => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+        };
+        sleeper.queued.store(false, Ordering::Release);
+        struct PendingWake(Arc<WorkerSleeper>);
+        impl Drop for PendingWake {
+            fn drop(&mut self) {
+                self.0.thread.get().unwrap().unpark();
+            }
+        }
+        let held = PendingWake(sleeper);
+        // Simulate a submitter preempted after claiming the park token but
+        // before unpark. Physical idle count is still one, but it cannot
+        // service another request until that submitter resumes.
+        assert!(held
+            .0
+            .state
+            .compare_exchange(
+                WORKER_PARKED,
+                WORKER_NOTIFIED,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            )
+            .is_ok());
+        let result = tokio::time::timeout(Duration::from_millis(250), pool.spawn(|| 7)).await;
+        drop(held);
+        assert_eq!(
+            result
+                .expect("a claimed sleeper must not suppress funded growth")
+                .unwrap(),
+            7
+        );
+        assert!(pool.total.load(Ordering::Acquire) <= 2);
     }
 
     #[tokio::test]
@@ -1175,6 +1254,11 @@ mod tests {
     #[tokio::test]
     async fn short_tasks_reuse_idle_workers_without_growth() {
         let pool = BlockingPool::with_limits(8, 16);
+        // Arrange the original eight-parked-worker fixture explicitly. Pool
+        // construction itself no longer creates idle operating-system threads.
+        while pool.total.load(Ordering::Acquire) < 8 {
+            pool.maybe_grow();
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while pool.idle.load(Ordering::Acquire) < 8 && std::time::Instant::now() < deadline {
             std::thread::yield_now();

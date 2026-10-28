@@ -148,6 +148,59 @@ fn sqlfix_minmax_row_and_row_spill_use_declared_collation() {
 }
 
 #[test]
+fn row_spill_reports_missing_occupied_partition() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let tmp = SpillTmpDir::create_kind(dir.path(), "missing-rowagg").unwrap();
+    let (rows, _) = fixture(1);
+    let schema = Arc::new(rows[0].fields.iter().cloned().collect::<Vec<_>>());
+    let (_, slots) = spec("SELECT COUNT(*) FROM t");
+    // The producer claims this bucket was completed. Losing its file must
+    // return an error, rather than silently treating it as an empty bucket.
+    assert!(merge_row_hash_agg_spill_partitions(&tmp, &[7], &schema, &[], &slots, None).is_err());
+}
+
+#[test]
+fn row_spill_does_not_open_unused_partitions_for_one_group() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = Arc::new(
+        Database::open_with_config(
+            dir.path(),
+            crate::engine::executor::tests::memory_test_storage_config(),
+        )
+        .unwrap(),
+    );
+    let (rows, plan) = fixture(1025);
+    let (select, slots) = spec("SELECT COUNT(*), SUM(v), VAR_POP(id) FROM t");
+    let expected = aggregate_plan_rows(rows.clone(), &select.group_by, None, &slots).unwrap();
+    let budget = Arc::new(MemBudget::new(64 * 1024 * 1024));
+    for streaming in [false, true] {
+        let before = crate::engine::executor::spill_quota::spill_file_opens();
+        let actual = with_query_budget(budget.clone(), || {
+            if streaming {
+                aggregate_plan_stream_spilled(
+                    &db,
+                    TxnView::read_only(0, IsolationLevel::RepeatableRead),
+                    &plan,
+                    &select.group_by,
+                    None,
+                    &slots,
+                )
+            } else {
+                aggregate_plan_rows_spilled(&db, rows.clone(), &select.group_by, None, &slots)
+            }
+        })
+        .unwrap();
+        assert_eq!(output(&actual, &slots), output(&expected, &slots));
+        assert_eq!(budget.used(), 0);
+        let opens = crate::engine::executor::spill_quota::spill_file_opens() - before;
+        assert!(
+            opens <= 4,
+            "single occupied group opened {opens} spill files; streaming={streaming}"
+        );
+    }
+}
+
+#[test]
 fn row_aggregate_entry_points_preserve_group_and_accumulator_semantics() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let db = Arc::new(Database::open(dir.path()).unwrap());

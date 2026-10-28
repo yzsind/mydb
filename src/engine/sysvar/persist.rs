@@ -296,7 +296,7 @@ impl PersistedVariables {
         {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&payload)?;
-            f.sync_all()?;
+            crate::platform::fs::sync_standard_before_atomic_rename_at(&f, &tmp)?;
         }
         fs::rename(&tmp, &self.path)?;
         if let Some(parent) = self.path.parent() {

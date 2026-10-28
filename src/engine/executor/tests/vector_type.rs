@@ -4487,6 +4487,8 @@ fn online_type_copy_vector_generations_allow_tail_writes() {
             for algo in ["HNSW", "IVF"] {
                 for partitioned in [false, true] {
                     let dir = tempfile::tempdir().unwrap();
+                    let preparation =
+                        crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
                     let engine = std::sync::Arc::new(open_strict_test_engine(dir.path()));
                     engine
                     .execute(if partitioned {
@@ -4506,6 +4508,7 @@ fn online_type_copy_vector_generations_allow_tail_writes() {
                     engine
                         .execute(&format!("CREATE INDEX emb_idx ON t(emb) USING {algo}"))
                         .unwrap();
+                    preparation.finish().unwrap();
                     let hook = engine.database().install_online_copy_publish_test_hook();
                     let worker = engine.clone();
                     let ddl = std::thread::spawn(move || {

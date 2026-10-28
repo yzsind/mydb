@@ -375,8 +375,6 @@ impl Database {
         })?;
         crate::util::file::write_staged_file(&path, &path.with_extension("json.tmp"), &bytes, true)
             .map_err(io_err)?;
-        // fsync the directory so the new entry is durable before the commit.
-        crate::platform::fs::sync_path(&dir).map_err(io_err)?;
         Ok(Some(path))
     }
 

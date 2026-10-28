@@ -1,6 +1,325 @@
 use super::*;
 
 #[test]
+fn memory_index_mutations_do_not_reencode_resident_leaf_for_each_entry() {
+    for kind in 0..8 {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let log = test_log(dir.path());
+        let pool = BufferPool::new_with_options(
+            16,
+            Arc::clone(&log),
+            DurabilityMode::Memory,
+            Duration::ZERO,
+            1,
+            0,
+        );
+        let mut index = IndexFile::open_with_durability(
+            dir.path().join("memory.idx"),
+            log.clone(),
+            DurabilityMode::Memory,
+            pool,
+        )
+        .unwrap();
+        let entries = (0..128)
+            .map(|value| IndexEntry {
+                key: IndexKey::from(match kind {
+                    0 => vec![KeyPart::Int(value)],
+                    1 => vec![KeyPart::UInt(value as u64)],
+                    2 => vec![KeyPart::Decimal {
+                        value: value as i128 * 101,
+                        scale: 2,
+                    }],
+                    3 => vec![KeyPart::Date(18000 + value as i32)],
+                    4 => vec![KeyPart::Float64(
+                        crate::util::ordered_float::f64_to_order_u64(value as f64 / 4.0),
+                    )],
+                    5 => vec![KeyPart::Bytes(format!("key-{value:04}").into_bytes())],
+                    6 => vec![KeyPart::String(format!("key-{value:04}"))],
+                    _ => vec![KeyPart::Int(value), KeyPart::UInt(value as u64 * 3)],
+                }),
+                row_id: RowId {
+                    page_id: value as u32 + 1,
+                    slot_id: 0,
+                },
+            })
+            .collect::<Vec<_>>();
+        index.bulk_load_sorted(7, entries.clone()).unwrap();
+        let wal_before = log.lock().last_lsn();
+        let encodings_before = INDEX_TREE_PAGE_ENCODINGS.with(|count| count.get());
+        for entry in &entries[32..64] {
+            index.delete(entry.key.clone(), entry.row_id).unwrap();
+        }
+        let actual = index.entries().unwrap();
+        let expected = entries[..32]
+            .iter()
+            .chain(&entries[64..])
+            .map(|entry| (entry.key.clone(), entry.row_id))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "kind={kind}");
+        for entry in &entries[32..64] {
+            index
+                .insert(entry.key.clone(), entry.row_id, false)
+                .unwrap();
+        }
+        assert_eq!(
+            index.entries().unwrap(),
+            entries
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.row_id))
+                .collect::<Vec<_>>(),
+            "kind={kind}"
+        );
+        assert_eq!(
+            log.lock().last_lsn(),
+            wal_before,
+            "memory mutations must not append WAL"
+        );
+        let encodings = INDEX_TREE_PAGE_ENCODINGS.with(|count| count.get()) - encodings_before;
+        assert!(
+            encodings <= 4,
+            "resident mutations encoded {encodings} whole pages; kind={kind}"
+        );
+        let root = index.page_key(index.root_page.load(Ordering::Acquire));
+        let frame = index.buffer_pool.lookup_frame(&root).unwrap().unwrap();
+        assert_eq!(frame.dirty_lsn.load(Ordering::Acquire), 0);
+
+        // Explicit replay still supplies a logical anchor even when the
+        // index's resident cache uses memory durability.
+        let logical_lsn = log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        assert!(logical_lsn > 0);
+        index
+            .apply_batch_with_lsn(
+                8,
+                vec![IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entries[96].key.clone(),
+                    row_id: entries[96].row_id,
+                }],
+                Some(logical_lsn),
+            )
+            .unwrap();
+        assert!(frame.dirty_lsn.load(Ordering::Acquire) >= logical_lsn);
+        assert!(index.get(&entries[96].key, false).unwrap().is_empty());
+
+        // Unlogged physical replay must keep the source's last applied LSN,
+        // rather than the next reservation used by local logical mutations.
+        log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        let source_lsn = log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        with_physical_wal_apply(|| {
+            index.apply_batch_with_lsn(
+                8,
+                vec![IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entries[97].key.clone(),
+                    row_id: entries[97].row_id,
+                }],
+                None,
+            )
+        })
+        .unwrap();
+        let frame = index.buffer_pool.lookup_frame(&root).unwrap().unwrap();
+        assert_eq!(frame.dirty_lsn.load(Ordering::Acquire), source_lsn);
+        assert!(index.get(&entries[97].key, false).unwrap().is_empty());
+
+        let source_lsn = log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        log.lock().set_physical_replica(true);
+        index
+            .apply_batch_with_lsn(
+                8,
+                vec![IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entries[98].key.clone(),
+                    row_id: entries[98].row_id,
+                }],
+                None,
+            )
+            .unwrap();
+        let frame = index.buffer_pool.lookup_frame(&root).unwrap().unwrap();
+        assert_eq!(frame.dirty_lsn.load(Ordering::Acquire), source_lsn);
+        assert!(index.get(&entries[98].key, false).unwrap().is_empty());
+        log.lock().set_physical_replica(false);
+    }
+}
+
+#[test]
+fn batched_index_visibility_reads_each_heap_header_once() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = open_memory_test_db(dir.path());
+    db.create_table(
+        "header_batch",
+        vec![
+            checkpoint_test_pk_column(),
+            ColumnDef {
+                name: "v".into(),
+                primary_key: false,
+                ..checkpoint_test_pk_column()
+            },
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let committed = db.begin_txn().unwrap();
+    db.insert_rows(
+        committed,
+        "test.header_batch",
+        (0..128)
+            .map(|id| vec![Value::Int(id), Value::Int(0)])
+            .collect(),
+    )
+    .unwrap();
+    db.commit_txn(committed.txn_id).unwrap();
+    let pending = db.begin_txn().unwrap();
+    db.update_rows_with_changed_columns(
+        pending,
+        "test.header_batch",
+        None,
+        Some(&[1]),
+        |values| Ok(matches!(values[0], Value::Int(id) if id >= 16)),
+        |values| Ok(vec![values[0].clone(), Value::Int(1)]),
+    )
+    .unwrap();
+    let table = db.table("test.header_batch").unwrap();
+    let index = table.indexes.iter().find(|index| index.primary).unwrap();
+    let entries = db
+        .range_index_entries_chunk(&table, index, None, None, None, 256)
+        .unwrap();
+    assert_eq!(entries.len(), 128);
+    assert!(entries
+        .iter()
+        .all(|(_, row)| row.page_id == entries[0].1.page_id));
+    let borrowed: Vec<_> = entries.iter().map(|(key, row)| (key, *row)).collect();
+    let integers: Vec<_> = entries
+        .iter()
+        .map(|(key, row)| {
+            let KeyPart::Int(value) = key.0[0] else {
+                panic!("integer primary key")
+            };
+            (Some(value), *row)
+        })
+        .collect();
+    let row_ids: Vec<_> = entries.iter().map(|(_, row)| *row).collect();
+    let heap = db.heap_handle(table.id).unwrap();
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    for variant in 0..4 {
+        let before = HEAP_BATCH_HEADER_SLOTS_READ.with(|count| count.get());
+        let mask = match variant {
+            0 => db.filter_visible_index_entries_mask_with_handle(
+                &heap, &table, index, &entries, view,
+            ),
+            1 => db.filter_visible_index_entries_refs_mask_with_handle(
+                &heap, &table, index, &borrowed, view,
+            ),
+            2 => db.filter_visible_index_i64_entries_mask_with_handle(
+                &heap, &table, index, &integers, 0, view,
+            ),
+            _ => db.filter_visible_row_ids_mask_with_handle(&heap, &table, &row_ids, view),
+        }
+        .unwrap();
+        assert_eq!(mask, vec![true; 128], "variant={variant}");
+        let examined = HEAP_BATCH_HEADER_SLOTS_READ.with(|count| count.get()) - before;
+        assert_eq!(
+            examined,
+            entries.len(),
+            "a fallback must retain the remaining same-page headers: variant={variant}"
+        );
+    }
+    db.rollback_txn(pending.txn_id).unwrap();
+}
+
+#[test]
+fn batched_visibility_invisible_insert_needs_no_heap_fallback() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = open_memory_test_db(dir.path());
+    db.create_table(
+        "invisible_headers",
+        vec![checkpoint_test_pk_column()],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let pending = db.begin_txn().unwrap();
+    db.insert_rows(
+        pending,
+        "test.invisible_headers",
+        (0..32).map(|id| vec![Value::Int(id)]).collect(),
+    )
+    .unwrap();
+    let table = db.table("test.invisible_headers").unwrap();
+    let entries = db
+        .range_index_entries_chunk(&table, &table.indexes[0], None, None, None, 64)
+        .unwrap();
+    let row_ids: Vec<_> = entries.iter().map(|(_, row)| *row).collect();
+    assert_eq!(row_ids.len(), 32);
+    let heap = db.heap_handle(table.id).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let mask = db
+        .filter_visible_via_heap_with_handle(&heap, &table, &row_ids, view, |row, _| {
+            calls.set(calls.get() + 1);
+            db.is_row_id_visible(&table, row, view)
+        })
+        .unwrap();
+    assert_eq!(mask, vec![false; 32]);
+    assert_eq!(
+        calls.get(),
+        0,
+        "an invisible initial version has no older row to decode"
+    );
+    db.rollback_txn(pending.txn_id).unwrap();
+}
+
+#[test]
+fn batched_visibility_cold_page_refills_headers_once() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let mut config = test_storage_config(DurabilityMode::Relaxed, false);
+    config.buffer_pool_prefetch_pages = 0;
+    let db = Database::open_with_config(dir.path(), config).unwrap();
+    db.create_table(
+        "cold_headers",
+        vec![checkpoint_test_pk_column()],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let committed = db.begin_txn().unwrap();
+    db.insert_rows(
+        committed,
+        "test.cold_headers",
+        (0..128).map(|id| vec![Value::Int(id)]).collect(),
+    )
+    .unwrap();
+    db.commit_txn(committed.txn_id).unwrap();
+    let table = db.table("test.cold_headers").unwrap();
+    let entries = db
+        .range_index_entries_chunk(&table, &table.indexes[0], None, None, None, 256)
+        .unwrap();
+    let row_ids: Vec<_> = entries.iter().map(|(_, row)| *row).collect();
+    assert_eq!(row_ids.len(), 128);
+    db.checkpoint().unwrap();
+    let heap = db.heap_handle(table.id).unwrap();
+    db.buffer_pool.discard_file(&heap.read().file_key).unwrap();
+    assert!(matches!(
+        heap.read().read_mvcc_header_cached(row_ids[0]).unwrap(),
+        CachedMvccHeaderRead::MissingPage
+    ));
+    let calls = std::cell::Cell::new(0);
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let mask = db
+        .filter_visible_via_heap_with_handle(&heap, &table, &row_ids, view, |row, _| {
+            calls.set(calls.get() + 1);
+            db.is_row_id_visible(&table, row, view)
+        })
+        .unwrap();
+    assert_eq!(mask, vec![true; 128]);
+    assert_eq!(
+        calls.get(),
+        1,
+        "the first disk read must restore the remaining header fast path"
+    );
+}
+
+#[test]
 fn contiguous_unique_insert_ranges_keep_prepared_lock_snapshots_complete() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
@@ -14046,7 +14365,8 @@ fn wal_redo_recovers_committed_index_batch_without_page_fallback() {
     // Restore a valid older index image, not a flushed new root whose
     // children were arbitrarily truncated. The latter is corruption and
     // correctly requires the startup rebuild path instead of logical redo.
-    db.with_index_exclusive(1, "PRIMARY", |index| index.flush()).unwrap();
+    db.with_index_exclusive(1, "PRIMARY", |index| index.flush())
+        .unwrap();
     db.buffer_pool.flush_all().unwrap();
     let empty_index_image = fs::read(&index_path).unwrap();
     let catalog_stats = db.log.lock().stats();
@@ -14079,7 +14399,11 @@ fn wal_redo_recovers_committed_index_batch_without_page_fallback() {
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
     {
-        let mut file = OpenOptions::new().write(true).truncate(true).open(&index_path).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&index_path)
+            .unwrap();
         file.write_all(&empty_index_image).unwrap();
         file.sync_data().unwrap();
     }
@@ -27281,24 +27605,8 @@ fn spatial_index_crash_child() {
         std::process::exit(87);
     }
     let mode = std::env::var("MYDB_SPATIAL_CRASH_KIND").unwrap();
-    let initial = if matches!(mode.as_str(), "delete" | "reuse") {
-        420
-    } else {
-        408
-    };
+    // The parent provides a private copy of the fully checkpointed input.
     let engine = StorageQueryEngine::open(Path::new(&path)).unwrap();
-    engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
-    let values = (0..initial)
-        .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
-        .collect::<Vec<_>>()
-        .join(",");
-    engine
-        .execute(&format!("INSERT INTO crash_spatial VALUES{values}"))
-        .unwrap();
-    if mode == "reuse" {
-        engine.execute("DELETE FROM crash_spatial").unwrap();
-    }
-    engine.database_for_replication().checkpoint().unwrap();
     let point = std::env::var("MYDB_SPATIAL_CRASH_POINT")
         .unwrap()
         .parse::<usize>()
@@ -27373,9 +27681,40 @@ fn spatial_index_crash_child() {
 fn spatial_index_crash_recovery_at_every_split_publication() {
     use crate::engine::{api::QueryResponse, StorageQueryEngine};
     fs::create_dir_all("/tmp/mydb").unwrap();
+    let mut bases = std::collections::BTreeMap::new();
+    for (name, initial, clear) in [
+        ("rows_408", 408, false),
+        ("rows_420", 420, false),
+        ("reuse", 420, true),
+    ] {
+        let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(base.path()).unwrap();
+        let engine = StorageQueryEngine::open(base.path()).unwrap();
+        engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+        let values = (0..initial)
+            .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO crash_spatial VALUES{values}"))
+            .unwrap();
+        if clear {
+            engine.execute("DELETE FROM crash_spatial").unwrap();
+        }
+        engine.database_for_replication().checkpoint().unwrap();
+        drop(engine);
+        preparation.finish().unwrap();
+        bases.insert(name, base);
+    }
     for mode in ["insert", "delete", "reuse", "rollback", "savepoint"] {
+        let base = &bases[match mode {
+            "delete" => "rows_420",
+            "reuse" => "reuse",
+            _ => "rows_408",
+        }];
         for point in 0..=5 {
             let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            crate::util::file::copy_fixture_tree(base.path(), dir.path()).unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",

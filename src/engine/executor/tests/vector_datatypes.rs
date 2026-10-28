@@ -352,101 +352,125 @@ fn vector_datatypes_native_paged_restart_snapshot_and_mapping() {
             ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
             ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
         ]);
-        for datatype in ["FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
-            for algo in ["HNSW", "IVF"] {
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let engine = open_strict_test_engine(dir.path());
-                let binary = datatype == "BINARY";
-                let dim = if binary { 9 } else { 4 };
-                engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR({dim},{datatype}) NOT NULL)")).unwrap();
-                let vector = |id: i32| {
-                    if binary {
-                        format!(
-                            "[{},{},{},{},1,0,0,0,1]",
-                            id & 1,
-                            (id >> 1) & 1,
-                            (id >> 2) & 1,
-                            (id >> 3) & 1
-                        )
-                    } else {
-                        format!("[{},{},{},{}]", id, id + 1, id + 2, id + 3)
-                    }
-                };
-                for id in 1..=16 {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut queries = Vec::new();
+        {
+            let engine = open_strict_test_engine(dir.path());
+            for datatype in ["FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
+                for algo in ["HNSW", "IVF"] {
+                    let name = format!("items_{datatype}_{algo}");
+                    let preparation =
+                        crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+                    let binary = datatype == "BINARY";
+                    let dim = if binary { 9 } else { 4 };
+                    engine.execute(&format!("CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR({dim},{datatype}) NOT NULL)")).unwrap();
+                    let vector = |id: i32| {
+                        if binary {
+                            format!(
+                                "[{},{},{},{},1,0,0,0,1]",
+                                id & 1,
+                                (id >> 1) & 1,
+                                (id >> 2) & 1,
+                                (id >> 3) & 1
+                            )
+                        } else {
+                            format!("[{},{},{},{}]", id, id + 1, id + 2, id + 3)
+                        }
+                    };
+                    let values = (1..=16)
+                        .map(|id| format!("({id},'{}')", vector(id)))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     engine
-                        .execute(&format!("INSERT INTO items VALUES({id},'{}')", vector(id)))
+                        .execute(&format!("INSERT INTO {name} VALUES {values}"))
                         .unwrap();
+                    let options = if algo == "HNSW" {
+                        "m=4, ef_construction=64"
+                    } else {
+                        "nlist=4, kmeans_iters=2"
+                    };
+                    engine
+                        .execute(&format!(
+                            "CREATE INDEX vx ON {name}(v) USING {algo} WITH ({options})"
+                        ))
+                        .unwrap();
+                    preparation.finish().unwrap();
+                    let query = if binary {
+                        format!("TO_VECTOR('{}','BINARY')", vector(7))
+                    } else {
+                        format!("TO_VECTOR('{}')", vector(7))
+                    };
+                    let sql = format!("SELECT id FROM {name} ORDER BY DISTANCE(v,{query}) LIMIT 1");
+                    assert_eq!(
+                        scalar(&engine, &sql),
+                        "7",
+                        "{datatype}/{algo}/mapped={mapped}"
+                    );
+                    let table = engine.database().table(&format!("test.{name}")).unwrap();
+                    let index = table.indexes.iter().find(|i| i.name == "vx").unwrap();
+                    let graph = engine
+                        .database()
+                        .vector_graph_get_or_build(&table, index)
+                        .unwrap();
+                    let file = match graph.as_ref() {
+                        VectorGraph::NativeHnsw(g) => g.file().unwrap(),
+                        VectorGraph::NativeIvf(g) => g.file().unwrap(),
+                        _ => panic!("native backend required"),
+                    };
+                    assert_eq!(
+                        file.with_navigation_mapping(|_| true).is_some(),
+                        mapped == "1"
+                    );
+                    let mut reader = SessionContext::default();
+                    engine
+                        .execute_with_session(
+                            &mut reader,
+                            "SET SESSION transaction_isolation='REPEATABLE-READ'",
+                        )
+                        .unwrap();
+                    engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+                    assert_eq!(
+                        support::result_rows(
+                            engine.execute_with_session(&mut reader, &sql).unwrap()
+                        )[0][0]
+                            .to_display_string(),
+                        "7"
+                    );
+                    engine
+                        .execute(&format!("DELETE FROM {name} WHERE id=7"))
+                        .unwrap();
+                    assert_eq!(
+                        support::result_rows(
+                            engine.execute_with_session(&mut reader, &sql).unwrap()
+                        )[0][0]
+                            .to_display_string(),
+                        "7"
+                    );
+                    engine
+                        .execute_with_session(&mut reader, "ROLLBACK")
+                        .unwrap();
+                    assert_ne!(scalar(&engine, &sql), "7");
+                    drop(graph);
+                    queries.push(sql);
                 }
-                let options = if algo == "HNSW" {
-                    "m=4, ef_construction=64"
-                } else {
-                    "nlist=4, kmeans_iters=2"
-                };
-                engine
-                    .execute(&format!(
-                        "CREATE INDEX vx ON items(v) USING {algo} WITH ({options})"
-                    ))
-                    .unwrap();
-                let query = if binary {
-                    format!("TO_VECTOR('{}','BINARY')", vector(7))
-                } else {
-                    format!("TO_VECTOR('{}')", vector(7))
-                };
-                let sql = format!("SELECT id FROM items ORDER BY DISTANCE(v,{query}) LIMIT 1");
-                assert_eq!(
-                    scalar(&engine, &sql),
-                    "7",
-                    "{datatype}/{algo}/mapped={mapped}"
-                );
-                let table = engine.database().table("test.items").unwrap();
-                let index = table.indexes.iter().find(|i| i.name == "vx").unwrap();
-                let graph = engine
-                    .database()
-                    .vector_graph_get_or_build(&table, index)
-                    .unwrap();
-                let file = match graph.as_ref() {
-                    VectorGraph::NativeHnsw(g) => g.file().unwrap(),
-                    VectorGraph::NativeIvf(g) => g.file().unwrap(),
-                    _ => panic!("native backend required"),
-                };
-                assert_eq!(
-                    file.with_navigation_mapping(|_| true).is_some(),
-                    mapped == "1"
-                );
-                let mut reader = SessionContext::default();
-                engine
-                    .execute_with_session(
-                        &mut reader,
-                        "SET SESSION transaction_isolation='REPEATABLE-READ'",
-                    )
-                    .unwrap();
-                engine.execute_with_session(&mut reader, "BEGIN").unwrap();
-                assert_eq!(
-                    support::result_rows(engine.execute_with_session(&mut reader, &sql).unwrap())
-                        [0][0]
-                        .to_display_string(),
-                    "7"
-                );
-                engine.execute("DELETE FROM items WHERE id=7").unwrap();
-                assert_eq!(
-                    support::result_rows(engine.execute_with_session(&mut reader, &sql).unwrap())
-                        [0][0]
-                        .to_display_string(),
-                    "7"
-                );
-                engine
-                    .execute_with_session(&mut reader, "ROLLBACK")
-                    .unwrap();
-                assert_ne!(scalar(&engine, &sql), "7");
-                drop(graph);
-                drop(engine);
-                let engine = open_strict_test_engine(dir.path());
-                assert_ne!(scalar(&engine, &sql), "7");
-                engine.database().set_physical_replica_mode(true).unwrap();
-                assert_ne!(scalar(&engine, &sql), "7");
-                engine.database().set_physical_replica_mode(false).unwrap();
-                assert_ne!(scalar(&engine, &sql), "7");
             }
+        }
+        // Leave the committed deletes in WAL, as each original case did.
+        let engine = open_strict_test_engine(dir.path());
+        for sql in &queries {
+            assert_ne!(scalar(&engine, sql), "7", "reopen mapped={mapped}: {sql}");
+        }
+        engine.database().set_physical_replica_mode(true).unwrap();
+        for sql in &queries {
+            assert_ne!(scalar(&engine, sql), "7", "replica mapped={mapped}: {sql}");
+        }
+        engine.database().set_physical_replica_mode(false).unwrap();
+        for sql in &queries {
+            assert_ne!(
+                scalar(&engine, sql),
+                "7",
+                "standalone mapped={mapped}: {sql}"
+            );
         }
     }
 }
@@ -578,58 +602,48 @@ fn vector_quantization_bq_physical_replication() {
 }
 fn physical_vector_replication_matrix(quantization: Option<&str>) {
     use std::io::{Read, Seek, SeekFrom};
-    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let dest = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &dest);
-            } else {
-                std::fs::copy(entry.path(), dest).unwrap();
-            }
+    let vector = |binary: bool, value: usize| {
+        if binary {
+            format!(
+                "[{}]",
+                (0..128)
+                    .map(|bit| if bit < value { "1" } else { "0" })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            format!("[{value},0,0]")
         }
-    }
+    };
     for backend in ["memory", "paged"] {
         let _env = HnswEnv::set(&[
             ("MYDB_VECTOR_STORAGE", backend),
             ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
             ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
         ]);
-        for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
-            if datatype == "BINARY" && quantization.is_some() {
-                continue;
-            }
-            for algo in ["HNSW", "IVF"] {
-                eprintln!("replication case {backend}/{datatype}/{algo}/{quantization:?}");
-                let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let binary = datatype == "BINARY";
-                let dimension = if binary { 128 } else { 3 };
-                let vector = |value: usize| {
-                    if binary {
-                        format!(
-                            "[{}]",
-                            (0..128)
-                                .map(|bit| if bit < value { "1" } else { "0" })
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )
-                    } else {
-                        format!("[{value},0,0]")
-                    }
-                };
-                let zero = vector(0);
-                let far = vector(127);
-                {
-                    let engine = open_strict_test_engine(source.path());
-                    engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR({dimension},{datatype}) NOT NULL)")).unwrap();
+        let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut cases = Vec::new();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(source.path()).unwrap();
+        // Distinct tables retain the full type/algorithm matrix while sharing
+        // one physical bootstrap, replica, promotion and promoted restart.
+        {
+            let engine = open_strict_test_engine(source.path());
+            for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
+                if datatype == "BINARY" && quantization.is_some() {
+                    continue;
+                }
+                for algo in ["HNSW", "IVF"] {
+                    let table = format!("items_{datatype}_{algo}");
+                    let binary = datatype == "BINARY";
+                    let dimension = if binary { 128 } else { 3 };
+                    engine.execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR({dimension},{datatype}) NOT NULL)")).unwrap();
                     let rows = (1..=127)
-                        .map(|id| format!("({id},'{}')", vector(id)))
+                        .map(|id| format!("({id},'{}')", vector(binary, id)))
                         .collect::<Vec<_>>()
                         .join(",");
                     engine
-                        .execute(&format!("INSERT INTO items VALUES {rows}"))
+                        .execute(&format!("INSERT INTO {table} VALUES {rows}"))
                         .unwrap();
                     let options = if algo == "HNSW" {
                         "m=4, ef_construction=64"
@@ -648,129 +662,162 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
                             )
                         })
                         .unwrap_or_default();
-                    engine
-                        .execute(&format!(
-                            "CREATE INDEX vx ON items(v) USING {algo} WITH ({options}{quant_options})"
-                        ))
-                        .unwrap();
+                    engine.execute(&format!("CREATE INDEX vx ON {table}(v) USING {algo} WITH ({options}{quant_options})")).unwrap();
+                    let hint = if algo == "HNSW" {
+                        "HNSW_EF(64)"
+                    } else {
+                        "IVF_NPROBE(2)"
+                    };
+                    let query_type = if binary { "BINARY" } else { "FLOAT32" };
+                    let sql = format!("SELECT /*+ {hint} */ id FROM {table} ORDER BY DISTANCE(v,TO_VECTOR('{}','{query_type}')) LIMIT 1", vector(binary, 0));
+                    cases.push((table, datatype, binary, hint, sql));
                 }
-                copy_tree(source.path(), target.path());
-                let mut role = crate::repl::role::RoleState::new_standalone();
-                role.demote_to_replica("127.0.0.1:1".into());
-                crate::repl::role::save(target.path(), &role).unwrap();
-                let master = open_strict_test_engine(source.path());
-                let replica = open_strict_test_engine(target.path());
-                replica.database().set_physical_replica_mode(true).unwrap();
-                let hint = if algo == "HNSW" {
-                    "HNSW_EF(64)"
-                } else {
-                    "IVF_NPROBE(2)"
+            }
+        }
+        preparation.finish().unwrap();
+        crate::util::file::copy_fixture_tree(source.path(), target.path()).unwrap();
+        let mut role = crate::repl::role::RoleState::new_standalone();
+        role.demote_to_replica("127.0.0.1:1".into());
+        crate::repl::role::save(target.path(), &role).unwrap();
+        let master = open_strict_test_engine(source.path());
+        let replica = open_strict_test_engine(target.path());
+        replica.database().set_physical_replica_mode(true).unwrap();
+        let mut next_lsn = replica.database().wal_log().lock().last_lsn() + 1;
+        for (table, _, _, _, sql) in &cases {
+            assert_eq!(scalar(&replica, sql), "1", "{backend}/{table}");
+        }
+        // One durable decision per DML phase covers every independent codec;
+        // the replica must expose each table's result after the whole apply.
+        for (phase, expected) in [(0, "128"), (1, "1"), (2, "127"), (3, "127")] {
+            let mut writer = SessionContext::default();
+            master.execute_with_session(&mut writer, "BEGIN").unwrap();
+            for (table, _, binary, _, _) in &cases {
+                let zero = vector(*binary, 0);
+                let far = vector(*binary, 127);
+                let dml = match phase {
+                    0 => format!("INSERT INTO {table} VALUES(128,'{zero}')"),
+                    1 => format!("UPDATE {table} SET v='{far}' WHERE id=128"),
+                    2 => format!("UPDATE {table} SET v='{zero}' WHERE id=127"),
+                    _ => format!("DELETE FROM {table} WHERE id=1"),
                 };
-                let query_type = if binary { "BINARY" } else { "FLOAT32" };
-                let sql = format!("SELECT /*+ {hint} */ id FROM items ORDER BY DISTANCE(v,TO_VECTOR('{}','{query_type}')) LIMIT 1", zero);
-                assert_eq!(scalar(&replica, &sql), "1");
-                let mut next_lsn = replica.database().wal_log().lock().last_lsn() + 1;
-                for (dml, expected) in [
-                    (format!("INSERT INTO items VALUES(128,'{zero}')"), "128"),
-                    (format!("UPDATE items SET v='{far}' WHERE id=128"), "1"),
-                    (format!("UPDATE items SET v='{zero}' WHERE id=127"), "127"),
-                    ("DELETE FROM items WHERE id=1".into(), "127"),
-                ] {
-                    eprintln!("replication DML {dml}");
-                    master.execute(&dml).unwrap_or_else(|err| {
-                        panic!("{backend}/{datatype}/{algo}: {dml}: {err:?}")
-                    });
-                    master.database().wal_log().lock().flush().unwrap();
-                    let scan = crate::wal::LogManager::scan(source.path()).unwrap();
-                    let prefixes = master
-                        .database()
-                        .wal_log()
-                        .lock()
-                        .pin_prefix_after(next_lsn - 1, None)
-                        .unwrap();
-                    for prefix in prefixes {
-                        let mut file = prefix.file.open().unwrap().try_clone().unwrap();
-                        file.seek(SeekFrom::Start(prefix.start_offset)).unwrap();
-                        let mut bytes = Vec::new();
-                        file.take(prefix.len - prefix.start_offset)
-                            .read_to_end(&mut bytes)
-                            .unwrap();
-                        let mut offset = 0;
-                        while offset < bytes.len() {
-                            let frame =
-                                crate::wal::decode_frame_for_replication(&bytes[offset..]).unwrap();
-                            if frame.header.lsn > replica.database().wal_log().lock().last_lsn() {
-                                replica
-                                    .database()
-                                    .wal_log()
-                                    .lock()
-                                    .append_replication_frame(
-                                        &bytes[offset..offset + frame.frame_len],
-                                        &frame,
-                                    )
-                                    .unwrap();
-                            }
-                            offset += frame.frame_len;
-                        }
-                    }
-                    replica.database().wal_log().lock().flush().unwrap();
-                    for record in scan.records.iter().filter(|r| r.lsn >= next_lsn) {
-                        replica.database().apply_wal_record(record).unwrap();
-                    }
-                    next_lsn = scan.next_lsn;
-                    assert_eq!(
-                        scalar(&replica, &sql),
-                        expected,
-                        "{backend}/{datatype}/{algo}: {dml}"
-                    );
-                    assert_eq!(
-                        scalar(&replica, &sql),
-                        scalar(&replica, &sql.replace(hint, "NO_VECTOR_INDEX"))
-                    );
-                }
-                // Match the production promotion order before opening local writes.
-                replica
-                    .database()
-                    .persist_replicated_undo_for_promotion()
-                    .unwrap();
-                replica
-                    .database()
-                    .rollback_all_active_replication_txns()
-                    .unwrap();
-                replica
-                    .database()
-                    .restore_replicated_xa_for_promotion()
-                    .unwrap();
-                replica.database().prepare_sequence_promotion().unwrap();
-                replica.database().checkpoint().unwrap();
-                replica.database().set_physical_replica_mode(false).unwrap();
-                replica.database().prepare_sequence_promotion().unwrap();
-                replica.database().checkpoint().unwrap();
-                crate::repl::role::save(
-                    target.path(),
-                    &crate::repl::role::RoleState::new_standalone(),
-                )
+                master
+                    .execute_with_session(&mut writer, &dml)
+                    .unwrap_or_else(|err| panic!("{backend}/{table}: {dml}: {err:?}"));
+            }
+            master.execute_with_session(&mut writer, "COMMIT").unwrap();
+            master.database().wal_log().lock().flush().unwrap();
+            let scan = crate::wal::LogManager::scan(source.path()).unwrap();
+            let prefixes = master
+                .database()
+                .wal_log()
+                .lock()
+                .pin_prefix_after(next_lsn - 1, None)
                 .unwrap();
-                assert_eq!(scalar(&replica, &sql), "127");
-                replica
-                    .execute(&format!("UPDATE items SET v='{far}' WHERE id=127"))
+            for prefix in prefixes {
+                let mut file = prefix.file.open().unwrap().try_clone().unwrap();
+                file.seek(SeekFrom::Start(prefix.start_offset)).unwrap();
+                let mut bytes = Vec::new();
+                file.take(prefix.len - prefix.start_offset)
+                    .read_to_end(&mut bytes)
                     .unwrap();
-                replica
-                    .execute(&format!("INSERT INTO items VALUES(129,'{}')", zero))
-                    .unwrap();
-                assert_eq!(scalar(&replica, &sql), "129");
-                drop(replica);
-                let promoted = open_strict_test_engine(target.path());
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let frame = crate::wal::decode_frame_for_replication(&bytes[offset..]).unwrap();
+                    if frame.header.lsn > replica.database().wal_log().lock().last_lsn() {
+                        replica
+                            .database()
+                            .wal_log()
+                            .lock()
+                            .append_replication_frame(
+                                &bytes[offset..offset + frame.frame_len],
+                                &frame,
+                            )
+                            .unwrap();
+                    }
+                    offset += frame.frame_len;
+                }
+            }
+            replica.database().wal_log().lock().flush().unwrap();
+            for record in scan.records.iter().filter(|r| r.lsn >= next_lsn) {
+                replica.database().apply_wal_record(record).unwrap();
+            }
+            next_lsn = scan.next_lsn;
+            for (table, _, _, hint, sql) in &cases {
                 assert_eq!(
-                    scalar(&promoted, &sql),
-                    "129",
-                    "promoted restart {backend}/{datatype}/{algo}"
+                    scalar(&replica, sql),
+                    expected,
+                    "{backend}/{table}: phase={phase}"
                 );
                 assert_eq!(
-                    scalar(&promoted, "SELECT VECTOR_DATATYPE(v) FROM items LIMIT 1"),
-                    datatype
+                    scalar(&replica, sql),
+                    scalar(&replica, &sql.replace(hint, "NO_VECTOR_INDEX"))
                 );
             }
+        }
+        // Match the production promotion order before opening local writes.
+        replica
+            .database()
+            .persist_replicated_undo_for_promotion()
+            .unwrap();
+        replica
+            .database()
+            .rollback_all_active_replication_txns()
+            .unwrap();
+        replica
+            .database()
+            .restore_replicated_xa_for_promotion()
+            .unwrap();
+        replica.database().prepare_sequence_promotion().unwrap();
+        replica.database().checkpoint().unwrap();
+        replica.database().set_physical_replica_mode(false).unwrap();
+        replica.database().prepare_sequence_promotion().unwrap();
+        replica.database().checkpoint().unwrap();
+        crate::repl::role::save(
+            target.path(),
+            &crate::repl::role::RoleState::new_standalone(),
+        )
+        .unwrap();
+        for (table, _, _, _, sql) in &cases {
+            assert_eq!(scalar(&replica, sql), "127", "{backend}/{table}");
+        }
+        let mut local = SessionContext::default();
+        replica.execute_with_session(&mut local, "BEGIN").unwrap();
+        for (table, _, binary, _, _) in &cases {
+            replica
+                .execute_with_session(
+                    &mut local,
+                    &format!(
+                        "UPDATE {table} SET v='{}' WHERE id=127",
+                        vector(*binary, 127)
+                    ),
+                )
+                .unwrap();
+            replica
+                .execute_with_session(
+                    &mut local,
+                    &format!("INSERT INTO {table} VALUES(129,'{}')", vector(*binary, 0)),
+                )
+                .unwrap();
+        }
+        replica.execute_with_session(&mut local, "COMMIT").unwrap();
+        for (table, _, _, _, sql) in &cases {
+            assert_eq!(scalar(&replica, sql), "129", "{backend}/{table}");
+        }
+        drop(replica);
+        let promoted = open_strict_test_engine(target.path());
+        for (table, datatype, _, _, sql) in &cases {
+            assert_eq!(
+                scalar(&promoted, sql),
+                "129",
+                "promoted restart {backend}/{table}"
+            );
+            assert_eq!(
+                scalar(
+                    &promoted,
+                    &format!("SELECT VECTOR_DATATYPE(v) FROM {table} LIMIT 1")
+                ),
+                *datatype
+            );
         }
     }
 }
@@ -835,6 +882,10 @@ fn vector_datatypes_duplicate_hnsw_postings_survive_mutations_and_restart() {
             ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
             ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
         ]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+        let mut cases = Vec::new();
         for datatype in ["FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
             let metrics: &[&str] = if datatype == "BINARY" {
                 &["HAMMING", "JACCARD"]
@@ -842,11 +893,10 @@ fn vector_datatypes_duplicate_hnsw_postings_survive_mutations_and_restart() {
                 &["L2", "COSINE", "DOT"]
             };
             for metric in metrics {
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let engine = open_strict_test_engine(dir.path());
+                let name = format!("dup_{datatype}_{metric}");
                 engine
                     .execute(&format!(
-                        "CREATE TABLE dup(id INT PRIMARY KEY,v VECTOR(2,{datatype}) NOT NULL)"
+                        "CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR(2,{datatype}) NOT NULL)"
                     ))
                     .unwrap();
                 let values = (1..=512)
@@ -854,55 +904,64 @@ fn vector_datatypes_duplicate_hnsw_postings_survive_mutations_and_restart() {
                     .collect::<Vec<_>>()
                     .join(",");
                 engine
-                    .execute(&format!("INSERT INTO dup VALUES {values}"))
+                    .execute(&format!("INSERT INTO {name} VALUES {values}"))
                     .unwrap();
-                engine
-                .execute(&format!("CREATE INDEX vx ON dup(v) USING HNSW WITH (metric={metric}, m=4, ef_construction=64)"))
-                .unwrap();
+                engine.execute(&format!("CREATE INDEX vx ON {name}(v) USING HNSW WITH (metric={metric}, m=4, ef_construction=64)")).unwrap();
                 let query =
                     codec::parse_typed_text("[0,1]", VectorDataType::parse(datatype).unwrap())
                         .unwrap();
-                let request = VectorSearchRequest {
-                    candidate_limit: 512,
-                    rerank_limit: 512,
-                    effort: VectorSearchEffort::Hnsw { ef: 512 },
-                };
-                let check = |engine: &StorageQueryEngine| {
-                    let table = engine.database().table("test.dup").unwrap();
-                    let index = table.indexes.iter().find(|i| i.name == "vx").unwrap();
-                    let graph = engine
-                        .database()
-                        .vector_graph_get_or_build(&table, index)
-                        .unwrap();
-                    let result = graph.search(&query, request).unwrap();
-                    assert_eq!(result.candidates.len(), 512, "{backend}/{datatype}");
-                    assert_eq!(
-                        result
-                            .candidates
-                            .iter()
-                            .map(|(row, _)| *row)
-                            .collect::<std::collections::HashSet<_>>()
-                            .len(),
-                        512
-                    );
-                };
-                check(&engine);
-                engine.execute("DELETE FROM dup WHERE id=1").unwrap();
-                engine
-                    .execute("INSERT INTO dup VALUES(513,'[-0,1]')")
-                    .unwrap();
-                check(&engine);
-                let stored =
-                    query_rows(&engine, "SELECT VECTOR_TO_BINARY(v) FROM dup WHERE id=513");
-                let expected =
-                    codec::parse_typed_text("[-0,1]", VectorDataType::parse(datatype).unwrap())
-                        .unwrap();
-                assert_eq!(stored[0][0], Value::Bytes(expected.payload));
-                drop(engine);
-                let engine = open_strict_test_engine(dir.path());
-                check(&engine);
+                cases.push((name, datatype, query));
             }
         }
+        preparation.finish().unwrap();
+        let request = VectorSearchRequest {
+            candidate_limit: 512,
+            rerank_limit: 512,
+            effort: VectorSearchEffort::Hnsw { ef: 512 },
+        };
+        let check = |engine: &StorageQueryEngine| {
+            for (name, _, query) in &cases {
+                let table = engine.database().table(&format!("test.{name}")).unwrap();
+                let index = table.indexes.iter().find(|i| i.name == "vx").unwrap();
+                let graph = engine
+                    .database()
+                    .vector_graph_get_or_build(&table, index)
+                    .unwrap();
+                let result = graph.search(query, request).unwrap();
+                assert_eq!(result.candidates.len(), 512, "{backend}/{name}");
+                assert_eq!(
+                    result
+                        .candidates
+                        .iter()
+                        .map(|(row, _)| *row)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                    512,
+                    "{backend}/{name}"
+                );
+            }
+        };
+        check(&engine);
+        for (name, datatype, _) in &cases {
+            engine
+                .execute(&format!("DELETE FROM {name} WHERE id=1"))
+                .unwrap();
+            engine
+                .execute(&format!("INSERT INTO {name} VALUES(513,'[-0,1]')"))
+                .unwrap();
+            let stored = query_rows(
+                &engine,
+                &format!("SELECT VECTOR_TO_BINARY(v) FROM {name} WHERE id=513"),
+            );
+            let expected =
+                codec::parse_typed_text("[-0,1]", VectorDataType::parse(datatype).unwrap())
+                    .unwrap();
+            assert_eq!(stored[0][0], Value::Bytes(expected.payload));
+        }
+        check(&engine);
+        drop(engine);
+        let engine = open_strict_test_engine(dir.path());
+        check(&engine);
     }
 }
 
@@ -926,23 +985,28 @@ fn every_vector_backend_loads_persistent_structure_without_heap_builds() {
                 cases.push(("FLOAT32", algorithm, quantization));
             }
         }
-        for (datatype, algorithm, quantization) in cases {
-            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-            let query = if datatype == "BINARY" {
-                "[1,0,0,0]"
-            } else {
-                "[1,2,3,4]"
-            };
-            let sql = format!("SELECT id FROM items ORDER BY DISTANCE(v, '{query}') LIMIT 1");
-            let scans;
-            let expected;
-            {
-                let engine = open_strict_test_engine(dir.path());
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut expected_cases = Vec::new();
+        let scans;
+        {
+            // Each matrix entry has a distinct typed index; one checkpoint
+            // and restart must recover all of them without heap rebuilding.
+            let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+            let engine = open_strict_test_engine(dir.path());
+            for (datatype, algorithm, quantization) in cases {
+                let table = format!("items_{datatype}_{algorithm}_{quantization}");
+                let query = if datatype == "BINARY" {
+                    "[1,0,0,0]"
+                } else {
+                    "[1,2,3,4]"
+                };
+                let sql = format!("SELECT id FROM {table} ORDER BY DISTANCE(v, '{query}') LIMIT 1");
                 engine
                     .execute(&format!(
-                        "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                        "CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
                     ))
                     .unwrap();
+                let mut values = Vec::new();
                 for id in 1..=32 {
                     let value = if datatype == "BINARY" {
                         format!(
@@ -955,10 +1019,13 @@ fn every_vector_backend_loads_persistent_structure_without_heap_builds() {
                     } else {
                         format!("[{id},{},{},{}]", id + 1, id + 2, id + 3)
                     };
-                    engine
-                        .execute(&format!("INSERT INTO items VALUES({id},'{value}')"))
-                        .unwrap();
+                    values.push(format!("({id},'{value}')"));
                 }
+                // Recovery is exercised after the index checkpoint below.
+                // Pre-index setup needs only one committed batch.
+                engine
+                    .execute(&format!("INSERT INTO {table} VALUES {}", values.join(",")))
+                    .unwrap();
                 let options = if algorithm == "HNSW" {
                     "m=4,ef_construction=32,ef_search=64"
                 } else {
@@ -978,24 +1045,24 @@ fn every_vector_backend_loads_persistent_structure_without_heap_builds() {
                 };
                 engine
                     .execute(&format!(
-                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options}{quant})"
+                        "CREATE INDEX vx ON {table}(v) USING {algorithm} WITH({options}{quant})"
                     ))
                     .unwrap();
-                expected = query_rows(&engine, &sql);
+                let expected = query_rows(&engine, &sql);
                 assert!(!expected.is_empty());
-                engine.checkpoint().unwrap();
-                scans = crate::storage::Database::vector_build_heap_scans_for_test();
+                expected_cases.push((sql, expected));
             }
-            let engine = open_strict_test_engine(dir.path());
-            assert_eq!(
-                query_rows(&engine, &sql),
-                expected,
-                "{backend}/{datatype}/{algorithm}/{quantization}"
-            );
+            engine.checkpoint().unwrap();
+            preparation.finish().unwrap();
+            scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        }
+        let engine = open_strict_test_engine(dir.path());
+        for (sql, expected) in expected_cases {
+            assert_eq!(query_rows(&engine, &sql), expected, "{backend}: {sql}");
             assert_eq!(
                 crate::storage::Database::vector_build_heap_scans_for_test(),
                 scans,
-                "normal restart rebuilt {backend}/{datatype}/{algorithm}/{quantization}"
+                "normal restart rebuilt {backend}: {sql}"
             );
             assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
         }
@@ -1005,15 +1072,30 @@ fn every_vector_backend_loads_persistent_structure_without_heap_builds() {
 #[test]
 fn vector_index_crash_replays_committed_deltas_without_heap_builds() {
     const NAME: &str = "engine::executor::tests::vector_datatypes::vector_index_crash_replays_committed_deltas_without_heap_builds";
+    const CASES: [(&str, &str, &str); 6] = [
+        ("FLOAT32", "HNSW", "none"),
+        ("FLOAT16", "HNSW", "none"),
+        ("BFLOAT16", "IVF", "none"),
+        ("INT8", "IVF", "none"),
+        ("FLOAT32", "HNSW", "sq8"),
+        ("FLOAT32", "IVF", "pq"),
+    ];
+    let table_name = |(datatype, algorithm, quantization): &(&str, &str, &str)| {
+        format!("items_{datatype}_{algorithm}_{quantization}")
+    };
     if let Ok(root) = std::env::var("MYDB_VECTOR_CRASH_CHILD") {
         let backend = std::env::var("MYDB_VECTOR_CRASH_BACKEND").unwrap();
-        let datatype = std::env::var("MYDB_VECTOR_CRASH_DATATYPE").unwrap();
-        let algorithm = std::env::var("MYDB_VECTOR_CRASH_ALGORITHM").unwrap();
-        let quantization = std::env::var("MYDB_VECTOR_CRASH_QUANTIZATION").unwrap();
         let phase = std::env::var("MYDB_VECTOR_CRASH_PHASE")
             .unwrap()
             .parse::<u64>()
             .unwrap();
+        let selection = std::env::var("MYDB_VECTOR_CRASH_CASE").unwrap();
+        let selected = if selection == "all" {
+            None
+        } else {
+            Some(selection.parse::<usize>().unwrap())
+        };
+        assert!(selected.is_none_or(|i| i < CASES.len()));
         let _env = HnswEnv::set(&[
             ("MYDB_VECTOR_STORAGE", &backend),
             ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
@@ -1021,167 +1103,195 @@ fn vector_index_crash_replays_committed_deltas_without_heap_builds() {
             ("MYDB_HNSW_COMPACT_DISABLE", "1"),
         ]);
         let engine = open_strict_test_engine(std::path::Path::new(&root));
-        engine
-            .execute(&format!(
-                "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
-            ))
-            .unwrap();
-        for id in 1..=32 {
-            engine
-                .execute(&format!(
-                    "INSERT INTO items VALUES({id},'[{id},{},{},{}]')",
-                    id + 1,
-                    id + 2,
-                    id + 3
-                ))
-                .unwrap();
-        }
-        let algorithm_options = if algorithm == "HNSW" {
-            "m=4,ef_construction=32,ef_search=128"
-        } else {
-            "nlist=4,nprobe=4"
-        };
-        let quant = if quantization == "pq" {
-            ",quantization=pq,pq_m=2,pq_bits=4".to_owned()
-        } else {
-            format!(",quantization={quantization}")
-        };
-        engine
-            .execute(&format!(
-                "CREATE INDEX vx ON items(v) USING {algorithm} WITH({algorithm_options}{quant})"
-            ))
-            .unwrap();
-        engine.checkpoint().unwrap();
         let mut writer = SessionContext::default();
         engine.execute_with_session(&mut writer, "BEGIN").unwrap();
-        engine
-            .execute_with_session(
-                &mut writer,
-                "UPDATE items SET v='[-100,-100,-100,-100]' WHERE id=1",
-            )
-            .unwrap();
-        engine
-            .execute_with_session(&mut writer, "DELETE FROM items WHERE id=2")
-            .unwrap();
-        engine
-            .execute_with_session(&mut writer, "INSERT INTO items VALUES(999,'[0,0,0,0]')")
-            .unwrap();
+        for (i, case) in CASES.iter().enumerate() {
+            if selected.is_some_and(|selected| selected != i) {
+                continue;
+            }
+            let name = table_name(case);
+            for sql in [
+                format!("UPDATE {name} SET v='[-100,-100,-100,-100]' WHERE id=1"),
+                format!("DELETE FROM {name} WHERE id=2"),
+                format!("INSERT INTO {name} VALUES(999,'[0,0,0,0]')"),
+            ] {
+                engine.execute_with_session(&mut writer, &sql).unwrap();
+            }
+        }
         engine.database().set_vector_crash_phase_for_test(phase);
         engine.execute_with_session(&mut writer, "COMMIT").unwrap();
         assert_eq!(phase, 3);
         std::fs::write(
             std::path::Path::new(&root).join("acknowledged"),
-            b"INSERT returned success",
+            b"COMMIT returned success",
         )
         .unwrap();
         std::process::exit(86);
     }
     for backend in ["memory", "paged"] {
-        for (datatype, algorithm, quantization) in [
-            ("FLOAT32", "HNSW", "none"),
-            ("FLOAT16", "HNSW", "none"),
-            ("BFLOAT16", "IVF", "none"),
-            ("INT8", "IVF", "none"),
-            ("FLOAT32", "HNSW", "sq8"),
-            ("FLOAT32", "IVF", "pq"),
-        ] {
-            for phase in [1, 2, 3, 4, 5, 6] {
-                if backend == "memory" && (phase == 4 || phase == 5) {
-                    continue;
-                }
-                eprintln!("crash case {backend}/{datatype}/{algorithm}/{quantization}/{phase}");
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+            ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+        ]);
+        let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(base.path()).unwrap();
+        let engine = open_strict_test_engine(base.path());
+        for case @ (datatype, algorithm, quantization) in &CASES {
+            let name = table_name(case);
+            engine
+                .execute(&format!(
+                    "CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                ))
+                .unwrap();
+            let values = (1..=32)
+                .map(|id| format!("({id},'[{id},{},{},{}]')", id + 1, id + 2, id + 3))
+                .collect::<Vec<_>>()
+                .join(",");
+            engine
+                .execute(&format!("INSERT INTO {name} VALUES {values}"))
+                .unwrap();
+            let options = if *algorithm == "HNSW" {
+                "m=4,ef_construction=32,ef_search=128"
+            } else {
+                "nlist=4,nprobe=4"
+            };
+            let quant = if *quantization == "pq" {
+                ",quantization=pq,pq_m=2,pq_bits=4".to_owned()
+            } else {
+                format!(",quantization={quantization}")
+            };
+            engine
+                .execute(&format!(
+                    "CREATE INDEX vx ON {name}(v) USING {algorithm} WITH({options}{quant})"
+                ))
+                .unwrap();
+        }
+        engine.checkpoint().unwrap();
+        drop(engine);
+        preparation.finish().unwrap();
+        for phase in 1..=6 {
+            if backend == "memory" && (phase == 4 || phase == 5) {
+                continue;
+            }
+            // Phases 1/2/3 follow the whole journal/decision/apply boundary,
+            // so every codec participates in the same interrupted transaction.
+            // Keep page-write phases 4/5 and pre-decision phase 6 per codec:
+            // their hooks must independently be reachable for every backend.
+            let selections: Vec<Option<usize>> = if phase <= 3 {
+                vec![None]
+            } else {
+                (0..CASES.len()).map(Some).collect()
+            };
+            for selected in selections {
                 let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                crate::util::file::copy_fixture_tree(base.path(), dir.path()).unwrap();
                 let status = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture"])
                     .env("MYDB_VECTOR_CRASH_CHILD", dir.path())
                     .env("MYDB_VECTOR_CRASH_BACKEND", backend)
-                    .env("MYDB_VECTOR_CRASH_DATATYPE", datatype)
-                    .env("MYDB_VECTOR_CRASH_ALGORITHM", algorithm)
-                    .env("MYDB_VECTOR_CRASH_QUANTIZATION", quantization)
+                    .env(
+                        "MYDB_VECTOR_CRASH_CASE",
+                        selected.map_or_else(|| "all".to_owned(), |i| i.to_string()),
+                    )
                     .env("MYDB_VECTOR_CRASH_PHASE", phase.to_string())
                     .output()
                     .unwrap();
                 assert_eq!(
                     status.status.code(),
                     Some(86),
-                    "{backend}/{datatype}/{algorithm}/{quantization}/phase={phase}: {}",
+                    "{backend}/{selected:?}/phase={phase}: {}",
                     String::from_utf8_lossy(&status.stderr)
                 );
                 if phase == 3 {
                     assert!(dir.path().join("acknowledged").exists());
                 }
-                let _env = HnswEnv::set(&[
-                    ("MYDB_VECTOR_STORAGE", backend),
-                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
-                    ("MYDB_HNSW_COMPACT_DISABLE", "1"),
-                ]);
                 let scans = crate::storage::Database::vector_build_heap_scans_for_test();
                 let engine = open_strict_test_engine(dir.path());
-                let table = engine.database().table("items").unwrap();
-                let index = table
-                    .indexes
-                    .iter()
-                    .find(|index| index.is_vector())
-                    .unwrap();
-                let graph = engine
-                    .database()
-                    .vector_graph_get_or_build(&table, index)
-                    .unwrap();
-                assert_eq!(graph.len(),32,"index cardinality after {backend}/{datatype}/{algorithm}/{quantization}/{phase}");
                 let query = crate::engine::vector::codec::parse_text("[0,0,0,0]").unwrap();
-                let effort = if algorithm == "HNSW" {
-                    crate::engine::vector::VectorSearchEffort::Hnsw { ef: 4096 }
-                } else {
-                    crate::engine::vector::VectorSearchEffort::Ivf { nprobe: 4096 }
-                };
-                let candidates = graph
-                    .search(
-                        &query,
-                        crate::engine::vector::VectorSearchRequest {
-                            candidate_limit: 64,
-                            rerank_limit: 64,
-                            effort,
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(
-                    candidates
-                        .candidates
+                for (i, case @ (_, algorithm, _)) in CASES.iter().enumerate() {
+                    let name = table_name(case);
+                    let committed = phase != 6 && selected.is_none_or(|selected| selected == i);
+                    let db = engine.database();
+                    let table = db.table(&name).unwrap();
+                    let index = table
+                        .indexes
                         .iter()
-                        .map(|(row, _)| *row)
-                        .collect::<std::collections::HashSet<_>>()
-                        .len(),
-                    32,
-                    "raw index coverage must be complete without an executor underfill fallback"
-                );
-                assert_eq!(
-                    scalar(
-                        &engine,
-                        "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
-                    ),
-                    if phase == 6 { "1" } else { "999" },
-                    "{backend}/{datatype}/{algorithm}/{quantization}/phase={phase}"
-                );
-                let tail = "id,DISTANCE(v,'[0,0,0,0]') AS d FROM items ORDER BY d,id LIMIT 32";
-                assert_eq!(query_rows(&engine, &format!("SELECT {tail}")),
-                    query_rows(&engine, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}")),
-                    "index contents differ after {backend}/{datatype}/{algorithm}/{quantization}/phase={phase}");
-                assert_eq!(
-                    scalar(&engine, "SELECT COUNT(*) FROM items WHERE id=2"),
-                    if phase == 6 { "1" } else { "0" }
-                );
-                if phase == 6 {
+                        .find(|index| index.is_vector())
+                        .unwrap();
+                    let graph = db.vector_graph_get_or_build(&table, index).unwrap();
+                    assert_eq!(graph.len(), 32, "{backend}/{name}/phase={phase}");
+                    let candidates = graph
+                        .search(
+                            &query,
+                            crate::engine::vector::VectorSearchRequest {
+                                candidate_limit: 64,
+                                rerank_limit: 64,
+                                effort: if *algorithm == "HNSW" {
+                                    crate::engine::vector::VectorSearchEffort::Hnsw { ef: 4096 }
+                                } else {
+                                    crate::engine::vector::VectorSearchEffort::Ivf { nprobe: 4096 }
+                                },
+                            },
+                        )
+                        .unwrap();
+                    let actual = candidates
+                        .candidates
+                        .into_iter()
+                        .map(|(row, _)| row)
+                        .collect::<std::collections::HashSet<_>>();
+                    let expected = db
+                        .scan_rows(
+                            &table.qualified_name(),
+                            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| row.row_id)
+                        .collect::<std::collections::HashSet<_>>();
+                    assert_eq!(actual.len(), 32);
                     assert_eq!(
-                        scalar(&engine, "SELECT COUNT(*) FROM items WHERE id=999"),
-                        "0"
+                        actual, expected,
+                        "raw index must cover committed heap rows: {backend}/{name}/phase={phase}"
                     );
+                    assert_eq!(
+                        scalar(
+                            &engine,
+                            &format!(
+                                "SELECT id FROM {name} ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+                            )
+                        ),
+                        if committed { "999" } else { "1" },
+                        "{backend}/{name}/phase={phase}"
+                    );
+                    let tail = format!(
+                        "id,DISTANCE(v,'[0,0,0,0]') AS d FROM {name} ORDER BY d,id LIMIT 32"
+                    );
+                    assert_eq!(
+                        query_rows(&engine, &format!("SELECT {tail}")),
+                        query_rows(&engine, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}")),
+                        "{backend}/{name}/phase={phase}"
+                    );
+                    assert_eq!(
+                        scalar(&engine, &format!("SELECT COUNT(*) FROM {name} WHERE id=2")),
+                        if committed { "0" } else { "1" }
+                    );
+                    if !committed {
+                        assert_eq!(
+                            scalar(
+                                &engine,
+                                &format!("SELECT COUNT(*) FROM {name} WHERE id=999")
+                            ),
+                            "0"
+                        );
+                    }
+                    assert_eq!(
+                        crate::storage::Database::vector_build_heap_scans_for_test(),
+                        scans
+                    );
+                    assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
                 }
-                assert_eq!(
-                    crate::storage::Database::vector_build_heap_scans_for_test(),
-                    scans
-                );
-                assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
             }
         }
     }
@@ -1300,29 +1410,27 @@ fn vector_checkpoint_publication_failures_preserve_wal_and_committed_results() {
             ("BFLOAT16", "IVF", "sq4"),
             ("FLOAT32", "IVF", "pq"),
         ] {
-            for stage in if backend == "memory" {
-                vec![1, 2, 3, 4, 5]
-            } else {
-                vec![6]
-            } {
-                let _env = HnswEnv::set(&[
-                    ("MYDB_VECTOR_STORAGE", backend),
-                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
-                    ("MYDB_HNSW_COMPACT_DISABLE", "1"),
-                ]);
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let engine = open_strict_test_engine(dir.path());
+            let _env = HnswEnv::set(&[
+                ("MYDB_VECTOR_STORAGE", backend),
+                ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+                ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+            ]);
+            let prepare = |path: &std::path::Path| {
+                let preparation = crate::platform::fs::FixtureSyncBatch::new(path).unwrap();
+                let engine = open_strict_test_engine(path);
                 engine
                     .execute(&format!(
                         "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
                     ))
                     .unwrap();
-                for id in 1..=20 {
-                    engine
-                        .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-                        .unwrap();
-                }
+                let values = (1..=20)
+                    .map(|id| format!("({id},'[{id},1,2,3]')"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute(&format!("INSERT INTO items VALUES {values}"))
+                    .unwrap();
                 let params = if algorithm == "HNSW" {
                     "m=4,ef_construction=32"
                 } else {
@@ -1339,6 +1447,29 @@ fn vector_checkpoint_publication_failures_preserve_wal_and_committed_results() {
                     ))
                     .unwrap();
                 engine.checkpoint().unwrap();
+                preparation.finish().unwrap();
+                engine
+            };
+            // Publication stages are independent failures over one immutable
+            // checkpoint. Preserve a separate private image and recovery for
+            // every stage rather than rebuilding its identical input.
+            let base = (backend == "memory").then(|| {
+                let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                drop(prepare(base.path()));
+                base
+            });
+            for stage in if backend == "memory" {
+                vec![1, 2, 3, 4, 5]
+            } else {
+                vec![6]
+            } {
+                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let engine = if let Some(base) = &base {
+                    crate::util::file::copy_fixture_tree(base.path(), dir.path()).unwrap();
+                    open_strict_test_engine(dir.path())
+                } else {
+                    prepare(dir.path())
+                };
                 engine
                     .execute("UPDATE items SET v='[0,0,0,0]' WHERE id=20")
                     .unwrap();
@@ -1388,11 +1519,32 @@ fn vector_checkpoint_publication_failures_preserve_wal_and_committed_results() {
 
 #[test]
 fn prepared_vector_decision_after_snapshot_recovers_all_persistent_backends() {
+    use crate::engine::vector::{VectorSearchEffort, VectorSearchRequest};
     for durability in [
         crate::storage::DurabilityMode::Strict,
         crate::storage::DurabilityMode::Relaxed,
     ] {
         for backend in ["memory", "paged"] {
+            let _env = HnswEnv::set(&[
+                ("MYDB_VECTOR_STORAGE", backend),
+                ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+                ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+                ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+            ]);
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let open = || {
+                let mut config = memory_test_storage_config();
+                config.durability = durability;
+                config.buffer_pool_pages = 2048;
+                StorageQueryEngine::open_with_storage_config_without_background_workers(
+                    dir.path(),
+                    config,
+                )
+                .unwrap()
+            };
+            let engine = open();
+            let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+            let mut cases = Vec::new();
             for (datatype, algorithm, quantization) in [
                 ("FLOAT32", "HNSW", "none"),
                 ("FLOAT16", "HNSW", "none"),
@@ -1402,34 +1554,19 @@ fn prepared_vector_decision_after_snapshot_recovers_all_persistent_backends() {
                 ("FLOAT32", "HNSW", "bq"),
                 ("FLOAT32", "IVF", "pq"),
             ] {
-                let _env = HnswEnv::set(&[
-                    ("MYDB_VECTOR_STORAGE", backend),
-                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
-                    ("MYDB_HNSW_COMPACT_DISABLE", "1"),
-                ]);
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let open = || {
-                    let mut config = memory_test_storage_config();
-                    config.durability = durability;
-                    config.buffer_pool_pages = 2048;
-                    StorageQueryEngine::open_with_storage_config_without_background_workers(
-                        dir.path(),
-                        config,
-                    )
-                    .unwrap()
-                };
-                let engine = open();
+                let name = format!("items_{datatype}_{algorithm}_{quantization}");
                 engine
                     .execute(&format!(
-                        "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                        "CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
                     ))
                     .unwrap();
-                for id in 1..=20 {
-                    engine
-                        .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-                        .unwrap();
-                }
+                let values = (1..=20)
+                    .map(|id| format!("({id},'[{id},1,2,3]')"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute(&format!("INSERT INTO {name} VALUES {values}"))
+                    .unwrap();
                 let params = if algorithm == "HNSW" {
                     "m=4,ef_construction=32,ef_search=128"
                 } else {
@@ -1442,59 +1579,115 @@ fn prepared_vector_decision_after_snapshot_recovers_all_persistent_backends() {
                 };
                 engine
                     .execute(&format!(
-                        "CREATE INDEX vx ON items(v) USING {algorithm} WITH({params},{quant})"
+                        "CREATE INDEX vx ON {name}(v) USING {algorithm} WITH({params},{quant})"
                     ))
                     .unwrap();
-                let mut session = SessionContext::default();
-                for sql in [
-                    "XA START 'decision-after-snapshot'",
-                    "INSERT INTO items VALUES(999,'[0,0,0,0]')",
-                    "XA END 'decision-after-snapshot'",
-                    "XA PREPARE 'decision-after-snapshot'",
-                ] {
-                    engine.execute_with_session(&mut session, sql).unwrap();
-                }
-                engine.checkpoint().unwrap();
-                drop(engine);
-                let recovered = open();
-                let count_batches = || {
-                    crate::wal::LogManager::scan(dir.path())
-                        .unwrap()
-                        .records
-                        .iter()
-                        .filter(|r| {
-                            matches!(r.payload, crate::wal::WalPayload::VectorIndexBatch { .. })
-                        })
-                        .count()
-                };
-                let before = count_batches();
-                recovered.database().test_interrupt_vector_completion();
-                let err = recovered
-                    .execute("XA COMMIT 'decision-after-snapshot'")
-                    .unwrap_err();
-                assert!(
-                    err.message()
-                        .contains("injected XA vector completion interruption"),
-                    "{err:?}"
-                );
-                assert_eq!(
-                    count_batches(),
-                    before,
-                    "a PREPARED immutable journal must not be re-logged at COMMIT"
-                );
-                // Relaxed durability explicitly forces the WAL boundary before
-                // simulating a process loss; it promises no per-COMMIT fsync.
-                recovered.database().wal_log().lock().flush().unwrap();
-                drop(recovered);
-                let scans = crate::storage::Database::vector_build_heap_scans_for_test();
-                let reopened = open();
+                cases.push((name, algorithm));
+            }
+            preparation.finish().unwrap();
+            // The completion interruption occurs after commit_txn has applied
+            // the entire journal. One XA covers every independent typed index
+            // at exactly that same decision/checkpoint boundary.
+            let mut session = SessionContext::default();
+            engine
+                .execute_with_session(&mut session, "XA START 'decision-after-snapshot'")
+                .unwrap();
+            for (name, _) in &cases {
+                engine
+                    .execute_with_session(
+                        &mut session,
+                        &format!("INSERT INTO {name} VALUES(999,'[0,0,0,0]')"),
+                    )
+                    .unwrap();
+            }
+            engine
+                .execute_with_session(&mut session, "XA END 'decision-after-snapshot'")
+                .unwrap();
+            engine
+                .execute_with_session(&mut session, "XA PREPARE 'decision-after-snapshot'")
+                .unwrap();
+            engine.checkpoint().unwrap();
+            drop(engine);
+            let recovered = open();
+            let count_batches = || {
+                crate::wal::LogManager::scan(dir.path())
+                    .unwrap()
+                    .records
+                    .iter()
+                    .filter(|r| {
+                        matches!(r.payload, crate::wal::WalPayload::VectorIndexBatch { .. })
+                    })
+                    .count()
+            };
+            let before = count_batches();
+            assert!(
+                before > 0,
+                "PREPARED must retain its immutable index journal"
+            );
+            recovered.database().test_interrupt_vector_completion();
+            let err = recovered
+                .execute("XA COMMIT 'decision-after-snapshot'")
+                .unwrap_err();
+            assert!(
+                err.message()
+                    .contains("injected XA vector completion interruption"),
+                "{err:?}"
+            );
+            assert_eq!(
+                count_batches(),
+                before,
+                "a PREPARED immutable journal must not be re-logged at COMMIT"
+            );
+            recovered.database().wal_log().lock().flush().unwrap();
+            drop(recovered);
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            let reopened = open();
+            for (name, algorithm) in &cases {
                 assert_eq!(
                     scalar(
                         &reopened,
-                        "SELECT id FROM items ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+                        &format!("SELECT id FROM {name} ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1")
                     ),
                     "999",
-                    "{durability:?}/{backend}/{datatype}/{algorithm}/{quantization}"
+                    "{durability:?}/{backend}/{name}"
+                );
+                let db = reopened.database();
+                let table = db.table(name).unwrap();
+                let index = table.indexes.iter().find(|i| i.name == "vx").unwrap();
+                let graph = db.vector_graph_get_or_build(&table, index).unwrap();
+                assert_eq!(graph.len(), 21, "{durability:?}/{backend}/{name}");
+                let query = crate::engine::vector::codec::parse_text("[0,0,0,0]").unwrap();
+                let result = graph
+                    .search(
+                        &query,
+                        VectorSearchRequest {
+                            candidate_limit: 32,
+                            rerank_limit: 32,
+                            effort: if *algorithm == "HNSW" {
+                                VectorSearchEffort::Hnsw { ef: 4096 }
+                            } else {
+                                VectorSearchEffort::Ivf { nprobe: 4096 }
+                            },
+                        },
+                    )
+                    .unwrap();
+                let actual = result
+                    .candidates
+                    .into_iter()
+                    .map(|(row, _)| row)
+                    .collect::<std::collections::HashSet<_>>();
+                let expected = db
+                    .scan_rows(
+                        &table.qualified_name(),
+                        TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.row_id)
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "raw index must cover every committed row: {backend}/{name}"
                 );
                 assert_eq!(
                     crate::storage::Database::vector_build_heap_scans_for_test(),
@@ -1510,16 +1703,7 @@ fn prepared_vector_decision_after_snapshot_recovers_all_persistent_backends() {
 fn vector_source_images_survive_partial_transfer_restartpoints_without_heap_builds() {
     use std::io::{Read, Seek, SeekFrom};
     fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
-        std::fs::create_dir_all(target).unwrap();
-        for entry in std::fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let dest = target.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &dest);
-            } else {
-                std::fs::copy(entry.path(), dest).unwrap();
-            }
-        }
+        crate::util::file::copy_fixture_tree(source, target).unwrap();
     }
     fn project(
         master: &StorageQueryEngine,
@@ -1578,18 +1762,24 @@ fn vector_source_images_survive_partial_transfer_restartpoints_without_heap_buil
             let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
             let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
             {
+                let preparation =
+                    crate::platform::fs::FixtureSyncBatch::new(source.path()).unwrap();
                 let engine = open_strict_test_engine(source.path());
                 engine
                     .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(2048) NOT NULL)")
                     .unwrap();
-                for id in 1..=130 {
-                    let vector = std::iter::repeat_n(id.to_string(), 2048)
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    engine
-                        .execute(&format!("INSERT INTO items VALUES({id},'[{vector}]')"))
-                        .unwrap();
-                }
+                let values = (1..=130)
+                    .map(|id| {
+                        let vector = std::iter::repeat_n(id.to_string(), 2048)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("({id},'[{vector}]')")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute(&format!("INSERT INTO items VALUES {values}"))
+                    .unwrap();
                 let options = if algorithm == "HNSW" {
                     "m=4,ef_construction=32,ef_search=256"
                 } else {
@@ -1601,8 +1791,10 @@ fn vector_source_images_survive_partial_transfer_restartpoints_without_heap_buil
                     ))
                     .unwrap();
                 engine.checkpoint().unwrap();
+                drop(engine);
+                preparation.finish().unwrap();
             }
-            copy_tree(source.path(), target.path());
+            crate::util::file::copy_fixture_tree(source.path(), target.path()).unwrap();
             let mut role = crate::repl::role::RoleState::new_standalone();
             role.demote_to_replica("127.0.0.1:1".into());
             crate::repl::role::save(target.path(), &role).unwrap();
@@ -1779,16 +1971,7 @@ fn vector_source_images_survive_partial_transfer_restartpoints_without_heap_buil
 #[test]
 fn copy_checkpoint_between_decision_and_graph_transfer_preserves_index_journal() {
     fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
-        std::fs::create_dir_all(target).unwrap();
-        for entry in std::fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let path = target.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &path);
-            } else {
-                std::fs::copy(entry.path(), path).unwrap();
-            }
-        }
+        crate::util::file::copy_fixture_tree(source, target).unwrap();
     }
     let _env = HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", "memory"),
@@ -2027,16 +2210,7 @@ fn failed_vector_rebuild_keeps_old_index_and_resumes_its_durable_job_after_resta
 #[test]
 fn checkpoint_during_committed_vector_batch_never_overstates_snapshot_coverage() {
     fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
-        std::fs::create_dir_all(target).unwrap();
-        for entry in std::fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let dest = target.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &dest);
-            } else {
-                std::fs::copy(entry.path(), dest).unwrap();
-            }
-        }
+        crate::util::file::copy_fixture_tree(source, target).unwrap();
     }
     let _env = HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", "memory"),
@@ -2327,124 +2501,150 @@ fn resident_checkpoint_retirements_stay_bounded_without_background_workers() {
         ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
         ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
     ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut fixtures = Vec::new();
     for (algorithm, options) in [
         ("HNSW", "m=4,ef_construction=32"),
         ("IVF", "nlist=2,nprobe=2,quantization=pq,pq_m=2,pq_bits=4"),
     ] {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-        let engine = open_strict_test_engine(dir.path());
-        engine
-            .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
-            .unwrap();
-        for id in 1..=32 {
-            engine
-                .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-                .unwrap();
-        }
+        let name = format!("items_{}", algorithm.to_ascii_lowercase());
         engine
             .execute(&format!(
-                "CREATE INDEX vx ON items(v) USING {algorithm} WITH({options})"
+                "CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)"
             ))
             .unwrap();
-        let table = engine.database().table("items").unwrap();
+        let values = (1..=32)
+            .map(|id| format!("({id},'[{id},1,2,3]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO {name} VALUES {values}"))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "CREATE INDEX vx ON {name}(v) USING {algorithm} WITH({options})"
+            ))
+            .unwrap();
+        let table = engine.database().table(&name).unwrap();
         let index = table
             .indexes
             .iter()
             .find(|index| index.is_vector())
-            .unwrap();
+            .unwrap()
+            .clone();
         let initial = engine
             .database()
-            .active_vector_file_for_test(&table, index, table.id)
+            .active_vector_file_for_test(&table, &index, table.id)
             .unwrap();
-        for _ in 0..3 {
-            engine.checkpoint().unwrap();
-        }
+        fixtures.push((name, table, index, initial));
+    }
+    preparation.finish().unwrap();
+    for _ in 0..3 {
+        engine.checkpoint().unwrap();
+    }
+    for (name, table, index, initial) in &fixtures {
         assert_eq!(
             engine
                 .database()
-                .active_vector_file_for_test(&table, index, table.id)
+                .active_vector_file_for_test(table, index, table.id)
                 .unwrap(),
-            initial,
-            "clean checkpoints must preserve the already durable object"
+            *initial,
+            "clean checkpoints must preserve the already durable object: {name}"
         );
-        for iteration in 0..70 {
+    }
+    let mut session = SessionContext::default();
+    session.connection_id = 8135;
+    // Both independent index families cross every one of the original seventy
+    // durable checkpoint boundaries. Check each directory separately so one
+    // family's missing snapshot cannot hide another family's leaked object.
+    for iteration in 0..70 {
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        for (name, _, _, _) in &fixtures {
             engine
-                .execute(&format!(
-                    "UPDATE items SET v='[1,1,2,{}]' WHERE id=1",
-                    3 + iteration % 2
-                ))
+                .execute_with_session(
+                    &mut session,
+                    &format!(
+                        "UPDATE {name} SET v='[1,1,2,{}]' WHERE id=1",
+                        3 + iteration % 2
+                    ),
+                )
                 .unwrap();
-            engine.checkpoint().unwrap();
+        }
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+        engine.checkpoint().unwrap();
+        for (name, _, _, initial) in &fixtures {
             assert_eq!(
-                snapshot_count(dir.path()),
+                snapshot_count(initial.parent().unwrap()),
                 1,
-                "retired resident files must be reclaimed"
+                "retired resident files must be reclaimed: {name}"
             );
         }
-        let coverage = scalar(&engine, "SELECT LAST_PERSISTED_LSN FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'");
+    }
+    for (name, _, _, _) in &fixtures {
+        let coverage = scalar(&engine, &format!("SELECT LAST_PERSISTED_LSN FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME='{name}' AND INDEX_NAME='vx'"));
         assert!(
             coverage.parse::<u64>().unwrap() > 0,
-            "resident coverage must be observable"
+            "resident coverage must be observable: {name}"
         );
-        drop(engine);
-        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
-        let engine = open_strict_test_engine(dir.path());
+    }
+    drop(engine);
+    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+    let engine = open_strict_test_engine(dir.path());
+    for (name, _, _, _) in &fixtures {
         assert_eq!(
             scalar(
                 &engine,
-                "SELECT id FROM items ORDER BY DISTANCE(v,'[0,1,2,3]') LIMIT 1"
+                &format!("SELECT id FROM {name} ORDER BY DISTANCE(v,'[0,1,2,3]') LIMIT 1")
             ),
-            "1"
+            "1",
+            "{name}"
         );
-        assert_eq!(
-            crate::storage::Database::vector_build_heap_scans_for_test(),
-            scans
-        );
-        assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
-        let root = dir.path().join("system/vector-purges.v1");
-        let mut damaged = std::fs::read(&root).unwrap();
-        assert_eq!(damaged.len(), 17);
-        damaged[0] ^= 1;
-        std::fs::write(&root, &damaged).unwrap();
-        let completed = || {
-            crate::wal::LogManager::scan(dir.path())
-                .unwrap()
-                .records
-                .iter()
-                .filter(|record| {
-                    matches!(record.payload, crate::wal::WalPayload::CheckpointEnd { .. })
-                })
-                .count()
-        };
-        let before = completed();
-        let err = engine.checkpoint().unwrap_err();
-        assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
-        assert_eq!(
-            completed(),
-            before,
-            "corrupt mandatory state cannot publish CheckpointEnd"
-        );
-        assert!(
-            engine.execute("SELECT 1").is_err(),
-            "known root corruption must fence service"
-        );
-        assert_eq!(
-            std::fs::read(&root).unwrap(),
-            damaged,
-            "checkpoint replaced corruption evidence"
-        );
-        drop(engine);
-        let mut config = memory_test_storage_config();
-        config.durability = crate::storage::DurabilityMode::Strict;
-        assert!(
-            StorageQueryEngine::open_with_storage_config_without_background_workers(
-                dir.path(),
-                config
-            )
-            .is_err()
-        );
-        assert_eq!(std::fs::read(&root).unwrap(), damaged);
     }
+    assert_eq!(
+        crate::storage::Database::vector_build_heap_scans_for_test(),
+        scans
+    );
+    assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
+    let root = dir.path().join("system/vector-purges.v1");
+    let mut damaged = std::fs::read(&root).unwrap();
+    assert_eq!(damaged.len(), 17);
+    damaged[0] ^= 1;
+    std::fs::write(&root, &damaged).unwrap();
+    let completed = || {
+        crate::wal::LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .iter()
+            .filter(|record| matches!(record.payload, crate::wal::WalPayload::CheckpointEnd { .. }))
+            .count()
+    };
+    let before = completed();
+    let err = engine.checkpoint().unwrap_err();
+    assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
+    assert_eq!(
+        completed(),
+        before,
+        "corrupt mandatory state cannot publish CheckpointEnd"
+    );
+    assert!(
+        engine.execute("SELECT 1").is_err(),
+        "known root corruption must fence service"
+    );
+    assert_eq!(
+        std::fs::read(&root).unwrap(),
+        damaged,
+        "checkpoint replaced corruption evidence"
+    );
+    drop(engine);
+    let mut config = memory_test_storage_config();
+    config.durability = crate::storage::DurabilityMode::Strict;
+    assert!(
+        StorageQueryEngine::open_with_storage_config_without_background_workers(dir.path(), config)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&root).unwrap(), damaged);
 }
 
 #[test]

@@ -7524,7 +7524,9 @@ mod tests {
         } else {
             setup_engine()
         };
-        let rows = 4096;
+        // Cross the parallel admission boundary and leave a tail after its
+        // probe, without doubling the same visibility/rollback workload.
+        let rows = PARALLEL_MIN_ROWS as i64 + 1;
         let path = tmp.path().join("visibility.tsv");
         let data = (1..=rows)
             .map(|id| format!("{id}\t{id}\t{}\t2024-01-{:02}\tvalue-{id:08}\traw-{id}\t{}\t{id}.25\t{id}.5\tpayload-{id}\n", id * 2, id % 28 + 1, if id % 7 == 0 { "\\N".to_owned() } else { (u64::MAX - id as u64).to_string() }))

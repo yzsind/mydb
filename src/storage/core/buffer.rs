@@ -241,10 +241,13 @@ fn data_file_nocache_enabled() -> bool {
 }
 
 fn sync_buffer_file_data(file: &File) -> std::io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = crate::platform::fs::try_fixture_sync_file(file) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = crate::platform::fs::try_private_sync_file(file) {
         return result;
     }
+    #[cfg(target_os = "macos")]
+    return crate::platform::fs::sync_full_file(file);
+    #[cfg(not(target_os = "macos"))]
     file.sync_data()
 }
 
@@ -5890,22 +5893,19 @@ impl BufferPool {
             // Keep every sync lock until these full barriers complete. A
             // competing single-file sync must not acknowledge our cleared
             // needs_sync bit before the device is durable.
-            #[cfg(test)]
-            let private_fixture = {
+            let private_tree = {
                 let mut all_private = true;
                 for file in &pending.files {
-                    match crate::platform::fs::try_fixture_sync_file(&file.file) {
+                    match crate::platform::fs::try_private_sync_file(&file.file) {
                         Some(result) => result.map_err(io_err)?,
                         None => all_private = false,
                     }
                 }
                 all_private
             };
-            #[cfg(not(test))]
-            let private_fixture = false;
-            if !private_fixture {
+            if !private_tree {
                 for file in devices.values() {
-                    file.file.sync_data().map_err(io_err)?;
+                    crate::platform::fs::sync_full_file(&file.file).map_err(io_err)?;
                 }
             }
         }

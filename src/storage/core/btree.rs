@@ -143,6 +143,7 @@ static BULK_INDEX_BUFFERED_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static BULK_INDEX_FAIL_BEFORE_META: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INDEX_TREE_PAGE_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -4139,7 +4140,7 @@ impl IndexFile {
         }
         let root_page = self.root_page.load(Ordering::Acquire);
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(pinned) = pinned_leaf {
             if let Some(applied) =
                 self.buffer_pool
@@ -4293,7 +4294,7 @@ impl IndexFile {
         let root_page = self.root_page.load(Ordering::Acquire);
         let old_key = self.page_key(old_leaf_id);
         let new_key = self.page_key(new_leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self.buffer_pool.try_modify_two_raw_pages(
             &old_key,
             &new_key,
@@ -4470,10 +4471,9 @@ impl IndexFile {
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(lsn);
         let result = (|| {
-            // Memory durability has no logical WAL LSN, so
-            // `try_insert_leaf_in_place` deliberately declines. Keep its
-            // batch under the legacy single structural guard instead of
-            // taking and dropping that guard once per entry.
+            // Ordinary memory writes have no logical WAL LSN. Keep admission
+            // under one topology guard instead of acquiring it per entry;
+            // resident leaves can still use the in-place mutation path.
             if self.durability == DurabilityMode::Memory {
                 let _structure = self.structure_lock.write();
                 let _mutation = self.begin_mutation();
@@ -6266,11 +6266,9 @@ impl IndexFile {
         saved
     }
 
-    /// Returns true when an in-place lazy mutation of the leaf is
-    /// allowed: WAL is active, so the byte image isn't load-bearing for
-    /// crash recovery beyond the logical index record the caller is about to
-    /// emit. Mirrors the gate `write_page` uses to decide between the lazy
-    /// and physical page-image branches — kept in sync there.
+    /// Persistent in-place mutations require logical WAL coverage. Memory
+    /// durability has no crash-redo obligation and can modify the same
+    /// resident bytes without serializing a replacement page per entry.
     fn lazy_write_eligible(&self, page_id: u64) -> Result<bool, QueryError> {
         // Deferred index buffering runs with `current() == None` (the record's
         // LSN is unknown until the batched commit-time append), but the leaf is
@@ -6278,12 +6276,33 @@ impl IndexFile {
         // Without the `is_deferred()` escape the in-place fast path would be
         // disabled here, routing every deferred update onto the far heavier
         // read_leaf + `write_page`/`store_page_decoded_lazy` path (~2× slower,
-        // measured).
-        if btree_logical_wal::current().is_none() && !btree_logical_wal::is_deferred() {
+        // measured). Unlogged physical apply retains the source's page-image
+        // path even when its resident cache uses memory durability.
+        if (self.durability != DurabilityMode::Memory
+            || physical_wal_apply_active()
+            || self.log_atomics.physical_replica())
+            && btree_logical_wal::current().is_none()
+            && !btree_logical_wal::is_deferred()
+        {
             return Ok(false);
         }
         let _ = page_id;
         Ok(true)
+    }
+
+    fn lazy_mutation_lsn(&self) -> u64 {
+        if self.durability == DurabilityMode::Memory
+            && btree_logical_wal::current().is_none()
+            && !btree_logical_wal::is_deferred()
+            && !physical_wal_apply_active()
+            && !self.log_atomics.physical_replica()
+        {
+            0
+        } else {
+            // Explicit logical/replica replay retains its existing WAL anchor,
+            // including a memory-backed cache of the source's index pages.
+            self.log_atomics.next_lsn().max(1)
+        }
     }
 
     /// Fast path for `insert_internal`: try to insert `entry` directly
@@ -6296,7 +6315,7 @@ impl IndexFile {
     ///     the mutation was rolled back, caller must take the slow
     ///     take/clone/split path.
     ///   - `None` — frame isn't suitable (not cached / FPI needed /
-    ///     non-WAL); caller falls back to the slow path.
+    ///     unlogged persistent mutation); caller falls back to the slow path.
     fn try_insert_leaf_in_place(
         &self,
         txn_id: u64,
@@ -6307,7 +6326,7 @@ impl IndexFile {
             return Ok(None);
         }
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self
             .buffer_pool
             .try_modify_raw_page(&key, peek_lsn, |bytes| {
@@ -6388,7 +6407,7 @@ impl IndexFile {
         if !self.lazy_write_eligible(leaf_id)? {
             return Ok(None);
         }
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         // Reuse an existing packed image for point writes too, but only
         // real batches may create one. Fresh single-row workloads keep
         // their existing allocation-free encoded-page kernel.
@@ -6497,7 +6516,7 @@ impl IndexFile {
             return Ok(None);
         }
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self
             .buffer_pool
             .try_modify_raw_page(&key, peek_lsn, |bytes| {
@@ -6560,7 +6579,7 @@ impl IndexFile {
         }
         let is_root = leaf_id == root_page;
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) =
             self.buffer_pool
                 .try_modify_existing_packed_leaf(pinned, peek_lsn, |leaf| {
@@ -9777,7 +9796,7 @@ impl IndexFile {
             ));
         }
         let key = self.page_key(parent_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self
             .buffer_pool
             .try_modify_raw_page(&key, peek_lsn, |bytes| {
@@ -11822,6 +11841,8 @@ fn encode_layout_index_entry(
 }
 
 fn encode_index_tree_page(page: &IndexPage) -> Result<Vec<u8>, QueryError> {
+    #[cfg(test)]
+    INDEX_TREE_PAGE_ENCODINGS.with(|count| count.set(count.get() + 1));
     // v12: the per-page `page_table_id` field was always zero. v19
     // dropped it from the on-disk payload entirely; in-memory
     // `LeafPayloadHeader.page_table_id` is just a 0 placeholder kept

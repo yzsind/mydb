@@ -4,11 +4,29 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+mod device_sync;
+
+pub(crate) fn sync_full_file(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    return device_sync::sync(file);
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()
+}
+
 /// Flush a regular file or directory without changing its contents.
 /// Windows directory handles require BACKUP_SEMANTICS, and FlushFileBuffers
 /// requires write access even when the caller only publishes metadata.
 pub(crate) fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
+    #[cfg(test)]
+    SYNC_PATH_ERROR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(target, _)| target == path) {
+            return Err(io::Error::from_raw_os_error(slot.take().unwrap().1));
+        }
+        Ok(())
+    })?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -23,57 +41,90 @@ pub(crate) fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
     sync_file_at(&File::open(path)?, path)
 }
 
+#[cfg(test)]
+thread_local! {
+    static SYNC_PATH_ERROR: std::cell::RefCell<Option<(std::path::PathBuf, i32)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_path_sync_error_for_test(path: &Path, errno: i32) {
+    SYNC_PATH_ERROR.with(|slot| *slot.borrow_mut() = Some((path.to_owned(), errno)));
+}
+
 /// Sync file contents. Production retains the platform's full durability
-/// barrier; macOS fixture construction may batch drive-cache flushes.
+/// barrier; unpublished private trees may coalesce drive-cache flushes.
 pub(crate) fn sync_file_at(file: &super::file::File, _path: &Path) -> io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = fixture_sync::sync(file, _path) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = private_sync::sync(file, _path) {
         return result;
     }
+    #[cfg(target_os = "macos")]
+    return sync_full_file(file);
+    #[cfg(not(target_os = "macos"))]
     file.sync_all()
 }
 
 pub(crate) fn sync_file_data_at(file: &super::file::File, _path: &Path) -> io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = fixture_sync::sync(file, _path) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = private_sync::sync(file, _path) {
         return result;
     }
+    #[cfg(target_os = "macos")]
+    return sync_full_file(file);
+    #[cfg(not(target_os = "macos"))]
     file.sync_data()
 }
 
 /// Standard-library handles also participate in private fixture construction.
-/// Outside that scope these retain their original full/data-only barriers.
+/// Outside a private-tree scope these retain their full/data-only barriers.
 pub(crate) fn sync_standard_file_at(file: &File, _path: &Path) -> io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = fixture_sync::sync(file, _path) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = private_sync::sync(file, _path) {
         return result;
     }
-    file.sync_all()
+    sync_full_file(file)
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn sync_standard_data_at(file: &File, _path: &Path) -> io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = fixture_sync::sync(file, _path) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = private_sync::sync(file, _path) {
         return result;
     }
+    #[cfg(target_os = "macos")]
+    return sync_full_file(file);
+    #[cfg(not(target_os = "macos"))]
     file.sync_data()
 }
 
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) fn try_fixture_sync_file(file: &File) -> Option<io::Result<()>> {
-    fixture_sync::sync_handle(file)
+#[cfg(target_os = "macos")]
+pub(crate) fn try_private_sync_file(file: &File) -> Option<io::Result<()>> {
+    private_sync::sync_handle(file)
 }
 
 pub(crate) fn sync_before_atomic_rename_at(
     file: &super::file::File,
     _path: &Path,
 ) -> io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = fixture_sync::sync(file, _path) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = private_sync::sync(file, _path) {
         return result;
     }
     sync_before_atomic_rename(file)
+}
+
+/// Order staging data before publication. The caller must complete a full
+/// parent-directory barrier after rename before acknowledging durability.
+pub(crate) fn sync_standard_before_atomic_rename_at(file: &File, _path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(result) = private_sync::sync(file, _path) {
+            return result;
+        }
+        sync_before_atomic_rename(file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()
 }
 
 /// Drain one path to its device and retain a representative descriptor for
@@ -88,8 +139,7 @@ pub(crate) fn sync_path_to_device(path: &Path) -> io::Result<Option<(u64, File)>
 fn sync_file_to_device(file: File, _path: &Path) -> io::Result<Option<(u64, File)>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    #[cfg(test)]
-    if let Some(result) = fixture_sync::sync(&file, _path) {
+    if let Some(result) = private_sync::sync(&file, _path) {
         return result.map(|()| None);
     }
     let device = file.metadata()?.dev();
@@ -147,10 +197,19 @@ impl DeviceSyncBatch {
     }
 
     pub(crate) fn sync_file(&mut self, file: File, path: &Path) -> io::Result<()> {
+        if let Some(result) = private_sync::sync(&file, path) {
+            return result;
+        }
+        if !device_sync::supports(&file) {
+            if let Some((_, previous)) = self.representative.take() {
+                sync_full_file(&previous)?;
+            }
+            return file.sync_all();
+        }
         if let Some((device, file)) = sync_file_to_device(file, path)? {
             if let Some((previous, representative)) = &self.representative {
                 if *previous != device {
-                    representative.sync_all()?;
+                    sync_full_file(representative)?;
                 }
             }
             // Keep only one representative: even huge inventories or mounted
@@ -162,27 +221,26 @@ impl DeviceSyncBatch {
 
     pub(crate) fn finish(self) -> io::Result<()> {
         if let Some((_, file)) = self.representative {
-            file.sync_all()?;
+            sync_full_file(&file)?;
         }
         Ok(())
     }
 }
 
-/// Only for constructing a private fixture, never for the operations under
-/// test. Each file/directory still reaches the device via fsync. Finish performs
-/// a full device-cache flush before exposing the completed fixture.
-#[cfg(test)]
-pub(crate) struct FixtureSyncBatch {
+/// Coalesce device-cache flushes while constructing an unpublished private
+/// tree. Every file/directory still reaches the device via fsync. The caller
+/// must join its writers and finish before publishing any completed state.
+/// Existing databases and live transaction work must never enter this scope.
+pub(crate) struct PrivateTreeSyncBatch {
     #[cfg(target_os = "macos")]
-    inner: fixture_sync::Batch,
+    inner: private_sync::Batch,
 }
 
-#[cfg(test)]
-impl FixtureSyncBatch {
+impl PrivateTreeSyncBatch {
     pub(crate) fn new(_root: &Path) -> io::Result<Self> {
         Ok(Self {
             #[cfg(target_os = "macos")]
-            inner: fixture_sync::Batch::new(_root)?,
+            inner: private_sync::Batch::new(_root)?,
         })
     }
 
@@ -193,10 +251,15 @@ impl FixtureSyncBatch {
     }
 }
 
+/// Only for private fixture construction; operations under test retain their
+/// ordinary barriers unless they use the production private-tree protocol.
+#[cfg(test)]
+pub(crate) type FixtureSyncBatch = PrivateTreeSyncBatch;
+
 #[cfg(test)]
 pub(crate) fn inherit_fixture_sync_batch(_command: &mut std::process::Command, _path: &Path) {
     #[cfg(target_os = "macos")]
-    if let Some((root, device)) = fixture_sync::root_for(_path) {
+    if let Some((root, device)) = private_sync::root_for(_path) {
         _command.env("MYDB_TEST_SYNC_BATCH_ROOT", root);
         _command.env("MYDB_TEST_SYNC_BATCH_DEVICE", device.to_string());
     }
@@ -204,11 +267,11 @@ pub(crate) fn inherit_fixture_sync_batch(_command: &mut std::process::Command, _
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn fixture_sync_epoch() -> Option<u64> {
-    fixture_sync::epoch()
+    private_sync::epoch()
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod fixture_sync {
+#[cfg(target_os = "macos")]
+mod private_sync {
     use super::*;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -217,7 +280,9 @@ mod fixture_sync {
     use std::sync::{Mutex, OnceLock};
 
     static EPOCH: AtomicU64 = AtomicU64::new(0);
+    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    #[cfg(test)]
     pub(super) fn epoch() -> Option<u64> {
         // Inherited construction scopes last for a preparation child. They
         // must never produce a reusable proof of a full device barrier.
@@ -240,6 +305,12 @@ mod fixture_sync {
         ROOTS.get_or_init(Default::default)
     }
 
+    #[cfg(not(test))]
+    fn inherited() -> Option<&'static (PathBuf, u64)> {
+        None
+    }
+
+    #[cfg(test)]
     fn inherited() -> Option<&'static (PathBuf, u64)> {
         static ROOT: OnceLock<Option<(PathBuf, u64)>> = OnceLock::new();
         ROOT.get_or_init(|| {
@@ -267,11 +338,15 @@ mod fixture_sync {
             })
     }
 
+    #[cfg(test)]
     pub(super) fn root_for(path: &Path) -> Option<(PathBuf, u64)> {
         find(&roots().lock().unwrap(), path)
     }
 
     pub(super) fn sync(file: &File, path: &Path) -> Option<io::Result<()>> {
+        if !ACTIVE.load(Ordering::Acquire) && inherited().is_none() {
+            return None;
+        }
         // Keep registration locked until fsync completes. Finish removes the
         // root under this lock before issuing the final full-device barrier.
         let roots = roots().lock().unwrap();
@@ -297,7 +372,7 @@ mod fixture_sync {
         use std::os::unix::ffi::OsStrExt;
         // Most WAL barriers are operations under test, with no fixture scope.
         // Avoid resolving their descriptor paths or changing their barriers.
-        if roots().lock().unwrap().is_empty() && inherited().is_none() {
+        if !ACTIVE.load(Ordering::Acquire) && inherited().is_none() {
             return None;
         }
         let mut path = [0u8; libc::PATH_MAX as usize];
@@ -329,6 +404,7 @@ mod fixture_sync {
             let mut registered = roots().lock().unwrap();
             EPOCH.fetch_add(1, Ordering::AcqRel);
             registered.push(root);
+            ACTIVE.store(true, Ordering::Release);
             EPOCH.fetch_add(1, Ordering::Release);
             Ok(Self {
                 id: Some(id),
@@ -341,6 +417,7 @@ mod fixture_sync {
                 let mut registered = roots().lock().unwrap();
                 EPOCH.fetch_add(1, Ordering::AcqRel);
                 registered.retain(|root| root.id != id);
+                ACTIVE.store(!registered.is_empty(), Ordering::Release);
                 EPOCH.fetch_add(1, Ordering::Release);
             }
         }
@@ -350,7 +427,7 @@ mod fixture_sync {
             // On Darwin std::File::sync_all issues F_FULLFSYNC. All prior
             // fixture fsyncs have completed, including joined preparation
             // children; this flushes their writes on this same device.
-            self.directory.sync_all()
+            sync_full_file(&self.directory)
         }
     }
 
@@ -379,7 +456,7 @@ pub(crate) fn sync_before_atomic_rename(file: &super::file::File) -> io::Result<
             }
             // Older filesystems may not implement the ordering-only barrier.
             if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
-                return file.sync_all();
+                return sync_full_file(file);
             }
             return Err(error);
         }
@@ -597,17 +674,17 @@ fn fixture_sync_batch_is_private_joined_and_removed_on_unwind() {
     let path = root.path().join("data");
     std::fs::write(&path, b"fixture data").unwrap();
     let batch = FixtureSyncBatch::new(root.path()).unwrap();
-    assert!(fixture_sync::root_for(other.path()).is_none());
+    assert!(private_sync::root_for(other.path()).is_none());
     let standard = File::open(&path).unwrap();
     let outside = File::open(other.path()).unwrap();
-    assert!(try_fixture_sync_file(&standard).unwrap().is_ok());
-    assert!(try_fixture_sync_file(&outside).is_none());
+    assert!(try_private_sync_file(&standard).unwrap().is_ok());
+    assert!(try_private_sync_file(&outside).is_none());
     sync_standard_file_at(&standard, &path).unwrap();
     sync_standard_data_at(&standard, &path).unwrap();
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                assert!(fixture_sync::root_for(&path).is_some());
+                assert!(private_sync::root_for(&path).is_some());
                 sync_path(&path).unwrap();
                 sync_path(root.path()).unwrap();
             })
@@ -618,13 +695,13 @@ fn fixture_sync_batch_is_private_joined_and_removed_on_unwind() {
     inherit_fixture_sync_batch(&mut child, &path);
     assert_eq!(child.get_envs().count(), 2);
     batch.finish().unwrap();
-    assert!(fixture_sync::root_for(&path).is_none());
-    assert!(try_fixture_sync_file(&standard).is_none());
+    assert!(private_sync::root_for(&path).is_none());
+    assert!(try_private_sync_file(&standard).is_none());
     assert_eq!(std::fs::read(&path).unwrap(), b"fixture data");
     let result = std::panic::catch_unwind(|| {
         let _batch = FixtureSyncBatch::new(root.path()).unwrap();
         panic!("fixture setup failed");
     });
     assert!(result.is_err());
-    assert!(fixture_sync::root_for(&path).is_none());
+    assert!(private_sync::root_for(&path).is_none());
 }

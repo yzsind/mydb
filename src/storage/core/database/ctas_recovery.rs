@@ -39,7 +39,6 @@ impl Database {
         std::fs::create_dir_all(&dir).map_err(io_err)?;
         let path = dir.join(format!("{}.json", table.id));
         Self::write_ctas_intent_file(&path, &intent)?;
-        crate::platform::fs::sync_path(&dir).map_err(io_err)?;
         Ok(Some(path))
     }
 

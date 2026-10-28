@@ -4556,10 +4556,8 @@ impl Database {
             #[cfg(test)]
             self.vector_persist_failpoint(2)
                 .map_err(std::io::Error::other)?;
-            writer
-                .into_inner()
-                .map_err(|e| e.into_error())?
-                .sync_all()?;
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            crate::platform::fs::sync_standard_file_at(&file, &tmp_path)?;
         }
         #[cfg(test)]
         self.vector_persist_failpoint(3)

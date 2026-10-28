@@ -317,9 +317,54 @@ pub(super) fn write_group_keys_to_simple_fields(
     }
 }
 
+struct RowAggregateSpillWriters<'a> {
+    writers: Vec<Option<crate::engine::executor::spill_quota::TrackedSpillWriter>>,
+    tmp: &'a SpillTmpDir,
+    capacity: usize,
+}
+
+impl<'a> RowAggregateSpillWriters<'a> {
+    fn new(tmp: &'a SpillTmpDir, partitions: usize) -> Self {
+        Self {
+            writers: (0..partitions).map(|_| None).collect(),
+            tmp,
+            capacity: crate::engine::executor::spill_quota::writer_buffer_capacity(partitions),
+        }
+    }
+
+    fn writer(
+        &mut self,
+        partition: usize,
+    ) -> Result<&mut crate::engine::executor::spill_quota::TrackedSpillWriter, QueryError> {
+        let slot = &mut self.writers[partition];
+        if slot.is_none() {
+            let path = self.tmp.path().join(format!("rowagg-{partition:03}.bin"));
+            *slot = Some(
+                crate::engine::executor::spill_quota::TrackedSpillWriter::create_new(
+                    &path,
+                    self.tmp.charger(),
+                    self.capacity,
+                )?,
+            );
+        }
+        Ok(slot.as_mut().expect("occupied partition has a writer"))
+    }
+
+    fn finish(self) -> Result<Vec<usize>, QueryError> {
+        let mut occupied = Vec::new();
+        for (partition, writer) in self.writers.into_iter().enumerate() {
+            if let Some(writer) = writer {
+                writer.finish()?;
+                occupied.push(partition);
+            }
+        }
+        Ok(occupied)
+    }
+}
+
 pub(super) fn merge_row_hash_agg_spill_partitions(
     tmp: &SpillTmpDir,
-    partitions: usize,
+    occupied_partitions: &[usize],
     schema_template: &Arc<Vec<PlanField>>,
     group_field_positions: &[Option<usize>],
     slots: &[crate::engine::executor::select::aggregate::AggregateSlot],
@@ -333,7 +378,7 @@ pub(super) fn merge_row_hash_agg_spill_partitions(
     super::super::aggregate::bind_slot_comparisons_for_row(&mut bound_slots, &template);
     let slots = bound_slots.as_slice();
     let mut out = Vec::new();
-    for idx in 0..partitions {
+    for &idx in occupied_partitions {
         crate::engine::cancel::check_cancelled()?;
         let path = tmp.path().join(format!("rowagg-{idx:03}.bin"));
         let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
@@ -405,18 +450,9 @@ pub(in crate::engine::executor::select) fn aggregate_plan_rows_spilled(
     let partition_mask = partitions - 1;
     let hasher_state = ahash::RandomState::new();
     let tmp = SpillTmpDir::create_kind(db.data_dir(), "hashagg")?;
-    let mut writers = Vec::with_capacity(partitions);
-    let writer_capacity = crate::engine::executor::spill_quota::writer_buffer_capacity(partitions);
-    for idx in 0..partitions {
-        let path = tmp.path().join(format!("rowagg-{idx:03}.bin"));
-        writers.push(
-            crate::engine::executor::spill_quota::TrackedSpillWriter::create_truncate(
-                &path,
-                tmp.charger(),
-                writer_capacity,
-            )?,
-        );
-    }
+    // Keep logical fanout and hashing unchanged, but reserve files/buffers
+    // only for occupied buckets. Replay must still open every claimed file.
+    let mut writers = RowAggregateSpillWriters::new(&tmp, partitions);
 
     let schema_template: Arc<Vec<PlanField>> = Arc::new(
         input_rows[0]
@@ -449,20 +485,18 @@ pub(in crate::engine::executor::select) fn aggregate_plan_rows_spilled(
             Vec::new()
         };
         write_row_hash_agg_spill_record(
-            &mut writers[pidx],
+            writers.writer(pidx)?,
             &key_values,
             &slot_inputs,
             &order_keys,
             &sample_values,
         )?;
     }
-    for writer in writers {
-        writer.finish()?;
-    }
+    let occupied_partitions = writers.finish()?;
 
     merge_row_hash_agg_spill_partitions(
         &tmp,
-        partitions,
+        &occupied_partitions,
         &schema_template,
         &group_field_positions,
         slots,
@@ -485,18 +519,9 @@ pub(in crate::engine::executor::select) fn aggregate_plan_stream_spilled(
     let partition_mask = partitions - 1;
     let hasher_state = ahash::RandomState::new();
     let tmp = SpillTmpDir::create_kind(db.data_dir(), "hashagg")?;
-    let mut writers = Vec::with_capacity(partitions);
-    let writer_capacity = crate::engine::executor::spill_quota::writer_buffer_capacity(partitions);
-    for idx in 0..partitions {
-        let path = tmp.path().join(format!("rowagg-{idx:03}.bin"));
-        writers.push(
-            crate::engine::executor::spill_quota::TrackedSpillWriter::create_truncate(
-                &path,
-                tmp.charger(),
-                writer_capacity,
-            )?,
-        );
-    }
+    // Keep logical fanout and hashing unchanged, but reserve files/buffers
+    // only for occupied buckets. Replay must still open every claimed file.
+    let mut writers = RowAggregateSpillWriters::new(&tmp, partitions);
 
     let mut stream = execute_plan_stream(db, txn, input)?;
     let mut schema_template: Option<Arc<Vec<PlanField>>> = None;
@@ -530,16 +555,14 @@ pub(in crate::engine::executor::select) fn aggregate_plan_stream_spilled(
             Vec::new()
         };
         write_row_hash_agg_spill_record(
-            &mut writers[pidx],
+            writers.writer(pidx)?,
             &key_values,
             &slot_inputs,
             &order_keys,
             &sample_values,
         )?;
     }
-    for writer in writers {
-        writer.finish()?;
-    }
+    let occupied_partitions = writers.finish()?;
     let Some(schema_template) = schema_template else {
         return aggregate_plan_rows(Vec::new(), group_by, having, slots);
     };
@@ -547,7 +570,7 @@ pub(in crate::engine::executor::select) fn aggregate_plan_stream_spilled(
 
     merge_row_hash_agg_spill_partitions(
         &tmp,
-        partitions,
+        &occupied_partitions,
         &schema_template,
         &group_field_positions,
         slots,

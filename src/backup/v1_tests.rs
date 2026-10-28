@@ -87,56 +87,71 @@ fn hybrid_rrf_immutable_backup_preserves_ranked_snapshot() {
 
 #[test]
 fn sealed_fulltext_reads_prepared_xa_visible_rows_and_scores() {
-    for change in [
-        "UPDATE docs SET body='prepared content' WHERE id=1",
-        "DELETE FROM docs WHERE id=1",
-        "INSERT INTO docs VALUES(3,'database uncommitted')",
-    ] {
-        for commit in [true, false] {
-            let root = root();
-            let source = engine(&root.path().join("source"));
+    for commit in [true, false] {
+        let root = root();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
+        let source = engine(&root.path().join("source"));
+        let mut cases = Vec::new();
+        for (case, change) in [
+            "UPDATE docs SET body='prepared content' WHERE id=1",
+            "DELETE FROM docs WHERE id=1",
+            "INSERT INTO docs VALUES(3,'database uncommitted')",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let table = format!("docs_{case}");
             source
-                .execute("CREATE TABLE docs(id INT PRIMARY KEY, body TEXT, FULLTEXT KEY ft(body))")
+                .execute(&format!(
+                    "CREATE TABLE {table}(id INT PRIMARY KEY, body TEXT, FULLTEXT KEY ft(body))"
+                ))
                 .unwrap();
-            source.execute("INSERT INTO docs VALUES(1,'backup database'),(2,'database history'),(4,'unrelated words')").unwrap();
+            source.execute(&format!("INSERT INTO {table} VALUES(1,'backup database'),(2,'database history'),(4,'unrelated words')")).unwrap();
+            cases.push((table, change, format!("fulltext-backup-{case}")));
+        }
+        preparation.finish().unwrap();
+        for (table, change, xid) in &cases {
             let mut xa = crate::engine::SessionContext::default();
             for sql in [
-                "XA START 'fulltext-backup'",
-                change,
-                "XA END 'fulltext-backup'",
-                "XA PREPARE 'fulltext-backup'",
+                format!("XA START '{xid}'"),
+                change.replace("docs", table),
+                format!("XA END '{xid}'"),
+                format!("XA PREPARE '{xid}'"),
             ] {
-                source.execute_with_session(&mut xa, sql).unwrap();
+                source.execute_with_session(&mut xa, &sql).unwrap();
             }
-            let coordinator = Coordinator::get(source.db_handle()).unwrap();
-            let repository = root.path().join("repository");
-            let base = job(&coordinator, coordinator.backup(&repository).unwrap())
-                .base_id
-                .unwrap();
+        }
+        let coordinator = Coordinator::get(source.db_handle()).unwrap();
+        let repository = root.path().join("repository");
+        let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+            .base_id
+            .unwrap();
+        for (_, _, xid) in &cases {
             source
-                .execute(if commit {
-                    "XA COMMIT 'fulltext-backup'"
-                } else {
-                    "XA ROLLBACK 'fulltext-backup'"
-                })
+                .execute(&format!(
+                    "XA {} '{xid}'",
+                    if commit { "COMMIT" } else { "ROLLBACK" }
+                ))
                 .unwrap();
-            for reopen in 0..2 {
-                let runtime = root.path().join(format!("runtime-{reopen}"));
-                let reader = super::open_base(&repository, &base, &runtime).unwrap();
-                let query = StorageQueryEngine::open_backup_image(
-                    reader.data_dir.clone(),
-                    runtime,
-                    Default::default(),
-                    Arc::new(crate::engine::session_registry::SessionRegistry::new()),
-                    vec![],
-                )
-                .unwrap();
+        }
+        for reopen in 0..2 {
+            let runtime = root.path().join(format!("runtime-{reopen}"));
+            let reader = super::open_base(&repository, &base, &runtime).unwrap();
+            let query = StorageQueryEngine::open_backup_image(
+                reader.data_dir.clone(),
+                runtime,
+                Default::default(),
+                Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+                vec![],
+            )
+            .unwrap();
+            for (table, _, _) in &cases {
+                let query_rows = |sql: &str| rows(&query, &sql.replace("docs", table));
                 assert_eq!(
-                    rows(&query, "SELECT id,body FROM docs ORDER BY id")[0][1],
+                    query_rows("SELECT id,body FROM docs ORDER BY id")[0][1],
                     Value::String("backup database".into())
                 );
-                let scored = rows(
-                    &query,
+                let scored = query_rows(
                     "SELECT id,MATCH(body) AGAINST('database') AS score FROM docs ORDER BY id",
                 );
                 assert_eq!(scored.len(), 3);
@@ -151,23 +166,19 @@ fn sealed_fulltext_reads_prepared_xa_visible_rows_and_scores() {
                 );
                 for term in ["'database'", "'+data*' IN BOOLEAN MODE"] {
                     assert_eq!(
-                        rows(
-                            &query,
-                            &format!(
-                                "SELECT id FROM docs WHERE MATCH(body) AGAINST({term}) ORDER BY id"
-                            )
-                        ),
+                        query_rows(&format!(
+                            "SELECT id FROM docs WHERE MATCH(body) AGAINST({term}) ORDER BY id"
+                        )),
                         vec![vec![Value::Int(1)], vec![Value::Int(2)]]
                     );
                 }
-                assert_eq!(rows(&query, "SELECT id FROM docs WHERE MATCH(body) AGAINST('\"backup database\"' IN BOOLEAN MODE)"), vec![vec![Value::Int(1)]]);
-                assert!(rows(
-                    &query,
+                assert_eq!(query_rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('\"backup database\"' IN BOOLEAN MODE)"), vec![vec![Value::Int(1)]]);
+                assert!(query_rows(
                     "SELECT id FROM docs WHERE MATCH(body) AGAINST('prepared uncommitted')"
                 )
                 .is_empty());
                 let mut session = crate::engine::SessionContext::default();
-                query.execute_with_session(&mut session, "PREPARE score FROM 'SELECT id,MATCH(body) AGAINST(?) AS score FROM docs ORDER BY id'").unwrap();
+                query.execute_with_session(&mut session, &format!("PREPARE score FROM 'SELECT id,MATCH(body) AGAINST(?) AS score FROM {table} ORDER BY id'")).unwrap();
                 query
                     .execute_with_session(&mut session, "SET @term='database'")
                     .unwrap();
@@ -181,15 +192,18 @@ fn sealed_fulltext_reads_prepared_xa_visible_rows_and_scores() {
                 query
                     .execute_with_session(&mut session, "DEALLOCATE PREPARE score")
                     .unwrap();
-                assert!(query.execute("UPDATE docs SET body='forbidden'").is_err());
-                query.shutdown().unwrap();
-                drop(query);
-                native::verify(&reader.data_dir).unwrap();
+                assert!(query
+                    .execute(&format!("UPDATE {table} SET body='forbidden'"))
+                    .is_err());
             }
-            discard_source(source, coordinator);
+            query.shutdown().unwrap();
+            drop(query);
+            native::verify(&reader.data_dir).unwrap();
         }
+        discard_source(source, coordinator);
     }
 }
+
 #[test]
 fn typed_sql_rejects_retired_duplicate_and_unknown_options() {
     for sql in ["BACKUP DATABASE TO 'file:///tmp/mydb/repo'","BACKUP WAL TO 'file:///tmp/mydb/repo'","ALTER MYDB BACKUP TO 'file:///tmp/mydb/repo' SET WAL_ARCHIVE=MANUAL,MAX_PENDING_WAL_BYTES=1024","ALTER MYDB BACKUP TO 'file:///tmp/mydb/repo' SET WAL_ARCHIVE=DISABLED,DISCARD_PENDING=TRUE","SHOW MYDB BACKUP STATUS","SHOW MYDB BACKUP JOBS","SHOW MYDB BACKUPS FROM 'file:///tmp/mydb/repo'","CANCEL MYDB BACKUP 'job-id'"]{assert!(matches!(crate::parser::parse_statement(sql).unwrap(),Statement::BackupAdmin{..}),"{sql}");}
@@ -1347,129 +1361,170 @@ fn source_restart_restores_protected_history_policy_and_rejects_memory_mode() {
 
 #[test]
 fn prepared_vectors_survive_sealing_local_decisions_and_interrupted_rebuilds() {
-    fn copy_image(source: &Path, target: &Path) {
-        fs::create_dir_all(target).unwrap();
-        for entry in fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let target = target.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_image(&entry.path(), &target);
-            } else {
-                crate::util::file::copy_fixture_file(&entry.path(), &target).unwrap();
-            }
-        }
-    }
-
     std::env::set_var("MYDB_HNSW_BRUTE_THRESHOLD", "0");
     std::env::set_var("MYDB_HNSW_BRUTE_FILTER_ROWS", "0");
+    let root = root();
+    let sync = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
+    let source = engine(&root.path().join("source"));
+    let mut cases = Vec::new();
     // Three nodes and exhaustive effort isolate MVCC from approximate recall.
-    for (change, committed_id) in [
-        ("UPDATE v SET emb='[100000,0,0]' WHERE id=1", 2),
-        ("UPDATE v SET emb='[0,0,0]' WHERE id=3", 3),
-        ("DELETE FROM v WHERE id=1", 2),
-        ("INSERT INTO v VALUES(4,'[0,0,0]')", 4),
-    ] {
-        let root = root();
-        let sync = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
-        let source = engine(&root.path().join("source"));
+    for (kind, committed_id) in [(0, 2), (1, 3), (2, 2), (3, 4)] {
+        let name = format!("v_{kind}");
         source
-            .execute("CREATE TABLE v(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)")
+            .execute(&format!(
+                "CREATE TABLE {name}(id INT PRIMARY KEY,emb VECTOR(3) NOT NULL)"
+            ))
             .unwrap();
         source
-            .execute("INSERT INTO v VALUES(1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')")
+            .execute(&format!(
+                "INSERT INTO {name} VALUES(1,'[10,0,0]'),(2,'[20,0,0]'),(3,'[30,0,0]')"
+            ))
             .unwrap();
         source
-            .execute("CREATE INDEX vi ON v(emb) USING HNSW")
+            .execute(&format!("CREATE INDEX vi ON {name}(emb) USING HNSW"))
             .unwrap();
-        let query =
-            "SELECT /*+ HNSW_EF(1024) */ id FROM v ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1";
-        assert_eq!(rows(&source, query)[0][0], Value::Int(1));
-        let mut xa = crate::engine::SessionContext::default();
-        for sql in [
-            "XA START 'vector-snapshot'",
-            change,
-            "XA END 'vector-snapshot'",
-            "XA PREPARE 'vector-snapshot'",
-        ] {
-            source.execute_with_session(&mut xa, sql).unwrap();
-        }
-        assert_eq!(rows(&source, query)[0][0], Value::Int(1));
-        let repository = root.path().join("repo");
-        let c = Coordinator::get(source.db_handle()).unwrap();
-        let base = job(&c, c.backup(&repository).unwrap()).base_id.unwrap();
-        // Restore the identical base once, then give every decision/crash
-        // combination a private image. The assertions below still open,
-        // validate, promote and recover each image through the real paths.
-        let template = root.path().join("restored-template");
-        super::restore::restore(
-            &repository,
-            Some(&base),
-            None,
-            Target::Base,
-            &template,
-            None,
-            false,
-        )
-        .unwrap();
-        let image = engine(&template);
-        assert_eq!(rows(&image, query)[0][0], Value::Int(1), "{change}");
-        let xid = crate::xa::Xid::new(1, b"vector-snapshot".to_vec(), vec![]).unwrap();
-        assert!(image.db_handle().commit_prepared(&xid).is_err());
-        assert!(image.db_handle().rollback_prepared(&xid).is_err());
-        image.shutdown().unwrap();
-        drop(image);
-        sync.finish().unwrap();
-        for commit in [false, true] {
-            for interrupt in [false, true] {
-                let target = root.path().join(format!("restore-{commit}-{interrupt}"));
-                copy_image(&template, &target);
-                native::promote(&target).unwrap();
-                let writable = engine(&target);
-                assert_eq!(rows(&writable, query)[0][0], Value::Int(1));
-                if interrupt {
-                    writable.db_handle().test_interrupt_vector_completion();
-                }
-                let result = writable.execute(if commit {
-                    "XA COMMIT 'vector-snapshot'"
-                } else {
-                    "XA ROLLBACK 'vector-snapshot'"
-                });
-                if interrupt {
-                    assert!(result.is_err());
-                    assert!(fs::read_dir(target.join("system/vector-completion"))
-                        .unwrap()
-                        .next()
-                        .is_some());
-                } else {
-                    result.unwrap();
-                    assert_eq!(
-                        rows(&writable, query)[0][0],
-                        Value::Int(if commit { committed_id } else { 1 }),
-                        "{change}"
-                    );
-                }
-                // Reopen directly from the durable XA decision/intent. A
-                // graceful-shutdown checkpoint would hide recovery defects
-                // and repeat the completion path's own checkpoint.
-                drop(writable);
-                let reopened = engine(&target);
-                assert_eq!(
-                    rows(&reopened, query)[0][0],
-                    Value::Int(if commit { committed_id } else { 1 }),
-                    "{change}; commit={commit}; interrupt={interrupt}"
-                );
-                assert!(fs::read_dir(target.join("system/vector-completion"))
-                    .unwrap()
-                    .next()
-                    .is_none());
-                // Recovery and its assertions are complete. Discarding this
-                // private image needs no additional checkpoint for a reopen.
-                drop(reopened);
-            }
-        }
-        source.execute("XA ROLLBACK 'vector-snapshot'").unwrap();
-        c.shutdown().unwrap();
+        let query = format!(
+            "SELECT /*+ HNSW_EF(1024) */ id FROM {name} ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1"
+        );
+        assert_eq!(rows(&source, &query)[0][0], Value::Int(1));
+        let change = match kind {
+            0 => format!("UPDATE {name} SET emb='[100000,0,0]' WHERE id=1"),
+            1 => format!("UPDATE {name} SET emb='[0,0,0]' WHERE id=3"),
+            2 => format!("DELETE FROM {name} WHERE id=1"),
+            _ => format!("INSERT INTO {name} VALUES(4,'[0,0,0]')"),
+        };
+        cases.push((name, change, query, committed_id));
     }
+    let mut xa = crate::engine::SessionContext::default();
+    source
+        .execute_with_session(&mut xa, "XA START 'vector-snapshot'")
+        .unwrap();
+    for (_, change, _, _) in &cases {
+        source.execute_with_session(&mut xa, change).unwrap();
+    }
+    source
+        .execute_with_session(&mut xa, "XA END 'vector-snapshot'")
+        .unwrap();
+    source
+        .execute_with_session(&mut xa, "XA PREPARE 'vector-snapshot'")
+        .unwrap();
+    for (_, _, query, _) in &cases {
+        assert_eq!(rows(&source, query)[0][0], Value::Int(1));
+    }
+    let repository = root.path().join("repo");
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let base = job(&c, c.backup(&repository).unwrap()).base_id.unwrap();
+    let template = root.path().join("restored-template");
+    super::restore::restore(
+        &repository,
+        Some(&base),
+        None,
+        Target::Base,
+        &template,
+        None,
+        false,
+    )
+    .unwrap();
+    let image = engine(&template);
+    for (_, _, query, _) in &cases {
+        assert_eq!(rows(&image, query)[0][0], Value::Int(1));
+    }
+    let xid = crate::xa::Xid::new(1, b"vector-snapshot".to_vec(), vec![]).unwrap();
+    assert!(image.db_handle().commit_prepared(&xid).is_err());
+    assert!(image.db_handle().rollback_prepared(&xid).is_err());
+    image.shutdown().unwrap();
+    drop(image);
+    sync.finish().unwrap();
+    let assert_state = |db: &StorageQueryEngine, commit: bool| {
+        for (name, _, query, committed_id) in &cases {
+            let id = if commit { *committed_id } else { 1 };
+            assert_eq!(
+                rows(db, query)[0][0],
+                Value::Int(id),
+                "{name}; commit={commit}"
+            );
+            // Check the index itself so an executor underfill fallback cannot
+            // conceal a missing typed mutation in the shared decision.
+            let handle = db.db_handle();
+            let table = handle.table(name).unwrap();
+            let index = table
+                .indexes
+                .iter()
+                .find(|index| index.is_vector())
+                .unwrap();
+            let graph = handle.vector_graph_get_or_build(&table, index).unwrap();
+            let query = crate::engine::vector::codec::parse_text("[0,0,0]").unwrap();
+            let result = graph
+                .search(
+                    &query,
+                    crate::engine::vector::VectorSearchRequest {
+                        candidate_limit: 1,
+                        rerank_limit: 1,
+                        effort: crate::engine::vector::VectorSearchEffort::Hnsw { ef: 1024 },
+                    },
+                )
+                .unwrap();
+            let expected = handle
+                .scan_rows(
+                    &table.qualified_name(),
+                    crate::storage::TxnView::read_only(
+                        u64::MAX,
+                        crate::storage::IsolationLevel::ReadCommitted,
+                    ),
+                )
+                .unwrap()
+                .into_iter()
+                .find(|row| row.values.first() == Some(&Value::Int(id)))
+                .unwrap()
+                .row_id;
+            assert_eq!(
+                result.candidates[0].0, expected,
+                "raw index {name}; commit={commit}"
+            );
+        }
+    };
+    for commit in [false, true] {
+        for interrupt in [false, true] {
+            let target = root.path().join(format!("restore-{commit}-{interrupt}"));
+            crate::util::file::copy_fixture_tree(&template, &target).unwrap();
+            native::promote(&target).unwrap();
+            let writable = engine(&target);
+            for (_, _, query, _) in &cases {
+                assert_eq!(rows(&writable, query)[0][0], Value::Int(1));
+            }
+            if interrupt {
+                writable.db_handle().test_interrupt_vector_completion();
+            }
+            let result = writable.execute(if commit {
+                "XA COMMIT 'vector-snapshot'"
+            } else {
+                "XA ROLLBACK 'vector-snapshot'"
+            });
+            if interrupt {
+                assert!(result.is_err());
+                assert_eq!(
+                    fs::read_dir(target.join("system/vector-completion"))
+                        .unwrap()
+                        .count(),
+                    cases.len(),
+                    "every affected index table needs a completion intent"
+                );
+            } else {
+                result.unwrap();
+                assert_state(&writable, commit);
+            }
+            drop(writable);
+            let reopened = engine(&target);
+            assert_state(&reopened, commit);
+            assert!(fs::read_dir(target.join("system/vector-completion"))
+                .unwrap()
+                .next()
+                .is_none());
+            drop(reopened);
+        }
+    }
+    source.execute("XA ROLLBACK 'vector-snapshot'").unwrap();
+    c.shutdown().unwrap();
 }
 
 #[test]
@@ -1722,62 +1777,62 @@ fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds(
             )))
             .collect(),
     );
+    let assert_index = |db: &StorageQueryEngine, sql: &str, index: &str| {
+        let QueryResponse::ResultSet(plan) = db.execute(&format!("EXPLAIN {sql}")).unwrap() else {
+            panic!("expected EXPLAIN rows")
+        };
+        let key = plan
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case("key"))
+            .unwrap();
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row[key].to_display_string() == index),
+            "{index}: {:?}",
+            plan.rows
+        );
+    };
     for backend in ["memory", "paged"] {
         std::env::set_var("MYDB_VECTOR_STORAGE", backend);
-        let mut cases = Vec::new();
+        let root = root();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
+        let source = engine(&root.path().join("source"));
+        let mut inputs = Vec::new();
+        let mut fixtures = Vec::new();
         for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
-            for algorithm in ["HNSW", "IVF"] {
-                cases.push((datatype, algorithm, "none"));
-            }
-        }
-        for quantization in ["sq8", "sq4", "pq", "bq"] {
-            for algorithm in ["HNSW", "IVF"] {
-                cases.push(("FLOAT32", algorithm, quantization));
-            }
-        }
-        for (datatype, algorithm, quantization) in cases {
-            eprintln!("backup persistence case {backend}/{datatype}/{algorithm}/{quantization}");
-            let root = root();
-            let source = engine(&root.path().join("source"));
+            let table = format!("docs_{}", datatype.to_ascii_lowercase());
             let binary = datatype == "BINARY";
             let dim = if binary { 128 } else { 4 };
             let metric = if binary { "HAMMING" } else { "L2" };
+            // Every vector index remains beyond twenty ordinary indexes.
+            // Independent algorithms/codecs share immutable typed input and
+            // fulltext state; FORCE INDEX and EXPLAIN pin every vector case.
             let indexes = (0..20)
                 .map(|i| format!(",INDEX ordinary_{i}(extra)"))
                 .collect::<String>();
-            source.execute(&format!("CREATE TABLE docs(id INT PRIMARY KEY,extra INT,body TEXT,v VECTOR({dim},{datatype}) NOT NULL,FULLTEXT KEY ft(body){indexes})")).unwrap();
-            let literal = |id: usize| {
-                if binary {
-                    format!(
-                        "[{}]",
-                        (0..128)
-                            .map(|bit| if bit < id { "1" } else { "0" })
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
-                } else {
-                    format!("[{id},1,2,3]")
-                }
-            };
-            for id in 1..=20 {
-                source
-                    .execute(&format!(
-                        "INSERT INTO docs VALUES({id},{id},'database baseline','{}')",
-                        literal(id)
-                    ))
-                    .unwrap();
-            }
-            let options = if algorithm == "HNSW" {
-                "m=4,ef_construction=32,ef_search=128"
-            } else {
-                "nlist=2,nprobe=2"
-            };
-            let quant = if quantization == "pq" {
-                "quantization=pq,pq_m=2,pq_bits=4".to_owned()
-            } else {
-                format!("quantization={quantization}")
-            };
-            source.execute(&format!("CREATE INDEX vx ON docs(v) USING {algorithm} WITH(metric={metric},{options},{quant})")).unwrap();
+            source.execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY,extra INT,body TEXT,v VECTOR({dim},{datatype}) NOT NULL,FULLTEXT KEY ft(body){indexes})")).unwrap();
+            let values = (1..=20)
+                .map(|id| {
+                    let vector = if binary {
+                        format!(
+                            "[{}]",
+                            (0..128)
+                                .map(|bit| if bit < id { "1" } else { "0" })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    } else {
+                        format!("[{id},1,2,3]")
+                    };
+                    format!("({id},{id},'database baseline','{vector}')")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            source
+                .execute(&format!("INSERT INTO {table} VALUES {values}"))
+                .unwrap();
             let zero = format!(
                 "[{}]",
                 std::iter::repeat_n("0", dim).collect::<Vec<_>>().join(",")
@@ -1787,92 +1842,153 @@ fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds(
             } else {
                 format!("TO_VECTOR('{zero}')")
             };
-            let tail = format!(
-                "id,DISTANCE(v,{query_vector},'{metric}') d,body FROM docs ORDER BY d,id LIMIT 20"
-            );
-            let sql = format!("SELECT {tail}");
-            let expected_base = rows(&source, &sql);
-            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
-            let repository = root.path().join("repo");
-            let coordinator = Coordinator::get(source.db_handle()).unwrap();
-            coordinator
-                .configure(&repository, Policy::Manual, false, None)
-                .unwrap();
-            let base = job(&coordinator, coordinator.backup(&repository).unwrap())
-                .base_id
-                .unwrap();
-            let base_dir = root.path().join("base");
-            super::restore::restore(
-                &repository,
-                Some(&base),
-                None,
-                Target::Base,
-                &base_dir,
-                None,
-                false,
-            )
+            let quantizations: &[&str] = if datatype == "FLOAT32" {
+                &["none", "sq8", "sq4", "pq", "bq"]
+            } else {
+                &["none"]
+            };
+            for algorithm in ["HNSW", "IVF"] {
+                for &quantization in quantizations {
+                    let index = format!("vx_{}_{quantization}", algorithm.to_ascii_lowercase());
+                    let options = if algorithm == "HNSW" {
+                        "m=4,ef_construction=32,ef_search=128"
+                    } else {
+                        "nlist=2,nprobe=2"
+                    };
+                    let quant = if quantization == "pq" {
+                        "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+                    } else {
+                        format!("quantization={quantization}")
+                    };
+                    source.execute(&format!("CREATE INDEX {index} ON {table}(v) USING {algorithm} WITH(metric={metric},{options},{quant})")).unwrap();
+                    let projection = format!("id,DISTANCE(v,{query_vector},'{metric}') d,body");
+                    let sql = format!("SELECT {projection} FROM {table} FORCE INDEX({index}) ORDER BY d,id LIMIT 20");
+                    let oracle = format!("SELECT /*+ NO_VECTOR_INDEX */ {projection} FROM {table} ORDER BY d,id LIMIT 20");
+                    let expected_base = rows(&source, &oracle);
+                    assert_index(&source, &sql, &index);
+                    assert_eq!(
+                        rows(&source, &sql),
+                        expected_base,
+                        "source {backend}/{table}/{index}"
+                    );
+                    fixtures.push((table.clone(), index, sql, oracle, expected_base));
+                }
+            }
+            inputs.push((table, zero));
+        }
+        assert_eq!(fixtures.len(), 18);
+        preparation.finish().unwrap();
+        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+        let repository = root.path().join("repo");
+        let coordinator = Coordinator::get(source.db_handle()).unwrap();
+        coordinator
+            .configure(&repository, Policy::Manual, false, None)
             .unwrap();
-            let baseline = engine(&base_dir);
-            assert_eq!(rows(&baseline, &sql), expected_base);
-            drop(baseline);
-            assert_eq!(crate::storage::Database::vector_build_heap_scans_for_test(),scans,"base sealing or reading reconstructed {backend}/{datatype}/{algorithm}/{quantization}");
+        let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+            .base_id
+            .unwrap();
+        let base_dir = root.path().join("base");
+        super::restore::restore(
+            &repository,
+            Some(&base),
+            None,
+            Target::Base,
+            &base_dir,
+            None,
+            false,
+        )
+        .unwrap();
+        let baseline = engine(&base_dir);
+        for (table, index, sql, _, expected_base) in &fixtures {
+            assert_index(&baseline, sql, index);
+            assert_eq!(
+                rows(&baseline, sql),
+                *expected_base,
+                "base {backend}/{table}/{index}"
+            );
+        }
+        drop(baseline);
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans,
+            "base sealing or reading reconstructed {backend} indexes"
+        );
+        // Keep separate committed UPDATE/DELETE/INSERT phases. Each DML now
+        // maintains all independent indexes on its typed table simultaneously.
+        for (table, zero) in &inputs {
             source
                 .execute(&format!(
-                    "UPDATE docs SET v='{zero}',body='database updateddelta' WHERE id=20"
+                    "UPDATE {table} SET v='{zero}',body='database updateddelta' WHERE id=20"
                 ))
                 .unwrap();
-            source.execute("DELETE FROM docs WHERE id=1").unwrap();
+            source
+                .execute(&format!("DELETE FROM {table} WHERE id=1"))
+                .unwrap();
             source
                 .execute(&format!(
-                    "INSERT INTO docs VALUES(999,999,'database archiveddelta','{zero}')"
+                    "INSERT INTO {table} VALUES(999,999,'database archiveddelta','{zero}')"
                 ))
                 .unwrap();
-            let expected = rows(&source, &sql);
+        }
+        let expected_rows = fixtures
+            .iter()
+            .map(|(table, index, sql, oracle, _)| {
+                let expected = rows(&source, oracle);
+                assert_eq!(
+                    rows(&source, sql),
+                    expected,
+                    "source DML {backend}/{table}/{index}"
+                );
+                expected
+            })
+            .collect::<Vec<_>>();
+        let receipt = job(&coordinator, coordinator.backup_wal(&repository).unwrap());
+        let target = root.path().join("pitr");
+        super::restore::restore(
+            &repository,
+            Some(&base),
+            None,
+            Target::Lsn(receipt.requested_lsn),
+            &target,
+            None,
+            false,
+        )
+        .unwrap();
+        let restored = engine(&target);
+        for ((table, index, sql, _, _), expected) in fixtures.iter().zip(expected_rows) {
+            assert_index(&restored, sql, index);
             assert_eq!(
+                rows(&restored, sql),
                 expected,
-                rows(&source, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}"))
+                "PITR {backend}/{table}/{index}"
             );
-            let receipt = job(&coordinator, coordinator.backup_wal(&repository).unwrap());
-            let target = root.path().join("pitr");
-            super::restore::restore(
-                &repository,
-                Some(&base),
-                None,
-                Target::Lsn(receipt.requested_lsn),
-                &target,
-                None,
-                false,
-            )
-            .unwrap();
-            let restored = engine(&target);
+        }
+        for (table, _) in &inputs {
             assert_eq!(
-                rows(&restored, &sql),
-                expected,
-                "PITR {backend}/{datatype}/{algorithm}/{quantization}"
+                rows(
+                    &restored,
+                    &format!("SELECT id FROM {table} WHERE MATCH(body) AGAINST('updateddelta')")
+                ),
+                vec![vec![Value::Int(20)]],
+                "{backend}/{table}"
             );
             assert_eq!(
                 rows(
                     &restored,
-                    "SELECT id FROM docs WHERE MATCH(body) AGAINST('updateddelta')"
+                    &format!("SELECT id FROM {table} WHERE MATCH(body) AGAINST('archiveddelta')")
                 ),
-                vec![vec![Value::Int(20)]]
-            );
-            assert_eq!(
-                rows(
-                    &restored,
-                    "SELECT id FROM docs WHERE MATCH(body) AGAINST('archiveddelta')"
-                ),
-                vec![vec![Value::Int(999)]]
-            );
-            assert_eq!(
-                crate::storage::Database::vector_build_heap_scans_for_test(),
-                scans,
-                "PITR reconstructed {backend}/{datatype}/{algorithm}/{quantization}"
+                vec![vec![Value::Int(999)]],
+                "{backend}/{table}"
             );
             assert!(rows(&restored, "SHOW WARNINGS").is_empty());
-            drop(restored);
-            discard_source(source, coordinator);
         }
+        assert_eq!(
+            crate::storage::Database::vector_build_heap_scans_for_test(),
+            scans,
+            "PITR reconstructed {backend} indexes"
+        );
+        drop(restored);
+        discard_source(source, coordinator);
     }
 }
 
@@ -1882,24 +1998,29 @@ fn resident_vector_seals_keep_source_lsn_for_prepared_future_decisions() {
     std::env::set_var("MYDB_VECTOR_STORAGE", "memory");
     std::env::set_var("MYDB_HNSW_BRUTE_THRESHOLD", "0");
     std::env::set_var("MYDB_HNSW_BRUTE_FILTER_ROWS", "0");
+    let root = root();
+    let preparation = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
+    let source = engine(&root.path().join("source"));
+    let mut names = Vec::new();
     for (datatype, algorithm, quantization) in [
         ("FLOAT32", "HNSW", "none"),
         ("FLOAT16", "HNSW", "none"),
         ("FLOAT32", "IVF", "none"),
         ("FLOAT32", "HNSW", "pq"),
     ] {
-        let root = root();
-        let source = engine(&root.path().join("source"));
+        let name = format!("docs_{datatype}_{algorithm}_{quantization}");
         source
             .execute(&format!(
-                "CREATE TABLE docs(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
+                "CREATE TABLE {name}(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
             ))
             .unwrap();
-        for id in 1..=20 {
-            source
-                .execute(&format!("INSERT INTO docs VALUES({id},'[{id},1,2,3]')"))
-                .unwrap();
-        }
+        let values = (1..=20)
+            .map(|id| format!("({id},'[{id},1,2,3]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        source
+            .execute(&format!("INSERT INTO {name} VALUES {values}"))
+            .unwrap();
         let options = if algorithm == "HNSW" {
             "m=4,ef_construction=32,ef_search=128"
         } else {
@@ -1912,80 +2033,98 @@ fn resident_vector_seals_keep_source_lsn_for_prepared_future_decisions() {
         };
         source
             .execute(&format!(
-                "CREATE INDEX vx ON docs(v) USING {algorithm} WITH({options},{quant})"
+                "CREATE INDEX vx ON {name}(v) USING {algorithm} WITH({options},{quant})"
             ))
             .unwrap();
-        let mut session = crate::engine::SessionContext::default();
-        for sql in [
-            "XA START 'future-index-decision'",
-            "INSERT INTO docs VALUES(999,'[0,0,0,0]')",
-            "XA END 'future-index-decision'",
-            "XA PREPARE 'future-index-decision'",
-        ] {
-            source.execute_with_session(&mut session, sql).unwrap();
-        }
-        let scans = crate::storage::Database::vector_build_heap_scans_for_test();
-        let repo = root.path().join("repo");
-        let coordinator = Coordinator::get(source.db_handle()).unwrap();
-        coordinator
-            .configure(&repo, Policy::Manual, false, None)
-            .unwrap();
-        let base = job(&coordinator, coordinator.backup(&repo).unwrap())
-            .base_id
-            .unwrap();
-        let baseline = root.path().join("baseline");
-        super::restore::restore(
-            &repo,
-            Some(&base),
-            None,
-            Target::Base,
-            &baseline,
-            None,
-            false,
-        )
+        names.push(name);
+    }
+    preparation.finish().unwrap();
+    let mut session = crate::engine::SessionContext::default();
+    source
+        .execute_with_session(&mut session, "XA START 'future-index-decision'")
         .unwrap();
-        let image = native::verify(&baseline).unwrap();
-        for file in image
-            .manifest
-            .files
-            .iter()
-            .filter(|file| file.path.ends_with(".hnsw"))
-        {
-            let bytes = fs::read(baseline.join(&file.path)).unwrap();
-            assert_eq!(&bytes[..8], b"MYDBIDX2");
-            let covered = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-            assert!(covered<=image.manifest.end_lsn,"{datatype}/{algorithm}/{quantization}: local seal position {covered} exceeded source end {}",image.manifest.end_lsn);
-        }
-        source.execute("XA COMMIT 'future-index-decision'").unwrap();
-        let receipt = job(&coordinator, coordinator.backup_wal(&repo).unwrap());
-        let target = root.path().join("decision");
-        super::restore::restore(
-            &repo,
-            Some(&base),
-            None,
-            Target::Lsn(receipt.requested_lsn),
-            &target,
-            None,
-            false,
-        )
+    for name in &names {
+        source
+            .execute_with_session(
+                &mut session,
+                &format!("INSERT INTO {name} VALUES(999,'[0,0,0,0]')"),
+            )
+            .unwrap();
+    }
+    source
+        .execute_with_session(&mut session, "XA END 'future-index-decision'")
         .unwrap();
-        let restored = engine(&target);
+    source
+        .execute_with_session(&mut session, "XA PREPARE 'future-index-decision'")
+        .unwrap();
+    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+    let repo = root.path().join("repo");
+    let coordinator = Coordinator::get(source.db_handle()).unwrap();
+    coordinator
+        .configure(&repo, Policy::Manual, false, None)
+        .unwrap();
+    let base = job(&coordinator, coordinator.backup(&repo).unwrap())
+        .base_id
+        .unwrap();
+    let baseline = root.path().join("baseline");
+    super::restore::restore(
+        &repo,
+        Some(&base),
+        None,
+        Target::Base,
+        &baseline,
+        None,
+        false,
+    )
+    .unwrap();
+    let image = native::verify(&baseline).unwrap();
+    for file in image
+        .manifest
+        .files
+        .iter()
+        .filter(|file| file.path.ends_with(".hnsw"))
+    {
+        let bytes = fs::read(baseline.join(&file.path)).unwrap();
+        assert_eq!(&bytes[..8], b"MYDBIDX2");
+        let covered = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        assert!(
+            covered <= image.manifest.end_lsn,
+            "{}: local seal position {covered} exceeded source end {}",
+            file.path,
+            image.manifest.end_lsn
+        );
+    }
+    source.execute("XA COMMIT 'future-index-decision'").unwrap();
+    let receipt = job(&coordinator, coordinator.backup_wal(&repo).unwrap());
+    let target = root.path().join("decision");
+    super::restore::restore(
+        &repo,
+        Some(&base),
+        None,
+        Target::Lsn(receipt.requested_lsn),
+        &target,
+        None,
+        false,
+    )
+    .unwrap();
+    let restored = engine(&target);
+    for name in &names {
         assert_eq!(
             rows(
                 &restored,
-                "SELECT id FROM docs ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1"
+                &format!("SELECT id FROM {name} ORDER BY DISTANCE(v,'[0,0,0,0]') LIMIT 1")
             ),
             vec![vec![Value::Int(999)]],
-            "{datatype}/{algorithm}/{quantization}"
+            "{name}"
         );
         assert_eq!(
             crate::storage::Database::vector_build_heap_scans_for_test(),
             scans
         );
         assert!(rows(&restored, "SHOW WARNINGS").is_empty());
-        drop(restored);
-        discard_source(source, coordinator);
     }
+    drop(restored);
+    discard_source(source, coordinator);
     if let Some(prior) = prior {
         std::env::set_var("MYDB_VECTOR_STORAGE", prior);
     } else {

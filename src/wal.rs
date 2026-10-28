@@ -6900,11 +6900,11 @@ fn sync_wal_file_with(file: &std::fs::File, method: WalSyncMethod) -> Result<(),
 
 #[cfg(target_os = "macos")]
 fn sync_wal_file_with(file: &std::fs::File, method: WalSyncMethod) -> Result<(), QueryError> {
-    #[cfg(test)]
     if method == WalSyncMethod::Fullfsync {
-        if let Some(result) = crate::platform::fs::try_fixture_sync_file(file) {
+        if let Some(result) = crate::platform::fs::try_private_sync_file(file) {
             return result.map_err(io_err);
         }
+        return crate::platform::fs::sync_full_file(file).map_err(io_err);
     }
     let fd = file.as_raw_fd();
     let rc = match method {

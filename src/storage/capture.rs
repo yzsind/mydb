@@ -277,7 +277,9 @@ impl CaptureState {
                 .open(&temp)
                 .map_err(|e| err(e.to_string()))?;
             file.write_all(&bytes)
-                .and_then(|_| file.sync_all())
+                .and_then(|_| {
+                    crate::platform::fs::sync_standard_before_atomic_rename_at(&file, &temp)
+                })
                 .map_err(|e| err(e.to_string()))?;
         }
         std::fs::rename(&temp, &self.path).map_err(|e| err(e.to_string()))?;
@@ -291,7 +293,9 @@ impl CaptureState {
                 .open(&marker)
                 .map_err(|e| err(e.to_string()))?;
             file.write_all(b"MYDB_WAL_LEASES/1")
-                .and_then(|_| file.sync_all())
+                .and_then(|_| {
+                    crate::platform::fs::sync_standard_before_atomic_rename_at(&file, &marker)
+                })
                 .map_err(|e| err(e.to_string()))?;
             crate::platform::fs::sync_path(parent).map_err(|e| err(e.to_string()))?;
         }

@@ -236,7 +236,7 @@ impl Database {
                 .open(&tmp)
                 .map_err(io_err)?;
             file.write_all(&bytes).map_err(io_err)?;
-            file.sync_all().map_err(io_err)?;
+            crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
         }
         fs::rename(&tmp, &path).map_err(io_err)?;
         #[cfg(test)]

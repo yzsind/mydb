@@ -623,8 +623,6 @@ fn recover_from_wal_with_options(
                 true,
             )
             .map_err(io_err)?;
-            crate::platform::fs::sync_path(pending_path.parent().expect("system directory"))
-                .map_err(io_err)?;
         }
         // Ordinary crash losers without a rolled-back savepoint need no
         // predecessor index. Keep the additional memory proportional to the
@@ -3116,7 +3114,7 @@ pub(crate) fn redo_vector_image(
     file.write_all(bytes).map_err(io_err)?;
     if offset + bytes.len() as u64 == total {
         file.set_len(total).map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
+        crate::platform::fs::sync_standard_file_at(&file, &incoming).map_err(io_err)?;
         drop(file);
         invalidate_recovery_page_io(data_dir, relative);
         fs::rename(&incoming, &path).map_err(io_err)?;
@@ -3132,7 +3130,7 @@ pub(crate) fn persist_vector_image_receipt(path: &Path, lsn: u64) -> Result<(), 
     bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
     let mut file = fs::File::create(&tmp).map_err(io_err)?;
     file.write_all(&bytes).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
     fs::rename(&tmp, &receipt).map_err(io_err)?;
     crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }
@@ -3159,7 +3157,7 @@ pub(crate) fn redo_vector_manifest(data_dir: &Path, relative: &str, bytes: &[u8]
     let tmp = path.with_extension("vmanifest.incoming");
     let mut file = fs::File::create(&tmp).map_err(io_err)?;
     file.write_all(bytes).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
     fs::rename(tmp, &path).map_err(io_err)?;
     crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }

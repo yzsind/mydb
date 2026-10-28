@@ -9,6 +9,7 @@ fn serial_insert_lock_oracle() -> bool {
 thread_local! {
     static HEAP_BATCH_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static HEAP_BATCH_HEADER_SLOTS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // Share the forwarding-aware scan without adding a callback layer to the
@@ -1431,6 +1432,8 @@ impl HeapFile {
         row_ids: &[RowId],
         out: &mut Vec<CachedMvccHeaderRead>,
     ) -> Result<(), QueryError> {
+        #[cfg(test)]
+        HEAP_BATCH_HEADER_SLOTS_READ.with(|count| count.set(count.get() + row_ids.len()));
         out.clear();
         if row_ids.is_empty() {
             return Ok(());

@@ -467,6 +467,11 @@ pub(super) fn finish(
             "MYDB_NATIVE_TEST_MEMORY_LIMIT",
             crate::engine::executor::mem_budget::effective_memory_limit_bytes().to_string(),
         );
+    #[cfg(test)]
+    match crate::util::env::var_os("MYDB_NATIVE_TEST_FAIL_PRIVATE_SYNC") {
+        Some(value) => command.env("MYDB_NATIVE_TEST_FAIL_PRIVATE_SYNC", value),
+        None => command.env_remove("MYDB_NATIVE_TEST_FAIL_PRIVATE_SYNC"),
+    };
     // Inherited service configuration must not turn an isolated preparation
     // into a replica/archiver or redirect it to the source instance.
     command.env_remove("MYDB_BACKUP_REPOSITORY");
@@ -621,6 +626,11 @@ pub fn prepare_directory(path: &Path) -> Result<(), QueryError> {
     }
     let _directory_lock = crate::storage::dir_lock::DataDirLock::acquire(path)?;
     validate_inventory(path, &snapshot)?;
+    // The preparation process owns this unpublished tree exclusively. Local
+    // redo, index reconstruction and checkpoint writes need ordering here;
+    // one complete device barrier precedes the queryable completion marker.
+    let private_sync = crate::platform::fs::PrivateTreeSyncBatch::new(path)
+        .map_err(|err| io_err("start private image sync batch", err))?;
     crate::wal::persist_source_clock(path, snapshot.manifest.end_commit_unix_us)?;
     let original =
         crate::wal::LogManager::scan_replay_with_mode(path, crate::wal::WalReadMode::Strict)?;
@@ -773,6 +783,11 @@ pub fn prepare_directory(path: &Path) -> Result<(), QueryError> {
     snapshot.manifest.completed_unix_ms = now_ms();
     // Data first, completion marker last. Staging remains private until the parent publishes it.
     sync_tree(path)?;
+    #[cfg(test)]
+    super::faults::hit("native_private_sync", path)?;
+    private_sync
+        .finish()
+        .map_err(|err| io_err("sync prepared image device", err))?;
     snapshot.state = State::ReadOnly;
     write_snapshot(path, &snapshot)?;
     sync_dir(path)
@@ -786,6 +801,9 @@ mod tests {
     #[test]
     fn prepare_worker_entry() {
         if let Some(path) = std::env::var_os("MYDB_NATIVE_TEST_PREPARE") {
+            if std::env::var_os("MYDB_NATIVE_TEST_FAIL_PRIVATE_SYNC").is_some() {
+                super::super::faults::fail("native_private_sync", std::path::Path::new(&path));
+            }
             if let Ok(limit) = std::env::var("MYDB_NATIVE_TEST_MEMORY_LIMIT") {
                 let limit = limit.parse().unwrap();
                 crate::engine::executor::mem_budget::with_test_effective_memory_limit(
@@ -798,6 +816,64 @@ mod tests {
                 super::prepare_directory(std::path::Path::new(&path)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn prepared_image_barrier_failure_cannot_publish_snapshot() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
+        let source = StorageQueryEngine::open(root.path().join("source")).unwrap();
+        source
+            .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+            .unwrap();
+        source.execute("INSERT INTO t VALUES(7)").unwrap();
+        preparation.finish().unwrap();
+        let failed = root.path().join("failed");
+        let error = crate::util::env::with_vars(
+            &[("MYDB_NATIVE_TEST_FAIL_PRIVATE_SYNC", Some("1"))],
+            || {
+                create_backup(
+                    source.db_handle(),
+                    &BackupRequest {
+                        repository: failed.clone(),
+                    },
+                    &random_uuid(),
+                    &AtomicBool::new(false),
+                    |_, _, _| {},
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message().contains("injected native_private_sync"),
+            "{error:?}"
+        );
+        assert!(!failed.exists(), "failed barrier published a snapshot");
+        assert!(source.db_handle().capture.floor().is_none());
+        assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".mydb-native-")));
+        let retry = root.path().join("retry");
+        create_backup(
+            source.db_handle(),
+            &BackupRequest {
+                repository: retry.clone(),
+            },
+            &random_uuid(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(verify(&retry).unwrap().state, State::ReadOnly);
+        let image = StorageQueryEngine::open(&retry).unwrap();
+        let QueryResponse::ResultSet(rows) = image.execute("SELECT id FROM t").unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows.rows, vec![vec![Value::Int(7)]]);
+        drop(image);
+        source.shutdown().unwrap();
     }
 
     #[test]

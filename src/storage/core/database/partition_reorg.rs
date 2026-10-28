@@ -945,9 +945,6 @@ impl Database {
             self.config.durability != DurabilityMode::Memory,
         )
         .map_err(io_err)?;
-        if self.config.durability != DurabilityMode::Memory {
-            crate::platform::fs::sync_path(&dir).map_err(io_err)?;
-        }
         Ok(path)
     }
 

@@ -3,80 +3,109 @@ use super::*;
 
 #[test]
 fn vector_audit_duplicate_cluster_preserves_distinct_directions() {
-    for (metric, distance) in [
+    let metrics = [
         ("l2", "L2_DISTANCE"),
         ("cosine", "COSINE_DISTANCE"),
         ("dot", "MAX_INNER_PRODUCT_DISTANCE"),
+    ];
+    for (backend, mode, incremental) in [
+        ("memory", "auto", false),
+        ("memory", "auto", true),
+        ("paged", "auto", false),
+        ("paged", "chunked", false),
+        ("paged", "auto", true),
     ] {
-        for (backend, mode, incremental) in [
-            ("memory", "auto", false),
-            ("memory", "auto", true),
-            ("paged", "auto", false),
-            ("paged", "chunked", false),
-            ("paged", "auto", true),
-        ] {
-            let _env = HnswEnv::set(&[
-                ("MYDB_VECTOR_STORAGE", backend),
-                ("MYDB_HNSW_BULK_MODE", mode),
-                ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-                ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
-            ]);
-            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-            let engine = open_strict_test_engine(dir.path());
-            engine
-                .execute("CREATE TABLE audit_dup(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
-                .unwrap();
-            let create =
-                format!("CREATE INDEX vi ON audit_dup(v) USING HNSW WITH(metric={metric})");
-            if incremental {
-                engine.execute(&create).unwrap();
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BULK_MODE", mode),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE audit_dup(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+            .unwrap();
+        // Keep the full duplicate cluster, all build modes and construction
+        // budgets. Three independent metric indexes share their input heap;
+        // incremental cases still maintain each graph in twelve insert batches.
+        let create = || {
+            for (metric, _) in metrics {
+                engine.execute(&format!("CREATE INDEX vi_{metric} ON audit_dup(v) USING HNSW WITH(metric={metric},m=8,ef_construction=64)")).unwrap();
             }
-            for start in (0..2400).step_by(200) {
-                let values = (start..start + 200)
-                    .map(|id| {
-                        let vector = if id < 2280 {
-                            "1,0,0,0".into()
-                        } else {
-                            format!("0,{},{},{}", 50 + id % 40, 51 + id % 30, 52 + id % 20)
-                        };
-                        format!("({id},'[{vector}]')")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                engine
-                    .execute(&format!("INSERT INTO audit_dup VALUES{values}"))
+        };
+        if incremental {
+            create();
+        }
+        for start in (0..2400).step_by(200) {
+            let values = (start..start + 200)
+                .map(|id| {
+                    let vector = if id < 2280 {
+                        "1,0,0,0".into()
+                    } else {
+                        format!("0,{},{},{}", 50 + id % 40, 51 + id % 30, 52 + id % 20)
+                    };
+                    format!("({id},'[{vector}]')")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            engine
+                .execute(&format!("INSERT INTO audit_dup VALUES{values}"))
+                .unwrap();
+        }
+        if !incremental {
+            create();
+        }
+        preparation.finish().unwrap();
+        let mut session = SessionContext::default();
+        engine
+            .execute_with_session(&mut session, "SET mydb_hnsw_ef_search=256")
+            .unwrap();
+        engine
+            .execute_with_session(&mut session, "SET mydb_hnsw_ef_dynamic_factor=0")
+            .unwrap();
+        let check = |engine: &StorageQueryEngine, session: &mut SessionContext, stage: &str| {
+            for (metric, distance) in metrics {
+                let index = format!("vi_{metric}");
+                let query = format!("SELECT id FROM audit_dup FORCE INDEX({index}) ORDER BY {distance}(v,'[0,60,60,60]') LIMIT 100");
+                let QueryResponse::ResultSet(plan) = engine
+                    .execute_with_session(session, &format!("EXPLAIN {query}"))
+                    .unwrap()
+                else {
+                    panic!("expected EXPLAIN rows")
+                };
+                let key = plan
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case("key"))
                     .unwrap();
-            }
-            if !incremental {
-                engine.execute(&create).unwrap();
-            }
-            let mut session = SessionContext::default();
-            engine
-                .execute_with_session(&mut session, "SET mydb_hnsw_ef_search=256")
-                .unwrap();
-            engine
-                .execute_with_session(&mut session, "SET mydb_hnsw_ef_dynamic_factor=0")
-                .unwrap();
-            let query =
-                format!("SELECT id FROM audit_dup ORDER BY {distance}(v,'[0,60,60,60]') LIMIT 100");
-            for rebuilt in [false, true] {
-                if rebuilt {
-                    engine.execute("OPTIMIZE TABLE audit_dup").unwrap();
-                }
-                let found = id_list_session(&engine, &mut session, &query);
-                assert_eq!(found.len(), 100);
+                assert!(
+                    plan.rows
+                        .iter()
+                        .any(|row| row[key].to_display_string() == index),
+                    "{index}: {:?}",
+                    plan.rows
+                );
+                let found = id_list_session(engine, session, &query);
+                assert_eq!(
+                    found.len(),
+                    100,
+                    "{backend}/{mode}/{incremental}/{metric}/{stage}"
+                );
                 assert!(
                     found.iter().all(|&id| id >= 2280),
-                    "{backend}/{mode}/{incremental}/{rebuilt}: {found:?}"
+                    "{backend}/{mode}/{incremental}/{metric}/{stage}: {found:?}"
                 );
             }
-            engine.checkpoint().unwrap();
-            drop(engine);
-            let engine = open_strict_test_engine(dir.path());
-            assert!(id_list_session(&engine, &mut session, &query)
-                .iter()
-                .all(|&id| id >= 2280));
-        }
+        };
+        check(&engine, &mut session, "initial");
+        engine.execute("OPTIMIZE TABLE audit_dup").unwrap();
+        check(&engine, &mut session, "rebuilt");
+        engine.checkpoint().unwrap();
+        drop(engine);
+        let engine = open_strict_test_engine(dir.path());
+        check(&engine, &mut session, "reopened");
     }
 }
 

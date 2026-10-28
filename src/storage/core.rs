@@ -874,6 +874,7 @@ enum CachedMvccRead {
 /// Cheaper sibling of [`CachedMvccRead`] that carries only the row's
 /// MVCC header. Returned by the buffered fast path that index-only
 /// scans use to test visibility without paying for value decoding.
+#[derive(Clone, Copy)]
 pub(crate) enum CachedMvccHeaderRead {
     Hit(RowHeader),
     /// Page not in the buffer pool, or the row needs forwarding/piece

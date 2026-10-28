@@ -94,9 +94,16 @@ struct RecoveryDirtyFiles {
 impl RecoveryDirtyFiles {
     fn sync(&mut self) -> Result<(), QueryError> {
         let mut directories = BTreeSet::new();
+        #[cfg(target_os = "macos")]
+        let mut files = crate::platform::fs::DeviceSyncBatch::new();
         for path in &self.paths {
             match File::open(path) {
-                Ok(file) => file.sync_data().map_err(io_err)?,
+                Ok(file) => {
+                    #[cfg(target_os = "macos")]
+                    files.sync_file(file, path).map_err(io_err)?;
+                    #[cfg(not(target_os = "macos"))]
+                    file.sync_data().map_err(io_err)?;
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(io_err(err)),
             }
@@ -108,6 +115,8 @@ impl RecoveryDirtyFiles {
                 parent = dir.parent();
             }
         }
+        #[cfg(target_os = "macos")]
+        files.finish().map_err(io_err)?;
         let _admission = crate::engine::executor::mem_budget::StorageLatchAdmissionScope::enter();
         self.directories.lock().add(directories)?;
         self.paths.clear();
