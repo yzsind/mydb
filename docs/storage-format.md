@@ -11,8 +11,8 @@ versions, see [`storage-format-versions.md`](storage-format-versions.md).
 
 - mydb currently uses fixed `16 KiB` data pages; except for the in-row value of `BIT(M)`, multi-byte scalars are
   little-endian.
-- The Catalog, user heaps, LOBs, the WAL, and the still-required undo are correctness data; Zone Maps, in-memory
-  R-trees, and query caches are not sources of truth for correctness.
+- The Catalog, user heaps, LOBs, the WAL, and the still-required undo are correctness data; Zone Maps
+  and query caches are not sources of truth for correctness. Spatial R-trees are persistent indexes.
 - Both ordinary and vector indexes store a `RowId` pointing into the heap; they are not clustered indexes. The executor must go back to the heap/MVCC to verify visibility; approximate vector indexes must additionally re-rank with the exact vectors stored in the heap.
 - This is the first product version. On format version mismatch the system explicitly refuses to open; it never silently migrates an old directory.
 - SQL object names play no part in the paths of ordinary persistent objects. Stable table/index IDs and the physical generation determine paths, so `RENAME TABLE` and `RENAME INDEX` do not move the bulk data files.
@@ -89,7 +89,7 @@ objects, but their lifecycles and recovery semantics differ.
 | `.idx` | Persistent index | Rebuildable from the Catalog definition and the heap; constraint enforcement must still preserve semantics |
 | `.hvec` / `.hnsw` | Vector candidate structures | Rebuild/degrade when not finalized, missing, or incompatible |
 | `.zm` | Conservative page-pruning sidecar | Fall back to a heap scan when missing, corrupted, stale, or short of memory |
-| In-memory R-tree | Spatial candidate cache | Rebuilt from the persistent MBR BTREE |
+| Persistent R-tree | Spatial MBR index | WAL-backed 16 KiB pages, read through the buffer pool |
 | `history-index.v1` | Historical old-key accelerator | Once degraded, fall back to heap/undo; correctness is unaffected |
 | `mysql.innodb_dynamic_metadata` | AUTO_INCREMENT checkpoint baseline | Recovered by merging with compact redo; `version` isolates resets |
 | Sequence state | `mysql.sequence_values` catalog heap | Complete WAL reservations, checkpoint materialization and native replay |
@@ -203,7 +203,9 @@ and decimal keys, and two-column integer keys, can use a page-level compact layo
 
 - FULLTEXT reuses BTREE with the key `String(token), Bytes(posting-payload)`; the payload uses
   unsigned LEB128 to store `doc_len`, `tf`, and optional position deltas.
-- The persistent source of truth for SPATIAL is the MBR BTREE; the in-memory R-tree is only a governor-managed derived cache, and candidates are finally
+- SPATIAL uses independent `.rtree` files containing persistent MBR tree pages. Compressed
+  `SpatialPageBatch` records recover structural changes and replicate the same pages.
+  Backup images include these files; startup never rebuilds them. Candidates are
   re-verified by the exact geometry predicate over the heap.
 - Neither ordinary BTREEs nor the primary key are clustered indexes; an index-only scan still judges visibility via the heap MVCC header,
   and the leaf's `page_max_trx_id` only provides a safe short-circuit.

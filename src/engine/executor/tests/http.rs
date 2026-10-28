@@ -245,6 +245,126 @@ fn echo(v: &Json) -> Json {
 }
 
 #[test]
+fn http_audit_source_free_explain_analyze_executes_once() {
+    let m = Mock::new();
+    let dir = temp();
+    let e = open_test_engine(dir.path());
+    let u = m.url("/echo");
+    for format in ["", "FORMAT=TREE ", "FORMAT=JSON ", "FORMAT=TRADITIONAL "] {
+        for from in ["", " FROM DUAL"] {
+            let target = format!("SELECT HTTP_GET('{u}'){from}");
+            let before = m.count();
+            rows(&e, &format!("EXPLAIN {format}{target}"));
+            assert_eq!(m.count(), before);
+            let result = rows(&e, &format!("EXPLAIN ANALYZE {format}{target}"));
+            assert_eq!(m.count(), before + 1, "format={format}, from={from}");
+            if format == "FORMAT=TRADITIONAL " {
+                assert_eq!(result[0].len(), 17);
+                assert_eq!(result[0][16], Value::Int(1));
+            } else if format == "FORMAT=JSON " {
+                let Value::String(text) = &result[0][0] else {
+                    panic!("expected JSON plan")
+                };
+                let plan: Json = serde_json::from_str(text).unwrap();
+                assert_eq!(plan["query_block"]["execution"]["rows_total"], 1);
+            } else {
+                let Value::String(text) = &result[0][0] else {
+                    panic!("expected tree plan")
+                };
+                assert!(text.contains("actual time="), "{text}");
+                assert!(text.contains("rows=1 loops=1"), "{text}");
+            }
+        }
+    }
+    let before = m.count();
+    rows(
+        &e,
+        &format!("EXPLAIN ANALYZE SELECT HTTP_GET('{u}') WHERE 0"),
+    );
+    rows(
+        &e,
+        &format!("EXPLAIN ANALYZE SELECT CASE WHEN 0 THEN HTTP_GET('{u}') ELSE 1 END"),
+    );
+    assert_eq!(m.count(), before);
+    let err = e
+        .execute("EXPLAIN ANALYZE SELECT HTTP_GET('file:///invalid')")
+        .unwrap_err();
+    assert!(
+        err.is(crate::error::catalog::ER_HTTP_INVALID_ARGUMENT),
+        "{err}"
+    );
+}
+
+#[test]
+fn http_audit_query_objects_have_deterministic_order_and_arrays_keep_order() {
+    let m = Mock::new();
+    let dir = temp();
+    let e = open_test_engine(dir.path());
+    let opts = r#"'{"query":{"zebra":"1","alpha":["second","first"]},"headers":{"z-last":"z","a-first":["second","first"]}}'"#;
+    let v = response(
+        &e,
+        &format!("SELECT HTTP_GET('{}',{opts})", m.url("/echo?z=0&a=1")),
+    );
+    assert_eq!(
+        echo(&v)["path"],
+        "/echo?z=0&a=1&alpha=second&alpha=first&zebra=1"
+    );
+    assert_eq!(echo(&v)["headers"]["a-first"], json!(["second", "first"]));
+    let v = response(
+        &e,
+        &format!(
+            "SELECT HTTP_GET('{}')",
+            m.url("/echo?zebra=1&alpha=2&zebra=3")
+        ),
+    );
+    assert_eq!(echo(&v)["path"], "/echo?zebra=1&alpha=2&zebra=3");
+}
+
+#[test]
+fn http_audit_rate_exhaustion_fails_fast_without_sending() {
+    let m = Mock::new();
+    let dir = temp();
+    let e = open_test_engine(dir.path());
+    let policy = dir.path().join("rate-policy.json");
+    std::fs::write(&policy, r#"{"version":1,"user_limits":[{"user":"rate_user","host":"localhost","requests_per_minute":2}]}"#).unwrap();
+    e.execute("CREATE USER 'rate_user'@'localhost' IDENTIFIED BY 'x'")
+        .unwrap();
+    e.execute("GRANT HTTP_USE ON *.* TO 'rate_user'@'localhost'")
+        .unwrap();
+    let mut s = SessionContext::default();
+    s.current_database = "test".into();
+    s.user = "rate_user".into();
+    s.login_user = "rate_user".into();
+    s.authenticated_as = crate::engine::auth::AccountKey::new("rate_user", "localhost");
+    s.current_user_is_system = false;
+    s.internal_system_session = false;
+    crate::util::env::with_vars(
+        &[("MYDB_HTTP_LOCAL_CONFIG", Some(policy.to_str().unwrap()))],
+        || {
+            let sql = format!("SELECT HTTP_GET('{}')", m.url("/echo"));
+            for _ in 0..2 {
+                e.execute_with_session(&mut s, &sql)
+                    .unwrap()
+                    .materialize()
+                    .unwrap();
+            }
+            assert_eq!(m.count(), 2);
+            for mode in ["raise", "return"] {
+                let began = std::time::Instant::now();
+                let err = e.execute_with_session(&mut s, &format!("SELECT HTTP_GET('{}','{{\"timeout_ms\":1500,\"on_error\":\"{mode}\"}}')", m.url("/echo"))).unwrap_err();
+                assert_eq!(err.symbol(), Some("ER_HTTP_RATE_LIMITED"), "{err}");
+                assert!(began.elapsed() < Duration::from_millis(750));
+                assert_eq!(m.count(), 2);
+                e.execute_with_session(&mut s, "SELECT 1").unwrap();
+            }
+            // An exhausted account does not prevent an unrestricted account from sending.
+            response(&e, &sql);
+            assert_eq!(m.count(), 3);
+        },
+    );
+}
+
+#[test]
 fn http_methods_payloads_and_response_contract() {
     let m = Mock::new();
     let dir = temp();

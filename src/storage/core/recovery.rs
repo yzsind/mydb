@@ -540,6 +540,12 @@ fn recover_from_wal_with_options(
         };
         log.lock().set_local_recovery(context.is_restore());
         set_recovery_undo_log(&log);
+        // Spatial compensation reads through its own bounded buffer pool.
+        // Make the completed redo prefix coherent before opening those files.
+        _recovery_io.finish()?;
+        let mut spatial_pool: Option<Arc<BufferPool>> = None;
+        let mut spatial_files = BTreeMap::<String, spatial_index::SpatialIndexFile>::new();
+        let mut spatial_incarnations = BTreeMap::<String, u64>::new();
         let mut last_by_txn = HashMap::new();
         let pending_path = data_dir.join("system/recovery-indexes.pending");
         let mut pending_indexes: BTreeSet<String> = if pending_path.try_exists().map_err(io_err)? {
@@ -552,6 +558,24 @@ fn recover_from_wal_with_options(
         let mut skipped_by_txn: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
         for record_index in 0..scan.records.len() {
             let header = scan.records.header(record_index)?;
+            if header.txn_id == 0 || committed.contains(&header.txn_id) {
+                use crate::wal::WalRecordType as T;
+                if matches!(header.record_type, T::FileCreate | T::FileDelete) {
+                    if let Some(path) = scan.records.redo_path(record_index)? {
+                        if path.ends_with(".rtree") {
+                            spatial_incarnations.insert(path.into_owned(), header.lsn);
+                        }
+                    }
+                } else if header.record_type == T::DdlCommit {
+                    if let WalPayload::DdlCommit { retired_paths, .. } =
+                        &scan.records.record(record_index)?.payload
+                    {
+                        for path in retired_paths.iter().filter(|p| p.ends_with(".rtree")) {
+                            spatial_incarnations.insert(path.clone(), header.lsn);
+                        }
+                    }
+                }
+            }
             if !losers.contains(&header.txn_id) {
                 continue;
             }
@@ -679,6 +703,70 @@ fn recover_from_wal_with_options(
                     format!("corrupt WAL undo chain at LSN {lsn}: expected transaction {txn_id}, found {}, predecessor {}", record.txn_id, record.prev_txn_lsn)));
             }
             match &record.payload {
+                WalPayload::SpatialIndexUndo { path, bytes } => {
+                    if !spatial_incarnations
+                        .get(path)
+                        .is_some_and(|floor| record.lsn < *floor)
+                    {
+                        if !path.ends_with(".rtree")
+                            || Path::new(path).is_absolute()
+                            || path.split('/').any(|p| p == "..")
+                        {
+                            return Err(error(
+                                crate::error::catalog::ER_INDEX_CORRUPT,
+                                "invalid spatial undo path",
+                            ));
+                        }
+                        if !spatial_files.contains_key(path) {
+                            if spatial_files.len() >= 64 {
+                                if let Some((_, file)) = spatial_files.pop_first() {
+                                    file.flush()?;
+                                }
+                            }
+                            let pool = spatial_pool
+                                .get_or_insert_with(|| {
+                                    BufferPool::new(
+                                        64,
+                                        log.clone(),
+                                        DurabilityMode::Strict,
+                                        Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+                                    )
+                                })
+                                .clone();
+                            let file = spatial_index::SpatialIndexFile::open(
+                                data_dir.join(path),
+                                log.clone(),
+                                DurabilityMode::Strict,
+                                pool,
+                                false,
+                            )?;
+                            spatial_files.insert(path.clone(), file);
+                        }
+                        spatial_files
+                            .get(path)
+                            .expect("opened spatial undo file")
+                            .apply(0, spatial_index::decode_inverse(bytes)?)?;
+                    }
+                    log.lock().append(
+                        txn_id,
+                        WalPayload::SpatialIndexClr {
+                            undo_next_lsn: record.prev_txn_lsn,
+                        },
+                    )?;
+                }
+                WalPayload::SpatialIndexClr { undo_next_lsn } => {
+                    if *undo_next_lsn >= record.lsn {
+                        return Err(error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "corrupt spatial compensation cursor",
+                        ));
+                    }
+                    if *undo_next_lsn != 0 {
+                        undo_queue.push((*undo_next_lsn, txn_id));
+                    }
+                    continue;
+                }
+
                 WalPayload::PageUpdate {
                     path,
                     page_id,
@@ -884,6 +972,9 @@ fn recover_from_wal_with_options(
             if record.prev_txn_lsn != 0 {
                 undo_queue.push((record.prev_txn_lsn, txn_id));
             }
+        }
+        for file in spatial_files.values() {
+            file.flush()?;
         }
         let mut end_lsn = 0;
         for txn_id in losers {
@@ -1153,7 +1244,15 @@ fn apply_redo_record_inner(
     state: &mut RedoState,
 ) -> Result<(), QueryError> {
     match &record.payload {
-        WalPayload::VectorIndexManifest { path, bytes } if should_redo_record(record, redoable, redo_cutoff) => {
+        WalPayload::SpatialPageBatch { path, bytes }
+            if should_redo_record(record, redoable, redo_cutoff) =>
+        {
+            spatial_index::redo(data_dir, path, bytes, record.lsn)?;
+            state.redone_records += 1;
+        }
+        WalPayload::VectorIndexManifest { path, bytes }
+            if should_redo_record(record, redoable, redo_cutoff) =>
+        {
             redo_vector_manifest(data_dir, path, bytes)?;
             state.redone_records += 1;
         }

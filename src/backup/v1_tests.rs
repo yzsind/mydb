@@ -1992,3 +1992,60 @@ fn resident_vector_seals_keep_source_lsn_for_prepared_future_decisions() {
         std::env::remove_var("MYDB_VECTOR_STORAGE");
     }
 }
+
+#[test]
+fn spatial_index_backup_restore_and_immutable_queries_keep_tree_pages() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source.execute("CREATE TABLE spatial_backup(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+    source.execute("INSERT INTO spatial_backup VALUES(1,ST_GeomFromText('POINT(1 1)')),(2,ST_GeomFromText('POINT(20 20)'))").unwrap();
+    let query="SELECT id FROM spatial_backup FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)')) ORDER BY id";
+    let expected = rows(&source, query);
+    let mut xa = crate::engine::SessionContext::default();
+    for sql in [
+        "XA START 'spatial-backup'",
+        "UPDATE spatial_backup SET g=ST_GeomFromText('POINT(40 40)') WHERE id=1",
+        "XA END 'spatial-backup'",
+        "XA PREPARE 'spatial-backup'",
+    ] {
+        source.execute_with_session(&mut xa, sql).unwrap();
+    }
+    let coordinator = Coordinator::get(source.db_handle()).unwrap();
+    let repository = root.path().join("repository");
+    let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+        .base_id
+        .unwrap();
+    source.execute("XA ROLLBACK 'spatial-backup'").unwrap();
+    source
+        .execute("UPDATE spatial_backup SET g=ST_GeomFromText('POINT(30 30)') WHERE id=1")
+        .unwrap();
+    let runtime = root.path().join("runtime");
+    let reader = super::open_base(&repository, &base, &runtime).unwrap();
+    let backup = StorageQueryEngine::open_backup_image(
+        reader.data_dir.clone(),
+        runtime,
+        Default::default(),
+        Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(rows(&backup, query), expected);
+    backup.shutdown().unwrap();
+    drop(backup);
+    let restored = root.path().join("restored");
+    super::restore::restore(
+        &repository,
+        Some(&base),
+        None,
+        Target::Base,
+        &restored,
+        None,
+        false,
+    )
+    .unwrap();
+    let backup = engine(&restored);
+    assert_eq!(rows(&backup, query), expected);
+    backup.shutdown().unwrap();
+    drop(backup);
+    discard_source(source, coordinator);
+}

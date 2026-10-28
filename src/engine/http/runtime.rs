@@ -151,7 +151,16 @@ async fn acquire(d: &Dispatch) -> Result<Permit, Failure> {
             }
             u.updated = now;
             u.last = now;
-            if global && u.inflight < d.user_inflight && d.rpm.is_none_or(|_| u.tokens >= 1.0) {
+            if d.rpm.is_some() && u.tokens < 1.0 {
+                return Err(hard(
+                    error(
+                        "ER_HTTP_RATE_LIMITED",
+                        "HTTP account request rate exhausted",
+                    ),
+                    "admission",
+                ));
+            }
+            if global && u.inflight < d.user_inflight {
                 if d.rpm.is_some() {
                     u.tokens -= 1.0;
                 }
@@ -955,4 +964,95 @@ async fn admit_owned_session(
 pub(crate) struct SessionPermit {
     _account: tokio::sync::OwnedSemaphorePermit,
     _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_admission_refills_tokens_and_releases_capacity_waits() {
+        std::fs::create_dir_all("/tmp/mydb/http-functions").unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("admission-")
+            .tempdir_in("/tmp/mydb/http-functions")
+            .unwrap();
+        let mut storage = crate::storage::StorageConfig::from_env();
+        storage.durability = crate::storage::DurabilityMode::Memory;
+        storage.buffer_pool_pages = 512;
+        let db = Arc::new(Database::open_with_config(dir.path(), storage).unwrap());
+        let auth = crate::engine::api::SessionContext::default().authorization_context();
+        let principal = format!("rate-refill-{}", Arc::as_ptr(&db) as usize);
+        let d = Dispatch {
+            control: control(&db).unwrap(),
+            db,
+            auth,
+            policy: config::load().unwrap(),
+            effects: Arc::new(scope::Effects::default()),
+            limits: Limits::load().unwrap(),
+            principal: principal.clone(),
+            user_inflight: 1,
+            rpm: Some(2),
+            calls: 100,
+            switch: config::switch_generation(),
+            token: None,
+            aborted: Arc::new(AtomicBool::new(false)),
+        };
+        // Advance only the bucket's accounting time, avoiding a 30-second test.
+        let now = Instant::now();
+        gate().lock().unwrap().users.insert(
+            principal.clone(),
+            UserGate {
+                inflight: 0,
+                tokens: 0.0,
+                updated: now - Duration::from_secs(31),
+                last: now,
+            },
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let permit = acquire(&d).await.unwrap_or_else(|f| panic!("{}", f.error));
+            let failure = match acquire(&d).await {
+                Err(f) => f,
+                Ok(_) => panic!("refill must not restore the full initial burst"),
+            };
+            assert!(failure
+                .error
+                .is(crate::error::catalog::ER_HTTP_RATE_LIMITED));
+            assert!(!failure.returnable);
+            assert!(!failure.ambiguous);
+            assert_eq!(d.effects.attempts.load(Ordering::Acquire), 0);
+            drop(permit);
+            {
+                let mut g = gate().lock().unwrap();
+                assert_eq!(g.waiting, 0);
+                assert_eq!(g.inflight, 0);
+                let user = g.users.get_mut(&principal).unwrap();
+                user.tokens = 2.0;
+                user.updated = Instant::now();
+            }
+            let first = acquire(&d).await.unwrap_or_else(|f| panic!("{}", f.error));
+            // A token remains, so the concurrency gate must wait rather than
+            // report a rate error or consume the remaining token while queued.
+            assert!(tokio::time::timeout(Duration::from_millis(30), acquire(&d))
+                .await
+                .is_err());
+            {
+                let g = gate().lock().unwrap();
+                assert_eq!(g.waiting, 0);
+                assert_eq!(g.inflight, 1);
+                assert!(g.users[&principal].tokens >= 1.0);
+            }
+            drop(first);
+            let second = acquire(&d).await.unwrap_or_else(|f| panic!("{}", f.error));
+            drop(second);
+        });
+        let mut g = gate().lock().unwrap();
+        assert_eq!(g.waiting, 0);
+        assert_eq!(g.inflight, 0);
+        assert_eq!(g.users.remove(&principal).unwrap().inflight, 0);
+    }
 }

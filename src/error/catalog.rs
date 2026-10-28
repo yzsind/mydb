@@ -399,3 +399,6 @@ pub const ER_HTTP_REPLAY_FORBIDDEN: ErrorSpec = ErrorSpec::new(
     *b"HY000",
     "ER_HTTP_REPLAY_FORBIDDEN",
 );
+
+pub const ER_HTTP_RATE_LIMITED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50114, *b"HY000", "ER_HTTP_RATE_LIMITED");

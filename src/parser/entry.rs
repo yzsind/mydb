@@ -1705,7 +1705,9 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
         let (sql, create_index_fulltext) = rewrite_sql_with(sql, |sql| {
             strip_create_index_fulltext(sql, prescan.has_fulltext)
         });
+        let (sql, create_index_spatial) = rewrite_sql_with(sql, strip_create_index_spatial);
         let post_parse = PostParseState {
+            create_index_spatial,
             ddl_query_hints,
             ddl_hint_warnings,
             window_frame_exclusions,

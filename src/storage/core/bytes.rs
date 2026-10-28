@@ -39,6 +39,7 @@ pub(crate) fn backup_page_valid(buf: &[u8]) -> bool {
                 read_u32(buf, 0),
                 HEAP_PAGE_MAGIC
                     | INDEX_PAGE_MAGIC
+                    | spatial_index::MAGIC
                     | INDEX_META_MAGIC
                     | OVFL_MAGIC
                     | VEC_META_MAGIC
@@ -52,7 +53,11 @@ fn refresh_page_checksum(buf: &mut [u8]) {
         return;
     }
     let offset = match read_u32(buf, 0) {
-        HEAP_PAGE_MAGIC | INDEX_PAGE_MAGIC | INDEX_META_MAGIC | OVFL_MAGIC => 16,
+        HEAP_PAGE_MAGIC
+        | INDEX_PAGE_MAGIC
+        | spatial_index::MAGIC
+        | INDEX_META_MAGIC
+        | OVFL_MAGIC => 16,
         VEC_META_MAGIC | VEC_NODE_MAGIC => 16,
         zone_map_page::MAGIC => 16,
         _ => return,
@@ -68,7 +73,11 @@ fn set_page_lsn_if_formatted(buf: &mut [u8], lsn: u64) {
         return;
     }
     match read_u32(buf, 0) {
-        HEAP_PAGE_MAGIC | INDEX_PAGE_MAGIC | INDEX_META_MAGIC | OVFL_MAGIC => {
+        HEAP_PAGE_MAGIC
+        | INDEX_PAGE_MAGIC
+        | spatial_index::MAGIC
+        | INDEX_META_MAGIC
+        | OVFL_MAGIC => {
             set_page_lsn(buf, lsn);
             refresh_page_checksum(buf);
         }

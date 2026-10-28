@@ -151,7 +151,7 @@ production-grade MySQL replacement.
 | B-tree (including unique, composite, covering INCLUDE, prefix, descending, functional/expression, and invisible indexes) | ✅/➕ |
 | JSON multi-valued index | ✅ |
 | FULLTEXT (BM25 + boolean mode) | ✅ |
-| SPATIAL (MBR B-tree + derived R-tree) | ✅ |
+| SPATIAL (persistent R-tree) | ✅ |
 | HNSW vector index (`USING HNSW`) | ➕ see [§9](#9-vector-search) |
 | IVF vector index (`USING IVF`) | ➕ see [§9](#9-vector-search) |
 
@@ -678,7 +678,7 @@ The compatibility baseline is fixed at MySQL 8.0.46. mydb supports 111
 official function names and aliases, supports the single `SRID + WKB`
 storage/protocol format, column-level `SRID n`, strict Geometry coercion,
 5152 SRS entries and 47 unit metadata entries, the `ST_Collect` aggregate, and
-persistent MBR B-trees with a derived R-tree cache. Planar area, length, and
+page-backed persistent R-trees with WAL recovery and physical replication. Planar area, length, and
 distance use the project's pure-Rust kernels;
 `ST_Buffer_Strategy` tokens match MySQL's 12-byte format. Geographic
 area/length/distance, polygon set operations, and Buffer without a reliable
@@ -687,8 +687,7 @@ pure-Rust implementation return clear errors — no silent degradation.
 "Registered" here does not mean every input shape is accepted. Still missing
 are SRS DDL/dynamic privileges and DD persistence, full EPSG projection
 transforms, complete geographic/axis-order semantics, all Geometry combinations
-for set operations, `ST_Collect` window/native vector channels, incremental
-background R-trees, and full compatibility coverage. GIS is
+for set operations, `ST_Collect` window/native vector channels, and full compatibility coverage. GIS is
 therefore not yet marked "fully compatible". See [Spatial Functions](function/spatial/README.md)
 for function-specific input restrictions and errors.
 

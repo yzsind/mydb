@@ -1114,7 +1114,8 @@ impl Database {
             // Raw index walks are only candidates. Remember repair state while
             // writers are drained; certification below also drains writers and
             // verifies the *unconsumed* transaction-qualified capture logs.
-            let merge_allowed = validation.columns.is_empty() && !self.has_pending_index_repairs();
+            let merge_allowed = validation.columns.is_empty()
+                && !self.constraint_merge_has_repairs(validation, &targets);
             let snapshot = self.begin_read_only_txn()?;
             let _snapshot_pin = self.register_statement_snapshot(snapshot.snapshot_scn);
             validation.watermark = Some(snapshot);
@@ -1160,7 +1161,7 @@ impl Database {
                     hold = Some(ConstraintHoldTimer(Instant::now()));
                     self.try_online_index_data_barrier_mode(lock_txn.txn_id, &ids, true)?;
                     if constraint_capture_is_empty(&jobs)?
-                        && !self.has_pending_index_repairs()
+                        && !self.constraint_merge_has_repairs(validation, &targets)
                         && targets.iter().all(|target| {
                             let log = target.log.state.lock();
                             !log.failed && log.entries.is_empty()

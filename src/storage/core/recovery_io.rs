@@ -240,6 +240,7 @@ fn recovery_page_valid(bytes: &[u8]) -> bool {
             read_u32(bytes, 0),
             HEAP_PAGE_MAGIC
                 | INDEX_PAGE_MAGIC
+                | spatial_index::MAGIC
                 | INDEX_META_MAGIC
                 | OVFL_MAGIC
                 | VEC_META_MAGIC

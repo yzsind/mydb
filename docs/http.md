@@ -41,8 +41,8 @@ return errors.
 
 | Option | Type and behavior |
 | --- | --- |
-| `headers` | Object mapping names to strings or arrays of strings. Arrays preserve repeated fields. |
-| `query` | Object mapping names to strings or arrays of strings. Values are URL encoded and appended to the original query string. |
+| `headers` | Object mapping names to strings or arrays of strings. Arrays preserve repeated-field value order; wire order between different names is unspecified. |
+| `query` | Object mapping names to strings or arrays of strings. Keys are processed in lexicographic order; each array preserves value order. Values are URL encoded and appended to the original query string. |
 | `body` | Raw UTF-8 string. |
 | `json` | Any JSON value, including JSON null. Serialized as JSON. |
 | `body_base64` | Standard padded Base64 representing arbitrary bytes. |
@@ -71,6 +71,11 @@ Each multipart part has `name` and exactly one of `text` or `base64`, with
 optional `filename` and `content_type`. Filenames are metadata; mydb never
 opens a server file for an HTTP upload.
 
+JSON objects do not express an insertion-order contract. The original URL's
+query parameter order is preserved. For signed URLs or endpoints requiring a
+specific parameter order, put the complete ordered query string in the URL
+and omit `query`.
+
 ```sql
 SELECT HTTP_REQUEST('POST', 'http://127.0.0.1:8080/upload', JSON_OBJECT(
   'multipart', JSON_ARRAY(
@@ -92,6 +97,9 @@ PROCESSLIST, audit events, and optimizer traces redact HTTP SQL. Client query
 histories remain under the client's control. A credential deliberately stored
 in a user table, routine, view, trigger, or event follows that object's normal
 persistence rules; this API does not provide an encrypted credential catalog.
+Redaction applies to HTTP statements, not to separate statements such as
+`SET @token = 'secret'`; those literal values can appear in normal SQL logs.
+Pass sensitive values through prepared placeholders from the client.
 
 ## Response contract
 
@@ -223,6 +231,14 @@ An optional policy file uses version 1:
 }
 ```
 
+`requests_per_minute` uses a per-account token bucket: its initial capacity is
+the configured count, and tokens refill continuously at that count per minute.
+Each admitted function call consumes one token; redirects instead count against
+the separate statement send budget. An empty bucket immediately raises
+`ER_HTTP_RATE_LIMITED` before sending, including with `on_error='return'`.
+Retry only when the application is ready to wait for replenishment. Concurrency
+limits still use the bounded queue and the request deadline.
+
 Omitting `egress` permits all HTTP/HTTPS destinations. Supplying it requires an
 allowed canonical origin; private destinations additionally need an explicit
 IP network, and HTTP origins need an explicit plaintext entry. An empty
@@ -263,7 +279,8 @@ ER_HTTP_ACCESS_DENIED (50101), ER_HTTP_DISABLED (50102), ER_HTTP_EGRESS_DENIED
 (50103), ER_HTTP_BUDGET_EXCEEDED (50104), ER_HTTP_QUEUE_FULL (50105), ER_HTTP_DNS
 (50106), ER_HTTP_CONNECT (50107), ER_HTTP_TLS (50108), ER_HTTP_TIMEOUT (50109),
 ER_HTTP_INVALID_RESPONSE (50110), ER_HTTP_TRANSPORT (50111),
-ER_HTTP_UNSUPPORTED_CONTEXT (50112), and ER_HTTP_REPLAY_FORBIDDEN (50113).
+ER_HTTP_UNSUPPORTED_CONTEXT (50112), ER_HTTP_REPLAY_FORBIDDEN (50113), and
+ER_HTTP_RATE_LIMITED (50114).
 Authorization and egress errors use SQLSTATE 42000; invalid arguments use
 22023; the remaining HTTP conditions use HY000. Existing SQL cancellation and
 memory conditions retain their native codes.

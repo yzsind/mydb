@@ -1230,7 +1230,7 @@ pub enum PhysicalPlan {
 
 #[derive(Debug, Clone)]
 pub enum SpatialProbe {
-    Constant([f64; 4]),
+    Constant { mbr: [f64; 4], srid: u32 },
     Parameter(Expr),
 }
 
@@ -9458,12 +9458,6 @@ fn find_spatial_index_scan<'a>(
     expr: &Expr,
     hints: &ScanHints<'_>,
 ) -> Option<(&'a IndexSchema, SpatialProbe)> {
-    // The spatial scan reads the index under the table's own storage id; on a
-    // partitioned table the MBR entries live under per-partition storage ids,
-    // so fall back to a normal scan to avoid missing rows.
-    if table.is_partitioned() {
-        return None;
-    }
     for conj in expr_conjuncts(expr) {
         let Expr::Function { name, args, .. } = conj else {
             continue;
@@ -9494,14 +9488,18 @@ fn find_spatial_index_scan<'a>(
             let Ok(crate::types::Value::Geometry(bytes)) =
                 crate::engine::expr::eval_expr_legacy(&args[const_i], table, &[])
             else {
-                continue;
+                return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
             };
             if let Some(m) = crate::engine::geo::mbr_of(&bytes) {
                 return Some((
                     index,
-                    SpatialProbe::Constant([m.minx, m.miny, m.maxx, m.maxy]),
+                    SpatialProbe::Constant {
+                        mbr: [m.minx, m.miny, m.maxx, m.maxy],
+                        srid: crate::engine::geo::read_geometry(&bytes).ok()?.srid,
+                    },
                 ));
             }
+            return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
         }
     }
     None

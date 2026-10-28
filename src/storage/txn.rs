@@ -757,6 +757,27 @@ impl IndexRepairState {
         self.writers.load(Ordering::Acquire) != 0
     }
 
+    /// Exact dependency check for physical validation under a table write
+    /// barrier. Unrelated dictionary retirements must not disable the walk.
+    pub(crate) fn has_entries_for(&self, table_id: u64, index_name: &str) -> bool {
+        let start = IndexRepairKey {
+            table_id,
+            index_name: normalize_name(index_name),
+            key: IndexKey::from(Vec::new()),
+        };
+        self.entry_shards.iter().any(|shard| {
+            shard
+                .read()
+                .range(&start..)
+                .next()
+                .is_some_and(|(key, entries)| {
+                    key.table_id == table_id
+                        && key.index_name == start.index_name
+                        && !entries.is_empty()
+                })
+        })
+    }
+
     /// The third tuple field identifies single-key indexes. For FULLTEXT/MVI,
     /// one mutation can retain some keys while retiring others, so the last
     /// row writer does not identify every key's creator. Keep those candidates

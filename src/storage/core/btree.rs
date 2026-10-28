@@ -466,6 +466,7 @@ struct PreparedIndexInsert {
 
 #[derive(Debug)]
 pub(crate) struct IndexFile {
+    spatial: Option<Box<spatial_index::SpatialIndexFile>>,
     /// A pinned BUILDING handle records DML while its private tree is bulk loaded.
     online_build_log: Option<Arc<OnlineIndexBuildLog>>,
     path: PathBuf,
@@ -2687,7 +2688,11 @@ impl IndexFile {
         {
             return err;
         }
-        let marker = self.path.with_extension("idx.corrupt");
+        let marker = self.path.with_extension(if self.spatial.is_some() {
+            "rtree.corrupt"
+        } else {
+            "idx.corrupt"
+        });
         let persist = (|| -> std::io::Result<()> {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -2712,6 +2717,15 @@ impl IndexFile {
     }
 
     fn ensure_healthy(&self) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            if self.failed.load(Ordering::Acquire) {
+                return Err(error(
+                    crate::error::catalog::ER_INDEX_CORRUPT,
+                    "persistent spatial index corruption requires explicit repair",
+                ));
+            }
+            return spatial.healthy();
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -2836,6 +2850,9 @@ impl IndexFile {
         durability: DurabilityMode,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Self, QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            return Self::open_spatial(path, log, durability, buffer_pool, false);
+        }
         if durability != DurabilityMode::Memory {
             Self::check_rebuild_marker(&path)?;
         }
@@ -2943,8 +2960,64 @@ impl IndexFile {
             flush_on_drop: true,
             failed: AtomicBool::new(false),
             online_build_log: None,
+            spatial: None,
         }
         .initialize_meta_if_needed(initialized)?)
+    }
+
+    fn open_spatial(
+        path: PathBuf,
+        log: Arc<crate::wal::LogMutex>,
+        durability: DurabilityMode,
+        buffer_pool: Arc<BufferPool>,
+        create: bool,
+    ) -> Result<Self, QueryError> {
+        let spatial = spatial_index::SpatialIndexFile::open(
+            path.clone(),
+            log.clone(),
+            durability,
+            buffer_pool.clone(),
+            create,
+        )?;
+        let meta = IndexMeta {
+            root_page: 1,
+            next_page_id: 2,
+            free_page_head: None,
+        };
+        let meta_image = Vec::new();
+        let file_key = Arc::new(BufferPool::index_file_key(path.clone()));
+        let dirty = false;
+        let dirty_meta = false;
+        let rel_path = Self::compute_relative_path(&path);
+        let log_atomics = log.lock().state_atomics();
+        let root_page_atomic = AtomicU64::new(meta.root_page);
+        let (page_latches, page_latch_mask) = new_page_latch_array();
+        Ok(Self {
+            path,
+            file: parking_lot::Mutex::new(None),
+            log,
+            log_atomics,
+            durability,
+            root_page: root_page_atomic,
+            root_frame_hint: parking_lot::RwLock::new(std::sync::Weak::new()),
+            structure_lock: Arc::new(parking_lot::RwLock::new(())),
+            split_prepare: parking_lot::Mutex::new(()),
+            meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
+            file_key,
+            buffer_pool,
+            dirty_meta: AtomicBool::new(dirty_meta),
+            dirty: AtomicBool::new(dirty),
+            page_latches,
+            page_latch_mask,
+            mutation_generation: AtomicU64::new(0),
+            active_mutations: AtomicUsize::new(0),
+            order_stats_cache: parking_lot::Mutex::new(HashMap::new()),
+            rel_path,
+            flush_on_drop: true,
+            failed: AtomicBool::new(false),
+            online_build_log: None,
+            spatial: Some(Box::new(spatial)),
+        })
     }
 
     fn initialize_meta_if_needed(mut self, initialized: bool) -> Result<Self, QueryError> {
@@ -2999,6 +3072,9 @@ impl IndexFile {
     }
 
     fn validate(path: PathBuf) -> Result<(), QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            return spatial_index::SpatialIndexFile::quick_validate(path);
+        }
         Self::check_rebuild_marker(&path)?;
         let mut file = OpenOptions::new().read(true).open(path).map_err(io_err)?;
         let meta = decode_index_meta(&read_index_page(&mut file, INDEX_META_PAGE)?)?;
@@ -3010,6 +3086,9 @@ impl IndexFile {
     /// Read through the buffer pool so dirty pages and memory-only databases
     /// receive the same structural checks as persisted indexes.
     fn validate_structure(&self) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.validate();
+        }
         let meta = self.meta_state.lock().meta.clone();
         validate_index_tree(meta.root_page, meta.next_page_id, &mut |id| {
             self.read_page_with_intent(id, AccessIntent::Scan)
@@ -3018,6 +3097,9 @@ impl IndexFile {
     }
 
     fn quick_validate(path: PathBuf) -> Result<(), QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            return spatial_index::SpatialIndexFile::quick_validate(path);
+        }
         Self::check_rebuild_marker(&path)?;
         let mut file = OpenOptions::new().read(true).open(path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
@@ -3156,6 +3238,7 @@ impl IndexFile {
             flush_on_drop: true,
             failed: AtomicBool::new(false),
             online_build_log: None,
+            spatial: None,
         })
     }
 
@@ -3166,6 +3249,15 @@ impl IndexFile {
         durability: DurabilityMode,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Self, QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            let index = Self::open_spatial(path, log, durability, buffer_pool, true)?;
+            index
+                .spatial
+                .as_ref()
+                .unwrap()
+                .build_sorted(entries.into_iter().map(Ok))?;
+            return Ok(index);
+        }
         let _ = fs::remove_file(&path);
         let index = Self::open_rebuilt_with_durability(path, log, durability, buffer_pool)?;
         if entries.is_empty() {
@@ -3200,6 +3292,12 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<IndexEntry, QueryError>>,
     {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            let index = Self::open_spatial(path, log, durability, buffer_pool, true)?;
+            index.spatial.as_ref().unwrap().build_sorted(entries)?;
+            return Ok(index);
+        }
+
         let _ = fs::remove_file(&path);
         let index = Self::open_rebuilt_with_durability(path, log, durability, buffer_pool)?;
         let started = Instant::now();
@@ -3489,6 +3587,7 @@ impl IndexFile {
             flush_on_drop: true,
             failed: AtomicBool::new(false),
             online_build_log: None,
+            spatial: None,
         })
     }
 
@@ -3573,6 +3672,16 @@ impl IndexFile {
     }
 
     fn insert_deferred(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(
+                txn_id,
+                [IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }],
+            );
+        }
         let entry = IndexEntry { key, row_id };
         // Always log via the compact logical `IndexBatch` record (one
         // op, ~24 bytes) and set `logical_wal_lsn` so the downstream
@@ -3605,6 +3714,9 @@ impl IndexFile {
         entries: Vec<(IndexKey, RowId)>,
         exclusive_handle: bool,
     ) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.insert_many(txn_id, entries);
+        }
         if entries.is_empty() {
             return Ok(());
         }
@@ -3650,6 +3762,9 @@ impl IndexFile {
         txn_id: u64,
         entries: Vec<IndexBatchEntry>,
     ) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(txn_id, entries);
+        }
         if let Some(log) = &self.online_build_log {
             log.record(entries);
             return Ok(());
@@ -3667,6 +3782,9 @@ impl IndexFile {
         entries: smallvec::SmallVec<[IndexBatchEntry; 2]>,
         payload: Option<WalPayload>,
     ) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(txn_id, entries);
+        }
         if let Some(log) = &self.online_build_log {
             log.record(entries);
             return Ok(());
@@ -6793,10 +6911,23 @@ impl IndexFile {
     /// Used by `Database::index_page_count` to report real
     /// `INDEX_LENGTH` from `information_schema.tables`.
     pub(crate) fn page_count(&self) -> u64 {
+        if let Some(spatial) = &self.spatial {
+            return spatial.count_pages();
+        }
         self.meta_state.lock().meta.next_page_id
     }
 
     fn delete_deferred(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(
+                txn_id,
+                [IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key,
+                    row_id,
+                }],
+            );
+        }
         let entry = IndexEntry { key, row_id };
         // Symmetric with `insert_deferred`: always log via `IndexBatch`
         // so we don't emit a 32 KB per-page before/after image for a
@@ -6907,6 +7038,9 @@ impl IndexFile {
     }
 
     fn get(&self, key: &IndexKey, dedup_row_ids: bool) -> Result<Vec<RowId>, QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.lookup(key);
+        }
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
         let mut rows = Vec::new();
@@ -8469,6 +8603,9 @@ impl IndexFile {
         txn_id: u64,
         entries: &[IndexBatchEntry],
     ) -> Result<Option<WalPayload>, QueryError> {
+        if self.spatial.is_some() {
+            return Ok(None);
+        }
         if self.durability == DurabilityMode::Memory {
             return Ok(None);
         }
@@ -8548,6 +8685,9 @@ impl IndexFile {
     }
 
     fn entries(&self) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.entries();
+        }
         let mut entries = Vec::new();
         let mut leaf_id = self.leftmost_leaf()?;
         loop {
@@ -8574,6 +8714,9 @@ impl IndexFile {
     }
 
     fn flush(&self) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.flush();
+        }
         #[cfg(test)]
         INDEX_FLUSH_TEST_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -8626,6 +8769,7 @@ impl IndexFile {
     }
 
     fn discard_without_flush(&mut self) {
+        self.spatial = None;
         self.dirty_meta.store(false, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         let _ = self.buffer_pool.discard_file(&self.file_key);
@@ -9807,6 +9951,9 @@ impl IndexFile {
     }
 
     fn is_empty(&self) -> Result<bool, QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.is_empty();
+        }
         if self.online_build_log.is_some() {
             // LOAD DATA must use its incremental writer, never replace the
             // private tree being built by CREATE INDEX.

@@ -3932,14 +3932,8 @@ impl Database {
                 &tombstone,
             )
         })?;
-        // Remove this row's entries from every index of this partition.
-        for index in &table.indexes {
-            for old_key in table.index_keys(index, old_values)? {
-                self.with_index_dml(storage_id, &index.name, |index_file| {
-                    index_file.delete_deferred(txn.txn_id, old_key, row_id)
-                })?;
-            }
-        }
+        // Publish old-key visibility before removing partition-local entries.
+        self.delete_indexes_deferred_at(txn.txn_id, storage_id, table, old_values, row_id)?;
         self.defer_vector_delete(txn.txn_id, undo_id, table, old_values, row_id, storage_id)?;
         if crate::binlog::should_record_table_rows(table) {
             crate::binlog::record_delete_rows(txn.txn_id, table, vec![old_values.to_vec()])?;

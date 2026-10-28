@@ -55,7 +55,7 @@ The current development format is incompatible with earlier versions. If version
 | backup bundle | $(version BACKUP_BUNDLE_VERSION) |
 | backup catalog checkpoint / packed lineage | $(version BACKUP_CHECKPOINT_VERSION) / $(version BACKUP_LINEAGE_VERSION) |
 
-The R-tree is an in-memory cache derived from the persistent MBR B-tree and has no separate persistent format version.
+Spatial indexes use persistent R-tree pages (format version 1), covered by the WAL and replication format boundary.
 EOF
 
 case "${1:---check}" in

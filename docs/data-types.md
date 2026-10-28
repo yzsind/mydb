@@ -293,9 +293,11 @@ explicit error. Text or plain BLOB is never implicitly treated as geometry on co
 applications should use constructors such as `ST_GeomFromText` and `ST_GeomFromWKB`.
 
 Spatial indexes require a single, non-unique, `NOT NULL` geometry column and do not support
-expression, prefix, or descending key parts. mydb uses a persistent MBR B-tree plus a
-rebuildable in-memory R-tree and rechecks the exact predicate against the row after candidate
-hits. See [`function/spatial/README.md`](function/spatial/README.md) for the GIS function
+expression, prefix, or descending key parts. mydb uses a page-backed persistent R-tree
+and rechecks the exact predicate against the row after candidate hits. Tree pages are read
+on demand through the buffer pool; startup and the first query do not rebuild the tree.
+Spatial range access requires an explicit column SRID and supports partition pruning.
+See [Spatial indexes](spatial-indexes.md) for storage and recovery behavior. See [`function/spatial/README.md`](function/spatial/README.md) for the GIS function
 list; some geographic computations, projection transforms, and polygon set operations may
 still return explicit unsupported errors.
 

@@ -974,13 +974,12 @@ struct ReorgStorageLocation {
     // idle-handle eviction until publication or rollback removes this entry.
     heap_codec: Option<Arc<RowCodec>>,
     index_ids: Option<Arc<BTreeMap<String, u64>>>,
+    spatial_indexes: Option<Arc<HashSet<String>>>,
 }
 
 type HeapCacheMap = hashbrown::HashMap<u64, HeapHandle, ahash::RandomState>;
 type IndexCacheMap = hashbrown::HashMap<(u64, String), IndexHandle, ahash::RandomState>;
 type OverflowCacheMap = hashbrown::HashMap<u64, OverflowHandle, ahash::RandomState>;
-type IndexGenerationMap = HashMap<(u64, String), u64>;
-type SpatialRtreeCacheMap = HashMap<(u64, String), Arc<SpatialRtreeCache>>;
 type BufferFrameMap = hashbrown::HashMap<PageKey, Arc<Frame>, ahash::RandomState>;
 /// Values are shared atomic cells so the hot paths (per-miss load, per-flush
 /// generation check) read them with one atomic load under the map's read
@@ -994,13 +993,6 @@ type BufferFileCacheMap =
 /// Sharded snapshot table — each shard sees ~1/N of the statement
 /// register / drop traffic, so the hash speedup compounds across shards.
 type ActiveSnapshotMap = hashbrown::HashMap<u64, ActiveSnapshot, ahash::RandomState>;
-
-#[derive(Debug)]
-struct SpatialRtreeCache {
-    generation: AtomicU64,
-    tree: parking_lot::RwLock<rtree::RTree>,
-    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
-}
 
 /// Undo directory latch. Cold segment I/O is prepared under a read guard and
 /// completed after releasing it, so this lock covers metadata only. Shared
@@ -1156,13 +1148,6 @@ pub struct Database {
     /// need no epoch lookup, and unrelated tables cannot invalidate an open.
     storage_handle_open_epochs: Mutex<HashMap<u64, std::sync::Weak<AtomicU64>>>,
     index_cache: parking_lot::RwLock<IndexCacheMap>,
-    /// Mutation generations registered before the first spatial projection
-    /// scan. Ordinary B-trees need no entry. Spatial R-tree cache entries are
-    /// usable only when their captured generation matches.
-    index_mutation_generations: parking_lot::RwLock<IndexGenerationMap>,
-    /// Optional, governor-accounted R-tree projections of durable spatial
-    /// B-trees. The B-tree remains the only WAL/recovery source of truth.
-    spatial_rtree_cache: parking_lot::RwLock<SpatialRtreeCacheMap>,
     /// Per-table overflow (LOB) file handles, opened lazily on first
     /// externalization. Mirrors `heap_cache` / `index_cache`.
     overflow_cache: parking_lot::RwLock<OverflowCacheMap>,
@@ -3066,6 +3051,10 @@ pub struct SnapshotGuard {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum BufferPageFileKind {
+    Spatial {
+        table_id: u64,
+        name: String,
+    },
     Heap {
         table_id: u64,
     },
@@ -3720,7 +3709,7 @@ impl BufferPageFileKind {
     pub(crate) fn slot(&self) -> usize {
         match self {
             BufferPageFileKind::Heap { .. } => 0,
-            BufferPageFileKind::Index { .. } => 1,
+            BufferPageFileKind::Index { .. } | BufferPageFileKind::Spatial { .. } => 1,
             BufferPageFileKind::Overflow { .. } => 2,
             BufferPageFileKind::Vector { .. } => 3,
             BufferPageFileKind::ZoneMap { .. } => 4,
@@ -4797,9 +4786,9 @@ include!("core/errors.rs");
 mod auto_increment_tests;
 #[cfg(test)]
 mod btree_batch_tests;
-pub(crate) mod rtree;
 #[cfg(test)]
 mod sequence_tests;
+mod spatial_index;
 #[cfg(test)]
 mod tests;
 

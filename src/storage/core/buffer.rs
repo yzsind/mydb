@@ -1507,7 +1507,14 @@ impl BufferPool {
 
     fn index_file_key(path: PathBuf) -> BufferPageFileKey {
         let (table_id, name) = index_identity_from_path(&path);
-        BufferPageFileKey::new(BufferPageFileKind::Index { table_id, name }, path)
+        BufferPageFileKey::new(
+            if path.extension().is_some_and(|e| e == "rtree") {
+                BufferPageFileKind::Spatial { table_id, name }
+            } else {
+                BufferPageFileKind::Index { table_id, name }
+            },
+            path,
+        )
     }
 
     fn overflow_file_key(path: PathBuf, table_id: u64) -> BufferPageFileKey {
@@ -3817,7 +3824,12 @@ impl BufferPool {
             .map(|frames| {
                 frames
                     .iter()
-                    .filter(|frame| matches!(frame.key.file.kind, BufferPageFileKind::Index { .. }))
+                    .filter(|frame| {
+                        matches!(
+                            frame.key.file.kind,
+                            BufferPageFileKind::Index { .. } | BufferPageFileKind::Spatial { .. }
+                        )
+                    })
                     .count()
             })
             .unwrap_or(0)
@@ -3867,7 +3879,7 @@ impl BufferPool {
                     BufferPageFileKind::Heap { .. } => {
                         dirty_heap_pages = dirty_heap_pages.saturating_add(1);
                     }
-                    BufferPageFileKind::Index { .. } => {
+                    BufferPageFileKind::Index { .. } | BufferPageFileKind::Spatial { .. } => {
                         dirty_index_pages = dirty_index_pages.saturating_add(1);
                     }
                     BufferPageFileKind::Overflow { .. } => {}
@@ -4018,6 +4030,9 @@ impl BufferPool {
             for frame in frames.values() {
                 let (storage_id, page_type, index_name) = match &frame.key.file.kind {
                     BufferPageFileKind::Heap { table_id } => (*table_id, "HEAP", None),
+                    BufferPageFileKind::Spatial { table_id, name } => {
+                        (*table_id, "SPATIAL", Some(name.clone()))
+                    }
                     BufferPageFileKind::Index { table_id, name } => {
                         (*table_id, "INDEX", Some(name.clone()))
                     }

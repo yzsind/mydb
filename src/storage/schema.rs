@@ -2517,9 +2517,7 @@ impl IndexSchema {
         self.index_type.eq_ignore_ascii_case("FULLTEXT")
     }
 
-    /// Whether this is a MySQL SPATIAL index. Spatial indexes do not use the B-tree; they build an
-    /// R-tree over geometry MBRs (`storage::core::rtree`), DML maintains no per-row B-tree, and
-    /// queries go through a dedicated R-tree candidate + exact residual-filter branch.
+    /// Whether this index uses the persistent page-backed spatial R-tree.
     pub fn is_spatial(&self) -> bool {
         self.index_type.eq_ignore_ascii_case("SPATIAL")
     }
@@ -4792,12 +4790,9 @@ impl TableSchema {
             .collect())
     }
 
-    /// Build a SPATIAL index key: the geometry column's MBR encoded as four
-    /// order-preserving `Float64` parts `(minx, miny, maxx, maxy)`. The
-    /// spatial index is stored as an ordinary B-tree over these MBR keys, so
-    /// it is crash-safe and maintained by the normal DML machinery with no
-    /// special-casing. The R-tree query accelerator
-    /// (`storage::core::rtree`) is bulk-built from exactly these entries.
+    /// Encode the geometry MBR for shared DML, undo and visibility-repair
+    /// interfaces. The spatial backend stores these coordinates in R-tree
+    /// pages; this key is not maintained in a separate B-tree.
     pub fn spatial_index_key(
         &self,
         index: &IndexSchema,

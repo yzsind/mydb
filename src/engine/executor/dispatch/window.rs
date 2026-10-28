@@ -1020,6 +1020,7 @@ fn prepare_window_execution(
         } = spec.as_ref();
 
         if let Some(frame) = frame {
+            validate_range_bound_domains(frame)?;
             if matches!(frame.start, WindowFrameBound::UnboundedFollowing) {
                 return Err(error(
                     crate::error::catalog::ER_WINDOW_FRAME_START_ILLEGAL,
@@ -2994,6 +2995,32 @@ fn frame_position_excluded(range: &WindowFrameRange, pos: usize) -> bool {
     }
 }
 
+/// Offset bounds in one RANGE frame must use the same value domain.
+fn validate_range_bound_domains(frame: &WindowFrame) -> Result<(), QueryError> {
+    if !matches!(frame.units, WindowFrameUnits::Range) {
+        return Ok(());
+    }
+    let offset_is_interval = |bound: &WindowFrameBound| match bound {
+        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => Some(
+            matches!(expr.as_ref(), Expr::Function { name, .. } if name.eq_ignore_ascii_case("__INTERVAL")),
+        ),
+        _ => None,
+    };
+    if matches!(
+        (
+            offset_is_interval(&frame.start),
+            offset_is_interval(&frame.end)
+        ),
+        (Some(true), Some(false)) | (Some(false), Some(true))
+    ) {
+        return Err(error(
+            crate::error::catalog::ER_WINDOW_RANGE_FRAME_TEMPORAL_TYPE,
+            "RANGE frame with INTERVAL offset requires INTERVAL for every offset bound",
+        ));
+    }
+    Ok(())
+}
+
 /// Decode a temporal frame offset once per partition. Calendar arithmetic
 /// uses the same interval kernel as DATE_ADD, including composite units.
 fn window_interval(bound: &WindowFrameBound) -> Result<Option<(Value, String)>, QueryError> {
@@ -3077,6 +3104,7 @@ fn compute_frame_ranges(
     columns: &[Column],
     rows: &[Vec<Value>],
 ) -> Result<Vec<WindowFrameRange>, QueryError> {
+    validate_range_bound_domains(frame)?;
     let n = partition.len();
     if n == 0 {
         return Ok(Vec::new());

@@ -691,6 +691,7 @@ impl Database {
                         generation,
                         heap_codec: None,
                         index_ids: None,
+                        spatial_indexes: None,
                     },
                 );
             }
@@ -708,6 +709,14 @@ impl Database {
                 .map(|index| (normalize_name(&index.name), index.index_id))
                 .collect::<BTreeMap<_, _>>(),
         );
+        let spatial_indexes = Arc::new(
+            table
+                .indexes
+                .iter()
+                .filter(|index| index.is_spatial())
+                .map(|index| normalize_name(&index.name))
+                .collect::<HashSet<_>>(),
+        );
         if let Ok(mut map) = self.reorg_storage_locs.lock() {
             for sid in sids {
                 map.insert(
@@ -718,6 +727,7 @@ impl Database {
                         generation: table.active_generation.max(1),
                         heap_codec: Some(table.row_codec.clone()),
                         index_ids: Some(index_ids.clone()),
+                        spatial_indexes: Some(spatial_indexes.clone()),
                     },
                 );
             }

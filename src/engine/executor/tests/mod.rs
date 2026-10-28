@@ -8,6 +8,7 @@ mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;
 mod sql_execution_audit_1015;
+mod sql_execution_audit_1027;
 mod sql_execution_fixes;
 mod support;
 mod table_ddl_audit_1012;

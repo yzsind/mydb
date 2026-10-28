@@ -873,3 +873,219 @@ fn srid_mismatch_is_rejected() {
     );
     assert!(r.is_err(), "SRID mismatch should error, got {r:?}");
 }
+
+#[test]
+fn spatial_index_partition_queries_rollback_and_restart() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine.execute("CREATE TABLE persistent_places(id INT PRIMARY KEY, g POINT NOT NULL SRID 0, SPATIAL KEY sp(g)) PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN(10), PARTITION p1 VALUES LESS THAN MAXVALUE)").unwrap();
+        engine.execute("INSERT INTO persistent_places VALUES(1,ST_GeomFromText('POINT(1 1)')),(11,ST_GeomFromText('POINT(1 1)')),(12,ST_GeomFromText('POINT(20 20)'))").unwrap();
+        let filter = "MBRIntersects(g,ST_GeomFromText('POLYGON((0 0,3 0,3 3,0 3,0 0))'))";
+        assert_eq!(
+            cell(
+                &engine,
+                &format!("SELECT COUNT(*) FROM persistent_places WHERE {filter}")
+            ),
+            "2"
+        );
+        assert_eq!(
+            cell(
+                &engine,
+                &format!("SELECT COUNT(*) FROM persistent_places WHERE id<10 AND {filter}")
+            ),
+            "1"
+        );
+        let indexed = rows(
+            &engine,
+            &format!("SELECT id FROM persistent_places FORCE INDEX(sp) WHERE {filter} ORDER BY id"),
+        );
+        let scanned = rows(
+            &engine,
+            &format!(
+                "SELECT id FROM persistent_places IGNORE INDEX(sp) WHERE {filter} ORDER BY id"
+            ),
+        );
+        assert_eq!(indexed, scanned);
+        let mut session = SessionContext::system_default();
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        engine
+            .execute_with_session(
+                &mut session,
+                "UPDATE persistent_places SET g=ST_GeomFromText('POINT(100 100)') WHERE id=1",
+            )
+            .unwrap();
+        engine
+            .execute_with_session(&mut session, "ROLLBACK")
+            .unwrap();
+        assert_eq!(
+            cell(
+                &engine,
+                &format!("SELECT COUNT(*) FROM persistent_places WHERE {filter}")
+            ),
+            "2"
+        );
+    }
+    let engine = StorageQueryEngine::open(dir.path()).unwrap();
+    assert_eq!(cell(&engine,"SELECT COUNT(*) FROM persistent_places WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))"),"2");
+    engine
+        .execute("UPDATE persistent_places SET id=2 WHERE id=11")
+        .unwrap();
+    assert_eq!(cell(&engine,"SELECT COUNT(*) FROM persistent_places WHERE id<10 AND MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))"),"2");
+}
+
+#[test]
+fn spatial_index_persistent_ddl_lifecycle() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE spatial_ddl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0)")
+        .unwrap();
+    for id in 0..600 {
+        engine
+            .execute(&format!(
+                "INSERT INTO spatial_ddl VALUES({id},ST_GeomFromText('POINT({id} {id})'))"
+            ))
+            .unwrap();
+    }
+    engine
+        .execute("ALTER TABLE spatial_ddl ADD SPATIAL INDEX sp(g)")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE spatial_ddl RENAME INDEX sp TO renamed")
+        .unwrap();
+    assert_eq!(cell(&engine,"SELECT COUNT(*) FROM spatial_ddl FORCE INDEX(renamed) WHERE MBRIntersects(g,ST_GeomFromText('POINT(7 7)'))"),"1");
+    engine.execute("OPTIMIZE TABLE spatial_ddl").unwrap();
+    assert_eq!(
+        cell(
+            &engine,
+            "SELECT COUNT(*) FROM spatial_ddl WHERE MBRIntersects(g,ST_GeomFromText('POINT(7 7)'))"
+        ),
+        "1"
+    );
+    engine.execute("TRUNCATE TABLE spatial_ddl").unwrap();
+    engine
+        .execute("INSERT INTO spatial_ddl VALUES(1,ST_GeomFromText('POINT(1 1)'))")
+        .unwrap();
+    assert_eq!(
+        cell(
+            &engine,
+            "SELECT COUNT(*) FROM spatial_ddl WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))"
+        ),
+        "1"
+    );
+    engine.execute("DROP INDEX renamed ON spatial_ddl").unwrap();
+    engine
+        .execute("CREATE SPATIAL INDEX replacement ON spatial_ddl(g)")
+        .unwrap();
+    assert_eq!(
+        cell(
+            &engine,
+            "SELECT COUNT(*) FROM spatial_ddl WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn spatial_index_partition_old_snapshot_keeps_physical_identity() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE spatial_snapshot(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g)) PARTITION BY RANGE(id) (PARTITION a VALUES LESS THAN(10),PARTITION b VALUES LESS THAN MAXVALUE)").unwrap();
+    engine.execute("INSERT INTO spatial_snapshot VALUES(1,ST_GeomFromText('POINT(1 1)')),(11,ST_GeomFromText('POINT(1 1)'))").unwrap();
+    let mut reader = SessionContext::system_default();
+    reader.connection_id = 99101;
+    let mut writer = SessionContext::system_default();
+    writer.connection_id = 99102;
+    engine
+        .execute_with_session(
+            &mut reader,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        )
+        .unwrap();
+    engine
+        .execute_with_session(&mut reader, "START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        .unwrap();
+    let query="SELECT id FROM spatial_snapshot FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)')) ORDER BY id";
+    let QueryResponse::ResultSet(expected) = engine
+        .execute_with_session(&mut reader, query)
+        .unwrap()
+        .materialize()
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    engine
+        .execute_with_session(
+            &mut writer,
+            "UPDATE spatial_snapshot SET g=ST_GeomFromText('POINT(99 99)') WHERE id=1",
+        )
+        .unwrap();
+    let QueryResponse::ResultSet(actual) = engine
+        .execute_with_session(&mut reader, query)
+        .unwrap()
+        .materialize()
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(actual.rows, expected.rows);
+    engine
+        .execute_with_session(&mut writer, "DELETE FROM spatial_snapshot WHERE id=11")
+        .unwrap();
+    let QueryResponse::ResultSet(actual) = engine
+        .execute_with_session(&mut reader, query)
+        .unwrap()
+        .materialize()
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(actual.rows, expected.rows);
+    engine.execute_with_session(&mut reader, "COMMIT").unwrap();
+}
+
+#[test]
+fn spatial_index_temporary_and_partition_ddl() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::system_default();
+    for sql in ["CREATE TEMPORARY TABLE spatial_tmp(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))","INSERT INTO spatial_tmp VALUES(1,ST_GeomFromText('POINT(1 1)'))","TRUNCATE TABLE spatial_tmp","INSERT INTO spatial_tmp VALUES(2,ST_GeomFromText('POINT(1 1)'))"] {engine.execute_with_session(&mut session,sql).unwrap();}
+    let QueryResponse::ResultSet(rs) = engine
+        .execute_with_session(
+            &mut session,
+            "SELECT id FROM spatial_tmp WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))",
+        )
+        .unwrap()
+        .materialize()
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+    for sql in [
+        "ALTER TABLE spatial_tmp DROP INDEX sp",
+        "ALTER TABLE spatial_tmp ADD SPATIAL INDEX sp(g)",
+        "ALTER TABLE spatial_tmp RENAME INDEX sp TO renamed",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    let QueryResponse::ResultSet(rs)=engine.execute_with_session(&mut session,"SELECT id FROM spatial_tmp FORCE INDEX(renamed) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap() else {panic!("rows")};
+    assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+    engine.execute("CREATE TABLE spatial_parts(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g)) PARTITION BY RANGE(id) (PARTITION a VALUES LESS THAN(10),PARTITION b VALUES LESS THAN MAXVALUE)").unwrap();
+    engine.execute("INSERT INTO spatial_parts VALUES(1,ST_GeomFromText('POINT(1 1)')),(11,ST_GeomFromText('POINT(1 1)'))").unwrap();
+    engine
+        .execute("ALTER TABLE spatial_parts TRUNCATE PARTITION a")
+        .unwrap();
+    engine
+        .execute("INSERT INTO spatial_parts VALUES(2,ST_GeomFromText('POINT(1 1)'))")
+        .unwrap();
+    assert_eq!(cell(&engine,"SELECT COUNT(*) FROM spatial_parts WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))"),"2");
+    engine
+        .execute("ALTER TABLE spatial_parts CHECK PARTITION ALL")
+        .unwrap();
+}

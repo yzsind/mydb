@@ -1112,7 +1112,7 @@ fn read_stable_chunk_with(
     let page_bytes = crate::storage::PAGE_SIZE;
     let paged = matches!(
         path.extension().and_then(|value| value.to_str()),
-        Some("heap" | "idx" | "lob" | "ovf" | "hvec" | "zm")
+        Some("heap" | "idx" | "rtree" | "lob" | "ovf" | "hvec" | "zm")
     );
     // Compare bulk reads, retrying only pages changed by a concurrent writer.
     // Each accepted page still has two identical reads and a valid CRC.

@@ -5326,8 +5326,8 @@ pub(super) fn open_fulltext_scan(
     )?))
 }
 
-/// Execute a `SpatialScan`: query the R-tree (built from the SPATIAL index's
-/// durable MBR B-tree) for every row whose stored MBR intersects the search
+/// Execute a `SpatialScan`: query persistent R-tree pages for every row
+/// whose stored MBR intersects the search
 /// window, read each candidate with MVCC visibility, then apply the residual
 /// `filter` (the full WHERE, including the exact spatial predicate) so the
 /// R-tree's superset is narrowed to the precise answer.
@@ -5340,9 +5340,28 @@ pub(super) fn execute_spatial_scan(
     filter: &Option<Expr>,
 ) -> Result<Vec<PlanRow>, QueryError> {
     let query_mbr = match query_probe {
-        planner::SpatialProbe::Constant(mbr) => *mbr,
+        planner::SpatialProbe::Constant { mbr, srid } => {
+            let column_srid = index
+                .columns
+                .first()
+                .and_then(|c| table.schema.column_index(c).ok())
+                .and_then(|i| match table.schema.columns[i].data_type {
+                    crate::storage::DataTypeKind::Geometry { srid, .. } => srid,
+                    _ => None,
+                });
+            if column_srid.is_some_and(|expected| expected != *srid) {
+                return Err(crate::storage::error(
+                    crate::error::catalog::ER_GIS_DIFFERENT_SRIDS,
+                    "Spatial index probe SRID differs from indexed column",
+                ));
+            }
+            *mbr
+        }
         planner::SpatialProbe::Parameter(expr) => {
             let value = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])?;
+            if matches!(value, Value::Null) {
+                return Ok(Vec::new());
+            }
             let Value::Geometry(bytes) = value else {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_GIS_INVALID_DATA,
@@ -5369,34 +5388,39 @@ pub(super) fn execute_spatial_scan(
                     ));
                 }
             }
-            let mbr = geometry.geom.mbr().ok_or_else(|| {
-                crate::storage::error(
-                    crate::error::catalog::ER_GIS_INVALID_DATA,
-                    "Empty geometry cannot be used as a spatial index probe.",
-                )
-            })?;
+            let Some(mbr) = geometry.geom.mbr() else {
+                // Empty geometries have no pruning rectangle. Evaluate the
+                // original predicate just as the constant-probe scan does.
+                return scan_plan_table(db, txn, table, filter, &[], None, false);
+            };
             [mbr.minx, mbr.miny, mbr.maxx, mbr.maxy]
         }
     };
     let window =
         crate::engine::geo::Mbr::new(query_mbr[0], query_mbr[1], query_mbr[2], query_mbr[3]);
-    let candidates = db.spatial_search_visible(&table.schema, index, window, txn)?;
-    let mut out: Vec<PlanRow> = Vec::with_capacity(candidates.len());
-    let mut eval_ctx = EvalQueryContext::default();
-    for row_id in candidates {
-        let Some(stored) = db.read_row(&table.schema, row_id, txn)? else {
-            continue;
-        };
-        let row = stored_row_to_plan_row(table, stored.values)?;
-        let keep = match filter {
-            Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
-            None => true,
-        };
-        if keep {
-            out.push(row);
+    run_plan_scan_with_partition_pruning(table, filter, || {
+        let mut out = Vec::new();
+        let mut eval_ctx = EvalQueryContext::default();
+        for storage_id in db.scan_storage_ids(&table.schema) {
+            let mut physical = (*table.schema).clone();
+            physical.id = storage_id;
+            let candidates = db.spatial_search_visible(&physical, index, window, txn)?;
+            for row_id in candidates.iter().copied() {
+                let Some(stored) = db.read_row_at(&table.schema, storage_id, row_id, txn)? else {
+                    continue;
+                };
+                let row = stored_row_to_plan_row(table, stored.values)?;
+                let keep = match filter {
+                    Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
+                    None => true,
+                };
+                if keep {
+                    out.push(row);
+                }
+            }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Execute a `VectorIndexScan`: ask the HNSW graph for the nearest candidate

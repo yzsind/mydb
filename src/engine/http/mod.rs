@@ -32,6 +32,7 @@ pub(crate) fn error(code: &str, message: &str) -> QueryError {
         "ER_HTTP_TRANSPORT" => ER_HTTP_TRANSPORT,
         "ER_HTTP_UNSUPPORTED_CONTEXT" => ER_HTTP_UNSUPPORTED_CONTEXT,
         "ER_HTTP_REPLAY_FORBIDDEN" => ER_HTTP_REPLAY_FORBIDDEN,
+        "ER_HTTP_RATE_LIMITED" => ER_HTTP_RATE_LIMITED,
         _ => ER_HTTP_TRANSPORT,
     };
     spec.error(format!("{code}: {message}"))

@@ -2018,7 +2018,7 @@ fn secondary_index_rowid_reads_migrated_heap_row() {
 }
 
 #[test]
-fn spatial_index_rtree_search_over_durable_btree() {
+fn spatial_index_search_over_persistent_pages() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     db.create_table(
@@ -2092,7 +2092,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
     db.commit_txn(txn.txn_id).unwrap();
 
     let table_id = db.table("test.places").unwrap().id;
-    assert!(db.index_mutation_generations.read().is_empty());
     // R-tree (built from the durable MBR B-tree) returns every point whose MBR
     // intersects the window [5,5]×[10,10] — points (5,5)…(10,10) ⇒ 6 rows.
     let hits = db
@@ -2103,16 +2102,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
         )
         .unwrap();
     assert_eq!(hits.len(), 6, "spatial_search window hits");
-    let cache_key = (table_id, normalize_name("sp"));
-    let warm_cache = db
-        .spatial_rtree_cache
-        .read()
-        .get(&cache_key)
-        .cloned()
-        .expect("spatial search should warm the R-tree cache");
-
-    // After deleting one in-window row, commit updates the same warm R-tree
-    // incrementally instead of making the next query rebuild all entries.
     let table = db.table("test.places").unwrap();
     let primary = table.indexes.iter().find(|i| i.primary).cloned().unwrap();
     let row_id = db
@@ -2129,16 +2118,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
         )
         .unwrap();
     assert_eq!(hits2.len(), 5, "spatial_search after delete");
-    let cache_after = db
-        .spatial_rtree_cache
-        .read()
-        .get(&cache_key)
-        .cloned()
-        .expect("incremental delete should keep the cache warm");
-    assert!(Arc::ptr_eq(&warm_cache, &cache_after));
-
-    // A projection registered after the initial load must also observe later
-    // inserts; lazily tracking generations cannot leave the first cache valid.
     let txn = db.begin_txn().unwrap();
     let geometry = crate::engine::geo::parse_wkt_internal("POINT(8 8)", 0).unwrap();
     db.insert_rows(
@@ -2148,7 +2127,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
     )
     .unwrap();
     db.commit_txn(txn.txn_id).unwrap();
-    assert_eq!(db.index_mutation_generations.read().len(), 1);
     assert_eq!(
         db.spatial_search(
             table_id,
@@ -26952,5 +26930,314 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
         .err()
         .expect("startup must preserve the corruption fence");
         assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
+    }
+}
+
+#[test]
+fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
+    use crate::engine::api::QueryResponse;
+    use crate::engine::api::SessionContext;
+    use crate::engine::StorageQueryEngine;
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    fn count(engine: &StorageQueryEngine, session: &mut SessionContext) -> String {
+        let result=engine.execute_with_session(session,"SELECT COUNT(*) FROM spatial_repl WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap();
+        let QueryResponse::ResultSet(rs) = result else {
+            panic!("rows")
+        };
+        rs.rows[0][0].to_display_string()
+    }
+    fs::create_dir_all("/tmp/mydb").unwrap();
+    let master_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let replica_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+    let source = master.database_for_replication();
+    master.execute("CREATE TABLE spatial_repl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+    master
+        .execute("INSERT INTO spatial_repl VALUES(1,ST_GeomFromText('POINT(1 1)'))")
+        .unwrap();
+    source.checkpoint().unwrap();
+    copy_tree(master_dir.path(), replica_dir.path());
+    let mut role = crate::repl::role::RoleState::new_standalone();
+    role.role = crate::repl::role::Role::Replica;
+    crate::repl::role::save(replica_dir.path(), &role).unwrap();
+    let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+    let target = replica.database_for_replication().clone();
+    let mut reader_session = SessionContext::system_default();
+    replica
+        .execute_with_session(
+            &mut reader_session,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        )
+        .unwrap();
+    replica
+        .execute_with_session(
+            &mut reader_session,
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+        )
+        .unwrap();
+    assert_eq!(count(&replica, &mut reader_session), "1");
+    let log = source.wal_log();
+    let mut start = log.lock().next_lsn();
+    master
+        .execute("CREATE TABLE spatial_repl_ddl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0)")
+        .unwrap();
+    master
+        .execute("INSERT INTO spatial_repl_ddl VALUES(1,ST_GeomFromText('POINT(1 1)'))")
+        .unwrap();
+    master
+        .execute("CREATE SPATIAL INDEX sp ON spatial_repl_ddl(g)")
+        .unwrap();
+    let mut writer = SessionContext::system_default();
+    master.execute_with_session(&mut writer, "BEGIN").unwrap();
+    master
+        .execute_with_session(
+            &mut writer,
+            "UPDATE spatial_repl SET g=ST_GeomFromText('POINT(10 10)') WHERE id=1",
+        )
+        .unwrap();
+    let mut applier = crate::repl::replica::applier::Applier::with_database(
+        replica_dir.path(),
+        target.wal_log(),
+        target.clone(),
+        crate::repl::replica::progress::ReplicaProgress::default(),
+    );
+    for commit in [false, true] {
+        if commit {
+            master.execute_with_session(&mut writer, "COMMIT").unwrap();
+        }
+        let safe = log.lock().next_lsn() - 1;
+        LogManager::sync_durable_to(&log, safe).unwrap();
+        let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+        while let Some(chunk) = reader.next_chunk(safe, 1 << 20).unwrap() {
+            applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+        }
+        start = safe + 1;
+        assert_eq!(count(&replica, &mut reader_session), "1");
+    }
+    replica
+        .execute_with_session(&mut reader_session, "COMMIT")
+        .unwrap();
+    assert_eq!(count(&replica, &mut reader_session), "0");
+    let result=replica.execute("SELECT id FROM spatial_repl_ddl FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap();
+    let QueryResponse::ResultSet(rs) = result else {
+        panic!("rows")
+    };
+    assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+    master.execute_with_session(&mut writer, "BEGIN").unwrap();
+    master
+        .execute_with_session(&mut writer, "DELETE FROM spatial_repl_ddl WHERE id=1")
+        .unwrap();
+    let fork_lsn = log.lock().next_lsn() - 1;
+    LogManager::sync_durable_to(&log, fork_lsn).unwrap();
+    let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+    while let Some(chunk) = reader.next_chunk(fork_lsn, 1 << 20).unwrap() {
+        applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+    }
+    target.checkpoint().unwrap();
+    drop(applier);
+    drop(target);
+    drop(replica);
+    role.promote_to_master_at(fork_lsn);
+    crate::repl::role::save(replica_dir.path(), &role).unwrap();
+    let reopened = StorageQueryEngine::open(replica_dir.path()).unwrap();
+    assert_eq!(count(&reopened, &mut SessionContext::system_default()), "0");
+    let QueryResponse::ResultSet(rs)=reopened.execute("SELECT id FROM spatial_repl_ddl FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap() else {panic!("rows")};
+    assert_eq!(
+        rs.rows,
+        vec![vec![Value::Int(1)]],
+        "promotion must undo the source's uncommitted spatial deletion"
+    );
+    master
+        .execute_with_session(&mut writer, "ROLLBACK")
+        .unwrap();
+}
+
+#[test]
+fn spatial_index_crash_child() {
+    let Some(path) = std::env::var_os("MYDB_SPATIAL_CRASH_DATABASE") else {
+        return;
+    };
+    use crate::engine::{api::SessionContext, StorageQueryEngine};
+    if std::env::var_os("MYDB_SPATIAL_RECOVERY_ONLY").is_some() {
+        spatial_index::CRASH_AFTER_PAGES.with(|v| v.set(Some(2)));
+        let _engine = StorageQueryEngine::open(Path::new(&path)).unwrap();
+        std::process::exit(87);
+    }
+    let mode = std::env::var("MYDB_SPATIAL_CRASH_KIND").unwrap();
+    let initial = if matches!(mode.as_str(), "delete" | "reuse") {
+        420
+    } else {
+        408
+    };
+    let engine = StorageQueryEngine::open(Path::new(&path)).unwrap();
+    engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+    let values = (0..initial)
+        .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO crash_spatial VALUES{values}"))
+        .unwrap();
+    if mode == "reuse" {
+        engine.execute("DELETE FROM crash_spatial").unwrap();
+    }
+    engine.database_for_replication().checkpoint().unwrap();
+    let point = std::env::var("MYDB_SPATIAL_CRASH_POINT")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let mut session = SessionContext::system_default();
+    engine.execute_with_session(&mut session, "BEGIN").unwrap();
+    let arm = || {
+        if point < 5 {
+            spatial_index::CRASH_AFTER_PAGES.with(|v| v.set(Some(point)));
+        }
+        spatial_index::CRASH_STRUCTURAL_ONLY
+            .with(|v| v.set(matches!(mode.as_str(), "delete" | "reuse")));
+    };
+    if mode != "rollback" && mode != "savepoint" {
+        arm();
+    }
+    if mode == "savepoint" {
+        for sql in [
+            "INSERT INTO crash_spatial VALUES(999,ST_GeomFromText('POINT(999 999)'))",
+            "SAVEPOINT s",
+            "UPDATE crash_spatial SET g=ST_GeomFromText('POINT(888 888)') WHERE id=0",
+            "INSERT INTO crash_spatial VALUES(1000,ST_GeomFromText('POINT(1000 1000)'))",
+            "ROLLBACK TO SAVEPOINT s",
+        ] {
+            engine.execute_with_session(&mut session, sql).unwrap();
+        }
+        arm();
+        engine
+            .execute_with_session(
+                &mut session,
+                "INSERT INTO crash_spatial VALUES(1001,ST_GeomFromText('POINT(1000 1000)'))",
+            )
+            .unwrap();
+    } else if mode == "delete" {
+        engine
+            .execute_with_session(&mut session, "DELETE FROM crash_spatial")
+            .unwrap();
+    } else if mode == "reuse" {
+        let values = (1000..1409)
+            .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("INSERT INTO crash_spatial VALUES{values}"),
+            )
+            .unwrap();
+    } else {
+        engine
+            .execute_with_session(
+                &mut session,
+                "INSERT INTO crash_spatial VALUES(999,ST_GeomFromText('POINT(999 999)'))",
+            )
+            .unwrap();
+    }
+    if mode == "rollback" {
+        arm();
+        engine
+            .execute_with_session(&mut session, "ROLLBACK")
+            .unwrap();
+    } else if point == 5 {
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+    }
+    let log = engine.database_for_replication().wal_log();
+    let last = log.lock().last_lsn();
+    LogManager::sync_durable_to(&log, last).unwrap();
+    std::process::exit(86);
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication() {
+    use crate::engine::{api::QueryResponse, StorageQueryEngine};
+    fs::create_dir_all("/tmp/mydb").unwrap();
+    for mode in ["insert", "delete", "reuse", "rollback", "savepoint"] {
+        for point in 0..=5 {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::core::tests::spatial_index_crash_child",
+                    "--nocapture",
+                ])
+                .env("MYDB_SPATIAL_CRASH_DATABASE", dir.path())
+                .env("MYDB_SPATIAL_CRASH_KIND", mode)
+                .env("MYDB_SPATIAL_CRASH_POINT", point.to_string())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86), "{mode}, crash point {point}");
+            if mode == "delete" && point == 0 {
+                let interrupted = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "storage::core::tests::spatial_index_crash_child",
+                        "--nocapture",
+                    ])
+                    .env("MYDB_SPATIAL_CRASH_DATABASE", dir.path())
+                    .env("MYDB_SPATIAL_RECOVERY_ONLY", "1")
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    interrupted.code(),
+                    Some(86),
+                    "recovery must crash after a compensated spatial record"
+                );
+            }
+            let expected = match (mode, point) {
+                ("insert", 5) => "409",
+                ("savepoint", 5) => "410",
+                ("savepoint", _) => "408",
+                ("insert" | "rollback", _) => "408",
+                ("delete", 5) => "0",
+                ("delete", _) => "420",
+                ("reuse", 5) => "409",
+                ("reuse", _) => "0",
+                _ => unreachable!(),
+            };
+            for _ in 0..2 {
+                let engine = StorageQueryEngine::open(dir.path()).unwrap();
+                for hint in ["FORCE INDEX(sp)", "IGNORE INDEX(sp)"] {
+                    let result=engine.execute(&format!("SELECT COUNT(*) FROM crash_spatial {hint} WHERE MBRIntersects(g,ST_GeomFromText('POLYGON((-1 -1,2000 -1,2000 2000,-1 2000,-1 -1))'))")).unwrap().materialize().unwrap();
+                    let QueryResponse::ResultSet(rs) = result else {
+                        panic!("rows")
+                    };
+                    assert_eq!(
+                        rs.rows[0][0].to_display_string(),
+                        expected,
+                        "{mode}, crash point {point}"
+                    );
+                }
+                let db = engine.database_for_replication();
+                let table = db.table("test.crash_spatial").unwrap();
+                db.with_index_read(table.id, "sp", |index| {
+                    index.validate_structure()?;
+                    assert_eq!(
+                        index.entries()?.len(),
+                        expected.parse::<usize>().unwrap(),
+                        "{mode}, dangling or missing spatial entry at {point}"
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
     }
 }

@@ -286,15 +286,37 @@ impl Database {
                 // deliberately independent of transaction outcome.
                 self.apply_zone_map_wal(bytes)?;
             }
-            WalPayload::VectorIndexManifest { path, bytes } => redo_vector_manifest(&self.data_dir, path, bytes)?,
-            WalPayload::VectorIndexImage { path, offset, total, bytes } => {
-                if *offset == 0 { self.replica_vector_state.lock().images.insert(path.clone(), lsn); }
+            WalPayload::SpatialIndexUndo { .. } | WalPayload::SpatialIndexClr { .. } => {}
+            WalPayload::SpatialPageBatch { path, bytes } => {
+                self.apply_spatial_page_batch(path, bytes, lsn)?;
+            }
+            WalPayload::VectorIndexManifest { path, bytes } => {
+                redo_vector_manifest(&self.data_dir, path, bytes)?
+            }
+            WalPayload::VectorIndexImage {
+                path,
+                offset,
+                total,
+                bytes,
+            } => {
+                if *offset == 0 {
+                    self.replica_vector_state
+                        .lock()
+                        .images
+                        .insert(path.clone(), lsn);
+                }
                 redo_vector_image(&self.data_dir, path, *offset, *total, bytes, lsn)?;
-                if offset.checked_add(bytes.len() as u64) == Some(*total) { self.replica_vector_state.lock().images.remove(path); }
+                if offset.checked_add(bytes.len() as u64) == Some(*total) {
+                    self.replica_vector_state.lock().images.remove(path);
+                }
                 self.invalidate_buffer_pool_path(path)?;
             }
-            WalPayload::VectorIndexBatch { .. } | WalPayload::VectorIndexModel { .. } => self.note_replica_vector_record(record)?,
-            WalPayload::VectorIndexComplete { txn_id, commit_scn } => self.complete_replica_vector_transaction(*txn_id, *commit_scn)?,
+            WalPayload::VectorIndexBatch { .. } | WalPayload::VectorIndexModel { .. } => {
+                self.note_replica_vector_record(record)?
+            }
+            WalPayload::VectorIndexComplete { txn_id, commit_scn } => {
+                self.complete_replica_vector_transaction(*txn_id, *commit_scn)?
+            }
             WalPayload::HistoryIndexBatch { bytes } => {
                 // Kept invisible until the matching CommitTxn installs the
                 // commit-SCN ledger entry. Abort/loser batches are harmless.
@@ -954,7 +976,7 @@ impl Database {
         if !matches!(info.kind, crate::storage::naming::ObjectFileKind::Index) {
             return None;
         }
-        if info.ext != "idx" && info.ext != "hnsw" && info.ext != "hvec" {
+        if info.ext != "rtree" && info.ext != "idx" && info.ext != "hnsw" && info.ext != "hvec" {
             return None;
         }
         // Startup keeps compact catalog headers without index definitions.
@@ -1460,6 +1482,61 @@ impl Database {
             .fetch_max(txn_id + 1, Ordering::AcqRel);
         self.next_scn_atomic
             .fetch_max(prepare_scn + 1, Ordering::AcqRel);
+    }
+
+    fn apply_spatial_page_batch(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        lsn: u64,
+    ) -> Result<(), QueryError> {
+        if let Some((txn_id, key, row_id)) = spatial_index::deleted_key(bytes)? {
+            if let Some((storage_id, name)) = self.parse_index_table_and_name(path) {
+                let head = self
+                    .txns
+                    .read()
+                    .slot(txn_id)
+                    .filter(|s| s.status.is_in_flight())
+                    .map(|s| s.undo_head.clone());
+                if let Some(head) = head {
+                    self.index_repair_state.register(
+                        txn_id,
+                        [(
+                            IndexRepairKey {
+                                table_id: storage_id,
+                                index_name: normalize_name(&name),
+                                key,
+                            },
+                            row_id,
+                            true,
+                        )],
+                        &head,
+                        &self.index_repair_epochs,
+                        &self.index_repair_version,
+                    )?;
+                }
+            }
+        }
+        let abs = self.data_dir.join(path);
+        let cache = self.index_cache.write();
+        let handle = cache.values().find(|h| h.read().path == abs).cloned();
+        if let Some(handle) = handle {
+            let index = handle.read();
+            index
+                .spatial
+                .as_ref()
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_INDEX_CORRUPT,
+                        "invalid spatial replay target",
+                    )
+                })?
+                .replay(&self.data_dir, bytes, lsn)?;
+        } else {
+            spatial_index::redo(&self.data_dir, path, bytes, lsn)?;
+            self.buffer_pool.discard_pages_for_path(&abs)?;
+        }
+        Ok(())
     }
 
     fn apply_index_batch_record(

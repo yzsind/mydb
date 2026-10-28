@@ -390,6 +390,9 @@ pub enum WalRecordType {
     VectorIndexComplete = 39,
     VectorIndexManifest = 40,
     VectorIndexModel = 38,
+    SpatialPageBatch = 41,
+    SpatialIndexUndo = 42,
+    SpatialIndexClr = 43,
 }
 
 impl WalRecordType {
@@ -434,6 +437,9 @@ impl WalRecordType {
             37 => Self::VectorIndexImage,
             39 => Self::VectorIndexComplete,
             40 => Self::VectorIndexManifest,
+            41 => Self::SpatialPageBatch,
+            42 => Self::SpatialIndexUndo,
+            43 => Self::SpatialIndexClr,
             38 => Self::VectorIndexModel,
             _ => {
                 return Err(error(
@@ -655,6 +661,18 @@ pub enum WalPayload {
     VectorIndexComplete {
         txn_id: u64,
         commit_scn: u64,
+    },
+    /// Transaction-owned logical inverse; structural pages remain redo-only.
+    SpatialIndexUndo {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    SpatialIndexClr {
+        undo_next_lsn: u64,
+    },
+    SpatialPageBatch {
+        path: String,
+        bytes: Vec<u8>,
     },
     VectorIndexManifest {
         path: String,
@@ -3475,6 +3493,7 @@ impl LogManager {
                 | WalPayload::CommitTxn { .. }
                 | WalPayload::Clr { .. }
                 | WalPayload::FileClr { .. }
+                | WalPayload::SpatialIndexClr { .. }
                 | WalPayload::RollbackTo { .. }
                 | WalPayload::AbortTxn
                 | WalPayload::EndTxn
@@ -4352,6 +4371,9 @@ impl WalPayload {
             WalPayload::VectorIndexImage { .. } => WalRecordType::VectorIndexImage,
             WalPayload::VectorIndexComplete { .. } => WalRecordType::VectorIndexComplete,
             WalPayload::VectorIndexManifest { .. } => WalRecordType::VectorIndexManifest,
+            WalPayload::SpatialPageBatch { .. } => WalRecordType::SpatialPageBatch,
+            WalPayload::SpatialIndexUndo { .. } => WalRecordType::SpatialIndexUndo,
+            WalPayload::SpatialIndexClr { .. } => WalRecordType::SpatialIndexClr,
             WalPayload::CatalogDelta { .. } => WalRecordType::CatalogDelta,
             WalPayload::DdlCommit { .. } => WalRecordType::DdlCommit,
             WalPayload::AutoIncrementAdvance { .. } => WalRecordType::AutoIncrementAdvance,
@@ -4424,7 +4446,9 @@ fn accumulate_wal_stats(stats: &mut WalStats, payload: &WalPayload) {
                 .index_payload_bytes
                 .saturating_add(ops.iter().map(|op| op.key.len() as u64 + 20).sum::<u64>());
         }
-        WalPayload::HistoryIndexBatch { bytes }
+        WalPayload::SpatialIndexUndo { bytes, .. }
+        | WalPayload::SpatialPageBatch { bytes, .. }
+        | WalPayload::HistoryIndexBatch { bytes }
         | WalPayload::VectorIndexBatch { bytes }
         | WalPayload::VectorIndexModel { bytes } => {
             stats.logical_records += 1;
@@ -5453,7 +5477,10 @@ fn encode_payload_into(payload: &WalPayload, mut out: &mut Vec<u8>) -> Result<()
         | WalPayload::HistoryIndexBatch { bytes }
         | WalPayload::VectorIndexBatch { bytes }
         | WalPayload::VectorIndexModel { bytes } => write_bytes(&mut out, bytes)?,
-        WalPayload::VectorIndexManifest { path, bytes } => {
+        WalPayload::SpatialIndexClr { undo_next_lsn } => write_u64_vec(&mut out, *undo_next_lsn),
+        WalPayload::SpatialIndexUndo { path, bytes }
+        | WalPayload::SpatialPageBatch { path, bytes }
+        | WalPayload::VectorIndexManifest { path, bytes } => {
             write_string(&mut out, path)?;
             write_bytes(&mut out, bytes)?;
         }
@@ -5863,7 +5890,10 @@ fn encoded_payload_len(payload: &WalPayload) -> Result<usize, QueryError> {
         | WalPayload::HistoryIndexBatch { bytes }
         | WalPayload::VectorIndexBatch { bytes }
         | WalPayload::VectorIndexModel { bytes } => encoded_bytes_len(bytes.len()),
-        WalPayload::VectorIndexManifest { path, bytes } => checked_sum([
+        WalPayload::SpatialIndexClr { .. } => Ok(8),
+        WalPayload::SpatialIndexUndo { path, bytes }
+        | WalPayload::SpatialPageBatch { path, bytes }
+        | WalPayload::VectorIndexManifest { path, bytes } => checked_sum([
             encoded_bytes_len(path.len())?,
             encoded_bytes_len(bytes.len())?,
         ]),
@@ -6336,6 +6366,17 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
             bytes: read_bytes(input, &mut offset)?,
         },
         WalRecordType::VectorIndexModel => WalPayload::VectorIndexModel {
+            bytes: read_bytes(input, &mut offset)?,
+        },
+        WalRecordType::SpatialIndexUndo => WalPayload::SpatialIndexUndo {
+            path: read_string(input, &mut offset)?,
+            bytes: read_bytes(input, &mut offset)?,
+        },
+        WalRecordType::SpatialIndexClr => WalPayload::SpatialIndexClr {
+            undo_next_lsn: read_u64_checked(input, &mut offset)?,
+        },
+        WalRecordType::SpatialPageBatch => WalPayload::SpatialPageBatch {
+            path: read_string(input, &mut offset)?,
             bytes: read_bytes(input, &mut offset)?,
         },
         WalRecordType::VectorIndexManifest => WalPayload::VectorIndexManifest {

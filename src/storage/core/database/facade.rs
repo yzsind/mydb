@@ -642,8 +642,6 @@ impl Database {
             heap_cache: parking_lot::RwLock::new(Default::default()),
             storage_handle_open_epochs: Mutex::new(HashMap::new()),
             index_cache: parking_lot::RwLock::new(Default::default()),
-            index_mutation_generations: parking_lot::RwLock::new(Default::default()),
-            spatial_rtree_cache: parking_lot::RwLock::new(Default::default()),
             overflow_cache: parking_lot::RwLock::new(Default::default()),
             zone_map_gate: parking_lot::RwLock::new(()),
             backup_maintenance_gate: parking_lot::RwLock::new(()),

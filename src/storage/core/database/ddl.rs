@@ -1364,9 +1364,14 @@ impl Database {
                 self.persist_auto_increment_max(id, auto_increment_max)?;
             }
             if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
                 self.initialize_empty_zone_maps_for_table(&table)?;
-                let vector_names = table.indexes.iter().filter(|index| index.is_vector())
-                    .map(|index| index.name.as_str()).collect::<Vec<_>>();
+                let vector_names = table
+                    .indexes
+                    .iter()
+                    .filter(|index| index.is_vector())
+                    .map(|index| index.name.as_str())
+                    .collect::<Vec<_>>();
                 self.warm_vector_graphs_after_ddl(&table, &vector_names)?;
             }
             self.note_catalog_table_key(&key)?;
@@ -1500,6 +1505,9 @@ impl Database {
                 // Seed the runtime counter; temporary tables never persist
                 // AUTO_INCREMENT dynamic metadata.
                 self.auto_increment.install(id, 1, auto_increment_max)?;
+            }
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
             }
             Ok(())
         })();
@@ -1761,8 +1769,14 @@ impl Database {
                 self.auto_increment.install(id, 1, 0)?;
             }
             self.remove_heap_cache_entry(id)?;
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
+            }
             for storage_id in &partition_ids {
                 self.remove_heap_cache_entry(*storage_id)?;
+            }
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
             }
             self.note_catalog_table_key(&key)?;
             self.commit_ddl_catalog_txn()
@@ -1852,6 +1866,9 @@ impl Database {
                 self.auto_increment.install(id, 1, 0)?;
             }
             self.remove_heap_cache_entry(id)?;
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
+            }
             Ok(())
         })();
         if let Err(err) = finalize {
@@ -1935,6 +1952,7 @@ impl Database {
             self.reset_auto_increment(table.id)?;
         }
         self.drop_table_vector_graphs(&table)?;
+        self.initialize_empty_spatial_indexes(&table)?;
         Ok(())
     }
 
@@ -2013,6 +2031,14 @@ impl Database {
             }
             for index in &table.indexes {
                 self.with_index_read(sid, &index.name, |idx| {
+                    if let Some(spatial) = &idx.spatial {
+                        return self.flush_temp_snapshot_pages(
+                            &idx.path,
+                            idx.file_key.clone(),
+                            spatial.count_pages(),
+                            None,
+                        );
+                    }
                     let meta = idx.meta_state.lock().meta.clone();
                     self.flush_temp_snapshot_pages(
                         &idx.path,
@@ -2228,10 +2254,16 @@ impl Database {
             next.primary_key = index.columns.clone();
         }
         index.state = IndexState::Public;
-        self.prepare_empty_temp_index_file(next.id, &index.name)?;
+        if !index.is_spatial() {
+            self.prepare_empty_temp_index_file(next.id, &index.name)?;
+        }
         next.indexes.push(index.clone());
         next.bump_schema_version();
-        self.rebuild_index(&next, &index)?;
+        if let Err(err) = self.rebuild_index(&next, &index) {
+            self.remove_index_cache_entry(next.id, &index.name)?;
+            self.remove_temp_file(self.index_path_for_table_schema(&next, next.id, &index.name))?;
+            return Err(err);
+        }
         self.temp_tables
             .write()
             .map_err(|_| {
@@ -2362,7 +2394,9 @@ impl Database {
         self.flush_dirty_data()?;
         self.remove_index_cache_entry(table.id, old_name)?;
         let old_path = self.index_path(table.id, old_name);
-        let new_path = self.index_path(table.id, new_name);
+        let new_path = self
+            .index_path(table.id, new_name)
+            .with_extension(if index.is_spatial() { "rtree" } else { "idx" });
         if old_path.exists() {
             fs::rename(&old_path, &new_path).map_err(io_err)?;
         }
@@ -3327,6 +3361,7 @@ impl Database {
         for path in &private.files {
             self.create_logged_file(txn_id_for_ddl(), self.data_dir.join(path), Vec::new())?;
         }
+        self.initialize_empty_spatial_indexes(&candidate)?;
         let candidate = Arc::new(candidate);
         let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
             crate::engine::executor::mem_budget::ControlledMemoryCategory::SystemMetadata,
@@ -4421,7 +4456,7 @@ impl Database {
                         table.id,
                         table.active_generation.max(1),
                         index.index_id,
-                        "idx",
+                        if index.is_spatial() { "rtree" } else { "idx" },
                     ),
                 )?;
             }
@@ -5182,7 +5217,11 @@ impl Database {
                     storage_id,
                     table_snapshot.active_generation.max(1),
                     dropped_index.index_id,
-                    "idx",
+                    if dropped_index.is_spatial() {
+                        "rtree"
+                    } else {
+                        "idx"
+                    },
                 ),
             ));
             if dropped_index.is_vector() {
@@ -8319,12 +8358,6 @@ impl Database {
                 cache.insert((source.id, name), handle);
             }
         }
-        self.spatial_rtree_cache
-            .write()
-            .retain(|(id, _), _| *id != source.id && *id != shadow_id);
-        self.index_mutation_generations
-            .write()
-            .retain(|(id, _), _| *id != source.id && *id != shadow_id);
         self.forget_zone_map(source.id)?;
         self.table_locks_sharded
             .set_schema_floor(source.id, target.schema_version);
@@ -11210,6 +11243,23 @@ impl Database {
                         ),
                     )
                 };
+                if index.is_spatial() {
+                    let mut actual = self.with_index_read(*storage_id, &index.name, |file| {
+                        file.validate_structure()?;
+                        file.entries()
+                    })?;
+                    actual.sort_unstable();
+                    for (key, row_id) in actual {
+                        let entry = expected.next().transpose()?.ok_or_else(&mismatch)?;
+                        if entry.key != key || entry.row_id != row_id {
+                            return Err(mismatch());
+                        }
+                    }
+                    if expected.next().transpose()?.is_some() {
+                        return Err(mismatch());
+                    }
+                    continue;
+                }
                 let mut actual = IndexRangeCursor::new(
                     self.index_handle(*storage_id, &index.name)?,
                     false,
@@ -11705,6 +11755,7 @@ impl Database {
             self.create_logged_file(txn_id_for_ddl(), self.table_path(*sid), Vec::new())?;
             self.remove_heap_cache_entry(*sid)?;
         }
+        self.initialize_empty_spatial_indexes_at(&candidate, &new_sids)?;
         self.note_catalog_table(table.id);
         self.commit_ddl_catalog_txn()?;
 
@@ -12226,6 +12277,7 @@ impl Database {
             self.create_logged_file(txn_id_for_ddl(), self.table_path(*sid), Vec::new())?;
             self.remove_heap_cache_entry(*sid)?;
         }
+        self.initialize_empty_spatial_indexes_at(&candidate, &new_sids)?;
         self.note_catalog_table(table.id);
         self.commit_ddl_catalog_txn()?;
         if !rows.is_empty() {

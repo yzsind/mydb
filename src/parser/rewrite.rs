@@ -65,6 +65,7 @@ pub(super) struct PostParseState {
     pub(super) window_frame_exclusions: Vec<WindowFrameExclusion>,
     pub(super) create_index_visible: Option<bool>,
     pub(super) create_index_fulltext: bool,
+    pub(super) create_index_spatial: bool,
     pub(super) update_modifiers: UpdateModifiers,
     pub(super) delete_modifiers: DeleteModifiers,
     pub(super) partition_for_create: Option<crate::parser_partition::PartitionDef>,
@@ -95,6 +96,11 @@ impl PostParseState {
             (self.create_index_visible, &mut *statement)
         {
             index.visible = visible;
+        }
+        if self.create_index_spatial {
+            if let Statement::CreateIndex(index) = &mut *statement {
+                index.index_type = "SPATIAL".to_string();
+            }
         }
         if self.create_index_fulltext {
             if let Statement::CreateIndex(index) = &mut *statement {
@@ -456,14 +462,23 @@ pub(super) fn strip_fulltext_parsers(
 /// right after CREATE). Returns `true` on a hit; the caller then sets the converted
 /// `CreateIndex.index_type` to `FULLTEXT`. Must run after [`strip_fulltext_parsers`]: that pass
 /// aligns `WITH PARSER` names via `fulltext` word occurrences; deleting the keyword early makes it exit early and miss the parser name.
-pub(super) fn strip_create_index_fulltext(
-    sql: &str,
-    has_fulltext: bool,
-) -> (std::borrow::Cow<'_, str>, bool) {
+pub(super) fn strip_create_index_fulltext(sql: &str, has_fulltext: bool) -> (Cow<'_, str>, bool) {
+    strip_create_index_kind(sql, has_fulltext, b"fulltext")
+}
+
+pub(super) fn strip_create_index_spatial(sql: &str) -> (Cow<'_, str>, bool) {
+    strip_create_index_kind(sql, true, b"spatial")
+}
+
+fn strip_create_index_kind<'a>(
+    sql: &'a str,
+    has_keyword: bool,
+    keyword: &[u8],
+) -> (Cow<'a, str>, bool) {
     // Head guard plus pre-scanned `has_fulltext`. Without these
     // `to_ascii_lowercase` would allocate a full copy of the SQL on every
     // `parse_statement`.
-    if !has_fulltext || !first_keyword_is(sql, b"CREATE") {
+    if !has_keyword || !first_keyword_is(sql, b"CREATE") {
         return (std::borrow::Cow::Borrowed(sql), false);
     }
     let lower = sql.to_ascii_lowercase();
@@ -481,11 +496,11 @@ pub(super) fn strip_create_index_fulltext(
     while i < b.len() && b[i].is_ascii_whitespace() {
         i += 1;
     }
-    if i == after_create || !fulltext_word_ci(lb, i, b"fulltext") {
+    if i == after_create || !fulltext_word_ci(lb, i, keyword) {
         return (std::borrow::Cow::Borrowed(sql), false);
     }
     let fulltext_start = i;
-    i += "fulltext".len();
+    i += keyword.len();
     let after_fulltext = i;
     while i < b.len() && b[i].is_ascii_whitespace() {
         i += 1;

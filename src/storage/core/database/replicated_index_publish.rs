@@ -140,6 +140,12 @@ impl Database {
                     leaf.id = id;
                     leaf.active_generation = self.storage_generation(id);
                     let path = self.index_path_for_table_schema(&leaf, id, &index.name);
+                    if index.is_spatial() {
+                        // Source page batches precede the catalog publication.
+                        // Never derive a replica R-tree from its heap.
+                        spatial_index::SpatialIndexFile::quick_validate(path)?;
+                        continue;
+                    }
                     if self.config.durability == DurabilityMode::Memory {
                         let minimum = 16 * 1024 * 1024;
                         let (_lease, _charge, scratch) =

@@ -1128,6 +1128,31 @@ impl IndexBatchStream {
         if !self.covering {
             return false;
         }
+        // Build-side integer values do not prove the physical index domain:
+        // an INT = DECIMAL equality is valid, but DECIMAL keys cannot use the
+        // raw integer decoder. Leave other domains to the parent join.
+        use crate::storage::schema::DataTypeKind;
+        let Ok(column_index) = self.table.schema.column_index(column) else {
+            return false;
+        };
+        if self.index.key_expression(key_position).is_some()
+            || !matches!(
+                self.table.schema.columns[column_index].data_type,
+                DataTypeKind::TinyInt
+                    | DataTypeKind::SmallInt
+                    | DataTypeKind::MediumInt
+                    | DataTypeKind::Int
+                    | DataTypeKind::BigInt
+                    | DataTypeKind::Bool
+                    | DataTypeKind::Date
+                    | DataTypeKind::Time { .. }
+                    | DataTypeKind::DateTime { .. }
+                    | DataTypeKind::Timestamp { .. }
+                    | DataTypeKind::Year
+            )
+        {
+            return false;
+        }
         self.exact_runtime_filters.push(ExactIndexRuntimeFilter {
             key_position,
             filter,

@@ -3436,7 +3436,6 @@ impl Database {
             self.note_vector_snapshot_change(graph);
         }
         drop(map);
-        self.note_spatial_cache_change(table, None, Some(values), row_id, storage_id);
         Ok(())
     }
 
@@ -3684,27 +3683,6 @@ impl Database {
         }
     }
 
-    fn note_spatial_cache_change(
-        &self,
-        table: &TableSchema,
-        old_values: Option<&[Value]>,
-        new_values: Option<&[Value]>,
-        row_id: RowId,
-        storage_id: u64,
-    ) {
-        for index in table.indexes.iter().filter(|index| index.is_spatial()) {
-            let old_key = old_values.and_then(|values| table.index_key(index, values).ok());
-            let new_key = new_values.and_then(|values| table.index_key(index, values).ok());
-            self.update_warm_spatial_cache(
-                storage_id,
-                &index.name,
-                row_id,
-                old_key.as_ref(),
-                new_key.as_ref(),
-            );
-        }
-    }
-
     /// The undo marker for deferred ANN maintenance, or `None` when the table
     /// has no vector/spatial index. Ordinary B-tree tables must not
     /// take the transaction-directory latch per mutated row just to discover
@@ -3890,33 +3868,8 @@ impl Database {
                         entry.storage_id,
                         &retire,
                     )?;
-                    self.note_spatial_cache_change(
-                        &table,
-                        Some(old_values),
-                        Some(&new_values),
-                        entry.row_id,
-                        entry.storage_id,
-                    );
                 } else {
                     self.note_vector_deletes(&table, entry.row_id, entry.storage_id, &retire)?;
-                    if let Some(old_values) = entry.old_values.as_deref() {
-                        self.note_spatial_cache_change(
-                            &table,
-                            Some(old_values),
-                            None,
-                            entry.row_id,
-                            entry.storage_id,
-                        );
-                    } else {
-                        // DELETE callers do not retain a second copy of the
-                        // before-image here. Invalidate only the affected
-                        // spatial caches; the next query rebuilds from the
-                        // authoritative B-tree without risking a false negative.
-                        let mut caches = self.spatial_rtree_cache.write();
-                        for index in table.indexes.iter().filter(|index| index.is_spatial()) {
-                            caches.remove(&(entry.storage_id, normalize_name(&index.name)));
-                        }
-                    }
                 }
             }
             #[cfg(test)]
@@ -5078,10 +5031,7 @@ pub(crate) static VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK: parking_lot::Mutex<
 > = parking_lot::Mutex::new(None);
 
 fn table_has_deferred_ann_indexes(table: &TableSchema) -> bool {
-    table
-        .indexes
-        .iter()
-        .any(|index| index.is_vector() || index.is_spatial())
+    table.indexes.iter().any(|index| index.is_vector())
 }
 
 #[cfg(test)]

@@ -1962,6 +1962,10 @@ fn reconstruct_column(r: &[Value]) -> ColumnSchema {
 
 /// Physical index identity for startup validation. Key definitions are only
 /// needed if validation discovers a file that must be rebuilt.
+pub(crate) fn index_is_spatial(row: &[Value]) -> bool {
+    r_str(row, 3).eq_ignore_ascii_case("SPATIAL")
+}
+
 pub(crate) fn index_is_fulltext(row: &[Value]) -> bool {
     r_str(row, 3).eq_ignore_ascii_case("FULLTEXT")
 }
