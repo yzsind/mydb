@@ -69,7 +69,7 @@ pub struct MasterServiceInit {
 /// Start the listener. Returns a [`MasterService`] handle whose
 /// `bind_addr` is the actual address (useful when `bind_port = 0`).
 pub async fn start(init: MasterServiceInit) -> Result<MasterService, QueryError> {
-    let bind = format!("{}:{}", init.bind_host, init.bind_port);
+    let bind = crate::repl::format_endpoint(&init.bind_host, init.bind_port);
     let listener = TcpListener::bind(&bind).await.map_err(|err| {
         error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -86,6 +86,7 @@ pub fn start_bound(
     init: MasterServiceInit,
     listener: TcpListener,
 ) -> Result<MasterService, QueryError> {
+    init.config.auth_token.validate()?;
     let bind_addr = listener.local_addr().map_err(|err| {
         error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -119,12 +120,19 @@ pub fn start_bound(
     let shutdown_clone = Arc::clone(&shutdown);
     let connection_slots_for_accept = Arc::clone(&connection_slots);
 
+    let shutdown_flag_for_accept = Arc::clone(&shutdown_flag);
     let join = tokio::spawn(async move {
         let mut senders = tokio::task::JoinSet::new();
+        let notified = shutdown_clone.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         loop {
+            if shutdown_flag_for_accept.load(Ordering::Acquire) {
+                break;
+            }
             tokio::select! {
                 biased;
-                _ = shutdown_clone.notified() => {
+                _ = &mut notified => {
                     log_message(format_args!(
                         "mydb-repl master: shutdown signal received, stopping accept loop"
                     ));
@@ -285,7 +293,7 @@ mod tests {
             bind_port: 0,
             config: ReplConfig {
                 heartbeat: Duration::from_millis(50),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             master_uuid: [0xAA; 16],
             epoch: 1,
@@ -314,6 +322,7 @@ mod tests {
         let mut reader = BufReader::new(rh);
         let mut writer = BufWriter::new(wh);
         let h = Handshake {
+            auth_token: ReplConfig::test_defaults().auth_token,
             protocol_version: PROTOCOL_VERSION,
             replica_uuid: [0xBB; 16],
             requested_start_lsn: start_lsn,
@@ -336,6 +345,48 @@ mod tests {
             other => panic!("expected HandshakeAck, got {other:?}"),
         };
         (reader, writer, ack)
+    }
+
+    #[tokio::test]
+    async fn release_audit_immediate_shutdown_is_sticky() {
+        let dir = TempDir::new().unwrap();
+        let (service, _) = build_service(&dir).await;
+        tokio::time::timeout(Duration::from_secs(1), service.shutdown())
+            .await
+            .expect("shutdown before accept task first polls must not be lost");
+    }
+
+    #[tokio::test]
+    async fn release_audit_unauthenticated_handshake_creates_no_slot() {
+        let dir = TempDir::new().unwrap();
+        let (service, _) = build_service(&dir).await;
+        for token in ["", "wrong-but-long-enough-secret"] {
+            let mut socket = TcpStream::connect(service.bind_addr()).await.unwrap();
+            let request = Handshake {
+                auth_token: token.into(),
+                protocol_version: PROTOCOL_VERSION,
+                replica_uuid: crate::repl::role::generate_uuid_bytes(),
+                requested_start_lsn: 0,
+                last_known_master_uuid: [0; 16],
+                last_known_epoch: 0,
+                cluster_uuid: [0; 16],
+                last_known_timeline_uuid: [0; 16],
+                client_version: "unauthorized".into(),
+                request_base_backup: true,
+                max_chunk_bytes: 4096,
+                format_compatibility:
+                    crate::storage::format_versions::native_replication_compatibility(),
+            };
+            write_frame_async(&mut socket, &Message::Handshake(request))
+                .await
+                .unwrap();
+            assert!(matches!(
+                read_frame_async(&mut socket).await.unwrap(),
+                Message::Close(_)
+            ));
+            assert!(service.slots.lock().snapshot().is_empty());
+        }
+        service.shutdown().await;
     }
 
     #[tokio::test]
@@ -546,7 +597,7 @@ mod tests {
         let svc = start(MasterServiceInit {
             bind_host: "127.0.0.1".to_string(),
             bind_port: 0,
-            config: ReplConfig::default(),
+            config: ReplConfig::test_defaults(),
             master_uuid: [0xAA; 16],
             epoch: 5,
             server_version: "test".into(),
@@ -566,6 +617,7 @@ mod tests {
         let mut writer = BufWriter::new(wh);
         // Replica claims a DIFFERENT prior master UUID.
         let h = Handshake {
+            auth_token: ReplConfig::test_defaults().auth_token,
             protocol_version: PROTOCOL_VERSION,
             replica_uuid: [0xBB; 16],
             requested_start_lsn: 1,
@@ -605,7 +657,7 @@ mod tests {
         let svc = start(MasterServiceInit {
             bind_host: "127.0.0.1".to_string(),
             bind_port: 0,
-            config: ReplConfig::default(),
+            config: ReplConfig::test_defaults(),
             master_uuid: [0xCC; 16],
             epoch: 3,
             server_version: "test".into(),
@@ -624,6 +676,7 @@ mod tests {
         let mut reader = BufReader::new(rh);
         let mut writer = BufWriter::new(wh);
         let h = Handshake {
+            auth_token: ReplConfig::test_defaults().auth_token,
             protocol_version: PROTOCOL_VERSION,
             replica_uuid: [0xDD; 16],
             requested_start_lsn: 1,

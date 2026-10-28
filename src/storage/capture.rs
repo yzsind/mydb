@@ -353,6 +353,22 @@ impl DatabaseServices {
     }
 }
 
+struct LogicalApplyGate(Arc<parking_lot::RwLock<()>>);
+
+/// Coordinate physical snapshot capture with complete logical source commits,
+/// including deferred durability and temporal sidecar publication.
+pub(crate) fn logical_apply_gate(
+    db: &super::Database,
+) -> Result<Arc<parking_lot::RwLock<()>>, QueryError> {
+    db.services
+        .get_or_init(|| {
+            Ok(Arc::new(LogicalApplyGate(Arc::new(
+                parking_lot::RwLock::new(()),
+            ))))
+        })
+        .map(|gate| Arc::clone(&gate.0))
+}
+
 use super::Database;
 pub(crate) struct Admission<'a>(&'a crate::storage::capture::CaptureState);
 impl<'a> Admission<'a> {

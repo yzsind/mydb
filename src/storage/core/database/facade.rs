@@ -319,6 +319,7 @@ impl Database {
         let dir_lock = crate::storage::dir_lock::DataDirLock::acquire(&data_dir)?;
         if !snapshot_read_only {
             crate::storage::image::cleanup_abandoned_staging(&data_dir)?;
+            crate::repl::base_backup::cleanup_abandoned_snapshots(&data_dir)?;
         }
         if snapshot_read_only {
             crate::storage::image::validate_open(&data_dir)?;

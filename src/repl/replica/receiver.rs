@@ -99,7 +99,7 @@ impl Receiver {
         // failed after append, so reconnect must resume from the persisted
         // durable-applied watermark and replay that tail idempotently.
         let mut initial_progress = self.initial_progress.clone();
-        let addr = format!("{}:{}", self.master_host, self.master_port);
+        let addr = crate::repl::format_endpoint(&self.master_host, self.master_port);
         let stream =
             match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
                 Ok(Ok(s)) => s,
@@ -130,7 +130,14 @@ impl Receiver {
         let mut writer = BufWriter::new(wh);
 
         // -------- Handshake --------
-        let replica_uuid_bytes = uuid_string_to_bytes(&self.replica_uuid).unwrap_or([0u8; 16]);
+        let replica_uuid_bytes = uuid_string_to_bytes(&self.replica_uuid)
+            .filter(|uuid| *uuid != [0; 16])
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_WRONG_VALUE,
+                    "replica UUID is invalid",
+                )
+            })?;
         let last_master_bytes = if !initial_progress.last_master_uuid.is_empty() {
             uuid_string_to_bytes(&initial_progress.last_master_uuid).unwrap_or([0; 16])
         } else {
@@ -141,6 +148,7 @@ impl Receiver {
             .saturating_add(1)
             .max(1);
         let handshake = Handshake {
+            auth_token: self.config.auth_token.clone(),
             protocol_version: PROTOCOL_VERSION,
             replica_uuid: replica_uuid_bytes,
             requested_start_lsn: start_lsn,
@@ -177,6 +185,13 @@ impl Receiver {
         .await
         {
             Ok(Ok(Message::HandshakeAck(a))) => a,
+            Ok(Ok(Message::Close(close))) => {
+                return Err(QueryError::internal_control(
+                    crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+                    crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+                    close.reason,
+                ));
+            }
             Ok(Ok(other)) => {
                 return Err(error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -197,7 +212,8 @@ impl Receiver {
         let master_uuid = crate::repl::role::uuid_bytes_to_string(&ack.master_uuid);
         let local_format = crate::storage::format_versions::native_replication_compatibility();
         if ack.format_compatibility != local_format {
-            return Err(error(
+            return Err(QueryError::internal_control(
+                crate::error::InternalErrorKind::ReplicaHandshakeRejected,
                 crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
                 format!(
                     "native replication format mismatch: master='{}', replica='{}'",
@@ -211,14 +227,27 @@ impl Receiver {
                 reason: format!("handshake rejected: {}", ack.reason),
             });
             // Drain a possible Resync.
-            if let Ok(Message::Resync(r)) = protocol::read_frame_async(&mut reader).await {
+            let followup = tokio::select! {
+                _ = &mut shutdown_notified => return Ok(()),
+                result = tokio::time::timeout(Duration::from_secs(10), protocol::read_frame_async(&mut reader)) => result,
+            };
+            if let Ok(Ok(Message::Resync(r))) = followup {
                 on_event(ReceiverEvent::ResyncRequired {
                     new_start_lsn: r.new_start_lsn,
                     reason: r.reason,
                 });
+                return Ok(());
             }
-            return Ok(());
+            return Err(QueryError::internal_control(
+                crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+                crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+                format!(
+                    "master rejected native replication handshake: {}",
+                    ack.reason
+                ),
+            ));
         }
+        initial_progress.source_heartbeat_ms = ack.heartbeat_ms;
         initial_progress.last_master_uuid.clone_from(&master_uuid);
         initial_progress.last_master_epoch = ack.epoch;
         initial_progress.cluster_uuid = crate::repl::role::uuid_bytes_to_string(&ack.cluster_uuid);
@@ -272,6 +301,7 @@ impl Receiver {
         let idle_timeout = self
             .config
             .heartbeat
+            .max(Duration::from_millis(ack.heartbeat_ms.max(1)))
             .saturating_mul(6)
             .max(Duration::from_secs(5));
         let mut idle_check =
@@ -295,7 +325,7 @@ impl Receiver {
             // bytes for a fresh "REPL" header. Keep one pinned read alive
             // across ACK/watchdog ticks; only discard it when the whole
             // connection is being closed.
-            let inbound = protocol::read_frame_async(&mut reader);
+            let inbound = protocol::read_frame_async_window(&mut reader, admitted_chunk_bytes);
             tokio::pin!(inbound);
             loop {
                 tokio::select! {
@@ -313,7 +343,7 @@ impl Receiver {
                         return Ok(());
                     }
                     inbound = &mut inbound => {
-                        let msg = match inbound {
+                        let (msg, _frame_memory) = match inbound {
                             Ok(m) => m,
                             Err(err) => {
                                 on_event(ReceiverEvent::Disconnected {
@@ -535,6 +565,7 @@ mod tests {
             source_current_lsn: 42,
             source_durable_lsn: 42,
             source_generation: 3,
+            source_heartbeat_ms: 1000,
             source_frozen: false,
             source_fence_lsn: 0,
             source_fence_token_hash: String::new(),
@@ -557,6 +588,7 @@ mod tests {
             protocol::write_frame_async(
                 &mut stream,
                 &Message::HandshakeAck(HandshakeAck {
+                    heartbeat_ms: 1000,
                     master_uuid: [0x5a; 16],
                     current_lsn: 1,
                     durable_lsn: 1,
@@ -624,7 +656,7 @@ mod tests {
             replica_uuid: "00112233-4455-6677-8899-aabbccddeeff".into(),
             config: ReplConfig {
                 heartbeat: Duration::from_millis(50),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             data_dir: dir.path().to_path_buf(),
             log,
@@ -661,6 +693,7 @@ mod tests {
             protocol::write_frame_async(
                 &mut stream,
                 &Message::HandshakeAck(HandshakeAck {
+                    heartbeat_ms: 1000,
                     master_uuid: [0x6b; 16],
                     current_lsn: 1,
                     durable_lsn: 1,
@@ -701,7 +734,7 @@ mod tests {
             master_host: "127.0.0.1".into(),
             master_port: port,
             replica_uuid: "00112233-4455-6677-8899-aabbccddeeff".into(),
-            config: ReplConfig::default(),
+            config: ReplConfig::test_defaults(),
             data_dir: dir.path().to_path_buf(),
             log,
             db: None,
@@ -724,5 +757,102 @@ mod tests {
         .expect("receiver shutdown notification must not be lost");
         result.expect("receiver shutdown should be clean");
         master.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod release_audit_tests {
+    use super::*;
+
+    fn ack(accepted: bool) -> Message {
+        Message::HandshakeAck(HandshakeAck {
+            heartbeat_ms: 6000,
+            master_uuid: [1; 16],
+            current_lsn: 1,
+            durable_lsn: 0,
+            min_available_lsn: 1,
+            epoch: 1,
+            server_version: "test".into(),
+            accepted,
+            reason: if accepted { "" } else { "version mismatch" }.into(),
+            format_compatibility: crate::storage::format_versions::native_replication_compatibility(
+            ),
+            semi_sync_required: false,
+            cluster_uuid: [1; 16],
+            timeline_uuid: [1; 16],
+            generation: 1,
+            source_frozen: false,
+            fence_lsn: 0,
+            fence_token_hash: String::new(),
+        })
+    }
+
+    async fn with_peer(accepted: bool, run_for: Duration) {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            protocol::read_frame_async(&mut stream).await.unwrap();
+            protocol::write_frame_async(&mut stream, &ack(accepted))
+                .await
+                .unwrap();
+            let _ = ready.send(());
+            // Drain ACKs but deliberately send no heartbeat and never close.
+            while protocol::read_frame_async(&mut stream).await.is_ok() {}
+        });
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_task = shutdown.clone();
+        let receiver = Receiver {
+            master_host: "127.0.0.1".into(),
+            master_port: port,
+            replica_uuid: crate::repl::role::generate_uuid_string(),
+            config: ReplConfig {
+                heartbeat: Duration::from_millis(1),
+                ..ReplConfig::test_defaults()
+            },
+            data_dir: dir.path().to_path_buf(),
+            log: Arc::new(parking_lot::Mutex::new(
+                crate::wal::LogManager::open(dir.path()).unwrap(),
+            )),
+            db: None,
+            initial_progress: ReplicaProgress::default(),
+            shutdown_flag: None,
+        };
+        let run = tokio::spawn(async move {
+            let mut disconnected = false;
+            let result = receiver
+                .run_once(shutdown_task, |event| {
+                    if accepted && matches!(event, ReceiverEvent::Disconnected { .. }) {
+                        disconnected = true;
+                    }
+                })
+                .await;
+            assert!(
+                !disconnected,
+                "negotiated heartbeat must prevent false idle timeout"
+            );
+            result
+        });
+        ready_rx.await.unwrap();
+        tokio::time::sleep(run_for).await;
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("shutdown must interrupt rejected-handshake drain")
+            .unwrap()
+            .unwrap();
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_handshake_drain_observes_shutdown() {
+        with_peer(false, Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn source_heartbeat_is_used_for_idle_watchdog() {
+        with_peer(true, Duration::from_millis(5300)).await;
     }
 }

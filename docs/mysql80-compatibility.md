@@ -949,7 +949,7 @@ their underlying tables.
 
 ### mydb → mydb Native Physical Replication
 
-➕ **mydb extension** (`MYDB_REPL_PORT` 3316): protocol v2, format fingerprints,
+➕ **mydb extension** (`MYDB_REPL_PORT` 3316): protocol v3, format fingerprints,
 mTLS, received/durable/applied watermarks, slots/retention, staged base backups, timeline/fencing,
 and manual controlled switchover. SQL surface: `CHANGE MYDB MASTER TO` / `START|STOP|RESET MYDB REPLICATION` /
 `STOP|RESUME MASTER WRITES` / controlled or `FORCE FENCED` `PROMOTE TO MASTER` /

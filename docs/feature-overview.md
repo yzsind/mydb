@@ -137,7 +137,7 @@ Every build includes the MySQL replica receiver. The IO thread pulls binlog into
 
 ### 7.3 Native mydb physical replication
 
-mydb provides native WAL physical replication independent of MySQL binlog, managed with `MYDB` keywords. It includes protocol v2/mTLS, async/semi-sync, four-watermark ACKs, slots, timeline/fork detection, retention, staged base physical backups, manually controlled promote/demote, and status queries.
+mydb provides native WAL physical replication independent of MySQL binlog, managed with `MYDB` keywords. It includes protocol v3/mTLS, async/semi-sync, four-watermark ACKs, slots, timeline/fork detection, retention, staged base physical backups, manually controlled promote/demote, and status queries.
 
 ### 7.4 Online Backup and PITR
 

@@ -78,7 +78,12 @@ impl RetentionPolicy {
                     // forever" and abandoning a live slot. Only abandon
                     // when we have a real timestamp and it has genuinely
                     // aged past the timeout.
-                    let aged_out = slot.last_seen_ms > 0
+                    let seed_lease = slot.seeding
+                        && (slot.connected
+                            || now_ms.saturating_sub(slot.last_seen_ms)
+                                < self.slot_timeout_ms.max(60_000));
+                    let aged_out = !seed_lease
+                        && slot.last_seen_ms > 0
                         && now_ms >= slot.last_seen_ms
                         && now_ms - slot.last_seen_ms >= self.slot_timeout_ms;
                     if aged_out {
@@ -178,7 +183,40 @@ mod tests {
             first_registered_ms: 0,
             status,
             connected: status == SlotStatus::Active,
+            seeding: false,
         }
+    }
+
+    #[test]
+    fn release_audit_seeding_lease_survives_timeout_but_not_retention_cap() {
+        let policy = RetentionPolicy {
+            slot_timeout_ms: 1,
+            max_retained_bytes: 1024,
+        };
+        let mut slot = make_slot("seed", 10, 1, SlotStatus::Active);
+        slot.seeding = true;
+        let decision = policy.decide(100, &[slot.clone()], &[], 100_000);
+        assert_eq!(decision.min_required_lsn, 10);
+        assert!(decision.abandon_slot_uuids.is_empty());
+        let sealed = [make_sealed(1, 1, 50, 4096), make_sealed(2, 51, 99, 4096)];
+        assert_eq!(
+            policy
+                .decide(100, &[slot.clone()], &sealed, 100_000)
+                .invalidate_slot_uuids,
+            ["seed"]
+        );
+        slot.connected = false;
+        assert!(
+            policy
+                .decide(100, &[slot.clone()], &[], 30_000)
+                .abandon_slot_uuids
+                .is_empty(),
+            "seed lease must cover installation after TCP completion"
+        );
+        assert_eq!(
+            policy.decide(100, &[slot], &[], 100_000).abandon_slot_uuids,
+            ["seed"]
+        );
     }
 
     #[test]

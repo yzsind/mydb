@@ -994,8 +994,9 @@ send `COM_REGISTER_SLAVE`. Unrecoverable append/publication failures stop
 subsequent binlog commits and wake ordering waiters with an error; restart
 reconciles the surviving history against WAL.
 
-mydb→mydb native physical replication uses a separate protocol v2. The default
-listener is `127.0.0.1:3316`; non-loopback requires mTLS. See
+mydb→mydb native physical replication uses a separate protocol v3. The default
+listener is `127.0.0.1:3316`; both peers require the same
+`MYDB_REPL_AUTH_TOKEN` (16–4096 bytes), and non-loopback requires mTLS. See
 [`native-replication.md`](native-replication.md) for configuration, watermarks,
 base backup, and manual controlled switchover procedures.
 

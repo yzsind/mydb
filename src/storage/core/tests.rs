@@ -8941,6 +8941,17 @@ fn replica_restartpoint_waits_for_apply_and_prunes_only_applied_durable_wal() {
     assert!(durable_lsn > applied_lsn);
     db.replica_applied_lsn_atomic
         .store(applied_lsn, Ordering::Release);
+    // A throttled progress file can lag behind the successfully applied WAL.
+    // Reconnect must still be able to validate the overlap at persisted + 1.
+    let persisted_lsn = applied_lsn - 2;
+    let mut progress = crate::repl::replica::ReplicaProgress {
+        received_lsn: latest_lsn,
+        durable_lsn,
+        applied_lsn: persisted_lsn,
+        durable_applied_lsn: persisted_lsn,
+        ..Default::default()
+    };
+    crate::repl::replica::save_progress(dir.path(), &progress).unwrap();
 
     // Model an applier paused in the middle of a complete outer WAL frame.
     // Restartpoint must not enter its sync/prune phase until that frame exits.
@@ -8972,14 +8983,30 @@ fn replica_restartpoint_waits_for_apply_and_prunes_only_applied_durable_wal() {
     assert!(
         log.segment_snapshot()
             .iter()
-            .all(|segment| segment.last_lsn >= applied_lsn),
-        "restartpoint may prune only segments strictly below applied_lsn"
+            .all(|segment| segment.last_lsn >= persisted_lsn),
+        "restartpoint must preserve the persisted resume watermark"
     );
     assert!(
         log.segment_snapshot()
             .iter()
             .any(|segment| segment.last_lsn > applied_lsn),
         "received/durable WAL above applied_lsn must remain available"
+    );
+    drop(log);
+    assert!(crate::wal::WalReader::open(&db.log, persisted_lsn + 1).is_ok());
+
+    progress.applied_lsn = applied_lsn;
+    progress.durable_applied_lsn = applied_lsn;
+    crate::repl::replica::save_progress(dir.path(), &progress).unwrap();
+    db.replica_restartpoint(std::time::Instant::now(), CHECKPOINT_TRIGGER_MANUAL)
+        .unwrap();
+    assert!(
+        db.log
+            .lock()
+            .segment_snapshot()
+            .iter()
+            .all(|segment| segment.last_lsn >= applied_lsn),
+        "persisting progress permits reclaiming the older overlap"
     );
 }
 

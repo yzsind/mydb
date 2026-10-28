@@ -75,15 +75,19 @@ pub struct BaseBackupSnapshot {
     pub backup_lsn: u64,
 }
 
-struct BackupFreezeGuard {
+struct BackupFreezeGuard<'a> {
     manager: Option<std::sync::Arc<crate::repl::MydbReplManager>>,
+    capture_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    capture_floor: &'a std::sync::atomic::AtomicU64,
 }
 
-impl Drop for BackupFreezeGuard {
+impl Drop for BackupFreezeGuard<'_> {
     fn drop(&mut self) {
         if let Some(manager) = self.manager.take() {
             manager.backup_capture_frozen.store(false, Ordering::SeqCst);
         }
+        self.capture_floor.store(0, Ordering::Release);
+        self.capture_active.store(false, Ordering::Release);
     }
 }
 
@@ -178,35 +182,56 @@ pub async fn stream_base_backup<W>(
 where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    // 1. Briefly stop admission and drain existing writers around a sharp
-    // checkpoint + private file snapshot capture. Transfer happens after this
-    // guard drops, so a large backup does not freeze writes for its duration.
+    let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
+    let logical_capture = logical_gate.try_write_arc().ok_or_else(|| {
+        error(
+            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+            "base backup capture deferred: logical applier is completing a transaction",
+        )
+    })?;
+    // Do not freeze a busy master while waiting for a long transaction.
+    // The storage admission barrier also covers logical replication writers.
+    if db.has_active_backup_conflicts() {
+        return Err(error(
+            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+            "base backup capture deferred: active source writers; retry after they drain",
+        ));
+    }
+    db.capture
+        .active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| {
+            error(
+                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                "another physical backup is active",
+            )
+        })?;
     let manager =
         crate::repl::global_manager().filter(|manager| manager.role() == crate::repl::Role::Master);
     if let Some(manager) = &manager {
-        manager
-            .backup_capture_frozen
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                error(
-                    crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                    "another base backup is capturing its snapshot",
-                )
-            })?;
+        manager.backup_capture_frozen.store(true, Ordering::SeqCst);
     }
-    let freeze_guard = BackupFreezeGuard { manager };
-    let drain_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while db.has_active_backup_conflicts() {
-        if std::time::Instant::now() >= drain_deadline {
-            return Err(error(
-                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                "base backup timed out draining source writers",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let freeze_guard = BackupFreezeGuard {
+        manager,
+        capture_active: std::sync::Arc::clone(&db.capture.active),
+        capture_floor: &db.capture.capture_floor,
+    };
+    let admission_freeze = db.capture.freeze();
+    if db.has_active_backup_conflicts() || db.capture.admissions.load(Ordering::SeqCst) != 0 {
+        return Err(error(
+            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+            "base backup capture deferred: source writer raced admission; retry",
+        ));
     }
-    db.checkpoint()?;
+    // Capture the boundary BEFORE the fuzzy checkpoint. Replaying its tail
+    // cannot skip a record published during the checkpoint flush window.
     let backup_lsn = db.wal_log().lock().next_lsn().saturating_sub(1);
+    // Also protect the boundary without a process-global replication manager
+    // (embedded services). A quiescent checkpoint must not collapse its tail.
+    db.capture
+        .capture_floor
+        .store(backup_lsn.max(1), Ordering::Release);
+    db.checkpoint()?;
 
     let mut snapshots = BackupSnapshotFiles::default();
     let opened = {
@@ -244,7 +269,7 @@ where
         // would overwrite the replica's identity with the MASTER's
         // node_uuid and role=master — the replica keeps its own role file.
         files.sort_by(|a, b| a.1.path.cmp(&b.1.path));
-        let mut opened = Vec::<(tokio::fs::File, BaseBackupFile)>::with_capacity(files.len());
+        let mut opened = Vec::<(PathBuf, BaseBackupFile)>::with_capacity(files.len());
         for (path, mut entry) in files {
             let mut file = File::open(&path).map_err(|err| {
                 error(
@@ -260,11 +285,14 @@ where
             // Copy while source writes are fenced; release admission before
             // network transfer so a slow replica cannot stall source DML.
             file = snapshots.capture(data_dir, &mut file, entry.len)?;
-            opened.push((tokio::fs::File::from_std(file.into()), entry));
+            drop(file);
+            opened.push((snapshots.last_path().unwrap().to_path_buf(), entry));
         }
         opened
     };
+    drop(admission_freeze);
     drop(freeze_guard);
+    drop(logical_capture);
 
     let manifest: Vec<BaseBackupFile> = opened.iter().map(|(_, m)| m.clone()).collect();
     let start = Message::BaseBackupStart(BaseBackupStart {
@@ -280,7 +308,8 @@ where
     //    out its output handle deterministically (even for empty
     //    files, which would otherwise have no chunks at all).
     let mut read_buf = vec![0u8; CHUNK_BYTES];
-    for (mut file, entry) in opened {
+    for (path, entry) in opened {
+        let mut file = tokio::fs::File::open(path).await.map_err(io_err)?;
         let mut offset: u64 = 0;
         let mut sha256 = Sha256::new();
         loop {
@@ -418,18 +447,141 @@ fn collect_files(
 /// replica's `progress.json` is created with
 /// `last_applied_lsn = backup_lsn`, so the subsequent WAL streaming
 /// path resumes at `backup_lsn + 1`. Returns the backup LSN.
+async fn read_backup_frame<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Message> {
+    read_backup_frame_with_timeout(reader, Duration::from_secs(60)).await
+}
+
+async fn read_backup_frame_with_timeout<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+) -> std::io::Result<Message> {
+    tokio::time::timeout(timeout, protocol::read_frame_async(reader))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "base backup frame read timed out",
+            )
+        })?
+}
+
+/// Remove only private transfer snapshots, after the data-directory lock is held.
+pub(crate) fn cleanup_abandoned_snapshots(data_dir: &Path) -> Result<(), QueryError> {
+    let dir = data_dir.join("system/replication");
+    match fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(io_err)?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".base-backup-")
+                    && name.ends_with(".snapshot")
+                    && entry.file_type().map_err(io_err)?.is_file()
+                {
+                    fs::remove_file(entry.path()).map_err(io_err)?;
+                }
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_err(err)),
+    }
+}
+
+/// A failed first open can leave directories, empty DD heaps and a WAL header.
+/// Those scaffolds are not a seeded database. Never infer emptiness when any
+/// progress, catalog data, WAL records or user object files already exist.
+pub(crate) fn replica_needs_initial_seed(data_dir: &Path) -> Result<bool, QueryError> {
+    if crate::repl::replica::progress::progress_path(data_dir)
+        .try_exists()
+        .map_err(io_err)?
+    {
+        return Ok(false);
+    }
+    for table in crate::storage::data_dictionary::dd_tables() {
+        let path =
+            crate::storage::naming::table_object_generation_path(data_dir, table.id, 1, "heap");
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.len() != 0 => return Ok(false),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_err(err)),
+        }
+    }
+    let wal_dir = crate::storage::naming::system_wal_dir(data_dir);
+    match fs::read_dir(wal_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(io_err)?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("wal-")
+                    && !name.ends_with(".tmp")
+                    && entry.metadata().map_err(io_err)?.len() > crate::wal::WAL_HEADER_LEN as u64
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_err(err)),
+    }
+    for root in ["schemas", "objects"] {
+        if contains_object_files(&data_dir.join(root))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn contains_object_files(root: &Path) -> Result<bool, QueryError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io_err(err)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_err)?;
+        if !entry.file_type().map_err(io_err)?.is_dir() || contains_object_files(&entry.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub async fn perform_base_backup_into(
     master_host: &str,
     master_port: u16,
     replica_uuid: &str,
     data_dir: &Path,
 ) -> Result<u64, QueryError> {
+    perform_base_backup_into_with_config(
+        master_host,
+        master_port,
+        replica_uuid,
+        data_dir,
+        crate::repl::config::ReplConfig::from_env(),
+    )
+    .await
+}
+
+pub(crate) async fn perform_base_backup_into_with_config(
+    master_host: &str,
+    master_port: u16,
+    replica_uuid: &str,
+    data_dir: &Path,
+    config: crate::repl::config::ReplConfig,
+) -> Result<u64, QueryError> {
+    config.auth_token.validate()?;
     let _memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
         crate::engine::executor::mem_budget::ControlledMemoryCategory::NativeReplicationTransient,
         CHUNK_BYTES.saturating_mul(2),
     )?;
     recover_interrupted_install(data_dir)?;
-    let addr = format!("{master_host}:{master_port}");
+    let master_host = master_host.trim_matches(['[', ']']);
+    let addr = crate::repl::format_endpoint(master_host, master_port);
     let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
         .await
         .map_err(|_| {
@@ -450,7 +602,6 @@ pub async fn perform_base_backup_into(
             "mydb-repl replica: base backup set_nodelay failed: {e}"
         ));
     }
-    let config = crate::repl::config::ReplConfig::from_env();
     let stream = crate::repl::tls::connect(stream, &config, master_host)
         .await
         .map_err(io_err)?;
@@ -465,6 +616,7 @@ pub async fn perform_base_backup_into(
         )
     })?;
     let handshake = Handshake {
+        auth_token: config.auth_token.clone(),
         protocol_version: PROTOCOL_VERSION,
         replica_uuid: replica_uuid_bytes,
         // 0 = ask for "from the very beginning", which the master
@@ -484,7 +636,7 @@ pub async fn perform_base_backup_into(
         .map_err(io_err)?;
     writer.flush().await.map_err(io_err)?;
 
-    let ack: HandshakeAck = match protocol::read_frame_async(&mut reader).await {
+    let ack: HandshakeAck = match read_backup_frame(&mut reader).await {
         Ok(Message::HandshakeAck(a)) => a,
         Ok(other) => {
             return Err(error(
@@ -517,7 +669,7 @@ pub async fn perform_base_backup_into(
     // After the handshake the master sends a `BaseBackupStart` because
     // we set `request_base_backup = true`. Anything else is a
     // protocol violation.
-    let start: BaseBackupStart = match protocol::read_frame_async(&mut reader).await {
+    let start: BaseBackupStart = match read_backup_frame(&mut reader).await {
         Ok(Message::BaseBackupStart(s)) => s,
         Ok(other) => {
             return Err(error(
@@ -530,6 +682,18 @@ pub async fn perform_base_backup_into(
         }
         Err(err) => return Err(io_err(err)),
     };
+    // Retain admission for the manifest and its verification maps throughout
+    // installation, rather than dropping all accounting after frame decode.
+    let manifest_bytes = start
+        .files
+        .iter()
+        .fold(start.files.len().saturating_mul(512), |bytes, file| {
+            bytes.saturating_add(file.path.capacity().saturating_mul(3))
+        });
+    let _manifest_memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::NativeReplicationTransient,
+        manifest_bytes,
+    )?;
     let total_bytes = start.files.iter().try_fold(0u64, |sum, file| {
         sum.checked_add(file.len).ok_or_else(|| {
             error(
@@ -592,7 +756,7 @@ pub async fn perform_base_backup_into(
     let mut open_files: std::collections::HashMap<String, File> = std::collections::HashMap::new();
     let backup_lsn;
     loop {
-        match protocol::read_frame_async(&mut reader).await {
+        match read_backup_frame(&mut reader).await {
             Ok(Message::BaseBackupChunk(chunk)) => {
                 validate_backup_relative_path(&chunk.path)?;
                 let Some((declared_len, next_offset, saw_eof)) = expected.get_mut(&chunk.path)
@@ -765,6 +929,7 @@ pub async fn perform_base_backup_into(
         source_current_lsn: ack.current_lsn,
         source_durable_lsn: ack.durable_lsn,
         source_generation: ack.generation,
+        source_heartbeat_ms: ack.heartbeat_ms,
         source_frozen: ack.source_frozen,
         source_fence_lsn: ack.fence_lsn,
         source_fence_token_hash: ack.fence_token_hash,
@@ -1342,5 +1507,60 @@ mod tests {
         recover_interrupted_install(&data).unwrap();
         assert_eq!(fs::read(data.join("schemas/test/value")).unwrap(), b"old");
         assert!(!journal.exists());
+    }
+}
+
+#[cfg(test)]
+mod release_audit_tests {
+    use super::*;
+    #[test]
+    fn failed_first_open_scaffolding_still_requires_seed_without_discarding_data() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        fs::create_dir_all(dir.path().join("schemas/mysql/tables")).unwrap();
+        fs::create_dir_all(crate::storage::naming::system_catalog_dir(dir.path())).unwrap();
+        let properties = crate::storage::naming::table_object_generation_path(
+            dir.path(),
+            crate::storage::data_dictionary::DD_DD_PROPERTIES,
+            1,
+            "heap",
+        );
+        fs::write(&properties, []).unwrap();
+        drop(crate::wal::LogManager::open(dir.path()).unwrap());
+        assert!(replica_needs_initial_seed(dir.path()).unwrap());
+
+        fs::write(&properties, [1]).unwrap();
+        assert!(!replica_needs_initial_seed(dir.path()).unwrap());
+        fs::remove_file(&properties).unwrap();
+        let object = dir.path().join("objects/tables/9/1.heap");
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(&object, []).unwrap();
+        assert!(!replica_needs_initial_seed(dir.path()).unwrap());
+        fs::remove_file(object).unwrap();
+        let mut log = crate::wal::LogManager::open(dir.path()).unwrap();
+        log.append(0, crate::wal::WalPayload::CheckpointBegin)
+            .unwrap();
+        log.flush().unwrap();
+        drop(log);
+        assert!(!replica_needs_initial_seed(dir.path()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stalled_backup_frame_times_out() {
+        let (mut reader, _writer) = tokio::io::duplex(64);
+        let err = read_backup_frame_with_timeout(&mut reader, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+    #[test]
+    fn startup_cleanup_removes_only_private_snapshot_files() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = dir.path().join("system/replication");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".base-backup-abandoned.snapshot"), b"orphan").unwrap();
+        fs::write(root.join("role.json"), b"keep").unwrap();
+        cleanup_abandoned_snapshots(dir.path()).unwrap();
+        assert!(!root.join(".base-backup-abandoned.snapshot").exists());
+        assert!(root.join("role.json").exists());
     }
 }

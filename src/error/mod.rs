@@ -239,6 +239,8 @@ pub(crate) enum InternalErrorKind {
     HashAggregateNeedsSpill,
     VectorHashJoinFallback,
     ReplicaPoisonFrame,
+    ReplicaApplyFailure,
+    ReplicaHandshakeRejected,
 }
 
 /// Error returned through the query engine and MySQL protocol.

@@ -2174,10 +2174,15 @@ impl ChannelRunner {
             .map(|op| self.decode_relay_rows(op))
             .collect::<Result<Vec<_>, _>>()?;
         let db = self.engine.database_for_replication();
+        let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
+        let logical_apply_lease = logical_gate.read_arc();
         let txn = db.begin_txn()?;
         let result = with_replication_applier(|| apply_ops_to_storage(&self.engine, db, txn, &ops));
         match result {
-            Ok(()) => db.commit_txn_deferred(txn.txn_id).map(Some),
+            Ok(()) => db.commit_txn_deferred(txn.txn_id).map(|mut commit| {
+                commit.logical_apply_lease = Some(logical_apply_lease);
+                Some(commit)
+            }),
             Err(err) => {
                 let _ = db.rollback_txn(txn.txn_id);
                 Err(err)
@@ -3397,6 +3402,10 @@ impl ChannelRunner {
     }
 
     fn apply_records(&self, ops: Vec<RelayOp>, gtid: Option<String>) -> Result<(), QueryError> {
+        let logical_gate = crate::storage::capture::logical_apply_gate(
+            self.engine.database_for_replication(),
+        )?;
+        let _logical_apply = logical_gate.read_arc();
         // Called only from the SQL thread; a failure propagates up to
         // `set_sql_error` and stops the SQL thread while IO keeps buffering.
         self.update_status(|status| status.sql_state = "applying relay transaction".to_string());
@@ -8637,6 +8646,60 @@ mod tests {
             panic!("expected result set");
         };
         assert_eq!(result.rows[0][0], Value::String("io".to_string()));
+    }
+
+    #[test]
+    fn release_audit_logical_applier_pauses_for_native_capture_and_covers_deferred_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+            .unwrap();
+        let (_runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        let db = engine.database_for_replication();
+        let gate = crate::storage::capture::logical_apply_gate(db).unwrap();
+        let capture = gate.write_arc();
+        let (started, starting) = std::sync::mpsc::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = runner.apply_records(
+                vec![RelayOp::WriteRows {
+                    database: "test".into(),
+                    table: "t".into(),
+                    rows: vec![vec![Value::Int(1)]],
+                }],
+                None,
+            );
+            done.send(result).unwrap();
+            runner
+        });
+        starting.recv().unwrap();
+        assert!(completed.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(capture);
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let runner = worker.join().unwrap();
+        let mut commit = runner
+            .prepare_row_records(
+                vec![RelayOp::WriteRows {
+                    database: "test".into(),
+                    table: "t".into(),
+                    rows: vec![vec![Value::Int(2)]],
+                }],
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            gate.try_write_arc().is_none(),
+            "capture must include deferred durability/sidecars"
+        );
+        db.finish_deferred_commits(&mut [&mut commit]).unwrap();
+        drop(commit);
+        assert!(gate.try_write_arc().is_some());
     }
 
     #[test]

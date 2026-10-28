@@ -51,6 +51,8 @@ fn async_row_lock_signal_shard(table_id: u64, row_id: RowId) -> usize {
 /// finishes a one-element batch.
 #[must_use = "a published commit must be passed to Database::finish_deferred_commits"]
 pub(crate) struct DeferredCommit {
+    pub(crate) logical_apply_lease:
+        Option<parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
     _backup_feedback: Option<crate::storage::capture::CommitSample>,
     txn_id: u64,
     commit_scn: u64,
@@ -2817,6 +2819,7 @@ impl Database {
             end_txn_redo_policy(&self.log, txn_id);
             self.table_locks_sharded.release_txn(txn_id);
             return Ok(DeferredCommit {
+                logical_apply_lease: None,
                 _backup_feedback: None,
                 txn_id,
                 commit_scn: 0,
@@ -3056,6 +3059,7 @@ impl Database {
         };
         self.notify_lock_waiters_for_rows(released);
         Ok(DeferredCommit {
+            logical_apply_lease: None,
             _backup_feedback: backup_feedback,
             txn_id,
             commit_scn,
@@ -3118,7 +3122,7 @@ impl Database {
         }
 
         for commit in commits.iter_mut() {
-            let Some(commit_lsn) = commit.commit_lsn else {
+            let Some(_commit_lsn) = commit.commit_lsn else {
                 commit.finished = true;
                 continue;
             };
@@ -3136,7 +3140,7 @@ impl Database {
                 self.notify_non_row_lock_waiters();
                 return Err(err);
             }
-            crate::repl::after_local_commit_durable(commit_lsn);
+
             if commit.temporal_enabled {
                 let ledger = self.persist_temporal_commit(
                     commit.txn_id,
@@ -3164,9 +3168,6 @@ impl Database {
             if let Some(token) = commit.temporal_persist.take() {
                 token.complete();
             }
-            if let Some((ref file, end_pos)) = commit.binlog_semi_sync_target {
-                crate::binlog::semi_sync_wait_after_commit(file, end_pos);
-            }
             self.publish_pending_live_row_deltas(commit.txn_id);
             self.maybe_gc_after_commit();
             end_txn_redo_policy(&self.log, commit.txn_id);
@@ -3183,6 +3184,14 @@ impl Database {
             self.table_locks_sharded.release_txn(commit.txn_id);
         }
         self.notify_non_row_lock_waiters();
+        for commit in commits.iter() {
+            if let Some(commit_lsn) = commit.commit_lsn {
+                crate::repl::after_local_commit_durable(commit_lsn);
+            }
+            if let Some((ref file, end_pos)) = commit.binlog_semi_sync_target {
+                crate::binlog::semi_sync_wait_after_commit(file, end_pos);
+            }
+        }
         if let Some((txn_id, err)) = commits.iter_mut().find_map(|commit| {
             commit.index_error.take().map(|err| (commit.txn_id, err))
         }) {
@@ -4286,7 +4295,9 @@ impl Database {
         })?;
         let applied_lsn = self.replica_applied_lsn_atomic.load(Ordering::Acquire);
         let wal_durable_lsn = self.log.lock().durable_lsn();
-        let mut restart_lsn = applied_lsn.min(wal_durable_lsn);
+        let persisted = crate::repl::replica::progress::load_progress(&self.data_dir)
+            .map_err(io_err)?.map(|p| p.durable_applied_lsn).unwrap_or(0);
+        let mut restart_lsn = applied_lsn.min(wal_durable_lsn).min(persisted);
         // Keep every streamed in-flight BEGIN, including transactions whose
         // first write has not arrived yet. Data-file durability alone cannot
         // reconstruct their MVCC identity after restart.
