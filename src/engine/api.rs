@@ -2848,6 +2848,9 @@ pub(crate) struct SessionSqlPreparedStatement {
     /// Result metadata bound at PREPARE time. Declared domains stay fixed;
     /// untyped parameter-derived domains are resolved at EXECUTE time.
     pub(crate) result_columns: std::sync::Arc<[crate::types::Column]>,
+    /// Routine domains are rebound by EXECUTE after routine DDL, so stale
+    /// PREPARE descriptors must not replace the current execution metadata.
+    pub(crate) routine_result_metadata: bool,
     /// Hard-governor reservation for all retained template capacity. Shared
     /// with transient EXECUTE clones and released by the last owner.
     pub(crate) memory_charge:

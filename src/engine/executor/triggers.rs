@@ -557,13 +557,18 @@ impl TriggerRowValidator {
             RoutineStmt::Signal {
                 message_text,
                 mysql_errno,
+                information,
                 ..
             }
             | RoutineStmt::Resignal {
                 message_text,
                 mysql_errno,
+                information,
                 ..
             } => {
+                for (_, expr) in information {
+                    self.expr(expr);
+                }
                 if let Some(expr) = message_text {
                     self.expr(expr);
                 }

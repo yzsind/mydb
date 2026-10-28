@@ -5438,11 +5438,12 @@ fn parse_routine_signal(sql: &str) -> Result<RoutineStmt, ParseError> {
             "SIGNAL requires SQLSTATE or a declared condition name",
         ));
     }
-    let (message_text, mysql_errno) = parse_signal_information_items(sql, idx)?;
+    let (message_text, mysql_errno, information) = parse_signal_information_items(sql, idx)?;
     Ok(RoutineStmt::Signal {
         condition,
         message_text,
         mysql_errno,
+        information,
     })
 }
 
@@ -5464,27 +5465,29 @@ fn parse_routine_resignal(sql: &str) -> Result<RoutineStmt, ParseError> {
         } else {
             None
         };
-    let (message_text, mysql_errno) = parse_signal_information_items(sql, idx)?;
+    let (message_text, mysql_errno, information) = parse_signal_information_items(sql, idx)?;
     Ok(RoutineStmt::Resignal {
         condition,
         message_text,
         mysql_errno,
+        information,
     })
 }
 
 fn parse_signal_information_items(
     sql: &str,
     idx: usize,
-) -> Result<(Option<Expr>, Option<Expr>), ParseError> {
+) -> Result<(Option<Expr>, Option<Expr>, Vec<(DiagItem, Expr)>), ParseError> {
     let mut message_text = None;
     let mut mysql_errno = None;
+    let mut information = Vec::new();
     let Some(next) = consume_keyword_at(sql, idx, "SET") else {
         if !sql[idx..].trim().is_empty() {
             return Err(parse_error_at_zero(
                 "unexpected SIGNAL condition information",
             ));
         }
-        return Ok((message_text, mysql_errno));
+        return Ok((message_text, mysql_errno, information));
     };
     for (lhs, value) in parse_routine_assignments(sql[next..].trim(), "SIGNAL SET item requires =")?
     {
@@ -5501,13 +5504,22 @@ fn parse_signal_information_items(
                 }
             }
             _ => {
-                return Err(parse_error_at_zero(
-                    "unsupported SIGNAL condition information item",
-                ));
+                let item = parse_diag_item(&name)?;
+                if item.condition_information_name().is_none() {
+                    return Err(parse_error_at_zero(
+                        "unsupported SIGNAL condition information item",
+                    ));
+                }
+                if information.iter().any(|(existing, _)| *existing == item) {
+                    return Err(parse_error_at_zero(
+                        "duplicate SIGNAL condition information item",
+                    ));
+                }
+                information.push((item, value));
             }
         }
     }
-    Ok((message_text, mysql_errno))
+    Ok((message_text, mysql_errno, information))
 }
 
 fn parse_routine_prepare(sql: &str) -> Result<RoutineStmt, ParseError> {

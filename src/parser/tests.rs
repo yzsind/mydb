@@ -7024,3 +7024,19 @@ fn round2_large_literal_without_join_does_not_spend_rewrite_budget() {
     let statement = parse_statement(&format!("SELECT LENGTH('{text}')")).unwrap();
     assert!(matches!(statement, Statement::Select(_)));
 }
+
+#[test]
+fn routine_audit_1028_rejects_nul_identifiers_but_preserves_literal_nuls() {
+    for sql in [
+        "SELECT `\0view_function_0`() FROM v",
+        "SELECT /*!80000 `\0view_function_0`() */ FROM v",
+        "CREATE PROCEDURE `\0invalid`() SELECT 1",
+    ] {
+        assert!(parse_statement(sql).is_err(), "{sql:?}");
+        assert!(parse_statements(sql).is_err(), "{sql:?}");
+    }
+    assert!(parse_statement("SELECT 'value\0payload'").is_ok());
+    assert!(parse_statement("SELECT /*!80000 'value\0payload' */").is_ok());
+    let _mode = ParserSqlModeGuard::activate(crate::engine::api::SQL_MODE_ANSI_QUOTES);
+    assert!(parse_statement("SELECT \"\0view_function_0\"()").is_err());
+}

@@ -173,6 +173,10 @@ fn expand_view_body(
     });
     let mut context = session.clone();
     context.current_database = view.database.clone();
+    let security = effective_view_security_account(db, session, view, None)?;
+    context.authenticated_as = security.authenticated_as;
+    context.active_roles = security.active_roles;
+    super::super::routines::bind_view_stored_functions(db, &context, &mut expanded)?;
     expand_views_in_select(db, &context, &mut expanded, depth + 1, trail)?;
     compact_expanded_view_body(&mut expanded)?;
     trail.remove(&trail_key(view));

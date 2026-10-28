@@ -50,6 +50,25 @@ use crate::storage::error;
 use crate::types::{Column, QueryError};
 use crate::util::logging::log_message;
 
+mod routine_results;
+
+fn server_status_for_context(context: &SessionContext) -> u16 {
+    let mut status = 0;
+    if context.autocommit {
+        status |= SERVER_STATUS_AUTOCOMMIT;
+    }
+    if context.in_transaction() {
+        status |= SERVER_STATUS_IN_TRANS;
+        if context.read_only_txn {
+            status |= 0x2000;
+        }
+    }
+    if context.temporal_sql_mode_bits & crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES != 0 {
+        status |= 0x0200;
+    }
+    status
+}
+
 /// The worker owns the real context while an engine call runs. If it panics,
 /// the blocking pool catches the panic after this guard has put the context
 /// back where the session can recover and roll back its transaction.
@@ -178,6 +197,7 @@ pub struct Session<E: QueryEngine> {
     /// the handshake, COM_INIT_DB, or USE selects a schema.
     process_database: Option<String>,
     command_response_sequence: u8,
+    routine_response_sequence: Option<u8>,
     /// Transaction-admission permit (opt-in via `MYDB_TXN_ADMISSION`). Held
     /// from this session's first lock-taking statement until the transaction
     /// commits or rolls back, bounding the
@@ -861,22 +881,7 @@ where
     }
 
     fn server_status(&self) -> u16 {
-        let mut status = 0;
-        if self.context.autocommit {
-            status |= SERVER_STATUS_AUTOCOMMIT;
-        }
-        if self.context.in_transaction() {
-            status |= SERVER_STATUS_IN_TRANS;
-            if self.context.read_only_txn {
-                status |= 0x2000; // SERVER_STATUS_IN_TRANS_READONLY
-            }
-        }
-        if self.context.temporal_sql_mode_bits & crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES
-            != 0
-        {
-            status |= 0x0200; // SERVER_STATUS_NO_BACKSLASH_ESCAPES
-        }
-        status
+        server_status_for_context(&self.context)
     }
 
     /// Drop every prepared statement for this session, keeping the global
@@ -1265,6 +1270,7 @@ where
             next_statement_id: 1,
             process_database: None,
             command_response_sequence: 1,
+            routine_response_sequence: None,
             txn_admission: None,
             registered_replica_guard: None,
             semi_sync_replica_requested: false,
@@ -4045,6 +4051,19 @@ where
         &mut self,
         result: Result<QueryResponse, QueryError>,
     ) -> io::Result<()> {
+        let original = self.command_response_sequence;
+        if let Some(sequence) = self.routine_response_sequence.take() {
+            self.command_response_sequence = sequence;
+        }
+        let result = self.write_query_response_inner(result).await;
+        self.command_response_sequence = original;
+        result
+    }
+
+    async fn write_query_response_inner(
+        &mut self,
+        result: Result<QueryResponse, QueryError>,
+    ) -> io::Result<()> {
         if let Some(handle) = &self.handle {
             handle.set_base_state(ProcessState::QueryEnd);
         }
@@ -5211,6 +5230,7 @@ where
                     values,
                     Some((Arc::clone(&normalized_sql), Arc::clone(&database))),
                     perf_texts.clone(),
+                    cursor_requested,
                 )
                 .await
             {
@@ -5285,6 +5305,22 @@ where
     }
 
     async fn write_stmt_execute_response_for(
+        &mut self,
+        statement_id: Option<u32>,
+        result: Result<QueryResponse, crate::types::QueryError>,
+    ) -> io::Result<()> {
+        let original = self.command_response_sequence;
+        if let Some(sequence) = self.routine_response_sequence.take() {
+            self.command_response_sequence = sequence;
+        }
+        let result = self
+            .write_stmt_execute_response_inner(statement_id, result)
+            .await;
+        self.command_response_sequence = original;
+        result
+    }
+
+    async fn write_stmt_execute_response_inner(
         &mut self,
         statement_id: Option<u32>,
         result: Result<QueryResponse, crate::types::QueryError>,
@@ -6950,10 +6986,11 @@ where
         } else {
             None
         };
+        let (sink, receiver) = self.routine_packet_stream(&sql, false);
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
         let work = move || {
-            let result = engine.execute(&mut context, &sql);
+            let result = routine_results::with_sink(sink, || engine.execute(&mut context, &sql));
             (context, result)
         };
         let job = if http {
@@ -6963,7 +7000,10 @@ where
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
         };
-        let (context, result) = job.await.map_err(|err| self.recover_join_error(err))?;
+        let (context, result) = self
+            .finish_routine_job(job, receiver)
+            .await
+            .map_err(|err| self.recover_join_error(err))?;
         self.restore_context(context);
 
         result
@@ -7274,15 +7314,19 @@ where
         sql: String,
         parser_sql_mode_bits: u16,
     ) -> Result<QueryResponse, QueryError> {
+        let (sink, receiver) = self.routine_packet_stream(&sql, false);
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
-        let (context, result) =
+        let job =
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), move || {
                 let _override =
                     crate::parser::ParserSqlModeOverrideGuard::activate(parser_sql_mode_bits);
-                let result = engine.execute(&mut context, &sql);
+                let result =
+                    routine_results::with_sink(sink, || engine.execute(&mut context, &sql));
                 (context, result)
-            })
+            });
+        let (context, result) = self
+            .finish_routine_job(job, receiver)
             .await
             .map_err(|err| self.recover_join_error(err))?;
         self.restore_context(context);
@@ -7324,7 +7368,13 @@ where
         params: Vec<crate::types::Value>,
         hint_keys: Option<(Arc<str>, Arc<str>)>,
         perf_texts: crate::engine::perf_events::PreparedStatementTexts,
+        cursor_requested: bool,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if cursor_requested && matches!(statement, Statement::Call(_)) {
+            return Some(Err(crate::mysql::errors::unsupported(
+                "server-side cursors for multi-result prepared statements",
+            )));
+        }
         // Statements that may take row locks have to run on the
         // `spawn_blocking` pool: the executor's row-lock acquire path
         // parks the OS thread on `Condvar::wait_timeout`. Running such a
@@ -7416,10 +7466,11 @@ where
         } else {
             None
         };
+        let (sink, receiver) = self.routine_packet_stream(&sql, true);
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
         let work = move || {
-            let result =
+            let result = routine_results::with_sink(sink, || {
                 crate::engine::perf_events::with_prepared_statement_texts(&perf_texts, || {
                     crate::engine::params::with_params(params, || {
                         let run =
@@ -7437,7 +7488,8 @@ where
                             None => run(),
                         }
                     })
-                });
+                })
+            });
             (context, result)
         };
         let job = if http {
@@ -7447,7 +7499,7 @@ where
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
         };
-        match job.await {
+        match self.finish_routine_job(job, receiver).await {
             Ok((context, result)) => {
                 self.restore_context(context);
 

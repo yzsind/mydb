@@ -25,6 +25,8 @@ use crate::storage::{
 };
 use crate::types::{QueryError, Value};
 
+pub(crate) mod result_sink;
+
 pub(crate) const PREPARED_CALL_OUT_MARKER: &str = "__mydb_ps_out_params";
 
 #[derive(Debug)]
@@ -2782,7 +2784,8 @@ fn exec_block_inner(
                         crate::error::catalog::ER_WRONG_VALUE,
                         format!("invalid warning condition: {invalid}"),
                     ))
-                })?;
+                })?
+                .with_condition_information(warning.condition_information());
                 let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
                 if find_matching_handler(frame, &handlers, &warning).is_some()
                     || frame.outer_handlers.iter().any(|scope| {
@@ -3372,24 +3375,32 @@ fn exec_stmt(
             condition,
             message_text,
             mysql_errno,
+            information,
         } => {
             let (resolved_condition, sql_state) = resolve_signal_condition(frame, condition)?;
             let message = signal_message_value(session, &frame.locals, message_text.as_ref())?
                 .unwrap_or_else(|| "Unhandled user-defined exception condition".to_string());
-            let code =
-                signal_errno_value(session, &frame.locals, mysql_errno.as_ref())?.unwrap_or(1644);
+            let code = signal_errno_value(session, &frame.locals, mysql_errno.as_ref())?
+                .unwrap_or_else(|| default_signal_errno(&sql_state));
             let err = QueryError::user_defined(code, &sql_state, message).map_err(|invalid| {
                 error(
                     crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
                     format!("Invalid SIGNAL condition: {invalid}"),
                 )
             })?;
+            let err = err.with_condition_information(signal_information_values(
+                session,
+                &frame.locals,
+                information,
+                BTreeMap::new(),
+            )?);
             Err(RoutineExecError::Condition(resolved_condition, err))
         }
         RoutineStmt::Resignal {
             condition,
             message_text,
             mysql_errno,
+            information,
         } => {
             let Some(active) = frame.active_handler_error.clone() else {
                 return Err(error(
@@ -3398,7 +3409,11 @@ fn exec_stmt(
                 )
                 .into());
             };
-            if condition.is_none() && message_text.is_none() && mysql_errno.is_none() {
+            if condition.is_none()
+                && message_text.is_none()
+                && mysql_errno.is_none()
+                && information.is_empty()
+            {
                 return Err(active);
             }
             let active_error = active.query_error();
@@ -3413,13 +3428,25 @@ fn exec_stmt(
             let message = signal_message_value(session, &frame.locals, message_text.as_ref())?
                 .unwrap_or_else(|| active_error.message().to_string());
             let code = signal_errno_value(session, &frame.locals, mysql_errno.as_ref())?
-                .unwrap_or_else(|| active_error.code());
+                .unwrap_or_else(|| {
+                    if resolved.is_some() {
+                        default_signal_errno(&state)
+                    } else {
+                        active_error.code()
+                    }
+                });
             let err = QueryError::user_defined(code, &state, message).map_err(|invalid| {
                 error(
                     crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
                     format!("Invalid RESIGNAL condition: {invalid}"),
                 )
             })?;
+            let err = err.with_condition_information(signal_information_values(
+                session,
+                &frame.locals,
+                information,
+                active_error.condition_information(),
+            )?);
             let condition = resolved
                 .map(|(condition, _)| condition)
                 .unwrap_or_else(|| active.condition());
@@ -3436,7 +3463,7 @@ fn exec_stmt(
                 Some(inherited_capabilities),
             )?;
             for response in result.responses {
-                collect_routine_response(frame, response)?;
+                collect_routine_response(session, frame, response)?;
             }
             Ok(RoutineControl::None)
         }
@@ -3522,6 +3549,7 @@ fn exec_stmt(
                         database: session.current_database.clone(),
                         parameter_count: next_placeholder,
                         result_columns: Arc::from([]),
+                        routine_result_metadata: false,
                         memory_charge,
                     },
                 )
@@ -3583,7 +3611,7 @@ fn exec_stmt(
             session.current_database = saved_database;
             session.record_sql_prepared_execute(name, execute_started.elapsed(), response.is_err());
             let response = response?;
-            collect_routine_response(frame, response)?;
+            collect_routine_response(session, frame, response)?;
             Ok(RoutineControl::None)
         }
         RoutineStmt::Deallocate { name } => {
@@ -3630,6 +3658,7 @@ fn exec_stmt(
                         &frame.static_statements,
                     ) {
                         collect_routine_response(
+                            session,
                             frame,
                             QueryResponse::ResultSet(crate::engine::api::ResultSet {
                                 columns,
@@ -3641,7 +3670,7 @@ fn exec_stmt(
                 }
             };
             frame.diag_row_count = response_row_count(&response);
-            collect_routine_response(frame, response)?;
+            collect_routine_response(session, frame, response)?;
             Ok(RoutineControl::None)
         }
         RoutineStmt::GetDiagnostics {
@@ -3802,38 +3831,47 @@ fn exec_get_diagnostics(
     };
     let condition_count = conditions.len() as i64;
     for (target, item) in items {
-        let value = match item {
-            DiagItem::RowCount => Value::Int(frame.diag_row_count),
-            DiagItem::Number => Value::Int(condition_count),
-            DiagItem::MysqlErrno => Value::Int(selected.as_ref().map_or(0, |e| e.code() as i64)),
-            DiagItem::ReturnedSqlState => Value::String(selected.as_ref().map_or_else(
-                || "00000".to_string(),
-                |e| e.sql_state().as_str().to_string(),
-            )),
-            DiagItem::MessageText => Value::String(
-                selected
-                    .as_ref()
-                    .map_or_else(String::new, |e| e.message().to_string()),
-            ),
-            DiagItem::ClassOrigin | DiagItem::SubclassOrigin => {
-                Value::String(selected.as_ref().map_or_else(String::new, |e| {
-                    if e.sql_state().as_str().starts_with("01")
-                        || e.sql_state().as_str().starts_with("02")
-                    {
-                        "ISO 9075".to_string()
-                    } else {
-                        "MySQL".to_string()
-                    }
-                }))
+        let explicit = item
+            .condition_information_name()
+            .and_then(|name| selected.as_ref()?.information_item(name));
+        let value = if let Some(value) = explicit {
+            Value::String(value.to_string())
+        } else {
+            match item {
+                DiagItem::RowCount => Value::Int(frame.diag_row_count),
+                DiagItem::Number => Value::Int(condition_count),
+                DiagItem::MysqlErrno => {
+                    Value::Int(selected.as_ref().map_or(0, |e| e.code() as i64))
+                }
+                DiagItem::ReturnedSqlState => Value::String(selected.as_ref().map_or_else(
+                    || "00000".to_string(),
+                    |e| e.sql_state().as_str().to_string(),
+                )),
+                DiagItem::MessageText => Value::String(
+                    selected
+                        .as_ref()
+                        .map_or_else(String::new, |e| e.message().to_string()),
+                ),
+                DiagItem::ClassOrigin | DiagItem::SubclassOrigin => {
+                    Value::String(selected.as_ref().map_or_else(String::new, |e| {
+                        if e.sql_state().as_str().starts_with("01")
+                            || e.sql_state().as_str().starts_with("02")
+                        {
+                            "ISO 9075".to_string()
+                        } else {
+                            "MySQL".to_string()
+                        }
+                    }))
+                }
+                DiagItem::ConstraintCatalog
+                | DiagItem::ConstraintSchema
+                | DiagItem::ConstraintName
+                | DiagItem::CatalogName
+                | DiagItem::SchemaName
+                | DiagItem::TableName
+                | DiagItem::ColumnName
+                | DiagItem::CursorName => Value::String(String::new()),
             }
-            DiagItem::ConstraintCatalog
-            | DiagItem::ConstraintSchema
-            | DiagItem::ConstraintName
-            | DiagItem::CatalogName
-            | DiagItem::SchemaName
-            | DiagItem::TableName
-            | DiagItem::ColumnName
-            | DiagItem::CursorName => Value::String(String::new()),
         };
         assign_target(
             session,
@@ -4485,43 +4523,36 @@ fn bind_expr_locals(expr: &mut Expr, locals: &HashMap<String, Value>) -> Result<
     Ok(())
 }
 
+fn default_signal_errno(state: &str) -> u16 {
+    match &state[..2] {
+        "01" => crate::error::catalog::ER_SIGNAL_WARN.code().get(),
+        "02" => crate::error::catalog::ER_SIGNAL_NOT_FOUND.code().get(),
+        _ => crate::error::catalog::ER_SIGNAL_EXCEPTION.code().get(),
+    }
+}
+
 fn collect_routine_response(
+    session: &mut SessionContext,
     frame: &mut RoutineFrame,
     response: QueryResponse,
 ) -> Result<(), QueryError> {
     match response {
-        QueryResponse::ResultSet(result) => {
+        response @ (QueryResponse::ResultSet(_)
+        | QueryResponse::SharedResultSet(_)
+        | QueryResponse::StreamingResultSet(_)) => {
             if !frame.allow_result_sets {
                 return Err(error(
                     crate::error::catalog::ER_SP_NO_RETSET,
                     "Not allowed to return a result set from stored function or trigger",
                 ));
             }
-            frame.responses.push(QueryResponse::ResultSet(result));
-        }
-        QueryResponse::SharedResultSet(result) => {
-            if !frame.allow_result_sets {
-                return Err(error(
-                    crate::error::catalog::ER_SP_NO_RETSET,
-                    "Not allowed to return a result set from stored function or trigger",
-                ));
+            if let Some(response) = result_sink::emit(session, response)? {
+                frame.responses.push(response);
             }
-            frame.responses.push(QueryResponse::SharedResultSet(result));
-        }
-        QueryResponse::StreamingResultSet(result) => {
-            if !frame.allow_result_sets {
-                return Err(error(
-                    crate::error::catalog::ER_SP_NO_RETSET,
-                    "Not allowed to return a result set from stored function or trigger",
-                ));
-            }
-            frame
-                .responses
-                .push(QueryResponse::StreamingResultSet(result));
         }
         QueryResponse::MultiResult(results) => {
             for result in results {
-                collect_routine_response(frame, result)?;
+                collect_routine_response(session, frame, result)?;
             }
         }
         QueryResponse::Ok | QueryResponse::OkAffected { .. } => {}
@@ -5074,6 +5105,35 @@ fn routine_expr_contains_subquery(expr: &Expr) -> bool {
     crate::parser::visit::value_expr_contains_subquery(expr)
 }
 
+fn signal_information_values(
+    session: &SessionContext,
+    locals: &HashMap<String, Value>,
+    items: &[(DiagItem, Expr)],
+    mut values: BTreeMap<&'static str, String>,
+) -> Result<BTreeMap<&'static str, String>, QueryError> {
+    for (item, expr) in items {
+        let name = item
+            .condition_information_name()
+            .expect("validated SIGNAL item");
+        let value = eval_routine_expr(session, locals, expr)?;
+        if matches!(value, Value::Null) {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
+                format!("{name} cannot be NULL"),
+            ));
+        }
+        let value = crate::storage::value_to_string(&value);
+        if value.chars().count() > 64 {
+            return Err(error(
+                crate::error::catalog::ER_COND_ITEM_TOO_LONG,
+                format!("Data too long for condition item '{name}'"),
+            ));
+        }
+        values.insert(name, value);
+    }
+    Ok(values)
+}
+
 fn signal_message_value(
     session: &SessionContext,
     locals: &HashMap<String, Value>,
@@ -5291,6 +5351,82 @@ fn resolve_subquery_functions(
     }
 }
 
+thread_local! {
+    static BIND_VIEW_FUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runtime-only bindings must never enter a persisted view definition or a
+/// shared parsed statement template during CREATE/ALTER validation.
+pub(super) fn with_view_function_binding<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BIND_VIEW_FUNCTIONS.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(BIND_VIEW_FUNCTIONS.with(|flag| flag.replace(true)));
+    work()
+}
+
+/// Bind only expressions physically belonging to this view body, before
+/// nested views are expanded under their own effective execution identities.
+pub(super) fn bind_view_stored_functions(
+    db: &Arc<Database>,
+    session: &SessionContext,
+    select: &mut crate::parser::Select,
+) -> Result<(), QueryError> {
+    if !BIND_VIEW_FUNCTIONS.with(|flag| flag.get()) || !db.has_stored_functions() {
+        return Ok(());
+    }
+    struct Bind<'a> {
+        db: &'a Arc<Database>,
+        session: &'a SessionContext,
+        result: Result<(), QueryError>,
+    }
+    impl crate::parser::visit::AstVisitorMut for Bind<'_> {
+        fn enter_expr(&mut self, expr: &mut Expr) {
+            if self.result.is_err() {
+                return;
+            }
+            let Expr::Function { name, .. } = expr else {
+                return;
+            };
+            if !name.contains('.')
+                && (crate::engine::cbo::function_cost::is_known_builtin_function(name)
+                    || crate::planner::is_aggregate_function(name))
+            {
+                return;
+            }
+            let Some(routine) = self.db.routine_definition(
+                &self.session.current_database,
+                RoutineKindSchema::Function,
+                name,
+            ) else {
+                return;
+            };
+            self.result = (|| {
+                authorize_routine_execute(self.db, self.session, &routine)?;
+                let program = compile_routine(&routine)?;
+                if let Some(binding) = crate::engine::expr::register_view_stored_function(
+                    routine,
+                    program,
+                    self.session.authorization_context(),
+                ) {
+                    *name = binding;
+                }
+                Ok(())
+            })();
+        }
+    }
+    let mut binder = Bind {
+        db,
+        session,
+        result: Ok(()),
+    };
+    crate::parser::visit::visit_select_mut(&mut binder, select);
+    binder.result
+}
+
 fn resolve_expr_functions(
     db: &Arc<Database>,
     session: &mut SessionContext,
@@ -5310,20 +5446,27 @@ fn resolve_expr_functions(
             {
                 return Ok(());
             }
-            let Some(routine) = db.routine_definition(
-                &session.current_database,
-                RoutineKindSchema::Function,
-                &function_name,
-            ) else {
+            let view_routine = crate::engine::expr::resolved_view_stored_function(&function_name);
+            let Some(routine) = view_routine.clone().or_else(|| {
+                db.routine_definition(
+                    &session.current_database,
+                    RoutineKindSchema::Function,
+                    &function_name,
+                )
+            }) else {
                 return Ok(());
             };
-            authorize_routine_execute(db, session, &routine)?;
+            if view_routine.is_none() {
+                authorize_routine_execute(db, session, &routine)?;
+            }
             let program = compile_routine(&routine)?;
-            crate::engine::expr::register_resolved_stored_function(
-                &function_name,
-                routine.clone(),
-                program,
-            );
+            if view_routine.is_none() {
+                crate::engine::expr::register_resolved_stored_function(
+                    &function_name,
+                    routine.clone(),
+                    program,
+                );
+            }
             needs.routines.insert(ResolvedRoutineMdl {
                 database: routine.database.clone(),
                 name: routine.name.clone(),

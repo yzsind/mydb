@@ -509,6 +509,7 @@ fn with_load_file_ctx<R>(
 // ===========================================================================
 thread_local! {
     static STORED_FN_CTX: Cell<Option<StoredFnCtx>> = const { Cell::new(None) };
+    static NEXT_VIEW_BINDING: Cell<u64> = const { Cell::new(0) };
     static RESOLVED_STORED_FUNCTIONS: std::cell::RefCell<
         HashMap<String, ResolvedStoredFunction>
     > = std::cell::RefCell::new(HashMap::new());
@@ -518,6 +519,7 @@ thread_local! {
 struct ResolvedStoredFunction {
     routine: std::sync::Arc<crate::storage::RoutineSchema>,
     program: std::sync::Arc<crate::engine::executor::routines::RoutineProgram>,
+    view_context: Option<crate::engine::auth::AuthorizationContext>,
 }
 
 #[derive(Clone, Copy)]
@@ -531,11 +533,13 @@ struct StoredFnCtx {
 pub(crate) struct StoredFnCtxGuard {
     prev: Option<StoredFnCtx>,
     prev_resolved: HashMap<String, ResolvedStoredFunction>,
+    prev_view_binding: u64,
 }
 
 impl Drop for StoredFnCtxGuard {
     fn drop(&mut self) {
         STORED_FN_CTX.with(|c| c.set(self.prev));
+        NEXT_VIEW_BINDING.with(|next| next.set(self.prev_view_binding));
         RESOLVED_STORED_FUNCTIONS.with(|resolved| {
             *resolved.borrow_mut() = std::mem::take(&mut self.prev_resolved);
         });
@@ -553,6 +557,7 @@ pub(crate) unsafe fn install_stored_fn_context(
     db: NonNull<std::sync::Arc<crate::storage::Database>>,
     session: NonNull<crate::engine::api::SessionContext>,
     registry: NonNull<crate::engine::session_registry::SessionRegistry>,
+    inherit_view_bindings: bool,
 ) -> StoredFnCtxGuard {
     let prev = STORED_FN_CTX.with(|c| {
         c.replace(Some(StoredFnCtx {
@@ -561,11 +566,30 @@ pub(crate) unsafe fn install_stored_fn_context(
             registry,
         }))
     });
-    let prev_resolved =
-        RESOLVED_STORED_FUNCTIONS.with(|resolved| std::mem::take(&mut *resolved.borrow_mut()));
+    let prev_resolved = RESOLVED_STORED_FUNCTIONS.with(|resolved| {
+        let mut resolved = resolved.borrow_mut();
+        let previous = std::mem::take(&mut *resolved);
+        if inherit_view_bindings {
+            resolved.extend(
+                previous
+                    .iter()
+                    .filter(|(_, binding)| binding.view_context.is_some())
+                    .map(|(name, binding)| (name.clone(), binding.clone())),
+            );
+        }
+        previous
+    });
+    let prev_view_binding = NEXT_VIEW_BINDING.with(|next| {
+        let previous = next.get();
+        if !inherit_view_bindings {
+            next.set(0);
+        }
+        previous
+    });
     StoredFnCtxGuard {
         prev,
         prev_resolved,
+        prev_view_binding,
     }
 }
 
@@ -577,7 +601,11 @@ pub(crate) fn register_resolved_stored_function(
     routine: std::sync::Arc<crate::storage::RoutineSchema>,
     program: std::sync::Arc<crate::engine::executor::routines::RoutineProgram>,
 ) {
-    let resolved_function = ResolvedStoredFunction { routine, program };
+    let resolved_function = ResolvedStoredFunction {
+        routine,
+        program,
+        view_context: None,
+    };
     RESOLVED_STORED_FUNCTIONS.with(|resolved| {
         let mut resolved = resolved.borrow_mut();
         resolved.insert(call_name.to_ascii_lowercase(), resolved_function.clone());
@@ -590,6 +618,57 @@ pub(crate) fn register_resolved_stored_function(
             resolved_function,
         );
     });
+}
+
+/// Give each view call its own binding, so a separate call of the same
+/// function cannot inherit the view's privileges. These names never persist.
+pub(crate) fn register_view_stored_function(
+    routine: std::sync::Arc<crate::storage::RoutineSchema>,
+    program: std::sync::Arc<crate::engine::executor::routines::RoutineProgram>,
+    context: crate::engine::auth::AuthorizationContext,
+) -> Option<String> {
+    STORED_FN_CTX.with(|ctx| ctx.get())?;
+    Some(RESOLVED_STORED_FUNCTIONS.with(|functions| {
+        let mut functions = functions.borrow_mut();
+        // NUL is forbidden in source identifiers. Keep identities stable
+        // across executions and distinct from inherited CTE bindings, while
+        // retaining the routine identity in semantic plan fingerprints.
+        let identity = NEXT_VIEW_BINDING.with(|next| {
+            let identity = next.get();
+            next.set(identity + 1);
+            identity
+        });
+        let name = format!(
+            "\0view_function_{identity}:{}:{}{}:{}",
+            routine.database.len(),
+            routine.database,
+            routine.name.len(),
+            routine.name
+        );
+        functions.insert(
+            name.clone(),
+            ResolvedStoredFunction {
+                routine,
+                program,
+                view_context: Some(context),
+            },
+        );
+        name
+    }))
+}
+
+pub(crate) fn resolved_view_stored_function(
+    name: &str,
+) -> Option<std::sync::Arc<crate::storage::RoutineSchema>> {
+    if !name.starts_with('\0') {
+        return None;
+    }
+    RESOLVED_STORED_FUNCTIONS.with(|functions| {
+        let functions = functions.borrow();
+        let function = functions.get(name)?;
+        function.view_context.as_ref()?;
+        Some(function.routine.clone())
+    })
 }
 
 /// Use the declared return domain of the version pinned by the resolver.
@@ -665,14 +744,30 @@ fn eval_stored_function(name: &str, arg_values: Vec<Value>) -> Option<Result<Val
         let resolved = RESOLVED_STORED_FUNCTIONS
             .with(|functions| functions.borrow().get(&name.to_ascii_lowercase()).cloned());
         match resolved {
-            Some(routine) => crate::engine::executor::routines::eval_stored_function_resolved(
-                db,
-                session,
-                &routine.routine,
-                &routine.program,
-                arg_values,
-                registry,
-            ),
+            Some(routine) => {
+                let saved = routine.view_context.as_ref().map(|context| {
+                    (
+                        std::mem::replace(
+                            &mut session.authenticated_as,
+                            context.authenticated_as.clone(),
+                        ),
+                        std::mem::replace(&mut session.active_roles, context.active_roles.clone()),
+                    )
+                });
+                let result = crate::engine::executor::routines::eval_stored_function_resolved(
+                    db,
+                    session,
+                    &routine.routine,
+                    &routine.program,
+                    arg_values,
+                    registry,
+                );
+                if let Some((account, roles)) = saved {
+                    session.authenticated_as = account;
+                    session.active_roles = roles;
+                }
+                result
+            }
             None => crate::engine::executor::routines::eval_stored_function_row(
                 db, session, name, arg_values, registry,
             ),

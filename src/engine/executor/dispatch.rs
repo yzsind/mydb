@@ -675,6 +675,7 @@ fn execute_statement_inner(
             std::ptr::NonNull::from(db),
             std::ptr::NonNull::from(&mut *session),
             std::ptr::NonNull::from(registry),
+            inherit_view_security,
         )
     };
     let mut statement = statement;
@@ -706,7 +707,9 @@ fn execute_statement_inner(
             super::routines::resolve_stored_functions(db, session, &mut statement, registry)?;
         // Resolve user references before inserting persistently bound view bodies.
         qualify_statement_tables(db, session, &mut statement)?;
-        expand_views(db, session, &mut statement, 0)?;
+        super::routines::with_view_function_binding(|| {
+            expand_views(db, session, &mut statement, 0)
+        })?;
         let has_fusion = select::hybrid::statement_has_fusion(&statement);
         let _fulltext_scoring = select::fulltext_context::enter_fusion(has_fusion);
         if has_fusion {
@@ -724,13 +727,14 @@ fn execute_statement_inner(
                     || (db.has_stored_functions()
                         && (name.contains('.')
                             || !crate::engine::cbo::function_cost::is_known_builtin_function(name))
-                        && db
-                            .routine_definition(
-                                &session.current_database,
-                                crate::storage::RoutineKindSchema::Function,
-                                name,
-                            )
-                            .is_some())
+                        && (crate::engine::expr::resolved_view_stored_function(name).is_some()
+                            || db
+                                .routine_definition(
+                                    &session.current_database,
+                                    crate::storage::RoutineKindSchema::Function,
+                                    name,
+                                )
+                                .is_some()))
             })
             .map_err(|error| error.spec.error(error.message))?;
         }
@@ -4350,6 +4354,22 @@ pub(super) fn authorize_prepared_statement_with_epoch(
                     ),
                 ));
             }
+            if let PrivilegeScope::Routine {
+                database, routine, ..
+            } = &required.scope
+            {
+                return Err(error(
+                    crate::error::catalog::ER_PROCACCESS_DENIED_ERROR,
+                    format!(
+                        "{} command denied to user '{}'@'{}' for routine '{}.{}'",
+                        required.privilege.sql_name().to_ascii_lowercase(),
+                        ctx.authenticated_as.user,
+                        ctx.authenticated_as.host,
+                        database,
+                        routine,
+                    ),
+                ));
+            }
             return Err(privilege_denied(&required.privilege, &required.scope));
         }
         Ok(auth.epoch)
@@ -7178,6 +7198,7 @@ fn execute_sql_prepare(
     session: &mut SessionContext,
     name: String,
     source: Expr,
+    registry: &SessionRegistry,
 ) -> Result<(), QueryError> {
     let prepare_started = std::time::Instant::now();
     let key = name.to_ascii_lowercase();
@@ -7225,8 +7246,16 @@ fn execute_sql_prepare(
     // but bind a private copy to the current database/temporary-table scope
     // for diagnostics that MySQL reports at PREPARE rather than EXECUTE.
     let mut validation_statement = statement.clone();
-    expand_views(db, session, &mut validation_statement, 0)?;
+    super::routines::with_view_function_binding(|| {
+        expand_views(db, session, &mut validation_statement, 0)
+    })?;
     qualify_statement_tables(db, session, &mut validation_statement)?;
+    let routine_resolution = super::routines::resolve_stored_functions(
+        db,
+        session,
+        &mut validation_statement,
+        registry,
+    )?;
     if let Statement::Select(select) = &validation_statement {
         crate::engine::executor::select::warn_prepared_select_temporal_constants(db, select);
     }
@@ -7286,6 +7315,7 @@ fn execute_sql_prepare(
             database: session.current_database.clone(),
             parameter_count,
             result_columns,
+            routine_result_metadata: !routine_resolution.routines.is_empty(),
             memory_charge,
         },
     )?;
@@ -7352,7 +7382,9 @@ fn execute_sql_prepared(
     });
     session.current_database = saved_database;
     if let Ok(result) = &mut response {
-        apply_sql_prepared_result_columns(result, &prepared.result_columns);
+        if !prepared.routine_result_metadata {
+            apply_sql_prepared_result_columns(result, &prepared.result_columns);
+        }
         super::select::cap_prepared_group_concat_limit_warnings(&prepared.statement, result);
         // PREPARE validates source syntax, but EXECUTE starts a fresh
         // diagnostics area. Re-publish lexical deprecation diagnostics for
@@ -7589,7 +7621,7 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::Prepare { name, source } => {
-            execute_sql_prepare(db, session, name, source)?;
+            execute_sql_prepare(db, session, name, source, registry)?;
             Ok(QueryResponse::Ok)
         }
         Statement::ExecutePrepared { name, using } => {

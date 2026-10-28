@@ -5375,9 +5375,6 @@ impl StorageQueryEngine {
         let mut statement = (*self.parse_cached_statement(session, sql)?).clone();
         authorize_statement(&self.db, session, &statement)?;
         qualify_statement_tables(&self.db, session, &mut statement)?;
-        // Bind view output metadata through the same expansion used by
-        // EXECUTE; a view name is not a physical catalog table.
-        dispatch::expand_views(&self.db, session, &mut statement, 0)?;
         // Bind routine return domains without executing their bodies. Keep the
         // same versioned descriptors available to PREPARE's column inference.
         // SAFETY: these pointers remain valid for this synchronous binding
@@ -5387,8 +5384,14 @@ impl StorageQueryEngine {
                 std::ptr::NonNull::from(&self.db),
                 std::ptr::NonNull::from(&mut *session),
                 std::ptr::NonNull::from(self.registry.as_ref()),
+                false,
             )
         };
+        // Bind view output metadata through the same expansion used by
+        // EXECUTE; a view name is not a physical catalog table.
+        routines::with_view_function_binding(|| {
+            dispatch::expand_views(&self.db, session, &mut statement, 0)
+        })?;
         routines::resolve_stored_functions(&self.db, session, &mut statement, &self.registry)?;
         // DESCRIBE/PREPARE is a binding operation and must observe the same
         // type-affecting session state as EXECUTE. Previously this path ran
