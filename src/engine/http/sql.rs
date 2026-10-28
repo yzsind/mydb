@@ -2,7 +2,10 @@
 use crate::storage::Database;
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock, RwLock,
+    },
 };
 struct Entry {
     epoch: u64,
@@ -11,8 +14,55 @@ struct Entry {
     owner: std::sync::Weak<Database>,
 }
 static CACHE: OnceLock<RwLock<HashMap<usize, Entry>>> = OnceLock::new();
+/// Bumped under the cache write lock after every change to [`CACHE`], so a
+/// [`SensitivityMemo`] can tell whether its dependency-name verdict is stale.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Changes whenever [`sensitive`]'s dependency-name verdicts may change.
+pub(crate) fn dependency_generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 fn cache() -> &'static RwLock<HashMap<usize, Entry>> {
     CACHE.get_or_init(Default::default)
+}
+
+/// Redaction verdict for one immutable SQL text, equal to
+/// `sql_may_have_ai(sql) || sensitive(sql)`. The text-only scans run once at
+/// construction; the dependency-name part is recomputed only after the
+/// catalog-derived cache changes. Prepared statements publish their text to
+/// the process list and performance_schema on every EXECUTE, so rescanning an
+/// unchanged statement there was pure per-execution overhead.
+#[derive(Debug)]
+pub(crate) struct SensitivityMemo {
+    text_sensitive: bool,
+    /// `(generation << 1) | verdict`; `u64::MAX` until first computed.
+    dependency_verdict: AtomicU64,
+}
+
+impl SensitivityMemo {
+    pub(crate) fn new(sql: &str) -> Self {
+        Self {
+            text_sensitive: crate::engine::ai::sql::sql_may_have_ai(sql) || super::mentions(sql),
+            dependency_verdict: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// `sql` must be the text this memo was built from.
+    pub(crate) fn is_sensitive(&self, sql: &str) -> bool {
+        if self.text_sensitive {
+            return true;
+        }
+        // Load the generation before reading the cache: a concurrent change
+        // then leaves a stale generation behind and forces a recomputation.
+        let generation = GENERATION.load(Ordering::Acquire);
+        let cached = self.dependency_verdict.load(Ordering::Acquire);
+        if cached != u64::MAX && cached >> 1 == generation {
+            return cached & 1 == 1;
+        }
+        let verdict = dependency_sensitive(sql);
+        self.dependency_verdict
+            .store((generation << 1) | u64::from(verdict), Ordering::Release);
+        verdict
+    }
 }
 fn contains(sql: &str, names: &BTreeSet<String>) -> bool {
     if names.is_empty() {
@@ -87,25 +137,65 @@ fn matches(sql: &str, names: &BTreeSet<String>, tables: &BTreeSet<String>) -> bo
     contains(sql, names) || (!tables.is_empty() && contains(sql, tables) && may_write(sql))
 }
 pub(crate) fn sensitive(sql: &str) -> bool {
-    if super::mentions(sql) {
-        return true;
-    }
+    super::mentions(sql) || dependency_sensitive(sql)
+}
+fn dependency_sensitive(sql: &str) -> bool {
     cache()
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .values()
         .any(|entry| matches(sql, &entry.names, &entry.trigger_tables))
 }
+/// Per-thread copy of one database's dependency names, valid while both the
+/// catalog epoch and [`GENERATION`] are unchanged.
+struct LocalEntry {
+    key: usize,
+    epoch: u64,
+    generation: u64,
+    names: Arc<BTreeSet<String>>,
+    trigger_tables: Arc<BTreeSet<String>>,
+}
+thread_local! {
+    static LOCAL: std::cell::RefCell<Option<LocalEntry>> = const { std::cell::RefCell::new(None) };
+}
 pub(crate) fn may_call(db: &Arc<Database>, sql: &str) -> bool {
+    let mentions = crate::engine::perf_events::prepared_sql_traits(sql)
+        .map_or_else(|| super::mentions(sql), |traits| traits.http_mentions);
+    if mentions {
+        return true;
+    }
     let key = Arc::as_ptr(db) as usize;
     let epoch = db.catalog_publication_epoch();
-    if let Some(entry) = cache()
+    // Every statement asks this, often more than once. Serve the steady state
+    // from a thread-local copy instead of the process-wide lock, whose reader
+    // count is one cache line shared by every executing session.
+    let generation = GENERATION.load(Ordering::Acquire);
+    let local = LOCAL.with(|local| {
+        local.borrow().as_ref().and_then(|e| {
+            (e.key == key && e.epoch == epoch && e.generation == generation)
+                .then(|| matches(sql, &e.names, &e.trigger_tables))
+        })
+    });
+    if let Some(verdict) = local {
+        return verdict;
+    }
+    let shared = cache()
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .filter(|e| e.epoch == epoch)
-    {
-        return super::mentions(sql) || matches(sql, &entry.names, &entry.trigger_tables);
+        .map(|e| (Arc::clone(&e.names), Arc::clone(&e.trigger_tables)));
+    if let Some((names, trigger_tables)) = shared {
+        LOCAL.with(|local| {
+            *local.borrow_mut() = Some(LocalEntry {
+                key,
+                epoch,
+                generation,
+                names: Arc::clone(&names),
+                trigger_tables: Arc::clone(&trigger_tables),
+            });
+        });
+        return matches(sql, &names, &trigger_tables);
     }
     let (epoch, sources) = db.http_dependency_sources();
     let mut names = BTreeSet::new();
@@ -132,6 +222,7 @@ pub(crate) fn may_call(db: &Arc<Database>, sql: &str) -> bool {
     // embedding applications that open many short-lived engines.
     if cache.len() >= 1024 && !cache.contains_key(&key) {
         cache.retain(|_, e| e.owner.strong_count() > 0);
+        GENERATION.fetch_add(1, Ordering::AcqRel);
     }
     if cache.len() >= 1024 && !cache.contains_key(&key) {
         return true;
@@ -145,13 +236,13 @@ pub(crate) fn may_call(db: &Arc<Database>, sql: &str) -> bool {
             owner: Arc::downgrade(db),
         },
     );
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     result
 }
 pub(crate) fn retire(db: &Database) {
-    cache()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(db as *const Database as usize));
+    let mut cache = cache().write().unwrap_or_else(|e| e.into_inner());
+    cache.remove(&(db as *const Database as usize));
+    GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// SQL-level EXECUTE names a connection-owned template, unlike binary EXECUTE

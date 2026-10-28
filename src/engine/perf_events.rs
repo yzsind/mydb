@@ -80,7 +80,7 @@ struct StatementEvent {
     sql_text: Arc<str>,
     digest: Option<Arc<str>>,
     digest_text: Option<Arc<str>>,
-    current_schema: String,
+    current_schema: Arc<str>,
     mysql_errno: Option<u16>,
     returned_sqlstate: Option<String>,
     message_text: Option<String>,
@@ -116,6 +116,17 @@ impl ThreadEvents {
     fn next_event_id(&mut self) -> u64 {
         self.next_event_id = self.next_event_id.saturating_add(1).max(1);
         self.next_event_id
+    }
+
+    /// The session's schema rarely changes between statements; share the
+    /// previous event's text instead of allocating a copy per statement.
+    fn schema(&self, current: &str) -> Arc<str> {
+        match &self.current_statement {
+            Some(event) if event.current_schema.as_ref() == current => {
+                Arc::clone(&event.current_schema)
+            }
+            _ => Arc::from(current),
+        }
     }
 }
 
@@ -707,17 +718,17 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
             return;
         }
     }
-    let safe = prepared_texts
+    let text = prepared_texts
         .is_none()
-        .then(|| crate::engine::logging::redact_sql_for_log(sql));
-    let trimmed = prepared_texts.as_ref().map_or_else(
-        || safe.as_deref().unwrap_or_default().trim(),
-        |texts| texts.0.sql_text.as_ref(),
-    );
+        .then(|| text_statement_identity(sql));
+    let (trimmed, event_class) = match (&prepared_texts, &text) {
+        (Some(texts), _) => (texts.0.sql_text.as_ref(), texts.1),
+        (None, Some((trimmed, class))) => (trimmed.as_ref(), *class),
+        (None, None) => return,
+    };
     if trimmed.is_empty() {
         return;
     }
-    let event_class = statement_event_class(trimmed);
     let event_name = event_class.name;
     if !statement_instrument_enabled(event_class) {
         return;
@@ -729,6 +740,7 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
         .entry(session.connection_id as u64)
         .or_default();
     let event_id = thread.next_event_id();
+    let current_schema = thread.schema(&session.current_database);
     thread.current_statement = Some(StatementEvent {
         thread_id: session.connection_id as u64,
         event_id,
@@ -744,7 +756,7 @@ pub(crate) fn begin_statement(session: &SessionContext, sql: &str) {
         ),
         digest: None,
         digest_text: None,
-        current_schema: session.current_database.clone(),
+        current_schema,
         mysql_errno: None,
         returned_sqlstate: None,
         message_text: None,
@@ -776,7 +788,39 @@ struct StatementTexts {
 /// blocking-pool migration otherwise makes even a tiny per-thread cache pay
 /// the full SQL hash on every execution.
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedStatementTexts(Arc<StatementTexts>);
+pub(crate) struct PreparedStatementTexts(
+    Arc<StatementTexts>,
+    StatementEventClass,
+    PreparedSqlSource,
+);
+
+/// Text-only facts about a prepared statement's SQL. Each one is a scan of
+/// the immutable text that every EXECUTE used to repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SqlTextTraits {
+    pub(crate) sequence_fn: bool,
+    pub(crate) may_have_ai: bool,
+    pub(crate) http_mentions: bool,
+}
+
+impl SqlTextTraits {
+    pub(crate) fn of(sql: &str) -> Self {
+        Self {
+            sequence_fn: crate::planner::sql_mentions_sequence_fn(sql),
+            may_have_ai: crate::engine::ai::sql::sql_may_have_ai(sql),
+            http_mentions: crate::engine::http::mentions(sql),
+        }
+    }
+}
+
+/// The executable SQL a prepared handle runs and its [`SqlTextTraits`].
+/// The handle executes this same allocation, so an EXECUTE recognises it by
+/// pointer; any other text (nested routine statements, fallbacks) misses.
+#[derive(Clone, Debug)]
+struct PreparedSqlSource {
+    sql: Arc<str>,
+    traits: SqlTextTraits,
+}
 
 impl PreparedStatementTexts {
     pub(crate) fn estimated_memory_bytes(&self) -> usize {
@@ -812,6 +856,74 @@ thread_local! {
     static PREPARED_STATEMENT_TEXTS: RefCell<Option<PreparedStatementTexts>> = const { RefCell::new(None) };
 }
 
+struct TextStatementMemo {
+    raw: Box<str>,
+    generation: u64,
+    trimmed: Arc<str>,
+    class: StatementEventClass,
+}
+
+thread_local! {
+    static TEXT_STATEMENT_MEMO: RefCell<Option<TextStatementMemo>> = const { RefCell::new(None) };
+}
+
+/// Longer texts are literal-heavy batches that never repeat verbatim.
+const TEXT_STATEMENT_MEMO_MAX_LEN: usize = 1024;
+
+/// Redacted, trimmed text and instrument class of a text-protocol statement.
+/// `begin_statement` and `record_statement` both need them for the same
+/// text, and drivers resend a few short texts (COMMIT, session-variable
+/// probes) many times per transaction. Redaction rescans the text and reads
+/// the shared HTTP dependency cache, so its verdict is keyed by that cache's
+/// generation as well as the exact text.
+fn text_statement_identity(sql: &str) -> (Arc<str>, StatementEventClass) {
+    let generation = crate::engine::http::dependency_generation();
+    let memoizable = sql.len() <= TEXT_STATEMENT_MEMO_MAX_LEN;
+    if memoizable {
+        let hit = TEXT_STATEMENT_MEMO.with(|memo| {
+            memo.borrow()
+                .as_ref()
+                .filter(|memo| memo.generation == generation && memo.raw.as_ref() == sql)
+                .map(|memo| (Arc::clone(&memo.trimmed), memo.class))
+        });
+        if let Some(hit) = hit {
+            return hit;
+        }
+    }
+    let safe = crate::engine::logging::redact_sql_for_log(sql);
+    let trimmed: Arc<str> = Arc::from(safe.trim());
+    let class = statement_event_class(&trimmed);
+    if memoizable {
+        TEXT_STATEMENT_MEMO.with(|memo| {
+            *memo.borrow_mut() = Some(TextStatementMemo {
+                raw: Box::from(sql),
+                generation,
+                trimmed: Arc::clone(&trimmed),
+                class,
+            });
+        });
+    }
+    (trimmed, class)
+}
+
+/// Traits of `sql` when it is the executable text of the prepared statement
+/// currently running on this thread.
+pub(crate) fn prepared_sql_traits(sql: &str) -> Option<SqlTextTraits> {
+    PREPARED_STATEMENT_TEXTS.with(|slot| {
+        slot.borrow().as_ref().and_then(|texts| {
+            let source = &texts.2;
+            (std::ptr::eq(source.sql.as_ptr(), sql.as_ptr()) && source.sql.len() == sql.len())
+                .then_some(source.traits)
+        })
+    })
+}
+
+/// Executable text shared with the prepared handle, so that EXECUTE passes
+/// the very allocation [`prepared_sql_traits`] recognises.
+pub(crate) fn prepared_statement_sql(texts: &PreparedStatementTexts) -> Arc<str> {
+    Arc::clone(&texts.2.sql)
+}
+
 pub(crate) fn prepared_statement_texts(sql: &str) -> PreparedStatementTexts {
     // PREPARE is frequently repeated for byte-identical SQL even when the
     // client closes the server-side handle after each transaction. Reuse the
@@ -825,13 +937,21 @@ pub(crate) fn prepared_statement_texts(sql: &str) -> PreparedStatementTexts {
     // borrow it without rescanning or allocating on every execution.
     let safe = crate::engine::logging::redact_sql_for_log(sql);
     let cached = statement_texts(safe.trim());
-    PreparedStatementTexts(Arc::new(StatementTexts {
-        sql_text: Arc::from(cached.sql_text.as_ref()),
-        digest: cached
-            .digest
-            .as_ref()
-            .map(|(text, digest)| (Arc::from(text.as_ref()), Arc::from(digest.as_ref()))),
-    }))
+    let event_class = statement_event_class(cached.sql_text.as_ref());
+    PreparedStatementTexts(
+        Arc::new(StatementTexts {
+            sql_text: Arc::from(cached.sql_text.as_ref()),
+            digest: cached
+                .digest
+                .as_ref()
+                .map(|(text, digest)| (Arc::from(text.as_ref()), Arc::from(digest.as_ref()))),
+        }),
+        event_class,
+        PreparedSqlSource {
+            sql: Arc::from(sql),
+            traits: SqlTextTraits::of(sql),
+        },
+    )
 }
 
 pub(crate) fn with_prepared_statement_texts<R>(
@@ -1021,18 +1141,18 @@ pub(crate) fn record_statement(
     }
 
     let prepared_texts = PREPARED_STATEMENT_TEXTS.with(|slot| slot.borrow().clone());
-    let safe_sql = prepared_texts
+    let text = prepared_texts
         .is_none()
-        .then(|| crate::engine::logging::redact_sql_for_log(sql));
-    let trimmed = prepared_texts.as_ref().map_or_else(
-        || safe_sql.as_deref().unwrap_or_default().trim(),
-        |texts| texts.0.sql_text.as_ref(),
-    );
+        .then(|| text_statement_identity(sql));
+    let (trimmed, event_class) = match (&prepared_texts, &text) {
+        (Some(texts), _) => (texts.0.sql_text.as_ref(), texts.1),
+        (None, Some((trimmed, class))) => (trimmed.as_ref(), *class),
+        (None, None) => return,
+    };
     if trimmed.is_empty() {
         return;
     }
 
-    let event_class = statement_event_class(trimmed);
     let event_name = event_class.name;
     let statement_instrumented = instrumentation_enabled
         && statement_instrument_enabled(event_class)
@@ -1123,7 +1243,7 @@ pub(crate) fn record_statement(
             sql_text: Arc::clone(&texts.sql_text),
             digest,
             digest_text,
-            current_schema: session.current_database.clone(),
+            current_schema: thread.schema(&session.current_database),
             mysql_errno: errno,
             returned_sqlstate: sql_state,
             message_text: message,
@@ -1166,10 +1286,20 @@ fn record_statement_event(
         .thread_accounts
         .entry(thread_id)
         .or_insert_with(|| (user.to_string(), host.to_string()));
-    let thread = state.threads.entry(thread_id).or_default();
-    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_CURRENT != 0 {
-        thread.current_statement = Some(event.clone());
+    upsert_statement(&mut state.statement_global, event.event_name, &event);
+    state
+        .statement_by_thread
+        .entry((thread_id, event.event_name))
+        .or_insert_with(|| LiveAggregate::new(StatementAggregate::new(event.event_name)))
+        .record(|aggregate| aggregate.record(&event));
+    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_HISTORY_LONG != 0
+        && crate::engine::perf_setup::thread_history_enabled(ONE_CONNECTION_THREAD)
+        && crate::engine::perf_setup::actor_history_enabled(user, host)
+    {
+        let limit = state.statement_history_long_limit;
+        push_bounded(&mut state.statement_history_long, event.clone(), limit);
     }
+    let thread = state.threads.entry(thread_id).or_default();
     if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_HISTORY != 0
         && crate::engine::perf_setup::thread_history_enabled(ONE_CONNECTION_THREAD)
         && crate::engine::perf_setup::actor_history_enabled(user, host)
@@ -1180,19 +1310,11 @@ fn record_statement_event(
             statement_history_limit(),
         );
     }
-    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_HISTORY_LONG != 0
-        && crate::engine::perf_setup::thread_history_enabled(ONE_CONNECTION_THREAD)
-        && crate::engine::perf_setup::actor_history_enabled(user, host)
-    {
-        let limit = state.statement_history_long_limit;
-        push_bounded(&mut state.statement_history_long, event.clone(), limit);
+    // The current-statement slot takes the event itself: one fewer deep
+    // clone per statement than cloning into every consumer.
+    if consumer_mask & crate::engine::perf_setup::CONSUMER_STATEMENTS_CURRENT != 0 {
+        thread.current_statement = Some(event);
     }
-    upsert_statement(&mut state.statement_global, event.event_name, &event);
-    state
-        .statement_by_thread
-        .entry((thread_id, event.event_name))
-        .or_insert_with(|| LiveAggregate::new(StatementAggregate::new(event.event_name)))
-        .record(|aggregate| aggregate.record(&event));
 }
 
 fn record_wait_event(
@@ -1775,7 +1897,7 @@ fn wait_aggregate_tail(agg: &WaitAggregate) -> [Value; 5] {
     ]
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct StatementEventClass {
     name: &'static str,
     index: usize,
@@ -2313,7 +2435,7 @@ mod tests {
             sql_text: Arc::from("SELECT 1"),
             digest: None,
             digest_text: None,
-            current_schema: "test".to_string(),
+            current_schema: Arc::from("test"),
             mysql_errno: None,
             returned_sqlstate: None,
             message_text: None,
@@ -2472,6 +2594,44 @@ mod tests {
         let prepared = prepared_statement_texts(raw);
         assert!(!prepared.0.sql_text.contains("secret-value"));
         assert_ne!(prepared.0.sql_text.as_ref(), raw);
+    }
+
+    #[test]
+    fn prepared_sql_traits_match_only_the_running_handle_text() {
+        let raw = "SELECT NEXTVAL(s), http_get('x') FROM t";
+        let prepared = prepared_statement_texts(raw);
+        let sql = prepared_statement_sql(&prepared);
+        assert_eq!(prepared_sql_traits(&sql), None);
+        with_prepared_statement_texts(&prepared, || {
+            let traits = prepared_sql_traits(&sql).expect("handle text is recognised");
+            assert_eq!(traits, SqlTextTraits::of(raw));
+            assert!(traits.sequence_fn && traits.http_mentions && !traits.may_have_ai);
+            // Equal text in another allocation, e.g. a nested statement, is
+            // scanned on its own.
+            let copy = String::from(raw);
+            assert_eq!(prepared_sql_traits(&copy), None);
+            assert_eq!(prepared_sql_traits(&sql[..6]), None);
+        });
+        assert_eq!(prepared_sql_traits(&sql), None);
+    }
+
+    #[test]
+    fn text_statement_identity_memo_matches_uncached_redaction() {
+        TEXT_STATEMENT_MEMO.with(|memo| memo.borrow_mut().take());
+        for raw in [
+            "  COMMIT ",
+            "  COMMIT ",
+            "ALTER USER u IDENTIFIED BY 'secret-value'",
+            "ALTER USER u IDENTIFIED BY 'secret-value'",
+            "SELECT @@session.transaction_read_only",
+        ] {
+            let (trimmed, class) = text_statement_identity(raw);
+            let expected = crate::engine::logging::redact_sql_for_log(raw);
+            assert_eq!(trimmed.as_ref(), expected.trim());
+            assert_eq!(class.name, statement_event_class(expected.trim()).name);
+        }
+        let (trimmed, _) = text_statement_identity("ALTER USER u IDENTIFIED BY 'secret-value'");
+        assert!(!trimmed.contains("secret-value"));
     }
 
     #[test]

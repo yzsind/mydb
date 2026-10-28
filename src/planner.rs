@@ -10526,8 +10526,31 @@ fn choose_scan(
             } else if let Some(lower_bound) = db.zone_map_cost_lower_bound(&table.schema, expr) {
                 let metadata_cpu = lower_bound.zones_examined as f64
                     * crate::engine::cbo::cbo_consts().cpu_operator_cost();
+                // Price only pages the estimator is guaranteed to retain:
+                // its sampling floor and untrusted storage objects. Expected
+                // rows do not prove a match; exact metadata can prune every
+                // page, and a matching tail zone may be only partially full.
+                let min_fraction = if lower_bound.total_pages > 0 {
+                    (lower_bound.min_surviving_pages as f64 / lower_bound.total_pages as f64)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let scan_floor = if min_fraction > 0.0 {
+                    operator_cost::seq_scan(
+                        &ctx,
+                        seq_pages * min_fraction,
+                        seq_access_rows * min_fraction,
+                        seq_output_rows,
+                        row_width,
+                        qual_cpu,
+                    )
+                    .weighted_total()
+                } else {
+                    0.0
+                };
                 frontier
-                    .should_expand(metadata_cpu, false)
+                    .should_expand(scan_floor + metadata_cpu, false)
                     .then(|| db.zone_map_cost_details(&table.schema, expr))
                     .flatten()
             } else {

@@ -539,12 +539,11 @@ impl Database {
                     let Some(ordinal) = key_ordinals.get(&index_key).copied() else {
                         continue;
                     };
-                    self.lock_manager().check_unique_key_lock(
+                    self.check_unique_key_reservation(
                         txn.txn_id,
                         table.id,
                         &index.name,
                         &index_key,
-                        &self.lock_owner_status(),
                     )?;
                     match self.check_unique_conflict_at_row(
                         table, txn, None, index, &index_key, table.id, row_id,
@@ -589,12 +588,11 @@ impl Database {
             return Ok(None);
         }
         for key in keys {
-            self.lock_manager().check_unique_key_lock(
+            self.check_unique_key_reservation(
                 txn.txn_id,
                 table.id,
                 &index.name,
                 key,
-                &self.lock_owner_status(),
             )?;
         }
         self.with_index_read(table.id, &index.name, |file| {
@@ -619,12 +617,11 @@ impl Database {
             if earliest.is_some_and(|prior| *ordinal >= prior) {
                 continue;
             }
-            self.lock_manager().check_unique_key_lock(
+            self.check_unique_key_reservation(
                 txn.txn_id,
                 table.id,
                 &index.name,
                 key,
-                &self.lock_owner_status(),
             )?;
             for (storage_id, row_id) in
                 self.lookup_index_row_locations(table, index, key.clone())?
@@ -745,12 +742,11 @@ impl Database {
                     // path), then validate the conflict against the
                     // exact row_id the index pointed at — no need to
                     // re-descend the B-tree.
-                    self.lock_manager().check_unique_key_lock(
+                    self.check_unique_key_reservation(
                         txn.txn_id,
                         table.id,
                         &index.name,
                         &idx_key,
-                        &self.lock_owner_status(),
                     )?;
                     // Merge-join only runs for unpartitioned tables (gated in
                     // `check_batch_unique_constraints`), so the owning heap is
@@ -889,12 +885,11 @@ impl Database {
         key: IndexKey,
         released_rows: Option<&crate::util::fast_hash::AhHashSet<RowId>>,
     ) -> Result<(), QueryError> {
-        self.lock_manager().check_unique_key_lock(
+        self.check_unique_key_reservation(
             txn.txn_id,
             table.id,
             &index.name,
             &key,
-            &self.lock_owner_status(),
         )?;
         for (storage_id, row_id) in self.lookup_index_row_locations(table, index, key.clone())? {
             // The earlier row is locked and its accepted update releases this

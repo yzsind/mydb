@@ -8,7 +8,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 /// hashing buys nothing here: the keys are internal identifiers, never
 /// attacker-chosen strings hashed across a trust boundary.
 pub(crate) type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -1145,12 +1145,178 @@ pub(crate) struct TransactionManager {
     pub(crate) named_savepoints: HashMap<u64, Vec<NamedSavepoint>>,
 }
 
+/// Lock-free per-table summary of unique-key reservations (point keys and
+/// integer ranges), readable without the `lock_manager` latch.
+///
+/// Every reservation increments its table's bucket inside the latch before it
+/// becomes visible in the lock tables, and every release decrements it after
+/// removal, so a zero bucket proves that no transaction holds a unique-key
+/// reservation on the table. Point probes that would only report "no other
+/// owner" can then skip the shared latch entirely; a non-zero bucket (a real
+/// reservation or a hash collision) falls back to the exact latched check.
+#[derive(Debug)]
+pub(crate) struct UniqueReservationFilter {
+    buckets: Box<[AtomicU32]>,
+}
+
+const UNIQUE_RESERVATION_FILTER_BUCKETS: usize = 1024;
+
+impl Default for UniqueReservationFilter {
+    fn default() -> Self {
+        Self {
+            buckets: (0..UNIQUE_RESERVATION_FILTER_BUCKETS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+        }
+    }
+}
+
+impl UniqueReservationFilter {
+    #[inline]
+    fn bucket(&self, table_id: u64) -> &AtomicU32 {
+        let hash = table_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54;
+        &self.buckets[hash as usize % self.buckets.len()]
+    }
+
+    fn add(&self, table_id: u64) {
+        self.bucket(table_id).fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn remove(&self, table_id: u64) {
+        let previous = self.bucket(table_id).fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "unique reservation filter underflow");
+    }
+
+    /// `false` proves that no transaction reserves a unique key of `table_id`.
+    #[inline]
+    pub(crate) fn may_have_reservations(&self, table_id: u64) -> bool {
+        self.bucket(table_id).load(Ordering::SeqCst) != 0
+    }
+}
+
+/// Lock-free per-transaction-bucket summary of which transactions own a
+/// lock log. A zero bucket proves that `txn_id` has no log, so a statement
+/// savepoint can record length 0 without taking the `lock_manager` latch.
+/// Only the owning transaction creates its log, so its own earlier creation
+/// is always visible to it.
+#[derive(Debug)]
+pub(crate) struct LockLogPresence {
+    buckets: Box<[AtomicU32]>,
+}
+
+const LOCK_LOG_PRESENCE_BUCKETS: usize = 1024;
+
+impl Default for LockLogPresence {
+    fn default() -> Self {
+        Self {
+            buckets: (0..LOCK_LOG_PRESENCE_BUCKETS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+        }
+    }
+}
+
+impl LockLogPresence {
+    #[inline]
+    fn bucket(&self, txn_id: u64) -> &AtomicU32 {
+        &self.buckets[txn_id as usize % self.buckets.len()]
+    }
+
+    /// `false` proves that `txn_id` holds no lock-log entries.
+    #[inline]
+    pub(crate) fn may_have_log(&self, txn_id: u64) -> bool {
+        self.bucket(txn_id).load(Ordering::SeqCst) != 0
+    }
+}
+
+/// Per-transaction lock logs. Keys are created and removed only through
+/// these methods so [`LockLogPresence`] always covers every live log.
+#[derive(Debug, Default)]
+pub(crate) struct LockLogs {
+    logs: FastHashMap<u64, Vec<HeldLock>>,
+    presence: Arc<LockLogPresence>,
+}
+
+pub(crate) struct LockLogEntry<'a> {
+    logs: &'a mut LockLogs,
+    txn_id: u64,
+}
+
+impl<'a> LockLogEntry<'a> {
+    pub(crate) fn or_default(self) -> &'a mut Vec<HeldLock> {
+        let LockLogs { logs, presence } = self.logs;
+        match logs.entry(self.txn_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                presence.bucket(self.txn_id).fetch_add(1, Ordering::SeqCst);
+                entry.insert(Vec::new())
+            }
+        }
+    }
+}
+
+impl LockLogs {
+    pub(crate) fn presence(&self) -> Arc<LockLogPresence> {
+        Arc::clone(&self.presence)
+    }
+
+    pub(crate) fn entry(&mut self, txn_id: u64) -> LockLogEntry<'_> {
+        LockLogEntry { logs: self, txn_id }
+    }
+
+    pub(crate) fn get(&self, txn_id: &u64) -> Option<&Vec<HeldLock>> {
+        self.logs.get(txn_id)
+    }
+
+    pub(crate) fn get_mut(&mut self, txn_id: &u64) -> Option<&mut Vec<HeldLock>> {
+        self.logs.get_mut(txn_id)
+    }
+
+    pub(crate) fn contains_key(&self, txn_id: &u64) -> bool {
+        self.logs.contains_key(txn_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.logs.is_empty()
+    }
+
+    pub(crate) fn remove(&mut self, txn_id: &u64) -> Option<Vec<HeldLock>> {
+        let removed = self.logs.remove(txn_id);
+        if removed.is_some() {
+            self.presence.bucket(*txn_id).fetch_sub(1, Ordering::SeqCst);
+        }
+        removed
+    }
+
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Vec<HeldLock>> {
+        self.logs.values_mut()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut Vec<HeldLock>)> {
+        self.logs.iter_mut()
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&u64, &mut Vec<HeldLock>) -> bool) {
+        let presence = &self.presence;
+        self.logs.retain(|txn_id, log| {
+            let retained = keep(txn_id, log);
+            if !retained {
+                presence.bucket(*txn_id).fetch_sub(1, Ordering::SeqCst);
+            }
+            retained
+        });
+    }
+}
+
 /// Most point-lock sets cover only a few tables. Keep their exact counters
 /// inline; larger sets retain hash lookup rather than an unbounded scan.
 #[derive(Debug, Default)]
 struct UniquePointTables {
     inline: SmallVec<[(u64, usize); 4]>,
     spill: Option<FastHashMap<u64, usize>>,
+    /// Lock-free mirror of these counters plus integer-range reservations.
+    filter: Arc<UniqueReservationFilter>,
 }
 
 impl UniquePointTables {
@@ -1162,6 +1328,7 @@ impl UniquePointTables {
     }
 
     fn increment(&mut self, table: u64) {
+        self.filter.add(table);
         if let Some(tables) = &mut self.spill {
             *tables.entry(table).or_default() += 1;
         } else if let Some((_, count)) = self.inline.iter_mut().find(|(id, _)| *id == table) {
@@ -1178,6 +1345,7 @@ impl UniquePointTables {
     fn decrement(&mut self, table: u64) {
         if let Some(tables) = &mut self.spill {
             if let Some(count) = tables.get_mut(&table) {
+                self.filter.remove(table);
                 *count -= 1;
                 if *count == 0 {
                     tables.remove(&table);
@@ -1187,6 +1355,7 @@ impl UniquePointTables {
                 self.spill = None;
             }
         } else if let Some(position) = self.inline.iter().position(|(id, _)| *id == table) {
+            self.filter.remove(table);
             self.inline[position].1 -= 1;
             if self.inline[position].1 == 0 {
                 self.inline.swap_remove(position);
@@ -1227,7 +1396,7 @@ pub(crate) struct LockManager {
     unique_ranges: UniqueRangeMap,
     unique_range_keys: usize,
     pub(crate) table_locks: FastHashMap<u64, TableLockState>,
-    pub(crate) lock_log: FastHashMap<u64, Vec<HeldLock>>,
+    pub(crate) lock_log: LockLogs,
     pub(crate) waits_for: FastHashMap<u64, LockWait>,
     pub(crate) lock_wait_count: u64,
     pub(crate) lock_wait_time_ms: u64,
@@ -3122,7 +3291,7 @@ impl LockManager {
         unique_locks: &mut UniqueLockMap,
         point_tables: &mut UniquePointTables,
         table_locks: &mut FastHashMap<u64, TableLockState>,
-        lock_log: &mut FastHashMap<u64, Vec<HeldLock>>,
+        lock_log: &mut LockLogs,
         txn_id: u64,
         entries: &[PreparedLockEntry],
     ) -> Result<(), QueryError> {
@@ -3676,6 +3845,7 @@ impl LockManager {
             last,
         });
         entries.insert(first, (Arc::clone(&range), txn_id));
+        self.unique_point_tables.filter.add(table_id);
         self.unique_range_keys += count;
         self.lock_log
             .entry(txn_id)
@@ -3737,6 +3907,7 @@ impl LockManager {
                         .is_some_and(|(_, owner)| *owner == txn_id)
                     {
                         entries.remove(&range.first);
+                        point_tables.filter.remove(range.table_id);
                         *unique_range_keys = unique_range_keys.saturating_sub(range.len());
                     }
                     if entries.is_empty() {
@@ -4084,6 +4255,18 @@ impl LockManager {
     /// A shared-latch probe for the common check-only path. Stale entries
     /// need no eager removal: insertion and transaction cleanup still own that
     /// mutation. A conflict falls back to the exclusive wait/deadlock path.
+    /// Shared handle to the lock-free lock-log presence summary. Like the
+    /// unique-reservation filter it lives as long as this lock manager.
+    pub(crate) fn lock_log_presence(&self) -> Arc<LockLogPresence> {
+        self.lock_log.presence()
+    }
+
+    /// Shared handle to the lock-free unique-reservation summary. The lock
+    /// manager is never replaced after open, so the handle stays current.
+    pub(crate) fn unique_reservation_filter(&self) -> Arc<UniqueReservationFilter> {
+        Arc::clone(&self.unique_point_tables.filter)
+    }
+
     pub(crate) fn unique_key_uncontended(
         &self,
         txn_id: u64,
@@ -5773,6 +5956,56 @@ mod group_commit_tests {
         assert!(manager
             .acquire_unique_key_lock(4, 9, "uk", &key(5), true, &active)
             .is_err());
+    }
+
+    #[test]
+    fn lock_free_summaries_track_reservations_and_lock_logs() {
+        use crate::storage::KeyPart;
+        let key = |n| IndexKey::from(vec![KeyPart::Int(n)]);
+        let active = |_| Some(TxnStatus::Active);
+        let mut manager = LockManager::default();
+        let reservations = manager.unique_reservation_filter();
+        let logs = manager.lock_log_presence();
+        assert!(!reservations.may_have_reservations(9));
+        assert!(!logs.may_have_log(1));
+
+        // Point reservation, savepoint release and commit release.
+        manager
+            .acquire_unique_key_lock(1, 9, "uk", &key(1), true, &active)
+            .unwrap();
+        assert!(reservations.may_have_reservations(9));
+        assert!(logs.may_have_log(1));
+        let saved = manager.lock_log_len(1);
+        manager
+            .acquire_unique_key_lock(1, 9, "uk", &key(2), true, &active)
+            .unwrap();
+        manager.restore_savepoint_locks(1, saved);
+        assert!(reservations.may_have_reservations(9));
+        manager.unlock_txn(1);
+        assert!(!reservations.may_have_reservations(9));
+        assert!(!logs.may_have_log(1));
+
+        // Integer-range reservations are covered as well.
+        assert!(manager
+            .try_lock_integer_range(2, 9, "uk", false, 1, 10)
+            .unwrap());
+        assert!(reservations.may_have_reservations(9));
+        assert!(logs.may_have_log(2));
+        manager.unlock_txn(2);
+        assert!(!reservations.may_have_reservations(9));
+        assert!(!logs.may_have_log(2));
+
+        // A stale reservation stays counted (conservatively) until released.
+        manager
+            .acquire_unique_key_lock(3, 9, "uk", &key(1), true, &active)
+            .unwrap();
+        manager
+            .acquire_unique_key_lock(4, 9, "uk", &key(1), false, &|_| Some(TxnStatus::Committed))
+            .unwrap();
+        assert!(reservations.may_have_reservations(9));
+        manager.unlock_txn(3);
+        assert!(!reservations.may_have_reservations(9));
+        assert!(!logs.may_have_log(3));
     }
 
     #[test]

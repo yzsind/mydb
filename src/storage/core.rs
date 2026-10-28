@@ -1066,6 +1066,11 @@ pub struct Database {
     // take the read guard so they don't serialise against each other. Stripe
     // later only if the write side becomes the hot spot.
     lock_manager: parking_lot::RwLock<TxnLockManager>,
+    /// Lock-free summary of `lock_manager`'s unique-key reservations; lets
+    /// read-only point probes skip the latch when a table has none.
+    unique_reservations: Arc<super::txn::UniqueReservationFilter>,
+    /// Lock-free summary of which transactions own a `lock_manager` lock log.
+    lock_log_presence: Arc<super::txn::LockLogPresence>,
     mdl: MdlManager,
     // parking_lot for the same metastable-convoy reason as `txns`: every
     // row-level DML appends an undo record under this lock.
@@ -1076,6 +1081,8 @@ pub struct Database {
     undo_append_shards: Arc<[UndoWriteShardHandle]>,
     undo_resident_admission: crate::storage::undo::UndoResidentAdmission,
     undo_append_next_shard: AtomicU64,
+    /// Flat-combining queue for concurrent undo directory publication.
+    undo_publish: UndoPublishQueue,
     /// Mirrors the two runtime gates that require append admission before IO.
     /// Disabling is published before changing either gate; enabling is
     /// published after, so runtime changes cannot admit an unsafe fast append.
@@ -4499,6 +4506,7 @@ include!("core/database/vector_replication.rs");
 include!("core/database/vector_generations.rs");
 include!("core/database/vector_retirements.rs");
 include!("core/database/mvcc.rs");
+include!("core/database/undo_publish.rs");
 include!("core/database/startup.rs");
 include!("core/database/stats_ops.rs");
 include!("core/database/io_handles.rs");

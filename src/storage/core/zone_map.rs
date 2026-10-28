@@ -396,6 +396,13 @@ impl ZoneMapCandidateResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ZoneMapCostLowerBound {
     pub zones_examined: u64,
+    /// The fewest surviving pages the full estimate can report. A sampled
+    /// estimate never proves an unsampled stride empty, and an untrusted
+    /// partition always survives whole, so even a predicate matching nothing
+    /// leaves these pages to scan.
+    pub min_surviving_pages: u64,
+    /// Physical heap pages the full estimate divides surviving pages by.
+    pub total_pages: u64,
 }
 
 #[inline]
@@ -412,6 +419,19 @@ fn zone_map_sample_geometry(page_count: u64, zone_pages: u64) -> (u64, u64, u64)
     let step = total_zones.div_ceil(sample_cap).max(1);
     let samples = total_zones.div_ceil(step);
     (total_zones, step, samples)
+}
+
+/// The fewest surviving pages `zone_map_cost_estimate_for_storage` reports
+/// for a trusted map, whatever the predicate. An exact (unsampled) estimate
+/// can prove every zone empty; a sampled one keeps a full stride when no
+/// sample survives and scales a single survivor to a `1/samples` share.
+fn zone_map_min_sampled_surviving_pages(page_count: u64, zone_pages: u64) -> u64 {
+    let (total_zones, step, samples) = zone_map_sample_geometry(page_count, zone_pages);
+    if page_count == 0 || (step == 1 && samples == total_zones) {
+        return 0;
+    }
+    let stride = step.saturating_mul(zone_pages.max(1)).min(page_count);
+    stride.min(((page_count as f64) / samples.max(1) as f64).ceil() as u64)
 }
 
 type ZoneMapsMap = hashbrown::HashMap<u64, Arc<ZoneMap>, ahash::RandomState>;
@@ -8624,18 +8644,29 @@ impl Database {
         }
         compile_zone_predicate(table, filter)?;
         let mut zones_examined = 0u64;
+        let mut min_surviving_pages = 0u64;
+        let mut total_pages = 0u64;
         let mut saw_trusted_map = false;
         for storage_id in table.storage_ids() {
             let page_count = self.heap_page_count_for_storage(storage_id).ok()?;
+            total_pages = total_pages.saturating_add(page_count);
             let map = self.zone_map_for(storage_id, table)?;
             if !map.trusted_base.load(Ordering::Acquire) {
+                min_surviving_pages = min_surviving_pages.saturating_add(page_count);
                 continue;
             }
             saw_trusted_map = true;
+            let zone_pages = map.zone_pages as u64;
             zones_examined = zones_examined
-                .saturating_add(zone_map_sample_geometry(page_count, map.zone_pages as u64).2);
+                .saturating_add(zone_map_sample_geometry(page_count, zone_pages).2);
+            min_surviving_pages = min_surviving_pages
+                .saturating_add(zone_map_min_sampled_surviving_pages(page_count, zone_pages));
         }
-        saw_trusted_map.then_some(ZoneMapCostLowerBound { zones_examined })
+        saw_trusted_map.then_some(ZoneMapCostLowerBound {
+            zones_examined,
+            min_surviving_pages,
+            total_pages,
+        })
     }
 
     fn zone_map_cost_estimate_inner(
@@ -10604,6 +10635,29 @@ impl Database {
 mod zone_map_tests {
     use super::*;
     use crate::parser::BinaryOp;
+
+    #[test]
+    fn sampled_cost_floor_never_exceeds_estimator_outcomes() {
+        // Exact estimates can prove every zone empty.
+        assert_eq!(zone_map_min_sampled_surviving_pages(0, 64), 0);
+        assert_eq!(zone_map_min_sampled_surviving_pages(64 * 4096, 64), 0);
+        for (page_count, zone_pages) in [
+            (64 * 4097, 64),
+            (64 * 8982 + 17, 64),
+            (1_000_003, 1),
+            (u32::MAX as u64, 64),
+        ] {
+            let (total_zones, step, samples) = zone_map_sample_geometry(page_count, zone_pages);
+            assert!(step > 1 || samples < total_zones);
+            let floor = zone_map_min_sampled_surviving_pages(page_count, zone_pages);
+            assert!(floor > 0);
+            // The estimator's two sampled outcomes: no survivor keeps a full
+            // stride; any survivor scales by at least 1/samples.
+            let no_survivor = step.saturating_mul(zone_pages).min(page_count);
+            let one_survivor = ((page_count as f64) / samples as f64).ceil() as u64;
+            assert!(floor <= no_survivor && floor <= one_survivor);
+        }
+    }
 
     struct PagedTestMap {
         map: ZoneMap,

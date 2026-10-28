@@ -27,8 +27,10 @@ const ASYNC_ROW_LOCK_SIGNAL_SHARDS: usize = 64;
 
 /// Undo records one purge lock round plans and removes. Rounds keep each
 /// undo-lock hold in the tens of microseconds, so DML undo publication never
-/// queues behind a whole purge batch.
-const UNDO_PURGE_ROUND_RECORDS: usize = 256;
+/// queues behind a whole purge batch. Measured under concurrent TPC-C, 256
+/// records held the write latch ~160 us on average (up to ~3 ms) and the
+/// planning read latch ~130 us, stalling every publisher meanwhile.
+const UNDO_PURGE_ROUND_RECORDS: usize = 64;
 
 #[inline]
 fn async_row_lock_signal_shard(table_id: u64, row_id: RowId) -> usize {
@@ -1832,6 +1834,28 @@ impl Database {
         Ok(())
     }
 
+    /// Non-blocking point probe for another transaction's reservation of a
+    /// unique key. A table without any reservation skips the lock-manager
+    /// latch; otherwise the exact latched check decides.
+    pub(crate) fn check_unique_key_reservation(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<(), QueryError> {
+        if !self.unique_reservations.may_have_reservations(table_id) {
+            return Ok(());
+        }
+        self.lock_manager().check_unique_key_lock(
+            txn_id,
+            table_id,
+            index_name,
+            key,
+            &self.lock_owner_status(),
+        )
+    }
+
     pub fn check_unique_key_lock_blocking(
         &self,
         txn_id: u64,
@@ -1840,6 +1864,10 @@ impl Database {
         key: &IndexKey,
     ) -> Result<bool, QueryError> {
         crate::engine::cancel::check_cancelled()?;
+        // No reservation on the table: nothing to wait for, and no latch.
+        if !self.unique_reservations.may_have_reservations(table_id) {
+            return Ok(false);
+        }
         if self.lock_manager_read().unique_key_uncontended(
             txn_id,
             table_id,
@@ -6064,7 +6092,13 @@ impl Database {
         &self,
         txn_id: u64,
     ) -> Result<StatementSavepoint, QueryError> {
-        let lock_log_len = self.lock_manager_read().lock_log_len(txn_id);
+        // Most statements start in a transaction without unique/range
+        // reservations; prove that lock-free instead of taking the latch.
+        let lock_log_len = if self.lock_log_presence.may_have_log(txn_id) {
+            self.lock_manager_read().lock_log_len(txn_id)
+        } else {
+            0
+        };
         let row_log_len = if row_lock_sharding_enabled() {
             self.row_locks_sharded.row_log_len(txn_id)
         } else {
