@@ -63,6 +63,7 @@ pub(crate) use grammar::strip_comments_in_explain_header;
 use grammar::*;
 pub(crate) use intrinsic::IntrinsicFunction;
 pub(crate) use manual::decode_bit_string;
+pub(crate) use manual::parse_xa_statement as parse_replication_xa_statement;
 use manual::*;
 pub use manual::{parse_routine_body_sql, sql_is_effectively_empty};
 pub use print::{binary_op_sql_pub, literal_to_sql_pub};

@@ -694,6 +694,15 @@ impl<'a> CatalogTxn<'a> {
     }
 
     fn commit_in(mut self, txn: TxnView, stage_ddl_binlog: bool) -> Result<(), QueryError> {
+        if stage_ddl_binlog {
+            if let Some((key, value)) = crate::replication::current_ddl_receipt()? {
+                self.replace(
+                    crate::storage::data_dictionary::DD_DD_PROPERTIES,
+                    CatalogRowSelector::PrimaryValues(vec![Value::String(key.clone())]),
+                    vec![vec![Value::String(key), Value::String(value)]],
+                );
+            }
+        }
         self.replacements
             .sort_by_key(|replacement| replacement.dd_table_id);
         // Independent table descriptors touch disjoint primary-key families
@@ -2053,5 +2062,74 @@ impl Database {
                 _charge: charge,
             });
         }
+    }
+}
+
+impl Database {
+    pub(crate) fn replication_property(&self, key: &str) -> Result<Option<String>, QueryError> {
+        let table = crate::storage::data_dictionary::dd_table_schema(
+            crate::storage::data_dictionary::DD_DD_PROPERTIES,
+        )
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "missing DD properties schema",
+            )
+        })?;
+        let primary = Self::dd_primary_index(&table)?;
+        let key = Self::dd_selector_key(&table, primary, &[Value::String(key.to_owned())])?;
+        let txn = self.begin_txn()?;
+        let result = (|| {
+            for id in self.lookup_index_visible(&table, primary, key, txn)? {
+                if let Some(row) = self.read_row(&table, id, txn)? {
+                    return Ok(row
+                        .values
+                        .get(1)
+                        .and_then(crate::types::value_str)
+                        .map(str::to_owned));
+                }
+            }
+            Ok(None)
+        })();
+        self.rollback_txn(txn.txn_id)?;
+        result
+    }
+
+    pub(crate) fn write_replication_property(
+        &self,
+        txn: TxnView,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), QueryError> {
+        let _binlog = crate::binlog::SessionSqlLogBinGuard::new(false);
+        self.apply_catalog_row_replacement(
+            txn,
+            &CatalogRowReplacement {
+                dd_table_id: crate::storage::data_dictionary::DD_DD_PROPERTIES,
+                selector: CatalogRowSelector::PrimaryValues(vec![Value::String(key.to_owned())]),
+                rows: value
+                    .map(|value| {
+                        vec![vec![
+                            Value::String(key.to_owned()),
+                            Value::String(value.to_owned()),
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn set_replication_property(
+        &self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), QueryError> {
+        let txn = self.begin_txn()?;
+        if let Err(err) = self.write_replication_property(txn, key, value) {
+            let _ = self.rollback_txn(txn.txn_id);
+            return Err(err);
+        }
+        self.commit_txn(txn.txn_id).map(|_| ())
     }
 }

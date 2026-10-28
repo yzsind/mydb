@@ -7802,7 +7802,7 @@ where
                 // O(1) on the binary form: read the tag, no DOM decode.
                 let bytes = json_doc_bytes(&value, 1, "json_type")?;
                 let r = crate::engine::json::JsonbRef::new(&bytes)?;
-                Ok(Value::String(r.json_type().as_str().to_string()))
+                Ok(Value::String(r.type_name().to_string()))
             })
         }
         "JSON_LENGTH" => {
@@ -16229,9 +16229,12 @@ fn json_value_convert_jsonb(jsonb: &[u8], returning: &str) -> Result<Value, Quer
         ),
         JsonType::Double => Value::Double(node.as_f64().unwrap_or_default()),
         JsonType::Decimal => Value::Decimal(node.number_text().unwrap_or_default()),
-        JsonType::String | JsonType::Date | JsonType::Time | JsonType::Datetime => {
-            Value::String(node.as_str().unwrap_or_default().to_string())
-        }
+        JsonType::String
+        | JsonType::Date
+        | JsonType::Time
+        | JsonType::Datetime
+        | JsonType::Timestamp => Value::String(node.as_str().unwrap_or_default().to_string()),
+        JsonType::Opaque => Value::String(crate::engine::json::unquote_text(jsonb)),
         JsonType::Null | JsonType::Array | JsonType::Object => unreachable!(),
     };
     json_value_cast(value, returning)
@@ -26399,7 +26402,7 @@ fn json_path_remove(doc: &mut OwnedJsonb, path: &str) -> Result<(), QueryError> 
 /// MySQL JSON path and mutation semantics.
 pub(crate) fn apply_replication_json_diffs(
     base: &Value,
-    diffs: &[(u8, String, Option<serde_json::Value>)],
+    diffs: &[(u8, String, Option<Vec<u8>>)],
 ) -> Result<Value, QueryError> {
     let Value::Json(bytes) = base else {
         return Err(error(
@@ -26417,7 +26420,7 @@ pub(crate) fn apply_replication_json_diffs(
                         "PARTIAL_JSON REPLACE operation has no value",
                     )
                 })?;
-                let value = OwnedJsonb::decode(&crate::engine::json::from_serde(&value))?;
+                let value = OwnedJsonb::decode(&value)?;
                 json_path_set(&mut doc, path, value, "JSON_REPLACE")?;
             }
             1 => {
@@ -26427,7 +26430,7 @@ pub(crate) fn apply_replication_json_diffs(
                         "PARTIAL_JSON INSERT operation has no value",
                     )
                 })?;
-                let value = OwnedJsonb::decode(&crate::engine::json::from_serde(&value))?;
+                let value = OwnedJsonb::decode(&value)?;
                 json_path_set(&mut doc, path, value, "JSON_INSERT")?;
             }
             2 => json_path_remove(&mut doc, path)?,
@@ -28469,8 +28472,18 @@ mod replication_json_diff_tests {
         let result = apply_replication_json_diffs(
             &base,
             &[
-                (0, "$.a".into(), Some(serde_json::json!(2))),
-                (1, "$.new".into(), Some(serde_json::json!("x"))),
+                (
+                    0,
+                    "$.a".into(),
+                    Some(crate::engine::json::scalar_from_value(&Value::Int(2))),
+                ),
+                (
+                    1,
+                    "$.new".into(),
+                    Some(crate::engine::json::scalar_from_value(&Value::String(
+                        "x".into(),
+                    ))),
+                ),
                 (2, "$.items[0]".into(), None),
                 (2, "$.gone".into(), None),
             ],

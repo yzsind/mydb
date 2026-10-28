@@ -68,7 +68,7 @@ pub(crate) fn compare_nodes(a: JsonbRef<'_>, b: JsonbRef<'_>) -> Ordering {
                 }
             }
         }
-        JsonType::Datetime => {
+        JsonType::Datetime | JsonType::Timestamp => {
             if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
                 if let (Ok(x), Ok(y)) = (
                     crate::storage::parse_datetime_to_micros(x),
@@ -78,6 +78,7 @@ pub(crate) fn compare_nodes(a: JsonbRef<'_>, b: JsonbRef<'_>) -> Ordering {
                 }
             }
         }
+        JsonType::Opaque => return a.opaque_value().cmp(&b.opaque_value()),
         _ => {}
     }
     if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {

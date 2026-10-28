@@ -4715,6 +4715,7 @@ struct DdlTxnContext {
 #[must_use]
 pub struct DdlTxnContextGuard {
     prior: Option<DdlTxnContext>,
+    _replica_receipt: Option<crate::replication::DdlReceiptGuard>,
 }
 
 pub fn enter_ddl_txn_context(
@@ -4729,13 +4730,17 @@ pub fn enter_ddl_txn_context(
         staged: false,
     };
     let prior = DDL_TXN_CONTEXT.with(|slot| slot.replace(Some(current)));
-    DdlTxnContextGuard { prior }
+    DdlTxnContextGuard {
+        prior,
+        _replica_receipt: None,
+    }
 }
 
 /// Internal catalog compensation must not replicate the rejected outer DDL.
 pub(crate) fn suspend_ddl_txn_context() -> DdlTxnContextGuard {
     DdlTxnContextGuard {
         prior: DDL_TXN_CONTEXT.with(|slot| slot.take()),
+        _replica_receipt: Some(crate::replication::suspend_ddl_receipt()),
     }
 }
 

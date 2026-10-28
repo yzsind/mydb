@@ -5201,9 +5201,16 @@ fn json_table_jsonb_to_value(
         ),
         JsonType::Double => Value::Double(node.as_f64().unwrap_or_default()),
         JsonType::Decimal => Value::Decimal(node.number_text().unwrap_or_default()),
-        JsonType::String | JsonType::Date | JsonType::Time | JsonType::Datetime => {
-            Value::String(node.as_str().unwrap_or_default().to_string())
-        }
+        JsonType::String
+        | JsonType::Date
+        | JsonType::Time
+        | JsonType::Datetime
+        | JsonType::Timestamp => Value::String(node.as_str().unwrap_or_default().to_string()),
+        JsonType::Opaque => Value::Bytes(
+            node.opaque_value()
+                .map(|(_, data)| data.to_vec())
+                .unwrap_or_default(),
+        ),
         JsonType::Array | JsonType::Object => {
             return Err(crate::error::catalog::ER_WRONG_JSON_TABLE_VALUE
                 .error("Can't store an array or an object in the scalar JSON_TABLE column"));

@@ -3425,7 +3425,7 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
 /// Returns `None` if the statement isn't an XA command. Returns
 /// `Some(Statement::Unsupported)` if it's clearly XA syntax but a
 /// branch mydb doesn't implement (e.g. JOIN/RESUME/SUSPEND).
-pub(super) fn parse_xa_statement(sql: &str) -> Option<Statement> {
+pub(crate) fn parse_xa_statement(sql: &str) -> Option<Statement> {
     // Head guard — running the sqlparser tokenizer on a 1 MB INSERT just
     // to discover it isn't an `XA …` command would dominate the parse
     // cost. The head check exits in O(1) bytes.
