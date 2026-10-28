@@ -1,7 +1,7 @@
 //! HNSW over native payloads, sharing decisions across memory and paged storage.
 use super::{
     codec,
-    distance::{typed_ordering_distance, Metric},
+    distance::{typed_ordering_distance, Metric, PreparedNativeDistance},
     hnsw_core::{self, Scored},
     VectorSearchRequest, VectorSearchResult,
 };
@@ -50,6 +50,24 @@ struct NativeSearchScratch {
     todo: BinaryHeap<Reverse<Scored<usize>>>,
     best: BinaryHeap<Scored<usize>>,
     charge: ControlledMemoryCharge,
+}
+
+struct ExactProbe {
+    distance: PreparedNativeDistance,
+    _charge: ControlledMemoryCharge,
+    _capacity_charge: Option<ControlledMemoryCharge>,
+}
+
+fn score_native_candidate<V: crate::vector::VectorInput + ?Sized>(
+    query: &VectorValue,
+    candidate: &V,
+    metric: Metric,
+    prepared: Option<&PreparedNativeDistance>,
+) -> Result<f64, QueryError> {
+    match prepared {
+        Some(prepared) => prepared.score(candidate),
+        None => typed_ordering_distance(query, candidate, metric),
+    }
 }
 
 thread_local! {
@@ -1206,6 +1224,7 @@ impl NativeHnsw {
         id: usize,
         query: &VectorValue,
         query_code: Option<&super::quantization::QuantQuery>,
+        exact: Option<&PreparedNativeDistance>,
     ) -> Result<f64, QueryError> {
         if let Some(quant) = self.quantizer() {
             let node = &state.nodes[id];
@@ -1231,23 +1250,69 @@ impl NativeHnsw {
                     quant.score_payload(value.payload, self.file.as_ref(), query, query_code)
                 });
         }
-        self.score(state, id, query)
+        self.score(state, id, query, exact)
     }
-    fn score(&self, state: &State, id: usize, query: &VectorValue) -> Result<f64, QueryError> {
+    fn score(
+        &self,
+        state: &State,
+        id: usize,
+        query: &VectorValue,
+        exact: Option<&PreparedNativeDistance>,
+    ) -> Result<f64, QueryError> {
         if self.quantizer().is_some() {
-            return self.navigation_score(state, id, query, None);
+            return self.navigation_score(state, id, query, None, None);
         }
         let node = &state.nodes[id];
         match (&node.value, &self.file) {
-            (Some(value), _) => typed_ordering_distance(query, value, self.metric),
+            (Some(value), _) => score_native_candidate(query, value, self.metric, exact),
             (_, Some(_)) if self.quantization_requested => {
-                typed_ordering_distance(query, &self.value(state, id)?, self.metric)
+                score_native_candidate(query, &self.value(state, id)?, self.metric, exact)
             }
             (_, Some(file)) => file.with_native_vector(node.vid, |value| {
-                typed_ordering_distance(query, &value, self.metric)
+                score_native_candidate(query, &value, self.metric, exact)
             }),
             _ => Err(codec::vector_err("missing native HNSW payload")),
         }
+    }
+
+    fn prepare_exact_probe(&self, query: &VectorValue) -> Option<ExactProbe> {
+        if self.quantizer().is_some()
+            || !matches!(
+                self.datatype,
+                VectorDataType::Float16 | VectorDataType::BFloat16
+            )
+        {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *DISABLED.get_or_init(|| {
+                std::env::var_os("MYDB_TEST_DISABLE_PREPARED_NATIVE_PROBES").is_some()
+            }) {
+                return None;
+            }
+        }
+        let bytes = (query.dimension as usize).checked_mul(std::mem::size_of::<f32>())?;
+        let charge = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::StorageScratch,
+            bytes,
+        )?;
+        let distance = PreparedNativeDistance::try_new(query, self.datatype, self.metric)?;
+        let extra = distance.allocated_bytes().saturating_sub(bytes);
+        let capacity_charge = if extra == 0 {
+            None
+        } else {
+            Some(ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::StorageScratch,
+                extra,
+            )?)
+        };
+        Some(ExactProbe {
+            distance,
+            _charge: charge,
+            _capacity_charge: capacity_charge,
+        })
     }
     fn node_probe(
         &self,
@@ -1359,7 +1424,9 @@ impl NativeHnsw {
         level: usize,
         query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<usize, QueryError> {
-        let mut best = self.navigation_score(state, entry, query, query_code)?;
+        let exact = self.prepare_exact_probe(query);
+        let exact = exact.as_ref().map(|probe| &probe.distance);
+        let mut best = self.navigation_score(state, entry, query, query_code, exact)?;
         loop {
             let mut improved = false;
             let compact = state
@@ -1377,7 +1444,7 @@ impl NativeHnsw {
                 .flat_map(|edges| edges.iter().map(|&id| id as usize))
                 .chain(owned)
             {
-                let d = self.navigation_score(state, next, query, query_code)?;
+                let d = self.navigation_score(state, next, query, query_code, exact)?;
                 if d < best {
                     best = d;
                     entry = next;
@@ -1398,13 +1465,15 @@ impl NativeHnsw {
         level: usize,
         query_code: Option<&super::quantization::QuantQuery>,
     ) -> Result<Vec<Scored<usize>>, QueryError> {
+        let exact = self.prepare_exact_probe(query);
+        let exact = exact.as_ref().map(|probe| &probe.distance);
         self.layer_scored(
             state,
             entries,
             ef,
             level,
             self.explore_query_ties(query),
-            |id| self.navigation_score(state, id, query, query_code),
+            |id| self.navigation_score(state, id, query, query_code, exact),
         )
     }
 
@@ -1531,15 +1600,23 @@ impl NativeHnsw {
         candidates: &[Scored<usize>],
         maximum: usize,
     ) -> Result<Vec<usize>, QueryError> {
-        let mut cached: Option<(usize, VectorValue, Option<super::quantization::QuantQuery>)> =
-            None;
+        let mut cached: Option<(
+            usize,
+            VectorValue,
+            Option<super::quantization::QuantQuery>,
+            Option<ExactProbe>,
+        )> = None;
         let selected = hnsw_core::select_diverse_by(
             candidates.iter().copied(),
             maximum,
             |candidate, previous| {
-                if cached.as_ref().is_none_or(|(id, _, _)| *id != candidate.id) {
+                if cached
+                    .as_ref()
+                    .is_none_or(|(id, _, _, _)| *id != candidate.id)
+                {
                     let (value, prepared) = self.node_probe(state, candidate.id)?;
-                    cached = Some((candidate.id, value, prepared));
+                    let exact = self.prepare_exact_probe(&value);
+                    cached = Some((candidate.id, value, prepared, exact));
                 }
                 Ok::<_, QueryError>(
                     self.navigation_score(
@@ -1547,6 +1624,12 @@ impl NativeHnsw {
                         previous.id,
                         &cached.as_ref().unwrap().1,
                         cached.as_ref().unwrap().2.as_ref(),
+                        cached
+                            .as_ref()
+                            .unwrap()
+                            .3
+                            .as_ref()
+                            .map(|probe| &probe.distance),
                     )? < candidate.dist,
                 )
             },
@@ -1820,6 +1903,7 @@ impl NativeHnsw {
                     }
                     if links.len() > capacity {
                         let (center, center_query) = self.node_probe(&state, neighbor)?;
+                        let exact = self.prepare_exact_probe(&center);
                         let mut scores = links
                             .iter()
                             .map(|&id| {
@@ -1829,6 +1913,7 @@ impl NativeHnsw {
                                         id,
                                         &center,
                                         center_query.as_ref(),
+                                        exact.as_ref().map(|probe| &probe.distance),
                                     )?,
                                     id,
                                 })

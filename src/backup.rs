@@ -1636,7 +1636,7 @@ fn sync_paths_parallel(paths: &[PathBuf]) -> Result<(), QueryError> {
             if let Some((device, file)) = synced {
                 if !devices.contains_key(&device) && devices.len() >= device_limit {
                     let (_, oldest) = devices.pop_first().expect("device batch is nonempty");
-                    File::sync_all(&oldest)
+                    crate::platform::fs::sync_full_file(&oldest)
                         .map_err(|err| io_err("sync backup device batch", err))?;
                 }
                 devices.insert(device, file);
@@ -1648,7 +1648,8 @@ fn sync_paths_parallel(paths: &[PathBuf]) -> Result<(), QueryError> {
         for file in devices.values() {
             // All file fsyncs in this group have completed. F_FULLFSYNC drains
             // each device once before the caller can publish or acknowledge.
-            File::sync_all(file).map_err(|err| io_err("sync backup device batch", err))?;
+            crate::platform::fs::sync_full_file(file)
+                .map_err(|err| io_err("sync backup device batch", err))?;
         }
         Ok(())
     })

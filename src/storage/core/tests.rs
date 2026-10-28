@@ -27677,41 +27677,27 @@ fn spatial_index_crash_child() {
     std::process::exit(86);
 }
 
-#[test]
-fn spatial_index_crash_recovery_at_every_split_publication() {
+fn check_spatial_index_split_crash_recovery(initial: usize, clear: bool, modes: &[&str]) {
     use crate::engine::{api::QueryResponse, StorageQueryEngine};
     fs::create_dir_all("/tmp/mydb").unwrap();
-    let mut bases = std::collections::BTreeMap::new();
-    for (name, initial, clear) in [
-        ("rows_408", 408, false),
-        ("rows_420", 420, false),
-        ("reuse", 420, true),
-    ] {
-        let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
-        let preparation = crate::platform::fs::FixtureSyncBatch::new(base.path()).unwrap();
-        let engine = StorageQueryEngine::open(base.path()).unwrap();
-        engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
-        let values = (0..initial)
-            .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
-            .collect::<Vec<_>>()
-            .join(",");
-        engine
-            .execute(&format!("INSERT INTO crash_spatial VALUES{values}"))
-            .unwrap();
-        if clear {
-            engine.execute("DELETE FROM crash_spatial").unwrap();
-        }
-        engine.database_for_replication().checkpoint().unwrap();
-        drop(engine);
-        preparation.finish().unwrap();
-        bases.insert(name, base);
+    let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let preparation = crate::platform::fs::FixtureSyncBatch::new(base.path()).unwrap();
+    let engine = StorageQueryEngine::open(base.path()).unwrap();
+    engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+    let values = (0..initial)
+        .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO crash_spatial VALUES{values}"))
+        .unwrap();
+    if clear {
+        engine.execute("DELETE FROM crash_spatial").unwrap();
     }
-    for mode in ["insert", "delete", "reuse", "rollback", "savepoint"] {
-        let base = &bases[match mode {
-            "delete" => "rows_420",
-            "reuse" => "reuse",
-            _ => "rows_408",
-        }];
+    engine.database_for_replication().checkpoint().unwrap();
+    drop(engine);
+    preparation.finish().unwrap();
+    for &mode in modes {
         for point in 0..=5 {
             let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
             crate::util::file::copy_fixture_tree(base.path(), dir.path()).unwrap();
@@ -27785,4 +27771,19 @@ fn spatial_index_crash_recovery_at_every_split_publication() {
             }
         }
     }
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication() {
+    check_spatial_index_split_crash_recovery(408, false, &["insert", "rollback", "savepoint"]);
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication_delete() {
+    check_spatial_index_split_crash_recovery(420, false, &["delete"]);
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication_reuse() {
+    check_spatial_index_split_crash_recovery(420, true, &["reuse"]);
 }

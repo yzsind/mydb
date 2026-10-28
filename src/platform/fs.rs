@@ -129,10 +129,19 @@ pub(crate) fn sync_standard_before_atomic_rename_at(file: &File, _path: &Path) -
 
 /// Drain one path to its device and retain a representative descriptor for
 /// the caller's full device-cache barrier. A fixture-owned barrier is returned
-/// as None because its construction scope supplies that final flush.
+/// as None because its construction scope supplies that final flush. An
+/// unsupported filesystem completes its ordinary full sync and also returns None.
 #[cfg(target_os = "macos")]
 pub(crate) fn sync_path_to_device(path: &Path) -> io::Result<Option<(u64, File)>> {
-    sync_file_to_device(File::open(path)?, path)
+    let file = File::open(path)?;
+    if let Some(result) = private_sync::sync(&file, path) {
+        return result.map(|()| None);
+    }
+    if !device_sync::supports(&file) {
+        file.sync_all()?;
+        return Ok(None);
+    }
+    sync_file_to_device(file, path)
 }
 
 #[cfg(target_os = "macos")]
@@ -222,6 +231,20 @@ impl DeviceSyncBatch {
     pub(crate) fn finish(self) -> io::Result<()> {
         if let Some((_, file)) = self.representative {
             sync_full_file(&file)?;
+        }
+        Ok(())
+    }
+
+    /// Join an already-drained worker batch before acknowledging the group.
+    /// Keep at most one descriptor; crossing devices completes the old one.
+    pub(crate) fn merge(&mut self, other: Self) -> io::Result<()> {
+        if let Some((device, file)) = other.representative {
+            if let Some((previous, representative)) = &self.representative {
+                if *previous != device {
+                    sync_full_file(representative)?;
+                }
+            }
+            self.representative = Some((device, file));
         }
         Ok(())
     }

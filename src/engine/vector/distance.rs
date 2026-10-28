@@ -2329,6 +2329,93 @@ pub(crate) fn typed_ordering_distance<
     })
 }
 
+/// A half-precision graph probe decoded once for repeated candidate scoring.
+/// Preserve typed scoring's 64-element reductions, including its f64 cosine
+/// accumulation, rather than selecting the different all-FLOAT32 kernel.
+pub(crate) struct PreparedNativeDistance {
+    query: Vec<f32>,
+    metric: Metric,
+    stored_datatype: crate::vector::VectorDataType,
+    query_squared: f64,
+}
+
+impl PreparedNativeDistance {
+    pub(crate) fn try_new<V: crate::vector::VectorInput + ?Sized>(
+        query: &V,
+        stored_datatype: crate::vector::VectorDataType,
+        metric: Metric,
+    ) -> Option<Self> {
+        use crate::vector::VectorDataType as D;
+        if !matches!(stored_datatype, D::Float16 | D::BFloat16)
+            || query.datatype() == D::Binary
+            || !matches!(metric, Metric::L2 | Metric::Dot | Metric::Cosine)
+        {
+            return None;
+        }
+        let dimension = query.dimension() as usize;
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(dimension).ok()?;
+        decoded.resize(dimension, 0.0);
+        let mut query_squared = 0.0;
+        for (index, block) in decoded.chunks_mut(64).enumerate() {
+            decode_native_block(query, index * 64, block);
+            if metric == Metric::Cosine {
+                query_squared -= ordering_distance(block, block, Metric::Dot);
+            }
+        }
+        Some(Self {
+            query: decoded,
+            metric,
+            stored_datatype,
+            query_squared,
+        })
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.query.capacity() * std::mem::size_of::<f32>()
+    }
+
+    pub(crate) fn score<V: crate::vector::VectorInput + ?Sized>(
+        &self,
+        row: &V,
+    ) -> Result<f64, crate::types::QueryError> {
+        if row.dimension() as usize != self.query.len() {
+            return Err(super::codec::vector_err("VECTOR dimension mismatch"));
+        }
+        if row.datatype() != self.stored_datatype {
+            return Err(super::codec::vector_err(
+                "prepared VECTOR datatype mismatch",
+            ));
+        }
+        let mut candidate = [0.0f32; 64];
+        let (mut sum, mut squared) = (0.0, 0.0);
+        for (index, query) in self.query.chunks(64).enumerate() {
+            let candidate = &mut candidate[..query.len()];
+            decode_native_block(row, index * 64, candidate);
+            match self.metric {
+                Metric::L2 => sum += ordering_distance(query, candidate, Metric::L2),
+                Metric::Dot => sum += ordering_distance(query, candidate, Metric::Dot),
+                Metric::Cosine => {
+                    sum -= ordering_distance(query, candidate, Metric::Dot);
+                    squared -= ordering_distance(candidate, candidate, Metric::Dot);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(match self.metric {
+            Metric::L2 | Metric::Dot => sum,
+            Metric::Cosine => {
+                if self.query_squared == 0.0 || squared == 0.0 {
+                    f64::NAN
+                } else {
+                    1.0 - (sum / (self.query_squared.sqrt() * squared.sqrt())).clamp(-1.0, 1.0)
+                }
+            }
+            _ => unreachable!(),
+        })
+    }
+}
+
 fn decode_native_block<V: crate::vector::VectorInput + ?Sized>(
     value: &V,
     start: usize,
@@ -2383,5 +2470,85 @@ pub(crate) fn typed_is_zero(value: &crate::vector::VectorValue) -> bool {
             .chunks_exact(2)
             .all(|v| u16::from_le_bytes(v.try_into().unwrap()) & 0x7fff == 0),
         D::Int8 | D::Binary => value.payload.iter().all(|&v| v == 0),
+    }
+}
+
+#[cfg(test)]
+mod prepared_native_tests {
+    use super::*;
+    use crate::vector::{VectorDataType as D, VectorValue};
+
+    fn value(datatype: D, dimension: usize, phase: usize) -> VectorValue {
+        let maximum = if datatype == D::Float16 {
+            0x7bff
+        } else {
+            0x7f7f
+        };
+        let words: [u16; 10] = match phase {
+            1 => [0; 10],
+            2 => [1, 0x8001, 2, 0x8002, 3, 0x8003, 4, 0x8004, 0, 0x8000],
+            _ => [
+                0,
+                0x8000,
+                1,
+                0x8001,
+                0x3c00,
+                0xbc00,
+                maximum,
+                maximum | 0x8000,
+                0x3555,
+                0xb555,
+            ],
+        };
+        let payload = match datatype {
+            D::Float16 | D::BFloat16 => (0..dimension)
+                .flat_map(|i| words[(i + phase) % words.len()].to_le_bytes())
+                .collect(),
+            D::Float32 => (0..dimension)
+                .flat_map(|i| {
+                    let v = if phase == 1 {
+                        0.0
+                    } else {
+                        (i as f32 % 23.0 - 11.0) / 7.0
+                    };
+                    v.to_le_bytes()
+                })
+                .collect(),
+            D::Int8 => (0..dimension)
+                .map(|i| (i as i8).wrapping_mul(7) as u8)
+                .collect(),
+            D::Binary => unreachable!(),
+        };
+        VectorValue::new(datatype, dimension as u32, payload)
+    }
+
+    #[test]
+    fn prepared_half_probes_preserve_exact_typed_reduction_bits() {
+        for stored in [D::Float16, D::BFloat16] {
+            for query_type in [D::Float16, D::BFloat16, D::Float32, D::Int8] {
+                for dimension in [1, 7, 9, 63, 64, 65, 127, 128, 129, 513] {
+                    for phase in 0..3 {
+                        let query = value(query_type, dimension, phase);
+                        let candidate = value(stored, dimension, phase);
+                        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+                            let expected =
+                                typed_ordering_distance(&query, &candidate, metric).unwrap();
+                            let prepared =
+                                PreparedNativeDistance::try_new(&query, stored, metric).unwrap();
+                            let actual = prepared.score(&candidate).unwrap();
+                            if expected.is_nan() {
+                                assert!(actual.is_nan());
+                            } else {
+                                assert_eq!(
+                                    actual.to_bits(),
+                                    expected.to_bits(),
+                                    "{stored:?}/{query_type:?}/{dimension}/{phase}/{metric:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

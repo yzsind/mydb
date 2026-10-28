@@ -77,6 +77,8 @@ impl Device {
 
 struct Coordinator {
     mapping: FileMapping,
+    epoch: Instant,
+    last_contention_ns: AtomicU64,
 }
 
 impl Coordinator {
@@ -145,7 +147,11 @@ impl Coordinator {
         {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        Ok(Self { mapping })
+        Ok(Self {
+            mapping,
+            epoch: Instant::now(),
+            last_contention_ns: AtomicU64::new(0),
+        })
     }
 
     fn state(&self) -> &Shared {
@@ -191,12 +197,17 @@ impl Coordinator {
                 .clamp(10_000_000, 100_000_000),
         );
         let mut spins = 0;
+        let mut observed_contention = false;
         loop {
             if state.completed.load(Ordering::Acquire) >= ticket {
                 return Ok(());
             }
             let leader = state.leader.load(Ordering::Acquire);
             let expired = began.elapsed() >= allowance;
+            if leader != 0 && !observed_contention {
+                self.note_contention();
+                observed_contention = true;
+            }
             if leader == 0 || expired {
                 let owns = state
                     .leader
@@ -214,17 +225,20 @@ impl Coordinator {
                         }
                         return Ok(());
                     }
-                    // Only an already contended queue can benefit from a
-                    // cohort. Give the prior leader's next publication one
-                    // small fraction of a device flush to join, without
-                    // delaying a lone request or a timeout takeover.
+                    let pending = state
+                        .requested
+                        .load(Ordering::Acquire)
+                        .saturating_sub(state.completed.load(Ordering::Acquire));
+                    if pending > 1 {
+                        self.note_contention();
+                    }
+                    // Recently waiting publishers can form the next cohort
+                    // just after its first ticket arrives. Remember contention
+                    // for at most the existing wait allowance, so an isolated
+                    // device and timeout takeovers never acquire a new delay.
                     if owns
                         && !expired
-                        && state
-                            .requested
-                            .load(Ordering::Acquire)
-                            .saturating_sub(state.completed.load(Ordering::Acquire))
-                            > 1
+                        && (pending > 1 || self.recent_contention(allowance))
                         && coalescing_window_enabled()
                     {
                         let nanos = (state.last_sync_ns.load(Ordering::Relaxed) / 16).min(250_000);
@@ -273,6 +287,32 @@ impl Coordinator {
                 std::thread::sleep(Duration::from_micros(50));
             }
         }
+    }
+
+    fn note_contention(&self) {
+        let nanos = self.epoch.elapsed().as_nanos().min(u64::MAX as u128 - 1) as u64;
+        self.last_contention_ns
+            .fetch_max(nanos + 1, Ordering::Relaxed);
+    }
+
+    fn recent_contention(&self, allowance: Duration) -> bool {
+        #[cfg(test)]
+        {
+            static DISABLED: OnceLock<bool> = OnceLock::new();
+            if *DISABLED.get_or_init(|| {
+                std::env::var_os("MYDB_TEST_DISABLE_RECENT_DEVICE_SYNC_COHORT").is_some()
+            }) {
+                return false;
+            }
+        }
+        let last = self.last_contention_ns.load(Ordering::Relaxed);
+        last != 0
+            && self
+                .epoch
+                .elapsed()
+                .as_nanos()
+                .saturating_sub(u128::from(last - 1))
+                <= allowance.as_nanos()
     }
 }
 

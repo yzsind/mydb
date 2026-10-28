@@ -50,9 +50,7 @@ impl RecoveryDirectorySync {
                 .min(8)
                 .min(paths.len());
             if workers <= 1 {
-                for path in paths {
-                    crate::platform::fs::sync_path(path).map_err(io_err)?;
-                }
+                crate::platform::fs::sync_paths(paths).map_err(io_err)?;
                 continue;
             }
             let next = std::sync::atomic::AtomicUsize::new(0);
@@ -61,21 +59,37 @@ impl RecoveryDirectorySync {
                 for _ in 0..workers {
                     let paths = &paths;
                     let next = &next;
-                    handles.push(scope.spawn(move || -> Result<(), QueryError> {
+                    handles.push(scope.spawn(move || -> Result<_, QueryError> {
+                        #[cfg(target_os = "macos")]
+                        let mut batch = crate::platform::fs::DeviceSyncBatch::new();
                         while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            #[cfg(target_os = "macos")]
+                            batch.sync_path(path).map_err(io_err)?;
+                            #[cfg(not(target_os = "macos"))]
                             crate::platform::fs::sync_path(path).map_err(io_err)?;
                         }
+                        #[cfg(target_os = "macos")]
+                        return Ok(batch);
+                        #[cfg(not(target_os = "macos"))]
                         Ok(())
                     }));
                 }
+                #[cfg(target_os = "macos")]
+                let mut batch = crate::platform::fs::DeviceSyncBatch::new();
                 for handle in handles {
-                    handle.join().map_err(|_| {
+                    let synced = handle.join().map_err(|_| {
                         error(
                             crate::error::catalog::ER_GET_ERRNO,
                             "directory sync worker panicked",
                         )
                     })??;
+                    #[cfg(target_os = "macos")]
+                    batch.merge(synced).map_err(io_err)?;
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = synced;
                 }
+                #[cfg(target_os = "macos")]
+                batch.finish().map_err(io_err)?;
                 Ok(())
             })?;
         }
@@ -464,6 +478,28 @@ fn invalidate_recovery_page_io(root: &Path, relative: &str) {
 #[cfg(test)]
 mod recovery_io_tests {
     use super::*;
+
+    #[test]
+    fn recovery_directory_drain_failure_keeps_the_entire_level_for_retry() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let coordinator = RecoveryIoScope::enter().unwrap();
+        let mut paths = BTreeSet::from([root.path().to_path_buf()]);
+        for index in 0..16 {
+            let path = root.path().join(format!("directory-{index}"));
+            fs::create_dir(&path).unwrap();
+            paths.insert(path);
+        }
+        coordinator.directories.lock().add(paths.clone()).unwrap();
+        let missing = root.path().join("directory-7");
+        fs::remove_dir(&missing).unwrap();
+        assert!(coordinator.finish().is_err());
+        assert_eq!(coordinator.directories.lock().paths, paths);
+        assert!(coordinator.directories.lock().charge.bytes() > 0);
+        fs::create_dir(missing).unwrap();
+        coordinator.finish().unwrap();
+        assert!(coordinator.directories.lock().paths.is_empty());
+        assert_eq!(coordinator.directories.lock().charge.bytes(), 0);
+    }
 
     #[test]
     fn recovery_workers_share_a_checked_directory_durability_barrier() {
