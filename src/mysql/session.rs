@@ -251,7 +251,7 @@ type PreparedMap = hashbrown::HashMap<u32, PreparedStatement, ahash::RandomState
 #[cfg(not(unix))]
 const LOCAL_INFILE_MEMORY_LIMIT: usize = 1024 * 1024;
 const ASYNC_ROW_LOCK_RETRY_LIMIT: usize = 1;
-const ASYNC_ROW_LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+const ASYNC_ROW_LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 static ASYNC_ROW_LOCK_RETRIES: AtomicU64 = AtomicU64::new(0);
 static ASYNC_ROW_LOCK_WAKEUPS: AtomicU64 = AtomicU64::new(0);
 static ASYNC_ROW_LOCK_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -3717,12 +3717,9 @@ where
             return self.write_query_response(result).await;
         }
 
-        // Bare transaction control never waits for a row lock: COMMIT
-        // releases row locks before its durability barrier and ROLLBACK only
-        // applies this session's own undo. Its blocking work (group-commit
-        // fsync) therefore matches the autocommit DML that already executes
-        // inline on this runtime worker, so it follows the same policy instead
-        // of paying a blocking-pool round trip on every transaction.
+        // A shared reactor must keep driving sibling lock holders while a
+        // COMMIT waits for durability/visibility or a ROLLBACK applies undo.
+        // Sole-connection reactors retain the inline control path.
         // A plain session-variable SET (e.g. JDBC's per-query
         // `SET SQL_SELECT_LIMIT`) is bounded the same way: it evaluates no
         // subquery or function and changes only this session's state.
@@ -3730,7 +3727,13 @@ where
             && (crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
                 || is_simple_session_set_sql(sql.as_str()))
         {
-            let result = self.engine.execute(&mut self.context, &sql);
+            let result = if crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
+                && crate::util::connection_dispatch::current_worker_has_sibling_connections()
+            {
+                self.execute_engine_blocking(sql).await
+            } else {
+                self.engine.execute(&mut self.context, &sql)
+            };
             if self.kill_flag.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -5160,7 +5163,7 @@ where
                             &values,
                             &perf_texts,
                         )
-                    } else if dml_inline_retry {
+                    } else if dml_inline_retry && prepared_dml_retry_context_allowed(&self.context) {
                         // Explicit / autocommit-off transaction: attempt
                         // inline with nonblocking lock waits. On conflict,
                         // the savepoint path rolls back cleanly before the
@@ -7197,7 +7200,9 @@ where
         if prepared_dml_inline_allowed(&self.context) {
             return self.run_text_dml_shape_inline(sql, parsed, dml_state, params, shape_sql);
         }
-        if prepared_dml_transactional_inline_retry_allowed(parsed.as_ref()) {
+        if prepared_dml_transactional_inline_retry_allowed(parsed.as_ref())
+            && prepared_dml_retry_context_allowed(&self.context)
+        {
             // The inline attempt may take this transaction's first row lock;
             // enter admission while it still holds no locks.
             self.acquire_txn_admission().await;
@@ -7553,14 +7558,10 @@ where
         }
     }
 
-    /// After an inline exact-point command reports an internal row-lock
-    /// conflict, keep the connection task on Tokio and wait for storage's
-    /// monotonic row-release signal. Each retry still runs under the
-    /// nonblocking lock policy, so it can never park a runtime worker. The
-    /// The conflict records the release generation before probing, so a
-    /// release racing with subscription is observed without an unconditional
-    /// replay. Complex/long waits retain the bounded blocking-pool oracle
-    /// after one directed wake opportunity (or a quiet 2ms slice).
+    /// Join the exact row FIFO and await its directed release token. Recheck
+    /// eligibility before sleeping and after waking, then replay once under
+    /// the nonblocking lock policy. A fixed deadline bounds cancellation
+    /// latency and hands long/complex waits to the blocking executor.
     async fn retry_prepared_dml_after_async_row_wake(
         &mut self,
         sql: &str,
@@ -7573,21 +7574,24 @@ where
         Option<Result<QueryResponse, QueryError>>,
         bool,
     ) {
-        if !async_row_lock_retry_enabled() {
+        if !async_row_lock_retry_enabled() || self.context.sysvars.innodb_lock_wait_timeout == Some(0) {
             return (state, None, false);
         }
         let Some(mut signal) = self.engine.row_lock_async_signal() else {
             ASYNC_ROW_LOCK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             return (state, None, false);
         };
+        let deadline = tokio::time::Instant::now() + ASYNC_ROW_LOCK_WAIT_SLICE;
         for _ in 0..ASYNC_ROW_LOCK_RETRY_LIMIT {
-            match tokio::time::timeout(ASYNC_ROW_LOCK_WAIT_SLICE, signal.changed()).await {
-                Ok(Ok(())) => {
-                    ASYNC_ROW_LOCK_WAKEUPS.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(Err(_)) | Err(_) => {
-                    ASYNC_ROW_LOCK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                    return (state, None, false);
+            while !self.engine.row_lock_async_ready(&signal) {
+                match tokio::time::timeout_at(deadline, signal.changed()).await {
+                    Ok(Ok(())) => {
+                        ASYNC_ROW_LOCK_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        ASYNC_ROW_LOCK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                        return (state, None, false);
+                    }
                 }
             }
             ASYNC_ROW_LOCK_RETRIES.fetch_add(1, Ordering::Relaxed);
@@ -7829,6 +7833,12 @@ fn prepared_dml_inline_allowed(context: &SessionContext) -> bool {
         && context.autocommit
         && !context.explicit_txn
         && context.current_txn.is_none()
+        && !crate::util::connection_dispatch::current_worker_has_sibling_connections()
+}
+
+fn prepared_dml_retry_context_allowed(context: &SessionContext) -> bool {
+    !context.autocommit || context.explicit_txn || context.current_txn.is_some()
+        || !crate::util::connection_dispatch::current_worker_has_sibling_connections()
 }
 
 fn mysql_tls_version_name(version: ProtocolVersion) -> &'static str {
@@ -10273,6 +10283,126 @@ mod tests {
         assert!(returned.explicit_txn);
     }
 
+    #[test]
+    fn shared_reactor_txn_control_keeps_sibling_timer_runnable() {
+        std::thread::spawn(|| {
+            crate::util::connection_dispatch::test_set_worker_connection_count(2);
+            let mut context = SessionContext::default();
+            assert!(!prepared_dml_inline_allowed(&context));
+            assert!(!prepared_dml_retry_context_allowed(&context));
+            context.autocommit = false;
+            assert!(prepared_dml_retry_context_allowed(&context));
+
+            struct Engine {
+                entered: AtomicBool,
+                completed: AtomicBool,
+                release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            }
+            impl QueryEngine for Engine {
+                fn execute(
+                    &self,
+                    _: &mut SessionContext,
+                    _: &str,
+                ) -> Result<QueryResponse, QueryError> {
+                    self.entered.store(true, Ordering::Release);
+                    let released = self
+                        .release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .is_ok();
+                    self.completed.store(released, Ordering::Release);
+                    Ok(QueryResponse::Ok)
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let _client = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (stream, peer) = listener.accept().await.unwrap();
+                let (release, receiver) = std::sync::mpsc::channel();
+                let engine = Arc::new(Engine {
+                    entered: AtomicBool::new(false),
+                    completed: AtomicBool::new(false),
+                    release: std::sync::Mutex::new(receiver),
+                });
+                let mut session = Session::new(
+                    1,
+                    peer,
+                    stream,
+                    None,
+                    engine.clone(),
+                    Arc::new(SessionRegistry::new()),
+                );
+                let sibling = async {
+                    while !engine.entered.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    release.send(()).ok();
+                };
+                let (response, ()) =
+                    tokio::join!(session.handle_single_query("COMMIT".into()), sibling);
+                response.unwrap();
+                assert!(
+                    engine.completed.load(Ordering::Acquire),
+                    "the shared reactor stalled its sibling behind COMMIT"
+                );
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_lock_timeout_skips_async_fifo_wait() {
+        struct Engine;
+        impl QueryEngine for Engine {
+            fn execute(
+                &self,
+                _: &mut SessionContext,
+                _: &str,
+            ) -> Result<QueryResponse, QueryError> {
+                Ok(QueryResponse::Ok)
+            }
+            fn row_lock_async_signal(&self) -> Option<crate::engine::api::AsyncRowLockSignal> {
+                panic!("zero timeout must use the synchronous immediate-timeout path");
+            }
+        }
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ASYNC_ROW_LOCK_RETRY_ENABLED.store(self.0, Ordering::Release);
+            }
+        }
+        let _reset = Reset(TEST_ASYNC_ROW_LOCK_RETRY_ENABLED.swap(true, Ordering::AcqRel));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut session = Session::new(
+            1,
+            peer,
+            stream,
+            None,
+            Arc::new(Engine),
+            Arc::new(SessionRegistry::new()),
+        );
+        session.context.sysvars.innodb_lock_wait_timeout = Some(0);
+        let sql = "UPDATE t SET v = 1 WHERE id = 1";
+        let parsed = Arc::new(parse_statement(sql).unwrap());
+        let texts = crate::engine::perf_events::prepared_statement_texts(sql);
+        let (_, result, completed) = session
+            .retry_prepared_dml_after_async_row_wake(sql, &parsed, Default::default(), &[], &texts)
+            .await;
+        assert!(result.is_none());
+        assert!(!completed);
+    }
     #[test]
     fn protocol_audit_blocking_failures_encode_server_errors() {
         for failure in [

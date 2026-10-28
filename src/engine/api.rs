@@ -1617,51 +1617,8 @@ pub enum PreparedDmlState {
     Ready(Arc<PreparedDmlPlan>),
 }
 
-/// One async subscription to a row-lock release shard. The shared waiter
-/// count lets the storage release path preserve its zero-allocation early
-/// return when no protocol task is awaiting a row.
-pub struct AsyncRowLockSignal {
-    receiver: tokio::sync::watch::Receiver<u64>,
-    observed_generation: u64,
-    active: Arc<AtomicU64>,
-}
-
-impl AsyncRowLockSignal {
-    pub(crate) fn new(
-        receiver: tokio::sync::watch::Receiver<u64>,
-        observed_generation: u64,
-        active: Arc<AtomicU64>,
-    ) -> Self {
-        active.fetch_add(1, Ordering::AcqRel);
-        Self {
-            receiver,
-            observed_generation,
-            active,
-        }
-    }
-
-    pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
-        let current = *self.receiver.borrow_and_update();
-        if current != self.observed_generation {
-            self.observed_generation = current;
-            return Ok(());
-        }
-        self.receiver.changed().await?;
-        self.observed_generation = *self.receiver.borrow_and_update();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation(&self) -> u64 {
-        *self.receiver.borrow()
-    }
-}
-
-impl Drop for AsyncRowLockSignal {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+pub use super::async_row_wait::AsyncRowLockSignal;
+pub(crate) use super::async_row_wait::AsyncRowLockRegistry;
 
 /// Statement-local metadata retained by the compiled text-DML batch executor.
 /// These plans cannot run triggers or change tracked session variables.
@@ -1696,11 +1653,17 @@ pub trait QueryEngine: Send + Sync + 'static {
     }
 
     /// Subscribe to row-lock release progress for async inline retry. Storage
-    /// engines return a per-database watch receiver; lightweight/mock engines
-    /// keep the default `None` and use the blocking executor fallback.
+    /// engines register the exact row FIFO and return a transaction wake token;
+    /// lightweight/mock engines use the default blocking executor fallback.
     fn row_lock_async_signal(&self) -> Option<AsyncRowLockSignal> {
         None
     }
+
+    /// Eligibility is rechecked before sleeping and after a directed wake.
+    fn row_lock_async_ready(&self, _signal: &AsyncRowLockSignal) -> bool {
+        true
+    }
+
 
     /// Bind protocol-memory reclamation for the current synchronous poll.
     fn enter_memory_reclaim_scope(

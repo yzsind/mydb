@@ -3297,7 +3297,14 @@ impl QueryEngine for StorageQueryEngine {
 
     fn row_lock_async_signal(&self) -> Option<crate::engine::api::AsyncRowLockSignal> {
         let target = crate::storage::take_nonblocking_row_wait_target()?;
-        Some(self.db.subscribe_row_lock_async_signal(target))
+        if self.db.lock_wait_timeout() < std::time::Duration::from_millis(50) {
+            return None;
+        }
+        self.db.subscribe_row_lock_async_signal(target)
+    }
+
+    fn row_lock_async_ready(&self, signal: &crate::engine::api::AsyncRowLockSignal) -> bool {
+        self.db.async_row_lock_ready(signal.target)
     }
 
     fn execute(

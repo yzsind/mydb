@@ -55,6 +55,14 @@ pub fn current_worker_owns_single_connection() -> bool {
     })
 }
 
+/// Only a dispatcher-owned reactor can have sibling connections. Embedded
+/// runtimes keep their existing caller-provided scheduling policy.
+pub fn current_worker_has_sibling_connections() -> bool {
+    WORKER_LOAD.with(|load| {
+        load.get().is_some_and(|load| load.load(Ordering::Acquire) > 1)
+    })
+}
+
 impl Dispatcher {
     fn new(count: usize, on_start: fn()) -> io::Result<Self> {
         let mut dispatcher = Self {
@@ -204,6 +212,13 @@ pub fn shutdown() {
     if let Some(dispatcher) = DISPATCHER.get() {
         dispatcher.stop();
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_worker_connection_count(connections: usize) {
+    WORKER_LOAD.with(|slot| {
+        slot.set(Arc::new(AtomicUsize::new(connections))).expect("fresh test reactor thread");
+    });
 }
 
 #[cfg(test)]

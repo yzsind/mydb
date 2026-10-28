@@ -23,7 +23,6 @@ pub(crate) enum LockingReadLockWatermark {
     Legacy(usize),
 }
 
-const ASYNC_ROW_LOCK_SIGNAL_SHARDS: usize = 64;
 
 /// Undo records one purge lock round plans and removes. Rounds keep each
 /// undo-lock hold in the tens of microseconds, so DML undo publication never
@@ -31,15 +30,6 @@ const ASYNC_ROW_LOCK_SIGNAL_SHARDS: usize = 64;
 /// records held the write latch ~160 us on average (up to ~3 ms) and the
 /// planning read latch ~130 us, stalling every publisher meanwhile.
 const UNDO_PURGE_ROUND_RECORDS: usize = 64;
-
-#[inline]
-fn async_row_lock_signal_shard(table_id: u64, row_id: RowId) -> usize {
-    let mut hash = table_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    hash ^= (row_id.page_id as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
-    hash ^= (row_id.slot_id as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
-    hash ^= hash >> 29;
-    hash as usize & (ASYNC_ROW_LOCK_SIGNAL_SHARDS - 1)
-}
 
 /// A commit whose MVCC state and WAL record have been published, but whose
 /// durability barrier and post-durable hooks are intentionally deferred.
@@ -1635,7 +1625,7 @@ impl Database {
         if self.lock_wait_waiters.load(Ordering::SeqCst) != 0 {
             self.lock_wait_signal.notify_all();
         }
-        let async_waiters = self.row_lock_async_waiters.load(Ordering::Acquire) != 0;
+        let async_waiters = self.row_lock_async_registry.has_waiters();
         if row_lock_direct_wake_enabled() {
             let parked_row_waiters = self.row_lock_waiters.load(Ordering::SeqCst) != 0;
             let direct_waiters = parked_row_waiters || self.row_lock_parkers.active_count() != 0;
@@ -1647,7 +1637,7 @@ impl Database {
                 return;
             }
             if async_waiters {
-                self.notify_async_row_lock_shards(&rows);
+                self.notify_async_row_lock_waiters(&rows);
             }
             if !direct_waiters {
                 return;
@@ -1688,7 +1678,7 @@ impl Database {
                 return;
             }
             if async_waiters {
-                self.notify_async_row_lock_shards(&rows);
+                self.notify_async_row_lock_waiters(&rows);
             }
             if !row_waiters {
                 return;
@@ -1698,32 +1688,62 @@ impl Database {
         }
     }
 
-    fn notify_async_row_lock_shards(&self, rows: &[(u64, RowId)]) {
-        let mut notified = [false; ASYNC_ROW_LOCK_SIGNAL_SHARDS];
-        for &(table_id, row_id) in rows {
-            let shard = async_row_lock_signal_shard(table_id, row_id);
-            if notified[shard] {
-                continue;
-            }
-            let signal = &self.row_lock_async_signals[shard];
-            if signal.receiver_count() != 0 {
-                signal.send_modify(|generation| *generation = generation.wrapping_add(1));
-                notified[shard] = true;
-            }
+    fn notify_async_row_lock_waiters(&self, rows: &[(u64, RowId)]) {
+        let mut fronts = Vec::new();
+        self.row_locks_sharded
+            .collect_front_row_waiters(rows, &mut fronts);
+        for txn in fronts {
+            self.row_lock_async_registry.notify(txn);
         }
     }
 
     pub(crate) fn subscribe_row_lock_async_signal(
         &self,
         target: crate::storage::NonblockingRowWaitTarget,
-    ) -> crate::engine::api::AsyncRowLockSignal {
-        let receiver = self.row_lock_async_signals
-            [async_row_lock_signal_shard(target.table_id, target.row_id)]
-        .subscribe();
-        crate::engine::api::AsyncRowLockSignal::new(
-            receiver,
-            target.observed_generation,
-            Arc::clone(&self.row_lock_async_waiters),
+    ) -> Option<crate::engine::api::AsyncRowLockSignal> {
+        if !row_lock_sharding_enabled() {
+            return None;
+        }
+        match self.row_locks_sharded.enqueue_async_wait(
+            target.txn_id,
+            target.table_id,
+            target.row_id,
+            target.mode,
+        ) {
+            RowAcquireOutcome::Acquired { cleared_wait } => {
+                if cleared_wait {
+                    self.lock_manager().clear_wait(target.txn_id);
+                }
+            }
+            RowAcquireOutcome::Conflict { owners } => {
+                let result = self.lock_manager().record_row_lock_wait(
+                    target.txn_id,
+                    owners,
+                    target.table_id,
+                    target.row_id,
+                    target.mode,
+                );
+                if result
+                    .as_ref()
+                    .is_err_and(|err| !is_lock_wait_pending_error(err))
+                {
+                    self.clear_blocking_lock_wait(target.txn_id);
+                    return None;
+                }
+            }
+        }
+        Some(self.row_lock_async_registry.register(target))
+    }
+
+    pub(crate) fn async_row_lock_ready(
+        &self,
+        target: crate::storage::NonblockingRowWaitTarget,
+    ) -> bool {
+        !self.row_locks_sharded.still_blocked(
+            target.txn_id,
+            target.table_id,
+            target.row_id,
+            target.mode,
         )
     }
 
@@ -1740,15 +1760,14 @@ impl Database {
         mode: LockMode,
     ) -> Result<(), QueryError> {
         if crate::storage::txn::lock_waits_nonblocking() {
-            let signal_shard = async_row_lock_signal_shard(table_id, row_id);
-            let observed_generation = *self.row_lock_async_signals[signal_shard].borrow();
             if self.try_row_lock_without_wait(txn_id, table_id, row_id, mode)? {
                 return Ok(());
             }
             crate::storage::txn::record_nonblocking_row_wait_target(
+                txn_id,
                 table_id,
                 row_id,
-                observed_generation,
+                mode,
             );
             return Err(crate::storage::txn::lock_would_block_error());
         }
@@ -1844,7 +1863,7 @@ impl Database {
         index_name: &str,
         key: &IndexKey,
     ) -> Result<(), QueryError> {
-        if !self.unique_reservations.may_have_reservations(table_id) {
+        if !self.unique_reservations.may_reserve_key(txn_id, table_id, index_name, key) {
             return Ok(());
         }
         self.lock_manager().check_unique_key_lock(
@@ -1865,7 +1884,7 @@ impl Database {
     ) -> Result<bool, QueryError> {
         crate::engine::cancel::check_cancelled()?;
         // No reservation on the table: nothing to wait for, and no latch.
-        if !self.unique_reservations.may_have_reservations(table_id) {
+        if !self.unique_reservations.may_reserve_key(txn_id, table_id, index_name, key) {
             return Ok(false);
         }
         if self.lock_manager_read().unique_key_uncontended(
@@ -1971,11 +1990,15 @@ impl Database {
     }
 
     fn clear_blocking_lock_wait(&self, txn_id: u64) {
-        if row_lock_sharding_enabled() {
-            self.row_locks_sharded.clear_wait(txn_id);
-        }
+        let row = row_lock_sharding_enabled()
+            .then(|| self.row_locks_sharded.clear_wait_row(txn_id))
+            .flatten();
         self.lock_manager().clear_wait(txn_id);
-        self.notify_lock_waiters();
+        if let Some(row) = row {
+            self.notify_lock_waiters_for_rows(std::iter::once(row));
+        } else {
+            self.notify_lock_waiters();
+        }
     }
 
     fn wait_for_specific_row(
@@ -6072,7 +6095,7 @@ impl Database {
         if row_lock_sharding_enabled() {
             LockingReadLockWatermark::Sharded(self.row_locks_sharded.row_log_len(txn_id))
         } else {
-            LockingReadLockWatermark::Legacy(self.lock_manager_read().lock_log_len(txn_id))
+            LockingReadLockWatermark::Legacy(self.lock_log_presence.len(txn_id))
         }
     }
 
@@ -6099,11 +6122,7 @@ impl Database {
     ) -> Result<StatementSavepoint, QueryError> {
         // Most statements start in a transaction without unique/range
         // reservations; prove that lock-free instead of taking the latch.
-        let lock_log_len = if self.lock_log_presence.may_have_log(txn_id) {
-            self.lock_manager_read().lock_log_len(txn_id)
-        } else {
-            0
-        };
+        let lock_log_len = self.lock_log_presence.len(txn_id);
         let row_log_len = if row_lock_sharding_enabled() {
             self.row_locks_sharded.row_log_len(txn_id)
         } else {
@@ -6314,7 +6333,10 @@ impl Database {
             drop(lm);
             if row_lock_sharding_enabled() {
                 if clear_wait {
-                    lock_state_changed |= self.row_locks_sharded.clear_wait_with_change(txn_id);
+                    if let Some(row) = self.row_locks_sharded.clear_wait_row(txn_id) {
+                        lock_state_changed = true;
+                        released.push(row);
+                    }
                 }
                 released.extend(
                     self.row_locks_sharded
@@ -6393,11 +6415,15 @@ impl Database {
     }
 
     pub fn clear_txn_wait(&self, txn_id: u64) -> Result<(), QueryError> {
-        if row_lock_sharding_enabled() {
-            self.row_locks_sharded.clear_wait(txn_id);
-        }
+        let row = row_lock_sharding_enabled()
+            .then(|| self.row_locks_sharded.clear_wait_row(txn_id))
+            .flatten();
         self.lock_manager().clear_wait(txn_id);
-        self.notify_lock_waiters();
+        if let Some(row) = row {
+            self.notify_lock_waiters_for_rows(std::iter::once(row));
+        } else {
+            self.notify_lock_waiters();
+        }
         Ok(())
     }
 
@@ -6883,7 +6909,7 @@ fn collect_prepared_locks(
     };
     let mut out = Vec::with_capacity(log.len());
     let mut rows = HashSet::new();
-    for held in log {
+    for held in log.iter() {
         match held {
             HeldLock::Row(table_id, row_id) | HeldLock::RowMode(table_id, row_id, _) => {
                 rows.insert((*table_id, *row_id));

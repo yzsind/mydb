@@ -14043,6 +14043,12 @@ fn wal_redo_recovers_committed_index_batch_without_page_fallback() {
         vec![],
     )
     .unwrap();
+    // Restore a valid older index image, not a flushed new root whose
+    // children were arbitrarily truncated. The latter is corruption and
+    // correctly requires the startup rebuild path instead of logical redo.
+    db.with_index_exclusive(1, "PRIMARY", |index| index.flush()).unwrap();
+    db.buffer_pool.flush_all().unwrap();
+    let empty_index_image = fs::read(&index_path).unwrap();
     let catalog_stats = db.log.lock().stats();
     let catalog_index_batches = catalog_stats.index_batch_records;
     let txn = db.begin_txn().unwrap();
@@ -14067,11 +14073,14 @@ fn wal_redo_recovers_committed_index_batch_without_page_fallback() {
             .saturating_sub(catalog_stats.page_fallback_records)
             < 10
     );
+    // Force the metadata-publication ordering that made the old fixture
+    // depend on the background flusher's timing.
+    db.buffer_pool.flush_all().unwrap();
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
     {
-        let file = OpenOptions::new().write(true).open(&index_path).unwrap();
-        file.set_len(PAGE_SIZE as u64).unwrap();
+        let mut file = OpenOptions::new().write(true).truncate(true).open(&index_path).unwrap();
+        file.write_all(&empty_index_image).unwrap();
         file.sync_data().unwrap();
     }
 

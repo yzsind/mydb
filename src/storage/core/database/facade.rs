@@ -631,11 +631,7 @@ impl Database {
             sequences: crate::storage::sequence::SequenceManager::default(),
             lock_wait_mutex: Mutex::new(()),
             lock_wait_signal: Condvar::new(),
-            row_lock_async_signals: (0..ASYNC_ROW_LOCK_SIGNAL_SHARDS)
-                .map(|_| tokio::sync::watch::channel(0).0)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            row_lock_async_waiters: Arc::new(AtomicU64::new(0)),
+            row_lock_async_registry: Arc::new(crate::engine::api::AsyncRowLockRegistry::default()),
             lock_wait_waiters: AtomicU64::new(0),
             config: config.clone(),
             runtime_config: RwLock::new(runtime_config),
@@ -790,7 +786,9 @@ impl Database {
             dml_stats: DmlStats::default(),
             table_modification_deltas: parking_lot::RwLock::new(HashMap::new()),
             table_live_row_deltas: parking_lot::RwLock::new(HashMap::new()),
-            pending_live_row_deltas: parking_lot::Mutex::new(HashMap::new()),
+            pending_live_row_deltas: (0..PENDING_LIVE_ROW_DELTA_SHARDS)
+                .map(|_| parking_lot::Mutex::new(FastHashMap::default()))
+                .collect(),
             table_write_epochs: parking_lot::RwLock::new(HashMap::new()),
             applier_dd_dirty_txns: parking_lot::Mutex::new(HashMap::new()),
             online_index_descriptors: parking_lot::RwLock::new(HashMap::new()),

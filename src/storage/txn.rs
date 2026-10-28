@@ -79,7 +79,7 @@ thread_local! {
 
     /// Exact row that caused the most recent inline would-block result on
     /// this worker. The session consumes it synchronously before its first
-    /// await and subscribes to the matching async release-signal shard.
+    /// await, joins the exact row FIFO and installs its own wake token.
     static NONBLOCKING_ROW_WAIT_TARGET: std::cell::Cell<Option<NonblockingRowWaitTarget>> = const { std::cell::Cell::new(None) };
 
     /// Per-statement row-lock wait timeout override, in seconds, installed by
@@ -159,21 +159,24 @@ pub fn with_nonblocking_lock_waits<R>(f: impl FnOnce() -> R) -> R {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NonblockingRowWaitTarget {
+    pub(crate) txn_id: u64,
     pub(crate) table_id: u64,
     pub(crate) row_id: RowId,
-    pub(crate) observed_generation: u64,
+    pub(crate) mode: LockMode,
 }
 
 pub(crate) fn record_nonblocking_row_wait_target(
+    txn_id: u64,
     table_id: u64,
     row_id: RowId,
-    observed_generation: u64,
+    mode: LockMode,
 ) {
     NONBLOCKING_ROW_WAIT_TARGET.with(|target| {
         target.set(Some(NonblockingRowWaitTarget {
+            txn_id,
             table_id,
             row_id,
-            observed_generation,
+            mode,
         }))
     });
 }
@@ -1157,9 +1160,21 @@ pub(crate) struct TransactionManager {
 #[derive(Debug)]
 pub(crate) struct UniqueReservationFilter {
     buckets: Box<[AtomicU32]>,
+    point_keys: Box<[parking_lot::RwLock<UniquePointSummary>]>,
+    ranges: Box<[AtomicU32]>,
+    hash: ahash::RandomState,
 }
 
 const UNIQUE_RESERVATION_FILTER_BUCKETS: usize = 1024;
+const UNIQUE_POINT_FILTER_BUCKETS: usize = 16384;
+
+/// Hash collisions retain the exact directory path. An unambiguous owner
+/// also proves that no *other* transaction can reserve the queried key.
+#[derive(Debug, Default)]
+struct UniquePointSummary {
+    count: usize,
+    sole_owner: Option<u64>,
+}
 
 impl Default for UniqueReservationFilter {
     fn default() -> Self {
@@ -1167,6 +1182,13 @@ impl Default for UniqueReservationFilter {
             buckets: (0..UNIQUE_RESERVATION_FILTER_BUCKETS)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
+            point_keys: (0..UNIQUE_POINT_FILTER_BUCKETS)
+                .map(|_| parking_lot::RwLock::new(UniquePointSummary::default()))
+                .collect(),
+            ranges: (0..UNIQUE_RESERVATION_FILTER_BUCKETS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            hash: ahash::RandomState::new(),
         }
     }
 }
@@ -1187,6 +1209,87 @@ impl UniqueReservationFilter {
         debug_assert!(previous > 0, "unique reservation filter underflow");
     }
 
+    fn point_bucket(
+        &self,
+        table_id: u64,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> &parking_lot::RwLock<UniquePointSummary> {
+        let hash = self.hash.hash_one(UniqueKeyProbe {
+            table_id,
+            index_name,
+            key,
+        });
+        &self.point_keys[hash as usize & (UNIQUE_POINT_FILTER_BUCKETS - 1)]
+    }
+
+    fn add_point(&self, key: &UniqueKeyLock, txn_id: u64) {
+        let mut state = self
+            .point_bucket(key.table_id, &key.index_name, &key.key)
+            .write();
+        state.sole_owner = (state.count == 0).then_some(txn_id);
+        state.count += 1;
+    }
+
+    fn remove_point(&self, key: &UniqueKeyLock) {
+        let mut state = self
+            .point_bucket(key.table_id, &key.index_name, &key.key)
+            .write();
+        debug_assert!(state.count > 0, "point reservation summary underflow");
+        state.count -= 1;
+        // A remaining colliding key can have a different owner. Do not guess.
+        state.sole_owner = None;
+    }
+
+    fn transfer_point(&self, key: &UniqueKeyLock, txn_id: u64) {
+        let mut state = self
+            .point_bucket(key.table_id, &key.index_name, &key.key)
+            .write();
+        state.sole_owner = (state.count == 1).then_some(txn_id);
+    }
+
+    fn range_bucket(&self, table_id: u64) -> &AtomicU32 {
+        let hash = table_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54;
+        &self.ranges[hash as usize % self.ranges.len()]
+    }
+
+    fn add_range(&self, table_id: u64) {
+        self.add(table_id);
+        self.range_bucket(table_id).fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn remove_range(&self, table_id: u64) {
+        let previous = self.range_bucket(table_id).fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "range reservation summary underflow");
+        self.remove(table_id);
+    }
+
+    /// An empty key bucket proves absence even while unrelated keys on the
+    /// same table are reserved. Collisions and all range reservations retain
+    /// the exact latched path. Publish counts before inserting a reservation
+    /// and remove them only after removing its directory entry.
+    pub(crate) fn may_reserve_key(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> bool {
+        if !self.may_have_reservations(table_id) {
+            return false;
+        }
+        if self.range_bucket(table_id).load(Ordering::SeqCst) != 0 {
+            return true;
+        }
+        let name = super::naming::normalize_name_cow(index_name);
+        // Readers never wait or retain a bucket guard while entering the
+        // lock manager. Writers hold the directory latch before this short
+        // bucket latch, so there is no reverse latch order.
+        self.point_bucket(table_id, &name, key)
+            .try_read()
+            .is_none_or(|state| state.count != 0 && state.sole_owner != Some(txn_id))
+    }
+
     /// `false` proves that no transaction reserves a unique key of `table_id`.
     #[inline]
     pub(crate) fn may_have_reservations(&self, table_id: u64) -> bool {
@@ -1194,14 +1297,16 @@ impl UniqueReservationFilter {
     }
 }
 
-/// Lock-free per-transaction-bucket summary of which transactions own a
-/// lock log. A zero bucket proves that `txn_id` has no log, so a statement
-/// savepoint can record length 0 without taking the `lock_manager` latch.
-/// Only the owning transaction creates its log, so its own earlier creation
-/// is always visible to it.
+/// Private length publication avoids invalidating other transactions' counters.
+type LockLogLength = Arc<CachePadded<AtomicUsize>>;
+
+/// A zero presence bucket skips the length directory entirely. Live logs
+/// publish exact private counters through a sharded directory; the owning
+/// executor serializes its statement boundaries with log mutations.
 #[derive(Debug)]
 pub(crate) struct LockLogPresence {
     buckets: Box<[AtomicU32]>,
+    lengths: Box<[parking_lot::RwLock<FastHashMap<u64, LockLogLength>>]>,
 }
 
 const LOCK_LOG_PRESENCE_BUCKETS: usize = 1024;
@@ -1212,6 +1317,9 @@ impl Default for LockLogPresence {
             buckets: (0..LOCK_LOG_PRESENCE_BUCKETS)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
+            lengths: (0..64)
+                .map(|_| parking_lot::RwLock::new(FastHashMap::default()))
+                .collect(),
         }
     }
 }
@@ -1220,6 +1328,22 @@ impl LockLogPresence {
     #[inline]
     fn bucket(&self, txn_id: u64) -> &AtomicU32 {
         &self.buckets[txn_id as usize % self.buckets.len()]
+    }
+
+    fn length_shard(&self, txn_id: u64) -> &parking_lot::RwLock<FastHashMap<u64, LockLogLength>> {
+        &self.lengths[txn_id as usize & (self.lengths.len() - 1)]
+    }
+
+    /// Statements of one transaction are serialized by the executor. Other
+    /// transactions never need its lock-directory latch to read this watermark.
+    pub(crate) fn len(&self, txn_id: u64) -> usize {
+        if !self.may_have_log(txn_id) {
+            return 0;
+        }
+        self.length_shard(txn_id)
+            .read()
+            .get(&txn_id)
+            .map_or(0, |length| length.load(Ordering::Acquire))
     }
 
     /// `false` proves that `txn_id` holds no lock-log entries.
@@ -1233,8 +1357,52 @@ impl LockLogPresence {
 /// these methods so [`LockLogPresence`] always covers every live log.
 #[derive(Debug, Default)]
 pub(crate) struct LockLogs {
-    logs: FastHashMap<u64, Vec<HeldLock>>,
+    logs: FastHashMap<u64, LockLog>,
     presence: Arc<LockLogPresence>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LockLog {
+    entries: Vec<HeldLock>,
+    length: LockLogLength,
+}
+
+impl std::ops::Deref for LockLog {
+    type Target = Vec<HeldLock>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl LockLog {
+    fn publish_len(&self) {
+        self.length.store(self.entries.len(), Ordering::Release);
+    }
+    fn push(&mut self, entry: HeldLock) {
+        self.entries.push(entry);
+        self.publish_len();
+    }
+    fn pop(&mut self) -> Option<HeldLock> {
+        let out = self.entries.pop();
+        self.publish_len();
+        out
+    }
+    fn reserve(&mut self, count: usize) {
+        self.entries.reserve(count);
+    }
+    fn split_off(&mut self, at: usize) -> Vec<HeldLock> {
+        let out = self.entries.split_off(at);
+        self.publish_len();
+        out
+    }
+    fn retain(&mut self, keep: impl FnMut(&HeldLock) -> bool) {
+        self.entries.retain(keep);
+        self.publish_len();
+    }
+    fn replace(&mut self, entries: Vec<HeldLock>) {
+        self.entries = entries;
+        self.publish_len();
+    }
 }
 
 pub(crate) struct LockLogEntry<'a> {
@@ -1243,13 +1411,21 @@ pub(crate) struct LockLogEntry<'a> {
 }
 
 impl<'a> LockLogEntry<'a> {
-    pub(crate) fn or_default(self) -> &'a mut Vec<HeldLock> {
+    pub(crate) fn or_default(self) -> &'a mut LockLog {
         let LockLogs { logs, presence } = self.logs;
         match logs.entry(self.txn_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let length = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+                presence
+                    .length_shard(self.txn_id)
+                    .write()
+                    .insert(self.txn_id, Arc::clone(&length));
                 presence.bucket(self.txn_id).fetch_add(1, Ordering::SeqCst);
-                entry.insert(Vec::new())
+                entry.insert(LockLog {
+                    entries: Vec::new(),
+                    length,
+                })
             }
         }
     }
@@ -1264,11 +1440,11 @@ impl LockLogs {
         LockLogEntry { logs: self, txn_id }
     }
 
-    pub(crate) fn get(&self, txn_id: &u64) -> Option<&Vec<HeldLock>> {
+    pub(crate) fn get(&self, txn_id: &u64) -> Option<&LockLog> {
         self.logs.get(txn_id)
     }
 
-    pub(crate) fn get_mut(&mut self, txn_id: &u64) -> Option<&mut Vec<HeldLock>> {
+    pub(crate) fn get_mut(&mut self, txn_id: &u64) -> Option<&mut LockLog> {
         self.logs.get_mut(txn_id)
     }
 
@@ -1284,24 +1460,26 @@ impl LockLogs {
     pub(crate) fn remove(&mut self, txn_id: &u64) -> Option<Vec<HeldLock>> {
         let removed = self.logs.remove(txn_id);
         if removed.is_some() {
+            self.presence.length_shard(*txn_id).write().remove(txn_id);
             self.presence.bucket(*txn_id).fetch_sub(1, Ordering::SeqCst);
         }
-        removed
+        removed.map(|log| log.entries)
     }
 
-    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Vec<HeldLock>> {
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut LockLog> {
         self.logs.values_mut()
     }
 
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut Vec<HeldLock>)> {
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut LockLog)> {
         self.logs.iter_mut()
     }
 
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&u64, &mut Vec<HeldLock>) -> bool) {
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&u64, &mut LockLog) -> bool) {
         let presence = &self.presence;
         self.logs.retain(|txn_id, log| {
             let retained = keep(txn_id, log);
             if !retained {
+                presence.length_shard(*txn_id).write().remove(txn_id);
                 presence.bucket(*txn_id).fetch_sub(1, Ordering::SeqCst);
             }
             retained
@@ -3265,7 +3443,7 @@ impl LockManager {
         let held = self
             .lock_log
             .get_mut(&txn_id)
-            .and_then(Vec::pop)
+            .and_then(LockLog::pop)
             .expect("exact lock checked above");
         Self::release_held_lock(
             &mut self.locks,
@@ -3338,6 +3516,7 @@ impl LockManager {
                     })?;
                     let lock = Arc::new(UniqueKeyLock::new(*table_id, index_name.clone(), key));
                     if unique_locks.insert(lock.clone(), txn_id).is_none() {
+                        point_tables.filter.add_point(&lock, txn_id);
                         point_tables.increment(*table_id);
                     }
                     log.push(HeldLock::Unique(lock));
@@ -3844,8 +4023,8 @@ impl LockManager {
             first,
             last,
         });
+        self.unique_point_tables.filter.add_range(table_id);
         entries.insert(first, (Arc::clone(&range), txn_id));
-        self.unique_point_tables.filter.add(table_id);
         self.unique_range_keys += count;
         self.lock_log
             .entry(txn_id)
@@ -3891,6 +4070,7 @@ impl LockManager {
                 {
                     if *entry.get() == txn_id {
                         entry.remove();
+                        point_tables.filter.remove_point(&lock);
                         Self::release_unique_point_count(point_tables, lock.table_id);
                     }
                 }
@@ -3907,7 +4087,7 @@ impl LockManager {
                         .is_some_and(|(_, owner)| *owner == txn_id)
                     {
                         entries.remove(&range.first);
-                        point_tables.filter.remove(range.table_id);
+                        point_tables.filter.remove_range(range.table_id);
                         *unique_range_keys = unique_range_keys.saturating_sub(range.len());
                     }
                     if entries.is_empty() {
@@ -4509,10 +4689,12 @@ impl LockManager {
                     // The old owner's rollback log may retain this immutable
                     // identity. Its release still checks the current owner,
                     // so taking over a stale reservation can reuse it safely.
+                    point_tables.filter.transfer_point(key, txn_id);
                     *entry.get_mut() = txn_id;
                     Ok(Some(Arc::clone(entry.key())))
                 } else {
                     entry.remove();
+                    point_tables.filter.remove_point(key);
                     Self::release_unique_point_count(point_tables, key.table_id);
                     Ok(None)
                 }
@@ -4520,6 +4702,7 @@ impl LockManager {
             hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
                 if insert_if_free {
                     let lock = Arc::new(lock.take().expect("new unique key"));
+                    point_tables.filter.add_point(&lock, txn_id);
                     point_tables.increment(lock.table_id);
                     entry.insert_hashed_nocheck(hash, Arc::clone(&lock), txn_id);
                     Ok(Some(lock))
@@ -5232,7 +5415,7 @@ impl LockManager {
     /// `StatementSavepoint` so a later rollback-to-savepoint can release
     /// exactly the locks acquired after the savepoint.
     pub(crate) fn lock_log_len(&self, txn_id: u64) -> usize {
-        self.lock_log.get(&txn_id).map(Vec::len).unwrap_or(0)
+        self.lock_log.get(&txn_id).map(|log| log.len()).unwrap_or(0)
     }
 
     /// Lock-side half of `restore_statement_savepoint`: truncate the held-lock
@@ -5532,7 +5715,7 @@ impl LockManager {
         let mut out = Vec::new();
         for (txn_id, log) in self.lock_log.iter_mut() {
             let mut keep = Vec::with_capacity(log.len());
-            for held in log.drain(..) {
+            for held in std::mem::take(&mut log.entries) {
                 match held {
                     HeldLock::Row(_, _) | HeldLock::RowMode(_, _, _) | HeldLock::Rows(_, _) => {
                         out.push((*txn_id, held));
@@ -5540,7 +5723,7 @@ impl LockManager {
                     other => keep.push(other),
                 }
             }
-            *log = keep;
+            log.replace(keep);
         }
         self.lock_log.retain(|_, log| !log.is_empty());
         self.locks.clear();
@@ -5956,6 +6139,222 @@ mod group_commit_tests {
         assert!(manager
             .acquire_unique_key_lock(4, 9, "uk", &key(5), true, &active)
             .is_err());
+    }
+
+    #[test]
+    fn unique_key_summary_proves_sole_ownership_and_fails_closed_when_busy() {
+        use crate::storage::KeyPart;
+        let key = IndexKey::from(vec![KeyPart::Int(7)]);
+        let active = |_| Some(TxnStatus::Active);
+        let mut manager = LockManager::default();
+        let summary = manager.unique_reservation_filter();
+        manager
+            .acquire_unique_key_lock(1, 9, "uk", &key, true, &active)
+            .unwrap();
+        assert!(!summary.may_reserve_key(1, 9, "UK", &key));
+        assert!(summary.may_reserve_key(2, 9, "uk", &key));
+        let busy = summary.point_bucket(9, "uk", &key).write();
+        assert!(
+            summary.may_reserve_key(1, 9, "uk", &key),
+            "a busy summary must not wait or claim absence"
+        );
+        drop(busy);
+        manager
+            .acquire_unique_key_lock(2, 9, "uk", &key, true, &|_| Some(TxnStatus::Committed))
+            .unwrap();
+        assert!(summary.may_reserve_key(1, 9, "uk", &key));
+        assert!(!summary.may_reserve_key(2, 9, "uk", &key));
+        manager.unlock_txn(1);
+        assert!(!summary.may_reserve_key(2, 9, "uk", &key));
+        let saved = manager.lock_log_len(2);
+        manager
+            .acquire_unique_key_lock(2, 9, "uk", &key, true, &active)
+            .unwrap();
+        assert_eq!(saved, manager.lock_log_len(2));
+        manager.restore_savepoint_locks(2, 0);
+        assert!(!summary.may_reserve_key(1, 9, "uk", &key));
+    }
+
+    #[test]
+    fn unique_key_summary_never_loses_a_live_owner_during_concurrent_collisions() {
+        use crate::storage::KeyPart;
+        let key = |n| IndexKey::from(vec![KeyPart::Int(n)]);
+        let mut manager = LockManager::default();
+        let summary = manager.unique_reservation_filter();
+        let mut buckets = HashMap::new();
+        let (first, second) = (0..=UNIQUE_POINT_FILTER_BUCKETS as i64)
+            .find_map(|n| {
+                let bucket = summary.point_bucket(9, "uk", &key(n)) as *const _ as usize;
+                buckets.insert(bucket, n).map(|previous| (previous, n))
+            })
+            .unwrap();
+        manager
+            .acquire_unique_key_lock(1, 9, "uk", &key(first), true, &|_| Some(TxnStatus::Active))
+            .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let summary = &summary;
+                scope.spawn(move || {
+                    for _ in 0..10000 {
+                        assert!(summary.may_reserve_key(2, 9, "UK", &key(first)));
+                    }
+                });
+            }
+            for _ in 0..3000 {
+                manager
+                    .acquire_unique_key_lock(3, 9, "uk", &key(second), true, &|_| {
+                        Some(TxnStatus::Active)
+                    })
+                    .unwrap();
+                manager.unlock_txn(3);
+            }
+        });
+        assert!(summary.may_reserve_key(2, 9, "uk", &key(first)));
+        manager.unlock_txn(1);
+        assert!(!summary.may_reserve_key(2, 9, "uk", &key(first)));
+    }
+
+    #[test]
+    fn unique_key_summary_preserves_collisions_ranges_and_stale_owners() {
+        use crate::storage::KeyPart;
+        let key = |n| IndexKey::from(vec![KeyPart::Int(n)]);
+        let active = |_| Some(TxnStatus::Active);
+        let mut manager = LockManager::default();
+        let summary = manager.unique_reservation_filter();
+        let mut buckets = HashMap::new();
+        let (first, second) = (0..=UNIQUE_POINT_FILTER_BUCKETS as i64)
+            .find_map(|n| {
+                let bucket = summary.point_bucket(9, "uk", &key(n)) as *const _ as usize;
+                buckets.insert(bucket, n).map(|previous| (previous, n))
+            })
+            .expect("pigeonhole collision");
+        for (txn, n) in [(1, first), (2, second)] {
+            manager
+                .acquire_unique_key_lock(txn, 9, "UK", &key(n), true, &active)
+                .unwrap();
+            assert!(summary.may_reserve_key(99, 9, "uK", &key(n)));
+        }
+        manager.unlock_txn(1);
+        assert!(
+            summary.may_reserve_key(99, 9, "uk", &key(first)),
+            "collision must stay conservative"
+        );
+        assert!(summary.may_reserve_key(99, 9, "uk", &key(second)));
+        manager
+            .acquire_unique_key_lock(3, 9, "uk", &key(second), true, &|_| {
+                Some(TxnStatus::Committed)
+            })
+            .unwrap();
+        manager.unlock_txn(2);
+        assert!(
+            summary.may_reserve_key(99, 9, "uk", &key(second)),
+            "old owner must not clear a stolen key"
+        );
+        manager.restore_savepoint_locks(3, 0);
+        assert!(!summary.may_reserve_key(99, 9, "uk", &key(second)));
+        manager.unlock_txn(3);
+        assert!(manager
+            .try_lock_integer_range(4, 9, "uk", false, 1, 10)
+            .unwrap());
+        assert!(summary.may_reserve_key(99, 9, "UK", &key(5)));
+        assert!(
+            summary.may_reserve_key(99, 9, "other", &key(100)),
+            "range summary may over-report"
+        );
+        manager.unlock_txn(4);
+        assert!(!summary.may_reserve_key(99, 9, "uk", &key(5)));
+    }
+
+    #[test]
+    fn unique_key_summary_matches_canonical_key_types_and_recovery() {
+        use crate::storage::KeyPart;
+        let mut manager = LockManager::default();
+        let summary = manager.unique_reservation_filter();
+        let active = |_| Some(TxnStatus::Prepared);
+        let keys = vec![
+            vec![KeyPart::Int(i64::MIN)],
+            vec![KeyPart::UInt(u64::MAX)],
+            vec![KeyPart::Float32(123)],
+            vec![KeyPart::Float64(456)],
+            vec![KeyPart::Decimal {
+                value: 12345,
+                scale: 2,
+            }],
+            vec![KeyPart::DecimalWide {
+                value: num_bigint::BigInt::from(12345),
+                scale: 2,
+            }],
+            vec![KeyPart::Bytes(vec![0, 255])],
+            vec![KeyPart::String("value".into())],
+            vec![KeyPart::CollatedString {
+                collation_id: 45,
+                value: "abc".into(),
+            }],
+            vec![
+                KeyPart::Date(-3),
+                KeyPart::Time(-42),
+                KeyPart::DateTime(17),
+                KeyPart::Year(126),
+            ],
+            vec![
+                KeyPart::Null,
+                KeyPart::Int(1),
+                KeyPart::String("composite".into()),
+            ],
+        ];
+        for (i, parts) in keys.into_iter().enumerate() {
+            let key = IndexKey::from(parts);
+            let id = i as u64 + 1;
+            manager
+                .acquire_unique_key_lock(id, 9, "UK", &key, true, &active)
+                .unwrap();
+            assert!(summary.may_reserve_key(99, 9, "uk", &key));
+            if let [KeyPart::CollatedString { .. }] = key.0.as_slice() {
+                assert!(summary.may_reserve_key(
+                    99,
+                    9,
+                    "uk",
+                    &IndexKey::from(vec![KeyPart::CollatedString {
+                        collation_id: 45,
+                        value: "ABC".into()
+                    }])
+                ));
+            }
+            manager.unlock_txn(id);
+            assert!(!summary.may_reserve_key(99, 9, "uk", &key));
+            let entry = PreparedLockEntry::UniqueKey {
+                table_id: 9,
+                index_name: "uk".into(),
+                key_bytes: serde_json::to_vec(&key).unwrap(),
+            };
+            manager.restore_prepared_locks(id, &[entry]).unwrap();
+            assert!(summary.may_reserve_key(99, 9, "uk", &key));
+            manager.unlock_txn(id);
+            assert!(!summary.may_reserve_key(99, 9, "uk", &key));
+        }
+    }
+
+    #[test]
+    fn lock_log_watermarks_follow_rollback_migration_and_colliding_transactions() {
+        let mut manager = LockManager::default();
+        let lengths = manager.lock_log_presence();
+        for txn in [1, 65, 1025] {
+            assert_eq!(lengths.len(txn), 0);
+            manager.lock_row(txn, 9, RowId::new(txn as u32, 0)).unwrap();
+            assert_eq!(lengths.len(txn), manager.lock_log_len(txn));
+            let saved = lengths.len(txn);
+            manager.lock_row(txn, 9, RowId::new(txn as u32, 1)).unwrap();
+            assert_eq!(lengths.len(txn), saved + 1);
+            manager.restore_savepoint_locks(txn, saved);
+            assert_eq!(lengths.len(txn), saved);
+        }
+        manager.unlock_txn(65);
+        assert_eq!(lengths.len(65), 0);
+        assert_eq!(lengths.len(1), 1);
+        assert_eq!(lengths.len(1025), 1);
+        assert_eq!(manager.drain_row_locks().len(), 2);
+        assert_eq!(lengths.len(1), 0);
+        assert_eq!(lengths.len(1025), 0);
     }
 
     #[test]

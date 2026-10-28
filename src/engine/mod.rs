@@ -1,5 +1,6 @@
 pub(crate) mod ai;
 pub mod api;
+mod async_row_wait;
 pub mod audit_log;
 pub mod auth;
 pub mod auto_analyze;

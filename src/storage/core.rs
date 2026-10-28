@@ -73,6 +73,9 @@ use super::wait_events::{WaitEvent, WaitEventHistory, WaitEventSample};
 // P0/4 — slot-reclaim retry tuning. Shared by `Database` field defs
 // (txn_ops.rs::reclaim_tombstoned_slots) and the regression tests
 // that reach in via `cfg(test)` accessors.
+const PENDING_LIVE_ROW_DELTA_SHARDS: usize = 64;
+type PendingLiveRowDeltaShard = parking_lot::Mutex<FastHashMap<u64, HashMap<u64, i64>>>;
+
 pub(crate) const SLOT_RECLAIM_MAX_ATTEMPTS: u8 = 8;
 pub(crate) const SLOT_RECLAIM_QUARANTINE_CAP: usize = 4096;
 pub(crate) const SLOT_RECLAIM_QUARANTINE_DRAIN_PER_RUN: usize = 256;
@@ -1109,13 +1112,11 @@ pub struct Database {
     sequences: crate::storage::sequence::SequenceManager,
     lock_wait_mutex: Mutex<()>,
     lock_wait_signal: Condvar,
-    /// Async-runtime mirror of row-lock release progress. Inline prepared
-    /// point commands subscribe only after an immediate lock conflict; a
-    /// monotonically changing watch value closes the release-before-await
-    /// race without parking an OS blocking-pool worker. The synchronous
-    /// condvar/parker path remains the correctness oracle and fallback.
-    row_lock_async_signals: Box<[tokio::sync::watch::Sender<u64>]>,
-    row_lock_async_waiters: Arc<AtomicU64>,
+    /// Exact async wake tokens for row FIFO waiters. Registration followed
+    /// by an eligibility recheck closes the release-before-await race without
+    /// parking an OS worker or waking unrelated rows. Long waits retain the
+    /// synchronous condvar/parker fallback.
+    row_lock_async_registry: Arc<crate::engine::api::AsyncRowLockRegistry>,
     /// Number of threads currently parked on `lock_wait_signal` (MDL /
     /// unique-key / table-lock waiters). `notify_lock_waiters` reads this and
     /// skips the broadcast when it is 0: the overwhelmingly common
@@ -1524,7 +1525,7 @@ pub struct Database {
     /// publishes it here and rollback discards it, so estimates never expose
     /// uncommitted or rolled-back population changes.
     table_live_row_deltas: parking_lot::RwLock<HashMap<u64, Arc<AtomicI64>>>,
-    pending_live_row_deltas: parking_lot::Mutex<HashMap<(u64, u64), i64>>,
+    pending_live_row_deltas: Box<[PendingLiveRowDeltaShard]>,
     /// Monotonic per-table data-change epoch for the CTE result cache.
     /// Unlike `table_modification_deltas` (reset by `take`/`drop` to fold
     /// into persisted stats), this only ever increases — bumped on every

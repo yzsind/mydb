@@ -153,6 +153,12 @@ impl ShardedRowLocks {
             }
             Some(state) => {
                 if state.holds(txn_id) {
+                    if mode == LockMode::Exclusive
+                        && state.mode == LockMode::Shared
+                        && !state.sole_owner(txn_id)
+                    {
+                        return LockOwnerCheck::Conflict(state.owners.blockers_except(txn_id));
+                    }
                     return LockOwnerCheck::SelfHolds;
                 }
                 if mode == LockMode::Shared && state.mode == LockMode::Shared {
@@ -231,6 +237,29 @@ impl ShardedRowLocks {
         }
         if remove {
             shard.row_waiters.remove(&key);
+        }
+    }
+
+    /// Register only the wait entitlement, never acquire or upgrade a lock
+    /// outside the statement's savepoint. The subsequent retry owns the grant.
+    pub(crate) fn enqueue_async_wait(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        row_id: RowId,
+        mode: LockMode,
+    ) -> RowAcquireOutcome {
+        let key = (table_id, row_id);
+        let mut shard = self.row_shard(key).lock();
+        if let LockOwnerCheck::Conflict(owners) = Self::compat(&shard, key, txn_id, mode) {
+            Self::enqueue_waiter(&mut shard, key, txn_id, mode);
+            drop(shard);
+            self.into_conflict(txn_id, key, owners, mode)
+        } else {
+            drop(shard);
+            RowAcquireOutcome::Acquired {
+                cleared_wait: self.clear_waiting(txn_id, Some(key)),
+            }
         }
     }
 
@@ -462,13 +491,14 @@ impl ShardedRowLocks {
         let Some(entry) = entry else {
             return Vec::new();
         };
+        let mut freed = Vec::new();
         // If the txn was mid-wait (e.g. killed/rolled back while blocked),
         // drop its dead waiter so it doesn't stall the row's FIFO queue.
         if let Some(key) = entry.waiting_on {
             let mut shard = self.row_shard(key).lock();
             Self::dequeue_waiter(&mut shard, key, txn_id);
+            freed.push(key);
         }
-        let mut freed = Vec::new();
         for held in entry.log {
             self.release_held(txn_id, &held, &mut freed);
         }
@@ -480,11 +510,7 @@ impl ShardedRowLocks {
     /// `LockManager::clear_wait` (which drops the `waits_for` edge). Used by
     /// the blocking-loop timeout/cancel and savepoint-rollback cleanup so a
     /// dead waiter never stalls the FIFO queue.
-    pub(crate) fn clear_wait(&self, txn_id: u64) {
-        self.clear_wait_with_change(txn_id);
-    }
-
-    pub(crate) fn clear_wait_with_change(&self, txn_id: u64) -> bool {
+    pub(crate) fn clear_wait_row(&self, txn_id: u64) -> Option<(u64, RowId)> {
         let waiting_on = {
             let mut map = self.txn_shard(txn_id).lock();
             match map.get_mut(&txn_id) {
@@ -499,7 +525,7 @@ impl ShardedRowLocks {
             let mut shard = self.row_shard(key).lock();
             Self::dequeue_waiter(&mut shard, key, txn_id);
         }
-        waiting_on.is_some()
+        waiting_on
     }
 
     pub(crate) fn blocked_waiting_row(&self, txn_id: u64) -> Option<(u64, RowId)> {
@@ -826,7 +852,9 @@ impl Database {
                 txn_id, table_id, row_id, mode, true,
             ) {
                 RowAcquireOutcome::Acquired { cleared_wait } => {
-                    debug_assert!(!cleared_wait, "an immediate probe must not own waiter state");
+                    if cleared_wait {
+                        self.lock_manager().clear_wait(txn_id);
+                    }
                     Ok(true)
                 }
                 RowAcquireOutcome::Conflict { .. } => Ok(false),
