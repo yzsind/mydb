@@ -221,8 +221,7 @@ impl ExecutionContext {
             kernel_mode: crate::engine::executor::vec::config::effective_mode(),
             rollup_window_topk_hint: super::plan::current_rollup_window_topk_hint(),
             group_concat_max_len: super::aggregate::group_concat_max_len(),
-            warning_sink: crate::engine::api::current_statement_warning_sink()
-                .unwrap_or_else(|| Arc::new(parking_lot::Mutex::new(Default::default()))),
+            warning_sink: crate::engine::api::current_statement_warning_sink().unwrap_or_default(),
             rows_examined: crate::engine::perf_events::current_rows_examined_counter(),
         }
     }

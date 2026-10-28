@@ -263,6 +263,12 @@ pub fn with_params_slice<R>(params: &[Value], f: impl FnOnce() -> R) -> R {
     install_params_slice(params, f)
 }
 
+/// Borrow text-protocol literal bindings while retaining resolver provenance.
+#[inline]
+pub(crate) fn with_auto_params_slice<R>(params: &[Value], f: impl FnOnce() -> R) -> R {
+    with_params_slice_and_provenance(params, true, f)
+}
+
 #[inline]
 fn with_params_slice_and_provenance<R>(
     params: &[Value],

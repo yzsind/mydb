@@ -3821,12 +3821,17 @@ where
                                     Arc::clone(&shape_sql),
                                     || {
                                         crate::engine::api::with_shared_result_metadata(|| {
-                                            self.engine.execute_prepared_select(
-                                                &mut self.context,
-                                                &mut memo.state,
-                                                compile_parsed,
-                                                sql.as_str(),
+                                            crate::engine::params::with_auto_params_slice(
                                                 &params,
+                                                || {
+                                                    self.engine.execute_prepared_select(
+                                                        &mut self.context,
+                                                        &mut memo.state,
+                                                        compile_parsed,
+                                                        sql.as_str(),
+                                                        &params,
+                                                    )
+                                                },
                                             )
                                         })
                                     },
@@ -9995,6 +10000,51 @@ mod tests {
         }));
         assert_eq!(engine.0.load(Ordering::Relaxed), 1);
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expression_audit_cached_text_read_keeps_literal_diagnostics() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE test.temporal_literal_cache(dt DATETIME(6), KEY k(dt))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO test.temporal_literal_cache VALUES('2020-01-01')")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut session = Session::try_new(
+            4243,
+            peer,
+            stream,
+            None,
+            engine,
+            Arc::new(SessionRegistry::new()),
+        )
+        .unwrap();
+        session.authenticated = true;
+        session.context.current_database = "test".into();
+        for _ in 0..4 {
+            session
+                .handle_single_query(
+                    "SELECT COUNT(*) FROM temporal_literal_cache WHERE dt='0000-00-00'".into(),
+                )
+                .await
+                .unwrap();
+            let packet = crate::mysql::packet::read_packet(&mut client)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(packet.payload[0], 0xff);
+            assert_eq!(
+                u16::from_le_bytes(packet.payload[1..3].try_into().unwrap()),
+                1525
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

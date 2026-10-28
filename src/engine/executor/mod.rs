@@ -4603,6 +4603,16 @@ impl StorageQueryEngine {
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         let result = crate::engine::params::with_params_slice(params, || {
             crate::engine::expr::with_session_expr_info(session, || {
+                if crate::engine::params::auto_parameterized_active()
+                    && params.iter().any(|value| {
+                        matches!(
+                            value,
+                            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                        )
+                    })
+                {
+                    select::validate_cached_temporal_literals(&self.db, select)?;
+                }
                 // Compiled plans bypass execute_select, including its registry scope.
                 // A business-table plan can still scan system tables in joins/subqueries.
                 select::with_session_registry((*self.registry).clone(), || {

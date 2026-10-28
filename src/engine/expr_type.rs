@@ -133,6 +133,8 @@ pub(crate) struct ExprType {
     pub(crate) collation_id: Option<u16>,
     /// MySQL collation coercibility (lower wins).
     pub(crate) coercibility: u8,
+    /// Precision retained when a temporal branch enters a character domain.
+    pub(crate) temporal_string_fsp: Option<u8>,
 }
 
 /// Static part of a built-in's bind-time contract.  Argument-dependent
@@ -265,6 +267,7 @@ crate::engine::builtin_catalog::declare_builtin_spec!();
 impl ExprType {
     pub(crate) const fn new(kind: ExprTypeKind, nullable: bool) -> Self {
         Self {
+            temporal_string_fsp: None,
             dynamic_parameter: false,
             kind,
             nullable,
@@ -368,6 +371,7 @@ impl ExprType {
             }
         };
         Self {
+            temporal_string_fsp: None,
             dynamic_parameter: false,
             kind,
             nullable: source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0,
@@ -471,6 +475,7 @@ impl ExprType {
             },
         };
         Self {
+            temporal_string_fsp: None,
             dynamic_parameter: false,
             kind,
             nullable,
@@ -837,6 +842,13 @@ pub(crate) fn aggregate_branch_types(left: ExprType, right: ExprType) -> ExprTyp
         right.collation_id
     };
     out.coercibility = left.coercibility.min(right.coercibility);
+    if matches!(out.kind, String { .. }) {
+        let fsp = |value: ExprType| match value.kind {
+            Temporal { fsp, .. } => Some(fsp),
+            _ => value.temporal_string_fsp,
+        };
+        out.temporal_string_fsp = fsp(left).into_iter().chain(fsp(right)).max();
+    }
     out.dynamic_parameter =
         matches!(out.kind, Unknown) && (left.dynamic_parameter || right.dynamic_parameter);
     out
@@ -2158,7 +2170,19 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         }
                         _ => Some("DAY"),
                     };
-                    if let Temporal { kind, fsp } = input.kind {
+                    let dynamic_first = !crate::engine::params::auto_parameterized_active()
+                        && args.first().is_some_and(|arg| {
+                            matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_))
+                        });
+                    if dynamic_first && !matches!(input.kind, Temporal { .. }) {
+                        ExprType::new(
+                            Temporal {
+                                kind: TemporalKind::DateTime,
+                                fsp: 6,
+                            },
+                            true,
+                        )
+                    } else if let Temporal { kind, fsp } = input.kind {
                         let date_unit = unit.is_some_and(|unit| {
                             ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"]
                                 .iter()

@@ -2050,9 +2050,7 @@ fn execute_load_data_ignore_parallel(
     if let Some(replay) = replay {
         // Trial diagnostics are private. Any warning forces an ordered replay
         // before publication, preserving both conversion and warning order.
-        let warnings = Arc::new(parking_lot::Mutex::new(
-            crate::engine::api::SqlWarnings::new(),
-        ));
+        let warnings = crate::engine::api::StatementWarningSink::default();
         let result = crate::engine::api::with_statement_warning_sink(warnings, || {
             let _ignore = crate::storage::DmlIgnoreCoercionGuard::new(false);
             let _decode = LoadDecodePolicyGuard::new(false);

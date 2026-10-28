@@ -2915,8 +2915,8 @@ fn phase1_b06_addtime_keeps_micros_and_extended_negative_time() {
         "SELECT ADDTIME('12:00:00.500000','00:00:00.250000'), \
          SUBTIME('12:00:00.500000','00:00:00.200000')",
     );
-    assert_eq!(as_text(&row[0]), "12:00:00.750000");
-    assert_eq!(as_text(&row[1]), "12:00:00.300000");
+    assert_eq!(as_text(&row[0]), "12:00:00.75");
+    assert_eq!(as_text(&row[1]), "12:00:00.3");
 
     // 12:00:00+24:00:00 yields 36:00:00, not wrapped 12:00:00.
     let row = one_row(

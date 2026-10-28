@@ -5,21 +5,39 @@ use super::{
 };
 use crate::types::{QueryError, Value};
 
-/// Trim ASCII spaces while preserving connection-charset conversion errors.
+/// Trim ASCII spaces in the original binary or character domain.
 #[inline]
 pub(crate) fn eval_edge_trim_value(value: Value, leading: bool) -> Result<Value, QueryError> {
     null_or(value, |value| {
-        let text = if matches!(value, Value::Bytes(_)) {
-            std::borrow::Cow::Owned(string_value_for_connection(&value)?)
-        } else {
-            str_value(&value)
-        };
+        if let Value::Bytes(bytes) = value {
+            let range = if leading {
+                bytes.iter().position(|b| *b != b' ').unwrap_or(bytes.len())..bytes.len()
+            } else {
+                0..bytes.iter().rposition(|b| *b != b' ').map_or(0, |i| i + 1)
+            };
+            return Ok(Value::Bytes(bytes[range].to_vec()));
+        }
+        let text = str_value(&value);
         let trimmed = if leading {
             text.trim_start_matches(' ')
         } else {
             text.trim_end_matches(' ')
         };
         Ok(Value::String(trimmed.to_string()))
+    })
+}
+
+/// Read the original leading octet without cloning string or binary buffers.
+#[inline]
+pub(crate) fn eval_ascii_value(value: Value) -> Result<Value, QueryError> {
+    null_or(value, |value| {
+        let first = match &value {
+            Value::String(text) => text.as_bytes().first().copied(),
+            Value::SmallString(bytes) => bytes.first().copied(),
+            Value::Bytes(bytes) => bytes.first().copied(),
+            other => str_value(other).as_bytes().first().copied(),
+        };
+        Ok(Value::Int(i64::from(first.unwrap_or(0))))
     })
 }
 

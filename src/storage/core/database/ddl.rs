@@ -8460,9 +8460,7 @@ impl Database {
         let session_info = crate::engine::expr::current_session_expr_info();
         // Schema coercion also emits statement diagnostics through TLS. Share a
         // batched sink with workers so those warnings survive their exit.
-        let warning_sink = Arc::new(parking_lot::Mutex::new(
-            crate::engine::api::SqlWarnings::new(),
-        ));
+        let warning_sink = crate::engine::api::StatementWarningSink::default();
         let result = std::thread::scope(|scope| {
             let defaults = &defaults;
             let session_info = &session_info;

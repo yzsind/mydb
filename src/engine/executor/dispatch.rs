@@ -7157,7 +7157,15 @@ fn execute_sql_prepare(
             session.group_concat_max_len,
             || {
                 crate::engine::expr::with_session_expr_info(session, || {
-                    super::select::describe_statement_columns(db, session, &validation_statement)
+                    // The new statement's placeholders must not see parameters
+                    // belonging to the surrounding PREPARE command.
+                    crate::engine::params::with_params(Vec::new(), || {
+                        super::select::describe_statement_columns(
+                            db,
+                            session,
+                            &validation_statement,
+                        )
+                    })
                 })
             },
         )?

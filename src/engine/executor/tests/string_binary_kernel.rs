@@ -510,20 +510,21 @@ fn regexp_instr_and_replace_reject_bad_arguments() {
         .execute("SELECT REGEXP_INSTR('abc', 'b', -1)")
         .is_err());
 
-    // occurrence < 1 rejected on REGEXP_INSTR.
-    assert!(engine
-        .execute("SELECT REGEXP_INSTR('abc', 'b', 1, -1)")
-        .is_err());
+    // Nonpositive occurrences select the first match.
+    assert_eq!(
+        one_row(&engine, "SELECT REGEXP_INSTR('abc', 'b', 1, -1)")[0],
+        Value::Int(2)
+    );
 
     // return_option ∉ {0, 1} rejected.
     assert!(engine
         .execute("SELECT REGEXP_INSTR('abc', 'b', 1, 1, 2)")
         .is_err());
 
-    // REGEXP_REPLACE occurrence < 0 rejected.
-    assert!(engine
-        .execute("SELECT REGEXP_REPLACE('aaa', 'a', 'X', 1, -1)")
-        .is_err());
+    assert_eq!(
+        one_row(&engine, "SELECT REGEXP_REPLACE('aaa', 'a', 'X', 1, -1)")[0],
+        Value::String("Xaa".into())
+    );
 
     // Sanity: occurrence == 0 still means "replace all".
     let row = one_row(&engine, "SELECT REGEXP_REPLACE('aaa', 'a', 'X', 1, 0)");

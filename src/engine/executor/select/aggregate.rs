@@ -469,6 +469,14 @@ impl AggregateSlot {
                 collation_id: None,
             })
             .collect();
+        if self.name.eq_ignore_ascii_case("JSON_ARRAYAGG") {
+            let mut acc = JsonArrayAggAcc::new(order_fields);
+            acc.boolean = self
+                .args
+                .first()
+                .is_some_and(crate::engine::expr::expr_is_boolean_typed);
+            return Box::new(acc);
+        }
         accumulator_for(
             self.kind(),
             &self.name,
@@ -2827,6 +2835,7 @@ struct JsonArrayAggEntry {
 }
 
 struct JsonArrayAggAcc {
+    boolean: bool,
     entries: Vec<JsonArrayAggEntry>,
     order_fields: Vec<SortField>,
     /// Cumulative payload bytes across all `entries`.
@@ -2849,12 +2858,14 @@ impl Clone for JsonArrayAggAcc {
             entries,
             payload_bytes,
             order_fields: self.order_fields.clone(),
+            boolean: self.boolean,
         }
     }
 }
 impl JsonArrayAggAcc {
     fn new(order_fields: Vec<SortField>) -> Self {
         Self {
+            boolean: false,
             entries: Vec::new(),
             order_fields,
             payload_bytes: 0,
@@ -2925,7 +2936,7 @@ impl JsonArrayAggAcc {
     fn push_entry(&mut self, value: Value, sort_keys: Vec<Value>) {
         // Keep each element in JSONB form. A serde round-trip loses MySQL's
         // DATE/TIME/DATETIME/DECIMAL/OPAQUE scalar tags.
-        let json = value_to_jsonb_typed(&value, false);
+        let json = value_to_jsonb_typed(&value, self.boolean);
         use crate::engine::executor::memory_footprint::AllocatedBytes;
         let byte_cost = json
             .capacity()

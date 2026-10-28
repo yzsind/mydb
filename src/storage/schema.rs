@@ -3479,7 +3479,7 @@ impl KeyPart {
             ParamTarget::Timestamp => Some(DataTypeKind::Timestamp { fsp: 6 }),
             _ => None,
         };
-        let value = if let Some(kind) = temporal_kind.filter(|_| {
+        let value = if let Some(kind) = temporal_kind.as_ref().filter(|_| {
             matches!(
                 value,
                 Value::Int(_)
@@ -3492,7 +3492,7 @@ impl KeyPart {
                     | Value::DecimalWide(_)
             )
         }) {
-            let text = Value::String(value.to_display_string());
+            let text = Value::Decimal(value.to_display_string());
             crate::engine::expr::coerce_comparison_constant_for_type(&text, &kind)
                 .filter(|converted| {
                     crate::engine::expr::compare_values(&value, converted).ok()
@@ -3504,6 +3504,13 @@ impl KeyPart {
                         "temporal index bound cannot preserve numeric comparison",
                     )
                 })?
+        } else if let Some(kind) = temporal_kind.as_ref().filter(|_| {
+            matches!(
+                value,
+                Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+            )
+        }) {
+            crate::engine::expr::coerce_comparison_constant_for_type(&value, &kind).unwrap_or(value)
         } else {
             value
         };

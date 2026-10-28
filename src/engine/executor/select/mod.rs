@@ -209,7 +209,17 @@ fn context_free_expr_descriptor(expr: &Expr) -> crate::engine::expr_type::ExprTy
     crate::engine::expr_type::infer_expr_type(expr, &context)
 }
 
-fn expr_needs_bound_result_coercion(expr: &Expr) -> bool {
+fn expr_needs_bound_result_coercion(
+    expr: &Expr,
+    descriptor: crate::engine::expr_type::ExprType,
+) -> bool {
+    if matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("GREATEST") || name.eq_ignore_ascii_case("LEAST"))
+    {
+        return matches!(
+            descriptor.kind,
+            crate::engine::expr_type::ExprTypeKind::String { .. }
+        );
+    }
     matches!(expr, Expr::Case { .. })
         || matches!(
             expr,
@@ -3084,6 +3094,36 @@ fn warn_group_by_resolution_diagnostics(db: &Database, stmt: &Select) {
             format!("Incorrect integer value: '{column_name}' for function INET_NTOA"),
         );
     }
+}
+
+pub(super) fn validate_cached_temporal_literals(
+    db: &Database,
+    stmt: &Select,
+) -> Result<(), QueryError> {
+    if !stmt.joins.is_empty() || stmt.derived.is_some() {
+        return Ok(());
+    }
+    let Some(base) = stmt
+        .from
+        .first()
+        .filter(|base| base.generate_series.is_none())
+    else {
+        return Ok(());
+    };
+    let Ok(table) = db.table(&base.name) else {
+        return Ok(());
+    };
+    if !table.columns.iter().any(|column| {
+        matches!(
+            column.data_type,
+            DataTypeKind::Date | DataTypeKind::DateTime { .. } | DataTypeKind::Timestamp { .. }
+        )
+    }) {
+        return Ok(());
+    }
+    validate_select_collations_with(stmt, |expr| {
+        crate::engine::expr::validate_expr_temporal_literals(expr, &table)
+    })
 }
 
 fn validate_single_base_select_exprs(db: &Database, stmt: &Select) -> Result<(), QueryError> {
@@ -6381,7 +6421,7 @@ pub(crate) fn execute_const_select(
         let value = if matches!(
             descriptor.kind,
             crate::engine::expr_type::ExprTypeKind::Unknown
-        ) || !expr_needs_bound_result_coercion(expr)
+        ) || !expr_needs_bound_result_coercion(expr, descriptor)
         {
             value
         } else {
@@ -6643,7 +6683,7 @@ fn execute_const_aggregate_select(
                     if matches!(
                         descriptor.kind,
                         crate::engine::expr_type::ExprTypeKind::Unknown
-                    ) || !expr_needs_bound_result_coercion(expr)
+                    ) || !expr_needs_bound_result_coercion(expr, descriptor)
                     {
                         value
                     } else {

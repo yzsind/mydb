@@ -182,7 +182,38 @@ pub struct StreamingResultSet {
 
 pub type SqlWarning = crate::error::SqlCondition;
 pub use crate::error::conditions::SqlConditions as SqlWarnings;
-pub(crate) type StatementWarningSink = std::sync::Arc<parking_lot::Mutex<SqlWarnings>>;
+#[derive(Debug, Default)]
+struct StatementWarningState {
+    warnings: parking_lot::Mutex<SqlWarnings>,
+    once: parking_lot::Mutex<std::collections::HashSet<(u64, u16, String)>>,
+}
+
+/// Warning storage and statement-wide constant-diagnostic identity travel
+/// together across workers; draining conditions must not reset the identity.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatementWarningSink(std::sync::Arc<StatementWarningState>);
+
+impl std::ops::Deref for StatementWarningSink {
+    type Target = parking_lot::Mutex<SqlWarnings>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.warnings
+    }
+}
+
+pub(crate) fn shared_statement_warning_should_publish(
+    context: u64,
+    code: u16,
+    message: &str,
+) -> Option<bool> {
+    STATEMENT_WARNING_SINK.with(|slot| {
+        slot.borrow().as_ref().map(|sink| {
+            sink.0
+                .once
+                .lock()
+                .insert((context, code, message.to_string()))
+        })
+    })
+}
 
 thread_local! {
     static STATEMENT_WARNINGS: std::cell::RefCell<SqlWarnings> = const { std::cell::RefCell::new(SqlWarnings::new()) };
@@ -394,6 +425,7 @@ pub(crate) fn clear_statement_warnings() {
     STATEMENT_WARNINGS.with(|warnings| warnings.borrow_mut().clear());
     if let Some(sink) = current_statement_warning_sink() {
         sink.lock().clear();
+        sink.0.once.lock().clear();
     }
     crate::engine::expr::clear_expression_warning_dedup();
 }
@@ -574,6 +606,38 @@ mod warning_batch_tests {
         assert!(scope.sink.lock().is_empty());
     }
 
+    #[test]
+    fn constant_diagnostic_identity_is_shared_and_survives_condition_draining() {
+        let sink = StatementWarningSink::default();
+        let emit_constant = |sink: StatementWarningSink| {
+            with_statement_warning_sink(sink, || {
+                crate::engine::expr::with_expression_warning_dedup(123, || {
+                    push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_WRONG_VALUE,
+                        "Incorrect TIME value: 'zz'",
+                    );
+                });
+            });
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let sink = sink.clone();
+                scope.spawn(move || emit_constant(sink));
+            }
+        });
+        assert_eq!(sink.lock().len(), 1);
+        let _drained = std::mem::take(&mut *sink.lock());
+        std::thread::scope(|scope| {
+            let sink = sink.clone();
+            scope.spawn(move || emit_constant(sink));
+        });
+        assert!(sink.lock().is_empty());
+        with_statement_warning_sink(sink.clone(), clear_statement_warnings);
+        emit_constant(sink.clone());
+        assert_eq!(sink.lock().len(), 1);
+    }
+
     fn emit(value: usize) {
         push_statement_warning(
             crate::error::ConditionLevel::Warning,
@@ -692,8 +756,7 @@ pub(crate) struct StatementWarningSinkScope {
 
 impl StatementWarningSinkScope {
     pub(crate) fn enter() -> Self {
-        let sink = current_statement_warning_sink()
-            .unwrap_or_else(|| std::sync::Arc::new(parking_lot::Mutex::new(SqlWarnings::new())));
+        let sink = current_statement_warning_sink().unwrap_or_default();
         let previous = STATEMENT_WARNING_SINK.with(|slot| slot.borrow_mut().replace(sink.clone()));
         Self { previous, sink }
     }

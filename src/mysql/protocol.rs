@@ -1384,6 +1384,21 @@ pub fn binary_row_packet_into_with_charset(
                 let bytes = crate::types::write_decimal_compact_canonical(*mag, *scale, &mut buf);
                 write_lenenc_string(payload, bytes);
             }
+            value
+            @ (Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::Time(_))
+                if matches!(
+                    columns.get(idx).map(|column| column.column_type),
+                    Some(ColumnType::VarString | ColumnType::Blob)
+                ) =>
+            {
+                let column = columns.get(idx);
+                write_text_value_inner(
+                    payload,
+                    value,
+                    result_charset_for_column(charset, column),
+                    column.and_then(|column| column.source.decimals),
+                );
+            }
             Value::Date(d) => {
                 write_binary_date_from_days(payload, *d);
             }
@@ -4103,6 +4118,30 @@ mod tests {
             f64::from_le_bytes(packet[18..26].try_into().unwrap()),
             89.97
         );
+    }
+
+    #[test]
+    fn expression_audit_temporal_values_under_string_metadata() {
+        for column_type in [ColumnType::VarString, ColumnType::Blob] {
+            let columns = [Column {
+                source: Default::default(),
+                name: "v".into(),
+                column_type,
+            }];
+            for value in [
+                Value::Date(0),
+                Value::Date(crate::types::ZERO_DATE),
+                Value::DateTime(0),
+                Value::DateTime(crate::types::ZERO_DATETIME),
+                Value::Time(-6_000_000),
+                Value::Timestamp(1_000_000),
+            ] {
+                let text = value.to_display_string();
+                let mut expected = vec![0, 0];
+                write_lenenc_string(&mut expected, text.as_bytes());
+                assert_eq!(binary_row_packet(&columns, &[value]), expected);
+            }
+        }
     }
 
     #[test]

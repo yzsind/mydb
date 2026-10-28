@@ -814,7 +814,7 @@ pub(super) fn project(
                 1
             },
             finished: false,
-            warnings: Arc::new(parking_lot::Mutex::new(Default::default())),
+            warnings: Default::default(),
         }),
     }))
 }

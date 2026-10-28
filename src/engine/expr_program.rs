@@ -1227,6 +1227,9 @@ impl ExprProgram {
         };
         let pattern = crate::types::value_str(pattern)?;
         let replacement = crate::types::value_str(replacement)?;
+        if replacement.contains(['$', '\\']) {
+            return None;
+        }
         let flags = if collation_id
             .and_then(crate::charset::resolve_collation_id)
             .is_some_and(|info| info.case_sensitive)
@@ -1902,7 +1905,7 @@ impl ExprCompiler {
                 if !classify.valid || !crate::engine::expr::expr_is_constant(&classification) {
                     return;
                 }
-                let diagnostics = Arc::new(parking_lot::Mutex::new(Default::default()));
+                let diagnostics = crate::engine::api::StatementWarningSink::default();
                 static EMPTY: OnceLock<TableSchema> = OnceLock::new();
                 let table = EMPTY.get_or_init(|| TableSchema::synthetic_for_planning("", &[]));
                 let value =
@@ -4608,7 +4611,8 @@ fn bound_result_coercion(
     let result_type = input_expr_type(expr, schema);
     matches!(
         result_type.column_type(),
-        ColumnType::Decimal { .. }
+        ColumnType::VarString
+            | ColumnType::Decimal { .. }
             | ColumnType::Float
             | ColumnType::Double
             | ColumnType::Blob
@@ -5348,10 +5352,27 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 return Err(CompileError::Unsupported);
             }
             let comparison = if is_cmp {
-                ComparisonProvenance {
+                let provenance = ComparisonProvenance {
                     left_dynamic_source: compiled_node_is_dynamic_string_source(left, &lnode),
                     right_dynamic_source: compiled_node_is_dynamic_string_source(right, &rnode),
                     ..ComparisonProvenance::from_exprs(left, right)
+                };
+                if matches!(
+                    input_expr_result_type(left, schema),
+                    ColumnType::Date
+                        | ColumnType::DateTime
+                        | ColumnType::Timestamp
+                        | ColumnType::Time
+                ) || matches!(
+                    input_expr_result_type(right, schema),
+                    ColumnType::Date
+                        | ColumnType::DateTime
+                        | ColumnType::Timestamp
+                        | ColumnType::Time
+                ) {
+                    provenance.with_temporal_constant_context(left, right)
+                } else {
+                    provenance
                 }
             } else {
                 ComparisonProvenance::default()
@@ -5566,10 +5587,26 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             distinct,
         } => {
             let result_coercion = match name.to_ascii_uppercase().as_str() {
+                "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE"
+                    if !crate::engine::params::auto_parameterized_active()
+                        && args.first().is_some_and(|arg| {
+                            matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_))
+                        }) =>
+                {
+                    bound_result_coercion(expr, schema)
+                }
                 "ABS" | "CEIL" | "CEILING" | "FLOOR" | "IF" | "IFNULL" | "COALESCE" | "NULLIF"
                     if !COMPILE_DYNAMIC_CONDITIONAL.with(Cell::get) =>
                 {
                     bound_result_coercion(expr, schema)
+                }
+                "GREATEST" | "LEAST" if !COMPILE_DYNAMIC_CONDITIONAL.with(Cell::get) => {
+                    bound_result_coercion(expr, schema).filter(|result| {
+                        matches!(
+                            result.kind,
+                            crate::engine::expr_type::ExprTypeKind::String { .. }
+                        )
+                    })
                 }
                 _ => None,
             };
@@ -5699,6 +5736,22 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                                 crate::engine::expr::hexbit_literal_cast_to_integer(b, true),
                             ));
                         }
+                        "DECIMAL" | "DOUBLE" | "FLOAT" => {
+                            return compile_node(
+                                &Expr::Function {
+                                    name: name.clone(),
+                                    args: std::iter::once(Expr::BoundValue(
+                                        crate::engine::expr::coerce_hex_bytes_to_uint(
+                                            Value::Bytes(b.clone()),
+                                        ),
+                                    ))
+                                    .chain(args.iter().skip(1).cloned())
+                                    .collect(),
+                                    distinct: *distinct,
+                                },
+                                schema,
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -5792,11 +5845,10 @@ fn try_eval_const_node(node: &ExprNode) -> Option<Value> {
     // into an isolated sink and fold only when the subtree is both successful
     // and diagnostic-free; warning-producing constants stay executable so
     // every statement/cache hit observes the same warning contract.
-    let diagnostics = std::sync::Arc::new(parking_lot::Mutex::new(Default::default()));
-    let value = crate::engine::api::with_statement_warning_sink(
-        std::sync::Arc::clone(&diagnostics),
-        || node.eval(&empty, &mut scratch),
-    )
+    let diagnostics = crate::engine::api::StatementWarningSink::default();
+    let value = crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+        node.eval(&empty, &mut scratch)
+    })
     .ok()?;
     let is_warning_free = diagnostics.lock().is_empty();
     is_warning_free.then_some(value)
@@ -6967,10 +7019,7 @@ impl FunctionKernel {
             FunctionKernel::Ascii => {
                 expect_len("ASCII", args, 1)?;
                 let value = args[0].eval(row, scratch)?;
-                null_or(value, |value| {
-                    let s = crate::engine::expr::str_value(&value);
-                    Ok(Value::Int(s.bytes().next().unwrap_or(0) as i64))
-                })
+                crate::engine::expr::eval_ascii_value(value)
             }
             FunctionKernel::Ord => {
                 expect_len("ORD", args, 1)?;
@@ -7284,12 +7333,13 @@ impl FunctionKernel {
                 if matches!(amount, Value::Null) {
                     return Ok(Value::Null);
                 }
-                crate::engine::expr::eval_date_add_values(
+                let result = crate::engine::expr::eval_date_add_values(
                     &date_val,
                     &amount,
                     &unit,
                     matches!(self, FunctionKernel::DateSub),
-                )
+                )?;
+                Ok(result)
             }
             FunctionKernel::Date => {
                 expect_len("DATE", args, 1)?;
@@ -9566,7 +9616,7 @@ mod legacy_escape_tests {
     }
 
     #[test]
-    fn refactor_edge_trim_preserves_binary_conversion_errors() {
+    fn refactor_edge_trim_preserves_binary_bytes() {
         for name in ["LTRIM", "RTRIM"] {
             let expression = Expr::Function {
                 name: name.into(),

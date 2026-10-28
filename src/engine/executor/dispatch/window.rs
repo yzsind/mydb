@@ -3886,9 +3886,13 @@ fn evaluate_window_per_partition_inner(
                             arr.push(vals[frame_pos].clone());
                         }
                     }
-                    result[row_idx] = crate::engine::expr::checked_json_value(
-                        crate::engine::json::build_array(&arr),
-                    )?;
+                    result[row_idx] = if arr.is_empty() {
+                        Value::Null
+                    } else {
+                        crate::engine::expr::checked_json_value(crate::engine::json::build_array(
+                            &arr,
+                        ))?
+                    };
                 }
             }
             "JSON_OBJECTAGG" => {
