@@ -379,7 +379,7 @@ impl Database {
             crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         }
         let mut directories = std::collections::BTreeSet::new();
-        for path in paths {
+        for path in &paths {
             self.buffer_pool.discard_pages_for_path(&path)?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -402,6 +402,7 @@ impl Database {
         if self.config.durability != DurabilityMode::Memory {
             crate::platform::fs::sync_paths(directories).map_err(io_err)?;
         }
+        self.remove_empty_object_directories(paths)?;
         Ok(())
     }
 }

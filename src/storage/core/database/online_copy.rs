@@ -178,7 +178,8 @@ impl Database {
         use crate::parser::AlterAction as A;
         if actions.is_empty()
             || !actions.iter().all(|a| match a {
-                A::AddColumn(_) | A::ModifyColumn(_) | A::ChangeColumn { .. } => true,
+                A::AddColumn(column) => !column.auto_increment || lock == crate::parser::AlterLock::Shared,
+                A::ModifyColumn(_) | A::ChangeColumn { .. } => true,
                 A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE"),
                 A::Rebuild
                 | A::DropColumn(_)
@@ -273,43 +274,40 @@ impl Database {
         job: &AlterCopyJob,
         snapshot: TxnView,
     ) -> Result<OnlineCopyReadyRows, QueryError> {
-        // Rotate the log under its latch; classification and I/O run outside
-        // it so business writers are never held behind an entire replay pass.
-        let batch = {
-            let mut changes = job.changes.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::replace(&mut *changes, AlterCopyChangeLog::new(self.data_dir()))
-        };
-        if batch.invalidated {
+        // Rotate each shard briefly; replay reads and classifies outside the
+        // writer latches. Concurrent writers remain captured for the next pass.
+        let batches = job.changes.take(self.data_dir());
+        if job.changes.invalidated.load(Ordering::Acquire) {
             return Err(error(
                 crate::error::catalog::ER_OUTOFMEMORY,
                 "online ALTER change log exceeded its budget or could not be written",
             ));
         }
+        let count = batches.iter().map(AlterCopyChangeLog::len).sum::<usize>();
         let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
             crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlOnlineLog,
-            batch
-                .len()
-                .saturating_mul(std::mem::size_of::<(u64, RowId)>()),
+            count.saturating_mul(std::mem::size_of::<(u64, RowId)>()),
         )?;
-        let mut ready = Vec::with_capacity(batch.len());
-        batch.visit(|(txn_id, storage_id, row)| {
-            let status = self.slot_status_cache.lookup(txn_id).or_else(|| {
-                self.txns
-                    .read()
-                    .slot(txn_id)
-                    .map(|slot| (slot.status, slot.commit_scn.unwrap_or(0)))
-            });
-            if matches!(status, Some((TxnStatus::RolledBack, _))) {
-                return Ok(());
-            }
-            if self.row_version_visible(RowHeader::visible(txn_id), snapshot)? {
-                ready.push((storage_id, row));
-            } else {
-                let mut changes = job.changes.lock().unwrap_or_else(|p| p.into_inner());
-                changes.record((txn_id, storage_id, row))?;
-            }
-            Ok(())
-        })?;
+        let mut ready = Vec::with_capacity(count);
+        for batch in batches {
+            batch.visit(|(txn_id, storage_id, row)| {
+                let status = self.slot_status_cache.lookup(txn_id).or_else(|| {
+                    self.txns
+                        .read()
+                        .slot(txn_id)
+                        .map(|slot| (slot.status, slot.commit_scn.unwrap_or(0)))
+                });
+                if matches!(status, Some((TxnStatus::RolledBack, _))) {
+                    return Ok(());
+                }
+                if self.row_version_visible(RowHeader::visible(txn_id), snapshot)? {
+                    ready.push((storage_id, row));
+                } else {
+                    job.changes.record(txn_id, storage_id, [row])?;
+                }
+                Ok(())
+            })?;
+        }
         ready.sort_unstable();
         ready.dedup();
         Ok(OnlineCopyReadyRows {
@@ -329,6 +327,7 @@ impl Database {
         warnings: &mut Vec<crate::engine::api::SqlWarning>,
         deadline: Option<Instant>,
     ) -> Result<usize, QueryError> {
+        let defaults = AlterCopyDefaults::new(source, shadow, job)?;
         let snapshot = StorageReadSnapshot::new(self);
         let read = snapshot.txn;
         let rows = self.take_online_copy_ready_rows(job, read)?;
@@ -353,7 +352,7 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values = self.prepare_alter_copy_values(shadow, row.values, strict, warnings)?;
+            let values = self.prepare_alter_copy_values(shadow, row.values, strict, warnings, &defaults)?;
             tail_bytes = tail_bytes.saturating_add(
                 crate::engine::executor::mem_budget::estimate_row_bytes(&values),
             );
@@ -625,6 +624,7 @@ impl Database {
         deadline: Option<Instant>,
     ) -> Result<std::collections::BTreeSet<u64>, QueryError> {
         let _timer = OnlineIndexTimer(&DDL_COPY_REPLAY_US, Instant::now());
+        let defaults = AlterCopyDefaults::new(source, target, job)?;
         let snapshot = StorageReadSnapshot::new(self);
         let read = snapshot.txn;
         let rows = self.take_online_copy_ready_rows(job, read)?;
@@ -676,7 +676,7 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values = self.prepare_alter_copy_values(target, row.values, strict, warnings)?;
+            let values = self.prepare_alter_copy_values(target, row.values, strict, warnings, &defaults)?;
             tail_bytes = tail_bytes.saturating_add(
                 crate::engine::executor::mem_budget::estimate_row_bytes(&values),
             );
@@ -982,6 +982,7 @@ impl Database {
                 .collect::<BTreeMap<u64, u64>>();
             #[cfg(test)]
             self.pause_ddl_backfill_for_test();
+            let defaults = AlterCopyDefaults::new(&source, &target, &job)?;
             let scan_timer = OnlineIndexTimer(&DDL_COPY_SCAN_US, Instant::now());
             for source_id in &source_ids {
                 let pages = self.with_heap_read(*source_id, |heap| heap.page_count())?;
@@ -1007,6 +1008,7 @@ impl Database {
                             row.values,
                             strict,
                             &mut warnings,
+                            &defaults,
                         )?;
                         let target_id = if target.is_partitioned() {
                             target.route_row_to_partition(&values)?.storage_id
@@ -1120,7 +1122,7 @@ impl Database {
                         .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                     let held = OnlineCopyHoldTimer(Instant::now());
                     self.try_online_index_data_barrier(txn.txn_id, &lock_ids)?;
-                    let tail = job.changes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    let tail = job.changes.len();
                     if tail <= 1024 {
                         DDL_COPY_FINAL_TAIL_ROWS.fetch_add(tail as u64, Ordering::Relaxed);
                         let dirty_targets = self.replay_partitioned_type_copy(
@@ -1374,10 +1376,15 @@ impl AlterCopyChangeLog {
         bytes
     }
 
+    #[cfg(test)]
     fn record(&mut self, entry: (u64, u64, RowId)) -> Result<(), QueryError> {
+        self.record_buffered(entry, 4096)
+    }
+
+    fn record_buffered(&mut self, entry: (u64, u64, RowId), buffered_rows: usize) -> Result<(), QueryError> {
         #[cfg(unix)]
         use std::os::unix::fs::FileExt;
-        if self.invalidated || self.len() >= 64 * 1024 * 1024 / 24 {
+        if self.len() >= 64 * 1024 * 1024 / 24 {
             return Err(error(
                 crate::error::catalog::ER_OUTOFMEMORY,
                 "online ALTER change log reached its 64 MiB limit",
@@ -1385,7 +1392,7 @@ impl AlterCopyChangeLog {
         }
         if self.touched_rows.len() == self.touched_rows.capacity() {
             let extra = self.touched_rows.capacity().max(64);
-            if self.touched_rows.capacity() < 4096
+            if self.touched_rows.capacity() < buffered_rows
                 && self
                     .memory_charge
                     .try_grow_optional(extra * std::mem::size_of::<(u64, u64, RowId)>())
@@ -1528,6 +1535,90 @@ fn check_online_copy_deadline(deadline: Option<Instant>) -> Result<(), QueryErro
 #[cfg(test)]
 mod online_copy_log_tests {
     use super::*;
+
+    #[test]
+    fn ddl_1027_capture_rotation_preserves_concurrent_transactions() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let capture = AlterCopyCapture::new(dir.path());
+        let finished = AtomicUsize::new(0);
+        let mut found = BTreeSet::new();
+        std::thread::scope(|scope| {
+            for writer in 0..4u64 {
+                let capture = &capture;
+                let finished = &finished;
+                scope.spawn(move || {
+                    for n in 0..12000u32 {
+                        capture
+                            .record(
+                                1 + writer + u64::from(n) * 4,
+                                writer + 50,
+                                [RowId::new(n, 1)],
+                            )
+                            .unwrap();
+                    }
+                    finished.fetch_add(1, Ordering::Release);
+                });
+            }
+            loop {
+                for batch in capture.take(dir.path()) {
+                    batch
+                        .visit(|entry| {
+                            assert!(found.insert(entry));
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                if finished.load(Ordering::Acquire) == 4 && capture.len() == 0 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        assert_eq!(found.len(), 48000);
+        assert!(!capture.invalidated.load(Ordering::Acquire));
+        // The cap is global, independent of the shard selected by a transaction.
+        capture.rows.store(64 * 1024 * 1024 / 24, Ordering::Release);
+        assert!(capture.record(1, 50, [RowId::new(0, 0)]).is_err());
+        assert!(capture.invalidated.load(Ordering::Acquire));
+        capture.rows.store(0, Ordering::Release);
+        assert!(capture.record(2, 50, [RowId::new(0, 0)]).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual online DDL capture contention benchmark"]
+    fn ddl_1027_capture_contention_benchmark() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        for writers in [1, 4] {
+            for round in 0..3 {
+                for sharded in [false, true] {
+                    let shared = Mutex::new(AlterCopyChangeLog::new(dir.path()));
+                    let capture = AlterCopyCapture::new(dir.path());
+                    let start = Instant::now();
+                    std::thread::scope(|scope| {
+                        for writer in 0..writers {
+                            let shared = &shared;
+                            let capture = &capture;
+                            scope.spawn(move || {
+                                for n in 0..100000u32 {
+                                    let txn = u64::from(n) * writers + writer;
+                                    let row = RowId::new(n, 1);
+                                    if sharded {
+                                        capture.record(txn, 50, [row]).unwrap();
+                                    } else {
+                                        shared.lock().unwrap().record((txn, 50, row)).unwrap();
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    eprintln!("capture writers={writers} round={round} sharded={sharded} rows={} elapsed_us={}", writers * 100000, start.elapsed().as_micros());
+                }
+            }
+        }
+    }
+
     #[test]
     fn disk_log_preserves_transaction_and_partition_identity() {
         let dir = tempfile::tempdir().unwrap();

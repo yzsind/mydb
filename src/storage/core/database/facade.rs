@@ -800,6 +800,8 @@ impl Database {
             #[cfg(test)]
             ddl_backfill_test_hook: Mutex::new(None),
             #[cfg(test)]
+            create_finalize_test_hook: Mutex::new(None),
+            #[cfg(test)]
             online_index_replay_test_hook: Mutex::new(None),
             #[cfg(test)]
             online_copy_publish_test_hook: Mutex::new(None),

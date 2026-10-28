@@ -1104,11 +1104,24 @@ pub(crate) fn rename_partition_column_references(
     Ok(())
 }
 
-fn rename_generated_column_references(
+fn rename_column_expression_references(
     table: &mut TableSchema,
     old_name: &str,
     new_name: &str,
 ) -> Result<(), QueryError> {
+    // DEFAULT expressions have the same schema scope as generated columns.
+    // Rewrite identifiers through the AST so literals and function names stay intact.
+    for column in &mut table.columns {
+        if let Some(sql) = &mut column.default_expr {
+            let mut expr = crate::parser::parse_catalog_expr(sql).map_err(|err| {
+                error(crate::error::catalog::ER_PARSE_ERROR, err.to_string())
+            })?;
+            if expr_references_column(&expr, old_name) {
+                rename_expr_column(&mut expr, old_name, new_name);
+                *sql = encode_catalog_expr(&expr)?;
+            }
+        }
+    }
     let mut changed = false;
     for column in &mut table.columns {
         let Some(expr_sql) = column.generated_expr.as_mut() else {
@@ -4210,6 +4223,16 @@ fn validate_auto_increment_schema(table: &TableSchema) -> Result<(), QueryError>
         return Err(error(crate::error::catalog::ER_WRONG_AUTO_KEY,
             "Incorrect table definition; there can be only one auto column and it must be defined as a key",
         ));
+    }
+    for (_, dependent) in table.iter_visible_columns() {
+        if let Some(sql) = &dependent.default_expr {
+            let expr = crate::parser::parse_catalog_expr(sql)
+                .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))?;
+            if expr_references_column(&expr, &column.name) {
+                return Err(error(crate::error::catalog::ER_DEFAULT_VAL_GENERATED_REF_AUTO_INC,
+                    format!("Default value expression of column '{}' cannot refer to an auto-increment column", dependent.name)));
+            }
+        }
     }
     Ok(())
 }

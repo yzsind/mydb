@@ -3,8 +3,8 @@
 fn constraint_capture_is_empty(jobs: &[Arc<AlterCopyJob>]) -> Result<bool, QueryError> {
     for job in jobs {
         Database::check_alter_copy_cancelled(job)?;
-        let log = job.changes.lock().unwrap_or_else(|p| p.into_inner());
-        if log.invalidated {
+        let log = &job.changes;
+        if log.invalidated.load(Ordering::Acquire) {
             return Err(error(
                 crate::error::catalog::ER_OUTOFMEMORY,
                 "online constraint capture was invalidated",

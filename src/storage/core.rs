@@ -1550,6 +1550,8 @@ pub struct Database {
     #[cfg(test)]
     ddl_backfill_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
+    create_finalize_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
     online_index_replay_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_copy_publish_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
@@ -1932,7 +1934,6 @@ struct AlterCopyJobProgress {
 #[derive(Debug)]
 struct AlterCopyChangeLog {
     touched_rows: Vec<(u64, u64, RowId)>,
-    invalidated: bool,
     spill: Option<File>,
     spilled_rows: u64,
     data_dir: PathBuf,
@@ -1943,7 +1944,6 @@ impl AlterCopyChangeLog {
     fn new(data_dir: &Path) -> Self {
         Self {
             touched_rows: Vec::new(),
-            invalidated: false,
             spill: None,
             spilled_rows: 0,
             data_dir: data_dir.to_path_buf(),
@@ -1957,6 +1957,71 @@ impl AlterCopyChangeLog {
 }
 
 #[derive(Debug)]
+struct AlterCopyCapture {
+    shards: [Mutex<AlterCopyChangeLog>; 16],
+    rows: AtomicUsize,
+    invalidated: AtomicBool,
+}
+
+impl AlterCopyCapture {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(AlterCopyChangeLog::new(data_dir))),
+            rows: AtomicUsize::new(0),
+            invalidated: AtomicBool::new(false),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.load(Ordering::Acquire)
+    }
+
+    fn record(
+        &self,
+        txn: u64,
+        storage: u64,
+        rows: impl IntoIterator<Item = RowId>,
+    ) -> Result<(), QueryError> {
+        let shard = (txn ^ (txn >> 32)) as usize % self.shards.len();
+        let mut log = self.shards[shard].lock().unwrap_or_else(|p| p.into_inner());
+        for row in rows {
+            if self.invalidated.load(Ordering::Acquire)
+                || self
+                    .rows
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                        (n < 64 * 1024 * 1024 / 24).then_some(n + 1)
+                    })
+                    .is_err()
+            {
+                self.invalidated.store(true, Ordering::Release);
+                return Err(error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "online ALTER change log reached its 64 MiB limit",
+                ));
+            }
+            if let Err(err) = log.record_buffered((txn, storage, row), 4096 / self.shards.len()) {
+                self.rows.fetch_sub(1, Ordering::AcqRel);
+                self.invalidated.store(true, Ordering::Release);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn take(&self, data_dir: &Path) -> Vec<AlterCopyChangeLog> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let mut log = shard.lock().unwrap_or_else(|p| p.into_inner());
+                let batch = std::mem::replace(&mut *log, AlterCopyChangeLog::new(data_dir));
+                self.rows.fetch_sub(batch.len(), Ordering::AcqRel);
+                batch
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
 struct AlterCopyJob {
     job_id: u64,
     table_id: u64,
@@ -1965,9 +2030,10 @@ struct AlterCopyJob {
     operation: &'static str,
     object_name: String,
     capture_rows: bool,
+    auto_increment_max: AtomicU64,
     cancel_token: crate::engine::cancel::QueryCancelToken,
     progress: Mutex<AlterCopyJobProgress>,
-    changes: Mutex<AlterCopyChangeLog>,
+    changes: AlterCopyCapture,
     cancel_requested: AtomicBool,
     retired_vector_graphs: Mutex<Vec<Arc<VectorGraph>>>,
     retired_files: Mutex<Vec<PathBuf>>,

@@ -318,7 +318,11 @@ impl OnlineConstraintValidation {
                 coerce_column_value_for_schema(value.clone(), column).err()
             };
             if let Some(err) = violation {
-                self.memory.grow(96 + err.message().len())?;
+                // A known data violation remains the cause of failure even
+                // when retaining more repairable violations exhausts the budget.
+                if !self.memory.try_grow(96 + err.message().len()) {
+                    return Err(err);
+                }
                 self.column_errors.insert(location, err);
                 break;
             }
@@ -1280,7 +1284,7 @@ impl Database {
                         self.try_online_index_data_barrier_mode(lock_txn.txn_id, &ids, true)?;
                         let tail: usize = jobs
                             .iter()
-                            .map(|j| j.changes.lock().unwrap_or_else(|p| p.into_inner()).len())
+                            .map(|j| j.changes.len())
                             .sum();
                         let index_tail: usize = targets
                             .iter()
@@ -1320,7 +1324,7 @@ impl Database {
                     )?;
                     if jobs
                         .iter()
-                        .any(|j| j.changes.lock().unwrap_or_else(|p| p.into_inner()).len() != 0)
+                        .any(|j| j.changes.len() != 0)
                     {
                         return Err(error(
                             crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,

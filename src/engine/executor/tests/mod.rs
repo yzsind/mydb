@@ -12,6 +12,7 @@ mod sql_execution_audit_1027;
 mod sql_execution_fixes;
 mod support;
 mod table_ddl_audit_1012;
+mod table_ddl_audit_1027;
 
 use super::*;
 use crate::parser::Assignment;
