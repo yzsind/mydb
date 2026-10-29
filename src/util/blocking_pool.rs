@@ -854,7 +854,9 @@ mod tests {
 
     fn wait_until_parked(pool: &BlockingPool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while pool.idle.load(Ordering::Acquire) != pool.total.load(Ordering::Acquire) {
+        while pool.idle.load(Ordering::Acquire) != pool.total.load(Ordering::Acquire)
+            || pool.sleepers.len() != pool.total.load(Ordering::Acquire)
+        {
             assert!(std::time::Instant::now() < deadline, "workers did not park");
             std::thread::yield_now();
         }
@@ -1259,13 +1261,11 @@ mod tests {
         while pool.total.load(Ordering::Acquire) < 8 {
             pool.maybe_grow();
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while pool.idle.load(Ordering::Acquire) < 8 && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert_eq!(pool.idle.load(Ordering::Acquire), 8);
-
         for value in 0..2_000usize {
+            // Result delivery precedes the worker's next park publication.
+            // Wait for available park tokens before testing idle-worker reuse;
+            // a completed handle alone does not rule out legitimate growth.
+            wait_until_parked(&pool);
             assert_eq!(pool.spawn(move || value).await.unwrap(), value);
         }
         assert_eq!(
@@ -1273,6 +1273,63 @@ mod tests {
             8,
             "parked workers should be claimed without spurious pool growth"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_handle_does_not_imply_worker_is_parked() {
+        struct PausedWake {
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl std::task::Wake for PausedWake {
+            fn wake(self: Arc<Self>) {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+        struct ResumeOnDrop(mpsc::Sender<()>);
+        impl Drop for ResumeOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let pool = BlockingPool::with_limits(1, 2);
+        let (start_tx, start_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume = ResumeOnDrop(resume_tx);
+        let waker = std::task::Waker::from(Arc::new(PausedWake {
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        }));
+        let mut cx = Context::from_waker(&waker);
+        let mut completed = pool.spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            7
+        });
+        assert!(Pin::new(&mut completed).poll(&mut cx).is_pending());
+        start_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Hold result notification after publication to model a worker
+        // preempted before it can publish another park token.
+        assert!(matches!(
+            Pin::new(&mut completed).poll(&mut cx),
+            Poll::Ready(Ok(7))
+        ));
+        assert_eq!(pool.idle.load(Ordering::Acquire), 0);
+        assert_eq!(pool.total.load(Ordering::Acquire), 1);
+        let next = tokio::time::timeout(Duration::from_secs(5), pool.spawn(|| 9))
+            .await
+            .expect("completion notification must not suppress funded growth")
+            .unwrap();
+        assert_eq!(next, 9);
+        assert_eq!(pool.total.load(Ordering::Acquire), 2);
+        drop(resume);
     }
 
     #[tokio::test]

@@ -19526,6 +19526,25 @@ pub(crate) fn compare_nullable_values(
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(None);
     }
+    // These homogeneous lanes cannot fail conversion. Avoid routing every
+    // scalar IN item through temporal tracking and the ordering dispatcher.
+    let ordering = match (l, r) {
+        (Value::Int(left), Value::Int(right)) => Some(left.cmp(right)),
+        (Value::UInt(left), Value::UInt(right)) => Some(left.cmp(right)),
+        (Value::Float(left), Value::Float(right)) => {
+            Some(left.partial_cmp(right).unwrap_or(Ordering::Equal))
+        }
+        (Value::Double(left), Value::Double(right)) => {
+            Some(left.partial_cmp(right).unwrap_or(Ordering::Equal))
+        }
+        (Value::DecimalCompact(left, ls), Value::DecimalCompact(right, rs)) if ls == rs => {
+            Some(left.cmp(right))
+        }
+        _ => None,
+    };
+    if ordering.is_some() {
+        return Ok(ordering);
+    }
     // Only temporal coercion uses the conversion-failure side channel. Keep
     // ordinary numeric/string comparisons free of thread-local accesses.
     let temporal = |value: &Value| {
@@ -25722,8 +25741,9 @@ pub(crate) fn eval_between_truth(
     // prepared range residuals; the ordering oracle still handles decimals,
     // NaNs and component-preserving temporal encodings.
     if !matches!(value, Value::Null)
-        && std::mem::discriminant(value) == std::mem::discriminant(low)
-        && std::mem::discriminant(value) == std::mem::discriminant(high)
+        && ((value_is_stringish(value) && value_is_stringish(low) && value_is_stringish(high))
+            || (std::mem::discriminant(value) == std::mem::discriminant(low)
+                && std::mem::discriminant(value) == std::mem::discriminant(high)))
     {
         let lower = compare_values(value, low)? != Ordering::Less;
         let higher = compare_values(value, high)? != Ordering::Greater;
