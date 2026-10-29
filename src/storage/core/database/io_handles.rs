@@ -238,6 +238,20 @@ impl Database {
                 .collect();
             crate::storage::naming::migrate_catalog(headers)
         } else {
+            if crate::storage::control::Control::load(&self.data_dir)?
+                .is_some_and(|control| control.initialized)
+            {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    format!(
+                        "initialized data dictionary is missing; refusing bootstrap; {}",
+                        self.catalog_property_scan_diagnostics()
+                            .unwrap_or_else(|err| {
+                                format!("property diagnostics failed: {}", err.message())
+                            })
+                    ),
+                ));
+            }
             // A fresh directory has no dictionary rows. Losing the version
             // property in an existing dictionary is corruption, not bootstrap.
             for table in crate::storage::data_dictionary::dd_tables() {
@@ -263,9 +277,15 @@ impl Database {
                 crate::storage::naming::migrate_catalog(super::catalog::empty_catalog());
             self.bootstrap_catalog_store(&bootstrap)?;
             self.catalog.replace_live(bootstrap)?;
+            if self.config.durability != DurabilityMode::Memory {
+                crate::storage::control::Control::finish_initialization(&self.data_dir)?;
+            }
             return Ok(());
         };
         self.catalog.replace_live(migrated)?;
+        if self.config.durability != DurabilityMode::Memory {
+            crate::storage::control::Control::finish_initialization(&self.data_dir)?;
+        }
         Ok(())
     }
 
@@ -300,7 +320,7 @@ impl Database {
         ];
         self.scan_dd_table_projected_batched(DD_TABLES, HEADER_COLUMNS, 24, 512, |rows| {
             for row in rows {
-                let table = crate::storage::data_dictionary::table_header_from_dd_row(&row);
+                let table = crate::storage::data_dictionary::table_header_from_dd_row(&row)?;
                 catalog.tables.insert(
                     crate::storage::naming::table_key(&table.database, &table.name),
                     table,
@@ -520,6 +540,7 @@ impl Database {
         path: PathBuf,
         bytes: Vec<u8>,
     ) -> Result<(), QueryError> {
+        let bytes = create_empty_heap_image(&path, bytes);
         self.append_wal(
             txn_id,
             WalPayload::FileCreate {
@@ -547,7 +568,13 @@ impl Database {
                 before,
             },
         )?;
-        let _ = fs::remove_file(path);
+        match fs::remove_file(&path) {
+            Ok(()) => retire_page_owner_proof(&path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                retire_page_owner_proof(&path)
+            }
+            Err(_) => {}
+        }
         Ok(())
     }
 
@@ -1062,7 +1089,9 @@ impl Database {
         let index = index.read();
         index.ensure_healthy()?;
         match f(&index) {
-            Err(err) if err.is(crate::error::catalog::ER_INDEX_CORRUPT) => Err(index.fence_persistent_corruption(err)),
+            Err(err) if err.is(crate::error::catalog::ER_INDEX_CORRUPT) => {
+                Err(index.fence_persistent_corruption(err))
+            }
             result => result,
         }
     }
@@ -1728,9 +1757,13 @@ impl Database {
         }
         let paths = match self.owned_vector_files(table, index, storage_id) {
             Ok(paths) => paths,
-            Err(err) => { self.quarantine_mvcc(format!("vector size accounting failed: {err:?}")); return 0; }
+            Err(err) => {
+                self.quarantine_mvcc(format!("vector size accounting failed: {err:?}"));
+                return 0;
+            }
         };
-        paths.iter()
+        paths
+            .iter()
             .filter_map(|path| fs::metadata(path).ok())
             .map(|meta| meta.len())
             .fold(0u64, u64::saturating_add)

@@ -574,6 +574,7 @@ fn collect_files<'a>(
         "objects",
         "system/catalog",
         "system/undo",
+        "system/object-owners",
         "system/xa-binlog",
     ] {
         collect_tree(data_dir, &data_dir.join(root), &mut files)?;
@@ -581,6 +582,7 @@ fn collect_files<'a>(
     for relative in [
         "system/commit-ledger.v1",
         "system/commit-clock.v1",
+        "system/storage.control",
         "system/history-index.v1",
         "system/tablespaces.json",
         "system/zone-map-checkpoint.manifest",
@@ -1454,12 +1456,14 @@ fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
         || relative.starts_with("objects/")
         || relative.starts_with("system/catalog/")
         || relative.starts_with("system/undo/")
+        || relative.starts_with("system/object-owners/")
         || relative.starts_with("system/xa-binlog/")
         || relative.starts_with("system/wal/")
         || matches!(
             relative,
             "system/commit-ledger.v1"
                 | "system/commit-clock.v1"
+                | "system/storage.control"
                 | "system/history-index.v1"
                 | "system/tablespaces.json"
                 | "system/zone-map-checkpoint.manifest"

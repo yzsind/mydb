@@ -4196,6 +4196,9 @@ impl Database {
         direct: bool,
     ) -> Result<SortedIndexEntries, QueryError> {
         let mut sorter = IndexEntryExternalSorter::with_exact_run_bytes(scratch_bytes);
+        if !table.storage_ids().contains(&table.id) {
+            return sorter.finish_with_degree(self.data_dir(), degree);
+        }
         let key = IndexKey::from(vec![KeyPart::Null]);
         let cosine = index.is_some_and(|i| {
             i.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine

@@ -38,6 +38,7 @@ pub(crate) fn backup_page_valid(buf: &[u8]) -> bool {
             || (matches!(
                 read_u32(buf, 0),
                 HEAP_PAGE_MAGIC
+                    | HEAP_META_MAGIC
                     | INDEX_PAGE_MAGIC
                     | spatial_index::MAGIC
                     | INDEX_META_MAGIC
@@ -54,6 +55,7 @@ fn refresh_page_checksum(buf: &mut [u8]) {
     }
     let offset = match read_u32(buf, 0) {
         HEAP_PAGE_MAGIC
+        | HEAP_META_MAGIC
         | INDEX_PAGE_MAGIC
         | spatial_index::MAGIC
         | INDEX_META_MAGIC
@@ -74,6 +76,7 @@ fn set_page_lsn_if_formatted(buf: &mut [u8], lsn: u64) {
     }
     match read_u32(buf, 0) {
         HEAP_PAGE_MAGIC
+        | HEAP_META_MAGIC
         | INDEX_PAGE_MAGIC
         | spatial_index::MAGIC
         | INDEX_META_MAGIC

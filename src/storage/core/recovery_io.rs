@@ -262,6 +262,7 @@ fn recovery_page_valid(bytes: &[u8]) -> bool {
         && matches!(
             read_u32(bytes, 0),
             HEAP_PAGE_MAGIC
+                | HEAP_META_MAGIC
                 | INDEX_PAGE_MAGIC
                 | spatial_index::MAGIC
                 | INDEX_META_MAGIC
@@ -360,6 +361,11 @@ impl RecoveryPageIo {
             )
             .map_err(io_err)?;
         }
+        validate_page_owner(
+            &bytes,
+            &page_owner(&self.root.join(&self.relative)),
+            page_id,
+        )?;
         self.remember(
             page_id,
             if recovery_page_valid(&bytes) {
@@ -399,6 +405,11 @@ impl RecoveryPageIo {
         }
         let mut page = after.to_vec();
         page.resize(PAGE_SIZE, 0);
+        stamp_page_owner(
+            &mut page,
+            &page_owner(&self.root.join(&self.relative)),
+            page_id,
+        );
         set_page_lsn_if_formatted(&mut page, lsn);
         if self
             .cached_page
@@ -574,8 +585,10 @@ mod recovery_io_tests {
         let page = Page::new().encode();
         for name in ["restore", "crash"] {
             let dir = root.path().join(name);
+            crate::storage::control::Control::admit(&dir).unwrap();
             fs::create_dir_all(dir.join("objects/tables/101")).unwrap();
             let mut newer = page.clone();
+            stamp_page_owner(&mut newer, &page_owner(&dir.join(relative)), 0);
             set_page_lsn(&mut newer, 999);
             refresh_page_checksum(&mut newer);
             fs::write(dir.join(relative), newer).unwrap();
@@ -586,10 +599,12 @@ mod recovery_io_tests {
                 ("crash", RecoveryContext::default(), 999),
             ] {
                 let dir = root.path().join(name);
-                let page = &page;
+                let mut page = page.clone();
+                stamp_page_owner(&mut page, &page_owner(&dir.join(relative)), 0);
+                refresh_page_checksum(&mut page);
                 scope.spawn(move || {
                     let io = RecoveryIoScope::enter().unwrap();
-                    redo_page_update_with_context(&dir, relative, 0, 77, page, context).unwrap();
+                    redo_page_update_with_context(&dir, relative, 0, 77, &page, context).unwrap();
                     io.finish().unwrap();
                     assert_eq!(page_lsn(&fs::read(dir.join(relative)).unwrap()), expected);
                 });
@@ -728,6 +743,7 @@ mod recovery_io_tests {
         let dir = tempfile::tempdir().unwrap();
         let relative = "objects/tables/999/1.heap";
         let mut page = Page::new().encode();
+        stamp_page_owner(&mut page, &page_owner(&dir.path().join(relative)), 0);
         set_page_lsn(&mut page, 20);
         refresh_page_checksum(&mut page);
         write_recovered_file(dir.path(), relative, &page).unwrap();
@@ -835,6 +851,7 @@ mod recovery_index_allocation_tests {
         )
         .unwrap();
         drop(file);
+        bind_test_file_pages(&path);
         IndexFile::validate(path.clone()).unwrap();
         let log = Arc::new(parking_lot::Mutex::new(
             LogManager::open(dir.path()).unwrap(),
@@ -925,6 +942,7 @@ mod recovery_index_lsn_tests {
         set_page_lsn_if_formatted(&mut leaf, 20);
         write_index_page(&mut file, 1, &leaf).unwrap();
         drop(file);
+        bind_test_file_pages(&path);
         let log = Arc::new(parking_lot::Mutex::new(
             LogManager::open(dir.path()).unwrap(),
         ));

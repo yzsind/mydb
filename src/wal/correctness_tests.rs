@@ -196,7 +196,7 @@ fn replacement_header_cannot_hide_history_without_valid_checkpoint() {
     log.flush().unwrap();
     drop(log);
     let path = segment_path(&crate::storage::naming::system_wal_dir(dir.path()), 2);
-    let mut bytes = segment_header_with_replacement(2, 5);
+    let mut bytes = segment_header_with_replacement(&path, 2, 5).unwrap();
     bytes.extend_from_slice(
         &encode_record(&WalRecord {
             source_time_us: 0,

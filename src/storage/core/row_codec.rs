@@ -2,8 +2,8 @@ use crate::storage::schema::temporal_fsp_width as temporal_width;
 use crate::util::decimal::wide_to_f64 as value_to_wide_f64;
 // Heap row encoding/decoding.
 //
-// On-disk heap row payload (v5):
-//   [u8: MVCC_ROW_VERSION = 7]      (0xFF means heap-forwarding stub)
+// On-disk heap row payload (current MVCC_ROW_VERSION):
+//   [u8: MVCC_ROW_VERSION = 9]      (0xFF means heap-forwarding stub)
 //   [u8: flags]
 //       bit 0  MVCC_FLAG_DELETED        (public, set by caller)
 //       bit 1  MVCC_FLAG_ROW_PIECE      (public, set by caller)
@@ -799,6 +799,15 @@ fn read_mvcc_header(input: &[u8]) -> Result<(RowHeader, usize, bool), QueryError
         ));
     }
     let raw_flags = input[1];
+    if raw_flags
+        & !(PUBLIC_FLAG_MASK | FLAG_HAS_LAST_TXN_ID | FLAG_HAS_UNDO_PTR | FLAG_HAS_EXTERNAL)
+        != 0
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unsupported row flags",
+        ));
+    }
     let mut pos = 2usize;
     let last_txn_id = if raw_flags & FLAG_HAS_LAST_TXN_ID != 0 {
         let bytes = read_exact(input, &mut pos, 8)?;
@@ -1809,27 +1818,26 @@ impl RowLayoutCodec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "id", content = "parameters", deny_unknown_fields)]
 pub(crate) enum ColumnKind {
     /// 1/2/3/4/8 byte LE integer; sign-extended on decode if `signed`.
-    Int {
-        width: u8,
-        signed: bool,
-    },
+    #[serde(rename = "1")]
+    Int { width: u8, signed: bool },
+    #[serde(rename = "2")]
     Float32,
+    #[serde(rename = "3")]
     Float64,
     /// Variable-length `DECIMAL(P, S)` storage. 1B sign + 1B
     /// nbytes K + K bytes LE unsigned magnitude (= |value| × 10^scale).
     /// Used for bare `DECIMAL` declarations without a precision.
-    Decimal {
-        scale: u8,
-    },
+    #[serde(rename = "4")]
+    Decimal { scale: u8 },
     /// Variable BCD storage for declared DECIMAL(P,S) with P > 38. The
     /// compact 4/8/16-byte lanes remain unchanged for ordinary decimals;
     /// only the MySQL DECIMAL(65) cold path uses this representation.
-    DecimalWide {
-        scale: u8,
-    },
+    #[serde(rename = "5")]
+    DecimalWide { scale: u8 },
     /// Fixed-width `DECIMAL(P, S)` storage. The on-disk body is a plain
     /// LE signed integer of width 4/8/16 bytes — no sign/nbytes header,
     /// no padding. Chosen by `column_kind_for` based on the declared
@@ -1841,83 +1849,80 @@ pub(crate) enum ColumnKind {
     /// `Value::DecimalCompact` representation. Round-tripping a
     /// DecimalCompact value through this kind skips the u128 parse +
     /// magnitude pack/unpack the variable-length codec does.
-    DecimalFixed {
-        width: u8,
-        scale: u8,
-    },
+    #[serde(rename = "6")]
+    DecimalFixed { width: u8, scale: u8 },
     /// CHAR / VARCHAR / TEXT — raw UTF-8 bytes addressed by the varlen
     /// directory.
+    #[serde(rename = "7")]
     VarString,
     /// VARBINARY / BLOB / variable BINARY — raw bytes addressed by the
     /// varlen directory.
+    #[serde(rename = "8")]
     VarBytes,
     /// JSON — binary `jsonb` bytes addressed by the varlen directory
     /// (see `engine::json`).
     /// Distinct from `VarBytes` so the decoder reconstructs a
     /// `Value::Json` rather than `Value::Bytes`, and so the column
     /// participates in off-page externalization for large documents.
+    #[serde(rename = "9")]
     Json,
     /// GEOMETRY — internal `SRID + WKB` bytes addressed by the varlen
     /// directory (see
     /// `engine::geo`). Distinct from `VarBytes` so the decoder reconstructs
     /// a `Value::Geometry`, and so large geometries externalize off-page.
+    #[serde(rename = "10")]
     Geometry,
     /// VECTOR without a declared dimension — internal little-endian `f32`
     /// bytes addressed by the varlen directory (see
     /// `engine::vector`). Distinct from `VarBytes` so the decoder reconstructs
     /// a `Value::Vector`, and so large vectors externalize off-page.
+    #[serde(rename = "11")]
     Vector {
         dim: Option<u32>,
         datatype: crate::vector::VectorDataType,
     },
     /// Fixed-width BINARY(n) payload in the fixed block.
-    FixedBytes {
-        width: usize,
-    },
+    #[serde(rename = "12")]
+    FixedBytes { width: usize },
     /// `BIT(M)` — an M-bit value stored in `ceil(M/8)` big-endian bytes in
     /// the fixed block. Distinct from `FixedBytes` so the value round-trips
     /// as an integer (`Value::UInt`) — MySQL BIT is numeric in expression
     /// context (`b + 0`, comparisons) — with the big-endian byte form used
     /// only on disk.
-    Bit {
-        width: usize,
-    },
+    #[serde(rename = "13")]
+    Bit { width: usize },
     /// Fixed-width VECTOR(n), stored as `dim * 4` little-endian f32 bytes.
+    #[serde(rename = "14")]
     VectorFixed {
         dim: u32,
         datatype: crate::vector::VectorDataType,
     },
     /// ENUM stored as a 1- or 2-byte ordinal. Ordinal 0 is the empty/error
     /// value; 1-based ordinals map to declared labels.
-    Enum {
-        values: Vec<String>,
-        width: u8,
-    },
+    #[serde(rename = "15")]
+    Enum { values: Vec<String>, width: u8 },
     /// SET stored as a compact bitmask over declared labels.
-    Set {
-        values: Vec<String>,
-        width: u8,
-    },
+    #[serde(rename = "16")]
+    Set { values: Vec<String>, width: u8 },
+    #[serde(rename = "17")]
     Date,
     /// `TIME[(fsp)]` — 3-6B signed quantum count. `fsp` (0..=6) is the declared
     /// fractional-seconds precision; writers truncate the payload to a
     /// multiple of `10^(6-fsp)` before encoding so a `TIME(0)` value
     /// always round-trips with zero microseconds.
-    Time {
-        fsp: u8,
-    },
+    #[serde(rename = "18")]
+    Time { fsp: u8 },
     /// `DATETIME[(fsp)]` — 5-8B signed quantum count since 1970-01-01 UTC.
     /// See [`ColumnKind::Time`] for fsp semantics.
-    DateTime {
-        fsp: u8,
-    },
+    #[serde(rename = "19")]
+    DateTime { fsp: u8 },
     /// `TIMESTAMP[(fsp)]` — physically the same 5-8B signed quantum count as
     /// DATETIME, but semantically an absolute UTC instant. The distinct kind
     /// reconstructs `Value::Timestamp` on read so timezone semantics survive
     /// through expressions, sorting, protocol output and replication.
-    Timestamp {
-        fsp: u8,
-    },
+    #[serde(rename = "20")]
+    Timestamp { fsp: u8 },
+    #[serde(rename = "21")]
     Year,
 }
 
@@ -1983,18 +1988,38 @@ impl RowCodec {
         }
         let mut layouts = Vec::new();
         for persisted in &schema.row_layouts {
-            let mut cols = persisted
-                .columns
-                .iter()
+            let mut physical_columns = persisted.columns.iter().collect::<Vec<_>>();
+            physical_columns.sort_by_key(|column| column.physical_pos);
+            let cols = physical_columns
+                .into_iter()
                 .filter_map(|layout_col| {
                     let column_index = *by_column_id.get(&layout_col.column_id)?;
                     let current = schema.columns.get(column_index)?;
                     Some(RowLayoutColumnCodec {
                         column_index,
-                        kind: column_kind_from_layout_codec_kind(&layout_col.codec_kind)
-                            .unwrap_or_else(|| {
-                                column_kind_for(&current.data_type, current.unsigned)
-                            }),
+                        kind: match (&layout_col.codec_kind.kind, &columns[column_index].kind) {
+                            // Appending labels without widening the ordinal/bit
+                            // lane preserves every existing byte interpretation.
+                            (
+                                ColumnKind::Enum { values: old, width },
+                                ColumnKind::Enum {
+                                    values: new,
+                                    width: next,
+                                },
+                            ) if width == next && new.starts_with(old) => {
+                                columns[column_index].kind.clone()
+                            }
+                            (
+                                ColumnKind::Set { values: old, width },
+                                ColumnKind::Set {
+                                    values: new,
+                                    width: next,
+                                },
+                            ) if width == next && new.starts_with(old) => {
+                                columns[column_index].kind.clone()
+                            }
+                            _ => layout_col.codec_kind.kind.clone(),
+                        },
                         nullable: current.nullable || layout_col.nullable_ord.is_some(),
                     })
                 })
@@ -2002,13 +2027,6 @@ impl RowCodec {
             if cols.is_empty() && !persisted.columns.is_empty() {
                 continue;
             }
-            cols.sort_by_key(|col| {
-                schema
-                    .columns
-                    .get(col.column_index)
-                    .map(|c| c.physical_pos)
-                    .unwrap_or(col.column_index as u32)
-            });
             layouts.push(RowLayoutCodec::new(persisted.layout_id.max(1), cols));
         }
         if layouts.is_empty() {
@@ -2226,122 +2244,69 @@ fn column_kind_for(ty: &DataTypeKind, unsigned: bool) -> ColumnKind {
     }
 }
 
-fn column_kind_from_layout_codec_kind(encoded: &str) -> Option<ColumnKind> {
-    let (body, suffix) = encoded.rsplit_once(':')?;
-    let unsigned = suffix == "u";
-    Some(match body {
-        "TinyInt" => ColumnKind::Int {
-            width: 1,
-            signed: !unsigned,
-        },
-        "SmallInt" => ColumnKind::Int {
-            width: 2,
-            signed: !unsigned,
-        },
-        "MediumInt" => ColumnKind::Int {
-            width: 3,
-            signed: !unsigned,
-        },
-        "Int" => ColumnKind::Int {
-            width: 4,
-            signed: !unsigned,
-        },
-        "BigInt" => ColumnKind::Int {
-            width: 8,
-            signed: !unsigned,
-        },
-        "Bool" => ColumnKind::Int {
-            width: 1,
-            signed: !unsigned,
-        },
-        "Date" => ColumnKind::Date,
-        "Year" => ColumnKind::Year,
-        "Json" => ColumnKind::Json,
-        _ if body.starts_with("Float") => ColumnKind::Float32,
-        _ if body.starts_with("Double") => ColumnKind::Float64,
-        _ if body.starts_with("Decimal") => {
-            let precision = parse_debug_option_u8(body, "precision");
-            let scale = parse_debug_option_u8(body, "scale").unwrap_or(0);
-            match precision {
-                Some(p) if p <= 9 => ColumnKind::DecimalFixed { width: 4, scale },
-                Some(p) if p <= 18 => ColumnKind::DecimalFixed { width: 8, scale },
-                Some(p) if p <= 38 => ColumnKind::DecimalFixed { width: 16, scale },
-                Some(_) => ColumnKind::DecimalWide { scale },
-                None => ColumnKind::Decimal { scale },
+/// Stable persisted row-codec identifiers. Numeric string tags are assigned
+/// explicitly on ColumnKind and must never be reused for another encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RowCodecSpec {
+    version: u16,
+    kind: ColumnKind,
+}
+
+impl<'de> Deserialize<'de> for RowCodecSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: u16,
+            kind: ColumnKind,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let valid = match &wire.kind {
+            ColumnKind::Int { width, .. } => matches!(width, 1 | 2 | 3 | 4 | 8),
+            ColumnKind::Decimal { scale } | ColumnKind::DecimalWide { scale } => *scale <= 30,
+            ColumnKind::DecimalFixed { width, scale } => {
+                matches!(width, 4 | 8 | 16) && *scale <= 30
             }
+            ColumnKind::Time { fsp }
+            | ColumnKind::DateTime { fsp }
+            | ColumnKind::Timestamp { fsp } => *fsp <= 6,
+            ColumnKind::Bit { width } => (1..=8).contains(width),
+            ColumnKind::FixedBytes { width } => *width <= 65535,
+            ColumnKind::Vector { dim, datatype } => {
+                dim.is_none_or(|dim| dim > 0 && dim <= datatype.max_dimension())
+            }
+            ColumnKind::VectorFixed { dim, datatype } => {
+                *dim > 0 && *dim <= datatype.max_dimension()
+            }
+            ColumnKind::Enum { values, width } => {
+                !values.is_empty()
+                    && values.len() <= 65535
+                    && *width == enum_storage_width(values.len())
+            }
+            ColumnKind::Set { values, width } => {
+                !values.is_empty()
+                    && values.len() <= 64
+                    && *width == set_storage_width(values.len())
+            }
+            _ => true,
+        };
+        if wire.version != crate::storage::format_versions::ROW_CODEC_SPEC_VERSION || !valid {
+            return Err(serde::de::Error::custom(
+                "unsupported or invalid row codec specification",
+            ));
         }
-        _ if body.starts_with("Char")
-            || body.starts_with("VarChar")
-            || body.starts_with("Text") =>
-        {
-            ColumnKind::VarString
-        }
-        _ if body.starts_with("Blob") || body.starts_with("VarBinary") => ColumnKind::VarBytes,
-        _ if body.starts_with("Binary") => match parse_debug_option_usize(body, "len") {
-            Some(width) => ColumnKind::FixedBytes { width },
-            None => ColumnKind::VarBytes,
-        },
-        _ if body.starts_with("Bit") => ColumnKind::Bit {
-            width: parse_debug_option_usize(body, "len")
-                .unwrap_or(1)
-                .div_ceil(8),
-        },
-        _ if body.starts_with("DateTime") => ColumnKind::DateTime {
-            fsp: parse_debug_u8(body, "fsp").unwrap_or(0),
-        },
-        _ if body.starts_with("Timestamp") => ColumnKind::Timestamp {
-            fsp: parse_debug_u8(body, "fsp").unwrap_or(0),
-        },
-        _ if body.starts_with("Time") => ColumnKind::Time {
-            fsp: parse_debug_u8(body, "fsp").unwrap_or(0),
-        },
-        _ if body.starts_with("Geometry") => ColumnKind::Geometry,
-        _ if body.starts_with("Vector") => {
-            let datatype = [
-                crate::vector::VectorDataType::Float32,
-                crate::vector::VectorDataType::Float16,
-                crate::vector::VectorDataType::BFloat16,
-                crate::vector::VectorDataType::Int8,
-                crate::vector::VectorDataType::Binary,
-            ]
-            .into_iter()
-            .find(|t| body.contains(&format!("datatype: {t:?}")))
-            .unwrap_or_default();
-            vector_column_kind(parse_debug_option_u32(body, "dim"), datatype)
-        }
-        _ => return None,
-    })
+        Ok(Self {
+            version: wire.version,
+            kind: wire.kind,
+        })
+    }
 }
 
-fn parse_debug_option_u8(body: &str, field: &str) -> Option<u8> {
-    parse_debug_option_u64(body, field).and_then(|v| u8::try_from(v).ok())
-}
-
-fn parse_debug_option_u32(body: &str, field: &str) -> Option<u32> {
-    parse_debug_option_u64(body, field).and_then(|v| u32::try_from(v).ok())
-}
-
-fn parse_debug_option_usize(body: &str, field: &str) -> Option<usize> {
-    parse_debug_option_u64(body, field).and_then(|v| usize::try_from(v).ok())
-}
-
-fn parse_debug_option_u64(body: &str, field: &str) -> Option<u64> {
-    let needle = format!("{field}: Some(");
-    let start = body.find(&needle)? + needle.len();
-    let rest = &body[start..];
-    let end = rest.find(')')?;
-    rest[..end].parse().ok()
-}
-
-fn parse_debug_u8(body: &str, field: &str) -> Option<u8> {
-    let needle = format!("{field}: ");
-    let start = body.find(&needle)? + needle.len();
-    let rest = &body[start..];
-    let digits = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse().ok()
+pub(crate) fn row_codec_spec(data_type: &DataTypeKind, unsigned: bool) -> RowCodecSpec {
+    RowCodecSpec {
+        version: crate::storage::format_versions::ROW_CODEC_SPEC_VERSION,
+        kind: column_kind_for(data_type, unsigned),
+    }
 }
 
 // --- Phase B value section helpers ---------------------------------------
@@ -7400,6 +7365,115 @@ mod row_codec_tests {
         test_row_codec_from_columns(kinds.into_iter().map(|kind| ColumnCodec { kind }).collect())
     }
 
+    #[test]
+    fn release_format_golden_schema_aware_mvcc_rows_and_retained_layout() {
+        let mut kinds = vec![
+            ColumnKind::Int {
+                width: 8,
+                signed: true,
+            },
+            ColumnKind::Int {
+                width: 8,
+                signed: false,
+            },
+            ColumnKind::Float32,
+            ColumnKind::Float64,
+            ColumnKind::DecimalFixed {
+                width: 16,
+                scale: 8,
+            },
+            ColumnKind::DecimalWide { scale: 30 },
+            ColumnKind::VarString,
+            ColumnKind::VarBytes,
+            ColumnKind::Date,
+            ColumnKind::Time { fsp: 6 },
+            ColumnKind::DateTime { fsp: 6 },
+            ColumnKind::Timestamp { fsp: 6 },
+            ColumnKind::Year,
+            ColumnKind::Enum {
+                values: vec!["a".into(), "中".into()],
+                width: 1,
+            },
+            ColumnKind::Set {
+                values: vec!["a".into(), "中".into()],
+                width: 1,
+            },
+            ColumnKind::Bit { width: 8 },
+            ColumnKind::VarString,
+        ];
+        let mut values = vec![
+            Value::Int(i64::MIN),
+            Value::UInt(u64::MAX),
+            Value::Float(-0.0),
+            Value::Double(f64::from_bits(0x3ff0000000000001)),
+            Value::Decimal128(1234567890123456789, 8),
+            Value::Decimal("123456789012345678901234567890.123456789012345678901234567890".into()),
+            Value::String("界\0".into()),
+            Value::Bytes(vec![0, 255]),
+            Value::Date(i32::MIN),
+            Value::Time(-123456789),
+            Value::DateTime(i64::MIN),
+            Value::Timestamp(4_102_444_799_123_456),
+            Value::Year(126),
+            Value::String("中".into()),
+            Value::String("a,中".into()),
+            Value::UInt(u64::MAX),
+            Value::Null,
+        ];
+        let old_codec = codec(kinds.clone());
+        let header = RowHeader {
+            flags: 0,
+            last_txn_id: 17,
+            undo_ptr: Some(33),
+        };
+        let old = encode_mvcc_row(header, &values, &old_codec, &[]).unwrap();
+        crate::storage::format_golden::golden!("heap-mvcc-row", &old);
+        let (_, decoded) = decode_mvcc_row(&old, &old_codec).unwrap();
+        let expected = values
+            .iter()
+            .map(Value::to_display_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(Value::to_display_string)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        kinds.push(ColumnKind::Int {
+            width: 4,
+            signed: true,
+        });
+        let mut next = codec(kinds);
+        next.active_layout_id = 2;
+        next.layouts = vec![
+            old_codec.layouts[0].clone(),
+            identity_layout_for_columns(&next.columns, 2),
+        ];
+        let (_, decoded) = decode_mvcc_row(&old, &next).unwrap();
+        assert_eq!(
+            decoded[..expected.len()]
+                .iter()
+                .map(Value::to_display_string)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        values.push(Value::Int(7));
+        let newer = encode_mvcc_row(header, &values, &next, &[]).unwrap();
+        crate::storage::format_golden::golden!("heap-mvcc-next-layout", &newer);
+        let (_, decoded) = decode_mvcc_row(&newer, &next).unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(Value::to_display_string)
+                .collect::<Vec<_>>(),
+            values
+                .iter()
+                .map(Value::to_display_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn schema_round_trip(values: Vec<Value>, kinds: Vec<ColumnKind>) -> usize {
         let codec = codec(kinds);
         let mut buf = Vec::new();
@@ -7865,11 +7939,17 @@ mod row_codec_tests {
             false,
         );
         assert_eq!(k, ColumnKind::DecimalWide { scale: 30 });
+        let spec = row_codec_spec(
+            &DataTypeKind::Decimal {
+                precision: Some(65),
+                scale: Some(30),
+            },
+            false,
+        );
+        let bytes = serde_json::to_vec(&spec).unwrap();
         assert_eq!(
-            column_kind_from_layout_codec_kind(
-                "Decimal { precision: Some(65), scale: Some(30) }:s"
-            ),
-            Some(ColumnKind::DecimalWide { scale: 30 })
+            serde_json::from_slice::<RowCodecSpec>(&bytes).unwrap().kind,
+            ColumnKind::DecimalWide { scale: 30 }
         );
         // No precision → legacy variable-length kind.
         let k = column_kind_for(

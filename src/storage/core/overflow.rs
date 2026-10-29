@@ -43,7 +43,7 @@
 
 const OVFL_MAGIC: u32 = 0x4d_4f_56_31; // "MOV1"
 use crate::storage::format_versions::OVERFLOW_VERSION as OVFL_VERSION;
-const OVFL_HEADER_SIZE: usize = 40;
+const OVFL_HEADER_SIZE: usize = 64;
 const OVFL_PAGE_PAYLOAD: usize = PAGE_SIZE - OVFL_HEADER_SIZE; // 16344
 const OVFL_FLAG_HEAD: u16 = 1 << 0;
 /// M5 (LOB compression) — head page flags bit1: the entire chain's payload is the lz4-compressed
@@ -252,6 +252,24 @@ impl OverflowFile {
             Some(file) => file.metadata().map_err(io_err)?.len(),
             None => 0,
         };
+        let heap_path = path.with_extension("heap");
+        let required = if heap_path.exists() {
+            let key = PageKey {
+                file: Arc::new(BufferPool::heap_file_key(heap_path.clone(), table_id)),
+                page_id: 0,
+            };
+            let meta = buffer_pool.read_raw_page(key.clone())?;
+            decode_heap_meta(&meta, &key.file.owner)?;
+            read_u64(&meta, 32) & HEAP_META_HAS_LOB != 0
+        } else {
+            false
+        };
+        if (required && len < PAGE_SIZE as u64) || len % PAGE_SIZE as u64 != 0 {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "required LOB file is missing or truncated",
+            ));
+        }
         let file_key = Arc::new(BufferPool::overflow_file_key(path.clone(), table_id));
         let rel_path = crate::storage::naming::wal_relative_object_path(&path);
         let mut me = Self {
@@ -270,6 +288,14 @@ impl OverflowFile {
         };
         if len >= PAGE_SIZE as u64 {
             let meta = me.read_raw_page(0)?;
+            if read_u32(&meta, OVFL_OFF_MAGIC) != OVFL_MAGIC
+                || read_u32(&meta, 16) != page_checksum(&meta, 16)
+            {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt LOB allocation metadata checksum or magic",
+                ));
+            }
             if read_u32(&meta, OVFL_OFF_MAGIC) == OVFL_MAGIC {
                 let version = read_u16(&meta, OVFL_OFF_VERSION);
                 if version != OVFL_VERSION {
@@ -283,7 +309,12 @@ impl OverflowFile {
                 me.free_head = read_u64(&meta, OVFL_META_FREE_HEAD);
                 me.page_count = read_u64(&meta, OVFL_META_PAGE_COUNT);
                 me.next_generation = read_u64(&meta, OVFL_META_NEXT_GENERATION);
-                if me.next_generation == 0 {
+                if me.next_generation == 0
+                    || me.page_count == 0
+                    || me.page_count > len / PAGE_SIZE as u64
+                    || me.page_count > u64::from(u32::MAX) + 1
+                    || me.free_head >= me.page_count
+                {
                     return Err(error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "corrupt overflow next generation",
@@ -385,6 +416,7 @@ impl OverflowFile {
     /// after a crash is merely unreferenced space, never corruption.
     fn write_page_logged(&mut self, page_id: u64, mut after: Vec<u8>) -> Result<(), QueryError> {
         debug_assert_eq!(after.len(), PAGE_SIZE);
+        stamp_page_owner(&mut after, &self.file_key.owner, page_id);
         if self.durability == DurabilityMode::Memory {
             refresh_page_checksum(&mut after);
             self.buffer_pool
@@ -423,7 +455,22 @@ impl OverflowFile {
         self.free_head = 0;
         self.next_generation = 1;
         let meta = encode_overflow_meta_page(self.free_head, self.page_count, self.next_generation);
-        self.write_page_logged(0, meta)
+        self.write_page_logged(0, meta)?;
+        let heap = self.path.with_extension("heap");
+        if heap.exists() {
+            update_heap_meta(
+                &heap,
+                self.table_id,
+                &self.buffer_pool,
+                &self.log,
+                self.durability,
+                |meta| {
+                    write_u64(meta, 32, read_u64(meta, 32) | HEAP_META_HAS_LOB);
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Reserve one page for a chain: pop the free list, else extend the file.
@@ -443,6 +490,12 @@ impl OverflowFile {
                     "overflow file is full",
                 )
             })?;
+            if new_count > u64::from(u32::MAX) + 1 {
+                return Err(error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                    "LOB page address space exhausted",
+                ));
+            }
             self.set_file_len(new_count)?;
             self.page_count = new_count;
             Ok(pid)
@@ -476,6 +529,12 @@ impl OverflowFile {
                     "overflow file is full",
                 )
             })?;
+            if new_count > u64::from(u32::MAX) + 1 {
+                return Err(error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                    "LOB page address space exhausted",
+                ));
+            }
             self.set_file_len(new_count)?;
             self.page_count = new_count;
             return Ok((start..new_count).collect());

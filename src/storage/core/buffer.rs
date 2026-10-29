@@ -1717,6 +1717,7 @@ impl BufferPool {
             self.validate_frame_mutation_image(&pinned.frame, &mut bytes)?;
             let result = f(&mut bytes);
             if result.is_ok() {
+                stamp_page_owner(&mut bytes, &key.file.owner, key.page_id);
                 self.write_requests.fetch_add(1, Ordering::Relaxed);
                 // Keep the formatted page header current immediately, not
                 // only when the background flusher eventually finalizes the
@@ -1776,6 +1777,7 @@ impl BufferPool {
             self.validate_frame_mutation_image(&frame, &mut bytes)?;
             let (modified, value) = f(&mut bytes)?;
             if modified {
+                stamp_page_owner(&mut bytes, &key.file.owner, key.page_id);
                 self.write_requests.fetch_add(1, Ordering::Relaxed);
                 frame.checksum_dirty.store(true, Ordering::Release);
                 if btree_logical_wal::is_deferred() {
@@ -1973,6 +1975,8 @@ impl BufferPool {
                 f(&mut high_bytes, &mut low_bytes)?
             };
             if modified {
+                stamp_page_owner(&mut low_bytes, &low.key.file.owner, low.key.page_id);
+                stamp_page_owner(&mut high_bytes, &high.key.file.owner, high.key.page_id);
                 self.write_requests.fetch_add(2, Ordering::Relaxed);
                 for frame in [&first_frame, &second_frame] {
                     frame.checksum_dirty.store(true, Ordering::Release);
@@ -2622,6 +2626,9 @@ impl BufferPool {
             self.read_syscalls.fetch_add(calls, Ordering::Relaxed);
             self.batch_read_pages.fetch_add(pages, Ordering::Relaxed);
         }
+        for (position, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
+            validate_page_owner(page, &file_key.owner, first + position as u64)?;
+        }
         Ok(())
     }
 
@@ -2967,6 +2974,12 @@ impl BufferPool {
                 "buffer pool page image has invalid size",
             ));
         }
+        if has_classic_identity(&bytes)
+            && (&bytes[40..56] != &key.file.owner || read_u64(&bytes, 56) != key.page_id)
+        {
+            stamp_page_owner(&mut bytes, &key.file.owner, key.page_id);
+            refresh_page_checksum(&mut bytes);
+        }
         loop {
             if let Some(frame) = self.lookup_frame(&key)? {
                 if !self.try_pin_existing(&frame, AccessIntent::Normal) {
@@ -3058,6 +3071,7 @@ impl BufferPool {
         oracle: Arc<IndexPage>,
     ) -> Result<(), QueryError> {
         let mut image = encode_index_tree_page(&oracle)?;
+        stamp_page_owner(&mut image, &key.file.owner, key.page_id);
         set_page_lsn_if_formatted(&mut image, dirty_lsn);
         self.store_page(key, image, dirty_lsn)
     }
@@ -5665,6 +5679,20 @@ impl BufferPool {
             return Ok(());
         }
         let syscalls = read_cached_page_at(&file, buf, offset).map_err(io_err)?;
+        validate_page_owner(buf, &key.file.owner, key.page_id)?;
+        if matches!(key.file.kind, BufferPageFileKind::Heap { .. })
+            && key.page_id > 0
+            && crate::storage::naming::parse_relative_object_path(
+                &crate::storage::naming::wal_relative_object_path(&key.file.path),
+            )
+            .is_some()
+            && buf.iter().all(|b| *b == 0)
+        {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "allocated heap page is zero",
+            ));
+        }
         self.read_ios.fetch_add(1, Ordering::Relaxed);
         self.kind_read_ios[key.file.kind.slot()].fetch_add(1, Ordering::Relaxed);
         self.read_syscalls.fetch_add(syscalls, Ordering::Relaxed);
@@ -5996,6 +6024,9 @@ impl BufferPool {
         &self,
         file_key: &BufferPageFileKey,
     ) -> Result<Arc<CachedFile>, QueryError> {
+        if let Some(message) = &file_key.owner_error {
+            return Err(error(crate::error::catalog::ER_GET_ERRNO, message.clone()));
+        }
         // M-2 - hot path: try the read lock first. The cache is
         // write-rarely (only on first touch of a given file_key);
         // every subsequent page IO would otherwise serialise on a
@@ -7102,6 +7133,9 @@ impl BufferPool {
                     syscall_total = syscall_total.saturating_add(
                         read_cached_pages_at(&file, &mut pages, offset).map_err(io_err)?,
                     );
+                    for (position, page) in pages.iter().enumerate() {
+                        validate_page_owner(page, &file_key.owner, first_page + position as u64)?;
+                    }
                     readable_total = readable_total.saturating_add(readable);
                     batch_total = batch_total.saturating_add(1);
                 }
@@ -8097,7 +8131,7 @@ mod oldest_dirty_tests {
         // A renamed direct handle and the current cache key can refer to
         // different inodes. Both identities must reach the barrier.
         let retired = dir.path().join("retired.heap");
-        std::fs::rename(&path, &retired).unwrap();
+        rename_owned_file(&path, &retired).unwrap();
         std::fs::write(&path, b"new").unwrap();
         let replacement = OpenOptions::new()
             .read(true)
@@ -8617,6 +8651,7 @@ mod oldest_dirty_tests {
             })
             .collect();
         fs::write(&path, bytes).unwrap();
+        bind_test_file_pages(&path);
         let pool = BufferPool::new_with_options(
             32,
             Arc::new(parking_lot::Mutex::new(
@@ -8859,7 +8894,7 @@ mod oldest_dirty_tests {
         read_cached_page_at(&cached, &mut bytes, PAGE_SIZE as u64).unwrap();
         assert!(bytes.iter().all(|byte| *byte == 29));
         let renamed = dir.path().join("old.heap");
-        fs::rename(&path, &renamed).unwrap();
+        rename_owned_file(&path, &renamed).unwrap();
         fs::write(&path, vec![99; PAGE_SIZE]).unwrap();
         write_cached_page_at(&cached, &vec![41; PAGE_SIZE], 0).unwrap();
         read_exact_at_counted(&File::open(&renamed).unwrap(), &mut bytes, 0).unwrap();
@@ -9466,6 +9501,7 @@ mod oldest_dirty_tests {
         template.insert(&[0u8; 8]).unwrap();
         let image = template.encode();
         fs::write(&path, image.repeat(PAGES)).unwrap();
+        bind_test_file_pages(&path);
         let pool = BufferPool::new_with_options(
             32,
             Arc::new(parking_lot::Mutex::new(

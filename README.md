@@ -6,7 +6,7 @@
 
 **A high-performance database, compatible with MySQL**
 
-Let agents manage data flexibly — transactions, analytics, and vector search in a single database.
+Let agents manage data flexibly — transactions, analytics, model calls, and hybrid search through SQL.
 
 [Download](https://github.com/yzsind/mydb/releases/tag/v1.0.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
@@ -14,7 +14,7 @@ Let agents manage data flexibly — transactions, analytics, and vector search i
 
 ---
 
-MyDB is a general-purpose database built in Rust, designed around three directions: **AI agents, high-performance hybrid transactional/analytical processing (HTAP), and MySQL compatibility**. Through a familiar SQL interface, applications and agents can manage business data, evolve table schemas, run real-time analytics, and search similar vectors — without copying data across systems or maintaining multiple interfaces.
+MyDB is a general-purpose database built in Rust, designed around three directions: **AI agents, high-performance hybrid transactional/analytical processing (HTAP), and MySQL compatibility**. Through a familiar SQL interface, applications and agents can manage business data, evolve table schemas, run real-time analytics, combine keyword and vector retrieval, and call text-generation and embedding services.
 
 MyDB 1.0.0 is a public-preview release intended for feature validation and controlled-environment evaluation. It is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
 
@@ -25,7 +25,7 @@ destinations, or set `http_enabled=OFF` when HTTP calls are unnecessary.
 
 | Core capability | What it gives you |
 | --- | --- |
-| **Built for AI agents** | Online schema changes, automatic zone maps, and native vector data management reduce manual work in schema evolution and query tuning. |
+| **Built for AI agents** | SQL model calls, native vectors, BM25 + RRF hybrid search, and model access controls support retrieval and generation; online DDL and automatic zone maps simplify data management. |
 | **High-performance HTAP** | Parallel hash joins, vectorized execution, and a cost-based optimizer power both transactional and analytical workloads. |
 | **MySQL compatible** | Reuse MySQL clients, JDBC drivers, core SQL, and row binlog integration. |
 
@@ -203,7 +203,20 @@ verification details, Windows limitations, and distribution scope.
 
 ## Built for AI Agents
 
-An agent's data needs change with every task: add a column, build an index, write embeddings, then join retrieval results back to business data. MyDB keeps all of this inside one transactional database.
+An agent's data needs change with every task: add a column, build an index, write embeddings, then join retrieval results back to business data. MyDB combines transactional data, retrieval, and SQL access to external models for retrieval-augmented generation (RAG), knowledge bases, and persistent agent memory.
+
+### Model calls in SQL: generate text and embeddings
+
+- **Text generation**: `AI_GENERATE` accepts a prompt or text message history for summarization, classification, extraction, and answer generation over selected data.
+- **Native embeddings**: `AI_EMBED` returns a FLOAT32 `VECTOR` with validated dimensions. `AI_EMBED_DETAIL` also accepts explicit batches of texts.
+- **Local and remote services**: configure SQL connection and model objects for Ollama, OpenAI Responses, Chat Completions-compatible services, and Embeddings-compatible services. Model weights and inference run outside MyDB.
+- **Structured results**: generation can request JSON Schema output when the configured deployment supports it; MyDB parses and validates the result locally. `_DETAIL` functions expose model revision, provider-reported token usage, timings, and explicit call errors.
+
+Ordinary filtering, joins, sorting, and `LIMIT` run before calls in the final
+SELECT projection, so applications can select the rows to enrich before
+contacting a model. Calls also support a single `SET @variable = AI_...`
+assignment. See [LLM and embedding calls](docs/ai.md) and the
+[AI function reference](docs/function/ai/README.md) for setup and supported SQL contexts.
 
 ### Smart indexing: fewer full scans without manual indexes
 
@@ -227,6 +240,35 @@ MyDB minimizes DDL locking and query waiting by coordinating schema versions, in
 - **Unified SQL**: the optimizer recognizes `ORDER BY distance LIMIT k` and supports parameterized queries; vector writes participate in transaction commit and rollback.
 
 Combined with JSONB, full-text, and structured queries, this supports semantic search, knowledge retrieval, and agent memory. Start with the [vector data and similarity search guide](docs/vector-search.md), then see [vector datatypes and indexes](docs/vector-indexes.md) for options, training, limits, and recovery, and the [vector function reference](docs/function/vector/README.md). The current implementation is HNSW / IVF; disk residency does not imply a complete DiskANN implementation.
+
+### Hybrid retrieval: keyword relevance and semantic similarity
+
+MyDB combines [BM25 full-text search](docs/fulltext-search.md), boolean search,
+and an `ngram` parser with native vector retrieval. The SQL `RRF` expression
+fuses two to eight independently ranked lists using reciprocal rank fusion,
+with configurable weights and optional per-branch score explanations. Its
+results can feed ordinary joins, CTEs, aggregation, and window functions.
+
+Applications can apply tenant, authorization, deletion, and model-version
+filters inside each retrieval branch before its candidate limit, then join the
+fused IDs back to source text and business records. All branches share the
+statement's transaction view. The [hybrid search guide](docs/hybrid-search.md)
+includes Python retrieval examples, optional external reranking, and a
+[LangChain adapter](examples/python/hybrid_langchain.py). RRF is a technical
+preview; retrieval quality depends on the data, models, and candidate windows.
+
+### Governed model access and observable calls
+
+- **Model privileges**: `AI_ADMIN` manages AI objects; `AI_USE` can be granted per model independently of table read privileges.
+- **Encrypted credentials**: API keys are stored as encrypted Secrets. SQL metadata views do not expose decrypted keys; Secret DDL requires TLS.
+- **Bounded execution**: concurrency, queue, memory, request-rate, and output budgets govern model calls. Deadlines and `KILL` cancel local waits, and optional node policies restrict outbound destinations.
+- **Visibility**: `SHOW AI MODELS`, `information_schema.AI_RUNTIME_STATUS`, and `_DETAIL` results expose configuration and execution information. `EXPLAIN` shows the external stage without calling a provider; `EXPLAIN ANALYZE` executes it.
+
+Model calls require autocommit outside explicit transactions and are rejected
+in DML, predicates, and persistent schema expressions. Save generated values
+with a subsequent ordinary write; rollback or cancellation cannot undo work
+already received by a provider. See the [execution boundaries](docs/ai.md#execution-boundaries)
+and [administration guide](docs/ai.md#administration-and-visibility).
 
 ### Try vector retrieval and RETURNING
 
@@ -263,6 +305,22 @@ recall and performance on larger collections depend on data and parameters. See
 [vector functions](docs/function/vector/README.md), and
 [INSERT RETURNING](docs/statements/dml/insert.md).
 
+After configuring and authorizing `test.local_chat` and `test.local_embed`
+with the [Ollama setup](docs/ai.md#configure-ollama), try model calls through the
+same SQL connection:
+
+```sql
+SELECT AI_GENERATE('test.local_chat',
+                   'Explain how semantic search helps an AI agent.') AS answer;
+
+SET @query_embedding = AI_EMBED('test.local_embed', 'shipping details');
+SELECT VECTOR_DIM(@query_embedding) AS embedding_dimensions;
+```
+
+Use that query embedding to search a collection populated with the same model
+revision and vector dimensions. The three-dimensional vectors in `agent_notes`
+above are illustrative values and do not share the configured model's embedding space.
+
 ## High-performance HTAP
 
 MyDB consolidates OLTP and OLAP in one engine — from concurrent point lookups and updates to multi-table joins, aggregation, and window computation — picking an execution path per query shape.
@@ -292,7 +350,7 @@ The full coverage map, transactional differences, and unsupported features are l
 
 | Feature | Use |
 | --- | --- |
-| **Wider TIMESTAMP range** | Supports dates beyond 2038, up to year 9999; replicating to MySQL via binlog is still bounded by the TIMESTAMP2 encoding and errors clearly on overflow. |
+| **Wider TIMESTAMP range** | Supports dates beyond 2038, up to year 9999. |
 | **Sequences** | Standalone sequence objects with `NEXTVAL`, `CURRVAL`, and friends. |
 | **DML `RETURNING`** | Return rows directly from INSERT, UPDATE, and DELETE, saving follow-up queries. |
 | **`generate_series()`** | Integer, decimal, and datetime series for time axes, gap filling, and data generation. |
@@ -317,6 +375,7 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 | --- | --- |
 | [Documentation index](docs/README.md) | Product, SQL, operations, and implementation docs |
 | [Feature overview](docs/feature-overview.md) | Capability map and implementation boundaries |
+| [AI model calls](docs/ai.md) / [Hybrid search](docs/hybrid-search.md) | Model setup, embeddings, generation, permissions, and retrieval fusion |
 | [SQL statements](docs/statements/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
 | [Configuration guide](docs/configuration.md) / [Config template](mydb.cnf.example) | Startup options, environment variables, and runtime settings |
 | [Storage format](docs/storage-format.md) | Data directory, pages, indexes, logs, and recovery |

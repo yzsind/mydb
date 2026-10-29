@@ -83,7 +83,12 @@ pub fn load_progress(data_dir: impl AsRef<Path>) -> IoResult<Option<ReplicaProgr
         return Ok(None);
     }
     let bytes = fs::read(&path)?;
-    let progress: ReplicaProgress = serde_json::from_slice(&bytes).map_err(|e| {
+    let progress: ReplicaProgress = crate::storage::metadata::decode(
+        crate::storage::metadata::PROGRESS,
+        crate::storage::format_versions::REPLICA_PROGRESS_VERSION,
+        &bytes,
+    )
+    .map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
             format!("replica_progress.json: {e}"),
@@ -98,8 +103,12 @@ pub fn save_progress(data_dir: impl AsRef<Path>, progress: &ReplicaProgress) -> 
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(progress)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("replica_progress.json: {e}")))?;
+    let bytes = crate::storage::metadata::encode(
+        crate::storage::metadata::PROGRESS,
+        crate::storage::format_versions::REPLICA_PROGRESS_VERSION,
+        progress,
+    )
+    .map_err(|e| Error::new(ErrorKind::Other, format!("replica_progress.json: {e}")))?;
     // Crash-safe: fsync tmp + parent dir so the durable progress
     // watermark can't roll back on power loss (a rollback below the
     // master's retention floor would force a full base-backup re-seed).

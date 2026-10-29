@@ -638,6 +638,17 @@ pub fn prepare_directory(path: &Path) -> Result<(), QueryError> {
     let dependency_floor = visibility.dependency_floor();
     let work = path.join(".seal-wal");
     fs::create_dir(&work).map_err(|e| io_err("create sealed dependency workspace", e))?;
+    // These segments replace source-domain WAL in the same image, so the
+    // private writer must retain its storage identity rather than mint a node.
+    crate::storage::control::Control::load(path)?
+        .ok_or_else(|| backup_err("missing captured storage identity"))?;
+    fs::create_dir(work.join("system"))
+        .map_err(|e| io_err("create dependency system directory", e))?;
+    fs::copy(
+        path.join(crate::storage::control::PATH),
+        work.join(crate::storage::control::PATH),
+    )
+    .map_err(|e| io_err("copy dependency storage identity", e))?;
     let mut dependency_log = crate::wal::LogManager::open(&work)?;
     dependency_log.set_local_recovery(true);
     let source_end = snapshot.manifest.end_lsn;

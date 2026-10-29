@@ -8657,8 +8657,8 @@ impl Database {
             }
             saw_trusted_map = true;
             let zone_pages = map.zone_pages as u64;
-            zones_examined = zones_examined
-                .saturating_add(zone_map_sample_geometry(page_count, zone_pages).2);
+            zones_examined =
+                zones_examined.saturating_add(zone_map_sample_geometry(page_count, zone_pages).2);
             min_surviving_pages = min_surviving_pages
                 .saturating_add(zone_map_min_sampled_surviving_pages(page_count, zone_pages));
         }
@@ -14613,6 +14613,16 @@ mod zone_map_tests {
             )
             .unwrap();
         let db = engine.db_for_tests();
+        // Retained neutral DML provenance can leave a boundary zone hot after
+        // reset. Control the quiet period so batch/resume assertions do not
+        // depend on ingestion batch boundaries.
+        struct QuietReset(u64);
+        impl Drop for QuietReset {
+            fn drop(&mut self) {
+                ZONE_MAP_TEST_MAINTENANCE_QUIET_MS.store(self.0, Ordering::Release);
+            }
+        }
+        let _quiet = QuietReset(ZONE_MAP_TEST_MAINTENANCE_QUIET_MS.swap(0, Ordering::AcqRel));
         let table = db.table("test.zm").unwrap();
         let map = db.zone_map_for(table.id, &table).unwrap();
         {

@@ -67,7 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // unlinking dozens of unused indexes and their nested directories per test.
     let memory_seed_dir = seed_dir.parent().unwrap().join("memory-seed");
     copy_seed_tree(&seed_dir, &memory_seed_dir)?;
-    let _ = fs::remove_dir_all(memory_seed_dir.join("system/catalog/indexes"));
+    // Dictionary indexes are needed for authoritative upserts even when
+    // transaction WAL is disabled in the cloned fixture.
     // Memory fixtures reconstruct undo and temporal state from WAL and do
     // not read the persistent undo segments or temporal ledgers. Avoid
     // cloning and unlinking these unused files in every isolated fixture.

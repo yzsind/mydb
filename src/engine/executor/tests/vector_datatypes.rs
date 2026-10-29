@@ -2609,7 +2609,8 @@ fn resident_checkpoint_retirements_stay_bounded_without_background_workers() {
     assert!(query_rows(&engine, "SHOW WARNINGS").is_empty());
     let root = dir.path().join("system/vector-purges.v1");
     let mut damaged = std::fs::read(&root).unwrap();
-    assert_eq!(damaged.len(), 17);
+    // The checked vector-state envelope adds its independent u16 version.
+    assert_eq!(damaged.len(), 19);
     damaged[0] ^= 1;
     std::fs::write(&root, &damaged).unwrap();
     let completed = || {

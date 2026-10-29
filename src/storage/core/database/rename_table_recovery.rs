@@ -51,7 +51,7 @@ impl Database {
             if let Some(parent) = to.parent() {
                 std::fs::create_dir_all(parent).map_err(io_err)?;
             }
-            std::fs::rename(from, to).map_err(io_err)?;
+            rename_owned_file(from, to).map_err(io_err)?;
         }
         Ok(())
     }

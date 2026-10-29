@@ -164,7 +164,7 @@ impl Default for IndexBuildOptions {
 // reserved for future use (e.g. persisted `deleted_count` or free
 // slot list head — see docs/storage-compression-opportunities.md
 // optimisation E).
-const PAGE_HEADER_SIZE: usize = 32;
+const PAGE_HEADER_SIZE: usize = 64;
 // Slot directory entry size. Was 8 bytes pre-rowid-6bytes (offset:2 +
 // len:2 + generation:2 + flags:1 + pad:1), then 6 bytes after that
 // refactor (offset:2 + len:2 + flags:1 + pad:1). v10 (HEAP_PAGE_VERSION)
@@ -3161,6 +3161,8 @@ struct BufferPageFileKey {
     kind: BufferPageFileKind,
     path: PathBuf,
     hash: u64,
+    owner: [u8; 16],
+    owner_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3175,7 +3177,16 @@ impl BufferPageFileKey {
         kind.hash(&mut hasher);
         path.hash(&mut hasher);
         let hash = hasher.finish();
-        Self { kind, path, hash }
+        let result = page_owner_result(&path);
+        let owner_error = result.as_ref().err().map(ToString::to_string);
+        let owner = result.unwrap_or([0; 16]);
+        Self {
+            kind,
+            path,
+            hash,
+            owner,
+            owner_error,
+        }
     }
 }
 
@@ -4855,6 +4866,8 @@ include!("core/row_codec.rs");
 include!("core/constraints.rs");
 include!("core/catalog_io.rs");
 include!("core/bytes.rs");
+include!("core/page_identity.rs");
+include!("core/heap_meta.rs");
 include!("core/errors.rs");
 // The R-tree spatial index is a proper submodule (not `include!`d) so its
 // helper types stay namespaced rather than polluting `storage::core`.

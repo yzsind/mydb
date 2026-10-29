@@ -40,6 +40,8 @@ The current development format is incompatible with earlier versions. If version
 
 | Format | Version |
 | --- | --- |
+| storage control / owner-transfer proof | $(version STORAGE_CONTROL_VERSION) / $(version PAGE_OWNER_PROOF_VERSION) |
+| row codec specification | $(version ROW_CODEC_SPEC_VERSION) |
 | catalog / WAL | $(version CATALOG_VERSION) / $(version WAL_VERSION) |
 | heap page / MVCC row | $(version HEAP_PAGE_VERSION) / $(version MVCC_ROW_VERSION) |
 | B-tree index file / page | $(version INDEX_VERSION) / $(version INDEX_PAGE_VERSION) |
@@ -48,6 +50,14 @@ The current development format is incompatible with earlier versions. If version
 | paged vector container (HNSW / IVF) index / page | $(version PAGED_HNSW_INDEX_VERSION) / $(version PAGED_HNSW_PAGE_VERSION) |
 | Zone Map file / page | $(version ZONE_MAP_VERSION) / $(version PAGED_ZONE_MAP_PAGE_VERSION) |
 | legacy in-memory HNSW snapshot | $(version IN_MEMORY_HNSW_VERSION) |
+| spatial R-tree page | $(version SPATIAL_PAGE_VERSION) |
+| vector state envelope | $(version VECTOR_STATE_VERSION) |
+| JSONB / geometry value / native vector value / binlog VECTOR | $(version JSONB_VERSION) / $(version GEOMETRY_VALUE_VERSION) / $(version NATIVE_VECTOR_VALUE_VERSION) / $(version VECTOR_BINLOG_VERSION) |
+| commit ledger / history index | $(version COMMIT_LEDGER_VERSION) / $(version HISTORY_INDEX_VERSION) |
+| binlog manifest | $(version BINLOG_MANIFEST_VERSION) |
+| replica progress / replication slot | $(version REPLICA_PROGRESS_VERSION) / $(version REPLICATION_SLOT_VERSION) |
+| MySQL channel / relay record | $(version MYSQL_CHANNEL_VERSION) / $(version MYSQL_RELAY_VERSION) |
+| WAL retention / persisted variables / AI keyring | $(version WAL_RETENTION_VERSION) / $(version PERSISTED_SYSVARS_VERSION) / $(version AI_KEYRING_VERSION) |
 | native replication metadata | $(version NATIVE_REPLICATION_METADATA_VERSION) |
 | commit clock watermark | $(version COMMIT_CLOCK_VERSION) |
 | native backup image / mode pointer | $(version NATIVE_IMAGE_VERSION) / $(version IMAGE_MODE_VERSION) |
@@ -55,7 +65,7 @@ The current development format is incompatible with earlier versions. If version
 | backup bundle | $(version BACKUP_BUNDLE_VERSION) |
 | backup catalog checkpoint / packed lineage | $(version BACKUP_CHECKPOINT_VERSION) / $(version BACKUP_LINEAGE_VERSION) |
 
-Spatial indexes use persistent R-tree pages (format version 1), covered by the WAL and replication format boundary.
+All required formats participate in the data-directory admission fingerprint. Unsupported versions or required features are rejected before writable recovery.
 EOF
 
 case "${1:---check}" in

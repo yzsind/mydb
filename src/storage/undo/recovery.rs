@@ -74,7 +74,7 @@ impl UndoManager {
         let mut seq = base;
         let mut segment = make_segment_id(COMPACTION_SHARD_LANE, seq);
         let mut buffer = Vec::new();
-        write_segment_header_into(&mut buffer, segment);
+        write_segment_header_into(&mut buffer, segment, &plan.dir)?;
         let mut remap = Vec::with_capacity(frames.len());
         for (old, payload) in frames {
             let frame_len = UNDO_FRAME_HEADER_LEN + payload.len();
@@ -89,7 +89,7 @@ impl UndoManager {
                 )?;
                 seq = next_recovery_sequence(seq)?;
                 segment = make_segment_id(COMPACTION_SHARD_LANE, seq);
-                write_segment_header_into(&mut buffer, segment);
+                write_segment_header_into(&mut buffer, segment, &plan.dir)?;
             }
             let new = make_undo_ptr(segment, buffer.len() as u64)?;
             let start = buffer.len();
@@ -97,11 +97,8 @@ impl UndoManager {
             buffer.extend_from_slice(payload);
             let encoded = &mut buffer[start + UNDO_FRAME_HEADER_LEN..];
             Self::patch_encoded_id(encoded, new)?;
-            let checksum = crc32fast::hash(encoded);
-            buffer[start..start + 4].copy_from_slice(&UNDO_FRAME_MAGIC.to_le_bytes());
-            buffer[start + 4..start + 8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-            buffer[start + 8..start + 12].copy_from_slice(&checksum.to_le_bytes());
-            buffer[start + 12..start + 16].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
+            let header = undo_frame_header(encoded);
+            buffer[start..start + UNDO_FRAME_HEADER_LEN].copy_from_slice(&header);
             remap.push((old, new));
         }
         Self::flush_compaction_segment(&plan, segment, buffer, &mut built)?;
@@ -181,7 +178,7 @@ thread_local! {
     pub(super) static FAIL_AFTER_RECOVERY_INTENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn next_recovery_sequence(sequence: u32) -> Result<u32, QueryError> {
+pub(super) fn next_recovery_sequence(sequence: u32) -> Result<u32, QueryError> {
     sequence
         .checked_add(1)
         .filter(|next| *next <= (u32::MAX >> SHARD_BITS))

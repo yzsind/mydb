@@ -879,6 +879,9 @@ fn private_added_index_keeps_identity_after_cold_open() {
     candidate.indexes.push(added.clone());
     let shadow = 100000;
     db.register_reorg_storage_definition(&[shadow], &candidate);
+    let path = db.table_path(shadow);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, encode_heap_meta(&path, 1)).unwrap();
     db.set_cached_heap_codec(shadow, candidate.row_codec.clone())
         .unwrap();
     let txn = db.begin_txn().unwrap();
@@ -5086,12 +5089,12 @@ fn alter_copy_generation_intent_rolls_back_uncommitted_swap_on_restart() {
         db.remove_heap_cache_entry(shadow_id).unwrap();
         for (live, backup) in &old_to_backup {
             if live.exists() {
-                std::fs::rename(live, backup).unwrap();
+                rename_owned_file(live, backup).unwrap();
             }
         }
         for (_, live) in &shadow_to_live {
             std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-            std::fs::write(live, []).unwrap();
+            std::fs::write(live, create_empty_heap_image(live, Vec::new())).unwrap();
         }
         let old_path = old_to_backup[0].0.clone();
         let new_path = shadow_to_live[0].1.clone();
@@ -5136,13 +5139,13 @@ fn alter_copy_generation_intent_rolls_forward_committed_swap_on_restart() {
         db.remove_heap_cache_entry(shadow_id).unwrap();
         for (live, backup) in &old_to_backup {
             if live.exists() {
-                std::fs::rename(live, backup).unwrap();
+                rename_owned_file(live, backup).unwrap();
             }
         }
         for (shadow, live) in &shadow_to_live {
             std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
             std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-            std::fs::write(shadow, []).unwrap();
+            std::fs::write(shadow, create_empty_heap_image(shadow, Vec::new())).unwrap();
             let _ = std::fs::remove_file(live);
         }
         {
@@ -5605,7 +5608,7 @@ fn cached_index_decode_revalidates_replaced_page_epoch() {
     // The first decode caches validation for this frame epoch. Replacing the
     // image must invalidate that marker; otherwise the new fast path could
     // decode a structurally plausible page whose CRC no longer matches.
-    let mut corrupted = encoded;
+    let mut corrupted = pool.read_raw_page(key.clone()).unwrap();
     corrupted[PAGE_SIZE - 1] ^= 0x80;
     pool.store_page(key.clone(), corrupted, 2).unwrap();
     let err = pool
@@ -5621,6 +5624,7 @@ fn cached_index_decode_revalidates_replaced_page_epoch() {
 #[test]
 fn buffer_pool_prefetch_run_batches_contiguous_pages() {
     let dir = tempfile::tempdir().unwrap();
+    crate::storage::control::Control::admit(dir.path()).unwrap();
     let path = t_path(dir.path(), "batch", 1, "heap");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = File::create(&path).unwrap();
@@ -5659,6 +5663,7 @@ fn buffer_pool_prefetch_run_batches_contiguous_pages() {
 #[test]
 fn buffer_pool_cold_queue_recycles_before_clock_scan() {
     let dir = tempfile::tempdir().unwrap();
+    crate::storage::control::Control::admit(dir.path()).unwrap();
     let path = t_path(dir.path(), "cold", 2, "heap");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = File::create(&path).unwrap();
@@ -13113,8 +13118,10 @@ fn heap_page_checksum_detects_corruption_on_open() {
     let heap_path = dir.path().join("1.heap");
     {
         let mut file = OpenOptions::new().write(true).open(&heap_path).unwrap();
-        file.seek(SeekFrom::Start((PAGE_HEADER_SIZE + SLOT_SIZE + 1) as u64))
-            .unwrap();
+        file.seek(SeekFrom::Start(
+            (PAGE_SIZE + PAGE_HEADER_SIZE + SLOT_SIZE + 1) as u64,
+        ))
+        .unwrap();
         file.write_all(&[0x5a]).unwrap();
         file.sync_data().unwrap();
     }
@@ -13237,9 +13244,10 @@ fn off_startup_validation_skips_heap_page_lsn_check_until_read() {
             .open(&heap_path)
             .unwrap();
         let mut page = vec![0; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
         file.read_exact(&mut page).unwrap();
         page[PAGE_HEADER_SIZE + SLOT_SIZE + 1] ^= 0x5a;
-        file.seek(SeekFrom::Start(0)).unwrap();
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
         file.write_all(&page).unwrap();
         file.sync_data().unwrap();
     }
@@ -14470,15 +14478,13 @@ fn assert_single_index_change_uses_logical_wal_without_page_fallback(db: &Databa
         after.index_page_payload_bytes,
         before.index_page_payload_bytes
     );
-    if db.durability_mode() == DurabilityMode::Strict {
-        assert_eq!(
-            after.page_fallback_records,
-            before.page_fallback_records + 1
-        );
-        assert!(after.heap_fpi_payload_bytes > before.heap_fpi_payload_bytes);
-    } else {
-        assert_eq!(after.page_fallback_records, before.page_fallback_records);
-    }
+    // The initial allocation logs the row-page baseline and the heap frontier.
+    // Index maintenance still adds no physical page payload.
+    assert_eq!(
+        after.page_fallback_records,
+        before.page_fallback_records + 2
+    );
+    assert!(after.heap_fpi_payload_bytes > before.heap_fpi_payload_bytes);
 }
 
 #[test]
@@ -15974,12 +15980,12 @@ fn validate_rejects_index_with_broken_leaf_chain() {
         }
     };
     // Read raw page, zero next_leaf in the leaf payload. Layout
-    // (after the 24-byte common header) v19 layout: 1B page_type,
+    // (after the 64-byte common header) v19 layout: 1B page_type,
     // 1B key_layout, 8B base_time, 8B next_leaf, 2B entry_count,
     // entries… (page_table_id removed in v19; entry_count u32 → u16.)
     let mut raw = read_index_page(&mut file, leaf_page_id).unwrap();
-    let payload_start = 24; // INDEX_HEADER_BYTES
-                            // skip page_type (1) + key_layout (1) + base_time (8)
+    let payload_start = INDEX_HEADER_BYTES;
+    // skip page_type (1) + key_layout (1) + base_time (8)
     let next_leaf_off = payload_start + 1 + 1 + 8;
     write_u64(&mut raw, next_leaf_off, 0);
     let new_checksum = page_checksum(&raw, 16);
@@ -20066,7 +20072,7 @@ fn reclaimed_slots_in_older_pages_take_new_rows_before_the_tail() {
         let victims: Vec<RowId> = row_ids
             .iter()
             .copied()
-            .filter(|id| id.page_id == 0)
+            .filter(|id| id.page_id == 1)
             .collect();
         assert!(!victims.is_empty());
         let txn = db.begin_txn().unwrap();
@@ -20087,8 +20093,8 @@ fn reclaimed_slots_in_older_pages_take_new_rows_before_the_tail() {
             db.commit_txn(txn.txn_id).unwrap();
         }
         assert!(
-            inserted.iter().all(|id| id.page_id == 0),
-            "new rows must reuse reclaimed page 0 slots: {inserted:?}"
+            inserted.iter().all(|id| id.page_id == 1),
+            "new rows must reuse reclaimed page 1 slots: {inserted:?}"
         );
         assert_eq!(
             db.heap_page_count(table.id),
@@ -23553,7 +23559,7 @@ fn m5_compression_mvcc_snapshot_rollback_delete_purge() {
 }
 
 #[test]
-fn m5_uncompressed_chain_is_v3_generation_layout_and_reads_back() {
+fn m5_uncompressed_chain_uses_current_generation_layout_and_reads_back() {
     // Compression off still writes overflow v3 without its compression flag; the head
     // persists the same allocation generation as LobRef. Verify raw head bytes directly.
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
@@ -23581,7 +23587,7 @@ fn m5_uncompressed_chain_is_v3_generation_layout_and_reads_back() {
         .row_column_external_ref(table_id, row_id, 1)
         .unwrap()
         .unwrap();
-    // Raw head version is 3 at OVFL_OFF_VERSION=4, little-endian u16;
+    // The head stores the current version at offset 4, little-endian u16;
     // flags at OVFL_OFF_FLAGS=22 contain HEAD only, not compression.
     let head = db
         .with_overflow_read(table_id, |ovf| {
@@ -23594,8 +23600,8 @@ fn m5_uncompressed_chain_is_v3_generation_layout_and_reads_back() {
     let flags = u16::from_le_bytes([head[22], head[23]]);
     let generation = u64::from_le_bytes(head[32..40].try_into().unwrap());
     assert_eq!(
-        version, 3,
-        "Uncompressed chains must use overflow v3 layout"
+        version, OVFL_VERSION,
+        "Uncompressed chains must use the registered overflow layout"
     );
     assert_eq!(generation, lob.generation);
     assert_eq!(
@@ -27076,6 +27082,7 @@ fn ddl_copy_swap_keeps_recovery_bases_until_commit() {
     for ((old, _), (private, _)) in old_paths.iter().zip(&private_paths) {
         if old.exists() {
             fs::create_dir_all(private.parent().unwrap()).unwrap();
+            transfer_page_owner(old, private).unwrap();
             fs::copy(old, private).unwrap();
         }
     }
@@ -27786,4 +27793,378 @@ fn spatial_index_crash_recovery_at_every_split_publication_delete() {
 #[test]
 fn spatial_index_crash_recovery_at_every_split_publication_reuse() {
     check_spatial_index_split_crash_recovery(420, true, &["reuse"]);
+}
+
+#[test]
+fn release_format_rejects_lost_heap_and_dictionary_authority() {
+    for damage in ["missing", "truncated", "zero", "dictionary"] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let config = test_storage_config_with_validation(
+            DurabilityMode::Strict,
+            StartupValidationMode::Full,
+        );
+        let path;
+        {
+            let db = Database::open_with_config(dir.path(), config.clone()).unwrap();
+            create_checkpoint_test_table(&db);
+            insert_checkpoint_test_row(&db, 111);
+            db.checkpoint().unwrap();
+            path = db.table_path(db.table("test.t").unwrap().id);
+        }
+        match damage {
+            "missing" => fs::remove_file(&path).unwrap(),
+            "truncated" => fs::write(&path, []).unwrap(),
+            "zero" => {
+                fs::write(&path, vec![0; fs::metadata(&path).unwrap().len() as usize]).unwrap()
+            }
+            _ => {
+                fs::remove_dir_all(crate::storage::naming::system_catalog_dir(dir.path())).unwrap()
+            }
+        }
+        assert!(
+            Database::open_with_config(dir.path(), config).is_err(),
+            "accepted {damage}"
+        );
+    }
+}
+
+#[test]
+fn release_format_rejects_heap_owner_and_page_position_swaps() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let log = test_log(dir.path());
+    let first = dir.path().join("a.heap");
+    let second = dir.path().join("b.heap");
+    {
+        let a = HeapFile::open(first.clone(), 1, log.clone()).unwrap();
+        let b = HeapFile::open(second.clone(), 2, log.clone()).unwrap();
+        a.insert_mvcc(1, RowHeader::visible(1), &[Value::Int(111)])
+            .unwrap();
+        b.insert_mvcc(2, RowHeader::visible(2), &[Value::Int(222)])
+            .unwrap();
+        a.flush_dirty_pages().unwrap();
+        b.flush_dirty_pages().unwrap();
+    }
+    let a = fs::read(&first).unwrap();
+    let b = fs::read(&second).unwrap();
+    fs::write(&first, &b).unwrap();
+    fs::write(&second, &a).unwrap();
+    assert!(HeapFile::open(first.clone(), 1, log.clone()).is_err());
+    fs::write(&first, &a).unwrap();
+    let mut bytes = a;
+    bytes[PAGE_SIZE + 56..PAGE_SIZE + 64].copy_from_slice(&2u64.to_le_bytes());
+    let checksum = page_checksum(&bytes[PAGE_SIZE..2 * PAGE_SIZE], 16);
+    write_u32(&mut bytes[PAGE_SIZE..2 * PAGE_SIZE], 16, checksum);
+    fs::write(&first, bytes).unwrap();
+    let heap = HeapFile::open(first, 1, log).unwrap();
+    assert!(heap.scan_mvcc().is_err());
+}
+
+#[test]
+fn release_format_golden_page_and_value_corpus() {
+    use crate::storage::format_golden::golden;
+    let page = |mut bytes: Vec<u8>, id| {
+        stamp_page_owner(&mut bytes, &[0xa5; 16], id);
+        set_page_lsn_if_formatted(&mut bytes, 17);
+        bytes
+    };
+    golden!(
+        "heap-meta",
+        &page(encode_heap_meta(Path::new("fixture.heap"), 2), 0)
+    );
+    golden!("heap-page", &page(Page::new().encode(), 1));
+    golden!(
+        "index-meta",
+        &page(
+            encode_index_meta(&IndexMeta {
+                root_page: 1,
+                next_page_id: 2,
+                free_page_head: None
+            }),
+            0
+        )
+    );
+    let entry = IndexEntry {
+        key: IndexKey::from(vec![KeyPart::Int(-17), KeyPart::String("中".into())]),
+        row_id: RowId {
+            page_id: 1,
+            slot_id: 3,
+        },
+    };
+    let leaf = IndexPage::Leaf(IndexLeafPage::new_with_resolved_layout(vec![entry], None));
+    golden!(
+        "index-leaf",
+        &page(encode_index_tree_page(&leaf).unwrap(), 1)
+    );
+    golden!("lob-meta", &page(encode_overflow_meta_page(0, 2, 18), 0));
+    golden!(
+        "lob-page",
+        &page(
+            encode_overflow_page(OVFL_FLAG_HEAD, 0, 17, b"persistent payload"),
+            1
+        )
+    );
+    golden!(
+        "vector-meta",
+        &encode_vector_meta(&VectorMeta::fresh(4, 0, 16, 32, 200))
+    );
+    let mut state = Vec::new();
+    let mut writer = crate::engine::vector::persistence::Writer::new(&mut state, 7).unwrap();
+    writer.u64(17).unwrap();
+    writer.bytes(b"model").unwrap();
+    writer.finish().unwrap();
+    golden!("vector-state", &state);
+    let value = crate::vector::VectorValue::new(
+        crate::vector::VectorDataType::Float16,
+        3,
+        vec![0, 0x3c, 0, 0x38, 0, 0xc0],
+    );
+    golden!("vector-value", &value.encode());
+    assert_eq!(
+        crate::vector::VectorValue::decode(&value.encode()).unwrap(),
+        value
+    );
+    let mut values = Vec::new();
+    encode_row_into(
+        &[
+            Value::Null,
+            Value::Int(-17),
+            Value::UInt(u64::MAX),
+            Value::String("中\0".into()),
+            Value::Bytes(vec![0, 255]),
+            Value::Decimal("123456789012345678901234567890.01".into()),
+            Value::Date(0),
+            Value::Time(-1),
+            Value::DateTime(1),
+            Value::Timestamp(4_102_444_799_123_456),
+        ],
+        &mut values,
+    )
+    .unwrap();
+    golden!("row-values", &values);
+    let spec = row_codec_spec(
+        &DataTypeKind::Decimal {
+            precision: Some(65),
+            scale: Some(30),
+        },
+        false,
+    );
+    golden!("row-codec-spec", &serde_json::to_vec(&spec).unwrap());
+}
+
+#[test]
+fn release_format_shadow_capacity_rejection_preserves_file_extent() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let path = dir.path().join("capacity.heap");
+    let heap = HeapFile::open(path.clone(), 1, test_log(dir.path())).unwrap();
+    heap.page_count
+        .store(u64::from(u32::MAX) + 1, Ordering::Release);
+    let mut batch = ShadowPreparedHeapBatch {
+        encoded_pages: vec![0; PAGE_SIZE],
+        row_ids: vec![RowId {
+            page_id: 0,
+            slot_id: 0,
+        }],
+    };
+    assert!(heap
+        .reserve_prepared_shadow_batch_direct(&mut batch)
+        .is_err());
+    assert_eq!(fs::metadata(path).unwrap().len(), PAGE_SIZE as u64);
+}
+
+#[test]
+fn release_format_golden_all_index_layouts() {
+    let cases = vec![
+        vec![
+            vec![KeyPart::String("a".into())],
+            vec![KeyPart::String("中".into())],
+        ],
+        vec![vec![KeyPart::DateTime(17)], vec![KeyPart::DateTime(19)]],
+        vec![vec![KeyPart::Date(-17)], vec![KeyPart::Date(19)]],
+        vec![
+            vec![KeyPart::Decimal {
+                value: -17,
+                scale: 2,
+            }],
+            vec![KeyPart::Decimal {
+                value: 19,
+                scale: 2,
+            }],
+        ],
+        vec![
+            vec![KeyPart::Decimal {
+                value: -17,
+                scale: 2,
+            }],
+            vec![KeyPart::Decimal {
+                value: 1i128 << 40,
+                scale: 2,
+            }],
+        ],
+        vec![vec![KeyPart::Int(-17)], vec![KeyPart::Int(19)]],
+        vec![vec![KeyPart::Int(-17)], vec![KeyPart::Int(1 << 20)]],
+        vec![
+            vec![KeyPart::Int(-17), KeyPart::Int(2)],
+            vec![KeyPart::Int(19), KeyPart::Int(3)],
+        ],
+        vec![vec![KeyPart::UInt(17)], vec![KeyPart::UInt(19)]],
+        vec![vec![KeyPart::UInt(17)], vec![KeyPart::UInt(1 << 20)]],
+    ];
+    let mut corpus = Vec::new();
+    for (layout, keys) in cases.into_iter().enumerate() {
+        let entries = keys
+            .into_iter()
+            .enumerate()
+            .map(|(slot, key)| IndexEntry {
+                key: IndexKey::from(key),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: slot as u16,
+                },
+            })
+            .collect::<Vec<_>>();
+        let leaf = IndexLeafPage::new_with_resolved_layout(entries.clone(), Some(3));
+        let internal = IndexInternalPage::new_generic(entries.clone(), vec![3, 4, 5]);
+        assert_eq!(leaf.key_layout, layout as u8);
+        assert_eq!(internal.key_layout, layout as u8);
+        for page in [IndexPage::Leaf(leaf), IndexPage::Internal(internal)] {
+            let mut bytes = encode_index_tree_page(&page).unwrap();
+            stamp_page_owner(&mut bytes, &[0xa5; 16], 1);
+            set_page_lsn_if_formatted(&mut bytes, 17);
+            match decode_index_tree_page(&bytes).unwrap() {
+                IndexPage::Leaf(decoded) => assert_eq!(decoded.entries, entries),
+                IndexPage::Internal(decoded) => assert_eq!(decoded.keys, entries),
+                _ => panic!("unexpected free page"),
+            }
+            corpus.extend(bytes);
+        }
+    }
+    crate::storage::format_golden::golden!("index-layouts", &corpus);
+}
+
+#[test]
+fn release_format_golden_all_codec_descriptors() {
+    use crate::vector::VectorDataType;
+    let mut kinds = vec![
+        ColumnKind::Float32,
+        ColumnKind::Float64,
+        ColumnKind::Decimal { scale: 0 },
+        ColumnKind::Decimal { scale: 30 },
+        ColumnKind::DecimalWide { scale: 30 },
+        ColumnKind::VarString,
+        ColumnKind::VarBytes,
+        ColumnKind::Json,
+        ColumnKind::Geometry,
+        ColumnKind::Date,
+        ColumnKind::Year,
+    ];
+    for width in [1, 2, 3, 4, 8] {
+        for signed in [false, true] {
+            kinds.push(ColumnKind::Int { width, signed });
+        }
+    }
+    for width in [4, 8, 16] {
+        kinds.push(ColumnKind::DecimalFixed { width, scale: 2 });
+    }
+    for fsp in 0..=6 {
+        kinds.extend([
+            ColumnKind::Time { fsp },
+            ColumnKind::DateTime { fsp },
+            ColumnKind::Timestamp { fsp },
+        ]);
+    }
+    for datatype in [
+        VectorDataType::Float32,
+        VectorDataType::Float16,
+        VectorDataType::BFloat16,
+        VectorDataType::Int8,
+        VectorDataType::Binary,
+    ] {
+        kinds.push(ColumnKind::Vector {
+            dim: None,
+            datatype,
+        });
+        kinds.push(ColumnKind::Vector {
+            dim: Some(17),
+            datatype,
+        });
+        kinds.push(ColumnKind::VectorFixed { dim: 17, datatype });
+    }
+    for width in [0, 1, 255, 65535] {
+        kinds.push(ColumnKind::FixedBytes { width });
+    }
+    for width in 1..=8 {
+        kinds.push(ColumnKind::Bit { width });
+    }
+    for count in [1, 255, 256, 65535] {
+        kinds.push(ColumnKind::Enum {
+            values: (0..count).map(|i| format!("v{i}")).collect(),
+            width: enum_storage_width(count),
+        });
+    }
+    for count in [1, 8, 9, 16, 17, 24, 25, 32, 33, 64] {
+        kinds.push(ColumnKind::Set {
+            values: (0..count).map(|i| format!("v{i}")).collect(),
+            width: set_storage_width(count),
+        });
+    }
+    let specs = kinds
+        .into_iter()
+        .map(|kind| RowCodecSpec {
+            version: crate::storage::format_versions::ROW_CODEC_SPEC_VERSION,
+            kind,
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&specs).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<RowCodecSpec>>(&bytes).unwrap(),
+        specs
+    );
+    crate::storage::format_golden::golden!("row-codec-matrix", &bytes);
+}
+
+#[test]
+fn release_format_table_id_limit_cannot_enter_dictionary_namespace() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let before = db
+        .scan_dd_table(crate::storage::data_dictionary::DD_DD_PROPERTIES)
+        .unwrap();
+    db.catalog_write().unwrap().next_table_id = crate::storage::data_dictionary::DD_TABLE_ID_BASE;
+    let err = db
+        .create_table(
+            "exhausted",
+            vec![checkpoint_test_pk_column()],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap_err();
+    assert!(
+        err.message().contains("identity space exhausted"),
+        "{err:?}"
+    );
+    assert_eq!(
+        db.scan_dd_table(crate::storage::data_dictionary::DD_DD_PROPERTIES)
+            .unwrap(),
+        before
+    );
+    assert!(db.table("test.exhausted").is_err());
+}
+
+#[test]
+fn release_format_column_and_layout_limits_preserve_existing_identity() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    create_checkpoint_test_table(&db);
+    let mut table = db.table("test.t").unwrap().as_ref().clone();
+    table.next_column_id = u32::MAX;
+    assert!(table.allocate_column_id().is_err());
+    assert_eq!(table.next_column_id, u32::MAX);
+    table.columns[0].physical_pos = u32::MAX;
+    assert!(table.next_physical_pos().is_err());
+    table.row_layouts[0].layout_id = u32::MAX;
+    table.active_layout_id = u32::MAX;
+    table.columns[0].data_type = DataTypeKind::BigInt;
+    assert!(table.publish_new_row_layout().is_err());
+    assert_eq!(table.active_layout_id, u32::MAX);
+    assert_eq!(table.row_layouts.len(), 1);
 }

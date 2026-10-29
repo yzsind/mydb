@@ -14,7 +14,11 @@ use crate::types::QueryError;
 /// Portable row-binlog envelope for VECTOR values encoded as a MySQL LONG
 /// BLOB. MySQL 8.0 replicas can store it losslessly in a BLOB column; mydb
 /// replicas recognize the magic and recover the explicit datatype, dimension and native payload.
-pub(crate) const VECTOR_BINLOG_MAGIC: &[u8; 8] = b"MYDBVEC2";
+pub(crate) const VECTOR_BINLOG_MAGIC: &[u8; 8] =
+    match crate::storage::format_versions::VECTOR_BINLOG_VERSION {
+        2 => b"MYDBVEC2",
+        _ => panic!("implement the registered VECTOR binlog envelope"),
+    };
 
 /// Build a `QueryError` for an invalid VECTOR value/operation. Centralised so
 /// the error code / SQLSTATE conventions stay consistent across the module.

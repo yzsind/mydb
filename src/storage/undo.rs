@@ -102,9 +102,88 @@ pub(crate) fn default_undo_mem_cache_bytes() -> u64 {
 }
 
 const UNDO_SEGMENT_MAGIC: &[u8; 8] = b"MYUNDO1\0";
-const UNDO_SEGMENT_HEADER_LEN: u64 = 32;
+const UNDO_SEGMENT_HEADER_LEN: u64 = 64;
 const UNDO_FRAME_MAGIC: u32 = 0x4d_55_46_52; // MUFR
-const UNDO_FRAME_HEADER_LEN: usize = 16;
+const UNDO_FRAME_HEADER_LEN: usize = 24;
+fn undo_header_crc(header: &[u8], segment: u32) -> u32 {
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&header[..16]);
+    crc.update(&header[20..24]);
+    crc.update(&segment.to_le_bytes());
+    crc.finalize()
+}
+
+fn undo_frame_header(payload: &[u8]) -> [u8; UNDO_FRAME_HEADER_LEN] {
+    let ptr = u64::from_le_bytes(
+        payload[UNDO_ENCODED_ID_OFFSET..UNDO_ENCODED_ID_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let mut header = [0; UNDO_FRAME_HEADER_LEN];
+    header[..4].copy_from_slice(&UNDO_FRAME_MAGIC.to_le_bytes());
+    header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    header[8..12].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    header[12..16].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
+    header[20..24].copy_from_slice(&(undo_ptr_offset(ptr) as u32).to_le_bytes());
+    let crc = undo_header_crc(&header, undo_ptr_segment(ptr));
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
+fn validate_undo_frame_header(header: &[u8], segment: u32, offset: u64) -> Result<(), QueryError> {
+    if header.len() != UNDO_FRAME_HEADER_LEN
+        || u32::from_le_bytes(header[20..24].try_into().unwrap()) as u64 != offset
+        || u32::from_le_bytes(header[16..20].try_into().unwrap())
+            != undo_header_crc(header, segment)
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt undo frame header checksum or physical identity",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode_framing(bytes: &[u8]) {
+    if let Some(payload) = bytes.get(UNDO_FRAME_HEADER_LEN..) {
+        let _ = decode_undo_record(payload);
+        let _ = decode_undo_record_metadata(payload);
+        if let Some(id) = payload.get(UNDO_ENCODED_ID_OFFSET..UNDO_ENCODED_ID_OFFSET + 8) {
+            let ptr = u64::from_le_bytes(id.try_into().unwrap());
+            let _ = validate_undo_frame_header(
+                &bytes[..UNDO_FRAME_HEADER_LEN],
+                undo_ptr_segment(ptr),
+                undo_ptr_offset(ptr),
+            );
+        }
+    }
+}
+
+fn undo_storage_uuid(directory: &Path) -> Result<[u8; 16], QueryError> {
+    let root = directory.parent().and_then(Path::parent).ok_or_else(|| {
+        error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid undo directory",
+        )
+    })?;
+    Ok(crate::storage::control::Control::load(root)?.map_or([0; 16], |control| control.uuid))
+}
+
+fn encode_undo_segment_header(
+    segment: u32,
+    uuid: [u8; 16],
+) -> [u8; UNDO_SEGMENT_HEADER_LEN as usize] {
+    let mut header = [0; UNDO_SEGMENT_HEADER_LEN as usize];
+    header[..8].copy_from_slice(UNDO_SEGMENT_MAGIC);
+    header[8..12].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&segment.to_le_bytes());
+    header[24..40].copy_from_slice(&uuid);
+    let crc = crc32fast::hash(&header[..60]);
+    header[60..64].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
 const MAX_UNDO_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_REPLICATED_PENDING_FRAMES: usize = 4096;
 const MAX_REPLICATED_PENDING_BYTES: usize = 64 * 1024 * 1024;
@@ -551,6 +630,12 @@ pub(crate) fn decode_undo_record(input: &[u8]) -> Result<UndoRecord, QueryError>
         0 => UndoKind::Insert,
         1 => {
             let count = undo_read_u32(input, &mut pos)? as usize;
+            if count > input.len().saturating_sub(pos) / 6 {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt undo row-id count",
+                ));
+            }
             let mut row_ids = Vec::with_capacity(count);
             for _ in 0..count {
                 row_ids.push(decode_row_id(input, &mut pos)?);
@@ -561,6 +646,12 @@ pub(crate) fn decode_undo_record(input: &[u8]) -> Result<UndoRecord, QueryError>
         3 => UndoKind::Delete,
         4 => {
             let count = undo_read_u32(input, &mut pos)? as usize;
+            if count > input.len().saturating_sub(pos) / 2 {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt undo changed-column count",
+                ));
+            }
             let mut before_cols = Vec::with_capacity(count);
             for _ in 0..count {
                 before_cols.push(undo_read_u16(input, &mut pos)?);
@@ -591,10 +682,13 @@ pub(crate) fn decode_undo_record(input: &[u8]) -> Result<UndoRecord, QueryError>
     let before_external = decode_undo_lob_refs(input, &mut pos, "corrupt undo record")?;
     let borrowed_external =
         decode_undo_lob_refs(input, &mut pos, "corrupt undo borrowed LOB descriptors")?;
-    // Older frames omit chain_depth; both read lanes preserve that contract.
-    let chain_depth = crate::util::bytes::read_word(input, &mut pos)
-        .map(u32::from_le_bytes)
-        .unwrap_or(0);
+    let chain_depth = undo_read_u32(input, &mut pos)?;
+    if pos != input.len() {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unexpected trailing undo record bytes",
+        ));
+    }
     Ok(UndoRecord {
         id,
         txn_id,
@@ -683,10 +777,13 @@ pub(crate) fn decode_undo_record_metadata(input: &[u8]) -> Result<UndoRecord, Qu
     let before_external = decode_undo_lob_refs(input, &mut pos, "corrupt undo record")?;
     let borrowed_external =
         decode_undo_lob_refs(input, &mut pos, "corrupt undo borrowed LOB descriptors")?;
-    // Older frames omit chain_depth; both read lanes preserve that contract.
-    let chain_depth = crate::util::bytes::read_word(input, &mut pos)
-        .map(u32::from_le_bytes)
-        .unwrap_or(0);
+    let chain_depth = undo_read_u32(input, &mut pos)?;
+    if pos != input.len() {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unexpected trailing undo record bytes",
+        ));
+    }
     Ok(UndoRecord {
         id,
         txn_id,
@@ -755,13 +852,13 @@ fn undo_read_u64(input: &[u8], pos: &mut usize) -> Result<u64, QueryError> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UndoManifest {
     /// Fsynced recovery outputs awaiting rename; published with their aliases.
-    #[serde(default)]
     pending_recovery_segments: Vec<u32>,
-    #[serde(default)]
     compaction_seq_high: u32,
     version: u32,
+    storage_uuid: [u8; 16],
     segment_bytes: u64,
     /// Legacy field: pre-sharding, the manager held a single active
     /// segment. Now `shard_active_segments` is authoritative; this
@@ -771,15 +868,29 @@ struct UndoManifest {
     /// P1/6 — one entry per shard. Index = shard_id, value = active
     /// segment_id for that shard. Older manifests without this field
     /// rebuild shard mapping from on-disk segments.
-    #[serde(default)]
     shard_active_segments: Vec<u32>,
-    #[serde(default)]
     compensated: HashSet<u64>,
     /// Frames that never became a transaction head. Never reuse their IDs.
-    #[serde(default)]
     discarded: HashSet<u64>,
-    #[serde(default)]
     forwardings: HashMap<u64, u64>,
+}
+
+fn decode_undo_manifest(bytes: &[u8]) -> Result<UndoManifest, QueryError> {
+    crate::storage::metadata::decode(
+        crate::storage::metadata::UNDO_MANIFEST,
+        UNDO_TABLESPACE_VERSION as u16,
+        bytes,
+    )
+    .map_err(json_err)
+}
+
+fn encode_undo_manifest(value: &UndoManifest) -> Result<Vec<u8>, QueryError> {
+    crate::storage::metadata::encode(
+        crate::storage::metadata::UNDO_MANIFEST,
+        UNDO_TABLESPACE_VERSION as u16,
+        value,
+    )
+    .map_err(json_err)
 }
 
 /// One rollback-segment shard. Each shard owns:
@@ -885,7 +996,7 @@ impl UndoWriteShard {
             .open(&path)
             .map_err(io_err)?;
         if !exists || file.metadata().map_err(io_err)?.len() == 0 {
-            write_segment_header(&mut file, self.active_segment_id)?;
+            write_segment_header(&mut file, self.active_segment_id, &path)?;
             self.pending_sync.insert(self.active_segment_id);
             self.active_offset = UNDO_SEGMENT_HEADER_LEN;
         } else {
@@ -910,7 +1021,7 @@ impl UndoWriteShard {
             file.flush().map_err(io_err)?;
         }
         self.active_file = None;
-        self.next_seg_seq = self.next_seg_seq.saturating_add(1).max(1);
+        self.next_seg_seq = recovery::next_recovery_sequence(self.next_seg_seq)?;
         self.active_segment_id = make_segment_id(self.shard_id, self.next_seg_seq);
         self.active_offset = UNDO_SEGMENT_HEADER_LEN;
         self.ensure_active_segment()
@@ -932,11 +1043,7 @@ impl UndoWriteShard {
                 "undo pointer allocation mismatch",
             ));
         }
-        let mut header = [0u8; UNDO_FRAME_HEADER_LEN];
-        header[0..4].copy_from_slice(&UNDO_FRAME_MAGIC.to_le_bytes());
-        header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        header[8..12].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
-        header[12..16].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
+        let header = undo_frame_header(&payload);
         self.pending_sync.insert(segment_id);
         let started = std::time::Instant::now();
         if self.buffer_limit == 0 {
@@ -1313,6 +1420,7 @@ fn read_undo_frame_from_open_file(
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(io_err(err)),
     }
+    validate_undo_frame_header(&header, segment_id, offset)?;
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -1684,6 +1792,26 @@ struct DecodedSegment {
     discarded_records: u64,
 }
 
+fn validate_scanned_undo_tail(
+    decoded: &DecodedSegment,
+    writable_tails: &std::collections::HashMap<u32, u32>,
+    forced: bool,
+) -> Result<(), QueryError> {
+    if decoded.truncate_to.is_some()
+        && !forced
+        && writable_tails.get(&shard_of_segment(decoded.segment_id)) != Some(&decoded.segment_id)
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!(
+                "incomplete sealed undo segment {:#x}; refusing tail truncation",
+                decoded.segment_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_segment_file(
     path: &Path,
     segment_id: u32,
@@ -1729,7 +1857,15 @@ fn decode_segment_file_filtered(
     }
     let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let stored_id = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-    if version != UNDO_TABLESPACE_VERSION || stored_id != segment_id {
+    if version != UNDO_TABLESPACE_VERSION
+        || stored_id != segment_id
+        || u32::from_le_bytes(buf[60..64].try_into().unwrap()) != crc32fast::hash(&buf[..60])
+        || buf[16..24]
+            .iter()
+            .chain(buf[40..60].iter())
+            .any(|b| *b != 0)
+        || buf[24..40] != undo_storage_uuid(path.parent().unwrap())?
+    {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             format!("corrupt undo segment header in {}: version {version}, segment {stored_id:#x}; expected version {UNDO_TABLESPACE_VERSION}, segment {segment_id:#x}", path.display()),
@@ -1778,6 +1914,10 @@ fn decode_segment_file_filtered(
             break;
         }
         let frame_header = &buf[hstart..hstart + UNDO_FRAME_HEADER_LEN];
+        if let Err(err) = validate_undo_frame_header(frame_header, segment_id, offset) {
+            truncate_to = bail(err.message(), offset)?;
+            break;
+        }
         let magic = u32::from_le_bytes(frame_header[0..4].try_into().unwrap());
         let payload_len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap()) as usize;
         let checksum = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
@@ -1891,26 +2031,22 @@ fn undo_force_recover() -> bool {
         .unwrap_or(false)
 }
 
-fn write_segment_header(file: &mut File, segment_id: u32) -> Result<(), QueryError> {
-    let mut header = [0u8; UNDO_SEGMENT_HEADER_LEN as usize];
-    header[..8].copy_from_slice(UNDO_SEGMENT_MAGIC);
-    header[8..12].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&segment_id.to_le_bytes());
+fn write_segment_header(file: &mut File, segment_id: u32, path: &Path) -> Result<(), QueryError> {
+    let header = encode_undo_segment_header(segment_id, undo_storage_uuid(path.parent().unwrap())?);
     file.seek(SeekFrom::Start(0)).map_err(io_err)?;
     file.write_all(&header).map_err(io_err)?;
     file.flush().map_err(io_err)
 }
 
-/// Serialize a 32-byte segment header into an in-memory buffer (the
-/// build-then-swap phase assembles a whole segment in RAM before one
-/// `write_all`, so it cannot use the `&mut File` variant).
-fn write_segment_header_into(buf: &mut Vec<u8>, segment_id: u32) {
-    let mut header = [0u8; UNDO_SEGMENT_HEADER_LEN as usize];
-    header[..8].copy_from_slice(UNDO_SEGMENT_MAGIC);
-    header[8..12].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&segment_id.to_le_bytes());
+fn write_segment_header_into(
+    buf: &mut Vec<u8>,
+    segment_id: u32,
+    directory: &Path,
+) -> Result<(), QueryError> {
+    let header = encode_undo_segment_header(segment_id, undo_storage_uuid(directory)?);
     buf.clear();
     buf.extend_from_slice(&header);
+    Ok(())
 }
 
 /// Decode a single undo frame directly from a segment file at `offset`,
@@ -1924,12 +2060,16 @@ fn read_undo_frame_at(path: &Path, offset: u64) -> Result<Option<UndoRecord>, Qu
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(io_err(err)),
     };
+    let mut segment_header = [0; UNDO_SEGMENT_HEADER_LEN as usize];
+    undo_read_exact_at(&file, &mut segment_header, 0).map_err(io_err)?;
+    let segment_id = u32::from_le_bytes(segment_header[12..16].try_into().unwrap());
     let mut header = [0u8; UNDO_FRAME_HEADER_LEN];
     match undo_read_exact_at(&file, &mut header, offset) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(io_err(err)),
     }
+    validate_undo_frame_header(&header, segment_id, offset)?;
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -2315,13 +2455,14 @@ impl UndoManager {
         strict_recovery: bool,
     ) -> Result<Self, QueryError> {
         let undo_dir = crate::storage::naming::system_undo_dir(data_dir);
-        fs::create_dir_all(&undo_dir).map_err(io_err)?;
         let legacy = undo_dir.join("undo.tbl");
         if legacy.exists() {
             return Err(error(crate::error::catalog::ER_UNKNOWN_ERROR,
                 "legacy undo/undo.tbl is incompatible with the segmented undo tablespace; use a new data directory or rebuild data",
             ));
         }
+        crate::storage::control::Control::admit(data_dir)?;
+        fs::create_dir_all(&undo_dir).map_err(io_err)?;
         if segment_bytes > u32::MAX as u64 {
             return Err(error(
                 crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
@@ -2520,7 +2661,7 @@ impl UndoManager {
                     .map_err(io_err)?;
                 let mut len = file.metadata().map_err(io_err)?.len();
                 if len < UNDO_SEGMENT_HEADER_LEN {
-                    write_segment_header(&mut file, segment_id)?;
+                    write_segment_header(&mut file, segment_id, &path)?;
                     len = UNDO_SEGMENT_HEADER_LEN;
                 }
                 open_files.insert(segment_id, (file, len));
@@ -2554,11 +2695,7 @@ impl UndoManager {
                         patched_payload.as_slice()
                     }
                 };
-            let mut header = [0u8; UNDO_FRAME_HEADER_LEN];
-            header[0..4].copy_from_slice(&UNDO_FRAME_MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-            header[8..12].copy_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-            header[12..16].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
+            let header = undo_frame_header(&payload);
             file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
             file.write_all(&header).map_err(io_err)?;
             file.write_all(&payload).map_err(io_err)?;
@@ -2853,7 +2990,7 @@ impl UndoManager {
     /// Apply the source's atomic relocation manifest to an online receiver.
     /// The accompanying output files have already been installed by WAL redo.
     pub(crate) fn apply_source_manifest(&mut self, bytes: &[u8]) -> Result<(), QueryError> {
-        let manifest: UndoManifest = serde_json::from_slice(bytes).map_err(json_err)?;
+        let manifest: UndoManifest = decode_undo_manifest(bytes)?;
         if manifest.version != UNDO_TABLESPACE_VERSION
             || !manifest.pending_recovery_segments.is_empty()
         {
@@ -2904,8 +3041,12 @@ impl UndoManager {
             return Ok(());
         }
         let bytes = fs::read(path).map_err(io_err)?;
-        let manifest: UndoManifest = serde_json::from_slice(&bytes).map_err(json_err)?;
-        if manifest.version != UNDO_TABLESPACE_VERSION {
+        let manifest: UndoManifest = decode_undo_manifest(&bytes)?;
+        if manifest.version != UNDO_TABLESPACE_VERSION
+            || manifest.storage_uuid != undo_storage_uuid(self.undo_dir.as_ref().unwrap())?
+            || manifest.shard_active_segments.is_empty()
+            || manifest.active_segment_id != manifest.shard_active_segments[0]
+        {
             return Err(error(
                 crate::error::catalog::ER_UNKNOWN_ERROR,
                 "unsupported undo tablespace version; use a new data directory or rebuild data",
@@ -2941,20 +3082,14 @@ impl UndoManager {
                 "persisted mydb_undo_segment_bytes exceeds the 32-bit undo offset limit",
             ));
         }
-        self.segment_bytes = manifest.segment_bytes.max(UNDO_SEGMENT_HEADER_LEN * 2);
-        // Restore each shard's active segment id from the manifest.
-        // Pre-sharding manifests have no `shard_active_segments`; in
-        // that case shard 0 inherits the legacy `active_segment_id`
-        // and the rest stay at their fresh defaults.
-        let shard_active = if manifest.shard_active_segments.is_empty() {
-            let mut v = vec![0u32; self.write_shards.len()];
-            if let Some(slot) = v.get_mut(0) {
-                *slot = manifest.active_segment_id;
-            }
-            v
-        } else {
-            manifest.shard_active_segments.clone()
-        };
+        if manifest.segment_bytes < UNDO_SEGMENT_HEADER_LEN * 2 {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "invalid undo segment size in manifest",
+            ));
+        }
+        self.segment_bytes = manifest.segment_bytes;
+        let shard_active = manifest.shard_active_segments;
         for (shard_idx, seg_id) in shard_active.into_iter().enumerate() {
             let Some(shard_mu) = self.write_shards.get(shard_idx) else {
                 continue;
@@ -2993,6 +3128,7 @@ impl UndoManager {
             pending_recovery_segments: pending.to_vec(),
             compaction_seq_high: self.compaction_seq_high,
             version: UNDO_TABLESPACE_VERSION,
+            storage_uuid: undo_storage_uuid(self.undo_dir.as_ref().unwrap())?,
             segment_bytes: self.segment_bytes,
             active_segment_id: legacy_active,
             shard_active_segments: shard_active,
@@ -3001,7 +3137,7 @@ impl UndoManager {
             forwardings: self.compaction_forwarded.clone(),
         };
         let tmp = path.with_extension("manifest.tmp");
-        let bytes = serde_json::to_vec_pretty(&manifest).map_err(json_err)?;
+        let bytes = encode_undo_manifest(&manifest)?;
         let unchanged = manifest_contents_match(path, &bytes);
         let sync = self.compensation_manifest_dirty.load(Ordering::Acquire);
         #[cfg(target_os = "macos")]
@@ -3097,6 +3233,23 @@ impl UndoManager {
         }
         ids.sort_unstable();
 
+        // Rotation flushes the old shard before publishing a successor.
+        // Only the highest allocation segment in a lane may have a torn append;
+        // atomically published compaction outputs are always sealed.
+        let mut writable_tails = std::collections::HashMap::<u32, u32>::new();
+        for id in self
+            .active_segment_ids()
+            .into_iter()
+            .chain(ids.iter().copied())
+        {
+            let lane = shard_of_segment(id);
+            if lane != COMPACTION_SHARD_LANE {
+                writable_tails
+                    .entry(lane)
+                    .and_modify(|old| *old = (*old).max(id))
+                    .or_insert(id);
+            }
+        }
         let scan_started = std::time::Instant::now();
         // P1/7 — decode segments in parallel, then apply sequentially.
         // Each segment file is independent at the byte level (no shared
@@ -3118,6 +3271,7 @@ impl UndoManager {
                 let path = dir.join(segment_file_name(*id));
                 let decoded =
                     decode_segment_file_filtered(&path, *id, force_recover, retained_txn_ids)?;
+                validate_scanned_undo_tail(&decoded, &writable_tails, force_recover)?;
                 self.apply_decoded_segment(decoded)?;
                 if bounded {
                     self.evict_to_cache_budget();
@@ -3139,11 +3293,18 @@ impl UndoManager {
                     let mut handles = Vec::with_capacity(workers);
                     for chunk in paths.chunks(chunk_size) {
                         let chunk = chunk.to_vec();
+                        let writable_tails = &writable_tails;
                         handles.push(scope.spawn(
                             move || -> Result<Vec<DecodedSegment>, QueryError> {
                                 let mut out = Vec::with_capacity(chunk.len());
                                 for (id, path) in chunk {
-                                    out.push(decode_segment_file(&path, id, force_recover)?);
+                                    let decoded = decode_segment_file(&path, id, force_recover)?;
+                                    validate_scanned_undo_tail(
+                                        &decoded,
+                                        writable_tails,
+                                        force_recover,
+                                    )?;
+                                    out.push(decoded);
                                 }
                                 Ok(out)
                             },
@@ -4948,7 +5109,8 @@ impl UndoManager {
             .map(|id| id >> SHARD_BITS)
             .max()
             .unwrap_or(0);
-        let base_seq = disk_max.max(self.compaction_seq_high).saturating_add(1);
+        let base_seq =
+            recovery::next_recovery_sequence(disk_max.max(self.compaction_seq_high)).ok()?;
         Some(CompactionPlan {
             candidates,
             size_before,
@@ -4989,7 +5151,7 @@ impl UndoManager {
         let mut out_seq = plan.out_base_seq;
         let mut seg_id = make_segment_id(COMPACTION_SHARD_LANE, out_seq);
         let mut buf: Vec<u8> = Vec::new();
-        write_segment_header_into(&mut buf, seg_id);
+        write_segment_header_into(&mut buf, seg_id, &plan.dir)?;
         for mv in &plan.moves {
             // Resolve the before-image: resident clone or an off-lock
             // page-in from the immutable candidate file.
@@ -5025,17 +5187,13 @@ impl UndoManager {
                 && cur_offset.saturating_add(frame_len) > seg_bytes
             {
                 Self::flush_compaction_segment(plan, seg_id, std::mem::take(&mut buf), built)?;
-                out_seq = out_seq.saturating_add(1);
+                out_seq = recovery::next_recovery_sequence(out_seq)?;
                 seg_id = make_segment_id(COMPACTION_SHARD_LANE, out_seq);
-                write_segment_header_into(&mut buf, seg_id);
+                write_segment_header_into(&mut buf, seg_id, &plan.dir)?;
             }
             let new_ptr = make_undo_ptr(seg_id, buf.len() as u64)?;
             Self::patch_encoded_id(&mut payload, new_ptr)?;
-            let mut header = [0u8; UNDO_FRAME_HEADER_LEN];
-            header[0..4].copy_from_slice(&UNDO_FRAME_MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-            header[8..12].copy_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-            header[12..16].copy_from_slice(&UNDO_TABLESPACE_VERSION.to_le_bytes());
+            let header = undo_frame_header(&payload);
             buf.extend_from_slice(&header);
             buf.extend_from_slice(&payload);
             rewritten.id = new_ptr;
@@ -5175,6 +5333,7 @@ impl UndoManager {
                     .unwrap_or(self.compaction_seq_high)
                     .max(self.compaction_seq_high),
                 version: UNDO_TABLESPACE_VERSION,
+                storage_uuid: undo_storage_uuid(self.undo_dir.as_ref().unwrap())?,
                 segment_bytes: self.segment_bytes,
                 active_segment_id: active.first().copied().unwrap_or(1),
                 shard_active_segments: active,
@@ -5184,7 +5343,7 @@ impl UndoManager {
             };
             payloads.push(crate::wal::WalPayload::FileCreate {
                 path: "system/undo/undo.manifest".into(),
-                after: serde_json::to_vec(&manifest).map_err(json_err)?,
+                after: encode_undo_manifest(&manifest)?,
             });
             publish(payloads)?;
         }
@@ -6469,7 +6628,7 @@ mod purge_tests {
             assert!(undo.manifest_sync_snapshot.lock().is_none());
         }
         undo.checkpoint_sync_manifest().unwrap();
-        let manifest: UndoManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let manifest: UndoManifest = decode_undo_manifest(&fs::read(&path).unwrap()).unwrap();
         assert!(manifest.compensated.contains(&ptr));
         #[cfg(unix)]
         {
@@ -7045,6 +7204,69 @@ mod buffer_tests {
     }
 
     #[test]
+    fn release_format_undo_frames_are_bound_to_segment_and_offset() {
+        let mut value = record(7);
+        value.id = make_undo_ptr(16, UNDO_SEGMENT_HEADER_LEN).unwrap();
+        let payload = encode_undo_record(&value).unwrap();
+        let header = undo_frame_header(&payload);
+        validate_undo_frame_header(&header, 16, UNDO_SEGMENT_HEADER_LEN).unwrap();
+        assert!(validate_undo_frame_header(&header, 17, UNDO_SEGMENT_HEADER_LEN).is_err());
+        assert!(validate_undo_frame_header(&header, 16, UNDO_SEGMENT_HEADER_LEN + 1).is_err());
+    }
+
+    #[test]
+    fn release_format_sealed_undo_tail_is_preserved() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut undo = open(dir.path());
+        let ptr = undo.append_record(record(1), true).unwrap().0;
+        undo.flush().unwrap();
+        let segment = undo_ptr_segment(ptr);
+        let lane = shard_of_segment(segment) as usize;
+        undo.write_shards[lane].lock().rotate().unwrap();
+        undo.flush().unwrap();
+        let path = undo.segment_path(segment).unwrap();
+        drop(undo);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[1, 2, 3]);
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            UndoManager::open_with_segments(&[], dir.path(), DEFAULT_UNDO_SEGMENT_BYTES).is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn release_format_golden_undo_frame() {
+        crate::storage::format_golden::golden!(
+            "undo-segment",
+            &encode_undo_segment_header(16, [0xa5; 16])
+        );
+        let mut value = record(7);
+        value.id = make_undo_ptr(16, UNDO_SEGMENT_HEADER_LEN).unwrap();
+        let bytes = encode_undo_record(&value).unwrap();
+        let mut frame = undo_frame_header(&bytes).to_vec();
+        frame.extend_from_slice(&bytes);
+        crate::storage::format_golden::golden!("undo-frame", &frame);
+    }
+
+    #[test]
+    fn release_format_undo_rejects_length_corruption_without_discarding_suffix() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut undo = open(dir.path());
+        let ptr = undo.append_record(record(1), true).unwrap().0;
+        undo.append_record(record(2), true).unwrap();
+        undo.flush().unwrap();
+        let segment = undo_ptr_segment(ptr);
+        let path = undo.segment_path(segment).unwrap();
+        drop(undo);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[undo_ptr_offset(ptr) as usize + 6] ^= 0x10;
+        fs::write(&path, &bytes).unwrap();
+        assert!(decode_segment_file(&path, segment, false).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
     fn checkpoint_pending_sync_releases_reclaimed_segments() {
         let dir = tempfile::tempdir().unwrap();
         let mut undo = open(dir.path());
@@ -7512,6 +7734,11 @@ mod buffer_tests {
             r.before_values = Some(vec![Value::String("q".repeat(60))]);
             undo.append_record(r, true).unwrap();
         }
+        undo.write_shards[0].lock().rotate().unwrap();
+        pin(&undo);
+        let mut dead = record(250);
+        dead.before_values = Some(vec![Value::String("q".repeat(60))]);
+        undo.append_record(dead, true).unwrap();
         pin(&undo);
         let (a, _, _) = undo.append_record(record(7), true).unwrap();
         pin(&undo);
@@ -8354,7 +8581,7 @@ mod buffer_tests {
             .is_err());
             let undo_dir = crate::storage::naming::system_undo_dir(dir.path());
             let manifest: UndoManifest =
-                serde_json::from_slice(&fs::read(undo_dir.join("undo.manifest")).unwrap()).unwrap();
+                decode_undo_manifest(&fs::read(undo_dir.join("undo.manifest")).unwrap()).unwrap();
             assert_eq!(manifest.pending_recovery_segments.len(), 2);
             assert!(UndoManager::open_read_only(dir.path(), 128).is_err());
             if rename_first {
@@ -8375,7 +8602,7 @@ mod buffer_tests {
             );
             assert_eq!(recovered.load_owned(second_ptr).unwrap().txn_id, 3);
             let manifest: UndoManifest =
-                serde_json::from_slice(&fs::read(undo_dir.join("undo.manifest")).unwrap()).unwrap();
+                decode_undo_manifest(&fs::read(undo_dir.join("undo.manifest")).unwrap()).unwrap();
             assert!(manifest.pending_recovery_segments.is_empty());
         }
     }

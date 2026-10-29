@@ -136,15 +136,16 @@ mod crash_consistency {
         let relative = "objects/tables/999/1.heap";
         let path = dir.path().join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut log = LogManager::open(dir.path()).unwrap();
         let mut image = Page::new().encode();
+        stamp_page_owner(&mut image, &page_owner(&path), 1);
         set_page_lsn(&mut image, 1);
         refresh_page_checksum(&mut image);
-        let mut log = LogManager::open(dir.path()).unwrap();
         log.append(
             0,
             WalPayload::FullPageImage {
                 path: relative.into(),
-                page_id: 0,
+                page_id: 1,
                 after: image.clone(),
             },
         )
@@ -154,10 +155,12 @@ mod crash_consistency {
         let mut torn = image.clone();
         torn[1000] ^= 1;
         assert!(Page::decode(&torn).is_err());
-        fs::write(&path, torn).unwrap();
+        let mut file = encode_heap_meta(&path, 2);
+        file.extend_from_slice(&torn);
+        fs::write(&path, file).unwrap();
         recover_from_wal(dir.path(), DurabilityMode::Strict).unwrap();
         assert!(
-            Page::decode(&fs::read(&path).unwrap()).is_ok(),
+            Page::decode(&fs::read(&path).unwrap()[PAGE_SIZE..]).is_ok(),
             "valid retained FPI must repair torn heap bytes even with intact page LSN"
         );
     }
@@ -167,8 +170,8 @@ mod crash_consistency {
         let relative = "objects/tables/999/1.heap";
         let path = dir.path().join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let image = Page::new().encode();
         let mut log = LogManager::open(dir.path()).unwrap();
+        let image = encode_heap_meta(&path, 1);
         log.append(7, WalPayload::BeginTxn { start_scn: 1 })
             .unwrap();
         log.append(

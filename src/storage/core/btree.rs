@@ -196,7 +196,7 @@ fn record_bulk_index_build(index: &IndexFile, direct: bool, started: Instant) {
     }
 }
 const INDEX_MIN_PAGE_BYTES: usize = PAGE_SIZE / 4;
-const INDEX_HEADER_BYTES: usize = 24;
+const INDEX_HEADER_BYTES: usize = 64;
 /// Common index page header (offsets 0..24). The buffer-pool +
 /// WAL layer manages this header uniformly for every page-typed
 /// file (heap / index / overflow / vector / ivf):
@@ -2480,6 +2480,7 @@ struct BulkIndexPageWriter {
     images: Vec<u8>,
     first_page: Option<u64>,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    owner: [u8; 16],
 }
 
 impl BulkIndexPageWriter {
@@ -2500,6 +2501,7 @@ impl BulkIndexPageWriter {
             images: Vec::with_capacity(Self::RUN_BYTES),
             first_page: None,
             _charge: charge,
+            owner: index.file_key.owner,
         })
     }
 
@@ -2509,7 +2511,10 @@ impl BulkIndexPageWriter {
             .first_page
             .is_none_or(|first| { page_id == first + (self.images.len() / PAGE_SIZE) as u64 }));
         self.first_page.get_or_insert(page_id);
+        let start = self.images.len();
         self.images.extend_from_slice(image);
+        stamp_page_owner(&mut self.images[start..], &self.owner, page_id);
+        refresh_page_checksum(&mut self.images[start..]);
     }
 
     fn append_leaf(&mut self, page_id: u64, image: &mut [u8], txn_id: u64, lsn: u64) {
@@ -2553,6 +2558,13 @@ impl BulkIndexPageWriter {
     }
 }
 
+fn stamp_bulk_index_images(index: &IndexFile, first_page: u64, images: &mut [u8]) {
+    for (position, image) in images.chunks_exact_mut(PAGE_SIZE).enumerate() {
+        stamp_page_owner(image, &index.file_key.owner, first_page + position as u64);
+        refresh_page_checksum(image);
+    }
+}
+
 /// Streamed external merges retain one producer and a bounded page queue.
 /// Positional writes can overlap both the merge and one another; no worker
 /// publishes a root or performs the final durability barrier.
@@ -2567,6 +2579,7 @@ fn with_parallel_bulk_image_writes<T>(
     let degree = degree.max(1);
     if degree == 1 {
         return produce(&mut |page, images| {
+            stamp_bulk_index_images(index, page, images);
             write_bulk_pages_at(index.durability, file, images, page * PAGE_SIZE as u64)
                 .map_err(io_err)?;
             images.clear();
@@ -2601,6 +2614,7 @@ fn with_parallel_bulk_image_writes<T>(
             }));
         }
         let result = produce(&mut |page, images| {
+            stamp_bulk_index_images(index, page, images);
             let batch =
                 std::mem::replace(images, Vec::with_capacity(BulkIndexPageWriter::RUN_BYTES));
             sender.send((page, batch)).map_err(|_| {
@@ -2861,6 +2875,7 @@ impl IndexFile {
         // files; snapshot restoration must be able to reopen those pages.
         let mut file = if durability == DurabilityMode::Memory
             && !crate::storage::temp_quota::is_temporary_path(&path)
+            && !path.try_exists().map_err(io_err)?
         {
             None
         } else {
@@ -2877,7 +2892,9 @@ impl IndexFile {
                 "corrupt index file length",
             ));
         }
-        let cached_meta = if crate::storage::temp_quota::is_temporary_path(&path) {
+        let cached_meta = if durability == DurabilityMode::Memory
+            || crate::storage::temp_quota::is_temporary_path(&path)
+        {
             // Handle eviction need not evict the buffer frames. Read their
             // current metadata before falling back to the backing file.
             buffer_pool.with_cached_bytes(
@@ -2900,6 +2917,7 @@ impl IndexFile {
                     INDEX_META_PAGE,
                 )?,
             };
+            validate_page_owner(&meta_page, &page_owner(&path), 0)?;
             (decode_index_meta(&meta_page)?, meta_page)
         } else {
             let meta = IndexMeta {
@@ -3035,6 +3053,8 @@ impl IndexFile {
                     let mut meta_image = encode_index_meta(&meta.meta);
                     let root = self.read_page(INDEX_EMPTY_ROOT)?;
                     let mut root_image = encode_index_tree_page(root.as_ref())?;
+                    stamp_page_owner(&mut meta_image, &self.file_key.owner, 0);
+                    stamp_page_owner(&mut root_image, &self.file_key.owner, INDEX_EMPTY_ROOT);
                     let mut log = self.log.lock();
                     let lsn = log.next_lsn();
                     set_page_lsn_if_formatted(&mut meta_image, lsn);
@@ -7244,7 +7264,12 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), token, None, true) {
+                if Self::fulltext_prefetch_may_continue(
+                    leaf.entries.last().map(|entry| &entry.key),
+                    token,
+                    None,
+                    true,
+                ) {
                     self.prefetch_fulltext_leaves(next, token, None, true);
                 }
             }
@@ -7301,7 +7326,12 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), prefix, prefix_upper, false) {
+                if Self::fulltext_prefetch_may_continue(
+                    leaf.entries.last().map(|entry| &entry.key),
+                    prefix,
+                    prefix_upper,
+                    false,
+                ) {
                     self.prefetch_fulltext_leaves(next, prefix, prefix_upper, false);
                 }
             }
@@ -10782,7 +10812,12 @@ impl IndexFile {
             }
             let mut cursor = header.read_slot_offset(header.count - 1);
             let last = header.decode_key_at(&mut cursor)?;
-            Ok(Self::fulltext_prefetch_may_continue(Some(&last), prefix, upper, exact))
+            Ok(Self::fulltext_prefetch_may_continue(
+                Some(&last),
+                prefix,
+                upper,
+                exact,
+            ))
         });
     }
 
@@ -10798,7 +10833,11 @@ impl IndexFile {
             // missing/loading page, then let asynchronous I/O extend the chain.
             match self.buffer_pool.with_cached_prefetch_bytes(&key, |bytes| {
                 let header = parse_leaf_payload_header(bytes)?;
-                Ok(if continues(&header)? { header.next_leaf } else { None })
+                Ok(if continues(&header)? {
+                    header.next_leaf
+                } else {
+                    None
+                })
             }) {
                 Ok(Some(Some(next))) => start = next,
                 Ok(None) => {
@@ -10920,6 +10959,8 @@ impl IndexFile {
             }
             e
         })?;
+        stamp_page_owner(&mut after, &self.file_key.owner, page_id);
+        refresh_page_checksum(&mut after);
         let lsn = if self.durability == DurabilityMode::Memory {
             0
         } else {
@@ -10981,6 +11022,8 @@ impl IndexFile {
 
     fn write_page_direct(&self, page_id: u64, page: IndexPage, lsn: u64) -> Result<(), QueryError> {
         let mut image = encode_index_tree_page(&page)?;
+        stamp_page_owner(&mut image, &self.file_key.owner, page_id);
+        refresh_page_checksum(&mut image);
         if lsn != 0 {
             set_page_lsn_if_formatted(&mut image, lsn);
         }
@@ -10997,6 +11040,8 @@ impl IndexFile {
     fn write_meta_page(&self, txn_id: u64) -> Result<(), QueryError> {
         let mut state = self.meta_state.lock();
         let mut after = encode_index_meta(&state.meta);
+        stamp_page_owner(&mut after, &self.file_key.owner, 0);
+        refresh_page_checksum(&mut after);
         // Physical-replication apply: no local WAL appends (see
         // PHYSICAL_WAL_APPLY); the master's own meta-page PageUpdate
         // records arrive in-stream and converge the on-disk image.
@@ -11066,6 +11111,8 @@ impl IndexFile {
 
     fn mark_meta_dirty(&self) -> Result<(), QueryError> {
         let mut image = encode_index_meta(&self.meta_state.lock().meta);
+        stamp_page_owner(&mut image, &self.file_key.owner, 0);
+        refresh_page_checksum(&mut image);
         let lsn = btree_logical_wal::current().unwrap_or(0);
         if lsn != 0 {
             set_page_lsn_if_formatted(&mut image, lsn);
@@ -11080,6 +11127,8 @@ impl IndexFile {
 
     fn write_meta_page_direct(&self, lsn: u64) -> Result<(), QueryError> {
         let mut image = encode_index_meta(&self.meta_state.lock().meta);
+        stamp_page_owner(&mut image, &self.file_key.owner, 0);
+        refresh_page_checksum(&mut image);
         if lsn != 0 {
             set_page_lsn_if_formatted(&mut image, lsn);
         }
@@ -11728,9 +11777,9 @@ fn encode_index_meta(meta: &IndexMeta) -> Vec<u8> {
     write_u32(&mut buf, 16, 0);
     write_u32(&mut buf, 20, INDEX_VERSION);
     write_u32(&mut buf, 24, PAGE_SIZE as u32);
-    write_u64(&mut buf, 32, meta.root_page);
-    write_u64(&mut buf, 40, meta.next_page_id);
-    write_u64(&mut buf, 48, meta.free_page_head.unwrap_or(0));
+    write_u64(&mut buf, 64, meta.root_page);
+    write_u64(&mut buf, 72, meta.next_page_id);
+    write_u64(&mut buf, 80, meta.free_page_head.unwrap_or(0));
     let checksum = page_checksum(&buf, 16);
     write_u32(&mut buf, 16, checksum);
     buf
@@ -11778,9 +11827,9 @@ fn decode_index_meta(buf: &[u8]) -> Result<IndexMeta, QueryError> {
         ));
     }
     Ok(IndexMeta {
-        root_page: read_u64(buf, 32),
-        next_page_id: read_u64(buf, 40),
-        free_page_head: match read_u64(buf, 48) {
+        root_page: read_u64(buf, 64),
+        next_page_id: read_u64(buf, 72),
+        free_page_head: match read_u64(buf, 80) {
             0 => None,
             page_id => Some(page_id),
         },

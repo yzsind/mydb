@@ -97,7 +97,7 @@ fn read_keyfile(path: &Path) -> Result<Keys, QueryError> {
     let parsed = parse_json(&data, 1024 * 1024)?;
     let f: KeyFile = serde_json::from_value(parsed)
         .map_err(|_| error("ER_AI_ENCRYPTION_KEY_INVALID", "invalid keyring fields"))?;
-    if f.version != 1 {
+    if f.version != crate::storage::format_versions::AI_KEYRING_VERSION {
         return Err(error(
             "ER_AI_ENCRYPTION_KEY_INVALID",
             "unsupported keyring version",
@@ -166,7 +166,7 @@ pub(crate) fn load_keys(dir: &Path, state: &AiCatalog, create: bool) -> Result<K
         })?;
         let id = key_id(&key);
         let f = KeyFile {
-            version: 1,
+            version: crate::storage::format_versions::AI_KEYRING_VERSION,
             active_key_id: id.clone(),
             keys: BTreeMap::from([(id, format!("base64:{}", STANDARD.encode(&key)))]),
         };

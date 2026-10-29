@@ -75,6 +75,7 @@ pub(crate) struct OnlineWalApplyContext {
 struct OnlineHeapRedoFile {
     file: File,
     len: u64,
+    owner: [u8; 16],
 }
 
 impl OnlineHeapRedoFiles {
@@ -117,8 +118,14 @@ impl OnlineHeapRedoFiles {
                 Err(err) => return Err(io_err(err)),
             };
             let len = file.metadata().map_err(io_err)?.len();
-            self.files
-                .insert(relative.to_string(), OnlineHeapRedoFile { file, len });
+            self.files.insert(
+                relative.to_string(),
+                OnlineHeapRedoFile {
+                    file,
+                    len,
+                    owner: page_owner_result(&path)?,
+                },
+            );
         }
         let entry = self
             .files
@@ -141,7 +148,8 @@ impl OnlineHeapRedoFiles {
         if entry.len >= end {
             entry.file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
             entry.file.read_exact(&mut bytes).map_err(io_err)?;
-            if page_lsn(&bytes) >= lsn {
+            validate_page_owner(&bytes, &entry.owner, page_id)?;
+            if page_lsn(&bytes) >= lsn && recovery_page_valid(&bytes) {
                 return Ok(());
             }
         }
@@ -151,7 +159,9 @@ impl OnlineHeapRedoFiles {
             return Ok(());
         }
         page.set_lsn(lsn);
-        let bytes = page.encode_into_owned();
+        let mut bytes = page.encode_into_owned();
+        stamp_page_owner(&mut bytes, &entry.owner, page_id);
+        refresh_page_checksum(&mut bytes);
         if entry.len < end {
             entry.file.set_len(end).map_err(io_err)?;
             entry.len = end;
@@ -214,7 +224,9 @@ impl Database {
         let lsn = record.lsn;
         let txn_id = record.txn_id;
         let _vector_write = match replica_payload_path(&record.payload) {
-            Some(path) if path.ends_with(".hvec") || path.ends_with(".vmanifest") => self.begin_vector_physical_redo(path)?,
+            Some(path) if path.ends_with(".hvec") || path.ends_with(".vmanifest") => {
+                self.begin_vector_physical_redo(path)?
+            }
             _ => None,
         };
         let _zone_operation = replica_payload_path(&record.payload)

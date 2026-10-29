@@ -137,7 +137,7 @@ const WAL_MAGIC: &[u8; 8] = b"MYDBWAL1";
 // with exact base LSN/CRC and after-image CRC, anchored by retained FPIs.
 use crate::storage::format_versions::WAL_VERSION;
 const WAL_RECORD_MAGIC: u32 = 0x4d_57_41_4c;
-pub(crate) const WAL_HEADER_LEN: usize = 8 + 4 + 8 + 8 + 8 + 4;
+pub(crate) const WAL_HEADER_LEN: usize = 64;
 pub(crate) const WAL_FRAME_HEADER_LEN: usize = 48;
 
 #[cfg(test)]
@@ -1414,6 +1414,7 @@ pub struct WalScan {
 
 impl LogManager {
     pub fn open(data_dir: &Path) -> Result<Self, QueryError> {
+        crate::storage::control::Control::admit(data_dir)?;
         let scan = Self::scan_replay(data_dir)?;
         Self::open_from_replay(data_dir, &scan)
     }
@@ -2008,7 +2009,12 @@ impl LogManager {
         // immediate truncate is not required for correctness.
         self.flush_pending_writes()?;
         self.active_file.flush().map_err(io_err)?;
-        let next_id = self.active_info.segment_id.saturating_add(1);
+        let next_id = self.active_info.segment_id.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL segment identity space exhausted",
+            )
+        })?;
         let path = segment_path(&self.dir, next_id).with_extension("log.pending");
         // Fast path: the background preparer (`ensure_next_segment`) already
         // created + header-wrote + fsynced this segment under a temp name off
@@ -2121,7 +2127,7 @@ impl LogManager {
         if self.active_info.size_bytes < threshold {
             return None;
         }
-        let next_id = self.active_info.segment_id.saturating_add(1);
+        let next_id = self.active_info.segment_id.checked_add(1)?;
         let tmp_path = self.dir.join(WAL_PREP_TMP_NAME);
         self.next_segment_prep_in_flight = true;
         Some((next_id, tmp_path, self.max_segment_bytes, fill))
@@ -2197,7 +2203,7 @@ impl LogManager {
     ) -> Result<(), QueryError> {
         self.next_segment_prep_in_flight = false;
         if self.next_segment.is_none()
-            && segment_id == self.active_info.segment_id.saturating_add(1)
+            && self.active_info.segment_id.checked_add(1) == Some(segment_id)
         {
             self.next_segment = Some(PreparedSegment {
                 segment_id,
@@ -2503,8 +2509,14 @@ impl LogManager {
         rec.bytes[36..44].copy_from_slice(&source_time.to_le_bytes());
         self.last_frame_time = source_time;
         let lsn_span = rec.lsn_span.max(1);
-        let lsn = self.next_lsn.saturating_add(lsn_span - 1);
-        self.next_lsn = self.next_lsn.saturating_add(lsn_span);
+        let next_lsn = self.next_lsn.checked_add(lsn_span).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
+        let lsn = next_lsn - 1;
+        self.next_lsn = next_lsn;
         self.state_atomics
             .next_lsn
             .store(self.next_lsn, Ordering::Release);
@@ -2789,7 +2801,12 @@ impl LogManager {
     pub fn reserve_lsn(&mut self) -> Result<u64, QueryError> {
         self.check_local_writer()?;
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
+        self.next_lsn = self.next_lsn.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
         // Mirror to the lock-free atomic so `Database::should_checkpoint`
         // can read it without locking us. Release ordering pairs with
         // the Acquire load on the reader side.
@@ -2813,6 +2830,12 @@ impl LogManager {
         txn_id: u64,
         payload: WalPayload,
     ) -> Result<u64, QueryError> {
+        let next_lsn = lsn.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
         if lsn <= self.last_lsn() {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -2838,7 +2861,7 @@ impl LogManager {
         let _disk = match self.check_wal_budget(&payload, estimated_len as u64) {
             Ok(token) => token,
             Err(error) => {
-                if self.next_lsn == lsn + 1 && self.last_lsn() < lsn {
+                if self.next_lsn == next_lsn && self.last_lsn() < lsn {
                     self.next_lsn = lsn;
                     self.state_atomics.next_lsn.store(lsn, Ordering::Release);
                 }
@@ -2846,7 +2869,7 @@ impl LogManager {
             }
         };
         if lsn >= self.next_lsn {
-            self.next_lsn = lsn + 1;
+            self.next_lsn = next_lsn;
             self.state_atomics
                 .next_lsn
                 .store(self.next_lsn, Ordering::Release);
@@ -3313,6 +3336,18 @@ impl LogManager {
         gc_safe_txn_frontier: u64,
         defer_cleanup: bool,
     ) -> Result<(), QueryError> {
+        let next_lsn = checkpoint_lsn.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
+        let new_id = self.active_info.segment_id.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL segment identity space exhausted",
+            )
+        })?;
         // Build the new "first record after checkpoint" — a fresh
         // CheckpointEnd at `checkpoint_lsn` — in a REPLACEMENT segment
         // (id = active + 1), fsync it, rename it into place, and only
@@ -3343,7 +3378,6 @@ impl LogManager {
         };
         let encoded = encode_record(&record)?;
         let started = Instant::now();
-        let new_id = self.active_info.segment_id.saturating_add(1);
         let new_path = segment_path(&self.dir, new_id);
         let tmp_path = new_path.with_extension("log.tmp");
         let valid_bytes = (WAL_HEADER_LEN + encoded.len()) as u64;
@@ -3360,8 +3394,12 @@ impl LogManager {
             // sparse segment, which still works (just falls back to
             // metadata-journal fsyncs until the next rotation).
             let _ = preallocate_segment(&tmp, self.max_segment_bytes);
-            tmp.write_all(&segment_header_with_replacement(new_id, checkpoint_lsn))
-                .map_err(io_err)?;
+            tmp.write_all(&segment_header_with_replacement(
+                &tmp_path,
+                new_id,
+                checkpoint_lsn,
+            )?)
+            .map_err(io_err)?;
             tmp.write_all(&encoded).map_err(io_err)?;
             // Order both data and extent metadata before rename. The full
             // directory sync below makes the new segment durable before any
@@ -3403,7 +3441,7 @@ impl LogManager {
         self.active_file = replacement;
         self.active_fill = SegmentFill::Reserve;
 
-        self.next_lsn = checkpoint_lsn.saturating_add(1).max(FIRST_LSN);
+        self.next_lsn = next_lsn.max(FIRST_LSN);
         self.state_atomics
             .next_lsn
             .store(self.next_lsn, Ordering::Release);
@@ -3620,6 +3658,12 @@ fn write_frame_header(out: &mut Vec<u8>, payload_len: usize, header: WalRecordHe
 /// pure field decode in their original order.
 #[inline]
 fn read_record_header(bytes: &[u8]) -> Result<WalRecordHeader, QueryError> {
+    if read_u16(bytes, 34) != 0 {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unsupported WAL frame flags",
+        ));
+    }
     Ok(WalRecordHeader {
         source_time_us: read_u64(bytes, 36),
         lsn: read_u64(bytes, 8),
@@ -3685,7 +3729,7 @@ fn inspect_wal_frame(bytes: &[u8]) -> Result<(WalRecordHeader, usize), QueryErro
 // ============================================================
 
 /// Output of [`WalReader::next_chunk`]: a contiguous run of WAL frames
-/// (each frame is the on-disk binary form, with its own 40-byte header
+/// (each frame is the on-disk binary form, with its own 48-byte header
 /// and CRC32) starting at `start_lsn` and ending at `end_lsn` inclusive.
 #[derive(Debug, Clone)]
 pub struct WalReadChunk {
@@ -4601,7 +4645,7 @@ fn initialize_segment(
     if preallocate_bytes > 0 {
         let _ = preallocate_segment(&file, preallocate_bytes);
     }
-    let header = segment_header(segment_id);
+    let header = segment_header(path, segment_id)?;
     file.write_all(&header).map_err(io_err)?;
     if fill == SegmentFill::Zero && preallocate_bytes > header.len() as u64 {
         zero_fill_segment(&file, header.len() as u64, preallocate_bytes)?;
@@ -4697,20 +4741,51 @@ fn zero_fill_segment(file: &File, from: u64, to: u64) -> Result<(), QueryError> 
     Ok(())
 }
 
-fn segment_header(segment_id: u64) -> Vec<u8> {
-    segment_header_with_replacement(segment_id, 0)
+fn segment_header(path: &Path, segment_id: u64) -> Result<Vec<u8>, QueryError> {
+    segment_header_with_replacement(path, segment_id, 0)
 }
 
-fn segment_header_with_replacement(segment_id: u64, replaces_through: u64) -> Vec<u8> {
+fn encode_segment_header(
+    segment_id: u64,
+    replaces_through: u64,
+    created_ms: u64,
+    uuid: [u8; 16],
+) -> Vec<u8> {
     let mut header = Vec::with_capacity(WAL_HEADER_LEN);
     header.extend_from_slice(WAL_MAGIC);
     header.extend_from_slice(&WAL_VERSION.to_le_bytes());
     header.extend_from_slice(&segment_id.to_le_bytes());
-    header.extend_from_slice(&current_unix_ms().to_le_bytes());
+    header.extend_from_slice(&created_ms.to_le_bytes());
     header.extend_from_slice(&replaces_through.to_le_bytes());
+    header.extend_from_slice(&uuid);
+    header.extend_from_slice(&(WAL_HEADER_LEN as u32).to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
     let checksum = wal_checksum(&header);
     header.extend_from_slice(&checksum.to_le_bytes());
     header
+}
+
+fn segment_header_with_replacement(
+    path: &Path,
+    segment_id: u64,
+    replaces_through: u64,
+) -> Result<Vec<u8>, QueryError> {
+    let uuid = crate::storage::control::uuid_for_system_file(path)?.unwrap_or([0; 16]);
+    Ok(encode_segment_header(
+        segment_id,
+        replaces_through,
+        current_unix_ms(),
+        uuid,
+    ))
+}
+
+fn segment_header_valid(header: &[u8]) -> bool {
+    header.len() == WAL_HEADER_LEN
+        && &header[..8] == WAL_MAGIC
+        && read_u32(header, 8) == WAL_VERSION
+        && read_u32(header, 52) == WAL_HEADER_LEN as u32
+        && read_u32(header, 56) == 0
+        && read_u32(header, 60) == wal_checksum(&header[..60])
 }
 
 fn ensure_segment_header(path: &Path, segment_id: u64) -> Result<(), QueryError> {
@@ -4739,8 +4814,8 @@ fn ensure_segment_header(path: &Path, segment_id: u64) -> Result<(), QueryError>
     }
     let version = read_u32(&header, 8);
     let stored_segment = read_u64(&header, 12);
-    let stored_crc = read_u32(&header, 36);
-    let actual_crc = wal_checksum(&header[..36]);
+    let stored_crc = read_u32(&header, 60);
+    let actual_crc = wal_checksum(&header[..60]);
     if version != WAL_VERSION {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
@@ -4749,7 +4824,13 @@ fn ensure_segment_header(path: &Path, segment_id: u64) -> Result<(), QueryError>
             ),
         ));
     }
-    if stored_segment != segment_id || stored_crc != actual_crc {
+    let expected_owner = crate::storage::control::uuid_for_system_file(path)?;
+    if stored_segment != segment_id
+        || stored_crc != actual_crc
+        || read_u32(&header, 52) != WAL_HEADER_LEN as u32
+        || read_u32(&header, 56) != 0
+        || expected_owner.is_some_and(|uuid| header[36..52] != uuid)
+    {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "corrupt WAL segment header",
@@ -5028,6 +5109,15 @@ fn visit_segment_records_located_from(
         // "corrupt record frame". A non-zero header that doesn't match
         // the magic is still a real corruption and bails out.
         if header.iter().all(|&b| b == 0) {
+            // A zeroed header inside committed history is not an unused tail.
+            // Inspect the suffix before any destructive repair, including for
+            // sealed/read-only segments whose internal holes must be rejected.
+            if wal_has_frame_after(path, offset + WAL_FRAME_HEADER_LEN as u64)? {
+                return Err(error(crate::error::catalog::ER_GET_ERRNO, format!(
+                    "corrupt WAL '{}' at offset {offset}: zero header precedes a later frame; refusing tail truncation",
+                    path.display()
+                )));
+            }
             if recover {
                 let file = reader.get_mut();
                 file.set_len(offset).map_err(io_err)?;
@@ -5059,14 +5149,18 @@ fn visit_segment_records_located_from(
         let record_header = match read_record_header(&header) {
             Ok(t) => t,
             Err(err) => {
-                recover_or_fail!("unknown record type");
+                if forced {
+                    recover_or_fail!("unknown record type");
+                }
                 return Err(err);
             }
         };
         let record_type = record_header.record_type;
         let reserved = read_u16(&header, 34);
         if reserved != 0 {
-            recover_or_fail!("unknown reserved bits");
+            if forced {
+                recover_or_fail!("unknown reserved bits");
+            }
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "corrupt WAL: unknown reserved bits",
@@ -5074,7 +5168,9 @@ fn visit_segment_records_located_from(
         }
         let lsn = record_header.lsn;
         if lsn == 0 || lsn <= previous_lsn {
-            recover_or_fail!("non-monotonic LSN");
+            if forced {
+                recover_or_fail!("non-monotonic LSN");
+            }
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "corrupt WAL: non-monotonic LSN",
@@ -5083,7 +5179,11 @@ fn visit_segment_records_located_from(
         let payload = match decode_payload(record_type, &payload_buf) {
             Ok(p) => p,
             Err(err) => {
-                recover_or_fail!("undecodable payload");
+                // A complete checksummed frame cannot be an incomplete append.
+                // Unsupported semantics must not silently erase durable history.
+                if forced {
+                    recover_or_fail!(format!("undecodable payload: {}", err.message()));
+                }
                 return Err(err);
             }
         };
@@ -6002,7 +6102,7 @@ fn bounded_wal_count(
 
 fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload, QueryError> {
     let mut offset = 0;
-    Ok(match record_type {
+    let payload = match record_type {
         WalRecordType::FileClr => {
             let path = read_string(input, &mut offset)?;
             let undo_next_lsn = read_u64_checked(input, &mut offset)?;
@@ -6125,6 +6225,7 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
                 ));
             }
             let compressed_after = input[offset..offset + len].to_vec();
+            offset += len;
             WalPayload::PageDelta {
                 path,
                 page_id,
@@ -6515,7 +6616,14 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
             }
             WalPayload::TxnBatch { records }
         }
-    })
+    };
+    if offset != input.len() {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unexpected trailing WAL payload bytes",
+        ));
+    }
+    Ok(payload)
 }
 
 fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), QueryError> {
@@ -8185,6 +8293,122 @@ mod tests {
         assert!(err.message().contains("offset"));
         assert!(err.message().contains("MYDB_WAL_FORCE_RECOVER=1"));
         assert!(err.message().contains("may lose data"));
+    }
+
+    #[test]
+    fn release_format_rejects_foreign_wal_directory_identity_without_writes() {
+        let a = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let b = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let make = |root: &Path| {
+            let mut log = LogManager::open(root).unwrap();
+            log.append(7, WalPayload::BeginTxn { start_scn: 5 })
+                .unwrap();
+            log.flush().unwrap();
+            log.path().to_owned()
+        };
+        let target = make(a.path());
+        let foreign = fs::read(make(b.path())).unwrap();
+        fs::write(&target, &foreign).unwrap();
+        assert!(LogManager::scan(a.path()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), foreign);
+    }
+
+    #[test]
+    fn release_format_wal_capacity_rejection_never_reuses_identity() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = LogManager::open(root.path()).unwrap();
+        log.flush().unwrap();
+        let path = log.path().to_owned();
+        let before = fs::read(&path).unwrap();
+        log.next_lsn = u64::MAX;
+        assert!(log.reserve_lsn().is_err());
+        assert_eq!(log.next_lsn, u64::MAX);
+        assert!(log
+            .append_pre_encoded(
+                LogManager::pre_encode_record(7, WalPayload::BeginTxn { start_scn: 1 }).unwrap()
+            )
+            .is_err());
+        assert!(log
+            .append_reserved(u64::MAX, 7, WalPayload::BeginTxn { start_scn: 1 })
+            .is_err());
+        log.active_info.segment_id = u64::MAX;
+        assert!(log.rotate_active_internal().is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn release_format_golden_wal_frame() {
+        let bytes = encode_record(&WalRecord {
+            source_time_us: 17,
+            lsn: 11,
+            prev_txn_lsn: 0,
+            txn_id: 7,
+            payload: WalPayload::BeginTxn { start_scn: 5 },
+        })
+        .unwrap();
+        crate::storage::format_golden::golden!("wal-frame", &bytes);
+        crate::storage::format_golden::golden!(
+            "wal-segment",
+            &encode_segment_header(7, 0, 17, [0xa5; 16])
+        );
+    }
+
+    #[test]
+    fn release_format_intact_unsupported_wal_frames_are_never_tail_trimmed() {
+        for offset in [8usize, 32, 34, WAL_FRAME_HEADER_LEN] {
+            let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(root.path()).unwrap();
+            log.append(7, WalPayload::CheckpointBegin).unwrap();
+            log.flush().unwrap();
+            let path = log.path().to_owned();
+            drop(log);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.truncate(WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN);
+            if offset == WAL_FRAME_HEADER_LEN {
+                bytes.push(99);
+                bytes[WAL_HEADER_LEN + 4..WAL_HEADER_LEN + 8].copy_from_slice(&1u32.to_le_bytes());
+            } else if offset == 8 {
+                bytes[WAL_HEADER_LEN + 8..WAL_HEADER_LEN + 16].fill(0);
+            } else {
+                bytes[WAL_HEADER_LEN + offset..WAL_HEADER_LEN + offset + 2].fill(255);
+            }
+            let checksum = wal_frame_checksum(
+                &bytes[WAL_HEADER_LEN..],
+                &bytes[WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN..],
+            );
+            bytes[WAL_HEADER_LEN + 44..WAL_HEADER_LEN + 48]
+                .copy_from_slice(&checksum.to_le_bytes());
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                scan_segment(&path, true).is_err(),
+                "accepted field at {offset}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn release_format_rejects_zero_header_before_later_frames_without_truncation() {
+        for tail in [false, true] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(dir.path()).unwrap();
+            for id in 1..=3 {
+                log.append(id, WalPayload::BeginTxn { start_scn: id })
+                    .unwrap();
+            }
+            log.flush().unwrap();
+            let path = log.path().to_owned();
+            drop(log);
+            let mut bytes = fs::read(&path).unwrap();
+            let offset = WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN + 8;
+            bytes[offset..offset + WAL_FRAME_HEADER_LEN].fill(0);
+            fs::write(&path, &bytes).unwrap();
+            assert!(scan_segment(&path, tail)
+                .unwrap_err()
+                .message()
+                .contains("later frame"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

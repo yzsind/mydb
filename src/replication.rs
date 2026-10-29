@@ -844,6 +844,7 @@ impl ReplicationManager {
     }
 
     pub fn change_source(&self, cfg: ReplicationChannelConfig) -> Result<(), QueryError> {
+        validate_existing_channel_metadata(&self.data_dir, &cfg.channel)?;
         fs::create_dir_all(replication_dir(&self.data_dir))
             .map_err(|err| io_error("create replication directory", err))?;
         if cfg.is_configured() && env_bool_default("MYDB_REPLICA_READ_ONLY", true) {
@@ -1484,7 +1485,12 @@ impl ReplicationManager {
                 format!("replication channel '{channel}' is not configured: {err}"),
             )
         })?;
-        serde_json::from_slice(&bytes).map_err(|err| {
+        crate::storage::metadata::decode(
+            crate::storage::metadata::CHANNEL,
+            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+            &bytes,
+        )
+        .map_err(|err| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 format!(
@@ -1840,7 +1846,12 @@ impl ChannelRunner {
             .map_err(|e| io_error("sync retained relay", e))?;
         sync_replication_directory(&self.data_dir)?;
         let tmp = marker.with_extension("tmp");
-        let bytes = serde_json::to_vec(&persisted).map_err(|e| {
+        let bytes = crate::storage::metadata::encode(
+            crate::storage::metadata::CHANNEL,
+            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+            &persisted,
+        )
+        .map_err(|e| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 format!("serialize relay reclaim: {e}"),
@@ -1981,7 +1992,11 @@ impl ChannelRunner {
                 continue;
             }
             txn_bytes = txn_bytes.saturating_add(read as u64);
-            let record: RelayRecord = match serde_json::from_slice(&buf) {
+            let record: RelayRecord = match crate::storage::metadata::decode(
+                crate::storage::metadata::RELAY,
+                crate::storage::format_versions::MYSQL_RELAY_VERSION,
+                &buf,
+            ) {
                 Ok(record) => record,
                 Err(err) => {
                     self.flush_pending_relay_commits(
@@ -3421,7 +3436,13 @@ impl ChannelRunner {
             *slot = Some(std::io::BufWriter::with_capacity(64 * 1024, file));
         }
         let writer = slot.as_mut().unwrap();
-        serde_json::to_writer(&mut *writer, &record).map_err(|err| {
+        crate::storage::metadata::write(
+            &mut *writer,
+            crate::storage::metadata::RELAY,
+            crate::storage::format_versions::MYSQL_RELAY_VERSION,
+            &record,
+        )
+        .map_err(|err| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 format!("write relay log JSON failed: {err}"),
@@ -6546,7 +6567,11 @@ fn show_relaylog_events(sql: &str) -> Result<QueryResponse, QueryError> {
         if start_pos < req.from {
             continue;
         }
-        let record: RelayRecord = match serde_json::from_slice(line) {
+        let record: RelayRecord = match crate::storage::metadata::decode(
+            crate::storage::metadata::RELAY,
+            crate::storage::format_versions::MYSQL_RELAY_VERSION,
+            line,
+        ) {
             Ok(r) => r,
             // A corrupt tail just terminates the scan — matches MySQL
             // mysqlbinlog's "stop at first bad event" behaviour.
@@ -6583,6 +6608,30 @@ fn sync_replication_directory(data_dir: &Path) -> Result<(), QueryError> {
         .map_err(|e| io_error("sync replication directory", e))
 }
 
+fn validate_existing_channel_metadata(data_dir: &Path, channel: &str) -> Result<(), QueryError> {
+    let path = channel_path(data_dir, channel);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read existing channel metadata", err)),
+    };
+    crate::storage::metadata::decode::<PersistedChannel>(
+        crate::storage::metadata::CHANNEL,
+        crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+        &bytes,
+    )
+    .map_err(|err| {
+        error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!(
+                "cannot update unsupported or corrupt channel metadata '{}': {err}",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
 fn recover_relay_reclaim(data_dir: &Path, channel: &str) -> Result<(), QueryError> {
     let marker = relay_reclaim_path(data_dir, channel);
     let bytes = match fs::read(&marker) {
@@ -6590,7 +6639,13 @@ fn recover_relay_reclaim(data_dir: &Path, channel: &str) -> Result<(), QueryErro
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io_error("read relay reclaim", e)),
     };
-    let persisted: PersistedChannel = serde_json::from_slice(&bytes).map_err(|e| {
+    validate_existing_channel_metadata(data_dir, channel)?;
+    let persisted: PersistedChannel = crate::storage::metadata::decode(
+        crate::storage::metadata::CHANNEL,
+        crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+        &bytes,
+    )
+    .map_err(|e| {
         error(
             crate::error::catalog::ER_GET_ERRNO,
             format!("corrupt relay reclaim: {e}"),
@@ -6669,7 +6724,11 @@ fn recover_relay_boundary(path: &Path) -> Result<(u64, Option<RelayRecord>), Que
             offset = next_offset;
             continue;
         }
-        match serde_json::from_slice::<RelayRecord>(trimmed) {
+        match crate::storage::metadata::decode::<RelayRecord>(
+            crate::storage::metadata::RELAY,
+            crate::storage::format_versions::MYSQL_RELAY_VERSION,
+            trimmed,
+        ) {
             Ok(record) => {
                 if matches!(
                     record.op,
@@ -6725,7 +6784,13 @@ fn persist_channel(data_dir: &Path, persisted: &PersistedChannel) -> Result<(), 
     let write = || -> Result<(), QueryError> {
         let mut file =
             File::create(&tmp).map_err(|err| io_error("create replication metadata", err))?;
-        serde_json::to_writer_pretty(&mut file, persisted).map_err(|err| {
+        crate::storage::metadata::write(
+            &mut file,
+            crate::storage::metadata::CHANNEL,
+            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+            persisted,
+        )
+        .map_err(|err| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 format!("serialize replication metadata failed: {err}"),
@@ -7918,6 +7983,63 @@ mod tests {
     }
 
     #[test]
+    fn release_format_golden_mysql_channel_and_relay() {
+        use crate::storage::{format_golden::golden, format_versions as versions, metadata};
+        let config = ReplicationChannelConfig {
+            channel: DEFAULT_CHANNEL.into(),
+            source_host: "source.example".into(),
+            source_log_file: "mysql-bin.000001".into(),
+            source_log_pos: 17,
+            ..Default::default()
+        };
+        let mut status = ReplicationStatus::from_config(&config, Path::new("fixture"));
+        status.relay_log_file = "fixture.relay".into();
+        let channel = PersistedChannel { config, status };
+        let bytes =
+            metadata::encode(metadata::CHANNEL, versions::MYSQL_CHANNEL_VERSION, &channel).unwrap();
+        golden!("mysql-channel", &bytes);
+        let decoded: PersistedChannel =
+            metadata::decode(metadata::CHANNEL, versions::MYSQL_CHANNEL_VERSION, &bytes).unwrap();
+        assert_eq!(decoded.config.source_log_pos, 17);
+        let record = RelayRecord {
+            source_file: "mysql-bin.000001".into(),
+            source_pos: 19,
+            gtid: Some("00000000-0000-4000-8000-000000000001:7".into()),
+            op: RelayOp::TxnCommit {
+                event_count: 3,
+                commit_ts: 17,
+            },
+        };
+        let bytes =
+            metadata::encode(metadata::RELAY, versions::MYSQL_RELAY_VERSION, &record).unwrap();
+        golden!("mysql-relay", &bytes);
+        let decoded: RelayRecord =
+            metadata::decode(metadata::RELAY, versions::MYSQL_RELAY_VERSION, &bytes).unwrap();
+        assert_eq!(decoded.source_pos, 19);
+    }
+
+    #[test]
+    fn release_format_change_source_preserves_unsupported_metadata() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let manager = ReplicationManager {
+            data_dir: dir.path().to_path_buf(),
+            engine,
+            channels: Mutex::new(HashMap::new()),
+        };
+        let path = channel_path(dir.path(), DEFAULT_CHANNEL);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = br#"{"magic":"MYDBMETA1","kind":3,"version":999,"required_features":0,"payload":{},"checksum":0}"#;
+        fs::write(&path, bytes).unwrap();
+        let config = ReplicationChannelConfig {
+            channel: DEFAULT_CHANNEL.into(),
+            ..Default::default()
+        };
+        assert!(manager.change_source(config).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
     fn incremental_change_source_preserves_unspecified_fields() {
         // C1: a second CHANGE that only sets SOURCE_DELAY must keep host /
         // user / password / auto_position from the first, not reset them to
@@ -8071,9 +8193,12 @@ mod tests {
             0
         );
         assert_eq!(runtime.status.lock().unwrap().relay_log_pos, 0);
-        let persisted: PersistedChannel =
-            serde_json::from_slice(&fs::read(channel_path(dir.path(), DEFAULT_CHANNEL)).unwrap())
-                .unwrap();
+        let persisted: PersistedChannel = crate::storage::metadata::decode(
+            crate::storage::metadata::CHANNEL,
+            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+            &fs::read(channel_path(dir.path(), DEFAULT_CHANNEL)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(persisted.status.exec_source_log_pos, 180);
         // Simulate a crash after the reclaim intent but before truncation.
         fs::write(
@@ -8088,7 +8213,12 @@ mod tests {
         .unwrap();
         fs::write(
             relay_reclaim_path(dir.path(), DEFAULT_CHANNEL),
-            serde_json::to_vec(&persisted).unwrap(),
+            crate::storage::metadata::encode(
+                crate::storage::metadata::CHANNEL,
+                crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+                &persisted,
+            )
+            .unwrap(),
         )
         .unwrap();
         recover_relay_reclaim(dir.path(), DEFAULT_CHANNEL).unwrap();
@@ -8951,8 +9081,12 @@ mod tests {
             .io_commit_txn("bin.000001", 240, &mut second)
             .unwrap();
         assert!(path.exists(), "threshold update must persist metadata");
-        let persisted: PersistedChannel =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let persisted: PersistedChannel = crate::storage::metadata::decode(
+            crate::storage::metadata::CHANNEL,
+            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
+            &std::fs::read(path).unwrap(),
+        )
+        .unwrap();
         assert_eq!(persisted.status.source_log_pos, 240);
         assert!(gtid_set_contains(
             &persisted.status.retrieved_gtid_set,
@@ -8984,7 +9118,9 @@ mod tests {
             .advance_applied(&relay_path, 91, "bin.000001", 180, None, true)
             .unwrap();
 
-        let persisted: PersistedChannel = serde_json::from_slice(
+        let persisted: PersistedChannel = crate::storage::metadata::decode(
+            crate::storage::metadata::CHANNEL,
+            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
             &std::fs::read(channel_path(dir.path(), DEFAULT_CHANNEL)).unwrap(),
         )
         .unwrap();
@@ -9266,7 +9402,13 @@ mod tests {
             .append(true)
             .open(path)
             .unwrap();
-        serde_json::to_writer(&mut file, record).unwrap();
+        crate::storage::metadata::write(
+            &mut file,
+            crate::storage::metadata::RELAY,
+            crate::storage::format_versions::MYSQL_RELAY_VERSION,
+            record,
+        )
+        .unwrap();
         file.write_all(b"\n").unwrap();
     }
 

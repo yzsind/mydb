@@ -22149,10 +22149,10 @@ fn information_schema_tables_create_options_marks_partitioned() {
 }
 
 #[test]
-fn information_schema_tables_empty_table_reports_zero_lengths() {
-    // Sanity check: zero rows means zero data / index length and zero
-    // AVG_ROW_LENGTH (we explicitly guard against div-by-zero when
-    // computing AVG_ROW_LENGTH = data_length / rows).
+fn information_schema_empty_table_counts_heap_metadata_allocation() {
+    // Physical storage includes the heap allocation authority even with no
+    // rows. AVG_ROW_LENGTH still guards against division by zero; an unopened
+    // empty primary index has not allocated a physical file.
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
@@ -22170,7 +22170,7 @@ fn information_schema_tables_empty_table_reports_zero_lengths() {
     };
     assert_eq!(cell_int(&rs, "TABLE_ROWS"), 0);
     assert_eq!(cell_int(&rs, "AVG_ROW_LENGTH"), 0);
-    assert_eq!(cell_int(&rs, "DATA_LENGTH"), 0);
+    assert_eq!(cell_int(&rs, "DATA_LENGTH"), 16 * 1024);
     assert_eq!(cell_int(&rs, "INDEX_LENGTH"), 0);
 }
 

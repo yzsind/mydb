@@ -2635,6 +2635,11 @@ pub(crate) fn recover_before_checkpoint(data_dir: &Path) -> Result<(), QueryErro
     Ok(())
 }
 
+pub(crate) fn validate_persisted_format(data_dir: &Path) -> Result<(), QueryError> {
+    read_manifest_file(&data_dir.join("binlog/manifest.json"))?;
+    Ok(())
+}
+
 impl BinlogSourceManager {
     fn open(data_dir: PathBuf, mut config: BinlogConfig) -> Result<Self, QueryError> {
         let dir = data_dir.join("binlog");
@@ -6801,6 +6806,7 @@ fn read_index_file(path: &Path) -> Result<Vec<String>, QueryError> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BinlogManifest {
     version: u32,
     active_file: String,
@@ -6821,7 +6827,7 @@ fn read_manifest_file(path: &Path) -> Result<Option<BinlogManifest>, QueryError>
         return Ok(None);
     }
     let bytes = fs::read(path).map_err(io_error)?;
-    let manifest = serde_json::from_slice(&bytes).map_err(|err| {
+    let manifest: BinlogManifest = serde_json::from_slice(&bytes).map_err(|err| {
         error(
             crate::error::catalog::ER_UNKNOWN_ERROR,
             format!(
@@ -6830,6 +6836,12 @@ fn read_manifest_file(path: &Path) -> Result<Option<BinlogManifest>, QueryError>
             ),
         )
     })?;
+    if manifest.version != crate::storage::format_versions::BINLOG_MANIFEST_VERSION {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("unsupported binlog manifest version {}", manifest.version),
+        ));
+    }
     Ok(Some(manifest))
 }
 
@@ -6862,7 +6874,7 @@ fn write_manifest_file(
         config: &'a BinlogConfig,
     }
     let manifest = Manifest {
-        version: 2,
+        version: crate::storage::format_versions::BINLOG_MANIFEST_VERSION,
         active_file,
         active_position: active_pos,
         gtid_executed,
@@ -7063,6 +7075,30 @@ fn env_value_truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_format_binlog_rejects_future_manifest_without_rewriting() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let path = dir.path().join("manifest.json");
+        write_manifest_file(
+            &path,
+            &test_config(dir.path()),
+            "binlog.000001",
+            4,
+            "",
+            "",
+            1,
+            1,
+        )
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["version"] = 999.into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_manifest_file(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
     use super::*;
 
     #[test]
