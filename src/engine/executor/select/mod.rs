@@ -2988,9 +2988,8 @@ pub(super) fn prepare_select_for_planning(
         planner::validate_select_column_references(db, stmt)?;
     }
     warn_group_by_resolution_diagnostics(db, stmt);
-    // A single base table can be validated completely here, including
-    // column-derived collations. Multi-source queries keep using the
-    // qualified planner/row schemas until their binding scope is available.
+    // Resolve typed comparisons before normalization can prune an empty
+    // input. Joins and derived sources use their own column binding scope.
     validate_single_base_select_exprs(db, stmt)?;
     // ENUM/SET numeric semantics (ordinal ORDER BY / numeric-literal
     // comparisons) rewrite on the executed statement — `plan_select`
@@ -3101,7 +3100,7 @@ pub(super) fn validate_cached_temporal_literals(
     stmt: &Select,
 ) -> Result<(), QueryError> {
     if !stmt.joins.is_empty() || stmt.derived.is_some() {
-        return Ok(());
+        return validate_scoped_temporal_literals(db, stmt);
     }
     let Some(base) = stmt
         .from
@@ -3110,17 +3109,12 @@ pub(super) fn validate_cached_temporal_literals(
     else {
         return Ok(());
     };
-    let Ok(table) = db.table(&base.name) else {
-        return Ok(());
-    };
-    if !table.columns.iter().any(|column| {
-        matches!(
-            column.data_type,
-            DataTypeKind::Date | DataTypeKind::DateTime { .. } | DataTypeKind::Timestamp { .. }
-        )
-    }) {
-        return Ok(());
+    if super::cte::has_cte(&base.name) {
+        return validate_scoped_temporal_literals(db, stmt);
     }
+    let Ok(table) = db.table(&base.name) else {
+        return validate_scoped_temporal_literals(db, stmt);
+    };
     validate_select_collations_with(stmt, |expr| {
         crate::engine::expr::validate_expr_temporal_literals(expr, &table)
     })
@@ -3129,7 +3123,7 @@ pub(super) fn validate_cached_temporal_literals(
 fn validate_single_base_select_exprs(db: &Database, stmt: &Select) -> Result<(), QueryError> {
     self::aggregate::clear_bit_aggregate_width_hints();
     if !stmt.joins.is_empty() || stmt.derived.is_some() {
-        return Ok(());
+        return validate_scoped_temporal_literals(db, stmt);
     }
     let Some(base) = stmt
         .from
@@ -3138,14 +3132,120 @@ fn validate_single_base_select_exprs(db: &Database, stmt: &Select) -> Result<(),
     else {
         return Ok(());
     };
+    if super::cte::has_cte(&base.name) {
+        return validate_scoped_temporal_literals(db, stmt);
+    }
     let Ok(table) = db.table(&base.name) else {
-        return Ok(());
+        return validate_scoped_temporal_literals(db, stmt);
     };
     validate_select_collations_with(stmt, |expr| {
         validate_bit_aggregate_operand_widths(expr, &table)?;
         crate::engine::expr::validate_expr_numeric_operands(expr, &table)?;
         crate::engine::expr::validate_expr_collations(expr, &table)?;
         crate::engine::expr::validate_expr_temporal_literals(expr, &table)
+    })
+}
+
+/// Resolve temporal literals before pruning or executing a derived/CTE/join
+/// source. Metadata, rather than sampled rows, also diagnoses empty inputs.
+fn validate_scoped_temporal_literals(db: &Database, stmt: &Select) -> Result<(), QueryError> {
+    let mut scopes: smallvec::SmallVec<[(&TableRef, Arc<TableSchema>); 4]> =
+        smallvec::SmallVec::new();
+    let sources = stmt
+        .from
+        .iter()
+        .map(|table| (table, stmt.derived.as_ref()))
+        .chain(
+            stmt.joins
+                .iter()
+                .map(|join| (&join.table, join.derived.as_ref())),
+        );
+    for (source, derived) in sources {
+        // A CTE shadows a catalog table with the same name.
+        let cte = derived
+            .is_none()
+            .then(|| super::cte::lookup_cte(&source.name))
+            .flatten();
+        // Catalog schemas already own the names, types and fractional
+        // precision. A cached join must not rebuild all column descriptors.
+        if derived.is_none() && cte.is_none() && source.column_aliases.is_empty() {
+            if let Ok(schema) = db.table(&source.name) {
+                scopes.push((source, schema));
+                continue;
+            }
+        }
+        let mut columns = if let Some(derived) = derived {
+            describe_subquery_columns(db, derived)?
+        } else if let Some(cte) = cte {
+            cte.columns.clone()
+        } else if let Ok(table) = db.table(&source.name) {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| Column {
+                    name: column.name.clone(),
+                    column_type: table.result_type(index),
+                    source: table.wire_column_source(index),
+                })
+                .collect()
+        } else {
+            continue;
+        };
+        crate::planner::apply_derived_column_aliases(
+            source,
+            columns.iter_mut().map(|column| &mut column.name),
+        )?;
+        scopes.push((
+            source,
+            Arc::new(TableSchema::synthetic_for_planning(&source.name, &columns)),
+        ));
+    }
+    let resolve = |expr: &Expr| {
+        use std::borrow::Cow;
+        let (name, qualifier) = match expr {
+            Expr::Identifier(name) => (name.as_str(), None),
+            Expr::CompoundIdentifier(parts) => {
+                let name = parts.last()?.as_str();
+                let qualifier = (parts.len() > 1).then(|| {
+                    if parts.len() == 2 {
+                        Cow::Borrowed(parts[0].as_str())
+                    } else {
+                        Cow::Owned(parts[..parts.len() - 1].join("."))
+                    }
+                });
+                (name, qualifier)
+            }
+            _ => return None,
+        };
+        let mut found = None;
+        for (source, schema) in &scopes {
+            if let Some(qualifier) = qualifier.as_deref() {
+                let matches = if let Some(alias) = &source.alias {
+                    alias.eq_ignore_ascii_case(qualifier)
+                } else {
+                    source.name.eq_ignore_ascii_case(qualifier)
+                        || source
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|short| short.eq_ignore_ascii_case(qualifier))
+                };
+                if !matches {
+                    continue;
+                }
+            }
+            if let Some(index) = schema.find_column_index(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(&schema.columns[index].data_type);
+            }
+        }
+        found
+    };
+    validate_select_collations_with(stmt, |expr| {
+        crate::engine::expr::validate_expr_temporal_literals_with_resolver(expr, None, &resolve)
     })
 }
 

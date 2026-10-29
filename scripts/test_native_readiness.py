@@ -10,6 +10,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -41,6 +42,7 @@ class Servers:
     def __init__(self, binary, root):
         self.binary = str(binary)
         self.root = root
+        self.repl_auth_token = secrets.token_hex(32)
         self.processes = []
         self.connections = []
 
@@ -55,7 +57,8 @@ class Servers:
         env.update(MYDB_DATA_DIR=str(self.root / name), MYDB_DURABILITY="strict",
                    MYDB_MEMORY_TARGET="512M", MYDB_WAL_SEGMENT_BYTES="1048576",
                    MYDB_CHECKPOINT_INTERVAL_MS="2000", MYDB_SHUTDOWN_TIMEOUT_MS="1000",
-                   MYDB_ROOT_PASSWORD="root", TMPDIR="/tmp/mydb")
+                   MYDB_ROOT_PASSWORD="root", MYDB_REPL_AUTH_TOKEN=self.repl_auth_token,
+                   TMPDIR="/tmp/mydb")
         env.update(extra or {})
         log = self.root / (name + ".log")
         with log.open("ab") as output:

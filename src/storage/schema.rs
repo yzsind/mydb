@@ -3458,7 +3458,24 @@ impl KeyPart {
                 }
             }
         }
-        KeyPart::for_target(value, *target)
+        let result = KeyPart::for_target(value, *target);
+        if result.is_err() {
+            let kind = match target {
+                ParamTarget::Date => Some("DATE"),
+                ParamTarget::DateTime | ParamTarget::Timestamp => Some("DATETIME"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                // A failed prepared temporal conversion is SQL UNKNOWN, not
+                // a probe for the zero date. Storage treats a deferred NULL
+                // key as unsatisfiable for these non-null-safe predicates.
+                let value = crate::engine::params::current_param(*idx)
+                    .expect("parameter was resolved above");
+                crate::engine::expr::report_invalid_date_comparison(kind, &value)?;
+                return Ok(KeyPart::Null);
+            }
+        }
+        result
     }
 
     /// Convert a runtime `Value` into the `KeyPart` shape an index entry
@@ -3510,7 +3527,27 @@ impl KeyPart {
                 Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
             )
         }) {
-            crate::engine::expr::coerce_comparison_constant_for_type(&value, &kind).unwrap_or(value)
+            if let Some(converted) =
+                crate::engine::expr::coerce_comparison_constant_for_type(&value, kind)
+            {
+                converted
+            } else if matches!(kind, DataTypeKind::Date)
+                && crate::engine::expr::coerce_comparison_constant_for_type(
+                    &value,
+                    &DataTypeKind::DateTime { fsp: 6 },
+                )
+                .is_some()
+            {
+                // DATE ranges may widen a valid non-midnight boundary to
+                // its day, provided the original residual remains. Validate
+                // the full timestamp before the date-only storage parser.
+                value
+            } else {
+                return Err(error(
+                    crate::error::catalog::ER_WRONG_VALUE,
+                    "temporal index bound cannot preserve text comparison",
+                ));
+            }
         } else {
             value
         };
@@ -3567,14 +3604,14 @@ impl KeyPart {
                 Value::Json(bytes) => KeyPart::Bytes(bytes),
                 other => KeyPart::Bytes(crate::engine::json::scalar_from_value(&other)),
             },
-            ParamTarget::Date => KeyPart::Date(value_to_date_days(&value)),
+            ParamTarget::Date => KeyPart::Date(value_to_date_days(&value)?),
             ParamTarget::Time => KeyPart::Time(value_to_time_micros(&value)),
-            ParamTarget::DateTime => KeyPart::DateTime(value_to_datetime_micros(&value)),
+            ParamTarget::DateTime => KeyPart::DateTime(value_to_datetime_micros(&value)?),
             ParamTarget::Timestamp => {
                 let micros = match &value {
                     Value::Timestamp(micros) => *micros,
                     _ => crate::engine::expr::session_local_datetime_to_utc_timestamp_micros(
-                        value_to_datetime_micros(&value),
+                        value_to_datetime_micros(&value)?,
                     )?,
                 };
                 KeyPart::DateTime(micros)
@@ -3904,22 +3941,27 @@ fn decimal_keypart_for_value(v: &Value, precision: u8, scale: u8) -> Result<KeyP
     }
 }
 
-fn value_to_date_days(v: &Value) -> i32 {
-    match v {
+fn value_to_date_days(v: &Value) -> Result<i32, QueryError> {
+    Ok(match v {
         Value::Date(d) => *d,
         Value::Int(d) => *d as i32,
         Value::UInt(d) => *d as i32,
-        Value::String(s) | Value::Decimal(s) => {
-            crate::storage::core::parse_date_to_days(s).unwrap_or(i32::MIN)
+        Value::String(s) | Value::Decimal(s) => crate::storage::core::parse_date_to_days(s)?,
+        Value::SmallString(s) => {
+            crate::storage::core::parse_date_to_days(&String::from_utf8_lossy(s))?
         }
-        Value::Bytes(b) => crate::storage::core::parse_date_to_days(&String::from_utf8_lossy(b))
-            .unwrap_or(i32::MIN),
+        Value::Bytes(b) => crate::storage::core::parse_date_to_days(&String::from_utf8_lossy(b))?,
         Value::DateTime(t) => {
             // truncate microseconds to days
             (*t / 86_400_000_000) as i32
         }
-        _ => i32::MIN,
-    }
+        _ => {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_VALUE,
+                "invalid DATE index bound",
+            ))
+        }
+    })
 }
 
 fn value_to_time_micros(v: &Value) -> i64 {
@@ -3943,21 +3985,26 @@ fn value_to_time_micros(v: &Value) -> i64 {
     }
 }
 
-fn value_to_datetime_micros(v: &Value) -> i64 {
-    match v {
+fn value_to_datetime_micros(v: &Value) -> Result<i64, QueryError> {
+    Ok(match v {
         Value::DateTime(t) => *t,
         Value::Int(t) => *t,
         Value::UInt(t) => *t as i64,
-        Value::String(s) | Value::Decimal(s) => {
-            crate::storage::core::parse_datetime_to_micros(s).unwrap_or(i64::MIN)
+        Value::String(s) | Value::Decimal(s) => crate::storage::core::parse_datetime_to_micros(s)?,
+        Value::SmallString(s) => {
+            crate::storage::core::parse_datetime_to_micros(&String::from_utf8_lossy(s))?
         }
         Value::Bytes(b) => {
-            crate::storage::core::parse_datetime_to_micros(&String::from_utf8_lossy(b))
-                .unwrap_or(i64::MIN)
+            crate::storage::core::parse_datetime_to_micros(&String::from_utf8_lossy(b))?
         }
         Value::Date(d) => *d as i64 * 86_400_000_000,
-        _ => i64::MIN,
-    }
+        _ => {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_VALUE,
+                "invalid DATETIME index bound",
+            ))
+        }
+    })
 }
 
 fn value_to_year_byte(v: &Value) -> u8 {

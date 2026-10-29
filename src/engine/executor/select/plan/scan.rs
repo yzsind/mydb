@@ -1345,21 +1345,19 @@ pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
         } => {
             let value = row.get(*col).unwrap_or(&Value::Null);
             let mut found = false;
+            let mut has_null = false;
             if !matches!(value, Value::Null) {
                 for item in values {
-                    if !matches!(item, Value::Null)
-                        && crate::engine::expr::compare_values(value, item)?
-                            == std::cmp::Ordering::Equal
-                    {
+                    let comparison = crate::engine::expr::compare_nullable_values(value, item)?;
+                    has_null |= comparison.is_none();
+                    if comparison == Some(std::cmp::Ordering::Equal) {
                         found = true;
                         break;
                     }
                 }
             }
             Ok(if *negated {
-                !matches!(value, Value::Null)
-                    && !found
-                    && !values.iter().any(|item| matches!(item, Value::Null))
+                !matches!(value, Value::Null) && !found && !has_null
             } else {
                 found
             })
@@ -1371,18 +1369,8 @@ pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
             negated,
         } => {
             let value = row.get(*col).unwrap_or(&Value::Null);
-            if matches!(value, Value::Null)
-                || matches!(low, Value::Null)
-                || matches!(high, Value::Null)
-            {
-                return Ok(false);
-            }
-            let ge_low =
-                crate::engine::expr::compare_values(value, low)? != std::cmp::Ordering::Less;
-            let le_high =
-                crate::engine::expr::compare_values(value, high)? != std::cmp::Ordering::Greater;
-            let result = ge_low && le_high;
-            Ok(if *negated { !result } else { result })
+            crate::engine::expr::eval_between_truth(value, low, high, *negated)
+                .map(|value| value.unwrap_or(false))
         }
         CteRowPredicate::Collated(id, inner) => {
             crate::engine::expr::with_compare_collation(Some(*id), || {
@@ -1409,7 +1397,9 @@ pub(super) fn eval_cte_row_cmp(
     } else if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(false);
     }
-    let ord = crate::engine::expr::compare_values(left, right)?;
+    let Some(ord) = crate::engine::expr::compare_nullable_values(left, right)? else {
+        return Ok(false);
+    };
     let ord = if flipped { ord.reverse() } else { ord };
     Ok(match op {
         BinaryOp::Eq | BinaryOp::NullSafeEq => ord == std::cmp::Ordering::Equal,

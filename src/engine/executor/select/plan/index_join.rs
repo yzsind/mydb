@@ -5624,7 +5624,9 @@ pub(super) fn eval_compiled_cmp(
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(false);
     }
-    let cmp = crate::engine::expr::compare_values(left, right)?;
+    let Some(cmp) = crate::engine::expr::compare_nullable_values(left, right)? else {
+        return Ok(false);
+    };
     Ok(match op {
         BinaryOp::Eq => cmp == std::cmp::Ordering::Equal,
         BinaryOp::NotEq => cmp != std::cmp::Ordering::Equal,
@@ -5651,7 +5653,9 @@ pub(super) fn eval_compiled_cmp_cols(
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(false);
     }
-    let cmp = crate::engine::expr::compare_values(left, right)?;
+    let Some(cmp) = crate::engine::expr::compare_nullable_values(left, right)? else {
+        return Ok(false);
+    };
     Ok(match op {
         BinaryOp::Eq => cmp == std::cmp::Ordering::Equal,
         BinaryOp::NotEq => cmp != std::cmp::Ordering::Equal,
@@ -5672,13 +5676,8 @@ pub(super) fn eval_compiled_between(
     let Some(value) = value else {
         return Ok(false);
     };
-    if matches!(value, Value::Null) || matches!(low, Value::Null) || matches!(high, Value::Null) {
-        return Ok(false);
-    }
-    let ge_low = crate::engine::expr::compare_values(value, low)? != std::cmp::Ordering::Less;
-    let le_high = crate::engine::expr::compare_values(value, high)? != std::cmp::Ordering::Greater;
-    let inside = ge_low && le_high;
-    Ok(if negated { !inside } else { inside })
+    crate::engine::expr::eval_between_truth(value, low, high, negated)
+        .map(|value| value.unwrap_or(false))
 }
 
 /// Per-row LIKE filter on the compiled fast path. Reads the column
@@ -5736,6 +5735,7 @@ pub(super) fn eval_compiled_in_list(
         return Ok(false);
     }
     let mut found = false;
+    let mut has_null = has_null;
     let all_string = items.iter().all(|item| {
         matches!(
             item,
@@ -5757,9 +5757,9 @@ pub(super) fn eval_compiled_in_list(
         crate::engine::expr::with_compare_collation(collation_id, || -> Result<(), QueryError> {
             let mut compare_all = || -> Result<(), QueryError> {
                 for item in items {
-                    if crate::engine::expr::compare_values(value, item)?
-                        == std::cmp::Ordering::Equal
-                    {
+                    let comparison = crate::engine::expr::compare_nullable_values(value, item)?;
+                    has_null |= comparison.is_none();
+                    if comparison == Some(std::cmp::Ordering::Equal) {
                         found = true;
                         if !all_string {
                             break;

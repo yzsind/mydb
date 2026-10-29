@@ -1744,10 +1744,7 @@ pub(super) fn fast_compare_value_const(
     if let (Some(l), Some(r)) = (value_to_f64_fast(left), right.numeric) {
         return Ok(Some(l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)));
     }
-    Ok(Some(crate::engine::expr::compare_values(
-        left,
-        &right.value,
-    )?))
+    crate::engine::expr::compare_nullable_values(left, &right.value)
 }
 
 #[inline]

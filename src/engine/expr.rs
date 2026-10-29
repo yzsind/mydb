@@ -19518,9 +19518,25 @@ pub(crate) fn null_cmp_binary(l: &Value, op: BinaryOp, r: &Value) -> Result<Valu
     } as i64))
 }
 
-fn compare_nullable_values(l: &Value, r: &Value) -> Result<Option<Ordering>, QueryError> {
+#[inline]
+pub(crate) fn compare_nullable_values(
+    l: &Value,
+    r: &Value,
+) -> Result<Option<Ordering>, QueryError> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(None);
+    }
+    // Only temporal coercion uses the conversion-failure side channel. Keep
+    // ordinary numeric/string comparisons free of thread-local accesses.
+    let temporal = |value: &Value| {
+        matches!(
+            value,
+            Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::Time(_)
+        )
+    };
+    let coercible = |value: &Value| value_is_stringish(value) || value_is_numeric(value);
+    if !(temporal(l) && coercible(r) || temporal(r) && coercible(l)) {
+        return compare_values(l, r).map(Some);
     }
     TEMPORAL_COMPARISON_CONVERSION_FAILED.with(|failed| failed.set(false));
     let comparison = compare_values(l, r);
@@ -19533,7 +19549,7 @@ pub(crate) fn null_safe_eq(left: &Value, right: &Value) -> Result<bool, QueryErr
     match (left, right) {
         (Value::Null, Value::Null) => Ok(true),
         (Value::Null, _) | (_, Value::Null) => Ok(false),
-        _ => Ok(compare_values(left, right)? == Ordering::Equal),
+        _ => Ok(compare_nullable_values(left, right)? == Some(Ordering::Equal)),
     }
 }
 
@@ -19567,7 +19583,9 @@ where
             has_null = true;
             continue;
         }
-        if compare_values(&value, &item_val)? == Ordering::Equal {
+        let comparison = compare_nullable_values(&value, &item_val)?;
+        has_null |= comparison.is_none();
+        if comparison == Some(Ordering::Equal) {
             found = true;
             // Constant IN operands are resolved as one expression.  Even
             // after a match, MySQL validates every remaining constant and
@@ -20801,16 +20819,53 @@ pub(crate) fn validate_expr_temporal_literals(
     expr: &Expr,
     table: &TableSchema,
 ) -> Result<(), QueryError> {
+    let resolve = |column: &Expr| {
+        let index = match column {
+            Expr::Identifier(name) => table.find_column_index(name),
+            Expr::CompoundIdentifier(parts) => parts.last().and_then(|name| {
+                table
+                    .find_column_index(name)
+                    .or_else(|| table.find_column_index(&parts.join(".")))
+            }),
+            _ => None,
+        }?;
+        table.columns.get(index).map(|column| &column.data_type)
+    };
+    validate_expr_temporal_literals_with_resolver(expr, Some(table), &resolve)
+}
+
+type TemporalLiteralColumnResolver<'a> = dyn Fn(&Expr) -> Option<&'a DataTypeKind> + 'a;
+
+/// Bind temporal diagnostics against an existing source scope without cloning
+/// column metadata. The optional base table supplies index-specific warnings.
+pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
+    expr: &Expr,
+    table: Option<&TableSchema>,
+    resolve: &TemporalLiteralColumnResolver<'a>,
+) -> Result<(), QueryError> {
     fn temporal_column<'a>(
         expr: &Expr,
-        table: &'a TableSchema,
-    ) -> Option<(&'a DataTypeKind, &'static str)> {
-        let name = match expr {
-            Expr::Identifier(name) => name.as_str(),
-            Expr::CompoundIdentifier(parts) => parts.last()?.as_str(),
-            _ => return None,
+        resolve: &TemporalLiteralColumnResolver<'a>,
+    ) -> Option<(DataTypeKind, &'static str)> {
+        let data_type = if let Some(data_type) = resolve(expr) {
+            match data_type {
+                DataTypeKind::Date => DataTypeKind::Date,
+                DataTypeKind::DateTime { fsp } => DataTypeKind::DateTime { fsp: *fsp },
+                DataTypeKind::Timestamp { fsp } => DataTypeKind::Timestamp { fsp: *fsp },
+                _ => return None,
+            }
+        } else {
+            match schema_expr_result_type(expr, &mut |column| {
+                resolve(column)
+                    .map(DataTypeKind::column_type)
+                    .unwrap_or(ColumnType::VarString)
+            }) {
+                ColumnType::Date => DataTypeKind::Date,
+                ColumnType::DateTime => DataTypeKind::DateTime { fsp: 6 },
+                ColumnType::Timestamp => DataTypeKind::Timestamp { fsp: 6 },
+                _ => return None,
+            }
         };
-        let data_type = &table.columns.get(table.column_index(name).ok()?)?.data_type;
         match data_type {
             DataTypeKind::Date => Some((data_type, "DATE")),
             DataTypeKind::DateTime { .. } => Some((data_type, "DATETIME")),
@@ -20883,14 +20938,24 @@ pub(crate) fn validate_expr_temporal_literals(
         None
     }
 
-    fn validate_pair(left: &Expr, right: &Expr, table: &TableSchema) -> Result<(), QueryError> {
-        let Some((data_type, kind, text, computed, numeric)) = temporal_column(left, table)
+    fn validate_pair<'a>(
+        left: &Expr,
+        right: &Expr,
+        resolve: &TemporalLiteralColumnResolver<'a>,
+    ) -> Result<(), QueryError> {
+        if let (Expr::Tuple(left), Expr::Tuple(right)) = (left, right) {
+            for (left, right) in left.iter().zip(right) {
+                validate_pair(left, right, resolve)?;
+            }
+            return Ok(());
+        }
+        let Some((data_type, kind, text, computed, numeric)) = temporal_column(left, resolve)
             .and_then(|(data_type, kind)| {
                 constant_text(right)
                     .map(|(text, computed, numeric)| (data_type, kind, text, computed, numeric))
             })
             .or_else(|| {
-                temporal_column(right, table).and_then(|(data_type, kind)| {
+                temporal_column(right, resolve).and_then(|(data_type, kind)| {
                     constant_text(left)
                         .map(|(text, computed, numeric)| (data_type, kind, text, computed, numeric))
                 })
@@ -20904,7 +20969,7 @@ pub(crate) fn validate_expr_temporal_literals(
         // 99991231235959.999999). MySQL keeps the comparison result but
         // publishes the resolver diagnostics once for the expression.
         if numeric {
-            if let DataTypeKind::DateTime { fsp } = data_type {
+            if let DataTypeKind::DateTime { fsp } = &data_type {
                 if *fsp < 6 {
                     let rounded_overflow = crate::util::temporal::parse_compact_datetime(&text)
                         .filter(|parts| parts.is_datetime)
@@ -20990,9 +21055,6 @@ pub(crate) fn validate_expr_temporal_literals(
                 format!("Incorrect {kind} value: '{text}'"),
             ));
         }
-        if !strict_sql_mode() {
-            return Ok(());
-        }
         Err(error(
             crate::error::catalog::ER_WRONG_VALUE,
             format!("Incorrect {kind} value: '{text}'"),
@@ -21000,16 +21062,24 @@ pub(crate) fn validate_expr_temporal_literals(
     }
 
     #[inline(never)]
-    fn visit(expr: &Expr, table: &TableSchema) -> Result<(), QueryError> {
+    fn visit<'a>(
+        expr: &Expr,
+        table: Option<&TableSchema>,
+        resolve: &TemporalLiteralColumnResolver<'a>,
+    ) -> Result<(), QueryError> {
         let _depth = ExpressionDepthGuard::enter()?;
         crate::util::stack::with_stack(
             crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
-            || visit_inner(expr, table),
+            || visit_inner(expr, table, resolve),
         )?
     }
 
     #[inline(never)]
-    fn visit_inner(expr: &Expr, table: &TableSchema) -> Result<(), QueryError> {
+    fn visit_inner<'a>(
+        expr: &Expr,
+        table: Option<&TableSchema>,
+        resolve: &TemporalLiteralColumnResolver<'a>,
+    ) -> Result<(), QueryError> {
         match expr {
             Expr::Binary { left, op, right } => {
                 if matches!(
@@ -21022,10 +21092,10 @@ pub(crate) fn validate_expr_temporal_literals(
                         | BinaryOp::Gt
                         | BinaryOp::GtEq
                 ) {
-                    validate_pair(left, right, table)?;
+                    validate_pair(left, right, resolve)?;
                 }
-                visit(left, table)?;
-                visit(right, table)
+                visit(left, table, resolve)?;
+                visit(right, table, resolve)
             }
             Expr::InList {
                 expr,
@@ -21039,24 +21109,26 @@ pub(crate) fn validate_expr_temporal_literals(
                 // losslessly. Preserve the diagnostic as part of statement
                 // semantics; positive IN does not build those complement
                 // boundaries and must stay quiet.
-                let date_column = match expr.as_ref() {
-                    Expr::Identifier(name) => Some(name.as_str()),
-                    Expr::CompoundIdentifier(parts) => parts.last().map(String::as_str),
-                    _ => None,
-                }
-                .filter(|name| {
-                    table
-                        .column_index(name)
-                        .ok()
-                        .and_then(|index| table.columns.get(index))
-                        .is_some_and(|column| matches!(column.data_type, DataTypeKind::Date))
-                })
-                .filter(|name| {
-                    table.iter_queryable_indexes().any(|index| {
-                        index
-                            .effective_columns()
-                            .iter()
-                            .any(|column| column.eq_ignore_ascii_case(name))
+                let date_column = table.and_then(|table| {
+                    match expr.as_ref() {
+                        Expr::Identifier(name) => Some(name.as_str()),
+                        Expr::CompoundIdentifier(parts) => parts.last().map(String::as_str),
+                        _ => None,
+                    }
+                    .filter(|name| {
+                        table
+                            .column_index(name)
+                            .ok()
+                            .and_then(|index| table.columns.get(index))
+                            .is_some_and(|column| matches!(column.data_type, DataTypeKind::Date))
+                    })
+                    .filter(|name| {
+                        table.iter_queryable_indexes().any(|index| {
+                            index
+                                .effective_columns()
+                                .iter()
+                                .any(|column| column.eq_ignore_ascii_case(name))
+                        })
                     })
                 });
                 let has_static_datetime = list.iter().any(|item| {
@@ -21080,9 +21152,19 @@ pub(crate) fn validate_expr_temporal_literals(
                     );
                 }
                 for item in list {
-                    visit(item, table)?;
+                    validate_pair(expr, item, resolve)?;
+                    visit(item, table, resolve)?;
                 }
-                visit(expr, table)
+                visit(expr, table, resolve)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                validate_pair(expr, low, resolve)?;
+                validate_pair(expr, high, resolve)?;
+                visit(expr, table, resolve)?;
+                visit(low, table, resolve)?;
+                visit(high, table, resolve)
             }
             Expr::Function { args, .. } => {
                 // TIMESTAMP() is a scalar conversion, not a typed temporal
@@ -21090,29 +21172,29 @@ pub(crate) fn validate_expr_temporal_literals(
                 // expression is evaluated (NULL plus warning); binding it
                 // eagerly is observably wrong for an empty input relation.
                 for arg in args {
-                    visit(arg, table)?;
+                    visit(arg, table, resolve)?;
                 }
                 Ok(())
             }
             Expr::QuantifiedComparison { left, right, .. } => {
-                visit(left, table)?;
+                visit(left, table, resolve)?;
                 if let QuantifiedComparisonRight::List(items) = right {
                     for item in items {
-                        validate_pair(left, item, table)?;
-                        visit(item, table)?;
+                        validate_pair(left, item, resolve)?;
+                        visit(item, table, resolve)?;
                     }
                 }
                 Ok(())
             }
-            Expr::InSubquery { expr, .. } => visit(expr, table),
+            Expr::InSubquery { expr, .. } => visit(expr, table, resolve),
             Expr::Subquery(_) | Expr::Exists { .. } => Ok(()),
             _ => crate::parser::visit::try_for_each_expr_child_with_frame(expr, |child| {
-                visit(child, table)
+                visit(child, table, resolve)
             }),
         }
     }
 
-    visit(expr, table)
+    visit(expr, table, resolve)
 }
 
 /// Publish conversion diagnostics that MySQL resolves when a SQL-level
@@ -24146,9 +24228,30 @@ pub(crate) fn compare_values_as_strings(
     }
 }
 
-/// Apply MySQL's temporal-vs-string comparison coercion before the generic
-/// numeric comparison rules. Returns `None` when the operand pair is not a
-/// DATE/DATETIME and string pair.
+/// Preserve source-literal errors and genuine prepared-value diagnostics at
+/// both expression and deferred index-bound conversion sites.
+#[cold]
+pub(crate) fn report_invalid_date_comparison(kind: &str, value: &Value) -> Result<(), QueryError> {
+    // Auto-parameterization is an execution optimization, not a change of
+    // literal semantics. Only genuine prepared values get runtime warnings.
+    if !crate::engine::params::has_active_params()
+        || crate::engine::params::auto_parameterized_active()
+    {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_VALUE,
+            format!("Incorrect {kind} value: '{}'", string_value(value)),
+        ));
+    }
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+        format!("Incorrect {kind} value: '{}'", string_value(value)),
+    );
+    Ok(())
+}
+
+/// Apply temporal/string coercion before generic numeric comparison rules.
+/// Returns None when the operand pair does not need temporal conversion.
 fn compare_temporal_string_values(
     left: &Value,
     right: &Value,
@@ -24251,47 +24354,15 @@ fn compare_temporal_string_values(
             ordering
         }));
     }
-    // MySQL diagnoses an invalid literal while resolving the statement, but
-    // a value supplied through a prepared-statement parameter is converted
-    // at execution time: conversion yields the zero temporal value plus
-    // ER_WRONG_VALUE as a warning.  Keep the distinction here because the
-    // runtime Value no longer carries its Placeholder provenance.
     let kind = if matches!(temporal, Value::Date(_)) {
         "DATE"
     } else {
         "DATETIME"
     };
-    if strict_sql_mode() && !crate::engine::params::has_active_params() {
-        return Err(error(
-            crate::error::catalog::ER_WRONG_VALUE,
-            format!("Incorrect {kind} value: '{}'", string_value(literal)),
-        ));
-    }
-    let in_list = IN_LIST_COMPARISON_CONTEXT.with(std::cell::Cell::get);
-    let dynamic_prepared_value = crate::engine::params::has_active_params()
-        && !crate::engine::params::auto_parameterized_active();
-    crate::engine::api::push_statement_warning(
-        crate::error::ConditionLevel::Warning,
-        if in_list || dynamic_prepared_value {
-            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE
-        } else {
-            crate::error::catalog::ER_WRONG_VALUE
-        },
-        if in_list {
-            format!(
-                "Truncated incorrect {} value: '{}'",
-                kind.to_ascii_lowercase(),
-                string_value(literal)
-            )
-        } else {
-            format!("Incorrect {kind} value: '{}'", string_value(literal))
-        },
-    );
-    if dynamic_prepared_value {
-        TEMPORAL_COMPARISON_CONVERSION_FAILED.with(|failed| failed.set(true));
-    }
-    // An execution-time failed temporal conversion produces the all-zero
-    // value. Every valid stored DATE/DATETIME therefore sorts after it.
+    report_invalid_date_comparison(kind, literal)?;
+    TEMPORAL_COMPARISON_CONVERSION_FAILED.with(|failed| failed.set(true));
+    // Ordering-only callers must not use a failed conversion as a SQL truth
+    // value. compare_nullable_values consumes the failure and returns NULL.
     let ordering = Ordering::Greater;
     Ok(Some(if flipped {
         ordering.reverse()
@@ -25624,23 +25695,44 @@ pub(crate) fn eval_logical_not(value: &Value) -> Value {
 /// already excludes the value (e.g. `10 BETWEEN NULL AND 5` = FALSE), and
 /// NULL only when the outcome is genuinely unknown. Single source of truth
 /// for every BETWEEN evaluation site.
+#[inline]
 pub(crate) fn eval_between(
     value: &Value,
     low: &Value,
     high: &Value,
     negated: bool,
 ) -> Result<Value, QueryError> {
+    Ok(match eval_between_truth(value, low, high, negated)? {
+        None => Value::Null,
+        Some(result) => Value::Int(result as i64),
+    })
+}
+
+/// Share BETWEEN's three-valued result with filters without materializing a
+/// Value only to convert it back to a boolean for every input row.
+#[inline]
+pub(crate) fn eval_between_truth(
+    value: &Value,
+    low: &Value,
+    high: &Value,
+    negated: bool,
+) -> Result<Option<bool>, QueryError> {
+    // Homogeneous, non-NULL values need no temporal coercion or failure
+    // tracking. Keep their original comparison cost in projections and
+    // prepared range residuals; the ordering oracle still handles decimals,
+    // NaNs and component-preserving temporal encodings.
+    if !matches!(value, Value::Null)
+        && std::mem::discriminant(value) == std::mem::discriminant(low)
+        && std::mem::discriminant(value) == std::mem::discriminant(high)
+    {
+        let lower = compare_values(value, low)? != Ordering::Less;
+        let higher = compare_values(value, high)? != Ordering::Greater;
+        let inside = lower && higher;
+        return Ok(Some(if negated { !inside } else { inside }));
+    }
     // lower = (value >= low); higher = (value <= high); `None` == unknown (NULL).
-    let lower = if matches!(value, Value::Null) || matches!(low, Value::Null) {
-        None
-    } else {
-        Some(compare_values(value, low)? != Ordering::Less)
-    };
-    let higher = if matches!(value, Value::Null) || matches!(high, Value::Null) {
-        None
-    } else {
-        Some(compare_values(value, high)? != Ordering::Greater)
-    };
+    let lower = compare_nullable_values(value, low)?.map(|order| order != Ordering::Less);
+    let higher = compare_nullable_values(value, high)?.map(|order| order != Ordering::Greater);
     // Three-valued AND: FALSE if either side is FALSE, else NULL if either is
     // unknown, else TRUE.
     let in_range = match (lower, higher) {
@@ -25648,10 +25740,7 @@ pub(crate) fn eval_between(
         (Some(true), Some(true)) => Some(true),
         _ => None,
     };
-    Ok(match in_range {
-        None => Value::Null,
-        Some(b) => Value::Int((if negated { !b } else { b }) as i64),
-    })
+    Ok(in_range.map(|inside| if negated { !inside } else { inside }))
 }
 
 /// MySQL three-valued logic for the `AND` / `OR` operators. Operands are
