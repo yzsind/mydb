@@ -2050,9 +2050,7 @@ fn execute_load_data_ignore_parallel(
     if let Some(replay) = replay {
         // Trial diagnostics are private. Any warning forces an ordered replay
         // before publication, preserving both conversion and warning order.
-        let warnings = Arc::new(parking_lot::Mutex::new(
-            crate::engine::api::SqlWarnings::new(),
-        ));
+        let warnings = crate::engine::api::StatementWarningSink::default();
         let result = crate::engine::api::with_statement_warning_sink(warnings, || {
             let _ignore = crate::storage::DmlIgnoreCoercionGuard::new(false);
             let _decode = LoadDecodePolicyGuard::new(false);
@@ -6685,6 +6683,9 @@ mod tests {
         let input: String = (0..5003).map(|id| format!("{id}|\n")).collect();
         std::fs::write(&path, input).unwrap();
         let mut session = SessionContext::default();
+        engine
+            .execute_with_session(&mut session, "SET max_error_count=65535")
+            .unwrap();
         let response = engine.execute_with_session(&mut session, &format!(
             "LOAD DATA /*+ PARALLEL(8) */ INFILE '{}' INTO TABLE warning_rows FIELDS TERMINATED BY '|'",
             crate::util::file::sql_path(&path)
@@ -7526,7 +7527,9 @@ mod tests {
         } else {
             setup_engine()
         };
-        let rows = 4096;
+        // Cross the parallel admission boundary and leave a tail after its
+        // probe, without doubling the same visibility/rollback workload.
+        let rows = PARALLEL_MIN_ROWS as i64 + 1;
         let path = tmp.path().join("visibility.tsv");
         let data = (1..=rows)
             .map(|id| format!("{id}\t{id}\t{}\t2024-01-{:02}\tvalue-{id:08}\traw-{id}\t{}\t{id}.25\t{id}.5\tpayload-{id}\n", id * 2, id % 28 + 1, if id % 7 == 0 { "\\N".to_owned() } else { (u64::MAX - id as u64).to_string() }))
@@ -8288,6 +8291,15 @@ mod tests {
 
     #[test]
     fn direct_delimiter_scan_matches_serial_for_escaped_and_plain_rows() {
+        crate::engine::sysvar::registry()
+            .write(
+                "max_error_count",
+                crate::engine::sysvar::SetScope::Global,
+                &mut SessionContext::default(),
+                None,
+                crate::engine::sysvar::SysVarValue::UInt(65535),
+            )
+            .unwrap();
         let (engine, tmp) = setup_strict_load_engine();
         for (case, delimiter, escape, options) in [
             ("ascii", '|', '\\', "FIELDS TERMINATED BY '|'"),

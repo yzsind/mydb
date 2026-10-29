@@ -4656,16 +4656,16 @@ fn xa_accepts_hex_xid_literal() {
 
 #[test]
 fn xa_rejects_empty_gtrid() {
-    let stmt = parse_statement("XA START ''").unwrap();
-    assert!(matches!(stmt, Statement::Unsupported { .. }));
+    let err = parse_statement("XA START ''").unwrap_err();
+    assert_eq!(err.spec, crate::error::catalog::ER_XAER_INVAL);
 }
 
 #[test]
 fn xa_rejects_oversized_gtrid() {
     let payload = "x".repeat(65);
     let sql = format!("XA START '{}'", payload);
-    let stmt = parse_statement(&sql).unwrap();
-    assert!(matches!(stmt, Statement::Unsupported { .. }));
+    let err = parse_statement(&sql).unwrap_err();
+    assert_eq!(err.spec, crate::error::catalog::ER_XAER_INVAL);
 }
 
 #[test]
@@ -7023,4 +7023,20 @@ fn round2_large_literal_without_join_does_not_spend_rewrite_budget() {
     let text = "x".repeat(5 * 1024 * 1024);
     let statement = parse_statement(&format!("SELECT LENGTH('{text}')")).unwrap();
     assert!(matches!(statement, Statement::Select(_)));
+}
+
+#[test]
+fn routine_audit_1028_rejects_nul_identifiers_but_preserves_literal_nuls() {
+    for sql in [
+        "SELECT `\0view_function_0`() FROM v",
+        "SELECT /*!80000 `\0view_function_0`() */ FROM v",
+        "CREATE PROCEDURE `\0invalid`() SELECT 1",
+    ] {
+        assert!(parse_statement(sql).is_err(), "{sql:?}");
+        assert!(parse_statements(sql).is_err(), "{sql:?}");
+    }
+    assert!(parse_statement("SELECT 'value\0payload'").is_ok());
+    assert!(parse_statement("SELECT /*!80000 'value\0payload' */").is_ok());
+    let _mode = ParserSqlModeGuard::activate(crate::engine::api::SQL_MODE_ANSI_QUOTES);
+    assert!(parse_statement("SELECT \"\0view_function_0\"()").is_err());
 }

@@ -473,6 +473,81 @@ struct AlterCopyProjection {
     decode: RowDecodePlan,
 }
 
+struct AlterCopyDefaults<'a> {
+    expressions: Vec<(usize, Expr)>,
+    auto_increment: Option<usize>,
+    job: &'a AlterCopyJob,
+    step: u64,
+    offset: u64,
+}
+
+impl<'a> AlterCopyDefaults<'a> {
+    fn new(
+        source: &TableSchema,
+        target: &TableSchema,
+        job: &'a AlterCopyJob,
+    ) -> Result<Self, QueryError> {
+        let mut expressions = Vec::new();
+        for (idx, column) in target.columns.iter().enumerate().skip(source.columns.len()) {
+            if let Some(sql) = &column.default_expr {
+                let expr = crate::parser::parse_catalog_expr(sql)
+                    .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))?;
+                // Constant defaults already have their frozen catalog backfill.
+                if crate::parser::visit::try_for_each_expr(&expr, |node| {
+                    if matches!(node, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                        Err(())
+                    } else {
+                        Ok(true)
+                    }
+                })
+                .is_err()
+                {
+                    expressions.push((idx, expr));
+                }
+            }
+        }
+        let (step, offset) = crate::engine::expr::session_auto_increment();
+        Ok(Self {
+            expressions,
+            auto_increment: target
+                .auto_increment_column_index()
+                .filter(|idx| *idx >= source.columns.len()),
+            job,
+            step,
+            offset,
+        })
+    }
+
+    fn apply(&self, target: &TableSchema, values: &mut Vec<Value>) -> Result<(), QueryError> {
+        while values.len() < target.columns.len() {
+            values.push(
+                crate::engine::executor::insert::column_read_backfill_default(
+                    &target.columns[values.len()],
+                ),
+            );
+        }
+        if let Some(idx) = self.auto_increment {
+            let mut current = self.job.auto_increment_max.load(Ordering::Relaxed);
+            let next = loop {
+                let next = next_auto_increment_after(current, self.step, self.offset)?;
+                match self.job.auto_increment_max.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break next,
+                    Err(actual) => current = actual,
+                }
+            };
+            values[idx] = generated_auto_increment_value(next, &target.columns[idx])?;
+        }
+        for (idx, expr) in &self.expressions {
+            values[*idx] = crate::engine::expr::eval_expr(expr, target, values)?;
+        }
+        Ok(())
+    }
+}
 fn alter_copy_projection(
     old_table: &TableSchema,
     candidate: &TableSchema,
@@ -482,7 +557,9 @@ fn alter_copy_projection(
         || candidate
             .columns
             .iter()
-            .any(|column| column.generated_expr.is_some() || column.default_expr.is_some())
+            .enumerate()
+            .any(|(idx, column)| column.generated_expr.is_some() || column.default_expr.is_some()
+                || (column.auto_increment && idx >= old_table.columns.len()))
         || candidate.indexes.iter().any(|index| {
             index.has_expression_parts()
                 || index.is_fulltext()
@@ -986,7 +1063,7 @@ fn prepare_create_table_schema(
                 .unwrap_or_else(|| "functional_index".to_string());
             let mut name = base.clone();
             let mut suffix = 2;
-            while index_schemas
+            while name.eq_ignore_ascii_case("PRIMARY") || index_schemas
                 .iter()
                 .any(|i| i.name.eq_ignore_ascii_case(&name))
             {
@@ -1313,6 +1390,7 @@ impl Database {
         };
         let partitioned = table.partitioning.is_some();
         let storage_ids = table.storage_ids();
+        let created_table = Arc::new(table);
         {
             let mut catalog = self.catalog_write()?;
             // Re-check while holding the writer lock. The early probe is
@@ -1327,14 +1405,14 @@ impl Database {
                     format!("Table '{name}' already exists"),
                 ));
             }
-            if !table.check_constraints.is_empty() {
+            if !created_table.check_constraints.is_empty() {
                 let schema_names =
-                    check_constraint_names_in_schema(&catalog, &table.database, None);
-                ensure_check_constraint_names_available(&schema_names, &table.check_constraints)?;
+                    check_constraint_names_in_schema(&catalog, &created_table.database, None);
+                ensure_check_constraint_names_available(&schema_names, &created_table.check_constraints)?;
             }
             let rebuild_fk_runtime =
-                !table.foreign_keys.is_empty() || self.catalog.may_have_foreign_keys();
-            catalog.tables.insert(key.clone(), Arc::new(table));
+                !created_table.foreign_keys.is_empty() || self.catalog.may_have_foreign_keys();
+            catalog.tables.insert(key.clone(), created_table.clone());
             // Rebuild FK runtime caches so this table's child_col_idx and
             // any parent's reverse `fk_referenced_by` reflect the new FKs.
             if rebuild_fk_runtime {
@@ -1342,6 +1420,11 @@ impl Database {
             }
         }
         self.register_catalog_table_mapping(&key)?;
+        #[cfg(test)]
+        {
+            let hook = self.create_finalize_test_hook.lock().unwrap().take();
+            if let Some(hook) = hook { hook.pause(); }
+        }
         let finalize = (|| -> Result<(), QueryError> {
             // Create one heap file per physical storage id. For partitioned
             // tables this is one heap per partition; otherwise table.id.
@@ -1364,20 +1447,33 @@ impl Database {
                 self.persist_auto_increment_max(id, auto_increment_max)?;
             }
             if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
                 self.initialize_empty_zone_maps_for_table(&table)?;
-                let vector_names = table.indexes.iter().filter(|index| index.is_vector())
-                    .map(|index| index.name.as_str()).collect::<Vec<_>>();
+                let vector_names = table
+                    .indexes
+                    .iter()
+                    .filter(|index| index.is_vector())
+                    .map(|index| index.name.as_str())
+                    .collect::<Vec<_>>();
                 self.warm_vector_graphs_after_ddl(&table, &vector_names)?;
             }
-            self.note_catalog_table_key(&key)?;
+            {
+                let catalog = self.catalog_read()?;
+                let table = catalog.tables.get(&key).filter(|table| table.id == id)
+                    .ok_or_else(|| error(crate::error::catalog::ER_NO_SUCH_TABLE,
+                        format!("catalog table '{key}' changed before CREATE commit")))?;
+                self.catalog.register_table(&key, table);
+                self.note_catalog_table(id);
+            }
             self.commit_ddl_catalog_txn()
         })();
         if let Err(err) = finalize {
             // CREATE is fail-closed: no in-memory ghost table or orphan heap
             // survives a file/sidecar/DD failure.
-            let cleanup = self
-                .table_by_id(id)
-                .map(|table| self.build_drop_table_intent(&table)).transpose();
+            // DROP may already have removed the public descriptor before
+            // finalization creates its last file. Keep CREATE's own identity
+            // so cleanup is still durable and never targets a replacement table.
+            let cleanup = self.build_drop_table_intent(&created_table);
             {
                 let mut catalog = self.catalog_write()?;
                 if catalog.tables.get(&key).is_some_and(|table| table.id == id) {
@@ -1386,11 +1482,13 @@ impl Database {
                 }
             }
             match cleanup {
-                Ok(Some(cleanup)) => {
+                Ok(cleanup) => {
                     let intent = self.write_drop_table_intent(&cleanup)?;
-                    if self.purge_dropped_table_files(&cleanup) { self.remove_drop_table_intent(intent.as_ref()); }
+                    if self.evict_dropped_table_caches(&created_table).is_ok()
+                        && self.purge_dropped_table_files(&cleanup) {
+                        self.remove_drop_table_intent(intent.as_ref());
+                    }
                 }
-                Ok(None) => {},
                 Err(cleanup_err) => self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}")),
             }
             self.auto_increment.forget_table(id);
@@ -1500,6 +1598,9 @@ impl Database {
                 // Seed the runtime counter; temporary tables never persist
                 // AUTO_INCREMENT dynamic metadata.
                 self.auto_increment.install(id, 1, auto_increment_max)?;
+            }
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
             }
             Ok(())
         })();
@@ -1761,8 +1862,14 @@ impl Database {
                 self.auto_increment.install(id, 1, 0)?;
             }
             self.remove_heap_cache_entry(id)?;
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
+            }
             for storage_id in &partition_ids {
                 self.remove_heap_cache_entry(*storage_id)?;
+            }
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
             }
             self.note_catalog_table_key(&key)?;
             self.commit_ddl_catalog_txn()
@@ -1852,6 +1959,9 @@ impl Database {
                 self.auto_increment.install(id, 1, 0)?;
             }
             self.remove_heap_cache_entry(id)?;
+            if let Some(table) = self.table_by_id(id) {
+                self.initialize_empty_spatial_indexes(&table)?;
+            }
             Ok(())
         })();
         if let Err(err) = finalize {
@@ -1935,6 +2045,9 @@ impl Database {
             self.reset_auto_increment(table.id)?;
         }
         self.drop_table_vector_graphs(&table)?;
+        self.initialize_empty_spatial_indexes(&table)?;
+        let vector_names = table.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+        self.warm_vector_graphs_after_ddl(&table, &vector_names)?;
         Ok(())
     }
 
@@ -2013,6 +2126,14 @@ impl Database {
             }
             for index in &table.indexes {
                 self.with_index_read(sid, &index.name, |idx| {
+                    if let Some(spatial) = &idx.spatial {
+                        return self.flush_temp_snapshot_pages(
+                            &idx.path,
+                            idx.file_key.clone(),
+                            spatial.count_pages(),
+                            None,
+                        );
+                    }
                     let meta = idx.meta_state.lock().meta.clone();
                     self.flush_temp_snapshot_pages(
                         &idx.path,
@@ -2228,10 +2349,16 @@ impl Database {
             next.primary_key = index.columns.clone();
         }
         index.state = IndexState::Public;
-        self.prepare_empty_temp_index_file(next.id, &index.name)?;
+        if !index.is_spatial() {
+            self.prepare_empty_temp_index_file(next.id, &index.name)?;
+        }
         next.indexes.push(index.clone());
         next.bump_schema_version();
-        self.rebuild_index(&next, &index)?;
+        if let Err(err) = self.rebuild_index(&next, &index) {
+            self.remove_index_cache_entry(next.id, &index.name)?;
+            self.remove_temp_file(self.index_path_for_table_schema(&next, next.id, &index.name))?;
+            return Err(err);
+        }
         self.temp_tables
             .write()
             .map_err(|_| {
@@ -2362,7 +2489,9 @@ impl Database {
         self.flush_dirty_data()?;
         self.remove_index_cache_entry(table.id, old_name)?;
         let old_path = self.index_path(table.id, old_name);
-        let new_path = self.index_path(table.id, new_name);
+        let new_path = self
+            .index_path(table.id, new_name)
+            .with_extension(if index.is_spatial() { "rtree" } else { "idx" });
         if old_path.exists() {
             fs::rename(&old_path, &new_path).map_err(io_err)?;
         }
@@ -2731,7 +2860,7 @@ impl Database {
                 }
             }
             rename_check_constraint_column_references(&mut candidate, old_name, &new_name)?;
-            rename_generated_column_references(&mut candidate, old_name, &new_name)?;
+            rename_column_expression_references(&mut candidate, old_name, &new_name)?;
         }
         candidate.publish_new_row_layout();
         validate_and_prepare_generated_columns(&mut candidate)?;
@@ -2800,7 +2929,7 @@ impl Database {
                 }
             }
             rename_check_constraint_column_references(table, old_name, new_name)?;
-            rename_generated_column_references(table, old_name, new_name)?;
+            rename_column_expression_references(table, old_name, new_name)?;
             rename_partition_column_references(table, old_name, new_name)?;
             validate_and_prepare_generated_columns(table)?;
             Ok(())
@@ -3303,7 +3432,7 @@ impl Database {
         candidate.build_column_index();
         let retired = self.build_drop_table_intent(&table)?;
         let retired_path = self.write_drop_table_intent(&retired)?;
-        let private = DropTableIntent {
+        let mut private = DropTableIntent {
             retired_index: None,
             table_id: candidate.id,
             had_auto_increment: candidate.auto_increment_column_index().is_some(),
@@ -3326,6 +3455,27 @@ impl Database {
         let private_path = self.write_drop_table_intent(&private)?;
         for path in &private.files {
             self.create_logged_file(txn_id_for_ddl(), self.data_dir.join(path), Vec::new())?;
+        }
+        self.initialize_empty_spatial_indexes(&candidate)?;
+        let vector_names = candidate.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+        if let Err(err) = self.warm_vector_graphs_after_ddl(&candidate, &vector_names) {
+            self.evict_table_vector_graphs(candidate.id);
+            let cleanup = self.build_drop_table_intent(&candidate)?;
+            if self.purge_dropped_table_files(&cleanup) {
+                self.remove_drop_table_intent(private_path.as_ref());
+                self.remove_drop_table_intent(retired_path.as_ref());
+            }
+            return Err(err);
+        }
+        // Record generated vector filenames before publishing the new identity.
+        // Recovery must retire these files too if the catalog commit aborts.
+        private = self.build_drop_table_intent(&candidate)?;
+        self.write_drop_table_intent(&private)?;
+        // The private identity is not in the catalog yet. An empty vector
+        // build may open its heap with a provisional empty codec. Reopen it
+        // from the published schema before accepting any DML.
+        for storage_id in candidate.storage_ids() {
+            self.remove_heap_cache_entry(storage_id)?;
         }
         let candidate = Arc::new(candidate);
         let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
@@ -3358,6 +3508,7 @@ impl Database {
                 .insert(key.clone(), table.clone());
             Self::take_catalog_mutations();
             // Preserve both intents if commit durability is ambiguous.
+            self.evict_table_vector_graphs(candidate.id);
             if self.ensure_operational().is_ok() && self.purge_dropped_table_files(&private) {
                 self.remove_drop_table_intent(private_path.as_ref());
                 self.remove_drop_table_intent(retired_path.as_ref());
@@ -4421,7 +4572,7 @@ impl Database {
                         table.id,
                         table.active_generation.max(1),
                         index.index_id,
-                        "idx",
+                        if index.is_spatial() { "rtree" } else { "idx" },
                     ),
                 )?;
             }
@@ -5182,7 +5333,11 @@ impl Database {
                     storage_id,
                     table_snapshot.active_generation.max(1),
                     dropped_index.index_id,
-                    "idx",
+                    if dropped_index.is_spatial() {
+                        "rtree"
+                    } else {
+                        "idx"
+                    },
                 ),
             ));
             if dropped_index.is_vector() {
@@ -6118,7 +6273,7 @@ impl Database {
                     self.prepare_change_column_candidate(table_name, old_name, new_def.clone())?;
                 Ok(copy_required)
             }
-            A::AddColumn(column) => Ok(column.generated.is_some()
+            A::AddColumn(column) => Ok(column.auto_increment || column.generated.is_some()
                 || column.checks.iter().any(|check| check.enforced)
                 || column.default.as_ref().is_some_and(|expr| {
                     crate::parser::visit::try_for_each_expr(expr, |node| {
@@ -6506,7 +6661,7 @@ impl Database {
                             old_name,
                             &new_name,
                         )?;
-                        rename_generated_column_references(&mut candidate, old_name, &new_name)?;
+                        rename_column_expression_references(&mut candidate, old_name, &new_name)?;
                         rename_partition_column_references(&mut candidate, old_name, &new_name)?;
                     }
                 }
@@ -6782,7 +6937,7 @@ impl Database {
                 &old_col_name,
                 &new_col_name,
             )?;
-            rename_generated_column_references(&mut candidate, &old_col_name, &new_col_name)?;
+            rename_column_expression_references(&mut candidate, &old_col_name, &new_col_name)?;
             // P1-11 — same partition-column propagation as rename_column.
             rename_partition_column_references(&mut candidate, &old_col_name, &new_col_name)?;
         }
@@ -7029,6 +7184,7 @@ impl Database {
             operation,
             object_name,
             capture_rows,
+            auto_increment_max: AtomicU64::new(0),
             cancel_token: crate::engine::cancel::current_token()
                 .unwrap_or_else(crate::engine::cancel::QueryCancelToken::noop)
                 .fork_local(),
@@ -7039,7 +7195,7 @@ impl Database {
                 replay_watermark: None,
                 error_message: None,
             }),
-            changes: Mutex::new(AlterCopyChangeLog::new(self.data_dir())),
+            changes: AlterCopyCapture::new(self.data_dir()),
             cancel_requested: AtomicBool::new(false),
             retired_vector_graphs: Mutex::new(Vec::new()),
             retired_files: Mutex::new(Vec::new()),
@@ -7099,12 +7255,12 @@ impl Database {
             }
         }
         let mut cleanup_failed = false;
-        for path in job
+        let retired_files = job
             .retired_files
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .drain(..)
-        {
+            .drain(..).collect::<Vec<_>>();
+        for path in &retired_files {
             if cleanup_failed && path.extension().is_some_and(|ext| ext == "job") {
                 continue;
             }
@@ -7117,6 +7273,9 @@ impl Database {
                     ));
                 }
             }
+        }
+        if let Err(err) = self.remove_empty_object_directories(retired_files) {
+            log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
         }
         let snapshot = Self::alter_copy_job_snapshot(&job);
         let history_bytes = std::mem::size_of::<AlterCopyJobHistoryEntry>()
@@ -7202,16 +7361,7 @@ impl Database {
         if !job.capture_rows {
             return;
         }
-        let mut changes = job
-            .changes
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        for row_id in rows {
-            if changes.record((txn_id, storage_id, row_id)).is_err() {
-                changes.invalidated = true;
-                break;
-            }
-        }
+        let _ = job.changes.record(txn_id, storage_id, rows);
     }
 
     pub fn alter_copy_job_snapshots(&self) -> Vec<AlterCopyJobSnapshot> {
@@ -7457,6 +7607,7 @@ impl Database {
             self.pause_ddl_backfill_for_test();
             let mut warnings = Vec::new();
             let mut rewritten_rows = Vec::with_capacity(source_rows.len());
+            let defaults = AlterCopyDefaults::new(&old_table, &candidate, &job)?;
             let mut unique_keys = candidate
                 .indexes
                 .iter()
@@ -7465,21 +7616,9 @@ impl Database {
                 .collect::<BTreeMap<_, crate::util::fast_hash::AhHashSet<IndexKey>>>();
             for row in source_rows {
                 Self::check_alter_copy_cancelled(&job)?;
-                let mut values = row.values;
-                // ADD COLUMN rewrite: pre-existing rows are short by the
-                // newly appended slot(s). Pad with each new column's
-                // catalog DEFAULT — generated slots get a placeholder that
-                // `materialize_generated_columns` immediately overwrites
-                // with the computed value. A no-op when the candidate has
-                // the same column count (MODIFY / CHANGE rewrites).
-                while values.len() < candidate.columns.len() {
-                    let col = &candidate.columns[values.len()];
-                    values.push(crate::engine::executor::insert::column_read_backfill_default(col));
-                }
-                coerce_row_for_alter_copy(&candidate, &mut values, strict, &mut warnings)?;
-                materialize_generated_columns(&candidate, &mut values, None)?;
-                self.check_not_null_constraints(&candidate, &values)?;
-                self.check_check_constraints(&candidate, &values, None)?;
+                let values = self.prepare_alter_copy_values(
+                    &candidate, row.values, strict, &mut warnings, &defaults,
+                )?;
                 for index in candidate.indexes.iter().filter(|index| index.unique) {
                     let key = candidate.index_key(index, &values)?;
                     if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
@@ -8015,7 +8154,7 @@ impl Database {
                     );
                     let held = OnlineCopyHoldTimer(Instant::now());
                     self.acquire_table_exclusive(ddl_txn_id, old_table.id)?;
-                    let tail = job.changes.lock().unwrap_or_else(|p| p.into_inner()).len();
+                    let tail = job.changes.len();
                     if tail <= 1024 {
                         DDL_COPY_FINAL_TAIL_ROWS.fetch_add(tail as u64, Ordering::Relaxed);
                         self.replay_online_copy_rows(
@@ -8256,6 +8395,11 @@ impl Database {
                 let _ = self.finish_shadow_generation_intent(&intent);
             }
         }
+        let shadow_paths = std::iter::once(shadow_heap_path).chain(candidate.indexes.iter()
+            .map(|index| self.index_path_for_table_schema(&candidate, shadow_id, &index.name)));
+        if let Err(err) = self.remove_empty_object_directories(shadow_paths) {
+            log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+        }
         if owns_job {
             self.unregister_alter_copy_job(old_table.id, result.as_ref().err());
         }
@@ -8319,12 +8463,6 @@ impl Database {
                 cache.insert((source.id, name), handle);
             }
         }
-        self.spatial_rtree_cache
-            .write()
-            .retain(|(id, _), _| *id != source.id && *id != shadow_id);
-        self.index_mutation_generations
-            .write()
-            .retain(|(id, _), _| *id != source.id && *id != shadow_id);
         self.forget_zone_map(source.id)?;
         self.table_locks_sharded
             .set_schema_floor(source.id, target.schema_version);
@@ -8355,30 +8493,7 @@ impl Database {
         ),
         QueryError,
     > {
-        let defaults = candidate
-            .columns
-            .iter()
-            .enumerate()
-            .skip(old_table.columns.len())
-            .filter_map(|(idx, column)| column.default_expr.as_deref().map(|sql| (idx, sql)))
-            .map(|(idx, sql)| {
-                crate::parser::parse_catalog_expr(sql)
-                    .map(|expr| (idx, expr))
-                    .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|(_, expr)| {
-                crate::parser::visit::try_for_each_expr(expr, |node| {
-                    if matches!(node, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-                        Err(())
-                    } else {
-                        Ok(true)
-                    }
-                })
-                .is_err()
-            })
-            .collect::<Vec<_>>();
+        let defaults = AlterCopyDefaults::new(old_table, candidate, job)?;
         if table_has_externalizable_column(old_table) || table_has_externalizable_column(candidate)
         {
             let started = Instant::now();
@@ -8427,9 +8542,7 @@ impl Database {
         let session_info = crate::engine::expr::current_session_expr_info();
         // Schema coercion also emits statement diagnostics through TLS. Share a
         // batched sink with workers so those warnings survive their exit.
-        let warning_sink = Arc::new(parking_lot::Mutex::new(
-            crate::engine::api::SqlWarnings::new(),
-        ));
+        let warning_sink = crate::engine::api::StatementWarningSink::default();
         let result = std::thread::scope(|scope| {
             let defaults = &defaults;
             let session_info = &session_info;
@@ -8803,6 +8916,8 @@ impl Database {
         old_table: &TableSchema,
         swap: ShadowGenerationFileSwap,
     ) -> Result<(), QueryError> {
+        // Drain the old summary handle before unlinking its generation's files.
+        self.forget_zone_map(old_table.id)?;
         let remove = |path: &Path| -> Result<(), QueryError> {
             match fs::remove_file(path) {
                 Ok(()) => Ok(()),
@@ -8820,8 +8935,12 @@ impl Database {
             remove(shadow)?;
         }
         self.sync_shadow_generation_directories(&swap)?;
-        self.forget_zone_map(old_table.id)?;
         let _ = fs::remove_file(self.zone_map_file_path(old_table.id));
+        let paths = swap.old_to_backup.into_iter().chain(swap.shadow_to_live)
+            .flat_map(|(a, b)| [a, b]);
+        if let Err(err) = self.remove_empty_object_directories(paths) {
+            log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+        }
         Ok(())
     }
 
@@ -8848,6 +8967,12 @@ impl Database {
             old_live_heap.clone(),
             old_live_heap.with_extension(format!("heap.alter-old-{job_id}")),
         )];
+        // The previous generation's derived map must retire with its heap;
+        // resolving zone_map_file_path after publication names the new generation.
+        let old_zone_map = crate::storage::naming::table_object_generation_path(
+            &self.data_dir, old_table.id, old_table.active_generation.max(1), "zm",
+        );
+        old_to_backup.push((old_zone_map.clone(), old_zone_map.with_extension(format!("zm.alter-old-{job_id}"))));
         old_to_backup.extend(old_table.indexes.iter().map(|index| {
             let live = self.index_path_for_table_schema(old_table, old_table.id, &index.name);
             let backup = live.with_extension(format!("idx.alter-old-{job_id}"));
@@ -9007,6 +9132,11 @@ impl Database {
                 true,
                 "invalid path in ALTER COPY intent",
             )?;
+            let paths = intent.old_to_backup.iter().chain(&intent.shadow_to_live)
+                .flat_map(|(a, b)| [self.data_dir.join(a), self.data_dir.join(b)]);
+            if let Err(err) = self.remove_empty_object_directories(paths) {
+                log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+            }
             self.finish_shadow_generation_intent(&path)?;
         }
         Ok(())
@@ -9084,11 +9214,9 @@ impl Database {
         mut values: Vec<Value>,
         strict: bool,
         warnings: &mut Vec<crate::engine::api::SqlWarning>,
+        defaults: &AlterCopyDefaults<'_>,
     ) -> Result<Vec<Value>, QueryError> {
-        while values.len() < candidate.columns.len() {
-            let column = &candidate.columns[values.len()];
-            values.push(crate::engine::executor::insert::column_read_backfill_default(column));
-        }
+        defaults.apply(candidate, &mut values)?;
         coerce_row_for_alter_copy(candidate, &mut values, strict, warnings)?;
         materialize_generated_columns(candidate, &mut values, None)?;
         self.check_not_null_constraints(candidate, &values)?;
@@ -9103,15 +9231,9 @@ impl Database {
         strict: bool,
         warnings: &mut Vec<crate::engine::api::SqlWarning>,
         coercion_mask: &[bool],
-        defaults: &[(usize, Expr)],
+        defaults: &AlterCopyDefaults<'_>,
     ) -> Result<Vec<Value>, QueryError> {
-        while values.len() < candidate.columns.len() {
-            let column = &candidate.columns[values.len()];
-            values.push(crate::engine::executor::insert::column_read_backfill_default(column));
-        }
-        for (idx, expr) in defaults {
-            values[*idx] = crate::engine::expr::eval_expr(expr, candidate, &values)?;
-        }
+        defaults.apply(candidate, &mut values)?;
         coerce_row_for_alter_copy_masked(
             candidate,
             &mut values,
@@ -9295,7 +9417,7 @@ impl Database {
                 }
             }
             rename_check_constraint_column_references(table, &old_col_name, new_name)?;
-            rename_generated_column_references(table, &old_col_name, new_name)?;
+            rename_column_expression_references(table, &old_col_name, new_name)?;
             // P1-11: propagate the rename into PARTITION BY / SUBPARTITION BY.
             // Previously `partitioning.columns` and `expr_sql` kept the old
             // name, so SHOW CREATE TABLE printed a stale definition, the
@@ -10870,6 +10992,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_create_finalize_test_hook(&self) -> Arc<DdlBackfillTestHook> {
+        let hook = Arc::new(DdlBackfillTestHook::new());
+        *self.create_finalize_test_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+
+    #[cfg(test)]
     fn pause_ddl_backfill_for_test(&self) {
         let hook = self
             .ddl_backfill_test_hook
@@ -11210,6 +11339,23 @@ impl Database {
                         ),
                     )
                 };
+                if index.is_spatial() {
+                    let mut actual = self.with_index_read(*storage_id, &index.name, |file| {
+                        file.validate_structure()?;
+                        file.entries()
+                    })?;
+                    actual.sort_unstable();
+                    for (key, row_id) in actual {
+                        let entry = expected.next().transpose()?.ok_or_else(&mismatch)?;
+                        if entry.key != key || entry.row_id != row_id {
+                            return Err(mismatch());
+                        }
+                    }
+                    if expected.next().transpose()?.is_some() {
+                        return Err(mismatch());
+                    }
+                    continue;
+                }
                 let mut actual = IndexRangeCursor::new(
                     self.index_handle(*storage_id, &index.name)?,
                     false,
@@ -11705,6 +11851,7 @@ impl Database {
             self.create_logged_file(txn_id_for_ddl(), self.table_path(*sid), Vec::new())?;
             self.remove_heap_cache_entry(*sid)?;
         }
+        self.initialize_empty_spatial_indexes_at(&candidate, &new_sids)?;
         self.note_catalog_table(table.id);
         self.commit_ddl_catalog_txn()?;
 
@@ -12226,6 +12373,7 @@ impl Database {
             self.create_logged_file(txn_id_for_ddl(), self.table_path(*sid), Vec::new())?;
             self.remove_heap_cache_entry(*sid)?;
         }
+        self.initialize_empty_spatial_indexes_at(&candidate, &new_sids)?;
         self.note_catalog_table(table.id);
         self.commit_ddl_catalog_txn()?;
         if !rows.is_empty() {

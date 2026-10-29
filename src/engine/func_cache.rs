@@ -249,8 +249,10 @@ fn compile_mysql_regex(pattern: &str, match_type: &str) -> Result<regex::Regex, 
             crate::error::catalog::ER_REGEXP_MISSING_CLOSE_BRACKET
         } else if message.contains("unclosed group") || message.contains("unopened group") {
             crate::error::catalog::ER_REGEXP_MISMATCHED_PAREN
+        } else if message.contains("invalid repetition count range") {
+            crate::error::catalog::ER_REGEXP_MAX_LT_MIN
         } else {
-            crate::error::catalog::ER_REGEXP_ERROR
+            crate::error::catalog::ER_REGEXP_RULE_SYNTAX
         };
         // The regex crate renders syntax diagnostics on multiple lines with
         // a source excerpt and caret. Protocol errors must remain one line:

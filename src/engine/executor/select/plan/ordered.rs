@@ -689,11 +689,7 @@ pub(super) fn try_execute_ordered_index_distinct_topk(
                 continue;
             }
             let mut distinct_values = Vec::with_capacity(projection.len());
-            for item in projection {
-                for value in crate::engine::executor::select::eval::project_item(&row, item) {
-                    distinct_values.push(ValueKey::from(&value?));
-                }
-            }
+            projected_dedup_key_into(&row, projection, &mut distinct_values)?;
             let key: std::sync::Arc<[ValueKey]> = distinct_values.into();
             if dedup.contains(&key) {
                 continue;
@@ -777,6 +773,17 @@ pub(in crate::engine::executor::select) fn execute_distinct_topk(
     while let Some(row) = stream.next()? {
         crate::engine::cancel::check_cancelled()?;
         sort_keys.clear();
+        if order_program.is_none() {
+            topk = topk.with_collations(
+                order_by
+                    .iter()
+                    .map(|item| {
+                        crate::engine::executor::select::eval::plan_expr_collation(&item.expr, &row)
+                            .map(|info| info.id)
+                    })
+                    .collect(),
+            );
+        }
         let program = order_program.get_or_insert_with(|| {
             crate::engine::executor::select::eval::PlanOrderProgram::compile_once(&row, order_by)
         });
@@ -791,11 +798,7 @@ pub(in crate::engine::executor::select) fn execute_distinct_topk(
         }
 
         let mut distinct_values = Vec::with_capacity(projection.len());
-        for item in projection {
-            for value in crate::engine::executor::select::eval::project_item(&row, item) {
-                distinct_values.push(ValueKey::from(&value?));
-            }
-        }
+        projected_dedup_key_into(&row, projection, &mut distinct_values)?;
         let key: std::sync::Arc<[ValueKey]> = distinct_values.into();
         if retained.contains(&key) {
             continue;
@@ -1260,7 +1263,8 @@ pub(super) fn projected_dedup_key_into(
                 }
             }
             SelectItem::Expr { expr, .. } => {
-                let value = eval_plan_expr(expr, row)?;
+                let value =
+                    crate::engine::executor::select::eval::eval_row_or_aggregate_expr(expr, row)?;
                 let collation =
                     crate::engine::executor::select::eval::plan_expr_collation(expr, row)
                         .map(|info| info.id);

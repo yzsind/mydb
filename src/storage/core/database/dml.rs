@@ -17,6 +17,32 @@ pub(crate) struct InsertHints {
     pub skip_row_lock: bool,
 }
 
+#[cfg(test)]
+mod audit_1029_tests {
+    use super::*;
+
+    #[test]
+    fn audit_1029_partial_lob_externalization_reclaims_rows_and_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine.execute("CREATE TABLE lob_failure(b LONGBLOB, j JSON)").unwrap();
+        let db = engine.db_handle();
+        let table = db.table("test.lob_failure").unwrap();
+        let invalid = vec![Value::Bytes(vec![42; 20000]), Value::String("invalid".repeat(5000))];
+        assert!(db.externalize_row_lobs(table.id, &table.row_codec, &invalid).is_err());
+        let (pages, free) = db.lob_space_stats(table.id).unwrap();
+        assert!(pages > 1);
+        assert_eq!(free, pages - 1);
+        let valid = vec![Value::Bytes(vec![43; 20000]), Value::String(format!("\"{}\"", "x".repeat(20000)))];
+        let txn = db.begin_txn().unwrap();
+        assert!(db.insert_mvcc_batch_externalized(txn.txn_id, table.id, &table.row_codec, &[], &[valid, invalid]).is_err());
+        db.rollback_txn(txn.txn_id).unwrap();
+        let (pages, free) = db.lob_space_stats(table.id).unwrap();
+        assert_eq!(free, pages - 1);
+        engine.shutdown().unwrap();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BulkInsertMode {
     User,
@@ -219,6 +245,7 @@ impl Database {
         let mut mask = vec![None; values.len()];
         // BUG-2 — chains this call allocates (excludes reused old chains).
         let mut newly_allocated: Vec<LobRef> = Vec::new();
+        let allocation = (|| -> Result<(), QueryError> {
         for i in 0..n {
             if externalized[i] {
                 // M1(LOB) — attach the kept/reused old chain: the caller (UPDATE reuse
@@ -251,6 +278,12 @@ impl Database {
                 mask[i] = Some(lob);
                 newly_allocated.push(lob);
             }
+        }
+            Ok(())
+        })();
+        if let Err(err) = allocation {
+            self.free_lob_chains(table_id, &newly_allocated);
+            return Err(err);
         }
         Ok((mask, newly_allocated))
     }
@@ -494,10 +527,13 @@ impl Database {
         rows: &[Vec<Value>],
     ) -> Result<Vec<RowId>, QueryError> {
         self.preflight_insert_undo_admission(table_id, rows.len())?;
-        let externals = rows
-            .iter()
-            .map(|values| self.externalize_row_lobs(table_id, codec, values))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut externals = Vec::with_capacity(rows.len());
+        for values in rows {
+            match self.externalize_row_lobs(table_id, codec, values) {
+                Ok(mask) => externals.push(mask),
+                Err(err) => { self.free_external_masks(table_id, &externals); return Err(err); }
+            }
+        }
         match self.with_heap_mut(table_id, |heap| {
             heap.insert_mvcc_batch(txn_id, headers, rows, &externals)
         }) {
@@ -3932,14 +3968,8 @@ impl Database {
                 &tombstone,
             )
         })?;
-        // Remove this row's entries from every index of this partition.
-        for index in &table.indexes {
-            for old_key in table.index_keys(index, old_values)? {
-                self.with_index_dml(storage_id, &index.name, |index_file| {
-                    index_file.delete_deferred(txn.txn_id, old_key, row_id)
-                })?;
-            }
-        }
+        // Publish old-key visibility before removing partition-local entries.
+        self.delete_indexes_deferred_at(txn.txn_id, storage_id, table, old_values, row_id)?;
         self.defer_vector_delete(txn.txn_id, undo_id, table, old_values, row_id, storage_id)?;
         if crate::binlog::should_record_table_rows(table) {
             crate::binlog::record_delete_rows(txn.txn_id, table, vec![old_values.to_vec()])?;

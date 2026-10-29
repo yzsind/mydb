@@ -1230,7 +1230,7 @@ pub enum PhysicalPlan {
 
 #[derive(Debug, Clone)]
 pub enum SpatialProbe {
-    Constant([f64; 4]),
+    Constant { mbr: [f64; 4], srid: u32 },
     Parameter(Expr),
 }
 
@@ -9458,12 +9458,6 @@ fn find_spatial_index_scan<'a>(
     expr: &Expr,
     hints: &ScanHints<'_>,
 ) -> Option<(&'a IndexSchema, SpatialProbe)> {
-    // The spatial scan reads the index under the table's own storage id; on a
-    // partitioned table the MBR entries live under per-partition storage ids,
-    // so fall back to a normal scan to avoid missing rows.
-    if table.is_partitioned() {
-        return None;
-    }
     for conj in expr_conjuncts(expr) {
         let Expr::Function { name, args, .. } = conj else {
             continue;
@@ -9494,14 +9488,18 @@ fn find_spatial_index_scan<'a>(
             let Ok(crate::types::Value::Geometry(bytes)) =
                 crate::engine::expr::eval_expr_legacy(&args[const_i], table, &[])
             else {
-                continue;
+                return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
             };
             if let Some(m) = crate::engine::geo::mbr_of(&bytes) {
                 return Some((
                     index,
-                    SpatialProbe::Constant([m.minx, m.miny, m.maxx, m.maxy]),
+                    SpatialProbe::Constant {
+                        mbr: [m.minx, m.miny, m.maxx, m.maxy],
+                        srid: crate::engine::geo::read_geometry(&bytes).ok()?.srid,
+                    },
                 ));
             }
+            return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
         }
     }
     None
@@ -10528,8 +10526,31 @@ fn choose_scan(
             } else if let Some(lower_bound) = db.zone_map_cost_lower_bound(&table.schema, expr) {
                 let metadata_cpu = lower_bound.zones_examined as f64
                     * crate::engine::cbo::cbo_consts().cpu_operator_cost();
+                // Price only pages the estimator is guaranteed to retain:
+                // its sampling floor and untrusted storage objects. Expected
+                // rows do not prove a match; exact metadata can prune every
+                // page, and a matching tail zone may be only partially full.
+                let min_fraction = if lower_bound.total_pages > 0 {
+                    (lower_bound.min_surviving_pages as f64 / lower_bound.total_pages as f64)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let scan_floor = if min_fraction > 0.0 {
+                    operator_cost::seq_scan(
+                        &ctx,
+                        seq_pages * min_fraction,
+                        seq_access_rows * min_fraction,
+                        seq_output_rows,
+                        row_width,
+                        qual_cpu,
+                    )
+                    .weighted_total()
+                } else {
+                    0.0
+                };
                 frontier
-                    .should_expand(metadata_cpu, false)
+                    .should_expand(scan_floor + metadata_cpu, false)
                     .then(|| db.zone_map_cost_details(&table.schema, expr))
                     .flatten()
             } else {
@@ -19985,7 +20006,10 @@ pub(crate) fn expr_is_deterministic(expr: &Expr) -> bool {
     crate::parser::visit::try_inspect_value_expr(expr, |node| {
         match node {
             Expr::Function { name, .. } => {
-                if crate::engine::ai::is_function(name) {
+                if crate::engine::ai::is_function(name)
+                    || crate::engine::http::is_function(name)
+                    || crate::engine::expr::function_has_external_effect(name)
+                {
                     return Err(());
                 }
                 let upper = name.to_ascii_uppercase();

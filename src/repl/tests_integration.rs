@@ -40,11 +40,12 @@ async fn initialize_replica_fixture(
     role.role = crate::repl::role::Role::Replica;
     role.master_endpoint = Some(master.to_string());
     crate::repl::role::save(dir, &role).unwrap();
-    crate::repl::base_backup::perform_base_backup_into(
+    crate::repl::base_backup::perform_base_backup_into_with_config(
         &master.ip().to_string(),
         master.port(),
         &role.node_uuid,
         dir,
+        ReplConfig::test_defaults(),
     )
     .await
     .unwrap();
@@ -65,7 +66,7 @@ async fn build_master() -> Master {
         bind_port: 0,
         config: ReplConfig {
             heartbeat: Duration::from_millis(10),
-            ..ReplConfig::default()
+            ..ReplConfig::test_defaults()
         },
         master_uuid: generate_uuid_bytes(),
         epoch: 1,
@@ -124,6 +125,7 @@ async fn audit_fragmented_ack_survives_heartbeat_ticks() {
         .await
         .unwrap();
     let hs = Handshake {
+        auth_token: ReplConfig::test_defaults().auth_token,
         protocol_version: protocol::PROTOCOL_VERSION,
         replica_uuid: generate_uuid_bytes(),
         requested_start_lsn: 1,
@@ -201,7 +203,7 @@ async fn replica_receives_master_wal_and_persists_progress() {
         config: ReplConfig {
             heartbeat: Duration::from_millis(10),
             reconnect_backoff: Duration::from_millis(10),
-            ..ReplConfig::default()
+            ..ReplConfig::test_defaults()
         },
         data_dir: replica_dir.path().to_path_buf(),
         log: Arc::clone(&replica_log),
@@ -276,7 +278,7 @@ async fn live_appends_after_replica_connects_also_propagate() {
         config: ReplConfig {
             heartbeat: Duration::from_millis(10),
             reconnect_backoff: Duration::from_millis(10),
-            ..ReplConfig::default()
+            ..ReplConfig::test_defaults()
         },
         data_dir: replica_dir.path().to_path_buf(),
         log: Arc::clone(&replica_log),
@@ -342,7 +344,7 @@ async fn replica_reconnect_resumes_from_persisted_progress() {
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
                 reconnect_backoff: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             data_dir: replica_dir.path().to_path_buf(),
             log: Arc::clone(&replica_log),
@@ -398,7 +400,7 @@ async fn replica_reconnect_resumes_from_persisted_progress() {
         config: ReplConfig {
             heartbeat: Duration::from_millis(10),
             reconnect_backoff: Duration::from_millis(10),
-            ..ReplConfig::default()
+            ..ReplConfig::test_defaults()
         },
         data_dir: replica_dir.path().to_path_buf(),
         log: Arc::clone(&replica_log),
@@ -459,7 +461,7 @@ async fn three_replicas_concurrent_catch_up_to_same_master() {
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
                 reconnect_backoff: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             data_dir: dir.path().to_path_buf(),
             log: Arc::clone(&log),
@@ -541,7 +543,7 @@ async fn handshake_below_retention_fires_resync_event() {
         master_host: bind_addr.ip().to_string(),
         master_port: bind_addr.port(),
         replica_uuid: crate::repl::role::generate_uuid_string(),
-        config: ReplConfig::default(),
+        config: ReplConfig::test_defaults(),
         data_dir: replica_dir.path().to_path_buf(),
         log: Arc::clone(&replica_log),
         db: None,
@@ -622,7 +624,7 @@ mod online_apply {
             bind_port: 0,
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             master_uuid: generate_uuid_bytes(),
             epoch: 1,
@@ -656,11 +658,12 @@ mod online_apply {
         role.role = crate::repl::role::Role::Replica;
         role.master_endpoint = Some(master_addr.to_string());
         crate::repl::role::save(dir.path(), &role).unwrap();
-        crate::repl::base_backup::perform_base_backup_into(
+        crate::repl::base_backup::perform_base_backup_into_with_config(
             &master_addr.ip().to_string(),
             master_addr.port(),
             &replica_uuid,
             dir.path(),
+            ReplConfig::test_defaults(),
         )
         .await
         .unwrap();
@@ -684,7 +687,7 @@ mod online_apply {
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
                 reconnect_backoff: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             data_dir: dir.path().to_path_buf(),
             log,
@@ -1026,14 +1029,28 @@ mod online_apply {
         }
         let db = replica.database_for_replication().clone();
         let before = db.wal_log().lock().last_lsn();
+        let source_log = source.database_for_replication().wal_log();
         tokio::task::spawn_blocking(move || {
             assert_eq!(db.catalog_retirement_count_for_test(), 1);
             assert_eq!(db.maintain_catalog_retirements_until(|| false).unwrap(), 1);
-            assert_eq!(
-                db.wal_log().lock().last_lsn(),
-                before,
-                "replica cleanup appended local WAL"
-            );
+            let after = db.wal_log().lock().last_lsn();
+            // The receiver remains live: legitimate source frames can arrive
+            // during cleanup. Compare their bytes instead of treating every
+            // concurrent tail advance as a locally generated record.
+            if after > before {
+                let mut received = crate::wal::WalReader::open(&db.wal_log(), before + 1).unwrap();
+                let mut source = crate::wal::WalReader::open(&source_log, before + 1).unwrap();
+                while let Some(chunk) = received.next_chunk(after, 1 << 20).unwrap() {
+                    let expected = source
+                        .next_chunk(chunk.end_lsn, chunk.bytes.len())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        chunk.bytes, expected.bytes,
+                        "replica cleanup generated divergent local WAL"
+                    );
+                }
+            }
             assert_eq!(
                 db.catalog_retirement_count_for_test(),
                 1,
@@ -1327,7 +1344,7 @@ mod online_apply {
                 ReplConfig {
                     heartbeat: Duration::from_millis(10),
                     reconnect_backoff: Duration::from_millis(10),
-                    ..ReplConfig::default()
+                    ..ReplConfig::test_defaults()
                 },
                 initial_progress,
                 Arc::clone(&status),
@@ -1775,9 +1792,10 @@ mod lifecycle_tests {
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
                 reconnect_backoff: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             slots,
+            transition: PlMutex::new(()),
             semi_sync_acked_commits: AtomicU64::new(0),
             semi_sync_timeout_commits: AtomicU64::new(0),
             semi_sync_degraded_commits: AtomicU64::new(0),
@@ -1789,6 +1807,175 @@ mod lifecycle_tests {
             receiver_status: Arc::new(PlMutex::new(String::new())),
             receiver_progress: Arc::new(PlMutex::new(ReplicaProgress::default())),
         })
+    }
+
+    #[tokio::test]
+    async fn release_audit_busy_source_backup_does_not_hold_capture_freeze() {
+        let dir = TempDir::new().unwrap();
+        let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        let engine = manager.engine.clone();
+        let mut session = crate::engine::SessionContext::default();
+        engine
+            .execute("CREATE TABLE busy_capture (id INT PRIMARY KEY)")
+            .unwrap();
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        engine
+            .execute_with_session(&mut session, "INSERT INTO busy_capture VALUES (1)")
+            .unwrap();
+        let db = engine.database_for_replication();
+        let mut writer = tokio::io::BufWriter::new(tokio::io::sink());
+        let started = std::time::Instant::now();
+        let result =
+            crate::repl::base_backup::stream_base_backup(&mut writer, db, dir.path()).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!db.capture.frozen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!db.capture.active.load(std::sync::atomic::Ordering::Acquire));
+        engine
+            .execute_with_session(&mut session, "ROLLBACK")
+            .unwrap();
+    }
+
+    #[test]
+    fn release_audit_concurrent_admin_transition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        let _transition = manager.transition.lock();
+        let err = manager.handle_reset_replication().unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::error::catalog::MYDB_ER_ROLE_CHANGE_BLOCKED.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_audit_unseeded_replica_reports_source_configuration() {
+        let dir = TempDir::new().unwrap();
+        let mut role = crate::repl::role::RoleState::new_standalone();
+        role.role = Role::Replica;
+        crate::repl::role::save(dir.path(), &role).unwrap();
+        let err = crate::repl::maybe_bootstrap_replica(dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("MYDB_REPL_MASTER_HOST"));
+        assert!(crate::repl::role::load(dir.path()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn release_audit_repeated_apply_failure_stops_without_reseed_marker() {
+        let (source, _source_dir, service) = build_master_with_engine().await;
+        let dir = TempDir::new().unwrap();
+        let manager = build_manager(service.bind_addr(), dir.path().to_path_buf());
+        manager.install_runtime_handle_for_tests(tokio::runtime::Handle::current());
+        let db = manager.engine.database_for_replication();
+        let baseline = db.wal_log().lock().last_lsn();
+        db.set_physical_replica_mode(true).unwrap();
+        std::fs::create_dir(dir.path().join("unwritable-redo-target")).unwrap();
+        {
+            let log = source.database_for_replication().wal_log();
+            let mut log = log.lock();
+            log.append_reserved(
+                baseline + 1,
+                0,
+                crate::wal::WalPayload::SlotReclaim {
+                    path: "unwritable-redo-target".into(),
+                    page_id: 0,
+                    slot_id: 0,
+                },
+            )
+            .unwrap();
+            log.flush().unwrap();
+        }
+        crate::wal::LogManager::sync_durable_to(
+            &source.database_for_replication().wal_log(),
+            baseline + 1,
+        )
+        .unwrap();
+        let progress = ReplicaProgress {
+            received_lsn: baseline,
+            durable_lsn: baseline,
+            applied_lsn: baseline,
+            durable_applied_lsn: baseline,
+            ..ReplicaProgress::default()
+        };
+        crate::repl::replica::progress::save_progress(dir.path(), &progress).unwrap();
+        manager.start_receiver_if_needed().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while manager.is_receiver_running() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !manager.is_receiver_running(),
+            "{}",
+            manager.receiver_status.lock()
+        );
+        assert!(manager
+            .receiver_status
+            .lock()
+            .contains("repeated apply failure"));
+        assert!(crate::repl::replica::progress::resync_marker_reason(dir.path()).is_none());
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn release_audit_idempotent_promote_reports_listener_bind_failure() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Arc::get_mut(&mut manager).unwrap().config.bind_port =
+            occupied.local_addr().unwrap().port();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        manager.install_runtime_handle_for_tests(runtime.handle().clone());
+        manager.set_role(Role::Master, None).unwrap();
+        let err = manager
+            .handle_promote(
+                "PROMOTE TO MASTER",
+                &crate::engine::SessionContext::default(),
+            )
+            .unwrap_err();
+        assert!(err.message().contains("bind"));
+    }
+
+    #[test]
+    fn release_audit_pending_promotion_blocks_reset_and_repoint() {
+        let dir = TempDir::new().unwrap();
+        let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        manager.install_runtime_handle_for_tests(runtime.handle().clone());
+        {
+            let mut state = manager.role_state.lock().unwrap();
+            state.promotion_pending = true;
+            state.promotion_target_lsn = Some(10);
+            crate::repl::role::save(dir.path(), &state).unwrap();
+        }
+        assert!(manager.handle_reset_replication().is_err());
+        assert!(manager
+            .handle_change_master("CHANGE MYDB MASTER TO HOST='127.0.0.1', PORT=3371")
+            .is_err());
+        assert_eq!(manager.role(), Role::Replica);
+    }
+
+    #[test]
+    fn release_audit_unconfigured_replica_reopens_existing_catalog() {
+        let dir = TempDir::new().unwrap();
+        let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        manager
+            .engine
+            .database_for_replication()
+            .checkpoint()
+            .unwrap();
+        {
+            let mut state = manager.role_state.lock().unwrap();
+            state.master_endpoint = None;
+            crate::repl::role::save(dir.path(), &state).unwrap();
+        }
+        drop(manager);
+        StorageQueryEngine::open_full(
+            dir.path().to_path_buf(),
+            QueryLogConfig::default(),
+            Arc::new(SessionRegistry::new()),
+        )
+        .expect("unconfigured replica must remain administrable");
     }
 
     #[test]
@@ -1929,7 +2116,7 @@ mod lifecycle_tests {
             bind_port: 0,
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             master_uuid: generate_uuid_bytes(),
             epoch: 1,
@@ -2106,7 +2293,7 @@ mod base_backup_tests {
     use super::*;
     use crate::engine::executor::StorageQueryEngine;
     use crate::engine::{QueryLogConfig, QueryResponse, SessionRegistry};
-    use crate::repl::base_backup::perform_base_backup_into;
+    use crate::repl::base_backup::perform_base_backup_into_with_config;
     use crate::repl::master::{self, MasterServiceInit, SlotRegistry};
     use crate::repl::role::{generate_uuid_bytes, generate_uuid_string};
     use crate::types::Value;
@@ -2131,7 +2318,7 @@ mod base_backup_tests {
             bind_port: 0,
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             master_uuid: generate_uuid_bytes(),
             epoch: 1,
@@ -2160,6 +2347,7 @@ mod base_backup_tests {
             .unwrap();
         let handshake = || {
             Message::Handshake(Handshake {
+                auth_token: ReplConfig::test_defaults().auth_token,
                 protocol_version: protocol::PROTOCOL_VERSION,
                 replica_uuid: generate_uuid_bytes(),
                 requested_start_lsn: 0,
@@ -2239,6 +2427,7 @@ mod base_backup_tests {
             .await
             .unwrap();
         let handshake = Message::Handshake(Handshake {
+            auth_token: ReplConfig::test_defaults().auth_token,
             protocol_version: protocol::PROTOCOL_VERSION,
             replica_uuid: generate_uuid_bytes(),
             requested_start_lsn: 0,
@@ -2323,11 +2512,12 @@ mod base_backup_tests {
         // `perform_base_backup_into` should pull a complete file
         // snapshot from the master.
         let replica_uuid = generate_uuid_string();
-        let backup_lsn = perform_base_backup_into(
+        let backup_lsn = perform_base_backup_into_with_config(
             &bind_addr.ip().to_string(),
             bind_addr.port(),
             &replica_uuid,
             replica_dir.path(),
+            ReplConfig::test_defaults(),
         )
         .await
         .expect("perform_base_backup_into");
@@ -2435,7 +2625,7 @@ mod base_backup_tests {
             replica_uuid,
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             data_dir: replica_dir.path().to_path_buf(),
             log: Arc::clone(&replica_log),
@@ -2558,7 +2748,7 @@ mod base_backup_tests {
             bind_port: 0,
             config: ReplConfig {
                 heartbeat: Duration::from_millis(10),
-                ..ReplConfig::default()
+                ..ReplConfig::test_defaults()
             },
             master_uuid: generate_uuid_bytes(),
             epoch: 1,
@@ -2574,11 +2764,12 @@ mod base_backup_tests {
         let bind_addr = service.bind_addr();
 
         let replica_dir = TempDir::new().unwrap();
-        let err = perform_base_backup_into(
+        let err = perform_base_backup_into_with_config(
             &bind_addr.ip().to_string(),
             bind_addr.port(),
             &generate_uuid_string(),
             replica_dir.path(),
+            ReplConfig::test_defaults(),
         )
         .await
         .expect_err("base backup must fail when master has no db");

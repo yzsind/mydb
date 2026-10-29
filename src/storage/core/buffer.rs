@@ -241,10 +241,13 @@ fn data_file_nocache_enabled() -> bool {
 }
 
 fn sync_buffer_file_data(file: &File) -> std::io::Result<()> {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(result) = crate::platform::fs::try_fixture_sync_file(file) {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = crate::platform::fs::try_private_sync_file(file) {
         return result;
     }
+    #[cfg(target_os = "macos")]
+    return crate::platform::fs::sync_full_file(file);
+    #[cfg(not(target_os = "macos"))]
     file.sync_data()
 }
 
@@ -1507,7 +1510,14 @@ impl BufferPool {
 
     fn index_file_key(path: PathBuf) -> BufferPageFileKey {
         let (table_id, name) = index_identity_from_path(&path);
-        BufferPageFileKey::new(BufferPageFileKind::Index { table_id, name }, path)
+        BufferPageFileKey::new(
+            if path.extension().is_some_and(|e| e == "rtree") {
+                BufferPageFileKind::Spatial { table_id, name }
+            } else {
+                BufferPageFileKind::Index { table_id, name }
+            },
+            path,
+        )
     }
 
     fn overflow_file_key(path: PathBuf, table_id: u64) -> BufferPageFileKey {
@@ -3817,7 +3827,12 @@ impl BufferPool {
             .map(|frames| {
                 frames
                     .iter()
-                    .filter(|frame| matches!(frame.key.file.kind, BufferPageFileKind::Index { .. }))
+                    .filter(|frame| {
+                        matches!(
+                            frame.key.file.kind,
+                            BufferPageFileKind::Index { .. } | BufferPageFileKind::Spatial { .. }
+                        )
+                    })
                     .count()
             })
             .unwrap_or(0)
@@ -3867,7 +3882,7 @@ impl BufferPool {
                     BufferPageFileKind::Heap { .. } => {
                         dirty_heap_pages = dirty_heap_pages.saturating_add(1);
                     }
-                    BufferPageFileKind::Index { .. } => {
+                    BufferPageFileKind::Index { .. } | BufferPageFileKind::Spatial { .. } => {
                         dirty_index_pages = dirty_index_pages.saturating_add(1);
                     }
                     BufferPageFileKind::Overflow { .. } => {}
@@ -4018,6 +4033,9 @@ impl BufferPool {
             for frame in frames.values() {
                 let (storage_id, page_type, index_name) = match &frame.key.file.kind {
                     BufferPageFileKind::Heap { table_id } => (*table_id, "HEAP", None),
+                    BufferPageFileKind::Spatial { table_id, name } => {
+                        (*table_id, "SPATIAL", Some(name.clone()))
+                    }
                     BufferPageFileKind::Index { table_id, name } => {
                         (*table_id, "INDEX", Some(name.clone()))
                     }
@@ -5875,22 +5893,19 @@ impl BufferPool {
             // Keep every sync lock until these full barriers complete. A
             // competing single-file sync must not acknowledge our cleared
             // needs_sync bit before the device is durable.
-            #[cfg(test)]
-            let private_fixture = {
+            let private_tree = {
                 let mut all_private = true;
                 for file in &pending.files {
-                    match crate::platform::fs::try_fixture_sync_file(&file.file) {
+                    match crate::platform::fs::try_private_sync_file(&file.file) {
                         Some(result) => result.map_err(io_err)?,
                         None => all_private = false,
                     }
                 }
                 all_private
             };
-            #[cfg(not(test))]
-            let private_fixture = false;
-            if !private_fixture {
+            if !private_tree {
                 for file in devices.values() {
-                    file.file.sync_data().map_err(io_err)?;
+                    crate::platform::fs::sync_full_file(&file.file).map_err(io_err)?;
                 }
             }
         }

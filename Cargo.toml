@@ -31,10 +31,10 @@ chrono = "0.4"
 [dependencies]
 half = "=2.7.1"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["unbounded_depth"] }
+serde_json = { version = "1", features = ["unbounded_depth", "raw_value"] }
 jsonschema = { version = "0.49.2", default-features = false }
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
 ipnet = { version = "2", features = ["serde"] }
 zeroize = "1"
 httpdate = "1"

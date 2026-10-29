@@ -22,6 +22,9 @@ fn options(algo: &str, q: &str) -> String {
     )
 }
 fn populate(engine: &StorageQueryEngine) {
+    populate_table(engine, "items");
+}
+fn populate_table(engine: &StorageQueryEngine, table: &str) {
     let rows = (0..32)
         .map(|id| {
             format!(
@@ -35,7 +38,7 @@ fn populate(engine: &StorageQueryEngine) {
         .collect::<Vec<_>>()
         .join(",");
     engine
-        .execute(&format!("INSERT INTO items VALUES {rows}"))
+        .execute(&format!("INSERT INTO {table} VALUES {rows}"))
         .unwrap();
 }
 fn matrix(backend: &str) {
@@ -46,13 +49,21 @@ fn matrix(backend: &str) {
     ]);
     let mut count = 0;
     for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        // This matrix checks SQL, codecs and runtime counters. The restart
+        // matrices below retain strict durability and their real reopen path.
+        let engine = open_test_engine(dir.path());
+        engine
+            .execute(&format!(
+                "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(7,{datatype}) NOT NULL)"
+            ))
+            .unwrap();
+        populate(&engine);
         for metric in ["L2", "COSINE", "DOT"] {
             for algo in ["HNSW", "IVF"] {
                 for quant in ["none", "sq8", "sq4", "pq", "bq"] {
-                    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                    let engine = open_strict_test_engine(dir.path());
-                    engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(7,{datatype}) NOT NULL)")).unwrap();
-                    populate(&engine);
+                    // Each new index gets fresh runtime counters and model
+                    // state over the same immutable typed input rows.
                     let ddl=format!("CREATE INDEX vx ON items(v) USING {algo} WITH (metric={metric},{}) COMMENT 'owner=search'",options(algo,quant));
                     engine
                         .execute(&ddl)
@@ -90,6 +101,8 @@ fn matrix(backend: &str) {
                         .execute(&show.replacen("`items`", "`copy`", 1))
                         .unwrap();
                     assert_eq!(text(&engine,"SELECT INDEX_COMMENT FROM information_schema.statistics WHERE TABLE_NAME='copy' AND INDEX_NAME='vx'"),"owner=search");
+                    engine.execute("DROP TABLE copy").unwrap();
+                    engine.execute("DROP INDEX vx ON items").unwrap();
                     count += 1;
                 }
             }
@@ -182,28 +195,35 @@ fn vector_quantization_pending_pq_trains_after_growth() {
 #[test]
 fn vector_quantization_dml_mvcc_and_restart() {
     for backend in ["memory", "paged"] {
-        for algo in ["HNSW", "IVF"] {
-            for q in ["sq8", "sq4", "pq", "bq"] {
-                let _env = HnswEnv::set(&[
-                    ("MYDB_VECTOR_STORAGE", backend),
-                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
-                ]);
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                {
-                    let engine = open_strict_test_engine(dir.path());
-                    engine
-                        .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(7) NOT NULL)")
-                        .unwrap();
-                    populate(&engine);
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut cases = Vec::new();
+        {
+            let engine = open_strict_test_engine(dir.path());
+            for algo in ["HNSW", "IVF"] {
+                for q in ["sq8", "sq4", "pq", "bq"] {
+                    let table = format!("items_{algo}_{q}");
+                    let preparation =
+                        crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
                     engine
                         .execute(&format!(
-                            "ALTER TABLE items ADD INDEX vx(v) USING {algo} WITH ({})",
+                            "CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR(7) NOT NULL)"
+                        ))
+                        .unwrap();
+                    populate_table(&engine, &table);
+                    engine
+                        .execute(&format!(
+                            "ALTER TABLE {table} ADD INDEX vx(v) USING {algo} WITH ({})",
                             options(algo, q)
                         ))
                         .unwrap();
-                    let sql="SELECT id FROM items ORDER BY L2_DISTANCE(v,'[100,101,102,103,104,105,106]') LIMIT 1";
-                    let before = text(&engine, sql);
+                    preparation.finish().unwrap();
+                    let sql = format!("SELECT id FROM {table} ORDER BY L2_DISTANCE(v,'[100,101,102,103,104,105,106]') LIMIT 1");
+                    let before = text(&engine, &sql);
                     let mut reader = SessionContext::default();
                     engine
                         .execute_with_session(
@@ -213,18 +233,20 @@ fn vector_quantization_dml_mvcc_and_restart() {
                         .unwrap();
                     engine.execute_with_session(&mut reader, "BEGIN").unwrap();
                     assert_eq!(
-                        match engine.execute_with_session(&mut reader, sql).unwrap() {
+                        match engine.execute_with_session(&mut reader, &sql).unwrap() {
                             QueryResponse::ResultSet(r) => r.rows[0][0].to_display_string(),
                             _ => panic!(),
                         },
                         before
                     );
                     engine
-                        .execute("UPDATE items SET v='[100,101,102,103,104,105,106]' WHERE id=0")
+                        .execute(&format!(
+                            "UPDATE {table} SET v='[100,101,102,103,104,105,106]' WHERE id=0"
+                        ))
                         .unwrap();
-                    assert_eq!(text(&engine, sql), "0");
+                    assert_eq!(text(&engine, &sql), "0");
                     assert_eq!(
-                        match engine.execute_with_session(&mut reader, sql).unwrap() {
+                        match engine.execute_with_session(&mut reader, &sql).unwrap() {
                             QueryResponse::ResultSet(r) => r.rows[0][0].to_display_string(),
                             _ => panic!(),
                         },
@@ -234,30 +256,42 @@ fn vector_quantization_dml_mvcc_and_restart() {
                     let mut writer = SessionContext::default();
                     engine.execute_with_session(&mut writer, "BEGIN").unwrap();
                     engine
-                        .execute_with_session(&mut writer, "DELETE FROM items WHERE id=0")
+                        .execute_with_session(
+                            &mut writer,
+                            &format!("DELETE FROM {table} WHERE id=0"),
+                        )
                         .unwrap();
                     engine
                         .execute_with_session(&mut writer, "ROLLBACK")
                         .unwrap();
-                    assert_eq!(text(&engine, sql), "0");
-                    engine.execute("ALTER SYSTEM CHECKPOINT").unwrap();
+                    assert_eq!(text(&engine, &sql), "0");
+                    cases.push((table, q, sql));
                 }
-                let engine = open_strict_test_engine(dir.path());
-                if q == "sq8" {
-                    let status = query_rows(&engine, "SHOW ENGINE MYDB STATUS");
-                    assert!(
-                        status
-                            .iter()
-                            .flatten()
-                            .any(|v| v.to_display_string().contains("quantization=sq8")),
-                        "{status:?}"
-                    );
-                }
-                assert_eq!(text(&engine,"SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE TABLE_SCHEMA='test' AND TABLE_NAME='items' AND INDEX_NAME='vx'"),q);
-                assert_eq!(text(&engine,"SELECT LOADED FROM information_schema.mydb_vector_indexes WHERE TABLE_SCHEMA='test' AND TABLE_NAME='items' AND INDEX_NAME='vx'"),"0");
-                assert_eq!(text(&engine,"SELECT id FROM items ORDER BY L2_DISTANCE(v,'[100,101,102,103,104,105,106]') LIMIT 1"),"0");
-                assert_eq!(text(&engine,"SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),q);
             }
+            // Every independent index must retain its committed DML through
+            // the same physical checkpoint and a cold process-local reopen.
+            engine.execute("ALTER SYSTEM CHECKPOINT").unwrap();
+        }
+        let engine = open_strict_test_engine(dir.path());
+        for (table, q, sql) in cases {
+            if q == "sq8" {
+                let status = query_rows(&engine, "SHOW ENGINE MYDB STATUS");
+                assert!(
+                    status
+                        .iter()
+                        .flatten()
+                        .any(|v| v.to_display_string().contains("quantization=sq8")),
+                    "{status:?}"
+                );
+            }
+            let predicate = format!(
+                "TABLE_SCHEMA='test' AND TABLE_NAME='{}' AND INDEX_NAME='vx'",
+                table.to_ascii_lowercase()
+            );
+            assert_eq!(text(&engine, &format!("SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE {predicate}")), q);
+            assert_eq!(text(&engine, &format!("SELECT LOADED FROM information_schema.mydb_vector_indexes WHERE {predicate}")), "0");
+            assert_eq!(text(&engine, &sql), "0");
+            assert_eq!(text(&engine, &format!("SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE {predicate}")), q);
         }
     }
 }
@@ -459,7 +493,7 @@ fn vector_quantization_partitioned_prepared_and_relational_boundaries() {
                 ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
             ]);
             let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-            let engine = open_strict_test_engine(dir.path());
+            let engine = open_test_engine(dir.path());
             engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(7,FLOAT16) NOT NULL,KEY vx(v) USING HNSW WITH({})) PARTITION BY HASH(id) PARTITIONS 2",options("HNSW",q))).unwrap();
             populate(&engine);
             let first = text(&engine, "SELECT VECTOR_TO_STRING(v) FROM items WHERE id=0");
@@ -517,136 +551,213 @@ fn vector_quantization_partitioned_prepared_and_relational_boundaries() {
 #[test]
 fn vector_quantization_copy_validates_type_and_dimension_before_publication() {
     for backend in ["memory", "paged"] {
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_relaxed_test_engine(dir.path());
         for algo in ["HNSW", "IVF"] {
             for q in ["sq8", "sq4", "pq", "bq"] {
-                let _env = HnswEnv::set(&[
-                    ("MYDB_VECTOR_STORAGE", backend),
-                    ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-                    ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
-                ]);
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let engine = open_strict_test_engine(dir.path());
+                let table = format!("items_{}_{q}", algo.to_ascii_lowercase());
+                let index = format!("vx_{}_{q}", algo.to_ascii_lowercase());
                 engine
-                    .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(7,FLOAT16) NOT NULL)")
+                    .execute(&format!(
+                        "CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR(7,FLOAT16) NOT NULL)"
+                    ))
                     .unwrap();
                 engine
                     .execute(&format!(
-                        "CREATE INDEX vx ON items(v) USING {algo} WITH({})",
+                        "CREATE INDEX {index} ON {table}(v) USING {algo} WITH({})",
                         options(algo, q)
                     ))
                     .unwrap();
                 if q == "pq" {
-                    let error=engine.execute("ALTER TABLE items MODIFY COLUMN v VECTOR(2,FLOAT16) NOT NULL, ALGORITHM=COPY").unwrap_err();
+                    let error=engine.execute(&format!("ALTER TABLE {table} MODIFY COLUMN v VECTOR(2,FLOAT16) NOT NULL, ALGORITHM=COPY")).unwrap_err();
                     assert!(error.message().contains("pq_m"), "{error}");
-                    assert_eq!(text(&engine,"SELECT DECLARED_DIM FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"7");
+                    assert_eq!(text(&engine,&format!("SELECT DECLARED_DIM FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='{index}'")),"7");
                 }
-                assert!(engine.execute("ALTER TABLE items MODIFY COLUMN v VECTOR(7,BINARY) NOT NULL, ALGORITHM=COPY").is_err());
+                assert!(engine.execute(&format!("ALTER TABLE {table} MODIFY COLUMN v VECTOR(7,BINARY) NOT NULL, ALGORITHM=COPY")).is_err());
                 assert!(engine
-                    .execute("ALTER TABLE items MODIFY COLUMN v VECTOR NOT NULL, ALGORITHM=COPY")
+                    .execute(&format!(
+                        "ALTER TABLE {table} MODIFY COLUMN v VECTOR NOT NULL, ALGORITHM=COPY"
+                    ))
                     .is_err());
-                populate(&engine);
-                let point = text(&engine, "SELECT VECTOR_TO_STRING(v) FROM items WHERE id=0");
-                engine.execute("ALTER TABLE items MODIFY COLUMN v VECTOR(7,BFLOAT16) NOT NULL, ALGORITHM=COPY").unwrap();
+                populate_table(&engine, &table);
+                let point = text(
+                    &engine,
+                    &format!("SELECT VECTOR_TO_STRING(v) FROM {table} WHERE id=0"),
+                );
+                engine.execute(&format!("ALTER TABLE {table} MODIFY COLUMN v VECTOR(7,BFLOAT16) NOT NULL, ALGORITHM=COPY")).unwrap();
                 assert_eq!(
                     text(
                         &engine,
-                        &format!("SELECT id FROM items ORDER BY L2_DISTANCE(v,'{point}') LIMIT 1")
+                        &format!(
+                            "SELECT id FROM {table} ORDER BY L2_DISTANCE(v,'{point}') LIMIT 1"
+                        )
                     ),
                     "0"
                 );
-                assert_eq!(text(&engine,"SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),q);
-                let create =
-                    query_rows(&engine, "SHOW CREATE TABLE items")[0][1].to_display_string();
+                assert_eq!(text(&engine,&format!("SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='{index}'")),q);
+                let create = query_rows(&engine, &format!("SHOW CREATE TABLE {table}"))[0][1]
+                    .to_display_string();
                 assert!(create.contains("vector(7,bfloat16)"), "{create}");
             }
         }
     }
 }
 
-#[test]
-fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml() {
+fn check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml(datatype: &str) {
     let _env = HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", "paged"),
         ("MYDB_HNSW_BUILD_THREADS", "4"),
         ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
         ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
     ]);
-    for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
-        for metric in ["L2", "COSINE", "DOT"] {
-            for quant in ["none", "sq8", "sq4", "pq", "bq"] {
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let sql = format!("SELECT /*+ HNSW_EF(4096) */ id FROM items ORDER BY DISTANCE(v,'[1,2,3,4,5,6,7,8,9]','{metric}'),id LIMIT 11");
-                let expected;
-                {
-                    let engine = open_strict_test_engine(dir.path());
-                    engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(9,{datatype}) NOT NULL)")).unwrap();
-                    for start in (0..2048).step_by(128) {
-                        let rows = (start..start + 128)
-                            .map(|id| {
-                                let values = (0..9)
-                                    .map(|j| {
-                                        (((id * (j * 2 + 3) + id / (j + 1)) % 113) - 56).to_string()
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                format!("({id},'[{values}]')")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        engine
-                            .execute(&format!("INSERT INTO items VALUES{rows}"))
-                            .unwrap();
-                    }
-                    let pq_options = if quant == "pq" {
-                        engine
-                            .execute("INSERT INTO items VALUES (3000,'[1,2,3,4,5,6,7,8,9]')")
-                            .unwrap();
-                        ",pq_bits=4,pq_train_samples=32,pq_iterations=3,rerank_mult=256"
-                    } else if quant == "bq" {
-                        // Enumerate every compressed candidate before comparing
-                        // with the exact oracle; BQ alone is deliberately lossy.
-                        ",rerank_mult=256"
-                    } else {
-                        ""
-                    };
-                    let scans = crate::storage::Database::vector_build_heap_scans_for_test();
-                    engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric={metric},m=4,ef_construction=32,quantization={quant}{pq_options})")).unwrap();
-                    if quant == "bq" && metric != "DOT" {
-                        // Training, eligibility, construction codes and payload
-                        // publication each stream the heap once. A row-at-a-time
-                        // fallback skips the bounded topology's two extra scans.
-                        assert_eq!(
-                            crate::storage::Database::vector_build_heap_scans_for_test() - scans,
-                            4,
-                            "BQ must use bounded construction: {datatype} {metric}"
-                        );
-                    }
-                    expected =
-                        query_rows(&engine, &sql.replace("HNSW_EF(4096)", "NO_VECTOR_INDEX"));
-                    assert_eq!(
-                        query_rows(&engine, &sql),
-                        expected,
-                        "{datatype} {metric} {quant}"
-                    );
-                }
-                let engine = open_strict_test_engine(dir.path());
+    let assert_index = |engine: &StorageQueryEngine, sql: &str, index: &str| {
+        let QueryResponse::ResultSet(plan) = engine.execute(&format!("EXPLAIN {sql}")).unwrap()
+        else {
+            panic!("expected EXPLAIN rows")
+        };
+        let key = plan
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case("key"))
+            .unwrap();
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row[key].to_display_string() == index),
+            "{index}: {:?}",
+            plan.rows
+        );
+    };
+    let values = (0..2048)
+        .map(|id| {
+            let values = (0..9)
+                .map(|j| (((id * (j * 2 + 3) + id / (j + 1)) % 113) - 56).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("({id},'[{values}]')")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+    // Keep the original 2,048-row input and PQ's additional exact-query
+    // row in separate tables. Independent indexes share their immutable
+    // input and one reopen; FORCE INDEX plus EXPLAIN pins every case.
+    for table in ["items", "pq_items"] {
+        engine
+            .execute(&format!(
+                "CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR(9,{datatype}) NOT NULL)"
+            ))
+            .unwrap();
+    }
+    engine
+        .execute(&format!("INSERT INTO items VALUES {values}"))
+        .unwrap();
+    engine
+        .execute("INSERT INTO pq_items SELECT id,v FROM items ORDER BY id")
+        .unwrap();
+    engine
+        .execute("INSERT INTO pq_items VALUES(3000,'[1,2,3,4,5,6,7,8,9]')")
+        .unwrap();
+    preparation.finish().unwrap();
+    let mut cases = Vec::new();
+    let mut oracles = std::collections::HashMap::new();
+    for metric in ["L2", "COSINE", "DOT"] {
+        for quant in ["none", "sq8", "sq4", "pq", "bq"] {
+            let table = if quant == "pq" { "pq_items" } else { "items" };
+            let index = format!("vx_{}_{quant}", metric.to_ascii_lowercase());
+            let extra = if quant == "pq" {
+                ",pq_bits=4,pq_train_samples=32,pq_iterations=3,rerank_mult=256"
+            } else if quant == "bq" {
+                ",rerank_mult=256"
+            } else {
+                ""
+            };
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            engine.execute(&format!("CREATE INDEX {index} ON {table}(v) USING HNSW WITH(metric={metric},m=4,ef_construction=32,quantization={quant}{extra})")).unwrap();
+            if quant == "bq" && metric != "DOT" {
                 assert_eq!(
-                    query_rows(&engine, &sql),
-                    expected,
-                    "reopen {datatype} {metric} {quant}"
-                );
-                engine
-                    .execute("UPDATE items SET v='[1,2,3,4,5,6,7,8,9]' WHERE id=2047")
-                    .unwrap();
-                engine.execute("DELETE FROM items WHERE id<10").unwrap();
-                assert_eq!(
-                    query_rows(&engine, &sql),
-                    query_rows(&engine, &sql.replace("HNSW_EF(4096)", "NO_VECTOR_INDEX")),
-                    "DML {datatype} {metric} {quant}"
+                    crate::storage::Database::vector_build_heap_scans_for_test() - scans,
+                    4,
+                    "BQ must use bounded construction: {datatype} {metric}"
                 );
             }
+            let order =
+                format!("ORDER BY DISTANCE(v,'[1,2,3,4,5,6,7,8,9]','{metric}'),id LIMIT 11");
+            let sql =
+                format!("SELECT /*+ HNSW_EF(4096) */ id FROM {table} FORCE INDEX({index}) {order}");
+            let exact = format!("SELECT /*+ NO_VECTOR_INDEX */ id FROM {table} {order}");
+            let expected = oracles
+                .entry(exact.clone())
+                .or_insert_with(|| query_rows(&engine, &exact));
+            assert_index(&engine, &sql, &index);
+            assert_eq!(
+                query_rows(&engine, &sql),
+                *expected,
+                "{datatype}/{metric}/{quant}"
+            );
+            cases.push((index, sql, exact, expected.clone()));
         }
     }
+    drop(engine);
+    let engine = open_strict_test_engine(dir.path());
+    for (index, sql, _, expected) in &cases {
+        assert_index(&engine, sql, index);
+        assert_eq!(
+            query_rows(&engine, sql),
+            *expected,
+            "reopen {datatype}/{index}"
+        );
+    }
+    for table in ["items", "pq_items"] {
+        engine
+            .execute(&format!(
+                "UPDATE {table} SET v='[1,2,3,4,5,6,7,8,9]' WHERE id=2047"
+            ))
+            .unwrap();
+        engine
+            .execute(&format!("DELETE FROM {table} WHERE id<10"))
+            .unwrap();
+    }
+    oracles.clear();
+    for (index, sql, exact, _) in &cases {
+        let expected = oracles
+            .entry(exact.clone())
+            .or_insert_with(|| query_rows(&engine, exact));
+        assert_eq!(
+            query_rows(&engine, sql),
+            *expected,
+            "DML {datatype}/{index}"
+        );
+    }
+}
+
+// Independent typed fixtures keep every matrix combination while using the
+// existing nextest admission slots; build worker counts remain unchanged.
+#[test]
+fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml() {
+    check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml("FLOAT32");
+}
+
+#[test]
+fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml_float16() {
+    check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml("FLOAT16");
+}
+
+#[test]
+fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml_bfloat16() {
+    check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml("BFLOAT16");
+}
+
+#[test]
+fn quantized_hnsw_parallel_paged_image_survives_restart_and_dml_int8() {
+    check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml("INT8");
 }
 
 #[test]

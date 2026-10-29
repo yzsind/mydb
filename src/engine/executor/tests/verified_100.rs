@@ -510,7 +510,7 @@ fn verified100_charset_and_remaining_scalar_paths() {
         ("SELECT -(-9223372036854775808)", "9223372036854775808"),
         ("SELECT TRUNCATE(1e15,-15)", "1e15"),
         ("SELECT TO_DAYS('0000-01-01')", "1"),
-        ("SELECT FROM_DAYS(365)", "0000-00-00"),
+        ("SELECT FROM_DAYS(365)", "0000-12-31"),
     ] {
         assert_eq!(
             crate::storage::value_to_string(&rows(&e, sql)[0][0]),

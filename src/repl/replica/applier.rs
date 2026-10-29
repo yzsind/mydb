@@ -35,6 +35,13 @@ fn replica_poison_error(detail: impl Into<String>) -> QueryError {
     )
     .with_diagnostic("MYDB-DIAG-REPL-POISON", detail)
 }
+pub(crate) fn overlap_read_error(err: crate::wal::WalReaderError) -> QueryError {
+    match err {
+        crate::wal::WalReaderError::Io(err) => err,
+        other => replica_poison_error(format!("unverifiable WAL overlap: {other:?}")),
+    }
+}
+
 use crate::wal::{decode_frame_for_replication, WalPayload, WalReadChunk, WalRecord};
 
 /// Per-batch outcome reported back to the receiver, used to decide
@@ -257,18 +264,15 @@ impl Applier {
             if frame.header.lsn < self.local_wal_next {
                 if overlap_reader.is_none() {
                     overlap_reader = Some(
-                        crate::wal::WalReader::open(&self.log, logical_start_lsn).map_err(
-                            |err| {
-                                replica_poison_error(format!("unverifiable WAL overlap: {err:?}"))
-                            },
-                        )?,
+                        crate::wal::WalReader::open(&self.log, logical_start_lsn)
+                            .map_err(overlap_read_error)?,
                     );
                 }
                 let local = overlap_reader
                     .as_mut()
                     .unwrap()
                     .next_chunk(frame.header.lsn, frame.frame_len)
-                    .map_err(|err| replica_poison_error(format!("WAL overlap read: {err:?}")))?
+                    .map_err(overlap_read_error)?
                     .ok_or_else(|| replica_poison_error("missing local WAL overlap"))?;
                 if local.bytes != chunk.bytes[frame_offset..cursor] {
                     return Err(replica_poison_error(
@@ -390,7 +394,18 @@ impl Applier {
                     txn_id: frame.header.txn_id,
                     payload: frame.payload,
                 };
-                db.apply_wal_record_with_context(&record, &mut apply_context)?;
+                db.apply_wal_record_with_context(&record, &mut apply_context)
+                    .map_err(|err| {
+                        QueryError::internal_control(
+                            crate::error::InternalErrorKind::ReplicaApplyFailure,
+                            crate::error::catalog::ER_UNKNOWN_ERROR,
+                            format!(
+                                "replica apply failed at LSN {}: {}",
+                                record.lsn,
+                                err.message()
+                            ),
+                        )
+                    })?;
                 last_lsn = record.lsn;
                 self.applied_lsn = self.applied_lsn.max(record.lsn);
                 self.progress.applied_lsn = self.applied_lsn;
@@ -672,7 +687,15 @@ mod tests {
             .next_chunk(failed_lsn, 1 << 20)
             .unwrap()
             .unwrap();
-        assert!(applier.apply_chunk(&failed, "master", 1).is_err());
+        let err = applier.apply_chunk(&failed, "master", 1).unwrap_err();
+        assert!(err.is_internal(crate::error::InternalErrorKind::ReplicaApplyFailure));
+        let mut reconciled = ReplicaProgress {
+            last_master_uuid: "master".into(),
+            ..ReplicaProgress::default()
+        };
+        crate::repl::replica::progress::reconcile_applied(&mut reconciled, &db, &target_log);
+        assert_eq!(reconciled.durable_applied_lsn, committed_lsn);
+        assert!(target_log.lock().durable_lsn() >= failed_lsn);
         assert_eq!(db.replica_applied_lsn(), committed_lsn);
         let mut retry = Applier::with_database(
             target_dir.path(),
@@ -705,6 +728,14 @@ mod tests {
             "the received but failed record must still be retried"
         );
         assert_eq!(db.replica_applied_lsn(), committed_lsn);
+    }
+
+    #[test]
+    fn release_audit_overlap_io_is_retryable() {
+        let err = error(crate::error::catalog::ER_GET_ERRNO, "injected ENOSPC");
+        let mapped = overlap_read_error(crate::wal::WalReaderError::Io(err));
+        assert!(!mapped.is_internal(crate::error::InternalErrorKind::ReplicaPoisonFrame));
+        assert_eq!(mapped.code(), crate::error::catalog::ER_GET_ERRNO.code());
     }
 
     #[test]

@@ -253,7 +253,9 @@ mod resource_limits {
         if limit == 0 {
             return Ok(());
         }
-        let mut map = table().lock().expect("resource_limits lock poisoned");
+        let mut map = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let usage = map.entry(account.clone()).or_default();
         roll_window(usage, super::current_time_ms());
         if usage.questions >= limit {
@@ -267,7 +269,9 @@ mod resource_limits {
         if limit == 0 {
             return Ok(());
         }
-        let mut map = table().lock().expect("resource_limits lock poisoned");
+        let mut map = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let usage = map.entry(account.clone()).or_default();
         roll_window(usage, super::current_time_ms());
         if usage.updates >= limit {
@@ -282,13 +286,38 @@ mod resource_limits {
         max_conn: u32,
         max_user_conn: u32,
     ) -> Result<(), QueryError> {
-        let mut map = table().lock().expect("resource_limits lock poisoned");
+        charge_connection(account, max_conn, max_user_conn, false)
+    }
+
+    pub fn charge_reauthenticated_connection(
+        account: &AccountKey,
+        previous: Option<&AccountKey>,
+        max_conn: u32,
+        max_user_conn: u32,
+    ) -> Result<(), QueryError> {
+        charge_connection(account, max_conn, max_user_conn, previous == Some(account))
+    }
+
+    fn charge_connection(
+        account: &AccountKey,
+        max_conn: u32,
+        max_user_conn: u32,
+        replacing_self: bool,
+    ) -> Result<(), QueryError> {
+        let mut map = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let usage = map.entry(account.clone()).or_default();
         roll_window(usage, super::current_time_ms());
         if max_conn > 0 && usage.new_conns >= max_conn {
             return Err(err_limit(account, "max_connections_per_hour", max_conn));
         }
-        if max_user_conn > 0 && usage.current_conns >= max_user_conn {
+        if max_user_conn > 0
+            && usage
+                .current_conns
+                .saturating_sub(u32::from(replacing_self))
+                >= max_user_conn
+        {
             return Err(err_limit(account, "max_user_connections", max_user_conn));
         }
         usage.new_conns = usage.new_conns.saturating_add(1);
@@ -299,7 +328,10 @@ mod resource_limits {
     }
 
     pub fn release_connection(account: &AccountKey) {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(usage) = map.get_mut(account) {
                 usage.current_conns = usage.current_conns.saturating_sub(1);
             }
@@ -307,7 +339,10 @@ mod resource_limits {
     }
 
     pub fn clear(account: &AccountKey) {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.remove(account);
             if map.capacity() > 64 && map.len().saturating_mul(4) < map.capacity() {
                 let live = map.len();
@@ -317,7 +352,10 @@ mod resource_limits {
     }
 
     pub fn rename(from: &AccountKey, to: &AccountKey) {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(mut usage) = map.remove(from) {
                 // Existing sessions still release the old authenticated key.
                 // They must not leave the renamed account's concurrent count
@@ -329,7 +367,10 @@ mod resource_limits {
     }
 
     pub fn flush_all() {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (_, usage) in map.iter_mut() {
                 usage.questions = 0;
                 usage.updates = 0;
@@ -358,8 +399,9 @@ mod resource_limits {
 }
 
 pub use resource_limits::{
-    charge_new_connection, charge_question, charge_update, clear as clear_user_resources,
-    flush_all as flush_user_resources, release_connection, rename as rename_user_resources,
+    charge_new_connection, charge_question, charge_reauthenticated_connection, charge_update,
+    clear as clear_user_resources, flush_all as flush_user_resources, release_connection,
+    rename as rename_user_resources,
 };
 
 /// Temporary failed-login lock tracking (the `FAILED_LOGIN_ATTEMPTS` /
@@ -393,7 +435,9 @@ mod failed_login {
     /// an active temporary lock window. Expired windows are cleared in place so
     /// the next failed attempt starts a fresh budget (MySQL semantics).
     pub fn active_lock(account: &AccountKey, now_ms: u64) -> Option<u64> {
-        let mut map = table().lock().expect("failed_login lock poisoned");
+        let mut map = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = map.get_mut(account) else {
             return None;
         };
@@ -421,7 +465,9 @@ mod failed_login {
         if max_attempts == 0 || lock_days.unwrap_or(0) == 0 {
             return;
         }
-        let mut map = table().lock().expect("failed_login lock poisoned");
+        let mut map = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = map.entry(account.clone()).or_default();
         state.failures = state.failures.saturating_add(1);
         if state.failures >= max_attempts && state.locked_until_ms.is_none() {
@@ -437,13 +483,19 @@ mod failed_login {
     /// Clear the counter and any temporary lock for one account (successful
     /// login, or explicit `ALTER USER ... ACCOUNT UNLOCK`).
     pub fn clear(account: &AccountKey) {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.remove(account);
         }
     }
 
     pub fn rename(from: &AccountKey, to: &AccountKey) {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prior = map.remove(from);
             map.remove(to);
             if let Some(state) = prior {
@@ -454,7 +506,10 @@ mod failed_login {
 
     /// `FLUSH HOSTS` — reset every account's failed-login budget.
     pub fn flush_all() {
-        if let Ok(mut map) = table().lock() {
+        {
+            let mut map = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.clear();
         }
     }
@@ -972,15 +1027,18 @@ impl UserAccount {
     }
 
     pub fn plaintext_password_reused(&self, password: &str, now_ms: u64) -> bool {
-        if verify_plaintext_auth_string(&self.plugin, &self.authentication_string, password) {
-            return true;
-        }
         let count = self
             .password_reuse_history
             .unwrap_or_else(global_password_history) as usize;
         let days = self
             .password_reuse_time_days
             .unwrap_or_else(global_password_reuse_interval);
+        if count == 0 && days == 0 {
+            return false;
+        }
+        if verify_plaintext_auth_string(&self.plugin, &self.authentication_string, password) {
+            return true;
+        }
         let window_ms = u64::from(days).saturating_mul(24 * 60 * 60 * 1000);
         self.password_history
             .iter()
@@ -1242,6 +1300,7 @@ pub struct AuthorizationContext {
 
 #[derive(Debug, Clone)]
 pub struct AuthRequest<'a> {
+    pub replacing_account: Option<&'a AccountKey>,
     pub username: &'a str,
     pub host: &'a str,
     pub auth_response: &'a [u8],
@@ -1267,6 +1326,7 @@ impl<'a> AuthRequest<'a> {
         auth_plugin: Option<&'a str>,
     ) -> Self {
         Self {
+            replacing_account: None,
             username,
             host,
             auth_response,
@@ -1295,6 +1355,8 @@ pub struct AuthOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthCatalog {
+    #[serde(default)]
+    pub password_validation_component: bool,
     #[serde(default)]
     pub epoch: u64,
     #[serde(default)]
@@ -1378,6 +1440,7 @@ impl AuthCatalog {
     /// bootstrap must explicitly install the root account.
     pub(crate) fn empty() -> Self {
         Self {
+            password_validation_component: false,
             epoch: 1,
             accounts: Default::default(),
             grants: GrantStore::new(),
@@ -2801,7 +2864,7 @@ fn random_crypt_salt(len: usize) -> String {
 }
 
 fn verify_sha256_crypt_string(stored: &str, password: &str, caching: bool) -> bool {
-    if password.len() > 256 {
+    if password.len() > 256 || !stored.is_ascii() {
         return false;
     }
     let (salt, checksum, rounds) = if caching {
@@ -2957,7 +3020,7 @@ pub fn current_time_ms() -> u64 {
 /// `skip_name_resolve` only matters when the pattern uses literal-DNS
 /// form (i.e. not an IP and not netmask form) — see `match_account_with_options`.
 pub fn host_matches(pattern: &str, host: &str) -> bool {
-    if pattern == "%" {
+    if pattern.is_empty() || pattern == "%" {
         return true;
     }
     // `'user'@'localhost'`. In stock MySQL this account is reached only via the
@@ -3345,6 +3408,8 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
     static SET: std::sync::OnceLock<Vec<Privilege>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         [
+            "HTTP_ADMIN",
+            "HTTP_USE",
             "AI_ADMIN",
             "AI_USE",
             "APPLICATION_PASSWORD_ADMIN",
@@ -3878,6 +3943,15 @@ mod tests {
         // IPv4 literals still compare correctly through the same path.
         assert!(host_matches("127.0.0.1", "127.0.0.1"));
         assert!(!host_matches("127.0.0.1", "127.0.0.2"));
+    }
+
+    #[test]
+    fn audit_1029_corrupt_utf8_password_hash_fails_closed() {
+        let stored = format!("$A$005${}é{}", "x".repeat(19), "x".repeat(42));
+        assert_eq!(stored.len(), 70);
+        assert!(!verify_sha256_crypt_string(&stored, "password", true));
+        assert!(host_matches("", "192.0.2.1"));
+        assert!(host_specificity("") < host_specificity("%"));
     }
 
     #[test]

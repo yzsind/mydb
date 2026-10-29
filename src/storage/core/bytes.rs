@@ -39,6 +39,7 @@ pub(crate) fn backup_page_valid(buf: &[u8]) -> bool {
                 read_u32(buf, 0),
                 HEAP_PAGE_MAGIC
                     | INDEX_PAGE_MAGIC
+                    | spatial_index::MAGIC
                     | INDEX_META_MAGIC
                     | OVFL_MAGIC
                     | VEC_META_MAGIC
@@ -52,7 +53,11 @@ fn refresh_page_checksum(buf: &mut [u8]) {
         return;
     }
     let offset = match read_u32(buf, 0) {
-        HEAP_PAGE_MAGIC | INDEX_PAGE_MAGIC | INDEX_META_MAGIC | OVFL_MAGIC => 16,
+        HEAP_PAGE_MAGIC
+        | INDEX_PAGE_MAGIC
+        | spatial_index::MAGIC
+        | INDEX_META_MAGIC
+        | OVFL_MAGIC => 16,
         VEC_META_MAGIC | VEC_NODE_MAGIC => 16,
         zone_map_page::MAGIC => 16,
         _ => return,
@@ -68,7 +73,11 @@ fn set_page_lsn_if_formatted(buf: &mut [u8], lsn: u64) {
         return;
     }
     match read_u32(buf, 0) {
-        HEAP_PAGE_MAGIC | INDEX_PAGE_MAGIC | INDEX_META_MAGIC | OVFL_MAGIC => {
+        HEAP_PAGE_MAGIC
+        | INDEX_PAGE_MAGIC
+        | spatial_index::MAGIC
+        | INDEX_META_MAGIC
+        | OVFL_MAGIC => {
             set_page_lsn(buf, lsn);
             refresh_page_checksum(buf);
         }
@@ -85,6 +94,9 @@ fn set_page_lsn_if_formatted(buf: &mut [u8], lsn: u64) {
     }
 }
 
+// Keep fixed-width checked reads in their callers: a per-key out-of-line
+// Result return otherwise spills the full error representation on the hot path.
+#[inline(always)]
 fn read_u8_checked(buf: &[u8], offset: &mut usize) -> Result<u8, QueryError> {
     if *offset >= buf.len() {
         return Err(error(
@@ -97,6 +109,7 @@ fn read_u8_checked(buf: &[u8], offset: &mut usize) -> Result<u8, QueryError> {
     Ok(value)
 }
 
+#[inline(always)]
 fn read_u16_checked(buf: &[u8], offset: &mut usize) -> Result<u16, QueryError> {
     if *offset + 2 > buf.len() {
         return Err(error(
@@ -109,6 +122,7 @@ fn read_u16_checked(buf: &[u8], offset: &mut usize) -> Result<u16, QueryError> {
     Ok(value)
 }
 
+#[inline(always)]
 fn read_u32_checked(buf: &[u8], offset: &mut usize) -> Result<u32, QueryError> {
     if *offset + 4 > buf.len() {
         return Err(error(
@@ -121,6 +135,7 @@ fn read_u32_checked(buf: &[u8], offset: &mut usize) -> Result<u32, QueryError> {
     Ok(value)
 }
 
+#[inline(always)]
 fn read_u64_checked(buf: &[u8], offset: &mut usize) -> Result<u64, QueryError> {
     if *offset + 8 > buf.len() {
         return Err(error(
@@ -133,14 +148,17 @@ fn read_u64_checked(buf: &[u8], offset: &mut usize) -> Result<u64, QueryError> {
     Ok(value)
 }
 
+#[inline(always)]
 fn read_i64_checked(buf: &[u8], offset: &mut usize) -> Result<i64, QueryError> {
     Ok(read_u64_checked(buf, offset)? as i64)
 }
 
+#[inline(always)]
 fn read_i32_checked(buf: &[u8], offset: &mut usize) -> Result<i32, QueryError> {
     Ok(read_u32_checked(buf, offset)? as i32)
 }
 
+#[inline(always)]
 fn read_i128_checked(buf: &[u8], offset: &mut usize) -> Result<i128, QueryError> {
     if *offset + 16 > buf.len() {
         return Err(error(

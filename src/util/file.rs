@@ -78,8 +78,9 @@ pub(crate) fn start_file_writeback(file: &File, offset: u64, length: usize) -> i
     Ok(())
 }
 
-/// Write a complete staging image before publishing it by rename. The caller
-/// owns the staging name, directory creation and directory-sync policy.
+/// Write a staging image and publish it by rename. With `sync`, order data
+/// before rename and complete the parent's full durability barrier afterward.
+/// The caller owns staging names and directory creation.
 pub(crate) fn write_staged_file(
     path: &Path,
     staging: &Path,
@@ -91,10 +92,18 @@ pub(crate) fn write_staged_file(
         let mut file = File::create(staging)?;
         file.write_all(contents)?;
         if sync {
-            file.sync_all()?;
+            crate::platform::fs::sync_before_atomic_rename_at(&file, staging)?;
         }
     }
-    fs::rename(staging, path)
+    fs::rename(staging, path)?;
+    if sync {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        crate::platform::fs::sync_path(parent)?;
+    }
+    Ok(())
 }
 
 /// Visit children before directories, rejecting symlinks before opening them.
@@ -160,6 +169,24 @@ mod tests {
 
     fn temporary_tree() -> tempfile::TempDir {
         tempfile::tempdir_in(test_temp_dir()).unwrap()
+    }
+
+    #[test]
+    fn staged_publication_does_not_acknowledge_a_failed_parent_barrier() {
+        let root = temporary_tree();
+        let live = root.path().join("intent");
+        let pending = root.path().join("intent.pending");
+        fs::write(&live, b"old").unwrap();
+        crate::platform::fs::inject_path_sync_error_for_test(root.path(), libc::EIO);
+        assert_eq!(
+            write_staged_file(&live, &pending, b"new", true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        write_staged_file(&live, &pending, b"retry", true).unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"retry");
     }
 
     #[test]
@@ -244,23 +271,87 @@ mod tests {
 #[cfg(test)]
 pub(crate) fn copy_fixture_file(source: &Path, destination: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        unsafe extern "C" {
-            fn clonefile(
-                source: *const libc::c_char,
-                destination: *const libc::c_char,
-                flags: u32,
-            ) -> libc::c_int;
-        }
-        let source = CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        let destination =
-            CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        // SAFETY: both C strings remain alive for the entire syscall.
-        if unsafe { clonefile(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+    if clone_fixture_path(source, destination).is_ok() {
+        return Ok(());
+    }
+    fs::copy(source, destination).map(|_| ())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn clone_fixture_path(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(
+            source: *const libc::c_char,
+            destination: *const libc::c_char,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: both C strings remain alive for the entire syscall.
+    if unsafe { clonefile(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Copy an isolated fixture tree, retaining the destination's reserved name.
+#[cfg(test)]
+pub(crate) fn copy_fixture_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    #[cfg(target_os = "macos")]
+    if fs::read_dir(destination)?.next().is_none() {
+        let staging = tempfile::Builder::new()
+            .prefix("mydb-fixture-stage-")
+            .tempdir_in(destination.parent().unwrap_or_else(|| Path::new(".")))?;
+        let cloned = staging.path().join("clone");
+        // A single clonefile call also copies nested directories on APFS.
+        if clone_fixture_path(source, &cloned).is_ok() {
+            fs::rename(cloned, destination)?;
             return Ok(());
         }
     }
-    fs::copy(source, destination).map(|_| ())
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_fixture_tree(&entry.path(), &target)?;
+        } else {
+            copy_fixture_file(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn fixture_tree_copy_keeps_private_nested_files_and_reserved_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("nested/data"), b"original").unwrap();
+    let destination = tempfile::tempdir_in(root.path()).unwrap();
+    copy_fixture_tree(&source, destination.path()).unwrap();
+    assert_eq!(
+        fs::read(destination.path().join("nested/data")).unwrap(),
+        b"original"
+    );
+    fs::write(destination.path().join("nested/data"), b"changed").unwrap();
+    assert_eq!(fs::read(source.join("nested/data")).unwrap(), b"original");
+    // A populated destination takes the portable recursive-copy path.
+    fs::write(destination.path().join("retained"), b"keep").unwrap();
+    fs::write(source.join("extra"), b"new").unwrap();
+    copy_fixture_tree(&source, destination.path()).unwrap();
+    assert_eq!(
+        fs::read(destination.path().join("nested/data")).unwrap(),
+        b"original"
+    );
+    assert_eq!(fs::read(destination.path().join("extra")).unwrap(), b"new");
+    assert_eq!(
+        fs::read(destination.path().join("retained")).unwrap(),
+        b"keep"
+    );
 }

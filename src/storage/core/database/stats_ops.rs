@@ -957,22 +957,23 @@ impl Database {
         if delta == 0 {
             return;
         }
-        let mut pending = self.pending_live_row_deltas.lock();
-        let entry = pending.entry((txn_id, table_id)).or_default();
+        let mut pending = self.pending_live_row_deltas
+            [txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
+            .lock();
+        let entry = pending
+            .entry(txn_id)
+            .or_default()
+            .entry(table_id)
+            .or_default();
         *entry = entry.saturating_add(delta);
     }
 
     pub(crate) fn publish_pending_live_row_deltas(&self, txn_id: u64) {
         let committed = {
-            let mut pending = self.pending_live_row_deltas.lock();
-            let keys = pending
-                .keys()
-                .filter(|(pending_txn, _)| *pending_txn == txn_id)
-                .copied()
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| pending.remove(&key).map(|delta| (key.1, delta)))
-                .collect::<Vec<_>>()
+            let mut pending = self.pending_live_row_deltas
+                [txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
+                .lock();
+            pending.remove(&txn_id).unwrap_or_default()
         };
         for (table_id, delta) in committed {
             let counters = self.table_live_row_deltas.read();
@@ -990,19 +991,17 @@ impl Database {
     }
 
     pub(crate) fn discard_pending_live_row_deltas(&self, txn_id: u64) {
-        self.pending_live_row_deltas
+        self.pending_live_row_deltas[txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock()
-            .retain(|(pending_txn, _), _| *pending_txn != txn_id);
+            .remove(&txn_id);
     }
 
     pub(crate) fn pending_live_row_deltas_snapshot(&self, txn_id: u64) -> HashMap<u64, i64> {
-        self.pending_live_row_deltas
+        self.pending_live_row_deltas[txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock()
-            .iter()
-            .filter_map(|(&(pending_txn, table_id), &delta)| {
-                (pending_txn == txn_id).then_some((table_id, delta))
-            })
-            .collect()
+            .get(&txn_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn restore_pending_live_row_deltas(
@@ -1010,15 +1009,15 @@ impl Database {
         txn_id: u64,
         snapshot: &HashMap<u64, i64>,
     ) {
-        let mut pending = self.pending_live_row_deltas.lock();
-        pending.retain(|(pending_txn, _), _| *pending_txn != txn_id);
-        pending.extend(
-            snapshot
-                .iter()
-                .map(|(&table_id, &delta)| ((txn_id, table_id), delta)),
-        );
+        let mut pending = self.pending_live_row_deltas
+            [txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
+            .lock();
+        if snapshot.is_empty() {
+            pending.remove(&txn_id);
+        } else {
+            pending.insert(txn_id, snapshot.clone());
+        }
     }
-
     pub(crate) fn table_live_row_delta(&self, table_id: u64) -> i64 {
         self.table_live_row_deltas
             .read()
@@ -1053,9 +1052,12 @@ impl Database {
         let mut deltas = self.table_modification_deltas.write();
         deltas.remove(&table_id);
         self.table_live_row_deltas.write().remove(&table_id);
-        self.pending_live_row_deltas
-            .lock()
-            .retain(|(_, pending_table), _| *pending_table != table_id);
+        for shard in &self.pending_live_row_deltas {
+            shard.lock().retain(|_, tables| {
+                tables.remove(&table_id);
+                !tables.is_empty()
+            });
+        }
     }
 
     /// Bump the monotonic write epoch for `table_id` (CTE result cache

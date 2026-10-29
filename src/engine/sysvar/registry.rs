@@ -304,7 +304,7 @@ impl Registry {
         // implication), not a hard-coded username, so a granted non-root
         // admin passes here just as it does in the dispatcher.
         if matches!(var.def.access_for(effective_scope), Access::SuperReadWrite)
-            && !account_has_sysvar_admin(session, db)
+            && !account_has_sysvar_admin(session, db, effective_scope)
         {
             return Err(access_denied(var.def.name));
         }
@@ -563,7 +563,7 @@ pub fn apply_option_file_on_startup(
 /// takes effect and a renamed-away root loses its implicit power. When no
 /// Database handle is available (rare internal call sites) grants can't be
 /// consulted, so only system sessions pass.
-fn account_has_sysvar_admin(session: &SessionContext, db: Option<&Database>) -> bool {
+fn account_has_sysvar_admin(session: &SessionContext, db: Option<&Database>, scope: Scope) -> bool {
     if session.internal_system_session {
         return true;
     }
@@ -575,8 +575,19 @@ fn account_has_sysvar_admin(session: &SessionContext, db: Option<&Database>) -> 
         privilege: Privilege::Dynamic("SYSTEM_VARIABLES_ADMIN".to_string()),
         scope: PrivilegeScope::Global,
     };
-    db.with_auth_catalog(|auth| auth.account_has_privilege(&ctx, &required, false))
-        .unwrap_or(false)
+    db.with_auth_catalog(|auth| {
+        auth.account_has_privilege(&ctx, &required, false)
+            || (scope == Scope::Session
+                && auth.account_has_privilege(
+                    &ctx,
+                    &RequiredPrivilege {
+                        privilege: Privilege::Dynamic("SESSION_VARIABLES_ADMIN".into()),
+                        scope: PrivilegeScope::Global,
+                    },
+                    false,
+                ))
+    })
+    .unwrap_or(false)
 }
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();

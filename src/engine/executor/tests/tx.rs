@@ -912,23 +912,182 @@ fn cloned_session_transaction_runtime_serializes_statement_mutation() {
 async fn row_lock_release_advances_async_retry_signal() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
+    let db = engine.db_for_tests();
+    let owner = db.begin_txn().unwrap().txn_id;
+    let waiter = db.begin_txn().unwrap().txn_id;
     let target = crate::storage::NonblockingRowWaitTarget {
+        txn_id: waiter,
         table_id: 7,
         row_id: crate::storage::RowId::new(3, 1),
-        observed_generation: 0,
+        mode: crate::storage::LockMode::Exclusive,
     };
-    let mut signal = engine
-        .db_for_tests()
-        .subscribe_row_lock_async_signal(target);
-    let before = signal.generation();
-    engine
-        .db_for_tests()
-        .notify_lock_waiters_for_rows([(target.table_id, target.row_id)]);
+    db.acquire_row_lock_blocking(owner, target.table_id, target.row_id, target.mode)
+        .unwrap();
+    let mut signal = db.subscribe_row_lock_async_signal(target).unwrap();
+    assert!(!db.async_row_lock_ready(target));
+    db.notify_lock_waiters_for_rows([(target.table_id, crate::storage::RowId::new(3, 2))]);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(3), signal.changed())
+            .await
+            .is_err()
+    );
+    db.rollback_txn(owner).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), signal.changed())
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(signal.generation(), before);
+    assert!(db.async_row_lock_ready(target));
+    crate::storage::with_nonblocking_lock_waits(|| {
+        db.acquire_row_lock_blocking(waiter, target.table_id, target.row_id, target.mode)
+    })
+    .unwrap();
+    db.rollback_txn(waiter).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_row_lock_fifo_wakes_only_front_and_promotes_canceled_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let db = engine.db_for_tests();
+    let owner = db.begin_txn().unwrap().txn_id;
+    let first = db.begin_txn().unwrap().txn_id;
+    let second = db.begin_txn().unwrap().txn_id;
+    let target = crate::storage::NonblockingRowWaitTarget {
+        txn_id: first,
+        table_id: 7,
+        row_id: crate::storage::RowId::new(3, 1),
+        mode: crate::storage::LockMode::Exclusive,
+    };
+    let next = crate::storage::NonblockingRowWaitTarget {
+        txn_id: second,
+        ..target
+    };
+    db.acquire_row_lock_blocking(owner, target.table_id, target.row_id, target.mode)
+        .unwrap();
+    let mut first_signal = db.subscribe_row_lock_async_signal(target).unwrap();
+    let mut second_signal = db.subscribe_row_lock_async_signal(next).unwrap();
+    db.rollback_txn(owner).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), first_signal.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.async_row_lock_ready(target));
+    assert!(!db.async_row_lock_ready(next));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(3), second_signal.changed())
+            .await
+            .is_err()
+    );
+    drop(first_signal);
+    db.rollback_txn(first).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), second_signal.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.async_row_lock_ready(next));
+    crate::storage::with_nonblocking_lock_waits(|| {
+        db.acquire_row_lock_blocking(second, next.table_id, next.row_id, next.mode)
+    })
+    .unwrap();
+    db.rollback_txn(second).unwrap();
+}
+
+#[test]
+fn async_row_lock_release_before_registration_is_immediately_eligible() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let db = engine.db_for_tests();
+    let owner = db.begin_txn().unwrap().txn_id;
+    let waiter = db.begin_txn().unwrap().txn_id;
+    let row = crate::storage::RowId::new(3, 1);
+    db.acquire_row_lock_blocking(owner, 7, row, crate::storage::LockMode::Exclusive)
+        .unwrap();
+    let error = crate::storage::with_nonblocking_lock_waits(|| {
+        db.acquire_row_lock_blocking(waiter, 7, row, crate::storage::LockMode::Exclusive)
+    })
+    .unwrap_err();
+    assert!(crate::storage::is_lock_would_block_error(&error));
+    let target = crate::storage::take_nonblocking_row_wait_target().unwrap();
+    db.rollback_txn(owner).unwrap();
+    let _signal = db.subscribe_row_lock_async_signal(target).unwrap();
+    assert!(db.async_row_lock_ready(target));
+    crate::storage::with_nonblocking_lock_waits(|| {
+        db.acquire_row_lock_blocking(waiter, 7, row, target.mode)
+    })
+    .unwrap();
+    db.rollback_txn(waiter).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_row_lock_upgrade_waits_without_eager_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let db = engine.db_for_tests();
+    let first = db.begin_txn().unwrap().txn_id;
+    let second = db.begin_txn().unwrap().txn_id;
+    let row = crate::storage::RowId::new(3, 1);
+    for txn in [first, second] {
+        db.acquire_row_lock_blocking(txn, 7, row, crate::storage::LockMode::Shared)
+            .unwrap();
+    }
+    let target = crate::storage::NonblockingRowWaitTarget {
+        txn_id: first,
+        table_id: 7,
+        row_id: row,
+        mode: crate::storage::LockMode::Exclusive,
+    };
+    let mut signal = db.subscribe_row_lock_async_signal(target).unwrap();
+    assert!(!db.async_row_lock_ready(target));
+    db.rollback_txn(second).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), signal.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.async_row_lock_ready(target));
+    crate::storage::with_nonblocking_lock_waits(|| {
+        db.acquire_row_lock_blocking(first, 7, row, target.mode)
+    })
+    .unwrap();
+    db.rollback_txn(first).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_row_lock_deadlock_fallback_preserves_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let db = engine.db_for_tests();
+    let first = db.begin_txn().unwrap().txn_id;
+    let second = db.begin_txn().unwrap().txn_id;
+    let row1 = crate::storage::RowId::new(3, 1);
+    let row2 = crate::storage::RowId::new(3, 2);
+    let mode = crate::storage::LockMode::Exclusive;
+    db.acquire_row_lock_blocking(first, 7, row1, mode).unwrap();
+    db.acquire_row_lock_blocking(second, 7, row2, mode).unwrap();
+    let target = crate::storage::NonblockingRowWaitTarget {
+        txn_id: first,
+        table_id: 7,
+        row_id: row2,
+        mode,
+    };
+    let mut signal = db.subscribe_row_lock_async_signal(target).unwrap();
+    assert!(db
+        .subscribe_row_lock_async_signal(crate::storage::NonblockingRowWaitTarget {
+            txn_id: second,
+            row_id: row1,
+            ..target
+        })
+        .is_none());
+    let error = db
+        .acquire_row_lock_blocking(second, 7, row1, mode)
+        .unwrap_err();
+    assert!(error.is(crate::error::catalog::ER_LOCK_DEADLOCK));
+    db.rollback_txn(second).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), signal.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.async_row_lock_ready(target));
+    db.rollback_txn(first).unwrap();
 }
 
 #[test]

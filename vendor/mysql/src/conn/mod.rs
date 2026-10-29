@@ -347,6 +347,21 @@ impl Conn {
             .map(Option::unwrap_or_default)
     }
 
+    /// Close immediately without sending QUIT or draining pending results.
+    pub fn abort(&mut self) {
+        self.0.stream.take();
+        self.0.stmt_cache = StmtCache::new(0);
+        self.0.has_results = false;
+    }
+
+    /// Whether the current connection uses TLS.
+    pub fn is_secure(&self) -> bool {
+        self.0
+            .stream
+            .as_ref()
+            .is_some_and(|s| !s.get_ref().is_insecure() && !s.get_ref().is_socket())
+    }
+
     fn stream_ref(&self) -> &MySyncFramed<Stream> {
         self.0.stream.as_ref().expect("incomplete connection")
     }
@@ -1225,8 +1240,10 @@ impl Conn {
                     ResultSetInfo::NonEmptySkipMeta
                 };
 
-                // skip eof packet
-                self.drop_packet()?;
+                // DEPRECATE_EOF omits the metadata terminator entirely.
+                if !self.has_capability(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+                    self.drop_packet()?;
+                }
                 self.0.has_results = column_count > 0;
 
                 Ok(output)

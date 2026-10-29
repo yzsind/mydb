@@ -211,13 +211,23 @@ fn options(
                 return Err(cursor.expected("password policy"));
             }
         } else if cursor.keyword(b"FAILED_LOGIN_ATTEMPTS")? {
-            out.failed_login_attempts = Some(number(cursor)?);
+            let value: u16 = number(cursor)?;
+            if value > 32767 {
+                return Err(cursor.expected("FAILED_LOGIN_ATTEMPTS between 0 and 32767"));
+            }
+            out.failed_login_attempts = Some(value);
             mask |= FAILED;
         } else if cursor.keyword(b"PASSWORD_LOCK_TIME")? {
             out.password_lock_time_days = Some(if cursor.keyword(b"UNBOUNDED")? {
                 u16::MAX
             } else {
-                number(cursor)?
+                let value: u16 = number(cursor)?;
+                if value > 32767 {
+                    return Err(
+                        cursor.expected("PASSWORD_LOCK_TIME between 0 and 32767 or UNBOUNDED")
+                    );
+                }
+                value
             });
             mask |= LOCK_TIME;
         } else if cursor.keyword(b"REQUIRE")? {

@@ -74,6 +74,22 @@ fn encode_node(node: JsonbRef<'_>) -> Result<EncodedValue, QueryError> {
             MYSQL_TYPE_TIME,
             pack_mysql_time(node.as_str().unwrap_or_default()).unwrap_or_default(),
         ),
+        JsonType::Timestamp => encode_temporal_opaque(
+            7,
+            pack_mysql_datetime(node.as_str().unwrap_or_default()).unwrap_or_default(),
+        ),
+        JsonType::Opaque => {
+            let (ty, data) = node
+                .opaque_value()
+                .ok_or_else(|| super::invalid_json_text(1, "opaque JSON"))?;
+            let mut payload = vec![ty];
+            write_variable_length(data.len(), &mut payload);
+            payload.extend_from_slice(data);
+            EncodedValue {
+                ty: OPAQUE,
+                payload,
+            }
+        }
         JsonType::Datetime => encode_temporal_opaque(
             MYSQL_TYPE_DATETIME,
             pack_mysql_datetime(node.as_str().unwrap_or_default()).unwrap_or_default(),

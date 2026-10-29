@@ -99,6 +99,8 @@ production-grade MySQL replacement.
 - **CTAS** (`CREATE [TEMPORARY] TABLE [IF NOT EXISTS] [(columns/constraints)] ... AS SELECT`): ✅ full target-table options/partitioning are never lost; inferred columns stay faithful to catalog origin and outer-join nullability follows the join shape; persistent tables/temporary tables, declared columns, IGNORE/REPLACE, CTEs/set operations/derived tables load in unified chunks, and CTAS no longer actively materializes the entire result (query operators themselves may still materialize); unknown string upper bounds use the full LOB range. Persistent CTAS achieves crash atomicity via intent + deferred DD generation, and binlog puts the parsed CREATE and WRITE_ROWS into the same GTID/XID transaction.
 - **Naming and size limits**: table/column identifiers and indexes declared in CREATE/ALTER TABLE are validated up to 64 characters (errno 1059); standalone CREATE INDEX currently has no equivalent index-name length guard. Tables have at most 1017 live columns (errno 1117). Tables, views, and sequences share one relational-name namespace, and concurrent CREATEs are double-checked under the catalog write lock. See [limits and enforcement gaps](limits.md).
 - **Generated columns** (`GENERATED ALWAYS AS`, VIRTUAL / STORED): ✅
+- **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
+- **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
 - **CHECK constraints**: ✅ all actions
 - **Foreign keys (FK)**: ✅ all four referential actions, including cascades
 - **Online CHECK / FK ALTER**: ➕ constraint-only ALTERs allow concurrent reads and writes by default, including CHECK add/enable/disable, FK add and DROP+ADD replacement, and atomic publication of multiple constraints. Preparation and publication use short write barriers; `LOCK=SHARED` allows reads and blocks writes, `LOCK=EXCLUSIVE` retains exclusive semantics. Enabling a not-yet-enabled CHECK, disabling, and dropping constraints do not scan existing data; weak lock requests in mixed column/index/partition actions fail explicitly.
@@ -151,7 +153,7 @@ production-grade MySQL replacement.
 | B-tree (including unique, composite, covering INCLUDE, prefix, descending, functional/expression, and invisible indexes) | ✅/➕ |
 | JSON multi-valued index | ✅ |
 | FULLTEXT (BM25 + boolean mode) | ✅ |
-| SPATIAL (MBR B-tree + derived R-tree) | ✅ |
+| SPATIAL (persistent R-tree) | ✅ |
 | HNSW vector index (`USING HNSW`) | ➕ see [§9](#9-vector-search) |
 | IVF vector index (`USING IVF`) | ➕ see [§9](#9-vector-search) |
 
@@ -231,17 +233,17 @@ for syntax and operational limits.
 - **Semantic definition persistence**: the query AST parsed at CREATE/ALTER is saved to the catalog and shared via immutable objects; execution uses that AST. The SHOW CREATE text is for display only. Quoting/escaping semantics from creation survive SQL mode changes and restarts; the view dependency key includes a digest of the query semantics.
 - **Encoding resource bounds**: semantic query encoding is capped at 64 MiB, 1,000,000 JSON containers, and 4,000,000 scalars. Scalar expression depth is 1,024 and SELECT nesting is 63; semantic query depth is `1,024 + 63 = 1,087`, and encoded JSON depth is `4 × (1,024 + 1,087) = 8,444`. The compiled-expression depth limit of 64 is separate: deeper admitted expressions use the stack-extending scalar evaluator. Exceeding the encoding limits returns a clear error before the catalog write; corrupted or unknown-version semantic queries fail at catalog read time instead of being replaced with an empty query. Encoding capacity is charged to SystemMetadata; decode scratch space and stack segments are charged to ParserTransient.
 - **ALGORITHM tri-state**: `MERGE` / `UNDEFINED` / `TEMPTABLE` (genuinely materialized under `no_merge`).
-- **SQL SECURITY DEFINER / INVOKER**: ✅ the read path switches the privilege account.
-- **WITH CHECK OPTION** (LOCAL / CASCADED): ✅ genuinely enforced (post-DML image evaluation, failure 1369). Single-table views with computed projection columns are currently rejected for CHECK OPTION with error 1368; use a direct-column view for checked DML.
+- **SQL SECURITY DEFINER / INVOKER**: ✅ the read path switches the privilege account. EXPLAIN additionally requires the caller to hold SHOW VIEW on referenced views and SELECT on their recursive dependencies; DEFINER execution privileges do not authorize plan disclosure.
+- **WITH CHECK OPTION** (LOCAL / CASCADED): ✅ genuinely enforced (post-DML image evaluation, failure 1369), including IN/EXISTS/scalar/ANY/ALL subquery predicates. Row-independent subqueries are materialized once per statement; correlated checks use each candidate post-image. Single-table views with computed projection columns are currently rejected for CHECK OPTION with error 1368; use a direct-column view for checked DML.
 - **Updatable views**: single-table INSERT / UPDATE / DELETE ✅, including nested views with wildcards and renamed columns; hidden base-table columns cannot be accessed via DML/locking reads.
 - **Non-recursive CTE views**: multiple references share the materialized result; recursive CTE views still fail explicitly with 1235.
-- **Locking reads**: simple updatable views and their joins with base tables support real row locks and NOWAIT/SKIP LOCKED; complex locking-join shapes involving aggregation, window functions, NATURAL/USING, LATERAL, etc. are still explicitly rejected. Lock clauses inside a view definition fail explicitly with 1235 at CREATE/ALTER instead of being silently ignored.
+- **Locking reads**: simple updatable views, mergeable INNER/LEFT/RIGHT JOIN views, and their supported joins with base tables support real row locks and NOWAIT/SKIP LOCKED; complex locking-join shapes involving aggregation, window functions, NATURAL/USING, LATERAL, etc. are still explicitly rejected. Lock clauses inside a view definition fail explicitly with 1235 at CREATE/ALTER instead of being silently ignored.
 - **Dependency revalidation**: ALTER/REPLACE VIEW propagates invalidation and rebinds dependent views; DROP DATABASE invalidates cross-database dependencies; missing dependencies report 1356.
 - **Normalized definition echo**: `SHOW CREATE VIEW` / `IS.views.VIEW_DEFINITION` echo the normalized definition (identifier backquoting, `db.tbl` qualification, `*` expansion, adding `AS alias`); constructs that cannot round-trip (subqueries/windows/CTE/MATCH/GROUP_CONCAT) conservatively fall back to the original text.
 - **Column types frozen at CREATE**: expression column types and nullability are determined when the view is created.
 - **Join-view DML**: single-base-table UPDATE over INNER/CROSS JOIN views with direct column projections is supported, preserving the join and WHERE conditions; duplicate matches modify each target row only once; cross-base-table assignments report 1393 and DELETE reports 1395. Single-base-table INSERT with an explicit column list remains supported. Outer joins, NATURAL/USING, computed columns, extra outer joins, and CHECK OPTION/RETURNING on join views — shapes not yet supported — are explicitly rejected.
-- **View definition and dependency behavior**: TRIM special syntax round-trips through normalization; wildcard metadata excludes INVISIBLE columns so the view column set is stable after ALTER; multi-object DROP VIEW deletes in a single catalog transaction after unified validation; dependent views are revalidated after function rebuilds; source views of INSERT…SELECT go through expansion and privilege validation; CHECK OPTION on non-updatable views reports 1368.
-- **Retained differences**: SHOW CREATE VIEW keeps the correct full output column-name list so explicit column names are not lost on rebuild; FOR UPDATE on aggregate views remains explicitly rejected (1288) rather than disguising unimplemented base-table row locking as success.
+- **View definition and dependency behavior**: TRIM special syntax round-trips through normalization; wildcard metadata follows logical column order and excludes dropped/INVISIBLE columns; recreated column names resolve to their current types and character metadata; multi-object DROP VIEW deletes in a single catalog transaction after unified validation; dependent views are revalidated after function rebuilds; source views of INSERT…SELECT go through expansion and privilege validation; CHECK OPTION on non-updatable views reports 1368.
+- **Retained differences**: SHOW CREATE VIEW keeps the correct full output column-name list so explicit column names are not lost on rebuild; FOR UPDATE on aggregate or materialized views remains explicitly rejected (1235) rather than disguising unimplemented base-table row locking as success.
 
 ### Other Objects
 
@@ -450,7 +452,16 @@ for mydb-specific behavior, see [Window Functions](function/aggregate-window/REA
 - `SET TRANSACTION` without SESSION/GLOBAL affects only the next transaction, including autocommit
   reads, and restores the session default afterwards; READ ONLY allows FOR SHARE and rejects FOR UPDATE and persistent-table writes.
   Historical validation of transaction/XA boundaries is archived in the project's internal engineering records (transaction-processing-fix-validation-2026-10-02).
-- **SAVEPOINT**, **`LOCK TABLES`**: ✅
+- **SAVEPOINT**, **`LOCK TABLES`**: ✅. Savepoints also operate inside ACTIVE XA branches;
+  IDLE branches reject savepoint operations.
+- Transaction statements such as BEGIN, SAVEPOINT, and XA RECOVER can be prepared in mydb.
+  This intentionally extends the set accepted by MySQL's prepared-statement protocol.
+- DDL rejected during pre-execution validation does not commit the user's existing transaction.
+  Successful implicit-commit statements retain their documented transaction boundaries.
+- Mixed SET statements validate system-variable assignments before applying them. Their expressions
+  therefore observe the pre-application state, including when autocommit is among the assignments;
+  this avoids partial system-variable changes on validation failure. A subquery evaluated by an
+  autocommit SET does not leave its temporary transaction open when that SET disables autocommit.
 
 ### EXPLAIN
 
@@ -524,6 +535,12 @@ Query hints (`/*+ ... */` and table-level `USE/FORCE/IGNORE INDEX`) are covered 
 ### validate_password Component
 
 ➕/✅ opt-in via `INSTALL COMPONENT 'file://component_validate_password'` (off by default, aligned with MySQL; unknown components report 3529). Once enabled, plaintext passwords in CREATE/ALTER USER and SET PASSWORD are policy-checked (LOW/MEDIUM/STRONG); weak passwords report 1819. `authentication_policy` is settable with format validation (violations report 1231).
+
+Component installation survives restart and is visible in `mysql.component`.
+Dictionary files are unsupported: setting a nonempty
+`validate_password.dictionary_file` returns a clear unsupported-feature error.
+Password rotation preserves a failed-login temporary lock; use
+`ALTER USER ... ACCOUNT UNLOCK` to clear it explicitly.
 
 ---
 
@@ -669,7 +686,7 @@ The compatibility baseline is fixed at MySQL 8.0.46. mydb supports 111
 official function names and aliases, supports the single `SRID + WKB`
 storage/protocol format, column-level `SRID n`, strict Geometry coercion,
 5152 SRS entries and 47 unit metadata entries, the `ST_Collect` aggregate, and
-persistent MBR B-trees with a derived R-tree cache. Planar area, length, and
+page-backed persistent R-trees with WAL recovery and physical replication. Planar area, length, and
 distance use the project's pure-Rust kernels;
 `ST_Buffer_Strategy` tokens match MySQL's 12-byte format. Geographic
 area/length/distance, polygon set operations, and Buffer without a reliable
@@ -678,8 +695,7 @@ pure-Rust implementation return clear errors — no silent degradation.
 "Registered" here does not mean every input shape is accepted. Still missing
 are SRS DDL/dynamic privileges and DD persistence, full EPSG projection
 transforms, complete geographic/axis-order semantics, all Geometry combinations
-for set operations, `ST_Collect` window/native vector channels, incremental
-background R-trees, and full compatibility coverage. GIS is
+for set operations, `ST_Collect` window/native vector channels, and full compatibility coverage. GIS is
 therefore not yet marked "fully compatible". See [Spatial Functions](function/spatial/README.md)
 for function-specific input restrictions and errors.
 
@@ -941,7 +957,7 @@ their underlying tables.
 
 ### mydb → mydb Native Physical Replication
 
-➕ **mydb extension** (`MYDB_REPL_PORT` 3316): protocol v2, format fingerprints,
+➕ **mydb extension** (`MYDB_REPL_PORT` 3316): protocol v3, format fingerprints,
 mTLS, received/durable/applied watermarks, slots/retention, staged base backups, timeline/fencing,
 and manual controlled switchover. SQL surface: `CHANGE MYDB MASTER TO` / `START|STOP|RESET MYDB REPLICATION` /
 `STOP|RESUME MASTER WRITES` / controlled or `FORCE FENCED` `PROMOTE TO MASTER` /

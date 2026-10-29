@@ -119,6 +119,110 @@ fn explain_source_free_select_reports_no_tables_used() {
 }
 
 #[test]
+fn explain_analyze_source_free_uses_runtime_semantics_and_real_row_counts() {
+    std::fs::create_dir_all("/tmp/mydb/http-functions").unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("explain-")
+        .tempdir_in("/tmp/mydb/http-functions")
+        .unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    session.current_database = "test".into();
+    engine
+        .execute("CREATE TABLE source_free_probe(id INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO source_free_probe VALUES (1)")
+        .unwrap();
+    for format in ["TREE", "JSON", "TRADITIONAL"] {
+        engine
+            .execute_with_session(&mut session, "SET @explain_effect=0")
+            .unwrap();
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("EXPLAIN FORMAT={format} SELECT @explain_effect:=@explain_effect+1"),
+            )
+            .unwrap();
+        let value = engine
+            .execute_with_session(&mut session, "SELECT @explain_effect")
+            .unwrap();
+        assert_eq!(response_rows(value)[0][0], Value::Int(0));
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!(
+                    "EXPLAIN ANALYZE FORMAT={format} SELECT @explain_effect:=@explain_effect+1"
+                ),
+            )
+            .unwrap();
+        let value = engine
+            .execute_with_session(&mut session, "SELECT @explain_effect")
+            .unwrap();
+        assert_eq!(response_rows(value)[0][0], Value::Int(1));
+
+        for (target, expected) in [
+            ("SELECT 10", 1),
+            ("SELECT 10 WHERE 0", 0),
+            ("SELECT 10 LIMIT 0", 0),
+            ("SELECT 10 LIMIT 1 OFFSET 1", 0),
+            ("SELECT COUNT(*)", 1),
+            ("SELECT COUNT(*) HAVING 0", 0),
+            ("SELECT ROW_NUMBER() OVER ()", 1),
+            ("SELECT (SELECT COUNT(*) FROM source_free_probe)", 1),
+        ] {
+            let result = response_rows(
+                engine
+                    .execute_with_session(
+                        &mut session,
+                        &format!("EXPLAIN ANALYZE FORMAT={format} {target}"),
+                    )
+                    .unwrap(),
+            );
+            if format == "TRADITIONAL" {
+                assert_eq!(result[0].len(), 17);
+                assert_eq!(result[0][16], Value::Int(expected), "{target}");
+            } else {
+                let Value::String(text) = &result[0][0] else {
+                    panic!("expected plan")
+                };
+                if format == "JSON" {
+                    let plan: serde_json::Value = serde_json::from_str(text).unwrap();
+                    assert_eq!(
+                        plan["query_block"]["execution"]["rows_total"], expected,
+                        "{target}"
+                    );
+                } else {
+                    assert!(
+                        text.contains(&format!("rows={expected} loops=1")),
+                        "{target}: {text}"
+                    );
+                }
+            }
+        }
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        engine
+            .execute_with_session(&mut session, "INSERT INTO source_free_probe VALUES (2)")
+            .unwrap();
+        engine.execute_with_session(&mut session, &format!("EXPLAIN ANALYZE FORMAT={format} SELECT @explain_effect := (SELECT COUNT(*) FROM source_free_probe)")).unwrap();
+        let value = engine
+            .execute_with_session(&mut session, "SELECT @explain_effect")
+            .unwrap();
+        assert_eq!(response_rows(value)[0][0], Value::Int(2));
+        engine
+            .execute_with_session(&mut session, "ROLLBACK")
+            .unwrap();
+        let err = engine
+            .execute_with_session(
+                &mut session,
+                &format!("EXPLAIN ANALYZE FORMAT={format} SELECT unknown_source_free_column"),
+            )
+            .unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_BAD_FIELD_ERROR), "{err}");
+    }
+}
+
+#[test]
 fn explain_analyze_static_plan_matches_plain_explain_in_all_formats() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

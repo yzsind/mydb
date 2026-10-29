@@ -18,6 +18,11 @@ MyDB is a general-purpose database built in Rust, designed around three directio
 
 MyDB 1.0.0 is a public-preview release intended for feature validation and controlled-environment evaluation. It is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
 
+HTTP SQL functions are enabled by default for accounts with `HTTP_USE` and can
+reach public, private, loopback, and link-local networks. Configure
+[`http_local_config` egress controls](docs/http.md#node-configuration) to restrict
+destinations, or set `http_enabled=OFF` when HTTP calls are unnecessary.
+
 | Core capability | What it gives you |
 | --- | --- |
 | **Built for AI agents** | Online schema changes, automatic zone maps, and native vector data management reduce manual work in schema evolution and query tuning. |
@@ -75,6 +80,18 @@ A fresh data directory includes the `test` database and the local `root` account
 with password `root`. Run `SELECT 1;` to check the connection. Enter `quit` to
 exit the client, then press **Ctrl+C** in the server terminal to stop it. Restart
 with the same data directory to reopen your data.
+
+### Native Rust client
+
+Build the independent client from a source checkout:
+
+```bash
+cargo build --release --locked --manifest-path clients/mydb-cli/Cargo.toml
+./clients/mydb-cli/target/release/mydb-cli -h127.0.0.1 -P8738 -uroot -p test
+```
+
+The client provides interactive editing and completion, SQL scripts, table/TSV/
+vertical output, TLS, and query cancellation. See the [client manual](docs/mydb-cli.md).
 
 ### Build and connect
 

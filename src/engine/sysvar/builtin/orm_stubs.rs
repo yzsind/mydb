@@ -15,6 +15,11 @@ use crate::types::QueryError;
 
 static INNODB_STRICT_MODE: AtomicBool = AtomicBool::new(true);
 static MAX_PREPARED_STMT_COUNT: AtomicU64 = AtomicU64::new(16_382);
+static MAX_ERROR_COUNT: AtomicU64 = AtomicU64::new(64);
+
+pub(crate) fn max_error_count() -> u64 {
+    MAX_ERROR_COUNT.load(Ordering::Relaxed)
+}
 
 pub(crate) fn global_innodb_strict_mode() -> bool {
     INNODB_STRICT_MODE.load(Ordering::Relaxed)
@@ -25,6 +30,29 @@ pub(crate) fn max_prepared_stmt_count() -> u64 {
 }
 
 pub(crate) fn register(reg: &mut Registry) {
+    reg.register(SysVar::session_backed(
+        SysVarDef::new(
+            "max_error_count",
+            Scope::Both,
+            DataType::Int { min: 0, max: 65535 },
+        )
+        .with_doc("Maximum stored conditions; warning_count includes discarded conditions."),
+        |ctx| {
+            SysVarValue::UInt(match (ctx.scope, ctx.session) {
+                (Scope::Session, Some(session)) => session.sysvars.max_error_count,
+                _ => max_error_count(),
+            })
+        },
+        |ctx, value| {
+            let count = value.as_u64().unwrap_or(64);
+            if ctx.is_global() {
+                MAX_ERROR_COUNT.store(count, Ordering::Relaxed);
+            } else {
+                ctx.session.sysvars.max_error_count = count;
+            }
+            Ok(())
+        },
+    ));
     register_innodb_stubs(reg);
     register_misc_stubs(reg);
     register_validate_password(reg);
@@ -114,9 +142,15 @@ fn register_validate_password(reg: &mut Registry) {
             Scope::Global,
             DataType::String { max_len: None },
         )
-        .with_doc("Dictionary file path (accepted; mydb ships no dictionary)."),
+        .with_doc("Dictionary files are unsupported; only an empty path is accepted."),
         |_ctx| SysVarValue::String(String::new()),
-        |_ctx: &mut WriteCtx<'_>, _v: SysVarValue| -> Result<(), QueryError> { Ok(()) },
+        |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
+            if !v.to_display_string().is_empty() {
+                return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("validate_password dictionary files are not supported"));
+            }
+            Ok(())
+        },
     ));
 
     // authentication_policy (8.0.27+) — validated + round-trips. mydb is
@@ -439,7 +473,6 @@ fn register_misc_stubs(reg: &mut Registry) {
         ("flush_time", 0),
         ("max_connect_errors", 100),
         ("max_delayed_threads", 20),
-        ("max_error_count", 1024),
         ("max_relay_log_size", 0),
         // max_sp_recursion_depth is a real settable sysvar (see query.rs),
         // wired to stored-procedure recursion enforcement.

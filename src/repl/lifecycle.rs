@@ -74,19 +74,19 @@ impl ReceiverLifecycle {
     /// and need to deterministically wait for the receiver loop to
     /// finish before asserting "replica saw no new rows after STOP".
     pub async fn stop_and_wait(&mut self) {
-        let Some(shutdown) = self.shutdown.take() else {
-            self.shutdown_flag = None;
-            self.join = None;
-            return;
-        };
-        if let Some(flag) = self.shutdown_flag.take() {
+        if let Some(flag) = &self.shutdown_flag {
             flag.store(true, Ordering::Release);
         }
-        let Some(join) = self.join.take() else {
-            return;
-        };
-        shutdown.notify_waiters();
-        let _ = tokio::time::timeout(STOP_TIMEOUT, join).await;
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.notify_waiters();
+        }
+        if let Some(join) = self.join.take() {
+            // A blocking apply cannot be cancelled safely. Shutdown must join
+            // it before the engine's final checkpoint or data-directory unlock.
+            let _ = join.await;
+        }
+        self.shutdown = None;
+        self.shutdown_flag = None;
     }
 
     /// Spin up the receiver loop. The actual receiver task is spawned
@@ -110,6 +110,16 @@ impl ReceiverLifecycle {
     ) -> Result<(), QueryError> {
         if self.shutdown.is_some() {
             if self.is_running() {
+                if self
+                    .shutdown_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_STOP_REPLICA_IO_THREAD_TIMEOUT,
+                        "previous receiver is still stopping; retry START after it exits",
+                    ));
+                }
                 return Ok(());
             }
             // A prior receiver exited naturally (resync/poison/fatal error).
@@ -130,7 +140,7 @@ impl ReceiverLifecycle {
                 format!("invalid master port in '{master_endpoint}'"),
             )
         })?;
-        let host = host.to_string();
+        let host = host.trim_matches(['[', ']']).to_string();
         let shutdown = Arc::new(Notify::new());
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_for_task = Arc::clone(&shutdown);
@@ -180,36 +190,28 @@ impl ReceiverLifecycle {
     ///   observe completion (or just trust that the next `start` will
     ///   be idempotent until the prior task drains).
     pub fn stop(&mut self, handle: Handle) -> Result<(), QueryError> {
-        let Some(shutdown) = self.shutdown.take() else {
-            self.shutdown_flag = None;
-            self.join = None;
-            return Ok(());
-        };
-        if let Some(flag) = self.shutdown_flag.take() {
+        if let Some(flag) = &self.shutdown_flag {
             flag.store(true, Ordering::Release);
         }
-        let Some(join) = self.join.take() else {
-            return Ok(());
-        };
-        shutdown.notify_waiters();
-        let on_runtime = Handle::try_current().is_ok();
-        if on_runtime {
-            // Don't block — driving the spawn requires the very
-            // thread we're on. Detach and rely on the receiver's
-            // cooperative shutdown.
-            handle.spawn(async move {
-                let _ = tokio::time::timeout(STOP_TIMEOUT, join).await;
-            });
-        } else {
-            // Blocking-worker path. Park the thread on a sync channel
-            // until the detached await reports the join completed.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-            handle.spawn(async move {
-                let _ = tokio::time::timeout(STOP_TIMEOUT, join).await;
-                let _ = tx.send(());
-            });
-            let _ = rx.recv_timeout(STOP_TIMEOUT + Duration::from_secs(1));
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.notify_waiters();
         }
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while self.join.as_ref().is_some_and(|join| !join.is_finished()) {
+            // A current-thread runtime cannot drive a receiver while this
+            // synchronous caller waits. Keep ownership and require a retry.
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+                && Handle::try_current().is_ok()
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(error(crate::error::catalog::ER_STOP_REPLICA_IO_THREAD_TIMEOUT,
+                    "receiver is still stopping; role change refused until all apply work has exited"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.join = None;
+        self.shutdown = None;
+        self.shutdown_flag = None;
         Ok(())
     }
 }
@@ -250,6 +252,7 @@ async fn run_reconnect_loop(
     // (connect/timeout/read) don't count — they reset on any progress.
     let mut retry_delay = backoff;
     let mut poison_failures = 0u32;
+    let mut apply_failures = 0u32;
     let mut last_applied_seen = initial_progress.durable_applied_lsn;
     const MAX_POISON_FAILURES: u32 = 5;
     loop {
@@ -264,6 +267,7 @@ async fn run_reconnect_loop(
                 initial_progress = loaded;
             }
         }
+        crate::repl::replica::progress::reconcile_applied(&mut initial_progress, &db, &log);
         let receiver = Receiver {
             master_host: host.clone(),
             master_port: port,
@@ -341,17 +345,25 @@ async fn run_reconnect_loop(
         }
         // Circuit-breaker bookkeeping: did the last run make durable
         // forward progress? If so, any prior poison streak is cleared.
-        let current_applied = crate::repl::replica::progress::load_progress(&data_dir)
-            .ok()
-            .flatten()
-            .map(|p| p.durable_applied_lsn)
-            .unwrap_or(last_applied_seen);
+        let current_applied = db.replica_applied_lsn().min(log.lock().durable_lsn());
         if current_applied > last_applied_seen {
             last_applied_seen = current_applied;
             poison_failures = 0;
+            apply_failures = 0;
             retry_delay = backoff;
         }
         if let Err(err) = &outcome {
+            if err.is_internal(crate::error::InternalErrorKind::ReplicaHandshakeRejected) {
+                *status.lock() = format!("stopped: handshake rejected: {}", err.message());
+                return;
+            }
+            if err.is_internal(crate::error::InternalErrorKind::ReplicaApplyFailure) {
+                apply_failures += 1;
+                if apply_failures >= MAX_POISON_FAILURES {
+                    *status.lock() = format!("stopped: repeated apply failure at LSN {}: {}; repair the cause and START MYDB REPLICATION", db.replica_applied_lsn(), err.message());
+                    return;
+                }
+            }
             let deterministic =
                 err.is_internal(crate::error::InternalErrorKind::ReplicaPoisonFrame);
             if deterministic && current_applied <= last_applied_seen {
@@ -363,10 +375,16 @@ async fn run_reconnect_loop(
                          and flagging resync for re-seed on next restart",
                         err.message()
                     ));
-                    let _ = crate::repl::replica::progress::write_resync_marker(
+                    if let Err(marker_err) = crate::repl::replica::progress::write_resync_marker(
                         &data_dir,
                         &format!("poison frame at LSN {last_applied_seen}: {}", err.message()),
-                    );
+                    ) {
+                        *status.lock() = format!(
+                            "stopped: poison frame; failed to persist resync marker: {marker_err}"
+                        );
+                        log_message(format_args!("mydb-repl receiver: {}", status.lock()));
+                        return;
+                    }
                     *status.lock() = format!("stopped: poison frame at LSN {last_applied_seen}");
                     return;
                 }
@@ -397,7 +415,7 @@ async fn run_reconnect_loop(
         // sleep so STOP MYDB REPLICATION is snappy.
         tokio::select! {
             _ = shutdown.notified() => return,
-            _ = tokio::time::sleep(retry_delay) => {}
+            _ = tokio::time::sleep(retry_delay.mul_f64(0.8 + rand::random::<f64>() * 0.4)) => {}
         }
         retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(60));
         if shutdown_flag.load(Ordering::Acquire) {
@@ -409,3 +427,32 @@ async fn run_reconnect_loop(
 // Generate a stable replica UUID. Stored in the role state, but we
 // also need a fallback for cases where the role state isn't fully
 // initialized (early boot tests, etc.).
+
+#[cfg(test)]
+mod release_audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stop_does_not_forget_a_running_applier() {
+        let shutdown = Arc::new(Notify::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            let _ = wait.await;
+        });
+        let mut lifecycle = ReceiverLifecycle {
+            shutdown: Some(shutdown),
+            shutdown_flag: Some(flag.clone()),
+            join: Some(join),
+        };
+        let err = lifecycle.stop(Handle::current()).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::error::catalog::ER_STOP_REPLICA_IO_THREAD_TIMEOUT.code()
+        );
+        assert!(lifecycle.is_running());
+        assert!(flag.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        lifecycle.stop_and_wait().await;
+        assert!(!lifecycle.is_running());
+    }
+}

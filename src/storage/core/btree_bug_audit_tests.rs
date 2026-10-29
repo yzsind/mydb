@@ -28,6 +28,19 @@ fn int_key(v: i64) -> IndexKey {
     IndexKey::from(vec![KeyPart::Int(v)])
 }
 
+#[test]
+fn btree_release_page_allocation_overflow_returns_error_without_mutation() {
+    let (_dir, index) = audit_index("overflow.idx");
+    let index = index.read();
+    for next in [u64::MAX, u64::MAX / PAGE_SIZE as u64] {
+        index.meta_state.lock().meta.next_page_id = next;
+        assert!(index.reserve_page_id().is_err());
+        assert_eq!(index.meta_state.lock().meta.next_page_id, next);
+        assert!(index.alloc_page(0).is_err());
+        assert_eq!(index.meta_state.lock().meta.next_page_id, next);
+    }
+}
+
 fn rid(i: usize) -> RowId {
     RowId {
         page_id: (i / 64) as u32,

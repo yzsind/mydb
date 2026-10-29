@@ -13,6 +13,7 @@ pub(super) struct LoginAccount {
     active_roles: BTreeSet<AccountKey>,
     epoch: u64,
     is_system_user: bool,
+    is_connection_admin: bool,
 }
 
 impl LoginAccount {
@@ -26,6 +27,18 @@ impl LoginAccount {
                 active_roles: auth.login_active_roles(&account.key),
                 epoch: auth.epoch,
                 is_system_user: auth.account_is_system_user(&account.key),
+                is_connection_admin: auth.account_has_privilege(
+                    &AuthorizationContext {
+                        authenticated_as: account.key.clone(),
+                        active_roles: auth.login_active_roles(&account.key).into(),
+                        epoch: auth.epoch,
+                    },
+                    &auth::RequiredPrivilege {
+                        privilege: auth::Privilege::Dynamic("CONNECTION_ADMIN".into()),
+                        scope: auth::PrivilegeScope::Global,
+                    },
+                    false,
+                ),
                 account,
             })
         })?
@@ -39,6 +52,11 @@ impl LoginAccount {
         request: &AuthRequest<'_>,
     ) -> Result<bool, QueryError> {
         let account = &self.account;
+        if crate::engine::sysvar::builtin::replication::offline_mode() && !self.is_connection_admin
+        {
+            return Err(crate::error::catalog::ER_SERVER_OFFLINE_MODE
+                .error("The server is currently in offline mode"));
+        }
         if account.account_locked {
             return Err(crate::mysql::errors::error(
                 crate::mysql::errors::ER_ACCOUNT_HAS_BEEN_LOCKED,
@@ -70,10 +88,15 @@ impl LoginAccount {
 
     /// Credential-specific cache updates happen before charging the quota.
     /// Every successful protocol path charges a connection exactly once.
-    pub fn finish(self, password_expired: bool) -> Result<AuthOutcome, QueryError> {
+    pub fn finish(
+        self,
+        password_expired: bool,
+        previous: Option<&AccountKey>,
+    ) -> Result<AuthOutcome, QueryError> {
         let account = &self.account;
-        auth::charge_new_connection(
+        auth::charge_reauthenticated_connection(
             &account.key,
+            previous,
             account.max_connections,
             account.max_user_connections,
         )?;

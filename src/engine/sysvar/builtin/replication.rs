@@ -34,7 +34,6 @@ pub fn super_read_only() -> bool {
     SUPER_READ_ONLY.load(Ordering::Relaxed)
 }
 
-#[cfg(test)]
 /// Returns true if the server is in offline-mode (only super users
 /// admitted).
 pub fn offline_mode() -> bool {

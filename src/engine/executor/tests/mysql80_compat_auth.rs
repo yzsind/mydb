@@ -2237,7 +2237,7 @@ fn s3_validate_password_off_by_default_accepts_weak() {
     engine
         .execute_with_session(&mut root, "CREATE USER 'weak'@'%' IDENTIFIED BY 'x'")
         .unwrap();
-    assert!(!crate::engine::password_policy::is_installed());
+    assert!(!engine.db.auth_catalog().password_validation_component);
 }
 
 #[test]
@@ -2251,7 +2251,7 @@ fn s3_install_component_enforces_and_uninstall_relaxes() {
             "INSTALL COMPONENT 'file://component_validate_password'",
         )
         .unwrap();
-    assert!(crate::engine::password_policy::is_installed());
+    assert!(engine.db.auth_catalog().password_validation_component);
     // Weak password now rejected with 1819.
     let err = engine
         .execute_with_session(&mut root, "CREATE USER 'a'@'%' IDENTIFIED BY 'short'")
@@ -2379,7 +2379,7 @@ fn s3_install_component_requires_admin_privilege() {
         )
         .unwrap_err();
     assert_eq!(err.code(), 1227, "INSTALL COMPONENT needs admin: {err:?}");
-    assert!(!crate::engine::password_policy::is_installed());
+    assert!(!engine.db.auth_catalog().password_validation_component);
 }
 
 // ===========================================================================
@@ -2444,6 +2444,7 @@ fn nonce_auth_request<'a>(
     nonce: &'a [u8],
 ) -> auth::AuthRequest<'a> {
     auth::AuthRequest {
+        replacing_account: None,
         username,
         host,
         auth_response: token,

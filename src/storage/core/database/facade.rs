@@ -319,6 +319,7 @@ impl Database {
         let dir_lock = crate::storage::dir_lock::DataDirLock::acquire(&data_dir)?;
         if !snapshot_read_only {
             crate::storage::image::cleanup_abandoned_staging(&data_dir)?;
+            crate::repl::base_backup::cleanup_abandoned_snapshots(&data_dir)?;
         }
         if snapshot_read_only {
             crate::storage::image::validate_open(&data_dir)?;
@@ -601,12 +602,15 @@ impl Database {
             ),
             temp_tables: RwLock::new(Default::default()),
             txns: parking_lot::RwLock::new(txns),
+            unique_reservations: lock_manager.unique_reservation_filter(),
+            lock_log_presence: lock_manager.lock_log_presence(),
             lock_manager: parking_lot::RwLock::new(lock_manager),
             mdl: MdlManager::default(),
             undo: UndoLatch::new(undo),
             undo_append_shards,
             undo_resident_admission,
             undo_append_next_shard: AtomicU64::new(0),
+            undo_publish: UndoPublishQueue::default(),
             undo_concurrent_append_eligible,
             active_snapshots: (0..ACTIVE_SNAPSHOT_SHARDS)
                 .map(|_| Mutex::new(Default::default()))
@@ -627,11 +631,7 @@ impl Database {
             sequences: crate::storage::sequence::SequenceManager::default(),
             lock_wait_mutex: Mutex::new(()),
             lock_wait_signal: Condvar::new(),
-            row_lock_async_signals: (0..ASYNC_ROW_LOCK_SIGNAL_SHARDS)
-                .map(|_| tokio::sync::watch::channel(0).0)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            row_lock_async_waiters: Arc::new(AtomicU64::new(0)),
+            row_lock_async_registry: Arc::new(crate::engine::api::AsyncRowLockRegistry::default()),
             lock_wait_waiters: AtomicU64::new(0),
             config: config.clone(),
             runtime_config: RwLock::new(runtime_config),
@@ -642,8 +642,6 @@ impl Database {
             heap_cache: parking_lot::RwLock::new(Default::default()),
             storage_handle_open_epochs: Mutex::new(HashMap::new()),
             index_cache: parking_lot::RwLock::new(Default::default()),
-            index_mutation_generations: parking_lot::RwLock::new(Default::default()),
-            spatial_rtree_cache: parking_lot::RwLock::new(Default::default()),
             overflow_cache: parking_lot::RwLock::new(Default::default()),
             zone_map_gate: parking_lot::RwLock::new(()),
             backup_maintenance_gate: parking_lot::RwLock::new(()),
@@ -682,6 +680,7 @@ impl Database {
             log,
             log_state_atomics,
             group_commit: GroupCommitCoordinator::default(),
+            flush_group_commit: GroupCommitCoordinator::default(),
             durability_worker,
             plan_cache_hits: AtomicU64::new(0),
             plan_cache_misses: AtomicU64::new(0),
@@ -787,7 +786,9 @@ impl Database {
             dml_stats: DmlStats::default(),
             table_modification_deltas: parking_lot::RwLock::new(HashMap::new()),
             table_live_row_deltas: parking_lot::RwLock::new(HashMap::new()),
-            pending_live_row_deltas: parking_lot::Mutex::new(HashMap::new()),
+            pending_live_row_deltas: (0..PENDING_LIVE_ROW_DELTA_SHARDS)
+                .map(|_| parking_lot::Mutex::new(FastHashMap::default()))
+                .collect(),
             table_write_epochs: parking_lot::RwLock::new(HashMap::new()),
             applier_dd_dirty_txns: parking_lot::Mutex::new(HashMap::new()),
             online_index_descriptors: parking_lot::RwLock::new(HashMap::new()),
@@ -799,6 +800,8 @@ impl Database {
             analyze_test_hook: Mutex::new(None),
             #[cfg(test)]
             ddl_backfill_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            create_finalize_test_hook: Mutex::new(None),
             #[cfg(test)]
             online_index_replay_test_hook: Mutex::new(None),
             #[cfg(test)]

@@ -614,6 +614,60 @@ fn cost_frontier_prunes_zone_expansion_for_cheap_nonunique_and_range_indexes() {
 }
 
 #[test]
+fn zone_map_costing_preserves_empty_and_partial_tail_candidates() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE zm_match_floor (id BIGINT, pad VARCHAR(4096), INDEX idx_id(id))")
+        .unwrap();
+    let pad = "x".repeat(3000);
+    let rows = (0..600)
+        .map(|id| format!("({id},'{pad}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO zm_match_floor VALUES {rows}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE zm_match_floor").unwrap();
+    let table = engine.db_for_tests().table("zm_match_floor").unwrap();
+    for id in [-1, 599] {
+        let Statement::Select(select) =
+            parse_statement(&format!("SELECT pad FROM zm_match_floor WHERE id = {id}")).unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let predicate = select.selection.as_ref().unwrap();
+        // Expected rows are a statistical estimate, not proof that a full
+        // zone survives. The absent key prunes every page; the final key
+        // survives only the partially filled last zone.
+        assert!(estimate_filter_rows(&table, predicate, 600.0) >= 1.0);
+        let preview = engine
+            .db_for_tests()
+            .zone_map_cost_lower_bound(&table, predicate)
+            .unwrap();
+        assert!(preview.total_pages > u64::from(table.zone_pages()));
+        assert_eq!(preview.min_surviving_pages, 0);
+        let full = engine
+            .db_for_tests()
+            .zone_map_cost_details(&table, predicate)
+            .unwrap();
+        assert!(full.exact);
+        if id == -1 {
+            assert_eq!(full.surviving_pages, 0);
+        } else {
+            assert!(full.surviving_pages > 0);
+            assert!(full.surviving_pages < u64::from(table.zone_pages()));
+        }
+        crate::storage::reset_zone_map_cost_estimate_calls();
+        let _ = plan_select(engine.db_for_tests(), &select).unwrap();
+        assert!(
+            crate::storage::zone_map_cost_estimate_calls() > 0,
+            "expected matches must not prune exact Zone Map costing for id={id}"
+        );
+    }
+}
+
+#[test]
 fn prepared_physical_point_lookup_matches_standalone_planner() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

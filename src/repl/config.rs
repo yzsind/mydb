@@ -7,6 +7,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplConfig {
+    pub auth_token: ReplAuthToken,
     /// Replication mode: `async` (default) or `semi_sync`.
     pub mode: ReplMode,
     /// Master-side TCP bind: `MYDB_REPL_BIND_HOST` + `MYDB_REPL_PORT`.
@@ -38,6 +39,8 @@ pub struct ReplConfig {
     /// Auto-start the replication subsystem on boot when the role file
     /// already says master/replica.
     pub auto_start: bool,
+    /// Zero retries indefinitely; a positive value bounds failed seed attempts.
+    pub bootstrap_max_attempts: u32,
     pub tls_mode: ReplTlsMode,
     pub tls_ca: Option<PathBuf>,
     pub tls_cert: Option<PathBuf>,
@@ -47,6 +50,48 @@ pub struct ReplConfig {
     pub max_base_backups: usize,
     pub apply_queue_bytes: usize,
     pub base_backup_disk_reserve_pct: u8,
+}
+
+/// Shared replication credential. Never include its bytes in diagnostics.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ReplAuthToken(zeroize::Zeroizing<String>);
+
+impl std::fmt::Debug for ReplAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+impl From<String> for ReplAuthToken {
+    fn from(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+}
+impl From<&str> for ReplAuthToken {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+impl ReplAuthToken {
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    pub(crate) fn matches(&self, candidate: &Self) -> bool {
+        use sha2::{Digest, Sha256};
+        !self.0.is_empty()
+            && openssl::memcmp::eq(
+                &Sha256::digest(self.0.as_bytes()),
+                &Sha256::digest(candidate.0.as_bytes()),
+            )
+    }
+    pub(crate) fn validate(&self) -> Result<(), crate::types::QueryError> {
+        if self.0.len() < 16 || self.0.len() > 4096 {
+            return Err(crate::storage::error(
+                crate::error::catalog::MYDB_ER_REPLICATION_SECURITY,
+                "native replication requires MYDB_REPL_AUTH_TOKEN (16..4096 bytes) on both peers",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +138,7 @@ impl ReplMode {
 impl Default for ReplConfig {
     fn default() -> Self {
         Self {
+            auth_token: ReplAuthToken::default(),
             mode: ReplMode::Async,
             // Safe-by-default: an unauthenticated/native listener must never
             // be exposed on every interface accidentally. Non-loopback mTLS
@@ -110,6 +156,7 @@ impl Default for ReplConfig {
             max_retained_bytes: 16 * 1024 * 1024 * 1024,
             slot_timeout: Duration::from_millis(300_000),
             auto_start: true,
+            bootstrap_max_attempts: 10,
             tls_mode: ReplTlsMode::Auto,
             tls_ca: None,
             tls_cert: None,
@@ -124,8 +171,19 @@ impl Default for ReplConfig {
 }
 
 impl ReplConfig {
+    #[cfg(test)]
+    pub(crate) fn test_defaults() -> Self {
+        Self {
+            auth_token: "mydb-native-replication-test".into(),
+            ..Self::default()
+        }
+    }
+
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
+        if let Ok(token) = crate::util::env::var("MYDB_REPL_AUTH_TOKEN") {
+            cfg.auth_token = token.into();
+        }
         if let Ok(v) = crate::util::env::var("MYDB_REPL_MODE") {
             if let Some(mode) = ReplMode::parse(&v) {
                 cfg.mode = mode;
@@ -173,7 +231,10 @@ impl ReplConfig {
             cfg.max_retained_bytes = v;
         }
         if let Ok(Some(v)) = parse_env_u64("MYDB_REPL_SLOT_TIMEOUT_MS") {
-            cfg.slot_timeout = Duration::from_millis(v);
+            cfg.slot_timeout = Duration::from_millis(v.max(1));
+        }
+        if let Ok(Some(v)) = parse_env_u32("MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS") {
+            cfg.bootstrap_max_attempts = v;
         }
         if let Ok(v) = crate::util::env::var("MYDB_REPL_AUTO_START") {
             cfg.auto_start = parse_bool(&v);
@@ -246,7 +307,7 @@ mod tests {
 
     #[test]
     fn defaults_match_design() {
-        let cfg = ReplConfig::default();
+        let cfg = ReplConfig::test_defaults();
         assert_eq!(cfg.mode, ReplMode::Async);
         assert_eq!(cfg.bind_host, "127.0.0.1");
         assert_eq!(cfg.bind_port, 3316);
@@ -288,4 +349,18 @@ fn audit_zero_semi_sync_timeout_is_clamped() {
         ReplConfig::from_env,
     );
     assert_eq!(config.semi_sync_timeout, Duration::from_millis(1));
+}
+
+#[cfg(test)]
+mod release_audit_tests {
+    use super::*;
+    #[test]
+    fn credentials_are_required_and_redacted() {
+        assert!(ReplConfig::default().auth_token.validate().is_err());
+        let token: ReplAuthToken = "a-long-private-replication-secret".into();
+        assert!(token.validate().is_ok());
+        assert!(token.matches(&token));
+        assert!(!token.matches(&"a-different-private-replication-secret".into()));
+        assert!(!format!("{token:?}").contains("private"));
+    }
 }

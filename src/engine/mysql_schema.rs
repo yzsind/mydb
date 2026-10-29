@@ -1160,6 +1160,15 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
         "columns_priv" => Ok(mysql_columns_priv_rows(db)),
         "procs_priv" => Ok(mysql_procs_priv_rows(db)),
         "password_history" => Ok(mysql_password_history_rows(db)),
+        "component" => Ok(if db.auth_catalog().password_validation_component {
+            vec![vec![
+                Value::UInt(1),
+                Value::UInt(1),
+                Value::String(crate::engine::password_policy::COMPONENT_URN.into()),
+            ]]
+        } else {
+            Vec::new()
+        }),
         "proxies_priv" => Ok(mysql_proxies_priv_rows(db)),
         "general_log" => crate::engine::logging::general_log_rows(db.data_dir()),
         "slow_log" => crate::engine::logging::slow_log_rows(db.data_dir()),

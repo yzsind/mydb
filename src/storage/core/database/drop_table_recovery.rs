@@ -52,6 +52,31 @@ pub(crate) struct DropTableIntent {
 }
 
 impl Database {
+    // Never recurse: a sibling generation/index may still belong to a live table.
+    fn remove_empty_object_directories(&self, paths: impl IntoIterator<Item = PathBuf>) -> Result<(), QueryError> {
+        let roots = [self.data_dir.join("objects/tables"), self.data_dir.join("objects/indexes")];
+        let mut directories = BTreeSet::new();
+        for path in paths {
+            for root in &roots {
+                if path.starts_with(root) {
+                    let mut parent = path.parent();
+                    while let Some(dir) = parent.filter(|dir| *dir != root.as_path()) {
+                        directories.insert(dir.to_path_buf());
+                        parent = dir.parent();
+                    }
+                }
+            }
+        }
+        for dir in directories.iter().rev() {
+            match fs::remove_dir(dir) {
+                Ok(()) => {},
+                Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {},
+                Err(err) => return Err(io_err(err)),
+            }
+        }
+        Ok(())
+    }
+
     fn retirement_selector(intent: &DropTableIntent) -> CatalogRowSelector {
         let (index_id, generation) = intent
             .retired_index
@@ -308,7 +333,7 @@ impl Database {
             files.push(self.relative_path(&self.overflow_path(sid)));
             files.push(self.relative_path(&self.zone_map_file_path(sid)));
             for index in &table.indexes {
-                files.push(self.relative_path(&self.index_path(sid, &index.name)));
+                files.push(self.relative_path(&self.index_path_for_table_schema(table, sid, &index.name)));
                 if index.is_vector() {
                     vector_files.extend(self.owned_vector_files(table, index, sid)?.iter().map(|path| self.relative_path(path)));
                 }
@@ -350,8 +375,6 @@ impl Database {
         })?;
         crate::util::file::write_staged_file(&path, &path.with_extension("json.tmp"), &bytes, true)
             .map_err(io_err)?;
-        // fsync the directory so the new entry is durable before the commit.
-        crate::platform::fs::sync_path(&dir).map_err(io_err)?;
         Ok(Some(path))
     }
 
@@ -434,6 +457,8 @@ impl Database {
             if intent.had_auto_increment {
                 self.delete_auto_increment_metadata(intent.table_id)?;
             }
+            self.remove_empty_object_directories(intent.files.iter().chain(&intent.vector_files)
+                .map(|rel| self.data_dir.join(rel)))?;
             Ok(())
         })();
         if let Err(err) = result {

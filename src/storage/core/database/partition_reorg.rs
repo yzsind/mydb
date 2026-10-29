@@ -379,7 +379,7 @@ impl Database {
             crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         }
         let mut directories = std::collections::BTreeSet::new();
-        for path in paths {
+        for path in &paths {
             self.buffer_pool.discard_pages_for_path(&path)?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -402,6 +402,7 @@ impl Database {
         if self.config.durability != DurabilityMode::Memory {
             crate::platform::fs::sync_paths(directories).map_err(io_err)?;
         }
+        self.remove_empty_object_directories(paths)?;
         Ok(())
     }
 }
@@ -691,6 +692,7 @@ impl Database {
                         generation,
                         heap_codec: None,
                         index_ids: None,
+                        spatial_indexes: None,
                     },
                 );
             }
@@ -708,6 +710,14 @@ impl Database {
                 .map(|index| (normalize_name(&index.name), index.index_id))
                 .collect::<BTreeMap<_, _>>(),
         );
+        let spatial_indexes = Arc::new(
+            table
+                .indexes
+                .iter()
+                .filter(|index| index.is_spatial())
+                .map(|index| normalize_name(&index.name))
+                .collect::<HashSet<_>>(),
+        );
         if let Ok(mut map) = self.reorg_storage_locs.lock() {
             for sid in sids {
                 map.insert(
@@ -718,6 +728,7 @@ impl Database {
                         generation: table.active_generation.max(1),
                         heap_codec: Some(table.row_codec.clone()),
                         index_ids: Some(index_ids.clone()),
+                        spatial_indexes: Some(spatial_indexes.clone()),
                     },
                 );
             }
@@ -934,9 +945,6 @@ impl Database {
             self.config.durability != DurabilityMode::Memory,
         )
         .map_err(io_err)?;
-        if self.config.durability != DurabilityMode::Memory {
-            crate::platform::fs::sync_path(&dir).map_err(io_err)?;
-        }
         Ok(path)
     }
 

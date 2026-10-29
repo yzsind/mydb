@@ -240,10 +240,7 @@ fn expand_wildcard(
             continue;
         }
         let table = db.table_required(default_database, base).map_err(|_| ())?;
-        for col in &table.columns {
-            if col.invisible {
-                continue;
-            }
+        for (_, col) in table.iter_select_columns() {
             parts.push(format!("{}.{}", q(visible), q(&col.name)));
         }
     }

@@ -36,7 +36,9 @@ pub const CATALOG_VERSION: u32 = 65;
 /// v33: sequence after-states and checkpoint coverage.
 /// v34: append-ordered source time on every frame; atomic system file batches.
 /// v35: transactional vector-index recovery batches.
-pub const WAL_VERSION: u32 = 35;
+/// v36: persistent spatial R-tree page batches.
+/// v37: transaction-linked spatial undo and compensation cursors.
+pub const WAL_VERSION: u32 = 37;
 /// v14: reduced-redo pages require an FPI before later physiological writes.
 pub const HEAP_PAGE_VERSION: u16 = 14;
 pub const MVCC_ROW_VERSION: u8 = 8;

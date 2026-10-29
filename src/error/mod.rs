@@ -239,6 +239,8 @@ pub(crate) enum InternalErrorKind {
     HashAggregateNeedsSpill,
     VectorHashJoinFallback,
     ReplicaPoisonFrame,
+    ReplicaApplyFailure,
+    ReplicaHandshakeRejected,
 }
 
 /// Error returned through the query engine and MySQL protocol.
@@ -254,6 +256,7 @@ pub struct QueryError {
     spec: Option<ErrorSpec>,
     diagnostic: Option<InternalDiagnostic>,
     internal_kind: Option<InternalErrorKind>,
+    condition_information: Option<std::sync::Arc<std::collections::BTreeMap<&'static str, String>>>,
 }
 
 impl QueryError {
@@ -265,6 +268,7 @@ impl QueryError {
             spec: Some(spec),
             diagnostic: None,
             internal_kind: None,
+            condition_information: None,
         }
     }
 
@@ -287,7 +291,24 @@ impl QueryError {
             spec: None,
             diagnostic: None,
             internal_kind: None,
+            condition_information: None,
         })
+    }
+
+    pub(crate) fn with_condition_information(
+        mut self,
+        information: std::collections::BTreeMap<&'static str, String>,
+    ) -> Self {
+        self.condition_information =
+            (!information.is_empty()).then(|| std::sync::Arc::new(information));
+        self
+    }
+
+    pub(crate) fn condition_information(&self) -> std::collections::BTreeMap<&'static str, String> {
+        self.condition_information
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn with_diagnostic(mut self, id: &'static str, detail: impl Into<String>) -> Self {
@@ -407,6 +428,7 @@ pub struct SqlCondition {
     sql_state: SqlState,
     symbol: Option<&'static str>,
     message: std::borrow::Cow<'static, str>,
+    condition_information: Option<std::sync::Arc<std::collections::BTreeMap<&'static str, String>>>,
 }
 
 impl SqlCondition {
@@ -417,6 +439,7 @@ impl SqlCondition {
             sql_state: spec.sql_state,
             symbol: Some(spec.symbol),
             message: std::borrow::Cow::Owned(message.into()),
+            condition_information: None,
         }
     }
 
@@ -429,6 +452,7 @@ impl SqlCondition {
             sql_state: spec.sql_state,
             symbol: Some(spec.symbol),
             message: std::borrow::Cow::Borrowed(message),
+            condition_information: None,
         }
     }
 
@@ -439,7 +463,22 @@ impl SqlCondition {
             sql_state: error.sql_state(),
             symbol: error.symbol(),
             message: std::borrow::Cow::Owned(error.message().to_string()),
+            condition_information: error.condition_information.clone(),
         }
+    }
+
+    pub(crate) fn condition_information(&self) -> std::collections::BTreeMap<&'static str, String> {
+        self.condition_information
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn information_item(&self, name: &str) -> Option<&str> {
+        self.condition_information
+            .as_ref()?
+            .get(name)
+            .map(String::as_str)
     }
 
     pub const fn level(&self) -> ConditionLevel {

@@ -52,6 +52,20 @@ pub fn set_global_redo_enabled(enabled: bool) {
 
 pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
+        SysVarDef::new("mydb_http_enabled", Scope::Global, DataType::Bool)
+            .without_persistence()
+            .with_doc("Enable HTTP SQL calls on this node; requires HTTP_ADMIN."),
+        |_| SysVarValue::Bool(crate::engine::http::enabled()),
+        |ctx: &mut WriteCtx<'_>, value: SysVarValue| {
+            let db = ctx.db.ok_or_else(|| {
+                crate::engine::http::error("ER_HTTP_DISABLED", "HTTP requires a storage database")
+            })?;
+            crate::engine::http::authorize(db, &ctx.session.authorization_context(), "HTTP_ADMIN")?;
+            crate::engine::http::set_enabled(value.as_bool().unwrap_or(false))
+        },
+    ));
+
+    reg.register(SysVar::settable(
         SysVarDef::new("mydb_ai_enabled", Scope::Global, DataType::Bool)
             .with_doc("Enable external AI calls on this node; requires AI_ADMIN."),
         |_| SysVarValue::Bool(crate::engine::ai::enabled()),

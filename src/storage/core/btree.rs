@@ -143,6 +143,7 @@ static BULK_INDEX_BUFFERED_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static BULK_INDEX_FAIL_BEFORE_META: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INDEX_TREE_PAGE_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -466,6 +467,7 @@ struct PreparedIndexInsert {
 
 #[derive(Debug)]
 pub(crate) struct IndexFile {
+    spatial: Option<Box<spatial_index::SpatialIndexFile>>,
     /// A pinned BUILDING handle records DML while its private tree is bulk loaded.
     online_build_log: Option<Arc<OnlineIndexBuildLog>>,
     path: PathBuf,
@@ -2687,7 +2689,11 @@ impl IndexFile {
         {
             return err;
         }
-        let marker = self.path.with_extension("idx.corrupt");
+        let marker = self.path.with_extension(if self.spatial.is_some() {
+            "rtree.corrupt"
+        } else {
+            "idx.corrupt"
+        });
         let persist = (|| -> std::io::Result<()> {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -2712,6 +2718,15 @@ impl IndexFile {
     }
 
     fn ensure_healthy(&self) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            if self.failed.load(Ordering::Acquire) {
+                return Err(error(
+                    crate::error::catalog::ER_INDEX_CORRUPT,
+                    "persistent spatial index corruption requires explicit repair",
+                ));
+            }
+            return spatial.healthy();
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -2836,6 +2851,9 @@ impl IndexFile {
         durability: DurabilityMode,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Self, QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            return Self::open_spatial(path, log, durability, buffer_pool, false);
+        }
         if durability != DurabilityMode::Memory {
             Self::check_rebuild_marker(&path)?;
         }
@@ -2943,8 +2961,64 @@ impl IndexFile {
             flush_on_drop: true,
             failed: AtomicBool::new(false),
             online_build_log: None,
+            spatial: None,
         }
         .initialize_meta_if_needed(initialized)?)
+    }
+
+    fn open_spatial(
+        path: PathBuf,
+        log: Arc<crate::wal::LogMutex>,
+        durability: DurabilityMode,
+        buffer_pool: Arc<BufferPool>,
+        create: bool,
+    ) -> Result<Self, QueryError> {
+        let spatial = spatial_index::SpatialIndexFile::open(
+            path.clone(),
+            log.clone(),
+            durability,
+            buffer_pool.clone(),
+            create,
+        )?;
+        let meta = IndexMeta {
+            root_page: 1,
+            next_page_id: 2,
+            free_page_head: None,
+        };
+        let meta_image = Vec::new();
+        let file_key = Arc::new(BufferPool::index_file_key(path.clone()));
+        let dirty = false;
+        let dirty_meta = false;
+        let rel_path = Self::compute_relative_path(&path);
+        let log_atomics = log.lock().state_atomics();
+        let root_page_atomic = AtomicU64::new(meta.root_page);
+        let (page_latches, page_latch_mask) = new_page_latch_array();
+        Ok(Self {
+            path,
+            file: parking_lot::Mutex::new(None),
+            log,
+            log_atomics,
+            durability,
+            root_page: root_page_atomic,
+            root_frame_hint: parking_lot::RwLock::new(std::sync::Weak::new()),
+            structure_lock: Arc::new(parking_lot::RwLock::new(())),
+            split_prepare: parking_lot::Mutex::new(()),
+            meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
+            file_key,
+            buffer_pool,
+            dirty_meta: AtomicBool::new(dirty_meta),
+            dirty: AtomicBool::new(dirty),
+            page_latches,
+            page_latch_mask,
+            mutation_generation: AtomicU64::new(0),
+            active_mutations: AtomicUsize::new(0),
+            order_stats_cache: parking_lot::Mutex::new(HashMap::new()),
+            rel_path,
+            flush_on_drop: true,
+            failed: AtomicBool::new(false),
+            online_build_log: None,
+            spatial: Some(Box::new(spatial)),
+        })
     }
 
     fn initialize_meta_if_needed(mut self, initialized: bool) -> Result<Self, QueryError> {
@@ -2999,10 +3073,14 @@ impl IndexFile {
     }
 
     fn validate(path: PathBuf) -> Result<(), QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            return spatial_index::SpatialIndexFile::quick_validate(path);
+        }
         Self::check_rebuild_marker(&path)?;
         let mut file = OpenOptions::new().read(true).open(path).map_err(io_err)?;
         let meta = decode_index_meta(&read_index_page(&mut file, INDEX_META_PAGE)?)?;
         validate_index_page_tree(&mut file, meta.root_page)?;
+        validate_index_freelist(&mut file, meta.free_page_head)?;
         Ok(())
     }
 
@@ -3010,6 +3088,9 @@ impl IndexFile {
     /// Read through the buffer pool so dirty pages and memory-only databases
     /// receive the same structural checks as persisted indexes.
     fn validate_structure(&self) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.validate();
+        }
         let meta = self.meta_state.lock().meta.clone();
         validate_index_tree(meta.root_page, meta.next_page_id, &mut |id| {
             self.read_page_with_intent(id, AccessIntent::Scan)
@@ -3018,6 +3099,9 @@ impl IndexFile {
     }
 
     fn quick_validate(path: PathBuf) -> Result<(), QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            return spatial_index::SpatialIndexFile::quick_validate(path);
+        }
         Self::check_rebuild_marker(&path)?;
         let mut file = OpenOptions::new().read(true).open(path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
@@ -3045,12 +3129,19 @@ impl IndexFile {
         rec_lsn: u64,
     ) -> Result<Self, QueryError> {
         Self::check_rebuild_marker(&path)?;
-        let buffer_pool = BufferPool::new(
+        // Each replay partition has one owner and already supplies file-level
+        // parallelism. Use synchronous eviction without speculative readers:
+        // background workers can retain this private pool after IndexFile drops,
+        // stranding raw-page charges before the live database pool is admitted.
+        let buffer_pool = BufferPool::new_with_options(
             DEFAULT_BUFFER_POOL_PAGES,
             log.clone(),
             DurabilityMode::Strict,
-            Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+            Duration::ZERO,
+            1,
+            0,
         );
+        buffer_pool.shutdown_flusher();
         let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
         if len > 0 && len < PAGE_SIZE as u64 {
@@ -3073,6 +3164,14 @@ impl IndexFile {
             set_page_lsn_if_formatted(&mut meta_image, rec_lsn);
             (meta, meta_image, true)
         };
+        if initialized {
+            // Logical redo is idempotent on a complete tree, not on a torn
+            // split/merge whose parent and leaf-chain views disagree. Validate
+            // before publishing any replay mutation; the caller fences failures
+            // and rebuilds the derived index from its authoritative heap.
+            validate_index_page_tree(&mut file, meta.root_page)?;
+            validate_index_freelist(&mut file, meta.free_page_head)?;
+        }
         // Data pages can reach disk before the allocation watermark in the
         // meta page. Reusing such a page ID during logical REDO overwrites a
         // live leaf/internal node and manufactures corruption. The physical
@@ -3156,6 +3255,7 @@ impl IndexFile {
             flush_on_drop: true,
             failed: AtomicBool::new(false),
             online_build_log: None,
+            spatial: None,
         })
     }
 
@@ -3166,6 +3266,15 @@ impl IndexFile {
         durability: DurabilityMode,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Self, QueryError> {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            let index = Self::open_spatial(path, log, durability, buffer_pool, true)?;
+            index
+                .spatial
+                .as_ref()
+                .unwrap()
+                .build_sorted(entries.into_iter().map(Ok))?;
+            return Ok(index);
+        }
         let _ = fs::remove_file(&path);
         let index = Self::open_rebuilt_with_durability(path, log, durability, buffer_pool)?;
         if entries.is_empty() {
@@ -3200,6 +3309,12 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<IndexEntry, QueryError>>,
     {
+        if path.extension().is_some_and(|e| e == "rtree") {
+            let index = Self::open_spatial(path, log, durability, buffer_pool, true)?;
+            index.spatial.as_ref().unwrap().build_sorted(entries)?;
+            return Ok(index);
+        }
+
         let _ = fs::remove_file(&path);
         let index = Self::open_rebuilt_with_durability(path, log, durability, buffer_pool)?;
         let started = Instant::now();
@@ -3489,6 +3604,7 @@ impl IndexFile {
             flush_on_drop: true,
             failed: AtomicBool::new(false),
             online_build_log: None,
+            spatial: None,
         })
     }
 
@@ -3573,6 +3689,16 @@ impl IndexFile {
     }
 
     fn insert_deferred(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(
+                txn_id,
+                [IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }],
+            );
+        }
         let entry = IndexEntry { key, row_id };
         // Always log via the compact logical `IndexBatch` record (one
         // op, ~24 bytes) and set `logical_wal_lsn` so the downstream
@@ -3605,6 +3731,9 @@ impl IndexFile {
         entries: Vec<(IndexKey, RowId)>,
         exclusive_handle: bool,
     ) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.insert_many(txn_id, entries);
+        }
         if entries.is_empty() {
             return Ok(());
         }
@@ -3650,6 +3779,9 @@ impl IndexFile {
         txn_id: u64,
         entries: Vec<IndexBatchEntry>,
     ) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(txn_id, entries);
+        }
         if let Some(log) = &self.online_build_log {
             log.record(entries);
             return Ok(());
@@ -3667,6 +3799,9 @@ impl IndexFile {
         entries: smallvec::SmallVec<[IndexBatchEntry; 2]>,
         payload: Option<WalPayload>,
     ) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(txn_id, entries);
+        }
         if let Some(log) = &self.online_build_log {
             log.record(entries);
             return Ok(());
@@ -3847,39 +3982,6 @@ impl IndexFile {
         self.apply_batch_with_lsn(txn_id, entries, Some(lsn))
     }
 
-    /// Native recovery can omit a complete logical batch when every routed
-    /// leaf's durable image already covers it. A page stamped at/above the
-    /// recovery ceiling was changed by this replay (normal logical writes use
-    /// next_lsn); it is not proof that later historical batches were applied.
-    /// Decide for the whole batch before any mutation, never per operation.
-    fn recovery_batch_already_persisted(
-        &self,
-        entries: &[IndexBatchEntry],
-        lsn: u64,
-        recovery_ceiling: u64,
-    ) -> Result<bool, QueryError> {
-        let _structure = self.structure_lock.read();
-        let mut path = smallvec::SmallVec::<[PinnedFrame; 4]>::new();
-        for entry in entries {
-            let target = IndexEntry {
-                key: entry.key.clone(),
-                row_id: entry.row_id,
-            };
-            let leaf = self.find_leaf_for_insert_cached(&target, &mut path)?;
-            if !leaf.with_index_raw_bytes(|bytes| {
-                let covered = page_lsn(bytes);
-                // open_for_recovery may synthesize an empty root stamped
-                // with this batch's LSN; that is not a durable-applied proof.
-                Ok(parse_leaf_payload_header(bytes)?.count != 0
-                    && covered >= lsn
-                    && covered < recovery_ceiling)
-            })? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     fn try_apply_two_op_update_batch_fast(
         &self,
         txn_id: u64,
@@ -4038,7 +4140,7 @@ impl IndexFile {
         }
         let root_page = self.root_page.load(Ordering::Acquire);
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(pinned) = pinned_leaf {
             if let Some(applied) =
                 self.buffer_pool
@@ -4192,7 +4294,7 @@ impl IndexFile {
         let root_page = self.root_page.load(Ordering::Acquire);
         let old_key = self.page_key(old_leaf_id);
         let new_key = self.page_key(new_leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self.buffer_pool.try_modify_two_raw_pages(
             &old_key,
             &new_key,
@@ -4369,10 +4471,9 @@ impl IndexFile {
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(lsn);
         let result = (|| {
-            // Memory durability has no logical WAL LSN, so
-            // `try_insert_leaf_in_place` deliberately declines. Keep its
-            // batch under the legacy single structural guard instead of
-            // taking and dropping that guard once per entry.
+            // Ordinary memory writes have no logical WAL LSN. Keep admission
+            // under one topology guard instead of acquiring it per entry;
+            // resident leaves can still use the in-place mutation path.
             if self.durability == DurabilityMode::Memory {
                 let _structure = self.structure_lock.write();
                 let _mutation = self.begin_mutation();
@@ -5927,9 +6028,25 @@ impl IndexFile {
 
     fn reserve_page_id(&self) -> Result<u64, QueryError> {
         let mut state = self.meta_state.lock();
+        self.extend_page_range(&mut state)
+    }
+
+    fn extend_page_range(&self, state: &mut IndexMetaState) -> Result<u64, QueryError> {
         let page_id = state.meta.next_page_id;
-        crate::storage::temp_quota::reserve_extent(&self.path, (page_id + 1) * PAGE_SIZE as u64)?;
-        state.meta.next_page_id += 1;
+        let next = page_id.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "index page range overflow",
+            )
+        })?;
+        let bytes = next.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "index page range overflow",
+            )
+        })?;
+        crate::storage::temp_quota::reserve_extent(&self.path, bytes)?;
+        state.meta.next_page_id = next;
         Ok(page_id)
     }
 
@@ -6149,11 +6266,9 @@ impl IndexFile {
         saved
     }
 
-    /// Returns true when an in-place lazy mutation of the leaf is
-    /// allowed: WAL is active, so the byte image isn't load-bearing for
-    /// crash recovery beyond the logical index record the caller is about to
-    /// emit. Mirrors the gate `write_page` uses to decide between the lazy
-    /// and physical page-image branches — kept in sync there.
+    /// Persistent in-place mutations require logical WAL coverage. Memory
+    /// durability has no crash-redo obligation and can modify the same
+    /// resident bytes without serializing a replacement page per entry.
     fn lazy_write_eligible(&self, page_id: u64) -> Result<bool, QueryError> {
         // Deferred index buffering runs with `current() == None` (the record's
         // LSN is unknown until the batched commit-time append), but the leaf is
@@ -6161,12 +6276,33 @@ impl IndexFile {
         // Without the `is_deferred()` escape the in-place fast path would be
         // disabled here, routing every deferred update onto the far heavier
         // read_leaf + `write_page`/`store_page_decoded_lazy` path (~2× slower,
-        // measured).
-        if btree_logical_wal::current().is_none() && !btree_logical_wal::is_deferred() {
+        // measured). Unlogged physical apply retains the source's page-image
+        // path even when its resident cache uses memory durability.
+        if (self.durability != DurabilityMode::Memory
+            || physical_wal_apply_active()
+            || self.log_atomics.physical_replica())
+            && btree_logical_wal::current().is_none()
+            && !btree_logical_wal::is_deferred()
+        {
             return Ok(false);
         }
         let _ = page_id;
         Ok(true)
+    }
+
+    fn lazy_mutation_lsn(&self) -> u64 {
+        if self.durability == DurabilityMode::Memory
+            && btree_logical_wal::current().is_none()
+            && !btree_logical_wal::is_deferred()
+            && !physical_wal_apply_active()
+            && !self.log_atomics.physical_replica()
+        {
+            0
+        } else {
+            // Explicit logical/replica replay retains its existing WAL anchor,
+            // including a memory-backed cache of the source's index pages.
+            self.log_atomics.next_lsn().max(1)
+        }
     }
 
     /// Fast path for `insert_internal`: try to insert `entry` directly
@@ -6179,7 +6315,7 @@ impl IndexFile {
     ///     the mutation was rolled back, caller must take the slow
     ///     take/clone/split path.
     ///   - `None` — frame isn't suitable (not cached / FPI needed /
-    ///     non-WAL); caller falls back to the slow path.
+    ///     unlogged persistent mutation); caller falls back to the slow path.
     fn try_insert_leaf_in_place(
         &self,
         txn_id: u64,
@@ -6190,7 +6326,7 @@ impl IndexFile {
             return Ok(None);
         }
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self
             .buffer_pool
             .try_modify_raw_page(&key, peek_lsn, |bytes| {
@@ -6271,7 +6407,7 @@ impl IndexFile {
         if !self.lazy_write_eligible(leaf_id)? {
             return Ok(None);
         }
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         // Reuse an existing packed image for point writes too, but only
         // real batches may create one. Fresh single-row workloads keep
         // their existing allocation-free encoded-page kernel.
@@ -6380,7 +6516,7 @@ impl IndexFile {
             return Ok(None);
         }
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self
             .buffer_pool
             .try_modify_raw_page(&key, peek_lsn, |bytes| {
@@ -6443,7 +6579,7 @@ impl IndexFile {
         }
         let is_root = leaf_id == root_page;
         let key = self.page_key(leaf_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) =
             self.buffer_pool
                 .try_modify_existing_packed_leaf(pinned, peek_lsn, |leaf| {
@@ -6793,10 +6929,23 @@ impl IndexFile {
     /// Used by `Database::index_page_count` to report real
     /// `INDEX_LENGTH` from `information_schema.tables`.
     pub(crate) fn page_count(&self) -> u64 {
+        if let Some(spatial) = &self.spatial {
+            return spatial.count_pages();
+        }
         self.meta_state.lock().meta.next_page_id
     }
 
     fn delete_deferred(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.apply(
+                txn_id,
+                [IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key,
+                    row_id,
+                }],
+            );
+        }
         let entry = IndexEntry { key, row_id };
         // Symmetric with `insert_deferred`: always log via `IndexBatch`
         // so we don't emit a 32 KB per-page before/after image for a
@@ -6907,6 +7056,9 @@ impl IndexFile {
     }
 
     fn get(&self, key: &IndexKey, dedup_row_ids: bool) -> Result<Vec<RowId>, QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.lookup(key);
+        }
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
         let mut rows = Vec::new();
@@ -8469,6 +8621,9 @@ impl IndexFile {
         txn_id: u64,
         entries: &[IndexBatchEntry],
     ) -> Result<Option<WalPayload>, QueryError> {
+        if self.spatial.is_some() {
+            return Ok(None);
+        }
         if self.durability == DurabilityMode::Memory {
             return Ok(None);
         }
@@ -8548,6 +8703,9 @@ impl IndexFile {
     }
 
     fn entries(&self) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.entries();
+        }
         let mut entries = Vec::new();
         let mut leaf_id = self.leftmost_leaf()?;
         loop {
@@ -8574,6 +8732,9 @@ impl IndexFile {
     }
 
     fn flush(&self) -> Result<(), QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.flush();
+        }
         #[cfg(test)]
         INDEX_FLUSH_TEST_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -8626,6 +8787,7 @@ impl IndexFile {
     }
 
     fn discard_without_flush(&mut self) {
+        self.spatial = None;
         self.dirty_meta.store(false, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         let _ = self.buffer_pool.discard_file(&self.file_key);
@@ -8972,6 +9134,7 @@ impl IndexFile {
     /// A discarded frame must be re-pinned even if its page id was recycled.
     /// Pins retain governed buffer frames; no page bytes or key vectors are
     /// copied, and the cache is bounded by this tree's current height.
+    #[cfg(test)]
     fn find_leaf_for_insert_cached<'a>(
         &self,
         entry: &IndexEntry,
@@ -9633,7 +9796,7 @@ impl IndexFile {
             ));
         }
         let key = self.page_key(parent_id);
-        let peek_lsn = self.log_atomics.next_lsn().max(1);
+        let peek_lsn = self.lazy_mutation_lsn();
         if let Some(result) = self
             .buffer_pool
             .try_modify_raw_page(&key, peek_lsn, |bytes| {
@@ -9807,6 +9970,9 @@ impl IndexFile {
     }
 
     fn is_empty(&self) -> Result<bool, QueryError> {
+        if let Some(spatial) = &self.spatial {
+            return spatial.is_empty();
+        }
         if self.online_build_log.is_some() {
             // LOAD DATA must use its incremental writer, never replace the
             // private tree being built by CREATE INDEX.
@@ -9857,13 +10023,7 @@ impl IndexFile {
                 // Lost the race — fall through to the extend branch.
             }
             let mut state = self.meta_state.lock();
-            let page_id = state.meta.next_page_id;
-            crate::storage::temp_quota::reserve_extent(
-                &self.path,
-                (page_id + 1) * PAGE_SIZE as u64,
-            )?;
-            state.meta.next_page_id += 1;
-            page_id
+            self.extend_page_range(&mut state)?
         };
         self.write_or_defer_meta_page(txn_id)?;
         Ok(page_id)
@@ -11681,6 +11841,8 @@ fn encode_layout_index_entry(
 }
 
 fn encode_index_tree_page(page: &IndexPage) -> Result<Vec<u8>, QueryError> {
+    #[cfg(test)]
+    INDEX_TREE_PAGE_ENCODINGS.with(|count| count.set(count.get() + 1));
     // v12: the per-page `page_table_id` field was always zero. v19
     // dropped it from the on-disk payload entirely; in-memory
     // `LeafPayloadHeader.page_table_id` is just a 0 placeholder kept
@@ -19607,6 +19769,30 @@ fn decode_validated_index_tree_page(buf: &[u8]) -> Result<IndexPage, QueryError>
     }
 }
 
+fn validate_index_freelist(file: &mut File, head: Option<u64>) -> Result<(), QueryError> {
+    let page_count = file.metadata().map_err(io_err)?.len() / PAGE_SIZE as u64;
+    let mut visited = HashSet::new();
+    let mut current = head;
+    while let Some(page_id) = current {
+        if page_id == INDEX_META_PAGE || page_id >= page_count || !visited.insert(page_id) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt index: invalid freelist link",
+            ));
+        }
+        current = match decode_index_tree_page(&read_index_page(file, page_id)?)? {
+            IndexPage::Free(page) => page.next_free,
+            _ => {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt index: freelist contains a live page",
+                ))
+            }
+        };
+    }
+    Ok(())
+}
+
 fn validate_index_page_tree(file: &mut File, root_page: u64) -> Result<(), QueryError> {
     let page_count = file.metadata().map_err(io_err)?.len() / PAGE_SIZE as u64;
     validate_index_tree(root_page, page_count, &mut |page_id| {
@@ -21719,6 +21905,9 @@ impl CompactChunkAccum {
     }
 }
 
+// A row ID consists of two checked fixed-width fields. Keep those checks
+// visible to the cursor so validated entry bounds eliminate redundant work.
+#[inline(always)]
 fn decode_row_id_v7_from(
     buf: &[u8],
     offset: &mut usize,

@@ -337,3 +337,68 @@ mod tests {
             .all(|spec| !(50000..=50999).contains(&spec.code.get())));
     }
 }
+
+pub const ER_HTTP_INVALID_ARGUMENT: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50100,
+    *b"22023",
+    "ER_HTTP_INVALID_ARGUMENT",
+);
+
+pub const ER_HTTP_ACCESS_DENIED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50101, *b"42000", "ER_HTTP_ACCESS_DENIED");
+
+pub const ER_HTTP_DISABLED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50102, *b"HY000", "ER_HTTP_DISABLED");
+
+pub const ER_HTTP_EGRESS_DENIED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50103, *b"42000", "ER_HTTP_EGRESS_DENIED");
+
+pub const ER_HTTP_BUDGET_EXCEEDED: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50104,
+    *b"HY000",
+    "ER_HTTP_BUDGET_EXCEEDED",
+);
+
+pub const ER_HTTP_QUEUE_FULL: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50105, *b"HY000", "ER_HTTP_QUEUE_FULL");
+
+pub const ER_HTTP_DNS: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50106, *b"HY000", "ER_HTTP_DNS");
+
+pub const ER_HTTP_CONNECT: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50107, *b"HY000", "ER_HTTP_CONNECT");
+
+pub const ER_HTTP_TLS: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50108, *b"HY000", "ER_HTTP_TLS");
+
+pub const ER_HTTP_TIMEOUT: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50109, *b"HY000", "ER_HTTP_TIMEOUT");
+
+pub const ER_HTTP_INVALID_RESPONSE: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50110,
+    *b"HY000",
+    "ER_HTTP_INVALID_RESPONSE",
+);
+
+pub const ER_HTTP_TRANSPORT: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50111, *b"HY000", "ER_HTTP_TRANSPORT");
+
+pub const ER_HTTP_UNSUPPORTED_CONTEXT: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50112,
+    *b"HY000",
+    "ER_HTTP_UNSUPPORTED_CONTEXT",
+);
+
+pub const ER_HTTP_REPLAY_FORBIDDEN: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50113,
+    *b"HY000",
+    "ER_HTTP_REPLAY_FORBIDDEN",
+);
+
+pub const ER_HTTP_RATE_LIMITED: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50114, *b"HY000", "ER_HTTP_RATE_LIMITED");

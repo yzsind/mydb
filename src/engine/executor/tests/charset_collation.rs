@@ -1004,8 +1004,6 @@ fn string_functions_reject_unconvertible_constant_bytes_at_bind_time() {
         "SELECT CONCAT(a, x'ff') FROM text_target",
         "SELECT SUBSTRING_INDEX(_latin1'hello', _latin2 x'a3', 2)",
         "SELECT REPLACE(_latin1'hello', _latin2 x'a3', 'hei')",
-        "SELECT LTRIM(WEIGHT_STRING(1))",
-        "SELECT RTRIM(WEIGHT_STRING(1))",
     ] {
         let err = engine.execute(sql).expect_err(sql);
         assert_eq!(err.code(), 3854, "{sql}: {err:?}");

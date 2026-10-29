@@ -887,26 +887,7 @@ fn reserve_chunk_workers(
 
 fn configure_chunk_worker_priority() {
     // Bulk checksums must yield CPU scheduling priority to request workers.
-    // These are best-effort hints; admission and correctness never depend on
-    // the operating system accepting a scheduling preference.
-    #[cfg(target_os = "macos")]
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        // Linux niceness is per thread. Use the explicit TID so this cannot
-        // lower the priority of the server's foreground request threads.
-        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
-    }
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-        };
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
+    crate::util::thread_priority::lower_current_thread_priority();
 }
 
 /// Share one bounded pool across capture, sealed-image hashing and verification.
@@ -1112,7 +1093,7 @@ fn read_stable_chunk_with(
     let page_bytes = crate::storage::PAGE_SIZE;
     let paged = matches!(
         path.extension().and_then(|value| value.to_str()),
-        Some("heap" | "idx" | "lob" | "ovf" | "hvec" | "zm")
+        Some("heap" | "idx" | "rtree" | "lob" | "ovf" | "hvec" | "zm")
     );
     // Compare bulk reads, retrying only pages changed by a concurrent writer.
     // Each accepted page still has two identical reads and a valid CRC.
@@ -1655,7 +1636,7 @@ fn sync_paths_parallel(paths: &[PathBuf]) -> Result<(), QueryError> {
             if let Some((device, file)) = synced {
                 if !devices.contains_key(&device) && devices.len() >= device_limit {
                     let (_, oldest) = devices.pop_first().expect("device batch is nonempty");
-                    File::sync_all(&oldest)
+                    crate::platform::fs::sync_full_file(&oldest)
                         .map_err(|err| io_err("sync backup device batch", err))?;
                 }
                 devices.insert(device, file);
@@ -1667,7 +1648,8 @@ fn sync_paths_parallel(paths: &[PathBuf]) -> Result<(), QueryError> {
         for file in devices.values() {
             // All file fsyncs in this group have completed. F_FULLFSYNC drains
             // each device once before the caller can publish or acknowledge.
-            File::sync_all(file).map_err(|err| io_err("sync backup device batch", err))?;
+            crate::platform::fs::sync_full_file(file)
+                .map_err(|err| io_err("sync backup device batch", err))?;
         }
         Ok(())
     })

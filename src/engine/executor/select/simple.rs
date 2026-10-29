@@ -1874,7 +1874,14 @@ fn compute_single_table_aggregate_value(
                         format!("Row {row} was cut by GROUP_CONCAT()"),
                     );
                 }
-                Value::String(out)
+                if crate::engine::expr::string_result_exceeds_packet(
+                    "group_concat",
+                    out.len() as u64,
+                ) {
+                    Value::Null
+                } else {
+                    Value::String(out)
+                }
             }
         }
         _ => return Ok(None),

@@ -85,6 +85,8 @@ const LOCKING_READ: StatementEffects = StatementEffects {
 pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
     use Statement as S;
     match statement {
+        S::AlterSystemReloadHttpConfig => READ_ONLY,
+        S::ShowHttpStatus => READ_ONLY,
         S::Ai(command) => {
             if matches!(command.action.as_str(), "show" | "show_create" | "reload") {
                 READ_ONLY

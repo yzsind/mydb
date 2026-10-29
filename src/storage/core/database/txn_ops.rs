@@ -23,21 +23,13 @@ pub(crate) enum LockingReadLockWatermark {
     Legacy(usize),
 }
 
-const ASYNC_ROW_LOCK_SIGNAL_SHARDS: usize = 64;
 
 /// Undo records one purge lock round plans and removes. Rounds keep each
 /// undo-lock hold in the tens of microseconds, so DML undo publication never
-/// queues behind a whole purge batch.
-const UNDO_PURGE_ROUND_RECORDS: usize = 256;
-
-#[inline]
-fn async_row_lock_signal_shard(table_id: u64, row_id: RowId) -> usize {
-    let mut hash = table_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    hash ^= (row_id.page_id as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
-    hash ^= (row_id.slot_id as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
-    hash ^= hash >> 29;
-    hash as usize & (ASYNC_ROW_LOCK_SIGNAL_SHARDS - 1)
-}
+/// queues behind a whole purge batch. Measured under concurrent TPC-C, 256
+/// records held the write latch ~160 us on average (up to ~3 ms) and the
+/// planning read latch ~130 us, stalling every publisher meanwhile.
+const UNDO_PURGE_ROUND_RECORDS: usize = 64;
 
 /// A commit whose MVCC state and WAL record have been published, but whose
 /// durability barrier and post-durable hooks are intentionally deferred.
@@ -51,6 +43,8 @@ fn async_row_lock_signal_shard(table_id: u64, row_id: RowId) -> usize {
 /// finishes a one-element batch.
 #[must_use = "a published commit must be passed to Database::finish_deferred_commits"]
 pub(crate) struct DeferredCommit {
+    pub(crate) logical_apply_lease:
+        Option<parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
     _backup_feedback: Option<crate::storage::capture::CommitSample>,
     txn_id: u64,
     commit_scn: u64,
@@ -1631,7 +1625,7 @@ impl Database {
         if self.lock_wait_waiters.load(Ordering::SeqCst) != 0 {
             self.lock_wait_signal.notify_all();
         }
-        let async_waiters = self.row_lock_async_waiters.load(Ordering::Acquire) != 0;
+        let async_waiters = self.row_lock_async_registry.has_waiters();
         if row_lock_direct_wake_enabled() {
             let parked_row_waiters = self.row_lock_waiters.load(Ordering::SeqCst) != 0;
             let direct_waiters = parked_row_waiters || self.row_lock_parkers.active_count() != 0;
@@ -1643,7 +1637,7 @@ impl Database {
                 return;
             }
             if async_waiters {
-                self.notify_async_row_lock_shards(&rows);
+                self.notify_async_row_lock_waiters(&rows);
             }
             if !direct_waiters {
                 return;
@@ -1684,7 +1678,7 @@ impl Database {
                 return;
             }
             if async_waiters {
-                self.notify_async_row_lock_shards(&rows);
+                self.notify_async_row_lock_waiters(&rows);
             }
             if !row_waiters {
                 return;
@@ -1694,32 +1688,62 @@ impl Database {
         }
     }
 
-    fn notify_async_row_lock_shards(&self, rows: &[(u64, RowId)]) {
-        let mut notified = [false; ASYNC_ROW_LOCK_SIGNAL_SHARDS];
-        for &(table_id, row_id) in rows {
-            let shard = async_row_lock_signal_shard(table_id, row_id);
-            if notified[shard] {
-                continue;
-            }
-            let signal = &self.row_lock_async_signals[shard];
-            if signal.receiver_count() != 0 {
-                signal.send_modify(|generation| *generation = generation.wrapping_add(1));
-                notified[shard] = true;
-            }
+    fn notify_async_row_lock_waiters(&self, rows: &[(u64, RowId)]) {
+        let mut fronts = Vec::new();
+        self.row_locks_sharded
+            .collect_front_row_waiters(rows, &mut fronts);
+        for txn in fronts {
+            self.row_lock_async_registry.notify(txn);
         }
     }
 
     pub(crate) fn subscribe_row_lock_async_signal(
         &self,
         target: crate::storage::NonblockingRowWaitTarget,
-    ) -> crate::engine::api::AsyncRowLockSignal {
-        let receiver = self.row_lock_async_signals
-            [async_row_lock_signal_shard(target.table_id, target.row_id)]
-        .subscribe();
-        crate::engine::api::AsyncRowLockSignal::new(
-            receiver,
-            target.observed_generation,
-            Arc::clone(&self.row_lock_async_waiters),
+    ) -> Option<crate::engine::api::AsyncRowLockSignal> {
+        if !row_lock_sharding_enabled() {
+            return None;
+        }
+        match self.row_locks_sharded.enqueue_async_wait(
+            target.txn_id,
+            target.table_id,
+            target.row_id,
+            target.mode,
+        ) {
+            RowAcquireOutcome::Acquired { cleared_wait } => {
+                if cleared_wait {
+                    self.lock_manager().clear_wait(target.txn_id);
+                }
+            }
+            RowAcquireOutcome::Conflict { owners } => {
+                let result = self.lock_manager().record_row_lock_wait(
+                    target.txn_id,
+                    owners,
+                    target.table_id,
+                    target.row_id,
+                    target.mode,
+                );
+                if result
+                    .as_ref()
+                    .is_err_and(|err| !is_lock_wait_pending_error(err))
+                {
+                    self.clear_blocking_lock_wait(target.txn_id);
+                    return None;
+                }
+            }
+        }
+        Some(self.row_lock_async_registry.register(target))
+    }
+
+    pub(crate) fn async_row_lock_ready(
+        &self,
+        target: crate::storage::NonblockingRowWaitTarget,
+    ) -> bool {
+        !self.row_locks_sharded.still_blocked(
+            target.txn_id,
+            target.table_id,
+            target.row_id,
+            target.mode,
         )
     }
 
@@ -1736,15 +1760,14 @@ impl Database {
         mode: LockMode,
     ) -> Result<(), QueryError> {
         if crate::storage::txn::lock_waits_nonblocking() {
-            let signal_shard = async_row_lock_signal_shard(table_id, row_id);
-            let observed_generation = *self.row_lock_async_signals[signal_shard].borrow();
             if self.try_row_lock_without_wait(txn_id, table_id, row_id, mode)? {
                 return Ok(());
             }
             crate::storage::txn::record_nonblocking_row_wait_target(
+                txn_id,
                 table_id,
                 row_id,
-                observed_generation,
+                mode,
             );
             return Err(crate::storage::txn::lock_would_block_error());
         }
@@ -1830,6 +1853,28 @@ impl Database {
         Ok(())
     }
 
+    /// Non-blocking point probe for another transaction's reservation of a
+    /// unique key. A table without any reservation skips the lock-manager
+    /// latch; otherwise the exact latched check decides.
+    pub(crate) fn check_unique_key_reservation(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<(), QueryError> {
+        if !self.unique_reservations.may_reserve_key(txn_id, table_id, index_name, key) {
+            return Ok(());
+        }
+        self.lock_manager().check_unique_key_lock(
+            txn_id,
+            table_id,
+            index_name,
+            key,
+            &self.lock_owner_status(),
+        )
+    }
+
     pub fn check_unique_key_lock_blocking(
         &self,
         txn_id: u64,
@@ -1838,6 +1883,10 @@ impl Database {
         key: &IndexKey,
     ) -> Result<bool, QueryError> {
         crate::engine::cancel::check_cancelled()?;
+        // No reservation on the table: nothing to wait for, and no latch.
+        if !self.unique_reservations.may_reserve_key(txn_id, table_id, index_name, key) {
+            return Ok(false);
+        }
         if self.lock_manager_read().unique_key_uncontended(
             txn_id,
             table_id,
@@ -1941,11 +1990,15 @@ impl Database {
     }
 
     fn clear_blocking_lock_wait(&self, txn_id: u64) {
-        if row_lock_sharding_enabled() {
-            self.row_locks_sharded.clear_wait(txn_id);
-        }
+        let row = row_lock_sharding_enabled()
+            .then(|| self.row_locks_sharded.clear_wait_row(txn_id))
+            .flatten();
         self.lock_manager().clear_wait(txn_id);
-        self.notify_lock_waiters();
+        if let Some(row) = row {
+            self.notify_lock_waiters_for_rows(std::iter::once(row));
+        } else {
+            self.notify_lock_waiters();
+        }
     }
 
     fn wait_for_specific_row(
@@ -2817,6 +2870,7 @@ impl Database {
             end_txn_redo_policy(&self.log, txn_id);
             self.table_locks_sharded.release_txn(txn_id);
             return Ok(DeferredCommit {
+                logical_apply_lease: None,
                 _backup_feedback: None,
                 txn_id,
                 commit_scn: 0,
@@ -3056,6 +3110,7 @@ impl Database {
         };
         self.notify_lock_waiters_for_rows(released);
         Ok(DeferredCommit {
+            logical_apply_lease: None,
             _backup_feedback: backup_feedback,
             txn_id,
             commit_scn,
@@ -3118,7 +3173,7 @@ impl Database {
         }
 
         for commit in commits.iter_mut() {
-            let Some(commit_lsn) = commit.commit_lsn else {
+            let Some(_commit_lsn) = commit.commit_lsn else {
                 commit.finished = true;
                 continue;
             };
@@ -3136,7 +3191,7 @@ impl Database {
                 self.notify_non_row_lock_waiters();
                 return Err(err);
             }
-            crate::repl::after_local_commit_durable(commit_lsn);
+
             if commit.temporal_enabled {
                 let ledger = self.persist_temporal_commit(
                     commit.txn_id,
@@ -3164,9 +3219,6 @@ impl Database {
             if let Some(token) = commit.temporal_persist.take() {
                 token.complete();
             }
-            if let Some((ref file, end_pos)) = commit.binlog_semi_sync_target {
-                crate::binlog::semi_sync_wait_after_commit(file, end_pos);
-            }
             self.publish_pending_live_row_deltas(commit.txn_id);
             self.maybe_gc_after_commit();
             end_txn_redo_policy(&self.log, commit.txn_id);
@@ -3183,6 +3235,14 @@ impl Database {
             self.table_locks_sharded.release_txn(commit.txn_id);
         }
         self.notify_non_row_lock_waiters();
+        for commit in commits.iter() {
+            if let Some(commit_lsn) = commit.commit_lsn {
+                crate::repl::after_local_commit_durable(commit_lsn);
+            }
+            if let Some((ref file, end_pos)) = commit.binlog_semi_sync_target {
+                crate::binlog::semi_sync_wait_after_commit(file, end_pos);
+            }
+        }
         if let Some((txn_id, err)) = commits.iter_mut().find_map(|commit| {
             commit.index_error.take().map(|err| (commit.txn_id, err))
         }) {
@@ -3506,8 +3566,8 @@ impl Database {
     ///
     /// The WAL write buffer is enabled for relaxed (see `facade.rs`), so
     /// appends only `memcpy` frames into the 256 KiB buffer under the log
-    /// mutex — cheap. This barrier then routes through the SAME group-commit
-    /// coordinator as strict, so a batch of N committers does ~one coalesced
+    /// mutex — cheap. A separate coordinator uses the same batching algorithm
+    /// as strict without sharing its fsync watermark. N committers do one coalesced
     /// `write()` instead of one-per-frame. That is what makes relaxed faster
     /// than strict again: identical batching, minus the fsync.
     ///
@@ -3521,7 +3581,7 @@ impl Database {
     fn flush_commit_lsn(&self, lsn: u64) -> Result<(), QueryError> {
         let target = self.current_group_commit_target();
         let (window, adaptive) = self.group_commit_window_and_adaptive();
-        self.group_commit
+        self.flush_group_commit
             .sync_lsn_with(lsn, window, target, adaptive, |sync_lsn| {
                 // `prepare_sync_to` drains `pending_write_bytes` to the fd
                 // (a coalesced write into the OS page cache) and returns the
@@ -3572,9 +3632,9 @@ impl Database {
         let result = (|| -> Result<Option<(u64, u64)>, QueryError> {
             #[cfg(test)]
             if FAIL_TXN_WAL_BUFFER_FLUSH.with(|fail| fail.replace(false)) {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "injected transaction WAL flush failure",
+                return Err(crate::util::io_error::map_io_error(
+                    "transaction WAL flush",
+                    std::io::Error::other("injected transaction WAL flush failure"),
                 ));
             }
             let mut finalize: Vec<(PageKey, u64)> = Vec::with_capacity(entries.len());
@@ -3680,6 +3740,11 @@ impl Database {
         match result {
             Ok(lsn) => Ok(lsn),
             Err(err) => {
+                if let Some(detail) = err.diagnostic_detail() {
+                    crate::util::logging::log_message(format_args!(
+                        "transaction {txn_id} WAL append failure diagnostic: {detail}"
+                    ));
+                }
                 self.quarantine_mvcc(format!(
                     "transaction {txn_id} WAL append failed: {}; restart recovery required",
                     err.message()
@@ -4286,7 +4351,9 @@ impl Database {
         })?;
         let applied_lsn = self.replica_applied_lsn_atomic.load(Ordering::Acquire);
         let wal_durable_lsn = self.log.lock().durable_lsn();
-        let mut restart_lsn = applied_lsn.min(wal_durable_lsn);
+        let persisted = crate::repl::replica::progress::load_progress(&self.data_dir)
+            .map_err(io_err)?.map(|p| p.durable_applied_lsn).unwrap_or(0);
+        let mut restart_lsn = applied_lsn.min(wal_durable_lsn).min(persisted);
         // Keep every streamed in-flight BEGIN, including transactions whose
         // first write has not arrived yet. Data-file durability alone cannot
         // reconstruct their MVCC identity after restart.
@@ -4681,7 +4748,10 @@ impl Database {
         } else {
             buffer_stats.hits.saturating_mul(100) / buffer_accesses
         };
-        let group_commit_stats = self.group_commit.stats();
+        let group_commit_stats = self
+            .group_commit
+            .stats()
+            .combined(self.flush_group_commit.stats());
         let durability_worker_enabled = crate::storage::txn::durability_worker_enabled();
         let durability_stats = self.durability_worker.stats();
         let effective_batches = if durability_worker_enabled {
@@ -6025,7 +6095,7 @@ impl Database {
         if row_lock_sharding_enabled() {
             LockingReadLockWatermark::Sharded(self.row_locks_sharded.row_log_len(txn_id))
         } else {
-            LockingReadLockWatermark::Legacy(self.lock_manager_read().lock_log_len(txn_id))
+            LockingReadLockWatermark::Legacy(self.lock_log_presence.len(txn_id))
         }
     }
 
@@ -6050,7 +6120,9 @@ impl Database {
         &self,
         txn_id: u64,
     ) -> Result<StatementSavepoint, QueryError> {
-        let lock_log_len = self.lock_manager_read().lock_log_len(txn_id);
+        // Most statements start in a transaction without unique/range
+        // reservations; prove that lock-free instead of taking the latch.
+        let lock_log_len = self.lock_log_presence.len(txn_id);
         let row_log_len = if row_lock_sharding_enabled() {
             self.row_locks_sharded.row_log_len(txn_id)
         } else {
@@ -6261,7 +6333,10 @@ impl Database {
             drop(lm);
             if row_lock_sharding_enabled() {
                 if clear_wait {
-                    lock_state_changed |= self.row_locks_sharded.clear_wait_with_change(txn_id);
+                    if let Some(row) = self.row_locks_sharded.clear_wait_row(txn_id) {
+                        lock_state_changed = true;
+                        released.push(row);
+                    }
                 }
                 released.extend(
                     self.row_locks_sharded
@@ -6340,11 +6415,15 @@ impl Database {
     }
 
     pub fn clear_txn_wait(&self, txn_id: u64) -> Result<(), QueryError> {
-        if row_lock_sharding_enabled() {
-            self.row_locks_sharded.clear_wait(txn_id);
-        }
+        let row = row_lock_sharding_enabled()
+            .then(|| self.row_locks_sharded.clear_wait_row(txn_id))
+            .flatten();
         self.lock_manager().clear_wait(txn_id);
-        self.notify_lock_waiters();
+        if let Some(row) = row {
+            self.notify_lock_waiters_for_rows(std::iter::once(row));
+        } else {
+            self.notify_lock_waiters();
+        }
         Ok(())
     }
 
@@ -6830,7 +6909,7 @@ fn collect_prepared_locks(
     };
     let mut out = Vec::with_capacity(log.len());
     let mut rows = HashSet::new();
-    for held in log {
+    for held in log.iter() {
         match held {
             HeldLock::Row(table_id, row_id) | HeldLock::RowMode(table_id, row_id, _) => {
                 rows.insert((*table_id, *row_id));
@@ -6893,4 +6972,26 @@ fn collect_prepared_locks(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod transaction_audit_tests {
+    use super::*;
+
+    #[test]
+    fn txn_audit_relaxed_flush_cannot_satisfy_strict_barrier() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Relaxed).unwrap();
+        db.buffer_pool.shutdown_flusher();
+        let txn = db.begin_txn().unwrap();
+        let lsn = db.log.lock().append(txn.txn_id, WalPayload::EndTxn).unwrap();
+        db.flush_commit_lsn(lsn).unwrap();
+        assert!(db.log.lock().durable_lsn() < lsn);
+        db.sync_commit_lsn(lsn).unwrap();
+        assert!(
+            db.log.lock().durable_lsn() >= lsn,
+            "strict barrier must fsync a previously flushed LSN"
+        );
+    }
 }

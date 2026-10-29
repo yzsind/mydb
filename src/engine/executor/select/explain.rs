@@ -25,6 +25,79 @@ fn is_source_free_select(select: &Select) -> bool {
         && select.joins.is_empty()
 }
 
+fn explain_source_free_select(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    registry: &SessionRegistry,
+    select: &Select,
+    format: ExplainFormat,
+    analyze: bool,
+) -> Result<QueryResponse, QueryError> {
+    let actual = if analyze {
+        let (txn, _snapshot_guard) = read_view_for_analyze(db, session)?;
+        let started = std::time::Instant::now();
+        // Source-free SELECTs still have runtime expressions, aggregates and
+        // subqueries. Use the ordinary executor and drain deferred results
+        // while the transaction's read view is pinned.
+        let response = if super::super::dispatch::select_has_window_functions(select) {
+            super::super::dispatch::execute_windowed_select(db, txn, select.clone(), registry)?
+        } else {
+            super::execute_select(db, txn, select.clone(), registry)?
+        };
+        let rows = count_response_rows(response)?;
+        Some((rows, started.elapsed().as_secs_f64() * 1000.0))
+    } else {
+        None
+    };
+    if matches!(format, ExplainFormat::Traditional) {
+        let QueryResponse::ResultSet(mut result) = explain_no_tables_used_result() else {
+            unreachable!();
+        };
+        if let Some((rows, ms)) = actual {
+            result.columns = explain_analyze_result_columns();
+            result.rows[0].extend([
+                Value::Double(rows as f64),
+                Value::Int(1),
+                Value::Double(ms),
+                Value::Double(ms),
+                Value::Int(rows as i64),
+            ]);
+        }
+        return Ok(QueryResponse::ResultSet(result));
+    }
+    let text = match format {
+        ExplainFormat::Tree => {
+            let mut text = "-> Rows fetched before execution (cost=0.00 rows=1)".to_string();
+            if let Some((rows, ms)) = actual {
+                text.push_str(&format!(
+                    " (actual time={ms:.3}..{ms:.3} rows={rows} loops=1)"
+                ));
+            }
+            text
+        }
+        ExplainFormat::Json => {
+            if let Some((rows, ms)) = actual {
+                serde_json::json!({"query_block":{
+                    "select_id":1,"message":"No tables used",
+                    "execution":{"rows_total":rows,"wall_time_ms":ms}
+                }})
+                .to_string()
+            } else {
+                r#"{"query_block":{"select_id":1,"message":"No tables used"}}"#.to_string()
+            }
+        }
+        ExplainFormat::Traditional => unreachable!(),
+    };
+    Ok(QueryResponse::ResultSet(ResultSet {
+        columns: vec![Column {
+            source: Default::default(),
+            name: "EXPLAIN".to_string(),
+            column_type: ColumnType::VarString,
+        }],
+        rows: vec![vec![Value::String(text)]],
+    }))
+}
+
 fn explain_no_tables_used_result() -> QueryResponse {
     QueryResponse::ResultSet(ResultSet {
         columns: planner::explain_result_columns(),
@@ -253,6 +326,9 @@ pub(in crate::engine::executor) fn execute_explain(
     prepare_select_for_planning(db, &mut select)?;
     if matches!(format, ExplainFormat::Tree | ExplainFormat::Json) {
         return execute_explain_formatted(db, session, registry, &select, format, analyze);
+    }
+    if analyze && is_source_free_select(&select) {
+        return explain_source_free_select(db, session, registry, &select, format, analyze);
     }
     if select_has_window_in_projection(&select) {
         return explain_select_with_window(db, &select);
@@ -816,6 +892,7 @@ fn run_with_body_for_analyze<'q>(
 fn count_response_rows(response: QueryResponse) -> Result<u64, QueryError> {
     Ok(match response {
         QueryResponse::ResultSet(rs) => rs.rows.len() as u64,
+        QueryResponse::SharedResultSet(rs) => rs.rows.len() as u64,
         QueryResponse::StreamingResultSet(mut srs) => {
             let mut count = 0u64;
             while srs.cursor.next_row()?.is_some() {
@@ -2728,6 +2805,7 @@ fn expr_is_nondeterministic(expr: &Expr) -> bool {
                         | "__SET_USER_VAR"
                 );
                 volatile
+                    || crate::engine::expr::function_has_external_effect(name)
                     || crate::engine::expr_type::builtin_spec(name).is_some_and(|spec| {
                         spec.volatility == crate::engine::expr_type::Volatility::Volatile
                     })
@@ -2947,23 +3025,7 @@ fn execute_explain_formatted(
         select
     };
     if is_source_free_select(select) {
-        let text = match format {
-            ExplainFormat::Tree => {
-                "-> Rows fetched before execution (cost=0.00 rows=1)".to_string()
-            }
-            ExplainFormat::Json => {
-                r#"{"query_block":{"select_id":1,"message":"No tables used"}}"#.to_string()
-            }
-            ExplainFormat::Traditional => unreachable!("traditional routed away"),
-        };
-        return Ok(QueryResponse::ResultSet(ResultSet {
-            columns: vec![Column {
-                source: Default::default(),
-                name: "EXPLAIN".to_string(),
-                column_type: ColumnType::VarString,
-            }],
-            rows: vec![vec![Value::String(text)]],
-        }));
+        return explain_source_free_select(db, session, registry, select, format, analyze);
     }
     if select_has_window_in_projection(select) {
         if analyze {
@@ -4051,7 +4113,7 @@ fn format_plan_tree_nodes(
                 idx = index.name
             );
             let window = match query_probe {
-                planner::SpatialProbe::Constant(query_mbr) => format!(
+                planner::SpatialProbe::Constant { mbr: query_mbr, .. } => format!(
                     "({:.6} {:.6}, {:.6} {:.6})",
                     query_mbr[0], query_mbr[1], query_mbr[2], query_mbr[3]
                 ),

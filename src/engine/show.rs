@@ -264,7 +264,17 @@ pub(crate) fn show_columns(
                             | DataTypeKind::Text { .. }
                             | DataTypeKind::Enum { .. }
                             | DataTypeKind::Set { .. } => {
-                                Value::String(crate::charset::DEFAULT_COLLATION.to_string())
+                                Value::String(column.collation.clone().unwrap_or_else(|| {
+                                    column
+                                        .charset
+                                        .as_deref()
+                                        .and_then(|charset| {
+                                            crate::charset::default_collation_for_charset(charset)
+                                                .ok()
+                                        })
+                                        .unwrap_or(crate::charset::DEFAULT_COLLATION)
+                                        .to_string()
+                                }))
                             }
                             _ => Value::Null,
                         })
@@ -4687,6 +4697,13 @@ pub(crate) fn show_create_user_result(
     account: &AccountKey,
 ) -> Result<QueryResponse, QueryError> {
     let auth = db.auth_catalog();
+    show_create_user_from_catalog(&auth, account)
+}
+
+pub(crate) fn show_create_user_from_catalog(
+    auth: &crate::engine::auth::AuthCatalog,
+    account: &AccountKey,
+) -> Result<QueryResponse, QueryError> {
     let Some(user) = auth.accounts.get(&crate::engine::auth::account_id(account)) else {
         return Err(crate::storage::error(
             crate::error::catalog::ER_CANNOT_USER,

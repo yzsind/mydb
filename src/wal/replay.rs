@@ -608,7 +608,9 @@ impl ReplayRecords {
 fn type_has_redo_path(ty: WalRecordType) -> bool {
     matches!(
         ty,
-        WalRecordType::VectorIndexManifest
+        WalRecordType::SpatialIndexUndo
+            | WalRecordType::SpatialPageBatch
+            | WalRecordType::VectorIndexManifest
             | WalRecordType::VectorIndexImage
             | WalRecordType::FileClr
             | WalRecordType::FileCreate
@@ -648,6 +650,8 @@ fn payload_redo_path(payload: &WalPayload) -> Option<&str> {
         | WalPayload::HeapUpdateLogical { path, .. }
         | WalPayload::HeapDelete { path, .. }
         | WalPayload::SlotReclaim { path, .. }
+        | WalPayload::SpatialIndexUndo { path, .. }
+        | WalPayload::SpatialPageBatch { path, .. }
         | WalPayload::IndexBatch { path, .. }
         | WalPayload::Clr { path, .. } => Some(path),
         _ => None,

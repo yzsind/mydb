@@ -22,6 +22,7 @@ use crate::types::QueryError;
 /// The component's canonical URN, plus the bare name people also type.
 pub const COMPONENT_URN: &str = "file://component_validate_password";
 
+#[cfg(test)]
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 // 0 = LOW, 1 = MEDIUM, 2 = STRONG. MySQL default MEDIUM.
 static POLICY: AtomicU64 = AtomicU64::new(1);
@@ -31,10 +32,12 @@ static NUMBER_COUNT: AtomicU64 = AtomicU64::new(1);
 static SPECIAL_CHAR_COUNT: AtomicU64 = AtomicU64::new(1);
 static CHECK_USER_NAME: AtomicBool = AtomicBool::new(true);
 
+#[cfg(test)]
 pub fn is_installed() -> bool {
     INSTALLED.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
 pub fn set_installed(on: bool) {
     INSTALLED.store(on, Ordering::Relaxed);
 }
@@ -159,8 +162,17 @@ fn too_weak() -> QueryError {
 /// Enforce the active policy on a plaintext `password`. No-op (Ok) when the
 /// component is not installed. `user_name` feeds the `check_user_name` rule
 /// (a password equal to the account's user name is rejected).
+#[cfg(test)]
 pub fn validate(password: &str, user_name: Option<&str>) -> Result<(), QueryError> {
-    if !is_installed() {
+    validate_with_installation(is_installed(), password, user_name)
+}
+
+pub(crate) fn validate_with_installation(
+    installed: bool,
+    password: &str,
+    user_name: Option<&str>,
+) -> Result<(), QueryError> {
+    if !installed {
         return Ok(());
     }
     // LOW and up: minimum length.

@@ -183,6 +183,12 @@ necessary fallbacks, and pre-commit fsync overhead. `strict` mode provides the
 full commit crash-recovery guarantee; `relaxed`/`memory` still inherit their
 respective weaker durability semantics.
 
+External XA coordinators that require durable PREPARE acknowledgements must use
+`durability=strict`. In `relaxed` mode, XA PREPARE drains WAL to the OS page cache
+but does not require fsync; a power loss can erase an acknowledged prepare.
+`memory` mode does not persist XA prepare decisions. Enabling binlog does not
+upgrade the XA PREPARE barrier to strict durability.
+
 The durability boundary of `strict` is the successful return of `COMMIT` (or an
 autocommit write statement). For group commit, the engine first publishes
 in-memory transaction state and releases row locks, then completes the WAL flush,
@@ -963,6 +969,12 @@ than the WAL's committed references. This protects against silently losing
 transactions or publishing an incomplete history to replicas, including
 tail-loss scenarios with `sync_binlog=0`; emptying the binlog directory cannot be
 relied on to preserve the original replication continuity.
+For `sync_binlog=0` or values greater than `1`, a power loss may therefore require
+operator recovery before startup succeeds. Preserve the data, WAL, and binlog
+files; restore a mutually consistent backup and rebuild downstream replication
+when the missing binlog history cannot be recovered. Do not delete or truncate
+binlogs to bypass the check. Use `sync_binlog=1` to require a synchronized binlog
+commit group before acknowledgement.
 
 Binlog status, heartbeat positions, and persisted publication boundaries exclude
 staged transactions. A consistent snapshot saves the file position and GTID set
@@ -982,8 +994,9 @@ send `COM_REGISTER_SLAVE`. Unrecoverable append/publication failures stop
 subsequent binlog commits and wake ordering waiters with an error; restart
 reconciles the surviving history against WAL.
 
-mydb→mydb native physical replication uses a separate protocol v2. The default
-listener is `127.0.0.1:3316`; non-loopback requires mTLS. See
+mydb→mydb native physical replication uses a separate protocol v3. The default
+listener is `127.0.0.1:3316`; both peers require the same
+`MYDB_REPL_AUTH_TOKEN` (16–4096 bytes), and non-loopback requires mTLS. See
 [`native-replication.md`](native-replication.md) for configuration, watermarks,
 base backup, and manual controlled switchover procedures.
 
@@ -1067,6 +1080,11 @@ summaries whose trusted state was revoked do not become trusted again by
 replaying increments.
 
 Recovery time depends on the volume of WAL, data pages, and index repairs.
+Recovery also requires writable disk headroom for REDO and UNDO. If startup
+reports `No space left on device`, free space outside the database's data/WAL
+files and retry startup. Do not delete database files or expose an incompletely
+recovered directory for reads; a failed startup does not mean committed data
+has been lost.
 `MYDB_MEMORY_TARGET` is a working-set target; system-level hard limits should still be set through
 cgroups or the like, and it must not be taken as a guarantee that any historical
 WAL can be recovered within a fixed amount of memory.
@@ -1132,6 +1150,14 @@ or other writes; it is recommended to be owned by the service account with mode
 
 ### Shutdown, Corruption Recovery, and Replication Initialization
 
+`KILL CONNECTION` closes a connection even while it is waiting for LOCAL INFILE
+data. Canceling a LOCAL upload also rolls back the incomplete statement; an
+interrupted upload may close the connection because a partially received frame
+cannot safely become the next SQL command. During result transmission,
+`KILL QUERY` completes the current frame before reporting interruption. If the
+client stops reading, `net_write_timeout` bounds that wait; `KILL CONNECTION`
+can close immediately.
+
 - `SIGINT`, `SIGTERM`, SQL `SHUTDOWN`, and `RESTART` all perform a controlled
   shutdown; `SIGHUP` does not trigger shutdown. If the final checkpoint fails, the
   process exits non-zero and `RESTART` does not exec a new image. An SQL OK only
@@ -1170,6 +1196,11 @@ or other writes; it is recommended to be owned by the service account with mode
   `*.log.force-recover-<pid>-<offset>.bak` in the same directory before
   truncating and logging the discarded byte range. This option cannot recover
   already-corrupted transactions and is not suitable for permanent configuration.
+  During crash recovery it also permits a missing undo predecessor to terminate
+  that transaction's undo chain after the retained suffix has been undone. A
+  warning identifies the transaction and missing LSN; changes in missing history
+  cannot be verified or undone. Transaction mismatches and non-backward undo
+  links remain fatal. Backup restore does not permit this undo salvage mode.
 - A corrupted `role.json` refuses startup by default and reports the path.
   Restoring a trusted backup is preferred; explicitly setting
   `MYDB_REPAIR_ROLE=replica` backs up the corrupted metadata and atomically writes
@@ -1512,3 +1543,9 @@ API keys are encrypted database metadata. The master key comes from the
 Keep master keys separate from database backups and deploy matching keys to
 replicas independently. See [LLM and Embedding Calls](ai.md) for the exact key
 format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.
+
+## HTTP SQL calls
+
+HTTP client SQL functions are enabled by default and require `HTTP_USE`. See
+[HTTP SQL Functions](http.md#node-configuration) for the `http_*` startup options,
+node egress policy, private CA bindings, account quotas, and runtime controls.

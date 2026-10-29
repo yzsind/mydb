@@ -391,9 +391,19 @@ pub(crate) fn retire_namespace(namespace: &str) {
 static MEMORY: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct Memory {
     bytes: usize,
+    response: Mutex<Option<Arc<Memory>>>,
     _charge: crate::engine::executor::mem_budget::ScopedCharge,
 }
 impl Memory {
+    pub(crate) fn reserve_response(&self, bytes: usize) -> Result<(), QueryError> {
+        let memory = Self::reserve_with_charge(bytes, self._charge.sibling())?;
+        *self
+            .response
+            .lock()
+            .map_err(|_| error("ER_AI_DISABLED", "AI memory state poisoned"))? = Some(memory);
+        Ok(())
+    }
+
     pub(crate) fn grow(&mut self, bytes: usize) -> Result<(), QueryError> {
         let cap = env_limit("MYDB_AI_MEMORY_LIMIT_MB", 128).saturating_mul(1024 * 1024);
         MEMORY
@@ -410,6 +420,16 @@ impl Memory {
     }
 
     pub(crate) fn reserve(bytes: usize) -> Result<Arc<Self>, QueryError> {
+        Self::reserve_with_charge(
+            bytes,
+            crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        )
+    }
+
+    fn reserve_with_charge(
+        bytes: usize,
+        mut charge: crate::engine::executor::mem_budget::ScopedCharge,
+    ) -> Result<Arc<Self>, QueryError> {
         let cap = env_limit("MYDB_AI_MEMORY_LIMIT_MB", 128).saturating_mul(1024 * 1024);
         MEMORY
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -421,9 +441,10 @@ impl Memory {
                     "instance AI memory budget exceeded",
                 )
             })?;
-        match crate::engine::executor::mem_budget::force_charge_scoped(bytes) {
-            Ok(charge) => Ok(Arc::new(Self {
+        match charge.add_force(bytes) {
+            Ok(()) => Ok(Arc::new(Self {
                 bytes,
+                response: Mutex::new(None),
                 _charge: charge,
             })),
             Err(e) => {

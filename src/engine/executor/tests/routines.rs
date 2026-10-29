@@ -2938,3 +2938,267 @@ fn audit_user_variable_metadata_tracks_current_value() {
         assert_eq!(rs.columns[0].column_type, expected);
     }
 }
+
+#[test]
+fn routine_audit_1028_view_function_security_is_per_call_site() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut owner = SessionContext::default();
+    for sql in [
+        "CREATE TABLE private_values (v INT)",
+        "INSERT INTO private_values VALUES (42)",
+        "CREATE USER 'view_owner'@'%' IDENTIFIED BY 'pw'",
+        "CREATE USER 'view_reader'@'%' IDENTIFIED BY 'pw'",
+        "GRANT ALL ON test.* TO 'view_owner'@'%'",
+        "CREATE DEFINER='view_owner'@'%' FUNCTION view_value() RETURNS INT SQL SECURITY INVOKER READS SQL DATA RETURN (SELECT MAX(v) FROM private_values)",
+        "CREATE DEFINER='view_owner'@'%' FUNCTION view_identity() RETURNS VARCHAR(64) SQL SECURITY INVOKER RETURN CURRENT_USER()",
+        "CREATE DEFINER='view_owner'@'%' VIEW secured_values AS SELECT view_value() AS v, view_identity() AS who",
+        "CREATE SQL SECURITY INVOKER VIEW invoker_values AS SELECT view_value() AS v",
+        "CREATE DEFINER='view_owner'@'%' VIEW nested_values AS SELECT * FROM invoker_values",
+        "GRANT SELECT ON test.secured_values TO 'view_reader'@'%'",
+        "GRANT SELECT ON test.invoker_values TO 'view_reader'@'%'",
+        "GRANT SELECT ON test.nested_values TO 'view_reader'@'%'",
+    ] { exec(&engine, &mut owner, sql).unwrap(); }
+    let mut reader = SessionContext::default();
+    reader.user = "view_reader".into();
+    reader.login_user = "view_reader".into();
+    reader.authenticated_as = crate::engine::auth::AccountKey::new("view_reader", "%");
+    for _ in 0..2 {
+        let QueryResponse::ResultSet(result) =
+            exec(&engine, &mut reader, "SELECT * FROM secured_values").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Int(42), Value::String("view_owner@%".into())]]
+        );
+        let QueryResponse::ResultSet(result) =
+            exec(&engine, &mut reader, "SELECT * FROM nested_values").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(42)]]);
+        for sql in [
+            "SELECT view_value() FROM secured_values",
+            "SELECT view_value()",
+            "SELECT * FROM invoker_values",
+        ] {
+            let err = exec(&engine, &mut reader, sql).unwrap_err();
+            assert!(
+                err.is(crate::error::catalog::ER_PROCACCESS_DENIED_ERROR),
+                "{sql}: {err:?}"
+            );
+        }
+        assert_eq!(reader.authenticated_as.user, "view_reader");
+    }
+    for sql in [
+        "WITH c AS (SELECT * FROM secured_values) SELECT v FROM c",
+        "WITH c AS (SELECT * FROM nested_values) SELECT v FROM c",
+        "WITH c AS (SELECT * FROM secured_values) SELECT v FROM c UNION ALL SELECT v FROM c",
+    ] {
+        let QueryResponse::ResultSet(result) = exec(&engine, &mut reader, sql).unwrap() else {
+            panic!()
+        };
+        assert!(result.rows.iter().all(|row| row == &vec![Value::Int(42)]));
+        assert!(!result.rows.is_empty());
+        assert_eq!(reader.authenticated_as.user, "view_reader");
+    }
+    for sql in [
+        "SELECT `\0view_function_0`() FROM secured_values",
+        "PREPARE injected FROM 'SELECT `\0view_function_0`() FROM secured_values'",
+    ] {
+        assert!(exec(&engine, &mut reader, sql).is_err());
+    }
+    let described = <StorageQueryEngine as QueryEngine>::describe_prepared_statement(
+        &engine,
+        &mut reader,
+        "SELECT * FROM secured_values",
+    )
+    .unwrap();
+    assert_eq!(described[0].column_type, crate::types::ColumnType::Long);
+    exec(
+        &engine,
+        &mut reader,
+        "PREPARE view_ps FROM 'SELECT * FROM secured_values'",
+    )
+    .unwrap();
+    let QueryResponse::ResultSet(result) = exec(&engine, &mut reader, "EXECUTE view_ps").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(result.rows[0][0], Value::Int(42));
+    assert_eq!(
+        result.columns[0].column_type,
+        crate::types::ColumnType::Long
+    );
+}
+
+#[test]
+fn routine_audit_1028_sql_prepare_binds_return_domains_without_execution() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE TABLE prepare_side_effects (v INT)",
+        "CREATE FUNCTION prepare_int() RETURNS INT BEGIN INSERT INTO prepare_side_effects VALUES (1); RETURN 42; END",
+        "CREATE FUNCTION prepare_unsigned() RETURNS BIGINT UNSIGNED RETURN 18446744073709551615",
+        "CREATE FUNCTION prepare_decimal() RETURNS DECIMAL(12,3) RETURN 1.234",
+        "CREATE FUNCTION prepare_text() RETURNS VARCHAR(20) RETURN 'value'",
+        "CREATE FUNCTION prepare_null() RETURNS DATE RETURN NULL",
+        "PREPARE typed_ps FROM 'SELECT prepare_int() AS i, prepare_unsigned() AS u, prepare_decimal() AS d, prepare_text() AS s, prepare_null() AS n'",
+    ] { exec(&engine, &mut session, sql).unwrap(); }
+    let QueryResponse::ResultSet(count) = exec(
+        &engine,
+        &mut session,
+        "SELECT COUNT(*) FROM prepare_side_effects",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(count.rows[0][0], Value::Int(0));
+    let QueryResponse::ResultSet(prepared) =
+        exec(&engine, &mut session, "EXECUTE typed_ps").unwrap()
+    else {
+        panic!()
+    };
+    let QueryResponse::ResultSet(direct) = exec(&engine, &mut session, "SELECT prepare_int() AS i, prepare_unsigned() AS u, prepare_decimal() AS d, prepare_text() AS s, prepare_null() AS n").unwrap() else { panic!() };
+    assert_eq!(prepared.columns, direct.columns);
+    assert_eq!(prepared.rows, direct.rows);
+    assert_eq!(
+        prepared.columns[0].column_type,
+        crate::types::ColumnType::Long
+    );
+}
+
+#[test]
+fn routine_audit_1028_resignal_errno_follows_explicit_condition_class() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for (suffix, expected) in [
+        ("SQLSTATE '45000' SET MESSAGE_TEXT='wrapped'", 1644),
+        ("SQLSTATE '02000'", 1643),
+        ("SQLSTATE '45000' SET MYSQL_ERRNO=6001", 6001),
+        ("SET MESSAGE_TEXT='wrapped'", 1146),
+        ("", 1146),
+    ] {
+        exec(
+            &engine,
+            &mut session,
+            "DROP PROCEDURE IF EXISTS resignal_audit",
+        )
+        .unwrap();
+        exec(&engine, &mut session, &format!("CREATE PROCEDURE resignal_audit() BEGIN DECLARE EXIT HANDLER FOR 1146 BEGIN RESIGNAL {suffix}; END; SELECT * FROM missing_resignal_table; END")).unwrap();
+        let err = exec(&engine, &mut session, "CALL resignal_audit()").unwrap_err();
+        assert_eq!(err.code(), expected, "{suffix}: {err:?}");
+    }
+}
+
+#[test]
+fn routine_audit_1028_signal_information_survives_handlers_and_resignal() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(&engine, &mut session, "CREATE PROCEDURE information_signal() BEGIN DECLARE suffix VARCHAR(8) DEFAULT 'table'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='m', CLASS_ORIGIN='custom', SUBCLASS_ORIGIN='sub', CONSTRAINT_CATALOG='cc', CONSTRAINT_SCHEMA='cs', CONSTRAINT_NAME='cn', CATALOG_NAME='catalog', SCHEMA_NAME='schema', TABLE_NAME=suffix, COLUMN_NAME='column', CURSOR_NAME='cursor'; END").unwrap();
+    exec(&engine, &mut session, "CREATE PROCEDURE information_resignal() BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN RESIGNAL SQLSTATE '45001' SET TABLE_NAME='replacement'; END; CALL information_signal(); END").unwrap();
+    exec(&engine, &mut session, "CREATE PROCEDURE information_catch() BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN GET STACKED DIAGNOSTICS CONDITION 1 @cl=CLASS_ORIGIN, @sub=SUBCLASS_ORIGIN, @cc=CONSTRAINT_CATALOG, @cs=CONSTRAINT_SCHEMA, @cn=CONSTRAINT_NAME, @cat=CATALOG_NAME, @sc=SCHEMA_NAME, @tab=TABLE_NAME, @col=COLUMN_NAME, @cur=CURSOR_NAME; END; CALL information_resignal(); END").unwrap();
+    exec(&engine, &mut session, "CALL information_catch()").unwrap();
+    for (name, value) in [
+        ("cl", "custom"),
+        ("sub", "sub"),
+        ("cc", "cc"),
+        ("cs", "cs"),
+        ("cn", "cn"),
+        ("cat", "catalog"),
+        ("sc", "schema"),
+        ("tab", "replacement"),
+        ("col", "column"),
+        ("cur", "cursor"),
+    ] {
+        assert_eq!(
+            session.user_variable(name),
+            Some(&Value::String(value.into())),
+            "{name}"
+        );
+    }
+    for (value, expected) in [("NULL", 1231), ("REPEAT('x',65)", 1648)] {
+        exec(
+            &engine,
+            &mut session,
+            "DROP PROCEDURE IF EXISTS invalid_information",
+        )
+        .unwrap();
+        exec(&engine, &mut session, &format!("CREATE PROCEDURE invalid_information() SIGNAL SQLSTATE '45000' SET TABLE_NAME={value}")).unwrap();
+        assert_eq!(
+            exec(&engine, &mut session, "CALL invalid_information()")
+                .unwrap_err()
+                .code(),
+            expected
+        );
+    }
+    assert!(exec(&engine, &mut session, "CREATE PROCEDURE duplicate_information() SIGNAL SQLSTATE '45000' SET TABLE_NAME='a', TABLE_NAME='b'").is_err());
+}
+
+#[test]
+fn routine_audit_1028_call_privilege_uses_routine_error_code() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut owner = SessionContext::default();
+    for sql in [
+        "CREATE PROCEDURE denied_call() SELECT 1",
+        "CREATE USER 'call_reader'@'%' IDENTIFIED BY 'pw'",
+        "GRANT SELECT ON test.* TO 'call_reader'@'%'",
+    ] {
+        exec(&engine, &mut owner, sql).unwrap();
+    }
+    let mut reader = SessionContext::default();
+    reader.user = "call_reader".into();
+    reader.authenticated_as = crate::engine::auth::AccountKey::new("call_reader", "%");
+    let err = exec(&engine, &mut reader, "CALL denied_call()").unwrap_err();
+    assert_eq!(err.code(), 1370);
+    assert!(err.message().contains("call_reader"));
+}
+
+#[test]
+fn routine_audit_1028_prepared_metadata_rebinds_after_return_type_ddl() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE FUNCTION replaced_type() RETURNS INT RETURN 42",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "PREPARE replacement_ps FROM 'SELECT replaced_type() AS v'",
+    )
+    .unwrap();
+    exec(&engine, &mut session, "DROP FUNCTION replaced_type").unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE FUNCTION replaced_type() RETURNS VARCHAR(30) RETURN 'replaced'",
+    )
+    .unwrap();
+    let QueryResponse::ResultSet(prepared) =
+        exec(&engine, &mut session, "EXECUTE replacement_ps").unwrap()
+    else {
+        panic!()
+    };
+    let QueryResponse::ResultSet(direct) =
+        exec(&engine, &mut session, "SELECT replaced_type() AS v").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(prepared, direct);
+}

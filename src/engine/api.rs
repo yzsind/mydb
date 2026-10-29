@@ -182,7 +182,38 @@ pub struct StreamingResultSet {
 
 pub type SqlWarning = crate::error::SqlCondition;
 pub use crate::error::conditions::SqlConditions as SqlWarnings;
-pub(crate) type StatementWarningSink = std::sync::Arc<parking_lot::Mutex<SqlWarnings>>;
+#[derive(Debug, Default)]
+struct StatementWarningState {
+    warnings: parking_lot::Mutex<SqlWarnings>,
+    once: parking_lot::Mutex<std::collections::HashSet<(u64, u16, String)>>,
+}
+
+/// Warning storage and statement-wide constant-diagnostic identity travel
+/// together across workers; draining conditions must not reset the identity.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatementWarningSink(std::sync::Arc<StatementWarningState>);
+
+impl std::ops::Deref for StatementWarningSink {
+    type Target = parking_lot::Mutex<SqlWarnings>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.warnings
+    }
+}
+
+pub(crate) fn shared_statement_warning_should_publish(
+    context: u64,
+    code: u16,
+    message: &str,
+) -> Option<bool> {
+    STATEMENT_WARNING_SINK.with(|slot| {
+        slot.borrow().as_ref().map(|sink| {
+            sink.0
+                .once
+                .lock()
+                .insert((context, code, message.to_string()))
+        })
+    })
+}
 
 thread_local! {
     static STATEMENT_WARNINGS: std::cell::RefCell<SqlWarnings> = const { std::cell::RefCell::new(SqlWarnings::new()) };
@@ -394,6 +425,7 @@ pub(crate) fn clear_statement_warnings() {
     STATEMENT_WARNINGS.with(|warnings| warnings.borrow_mut().clear());
     if let Some(sink) = current_statement_warning_sink() {
         sink.lock().clear();
+        sink.0.once.lock().clear();
     }
     crate::engine::expr::clear_expression_warning_dedup();
 }
@@ -574,6 +606,38 @@ mod warning_batch_tests {
         assert!(scope.sink.lock().is_empty());
     }
 
+    #[test]
+    fn constant_diagnostic_identity_is_shared_and_survives_condition_draining() {
+        let sink = StatementWarningSink::default();
+        let emit_constant = |sink: StatementWarningSink| {
+            with_statement_warning_sink(sink, || {
+                crate::engine::expr::with_expression_warning_dedup(123, || {
+                    push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_WRONG_VALUE,
+                        "Incorrect TIME value: 'zz'",
+                    );
+                });
+            });
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let sink = sink.clone();
+                scope.spawn(move || emit_constant(sink));
+            }
+        });
+        assert_eq!(sink.lock().len(), 1);
+        let _drained = std::mem::take(&mut *sink.lock());
+        std::thread::scope(|scope| {
+            let sink = sink.clone();
+            scope.spawn(move || emit_constant(sink));
+        });
+        assert!(sink.lock().is_empty());
+        with_statement_warning_sink(sink.clone(), clear_statement_warnings);
+        emit_constant(sink.clone());
+        assert_eq!(sink.lock().len(), 1);
+    }
+
     fn emit(value: usize) {
         push_statement_warning(
             crate::error::ConditionLevel::Warning,
@@ -692,18 +756,17 @@ pub(crate) struct StatementWarningSinkScope {
 
 impl StatementWarningSinkScope {
     pub(crate) fn enter() -> Self {
-        let sink = current_statement_warning_sink()
-            .unwrap_or_else(|| std::sync::Arc::new(parking_lot::Mutex::new(SqlWarnings::new())));
+        let sink = current_statement_warning_sink().unwrap_or_default();
         let previous = STATEMENT_WARNING_SINK.with(|slot| slot.borrow_mut().replace(sink.clone()));
         Self { previous, sink }
     }
 
     pub(crate) fn drain_to_local(&self) {
         flush_statement_warning_batch();
-        let mut pending = std::mem::take(&mut *self.sink.lock());
+        let mut pending = self.sink.lock().take();
         STATEMENT_WARNINGS.with(|warnings| {
             let mut warnings = warnings.borrow_mut();
-            if warnings.is_empty() {
+            if warnings.total_len() == 0 {
                 // Transfer the allocation as well as the conditions. Copying
                 // a large bulk statement's diagnostics one element at a time
                 // doubles live storage and serializes statement completion.
@@ -727,10 +790,9 @@ pub(crate) fn take_statement_warnings() -> SqlWarnings {
     // Reset any per-statement "warn once" flags so the same connection's
     // next statement gets a fresh chance to emit its diagnostics.
     JSON_MERGE_DEPRECATION_WARNED.with(|c| c.set(false));
-    let mut warnings =
-        STATEMENT_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()));
+    let mut warnings = STATEMENT_WARNINGS.with(|warnings| warnings.borrow_mut().take());
     if let Some(sink) = current_statement_warning_sink() {
-        warnings.append(&mut std::mem::take(&mut *sink.lock()));
+        warnings.append(&mut sink.lock().take());
     }
     warnings
 }
@@ -774,9 +836,9 @@ pub(crate) fn warn_json_merge_deprecation_once() {
 /// `Records: N Deleted: M Skipped: K Warnings: W` info trailer while the
 /// warnings themselves are still pending drain into the session.
 pub(crate) fn statement_warning_count() -> usize {
-    STATEMENT_WARNINGS.with(|warnings| warnings.borrow().len())
+    STATEMENT_WARNINGS.with(|warnings| warnings.borrow().total_len())
         + current_statement_warning_sink()
-            .map(|sink| sink.lock().len())
+            .map(|sink| sink.lock().total_len())
             .unwrap_or(0)
 }
 
@@ -1048,6 +1110,9 @@ impl std::fmt::Debug for ResultBatch {
 }
 
 pub trait ResultCursor: Send + std::fmt::Debug {
+    fn external_http_io(&self) -> bool {
+        false
+    }
     /// External streams own their relational input and need a dedicated worker.
     fn external_io(&self) -> bool {
         false
@@ -1097,6 +1162,9 @@ struct TimestampLocalizingCursor {
 }
 
 impl ResultCursor for TimestampLocalizingCursor {
+    fn external_http_io(&self) -> bool {
+        self.inner.external_http_io()
+    }
     fn external_io(&self) -> bool {
         self.inner.external_io()
     }
@@ -1158,6 +1226,18 @@ impl ChainedCursor {
 }
 
 impl ResultCursor for ChainedCursor {
+    fn external_io(&self) -> bool {
+        self.current
+            .iter()
+            .chain(self.remaining.iter())
+            .any(|c| c.external_io())
+    }
+    fn external_http_io(&self) -> bool {
+        self.current
+            .iter()
+            .chain(self.remaining.iter())
+            .any(|c| c.external_http_io())
+    }
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         while let Some(cursor) = self.current.as_mut() {
             match cursor.next_row()? {
@@ -1283,16 +1363,12 @@ impl QueryResponse {
                         Ok(Some(row)) => rows.push(row),
                         Ok(None) => break,
                         Err(err) => {
-                            for warning in result.cursor.take_warnings() {
-                                push_sql_warning(warning);
-                            }
+                            append_statement_warnings(result.cursor.take_warnings());
                             return Err(err);
                         }
                     }
                 }
-                for warning in result.cursor.take_warnings() {
-                    push_sql_warning(warning);
-                }
+                append_statement_warnings(result.cursor.take_warnings());
                 Ok(QueryResponse::ResultSet(ResultSet {
                     columns: result.columns,
                     rows,
@@ -1536,51 +1612,8 @@ pub enum PreparedDmlState {
     Ready(Arc<PreparedDmlPlan>),
 }
 
-/// One async subscription to a row-lock release shard. The shared waiter
-/// count lets the storage release path preserve its zero-allocation early
-/// return when no protocol task is awaiting a row.
-pub struct AsyncRowLockSignal {
-    receiver: tokio::sync::watch::Receiver<u64>,
-    observed_generation: u64,
-    active: Arc<AtomicU64>,
-}
-
-impl AsyncRowLockSignal {
-    pub(crate) fn new(
-        receiver: tokio::sync::watch::Receiver<u64>,
-        observed_generation: u64,
-        active: Arc<AtomicU64>,
-    ) -> Self {
-        active.fetch_add(1, Ordering::AcqRel);
-        Self {
-            receiver,
-            observed_generation,
-            active,
-        }
-    }
-
-    pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
-        let current = *self.receiver.borrow_and_update();
-        if current != self.observed_generation {
-            self.observed_generation = current;
-            return Ok(());
-        }
-        self.receiver.changed().await?;
-        self.observed_generation = *self.receiver.borrow_and_update();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation(&self) -> u64 {
-        *self.receiver.borrow()
-    }
-}
-
-impl Drop for AsyncRowLockSignal {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+pub(crate) use super::async_row_wait::AsyncRowLockRegistry;
+pub use super::async_row_wait::AsyncRowLockSignal;
 
 /// Statement-local metadata retained by the compiled text-DML batch executor.
 /// These plans cannot run triggers or change tracked session variables.
@@ -1596,6 +1629,11 @@ pub struct DmlStatementResult {
 }
 
 pub trait QueryEngine: Send + Sync + 'static {
+    /// Conservative catalog-aware scheduling hint, never an execution step.
+    fn sql_may_call_http(&self, sql: &str) -> bool {
+        crate::engine::http::mentions(sql)
+    }
+
     fn execute(&self, session: &mut SessionContext, sql: &str)
         -> Result<QueryResponse, QueryError>;
 
@@ -1610,10 +1648,15 @@ pub trait QueryEngine: Send + Sync + 'static {
     }
 
     /// Subscribe to row-lock release progress for async inline retry. Storage
-    /// engines return a per-database watch receiver; lightweight/mock engines
-    /// keep the default `None` and use the blocking executor fallback.
+    /// engines register the exact row FIFO and return a transaction wake token;
+    /// lightweight/mock engines use the default blocking executor fallback.
     fn row_lock_async_signal(&self) -> Option<AsyncRowLockSignal> {
         None
+    }
+
+    /// Eligibility is rechecked before sleeping and after a directed wake.
+    fn row_lock_async_ready(&self, _signal: &AsyncRowLockSignal) -> bool {
+        true
     }
 
     /// Bind protocol-memory reclamation for the current synchronous poll.
@@ -1962,6 +2005,12 @@ pub trait QueryEngine: Send + Sync + 'static {
     /// every connection on a stub engine takes the full path.
     fn is_in_auth_cache(&self, _username: &str, _peer_host: &str) -> bool {
         false
+    }
+
+    /// COM_CHANGE_USER clients may send an empty placeholder and wait for
+    /// a fresh challenge even when the account requires a password.
+    fn auth_account_has_password(&self, _username: &str, _host: &str) -> Result<bool, QueryError> {
+        Ok(false)
     }
 
     fn authenticate_request(&self, request: AuthRequest<'_>) -> Result<AuthOutcome, QueryError> {
@@ -2362,6 +2411,7 @@ pub struct SessionContext {
 /// like a stock MySQL session.
 #[derive(Debug, Clone)]
 pub struct SessionSysVarState {
+    pub max_error_count: u64,
     pub auto_increment_increment: u64,
     pub auto_increment_offset: u64,
     pub transaction_read_only: bool,
@@ -2564,6 +2614,7 @@ impl Default for SessionSysVarState {
             crate::engine::sysvar::builtin::charset::server_charset_defaults();
         const RAND_MAX: u64 = 0x3FFF_FFFF;
         Self {
+            max_error_count: crate::engine::sysvar::builtin::orm_stubs::max_error_count(),
             max_allowed_packet:
                 crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes(),
             max_user_connections: crate::engine::sysvar::builtin::connection::max_user_connections(
@@ -2762,6 +2813,9 @@ pub(crate) struct SessionSqlPreparedStatement {
     /// Result metadata bound at PREPARE time. Declared domains stay fixed;
     /// untyped parameter-derived domains are resolved at EXECUTE time.
     pub(crate) result_columns: std::sync::Arc<[crate::types::Column]>,
+    /// Routine domains are rebound by EXECUTE after routine DDL, so stale
+    /// PREPARE descriptors must not replace the current execution metadata.
+    pub(crate) routine_result_metadata: bool,
     /// Hard-governor reservation for all retained template capacity. Shared
     /// with transient EXECUTE clones and released by the last owner.
     pub(crate) memory_charge:
@@ -3391,16 +3445,19 @@ impl SessionContext {
 
     pub fn set_warnings(&mut self, warnings: impl Into<SqlWarnings>) {
         self.warnings = warnings.into();
+        // Internal diagnostics remain available to strict conversion and
+        // stored-program handlers until execution finishes. Only the client
+        // condition area is truncated; counts include discarded conditions.
+        self.warnings
+            .set_limit(self.sysvars.max_error_count as usize);
     }
 
     pub fn warning_count(&self) -> u16 {
-        self.warnings.len().min(u16::MAX as usize) as u16
+        self.warnings.total_len().min(u16::MAX as usize) as u16
     }
 
     pub fn error_count(&self) -> u16 {
-        self.warnings
-            .count_matching(|condition| condition.level() == crate::error::ConditionLevel::Error)
-            .min(u16::MAX as usize) as u16
+        self.warnings.error_count().min(u16::MAX as usize) as u16
     }
 
     pub fn is_strict_sql_mode(&self) -> bool {

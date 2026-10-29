@@ -95,7 +95,7 @@ fn expression_audit_time_and_string_boundaries() {
         ["", "ab", ""]
     );
     assert_eq!(strings(&engine,"SELECT WEEK('10:11:12'),YEAR('10:11:12'),DATE_FORMAT('10:11:12','%Y-%m-%d'),DATE_ADD('10:11:12',INTERVAL 1 DAY),LAST_DAY('2020-02-00')"), ["45","2010","2010-11-12","2010-11-13","2020-02-29"]);
-    assert_eq!(strings(&engine,"SELECT CAST('10:11:12.999999' AS TIME(3)),CAST('-00:00:00.999999' AS TIME(3)),ADDTIME(59,2.5)"), ["10:11:13","-00:00:01","00:01:01.500000"]);
+    assert_eq!(strings(&engine,"SELECT CAST('10:11:12.999999' AS TIME(3)),CAST('-00:00:00.999999' AS TIME(3)),ADDTIME(59,2.5)"), ["10:11:13","-00:00:01","00:01:01.5"]);
     assert_eq!(rows(&engine,"SELECT TIME_FORMAT('abc','%H'),TO_SECONDS('FF'),ADDTIME(CAST('838:59:59' AS TIME),'1:00:00')"),vec![vec![Value::Null;3]]);
     assert_eq!(
         rows(&engine, "SELECT BINARY(1)"),

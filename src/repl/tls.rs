@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn plaintext_is_rejected_off_loopback() {
-        let mut config = ReplConfig::default();
+        let mut config = ReplConfig::test_defaults();
         assert_eq!(
             should_use_tls(&config, "10.0.0.1").unwrap_err().kind(),
             ErrorKind::PermissionDenied

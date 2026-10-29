@@ -390,6 +390,9 @@ pub enum WalRecordType {
     VectorIndexComplete = 39,
     VectorIndexManifest = 40,
     VectorIndexModel = 38,
+    SpatialPageBatch = 41,
+    SpatialIndexUndo = 42,
+    SpatialIndexClr = 43,
 }
 
 impl WalRecordType {
@@ -434,6 +437,9 @@ impl WalRecordType {
             37 => Self::VectorIndexImage,
             39 => Self::VectorIndexComplete,
             40 => Self::VectorIndexManifest,
+            41 => Self::SpatialPageBatch,
+            42 => Self::SpatialIndexUndo,
+            43 => Self::SpatialIndexClr,
             38 => Self::VectorIndexModel,
             _ => {
                 return Err(error(
@@ -655,6 +661,18 @@ pub enum WalPayload {
     VectorIndexComplete {
         txn_id: u64,
         commit_scn: u64,
+    },
+    /// Transaction-owned logical inverse; structural pages remain redo-only.
+    SpatialIndexUndo {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    SpatialIndexClr {
+        undo_next_lsn: u64,
+    },
+    SpatialPageBatch {
+        path: String,
+        bytes: Vec<u8>,
     },
     VectorIndexManifest {
         path: String,
@@ -1990,19 +2008,6 @@ impl LogManager {
         // immediate truncate is not required for correctness.
         self.flush_pending_writes()?;
         self.active_file.flush().map_err(io_err)?;
-        self.pending_sealed_sync.push(PendingSealedSync {
-            file: Arc::clone(&self.active_file),
-            last_lsn: self.active_info.last_lsn,
-        });
-        let mut sealed = self.active_info.clone();
-        sealed.status = WalSegmentStatus::Reclaimable;
-        let sealed_bytes = sealed.size_bytes;
-        self.segments.push(sealed);
-        // Sealed list grew by sealed_bytes; mirror to atomic.
-        self.state_atomics
-            .sealed_size_bytes
-            .fetch_add(sealed_bytes, Ordering::AcqRel);
-
         let next_id = self.active_info.segment_id.saturating_add(1);
         let path = segment_path(&self.dir, next_id).with_extension("log.pending");
         // Fast path: the background preparer (`ensure_next_segment`) already
@@ -2037,6 +2042,20 @@ impl LogManager {
                 (Arc::new(file), SegmentFill::Reserve)
             }
         };
+        // Preparing the successor can fail. Until it succeeds, the current
+        // descriptor is still active and must never enter the reclaimable
+        // list: checkpoint cleanup could otherwise unlink a live WAL file.
+        self.pending_sealed_sync.push(PendingSealedSync {
+            file: Arc::clone(&self.active_file),
+            last_lsn: self.active_info.last_lsn,
+        });
+        let mut sealed = self.active_info.clone();
+        sealed.status = WalSegmentStatus::Reclaimable;
+        let sealed_bytes = sealed.size_bytes;
+        self.segments.push(sealed);
+        self.state_atomics
+            .sealed_size_bytes
+            .fetch_add(sealed_bytes, Ordering::AcqRel);
         // Active-segment size tracks valid bytes, not the preallocated
         // extent.
         let size_bytes = WAL_HEADER_LEN as u64;
@@ -3475,6 +3494,7 @@ impl LogManager {
                 | WalPayload::CommitTxn { .. }
                 | WalPayload::Clr { .. }
                 | WalPayload::FileClr { .. }
+                | WalPayload::SpatialIndexClr { .. }
                 | WalPayload::RollbackTo { .. }
                 | WalPayload::AbortTxn
                 | WalPayload::EndTxn
@@ -4352,6 +4372,9 @@ impl WalPayload {
             WalPayload::VectorIndexImage { .. } => WalRecordType::VectorIndexImage,
             WalPayload::VectorIndexComplete { .. } => WalRecordType::VectorIndexComplete,
             WalPayload::VectorIndexManifest { .. } => WalRecordType::VectorIndexManifest,
+            WalPayload::SpatialPageBatch { .. } => WalRecordType::SpatialPageBatch,
+            WalPayload::SpatialIndexUndo { .. } => WalRecordType::SpatialIndexUndo,
+            WalPayload::SpatialIndexClr { .. } => WalRecordType::SpatialIndexClr,
             WalPayload::CatalogDelta { .. } => WalRecordType::CatalogDelta,
             WalPayload::DdlCommit { .. } => WalRecordType::DdlCommit,
             WalPayload::AutoIncrementAdvance { .. } => WalRecordType::AutoIncrementAdvance,
@@ -4424,7 +4447,9 @@ fn accumulate_wal_stats(stats: &mut WalStats, payload: &WalPayload) {
                 .index_payload_bytes
                 .saturating_add(ops.iter().map(|op| op.key.len() as u64 + 20).sum::<u64>());
         }
-        WalPayload::HistoryIndexBatch { bytes }
+        WalPayload::SpatialIndexUndo { bytes, .. }
+        | WalPayload::SpatialPageBatch { bytes, .. }
+        | WalPayload::HistoryIndexBatch { bytes }
         | WalPayload::VectorIndexBatch { bytes }
         | WalPayload::VectorIndexModel { bytes } => {
             stats.logical_records += 1;
@@ -5453,7 +5478,10 @@ fn encode_payload_into(payload: &WalPayload, mut out: &mut Vec<u8>) -> Result<()
         | WalPayload::HistoryIndexBatch { bytes }
         | WalPayload::VectorIndexBatch { bytes }
         | WalPayload::VectorIndexModel { bytes } => write_bytes(&mut out, bytes)?,
-        WalPayload::VectorIndexManifest { path, bytes } => {
+        WalPayload::SpatialIndexClr { undo_next_lsn } => write_u64_vec(&mut out, *undo_next_lsn),
+        WalPayload::SpatialIndexUndo { path, bytes }
+        | WalPayload::SpatialPageBatch { path, bytes }
+        | WalPayload::VectorIndexManifest { path, bytes } => {
             write_string(&mut out, path)?;
             write_bytes(&mut out, bytes)?;
         }
@@ -5863,7 +5891,10 @@ fn encoded_payload_len(payload: &WalPayload) -> Result<usize, QueryError> {
         | WalPayload::HistoryIndexBatch { bytes }
         | WalPayload::VectorIndexBatch { bytes }
         | WalPayload::VectorIndexModel { bytes } => encoded_bytes_len(bytes.len()),
-        WalPayload::VectorIndexManifest { path, bytes } => checked_sum([
+        WalPayload::SpatialIndexClr { .. } => Ok(8),
+        WalPayload::SpatialIndexUndo { path, bytes }
+        | WalPayload::SpatialPageBatch { path, bytes }
+        | WalPayload::VectorIndexManifest { path, bytes } => checked_sum([
             encoded_bytes_len(path.len())?,
             encoded_bytes_len(bytes.len())?,
         ]),
@@ -6336,6 +6367,17 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
             bytes: read_bytes(input, &mut offset)?,
         },
         WalRecordType::VectorIndexModel => WalPayload::VectorIndexModel {
+            bytes: read_bytes(input, &mut offset)?,
+        },
+        WalRecordType::SpatialIndexUndo => WalPayload::SpatialIndexUndo {
+            path: read_string(input, &mut offset)?,
+            bytes: read_bytes(input, &mut offset)?,
+        },
+        WalRecordType::SpatialIndexClr => WalPayload::SpatialIndexClr {
+            undo_next_lsn: read_u64_checked(input, &mut offset)?,
+        },
+        WalRecordType::SpatialPageBatch => WalPayload::SpatialPageBatch {
+            path: read_string(input, &mut offset)?,
             bytes: read_bytes(input, &mut offset)?,
         },
         WalRecordType::VectorIndexManifest => WalPayload::VectorIndexManifest {
@@ -6858,11 +6900,11 @@ fn sync_wal_file_with(file: &std::fs::File, method: WalSyncMethod) -> Result<(),
 
 #[cfg(target_os = "macos")]
 fn sync_wal_file_with(file: &std::fs::File, method: WalSyncMethod) -> Result<(), QueryError> {
-    #[cfg(test)]
     if method == WalSyncMethod::Fullfsync {
-        if let Some(result) = crate::platform::fs::try_fixture_sync_file(file) {
+        if let Some(result) = crate::platform::fs::try_private_sync_file(file) {
             return result.map_err(io_err);
         }
+        return crate::platform::fs::sync_full_file(file).map_err(io_err);
     }
     let fd = file.as_raw_fd();
     let rc = match method {
@@ -6956,11 +6998,11 @@ fn wal_preallocate_enabled() -> bool {
 /// is traded for completeness, identical in spirit to undo's
 /// `MYDB_UNDO_FORCE_RECOVER`. Default off: corruption is fatal so silent
 /// data loss never happens without an explicit opt-in.
-fn wal_force_recover_enabled() -> bool {
+pub(crate) fn wal_force_recover_enabled() -> bool {
     // Read fresh (not cached): this is only consulted on the cold
     // recovery/scan path, never in a hot loop, and a fresh read keeps the
     // flag deterministically toggleable in tests.
-    std::env::var_os("MYDB_WAL_FORCE_RECOVER")
+    crate::util::env::var_os("MYDB_WAL_FORCE_RECOVER")
         .map(|v| {
             !matches!(
                 v.to_string_lossy().to_ascii_lowercase().as_str(),
@@ -8611,6 +8653,35 @@ mod tests {
         drop(log);
         let reopened = LogManager::open(dir.path()).unwrap();
         assert_log_state_atomics_match(&reopened);
+    }
+
+    #[test]
+    fn btree_release_failed_rotation_cannot_publish_active_as_reclaimable() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = LogManager::open(dir.path()).unwrap();
+        let begin = log
+            .append(7, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        log.flush().unwrap();
+        let pending =
+            segment_path(&log.dir, log.active_segment_id() + 1).with_extension("log.pending");
+        fs::create_dir(&pending).unwrap();
+        assert!(log.rotate_segment().is_err());
+        assert!(
+            log.segments.is_empty(),
+            "a failed rotation must not make the active WAL reclaimable"
+        );
+        assert!(log.pending_sealed_sync.is_empty());
+        fs::remove_dir(&pending).unwrap();
+        log.rotate_segment().unwrap();
+        let end = log.append(7, WalPayload::AbortTxn).unwrap();
+        log.flush().unwrap();
+        let scan = LogManager::scan(dir.path()).unwrap();
+        assert_eq!(
+            scan.records.iter().map(|r| r.lsn).collect::<Vec<_>>(),
+            vec![begin, end]
+        );
+        assert_eq!(scan.records[1].prev_txn_lsn, begin);
     }
 
     #[test]

@@ -290,6 +290,10 @@ pub(crate) fn to_pretty(jsonb: &[u8]) -> String {
 /// `->>` operator.
 pub(crate) fn unquote_text(jsonb: &[u8]) -> String {
     match JsonbRef::new(jsonb) {
+        Ok(r) if r.opaque_value().is_some() => {
+            let (ty, bytes) = r.opaque_value().expect("checked opaque value");
+            opaque_text(ty, bytes)
+        }
         Ok(r) => match r.as_str() {
             Some(s) => s.to_string(),
             None => {
@@ -453,4 +457,43 @@ pub(crate) fn binary_json_text(bytes: &[u8]) -> String {
         "base64:type15:{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     )
+}
+
+/// Encode a validated rich scalar supplied by the binary-JSON receiver.
+/// Keep the tag rather than passing through a JSON-text/serde conversion.
+pub(crate) fn typed_text_scalar(ty: JsonType, text: &str) -> Result<Vec<u8>, QueryError> {
+    let tag = match ty {
+        JsonType::Date => jsonb::T_DATE,
+        JsonType::Time => jsonb::T_TIME,
+        JsonType::Datetime => jsonb::T_DATETIME,
+        JsonType::Timestamp => jsonb::T_TIMESTAMP,
+        _ => return Err(invalid_json_text(1, "replication typed scalar")),
+    };
+    let mut out = Vec::with_capacity(text.len() + 2);
+    jsonb::write_text_scalar(tag, text, &mut out);
+    Ok(out)
+}
+
+/// Preserve the source field type and raw bytes for non-temporal opaque JSON.
+pub(crate) fn opaque_scalar(ty: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 6);
+    out.push(jsonb::T_OPAQUE);
+    write_uvarint(&mut out, bytes.len() as u64 + 1);
+    out.push(ty);
+    out.extend_from_slice(bytes);
+    out
+}
+
+pub(crate) fn opaque_text(ty: u8, bytes: &[u8]) -> String {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut text = format!("base64:type{ty}:");
+    for (i, chunk) in encoded.as_bytes().chunks(76).enumerate() {
+        if i != 0 {
+            text.push('\n');
+        }
+        // The encoder produces ASCII exclusively.
+        text.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+    }
+    text
 }

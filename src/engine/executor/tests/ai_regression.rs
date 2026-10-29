@@ -363,23 +363,38 @@ fn ai_http_attempt_budget_cannot_be_bypassed_by_retry_or_detail() {
 
 #[test]
 fn ai_memory_rejection_releases_reservations_and_allows_next_query() {
-    with_mock(|mock, _, engine, session| {
+    let mock = Mock::responding(|_, request| {
+        if request["messages"][0]["content"] == "dense" {
+            reply(200, json!({"extra":vec![0;10000]}).to_string(), &[])
+        } else if request["messages"][0]["content"] == "structured" {
+            answer(&json!({"data":vec![0; 20000]}).to_string())
+        } else {
+            answer("healthy")
+        }
+    });
+    with_provider(&mock, |mock, _, engine, session| {
         crate::util::env::with_vars(&[("MYDB_AI_MEMORY_LIMIT_MB", Some("1"))], || {
             assert_error(
                 engine,
                 session,
-                "SELECT AI_GENERATE_DETAIL('test.chat','x',JSON_OBJECT('on_error','return'))",
+                "SELECT AI_GENERATE_DETAIL('test.chat','dense',JSON_OBJECT('on_error','return'))",
                 ER_AI_BUDGET_EXCEEDED,
             );
+            assert_idle();
+            assert_error(
+                engine,
+                session,
+                r#"SELECT AI_GENERATE_DETAIL('test.chat','structured','{"response_format":{"type":"json_schema","name":"array","strict":true,"schema":{"type":"object","properties":{"data":{"type":"array","items":{"type":"integer"}}},"required":["data"],"additionalProperties":false}},"on_error":"return"}')"#,
+                ER_AI_BUDGET_EXCEEDED,
+            );
+            assert_idle();
+            exec(
+                engine,
+                session,
+                "SELECT AI_GENERATE('test.chat','after budget rejection')",
+            );
         });
-        assert!(mock.requests.lock().unwrap().is_empty());
-        assert_idle();
-        exec(
-            engine,
-            session,
-            "SELECT AI_GENERATE('test.chat','after budget rejection')",
-        );
-        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        assert_eq!(mock.requests.lock().unwrap().len(), 3);
         assert_idle();
     });
 }
@@ -1145,3 +1160,167 @@ fn ai_http_fixture_waits_for_request_bytes_after_accepting_connection() {
 
 #[path = "ai_concurrency.rs"]
 mod deep_review;
+
+#[test]
+fn ai_audit_large_embedding_batch() {
+    let mock = Mock::responding(|path, body| {
+        let count = body["input"].as_array().unwrap().len();
+        let dimensions = body["dimensions"].as_u64().unwrap() as usize;
+        let vectors = vec![vec![0.123456_f64; dimensions]; count];
+        let response = if path.ends_with("/api/embed") {
+            json!({"embeddings":vectors})
+        } else {
+            json!({"data":vectors.into_iter().enumerate().rev().map(|(index,embedding)| json!({"index":index,"embedding":embedding})).collect::<Vec<_>>()})
+        };
+        reply(200, response.to_string(), &[])
+    });
+    with_provider(&mock, |mock, _, engine, session| {
+        exec(
+            engine,
+            session,
+            &format!(
+                "CREATE AI CONNECTION audit_openai WITH CONFIG '{}'",
+                json!({"protocol":"openai_embeddings","base_url":format!("http://127.0.0.1:{}",mock.port),"auth":{"type":"none"}})
+            ),
+        );
+        let inputs = vec!["'x'"; 64].join(",");
+        for connection in ["local", "audit_openai"] {
+            for dimensions in [4096, 8192] {
+                let name = format!("test.batch_{connection}_{dimensions}");
+                exec(
+                    engine,
+                    session,
+                    &format!(
+                        "CREATE AI MODEL {name} USING {connection} WITH CONFIG '{}'",
+                        json!({"kind":"embedding","remote_model":"embed","model_revision":"v1","embedding":{"dimensions":dimensions,"request_dimensions":true},"limits":{"max_batch_items":64}})
+                    ),
+                );
+                let result = json_result(exec(
+                    engine,
+                    session,
+                    &format!("SELECT AI_EMBED_DETAIL('{name}',JSON_ARRAY({inputs}))"),
+                ));
+                let data = result["data"].as_array().unwrap();
+                assert_eq!(data.len(), 64);
+                for (index, item) in data.iter().enumerate() {
+                    assert_eq!(item["index"], index);
+                    assert_eq!(item["embedding"].as_array().unwrap().len(), dimensions);
+                    assert_eq!(
+                        item["embedding"][dimensions - 1].as_f64().unwrap(),
+                        0.123456_f32 as f64
+                    );
+                }
+                assert_idle();
+            }
+        }
+        assert_eq!(mock.requests.lock().unwrap().len(), 4);
+        crate::util::env::with_vars(&[("MYDB_AI_MEMORY_LIMIT_MB", Some("1"))], || {
+            assert_error(
+                engine,
+                session,
+                &format!("SELECT AI_EMBED_DETAIL('test.batch_local_4096',JSON_ARRAY({inputs}))"),
+                ER_AI_BUDGET_EXCEEDED,
+            );
+        });
+        assert_eq!(mock.requests.lock().unwrap().len(), 4);
+        assert_idle();
+    });
+}
+
+#[test]
+fn ai_audit_routine_creation_rejects_external_calls() {
+    with_mock(|mock, _, engine, session| {
+        exec(engine, session, "CREATE TABLE audit_source (id INT)");
+        for sql in [
+            "CREATE PROCEDURE audit_p() BEGIN SELECT AI_GENERATE('test.chat','x'); END",
+            "CREATE PROCEDURE audit_p() BEGIN IF 1 THEN SET @x=AI_GENERATE('test.chat','x'); END IF; END",
+            "CREATE PROCEDURE audit_p() BEGIN DECLARE c CURSOR FOR SELECT AI_GENERATE('test.chat','x'); END",
+            "CREATE PROCEDURE audit_p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET @x=AI_GENERATE('test.chat','x'); SELECT 1; END",
+            "CREATE TRIGGER audit_t BEFORE INSERT ON audit_source FOR EACH ROW SET @x=AI_GENERATE('test.chat','x')",
+            "CREATE EVENT audit_e ON SCHEDULE EVERY 1 DAY DO SELECT AI_GENERATE('test.chat','x')",
+            "CREATE FUNCTION audit_f() RETURNS TEXT RETURN AI_GENERATE('test.chat','x')",
+            "CREATE PROCEDURE audit_p() BEGIN DECLARE x TEXT DEFAULT AI_GENERATE('test.chat','x'); END",
+        ] {
+            assert_error(engine,session,sql,ER_AI_UNSUPPORTED_CONTEXT);
+        }
+        exec(
+            engine,
+            session,
+            "CREATE PROCEDURE audit_ok() SELECT 'AI_GENERATE' AS label",
+        );
+        exec(engine, session, "CALL audit_ok()");
+        exec(engine,session, "CREATE PROCEDURE audit_dynamic() BEGIN SET @sql='SELECT AI_GENERATE(''test.chat'',''x'')'; PREPARE audit_stmt FROM @sql; EXECUTE audit_stmt; END");
+        assert_error(
+            engine,
+            session,
+            "CALL audit_dynamic()",
+            ER_AI_UNSUPPORTED_CONTEXT,
+        );
+        assert!(mock.requests.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn ai_audit_incomplete_finish_reason() {
+    let cases = [
+        ("ollama", json!({"done":false}), "incomplete"),
+        (
+            "ollama",
+            json!({"done":true,"done_reason":"length","message":{"role":"assistant","content":"partial"}}),
+            "length",
+        ),
+        (
+            "openai_chat",
+            json!({"choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":"length"}]}),
+            "length",
+        ),
+        (
+            "openai_chat",
+            json!({"choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":"unknown"}]}),
+            "incomplete",
+        ),
+        (
+            "openai_responses",
+            json!({"status":"in_progress"}),
+            "incomplete",
+        ),
+        ("openai_responses", json!({"status":"failed"}), "incomplete"),
+        (
+            "openai_responses",
+            json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+            "length",
+        ),
+        (
+            "openai_responses",
+            json!({"status":"incomplete","incomplete_details":{"reason":"unknown"}}),
+            "incomplete",
+        ),
+    ];
+    for (protocol, response, expected) in cases {
+        let mock = Mock::responding(move |_, _| reply(200, response.to_string(), &[]));
+        with_provider(&mock, |_, _, engine, session| {
+            exec(
+                engine,
+                session,
+                &format!(
+                    "CREATE AI CONNECTION reason_conn WITH CONFIG '{}'",
+                    json!({"protocol":protocol,"base_url":format!("http://127.0.0.1:{}",mock.port),"auth":{"type":"none"}})
+                ),
+            );
+            exec(
+                engine,
+                session,
+                r#"CREATE AI MODEL test.reason_model USING reason_conn WITH CONFIG '{"kind":"text_generation","remote_model":"mock","model_revision":"v1"}'"#,
+            );
+            let result = json_result(exec(
+                engine,
+                session,
+                r#"SELECT AI_GENERATE_DETAIL('test.reason_model','x','{"on_error":"return"}')"#,
+            ));
+            assert_eq!(result["error"]["code"], "ER_AI_INCOMPLETE");
+            assert_eq!(result["finish_reason"], expected, "{protocol}");
+            assert!(result["text"].is_null());
+            assert_idle();
+        });
+    }
+}

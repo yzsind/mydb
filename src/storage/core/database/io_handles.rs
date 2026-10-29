@@ -663,8 +663,6 @@ impl Database {
             }};
         }
         rebind!(self.index_cache, keys);
-        rebind!(self.spatial_rtree_cache, keys);
-        rebind!(self.index_mutation_generations, keys);
         let graph_keys = keys
             .iter()
             .map(|((sid, old), (_, new))| {
@@ -689,8 +687,6 @@ impl Database {
             self.invalidate_storage_handle_open_epoch(table_id);
             cache.remove(&key)
         };
-        self.spatial_rtree_cache.write().remove(&key);
-        self.index_mutation_generations.write().remove(&key);
         if let Some(index) = index {
             index.write().discard_without_flush();
         }
@@ -1033,9 +1029,6 @@ impl Database {
         let index = index.write();
         index.ensure_healthy()?;
         let result = f(&index);
-        if result.is_ok() {
-            self.bump_index_mutation_generation(table_id, index_name);
-        }
         result
     }
 
@@ -1053,31 +1046,7 @@ impl Database {
         let index = index.read();
         index.ensure_healthy()?;
         let result = f(&index);
-        if result.is_ok() {
-            self.bump_index_mutation_generation(table_id, index_name);
-        }
         result
-    }
-
-    fn bump_index_mutation_generation(&self, table_id: u64, index_name: &str) {
-        // Only a derived spatial projection consumes this generation. Register
-        // it before the first projection scan (see spatial_search), rather than
-        // serializing every ordinary B-tree write on this global map.
-        let generations = self.index_mutation_generations.read();
-        if generations.is_empty() {
-            return;
-        }
-        let key = (table_id, normalize_name(index_name));
-        if !generations.contains_key(&key) {
-            return;
-        }
-        drop(generations);
-        let mut generations = self.index_mutation_generations.write();
-        // DDL may have removed the registration while the read lock was
-        // released. Do not resurrect a dropped index's generation.
-        if let Some(generation) = generations.get_mut(&key) {
-            *generation = generation.wrapping_add(1).max(1);
-        }
     }
 
     /// Phase 2: read-only access to an `IndexFile`. Multiple readers run
@@ -1490,10 +1459,57 @@ impl Database {
         self.persist_auto_increment_state(&state, version, max_value)
     }
 
+    fn spatial_index_named(&self, table_id: u64, name: &str) -> bool {
+        if let Some(names) = self
+            .reorg_storage_locs
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&table_id).and_then(|l| l.spatial_indexes.clone()))
+        {
+            return names.contains(normalize_name_cow(name).as_ref());
+        }
+        if let Some(table) = self.table_by_id(table_id) {
+            return table
+                .indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(name) && i.is_spatial());
+        }
+        let location = self
+            .reorg_storage_locs
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&table_id).cloned());
+        location.is_some_and(|loc| {
+            self.catalog
+                .read()
+                .ok()
+                .and_then(|c| {
+                    c.tables
+                        .get(&crate::storage::naming::table_key(
+                            &loc.database,
+                            &loc.table_name,
+                        ))
+                        .cloned()
+                })
+                .is_some_and(|t| {
+                    t.indexes
+                        .iter()
+                        .any(|i| i.name.eq_ignore_ascii_case(name) && i.is_spatial())
+                })
+        })
+    }
+
     fn index_path(&self, table_id: u64, index_name: &str) -> PathBuf {
         if is_temp_table_id(table_id) {
-            return crate::storage::naming::temp_indexes_dir(&self.data_dir)
-                .join(format!("{table_id}_{}.idx", sanitize_name(index_name)));
+            return crate::storage::naming::temp_indexes_dir(&self.data_dir).join(format!(
+                "{table_id}_{}.{}",
+                sanitize_name(index_name),
+                if self.spatial_index_named(table_id, index_name) {
+                    "rtree"
+                } else {
+                    "idx"
+                }
+            ));
         }
         let private_index_id = self.reorg_storage_locs.lock().ok().and_then(|map| {
             map.get(&table_id)
@@ -1554,7 +1570,11 @@ impl Database {
             table_id,
             self.storage_generation(table_id),
             index_id,
-            "idx",
+            if self.spatial_index_named(table_id, index_name) {
+                "rtree"
+            } else {
+                "idx"
+            },
         )
     }
 
@@ -1565,8 +1585,19 @@ impl Database {
         index_name: &str,
     ) -> PathBuf {
         if is_temp_table_id(table_id) {
-            return crate::storage::naming::temp_indexes_dir(&self.data_dir)
-                .join(format!("{table_id}_{}.idx", sanitize_name(index_name)));
+            return crate::storage::naming::temp_indexes_dir(&self.data_dir).join(format!(
+                "{table_id}_{}.{}",
+                sanitize_name(index_name),
+                if table
+                    .indexes
+                    .iter()
+                    .any(|index| index.name.eq_ignore_ascii_case(index_name) && index.is_spatial())
+                {
+                    "rtree"
+                } else {
+                    "idx"
+                }
+            ));
         }
         let index_id = table
             .indexes
@@ -1579,7 +1610,15 @@ impl Database {
             table_id,
             table.active_generation.max(1),
             index_id,
-            "idx",
+            if table
+                .indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(index_name) && i.is_spatial())
+            {
+                "rtree"
+            } else {
+                "idx"
+            },
         )
     }
 

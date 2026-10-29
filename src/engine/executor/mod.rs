@@ -897,7 +897,7 @@ fn maybe_log_binlog_ddl_lazy(
         && !crate::binlog::current_ddl_transaction_staged()
     {
         let _sql_log_bin_guard = crate::binlog::SessionSqlLogBinGuard::new(session.sql_log_bin);
-        let normalized = credential_safe_binlog_sql(db, session, &normalize_sql(sql))?;
+        let normalized = credential_safe_binlog_sql(db, session, sql)?;
         let ctx = binlog_ctx_from_session(session);
         crate::binlog::record_ddl_autocommit_with(&session.current_database, &normalized, &ctx)?;
     }
@@ -1004,6 +1004,42 @@ fn alter_users_shared_options_sql(sql: &str) -> Result<&str, QueryError> {
     Ok(&sql[tokens.get(idx).map_or(sql.len(), |token| token.span.start)..])
 }
 
+fn create_users_shared_options_sql(sql: &str) -> Result<&str, QueryError> {
+    use crate::sql_lex::{SqlLexMode, SqlTokenCursor, SqlTokenKind};
+    let mut cursor = SqlTokenCursor::new(
+        sql,
+        SqlLexMode::from_parser_bits(crate::parser::current_parser_sql_mode_bits()),
+        crate::parser::MYSQL_VERSION_ID,
+    );
+    while let Some(token) = cursor.next().map_err(|_| {
+        crate::error::catalog::ER_PARSE_ERROR.error("Cannot locate CREATE USER options")
+    })? {
+        if token.kind != SqlTokenKind::Word
+            || ![
+                "REQUIRE",
+                "WITH",
+                "PASSWORD",
+                "ACCOUNT",
+                "ATTRIBUTE",
+                "COMMENT",
+                "FAILED_LOGIN_ATTEMPTS",
+                "PASSWORD_LOCK_TIME",
+                "DEFAULT",
+            ]
+            .iter()
+            .any(|word| cursor.token_text(&token).eq_ignore_ascii_case(word))
+        {
+            continue;
+        }
+        let tail = &sql[token.span.start..];
+        if matches!(parse_statement(&format!("CREATE USER __binlog_options__ {tail}")), Ok(Statement::CreateUser(create)) if create.accounts.len() == 1)
+        {
+            return Ok(tail);
+        }
+    }
+    Ok("")
+}
+
 /// Account DDL must never put cleartext credentials in QUERY_EVENT. MySQL
 /// rewrites successful CREATE/ALTER USER and SET PASSWORD statements to the
 /// plugin hash before binlogging; rebuild that replay SQL from the committed
@@ -1013,11 +1049,143 @@ fn credential_safe_binlog_sql(
     session: &SessionContext,
     sql: &str,
 ) -> Result<String, QueryError> {
-    let Ok(statement) = parse_statement(sql) else {
+    credential_safe_binlog_sql_from_catalog(&db.auth_catalog(), &session.authenticated_as, sql)
+}
+
+fn ddl_binlog_source_sql(sql: &str, statement: &Statement) -> String {
+    if matches!(
+        statement,
+        Statement::CreateUser(_)
+            | Statement::AlterUser(_)
+            | Statement::AlterUsers(_)
+            | Statement::SetPassword { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::DropUser { .. }
+            | Statement::RenameUser { .. }
+            | Statement::Grant(_)
+            | Statement::Revoke(_)
+            | Statement::SetDefaultRole(_)
+    ) {
+        sql.to_string()
+    } else {
+        normalize_sql(sql)
+    }
+}
+
+fn bind_binlog_account_targets(
+    sql: &str,
+    targets: &[crate::parser::AccountIdent],
+    grant: bool,
+    roles: bool,
+    account: &AccountKey,
+) -> Result<String, QueryError> {
+    use crate::sql_lex::{SqlLexMode, SqlTokenCursor, SqlTokenKind};
+    let count = targets
+        .iter()
+        .filter(|target| target.user == "CURRENT_USER()" && target.host.is_empty())
+        .count();
+    if count == 0 {
         return Ok(sql.to_string());
+    }
+    let mut cursor = SqlTokenCursor::new(
+        sql,
+        SqlLexMode::from_parser_bits(crate::parser::current_parser_sql_mode_bits()),
+        crate::parser::MYSQL_VERSION_ID,
+    );
+    let mut tokens = Vec::new();
+    while let Some(token) = cursor.next().map_err(|_| {
+        crate::error::catalog::ER_PARSE_ERROR.error("Cannot bind binary-log account targets")
+    })? {
+        tokens.push(token);
+    }
+    let delimiter = if grant { "TO" } else { "FROM" };
+    let prefix = match (grant, roles) {
+        (true, true) => "GRANT placeholder TO ",
+        (false, true) => "REVOKE placeholder FROM ",
+        (true, false) => "GRANT USAGE ON *.* TO ",
+        (false, false) => "REVOKE SELECT ON *.* FROM ",
     };
+    let start = tokens
+        .iter()
+        .position(|token| {
+            if token.kind != SqlTokenKind::Word
+                || !sql[token.span.clone()].eq_ignore_ascii_case(delimiter)
+            {
+                return false;
+            }
+            // Parsing the suffix distinguishes the delimiter from identically
+            // named roles, objects, accounts, or hosts in earlier productions.
+            match parse_statement(&format!("{prefix}{}", &sql[token.span.end..])) {
+                Ok(Statement::Grant(parsed)) => parsed.targets == targets,
+                Ok(Statement::Revoke(parsed)) => parsed.targets == targets,
+                _ => false,
+            }
+        })
+        .ok_or_else(|| {
+            crate::error::catalog::ER_PARSE_ERROR.error("Cannot locate binary-log account targets")
+        })?;
+    let mut result = String::with_capacity(sql.len());
+    let mut copied = 0;
+    let mut bound = 0;
+    for (i, token) in tokens.iter().enumerate().skip(start + 1) {
+        if bound == count {
+            break;
+        }
+        if token.kind != SqlTokenKind::Word
+            || !sql[token.span.clone()].eq_ignore_ascii_case("CURRENT_USER")
+            || tokens
+                .get(i.wrapping_sub(1))
+                .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'@'))
+            || tokens
+                .get(i + 1)
+                .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'@'))
+        {
+            continue;
+        }
+        let end = if tokens
+            .get(i + 1)
+            .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'('))
+        {
+            tokens
+                .get(i + 2)
+                .filter(|token| token.kind == SqlTokenKind::Symbol(b')'))
+                .map_or(token.span.end, |token| token.span.end)
+        } else {
+            token.span.end
+        };
+        result.push_str(&sql[copied..token.span.start]);
+        result.push_str(&account.display());
+        copied = end;
+        bound += 1;
+    }
+    if bound != count {
+        return Err(crate::error::catalog::ER_PARSE_ERROR
+            .error("Cannot resolve binary-log account targets"));
+    }
+    result.push_str(&sql[copied..]);
+    Ok(result)
+}
+
+pub(crate) fn credential_safe_binlog_sql_from_catalog(
+    auth: &crate::engine::auth::AuthCatalog,
+    account: &AccountKey,
+    sql: &str,
+) -> Result<String, QueryError> {
+    let session = SessionContext {
+        authenticated_as: account.clone(),
+        ..SessionContext::default()
+    };
+    let statement = parse_statement(sql).map_err(|_| {
+        error(
+            crate::error::catalog::ER_PARSE_ERROR,
+            "Cannot safely rewrite DDL for the binary log",
+        )
+    })?;
     let account_sql = |account: &AccountKey| -> Result<String, QueryError> {
-        let QueryResponse::ResultSet(result) = show_create_user_result(db, account)? else {
+        let QueryResponse::ResultSet(result) =
+            crate::engine::show::show_create_user_from_catalog(auth, account)?
+        else {
             unreachable!("SHOW CREATE USER returns a result set")
         };
         result
@@ -1033,6 +1201,20 @@ fn credential_safe_binlog_sql(
             })
     };
     match statement {
+        Statement::Grant(grant) => bind_binlog_account_targets(
+            sql,
+            &grant.targets,
+            true,
+            matches!(grant.kind, crate::parser::GrantKind::Roles(_)),
+            account,
+        ),
+        Statement::Revoke(revoke) => bind_binlog_account_targets(
+            sql,
+            &revoke.targets,
+            false,
+            matches!(revoke.kind, crate::parser::GrantKind::Roles(_)),
+            account,
+        ),
         Statement::CreateUser(create) => {
             let mut rendered = create
                 .accounts
@@ -1047,31 +1229,18 @@ fn credential_safe_binlog_sql(
                     sql
                 });
             }
-            let tail_start = |value: &str| {
-                [
-                    " REQUIRE ",
-                    " WITH ",
-                    " PASSWORD ",
-                    " ACCOUNT ",
-                    " ATTRIBUTE ",
-                ]
-                .into_iter()
-                .filter_map(|marker| value.find(marker))
-                .min()
-                .unwrap_or(value.len())
+            // IF NOT EXISTS may skip the last account, whose existing policy
+            // can differ from the policy applied to newly created accounts.
+            let options = create_users_shared_options_sql(sql)?;
+            let tail = if options.is_empty() {
+                String::new()
+            } else {
+                format!(" {options}")
             };
-            let tail_pos = tail_start(rendered.last().expect("non-empty CREATE USER"));
-            let tail = rendered.last().unwrap()[tail_pos..].to_string();
             let accounts = rendered
                 .iter()
-                .map(|value| {
-                    let end = tail_start(value);
-                    value[..end]
-                        .strip_prefix("CREATE USER ")
-                        .unwrap_or(&value[..end])
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
+                .map(|value| auth_account_prefix(value))
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             let if_not_exists = if create.if_not_exists {
                 " IF NOT EXISTS"
@@ -1133,11 +1302,11 @@ fn credential_safe_binlog_sql(
         }
         Statement::SetPassword { account, .. } => {
             let account = account
-                .map(|account| dispatch::show_account_key(&account, session))
+                .map(|account| dispatch::show_account_key(&account, &session))
                 .unwrap_or_else(|| session.authenticated_as.clone());
             Ok(account_sql(&account)?.replacen("CREATE USER", "ALTER USER", 1))
         }
-        _ => Ok(sql.to_string()),
+        _ => Ok(ddl_binlog_source_sql(sql, &statement)),
     }
 }
 
@@ -2585,6 +2754,7 @@ impl StorageQueryEngine {
         ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata),
     ) -> Result<QueryResponse, QueryError> {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         self.db.ensure_operational()?;
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
@@ -2597,6 +2767,11 @@ impl StorageQueryEngine {
             crate::engine::cbo::trace::activate(session.connection_id, trace_enabled);
         crate::engine::cbo::trace::begin(sql);
         let preserve_warnings = begin_statement_diagnostics(session, sql);
+        if !preserve_warnings {
+            session
+                .warnings
+                .set_limit(session.sysvars.max_error_count as usize);
+        }
         let warning_scope = crate::engine::api::StatementWarningSinkScope::enter();
         let _executor_tuning = crate::engine::executor::tuning::enter(
             crate::engine::executor::tuning::ExecutorTuningSnapshot::capture_for_session(
@@ -2604,6 +2779,10 @@ impl StorageQueryEngine {
             ),
         );
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         crate::engine::cancel::set_process_base_state(process_state_for_sql(sql));
         // LOAD_FILE is evaluated only on this connection thread and reads the
@@ -2637,7 +2816,8 @@ impl StorageQueryEngine {
         // the statement serial when it references a sequence function.
         let _force_serial = (sequence_dependent
             || crate::planner::sql_mentions_user_var_assign(sql)
-            || crate::planner::sql_mentions_load_file_fn(sql))
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
         // Publish the session's `group_concat_max_len` to the
         // thread-local that `GroupConcatAcc::new` reads. Scoped via
@@ -2804,7 +2984,14 @@ fn enforce_tls_requirement(
             issuer,
             subject,
         } => {
-            enforce_tls_requirement(&SslRequirement::X509, request)?;
+            enforce_tls_requirement(
+                if issuer.is_some() || subject.is_some() {
+                    &SslRequirement::X509
+                } else {
+                    &SslRequirement::Ssl
+                },
+                request,
+            )?;
             if let Some(required) = cipher {
                 if !request
                     .tls_cipher
@@ -3174,6 +3361,7 @@ impl StorageQueryEngine {
     }
 
     pub fn shutdown(&self) -> Result<(), QueryError> {
+        crate::engine::http::shutdown_database(&self.db)?;
         crate::engine::ai::runtime::shutdown_database(&self.db)?;
         crate::backup::shutdown_jobs(&self.db)?;
         // No background writer may race the final checkpoint. In
@@ -3270,6 +3458,10 @@ impl StorageQueryEngine {
 }
 
 impl QueryEngine for StorageQueryEngine {
+    fn sql_may_call_http(&self, sql: &str) -> bool {
+        crate::engine::http::may_call(&self.db, sql)
+    }
+
     fn enter_memory_reclaim_scope(&self) -> Option<mem_budget::ReclaimDatabaseScope> {
         Some(mem_budget::ReclaimDatabaseScope::enter(&self.db))
     }
@@ -3286,7 +3478,14 @@ impl QueryEngine for StorageQueryEngine {
 
     fn row_lock_async_signal(&self) -> Option<crate::engine::api::AsyncRowLockSignal> {
         let target = crate::storage::take_nonblocking_row_wait_target()?;
-        Some(self.db.subscribe_row_lock_async_signal(target))
+        if self.db.lock_wait_timeout() < std::time::Duration::from_millis(50) {
+            return None;
+        }
+        self.db.subscribe_row_lock_async_signal(target)
+    }
+
+    fn row_lock_async_ready(&self, signal: &crate::engine::api::AsyncRowLockSignal) -> bool {
+        self.db.async_row_lock_ready(signal.target)
     }
 
     fn execute(
@@ -3307,6 +3506,9 @@ impl QueryEngine for StorageQueryEngine {
         Vec<crate::engine::api::DmlStatementResult>,
         Result<QueryResponse, QueryError>,
     )> {
+        if crate::engine::http::may_call(&self.db, sql) {
+            return None;
+        }
         // The compiled batch bypasses execute_with_log_metadata, which normally
         // installs the session timeout for the coalesced row-lock acquisition.
         let _lock_wait = crate::storage::LockWaitTimeoutGuard::new(Some(
@@ -3425,6 +3627,7 @@ impl QueryEngine for StorageQueryEngine {
         expected_param_count: usize,
     ) -> Result<Arc<Statement>, QueryError> {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         // The parser cache owns an unqualified immutable AST. Qualification is
         // intentionally repeated at PREPARE time so temporary-table shadowing
@@ -3439,6 +3642,10 @@ impl QueryEngine for StorageQueryEngine {
                     "placeholder count mismatch: parsed {next}, expected {expected_param_count}"
                 ),
             ));
+        }
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
         }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         crate::engine::cancel::set_process_base_state(
@@ -3483,6 +3690,7 @@ impl QueryEngine for StorageQueryEngine {
                     format!("placeholder count mismatch: parsed {count}, expected {expected_param_count}"),
                 ));
             }
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             crate::engine::cancel::set_process_base_state(
                 crate::engine::session_registry::ProcessState::Preparing,
@@ -3539,6 +3747,18 @@ impl QueryEngine for StorageQueryEngine {
         self.db.with_auth_catalog(|auth| {
             auth.match_account(username, host)
                 .map(|account| account.plugin.clone())
+        })
+    }
+
+    fn auth_account_has_password(&self, username: &str, host: &str) -> Result<bool, QueryError> {
+        self.db.with_auth_catalog(|auth| {
+            auth.match_account(username, host).is_some_and(|account| {
+                !account.authentication_string.is_empty()
+                    && account
+                        .secondary_authentication_string
+                        .as_ref()
+                        .is_none_or(|password| !password.is_empty())
+            })
         })
     }
 
@@ -3602,7 +3822,7 @@ impl QueryEngine for StorageQueryEngine {
                     .expect("verified secondary credential")
             },
         );
-        login.finish(effective_expired)
+        login.finish(effective_expired, request.replacing_account)
     }
 
     fn is_in_auth_cache(&self, username: &str, peer_host: &str) -> bool {
@@ -3704,7 +3924,7 @@ impl QueryEngine for StorageQueryEngine {
             return Err(access_denied(request.username, request.host));
         }
         let effective_expired = login.validate_verified(request.username, &request)?;
-        login.finish(effective_expired)
+        login.finish(effective_expired, request.replacing_account)
     }
 
     fn kill_session(&self, session: &SessionContext, connection_id: u32) -> Result<(), QueryError> {
@@ -3767,6 +3987,7 @@ impl QueryEngine for StorageQueryEngine {
             return result;
         }
         if let Statement::LoadData(stmt) = statement {
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             // Install the session expr view so storage-side `coerce_row`
             // and the general LOAD path see the real sql_mode (G4). The
@@ -3835,6 +4056,7 @@ impl QueryEngine for StorageQueryEngine {
             )
         };
         let result = if let Statement::LoadData(stmt) = statement {
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             let session_ptr = std::ptr::NonNull::from(&*session);
             let result = unsafe {
@@ -3897,9 +4119,14 @@ impl QueryEngine for StorageQueryEngine {
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         let preserve_warnings = begin_statement_diagnostics(session, sql);
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         // SAFETY: db/session outlive this statement, including the constant
         // SELECT lane that bypasses dispatch. Sequence calls remain serial.
@@ -3918,7 +4145,8 @@ impl QueryEngine for StorageQueryEngine {
         };
         let _force_serial = (sequence_dependent
             || crate::planner::sql_mentions_user_var_assign(sql)
-            || crate::planner::sql_mentions_load_file_fn(sql))
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
         let (result, metadata) = match statement.as_ref() {
             Statement::Select(select)
@@ -4058,8 +4286,10 @@ impl QueryEngine for StorageQueryEngine {
                 std::ptr::NonNull::from(&*session),
             )
         };
-        let _force_serial = (sequence_dependent || crate::planner::sql_mentions_load_file_fn(sql))
-            .then(crate::planner::force_serial_scope);
+        let _force_serial = (sequence_dependent
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
+        .then(crate::planner::force_serial_scope);
         // Prepared-statement EXECUTE bypasses `execute_statement` (which is
         // where L8 quota enforcement normally runs). Charge the per-account
         // budget here so sqlx / Connector/J prepared-binding apps don't sneak
@@ -4102,6 +4332,10 @@ impl QueryEngine for StorageQueryEngine {
         }
         let use_shared_plan_cache =
             should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement);
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if crate::engine::http::may_call(&self.db, sql) {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         let result = if use_shared_plan_cache && !statement_skips_plan_cache_hint(&statement) {
             // Prepared statements feed the plan cache through the same hint
@@ -4161,8 +4395,9 @@ impl QueryEngine for StorageQueryEngine {
         // Sequence evaluation mutates live session/durable state. Route it
         // through the ordinary statement lane, which drains under that scope,
         // and keep the read-only prepared fast path unchanged.
-        if crate::planner::sql_mentions_sequence_fn(sql)
-            || crate::engine::ai::sql::sql_may_have_ai(sql)
+        let traits = crate::engine::perf_events::prepared_sql_traits(sql)
+            .unwrap_or_else(|| crate::engine::perf_events::SqlTextTraits::of(sql));
+        if traits.sequence_fn || traits.may_have_ai || crate::engine::http::may_call(&self.db, sql)
         {
             return None;
         }
@@ -4311,6 +4546,9 @@ impl QueryEngine for StorageQueryEngine {
         session: &mut SessionContext,
         sql: &str,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if crate::engine::http::may_call(&self.db, sql) {
+            return None;
+        }
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let parse_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
         let statement = {
@@ -4370,10 +4608,15 @@ impl QueryEngine for StorageQueryEngine {
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         self.db.ensure_operational()?;
         let preserve_warnings = begin_statement_diagnostics(session, sql);
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
+        if _http_dependent {
+            crate::engine::http::activate();
+        }
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         // SAFETY: db/session outlive this statement, including the constant
         // SELECT lane that bypasses dispatch. Sequence calls remain serial.
@@ -4392,7 +4635,8 @@ impl QueryEngine for StorageQueryEngine {
         };
         let _force_serial = (sequence_dependent
             || crate::planner::sql_mentions_user_var_assign(sql)
-            || crate::planner::sql_mentions_load_file_fn(sql))
+            || crate::planner::sql_mentions_load_file_fn(sql)
+            || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
         let Statement::Select(select) = statement.as_ref() else {
             return self.execute_parsed(session, sql, statement);
@@ -4440,6 +4684,7 @@ impl StorageQueryEngine {
         }
         let preserve_warnings = begin_statement_diagnostics(session, sql);
         let started = Instant::now();
+        let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         // SAFETY: db/session outlive this statement, including the constant
         // SELECT lane that bypasses dispatch. Sequence calls remain serial.
@@ -4554,9 +4799,20 @@ impl StorageQueryEngine {
         // the session into the shared-borrow execution closure below.
         let (txn, _snapshot_guard) = tx::prepared_select_read_view(&self.db, session, select)?;
         let connection_id = session.connection_id as u64;
+        let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
         let result = crate::engine::params::with_params_slice(params, || {
             crate::engine::expr::with_session_expr_info(session, || {
+                if crate::engine::params::auto_parameterized_active()
+                    && params.iter().any(|value| {
+                        matches!(
+                            value,
+                            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                        )
+                    })
+                {
+                    select::validate_cached_temporal_literals(&self.db, select)?;
+                }
                 // Compiled plans bypass execute_select, including its registry scope.
                 // A business-table plan can still scan system tables in joins/subqueries.
                 select::with_session_registry((*self.registry).clone(), || {
@@ -4602,6 +4858,9 @@ impl StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if crate::engine::http::may_call(&self.db, sql) {
+            return None;
+        }
         use crate::engine::api::PreparedDmlState;
         if !self.plan_cache_enabled || !prepared_dml_cache_enabled() {
             return None;
@@ -4725,6 +4984,7 @@ impl StorageQueryEngine {
             if let Err(err) = session.check_cancelled() {
                 return (Err(err), wait_stats);
             }
+            let _http_scope = crate::engine::http::enter(&self.db);
             let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
             // SAFETY: `session` lives for the entire duration of this
             // function — we hold the `&mut SessionContext` parameter on
@@ -4746,7 +5006,14 @@ impl StorageQueryEngine {
                             dp,
                             connection_id,
                         )
-                        .and_then(QueryResponse::materialize)
+                        .and_then(|response| match response {
+                            // A locking read's rows are already owned; only its
+                            // column metadata is shared. Deep-copying that here
+                            // also defeats the writer's pointer-identity check
+                            // against the prepared handle's cached metadata.
+                            QueryResponse::SharedResultSet(_) => Ok(response),
+                            response => response.materialize(),
+                        })
                     })
                 })
             };
@@ -4757,6 +5024,16 @@ impl StorageQueryEngine {
                         clear_session_lock_wait(&self.db, session);
                     }
                     return (Ok(resp), wait_stats);
+                }
+                Err(err) if is_lock_wait_pending(&err) && crate::engine::http::sent() => {
+                    clear_session_lock_wait(&self.db, session);
+                    let failure = crate::engine::http::error("ER_HTTP_REPLAY_FORBIDDEN", "lock wait requires replay after an HTTP send; external effects may have occurred");
+                    if let Err(cleanup) =
+                        self.finalize_failed_statement_transaction(session, &failure)
+                    {
+                        return (Err(cleanup), wait_stats);
+                    }
+                    return (Err(failure), wait_stats);
                 }
                 Err(err) if is_lock_wait_pending(&err) => {
                     waited_for_lock = true;
@@ -5314,8 +5591,14 @@ impl StorageQueryEngine {
                 std::ptr::NonNull::from(&self.db),
                 std::ptr::NonNull::from(&mut *session),
                 std::ptr::NonNull::from(self.registry.as_ref()),
+                false,
             )
         };
+        // Bind view output metadata through the same expansion used by
+        // EXECUTE; a view name is not a physical catalog table.
+        routines::with_view_function_binding(|| {
+            dispatch::expand_views(&self.db, session, &mut statement, 0)
+        })?;
         routines::resolve_stored_functions(&self.db, session, &mut statement, &self.registry)?;
         // DESCRIBE/PREPARE is a binding operation and must observe the same
         // type-affecting session state as EXECUTE. Previously this path ran
@@ -5517,6 +5800,7 @@ impl StorageQueryEngine {
         let mut metadata = QueryLogMetadata::default();
         let mut response = QueryResponse::Ok;
         while index < ranges.len() {
+            let _http_statement = crate::engine::http::fresh_statement();
             let range = ranges[index].clone();
             let _mode = crate::parser::ParserSqlModeGuard::activate(mode);
             let child_sql = &effective[range.clone()];
@@ -5701,8 +5985,9 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &normalize_sql(sql),
+                    &ddl_binlog_source_sql(sql, &statement),
                     &ctx,
+                    &session.authenticated_as,
                 )
             });
         if let Some((result, wait_stats)) =
@@ -5763,8 +6048,9 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &normalize_sql(sql),
+                    &ddl_binlog_source_sql(sql, &statement),
                     &ctx,
+                    &session.authenticated_as,
                 )
             });
         let (result, wait_stats) = self.execute_statement_with_lock_wait(session, statement);
@@ -5773,7 +6059,7 @@ impl StorageQueryEngine {
             session,
             is_ddl,
             binloggable_ddl,
-            &normalize_sql(sql),
+            sql,
             result,
         );
         drop(ddl_binlog_context);
@@ -5801,8 +6087,9 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &normalize_sql(sql),
+                    &ddl_binlog_source_sql(sql, &statement),
                     &ctx,
+                    &session.authenticated_as,
                 )
             });
         let already_qualified = !statement_refs_temp_table(session, &statement);
@@ -5813,7 +6100,7 @@ impl StorageQueryEngine {
             session,
             is_ddl,
             binloggable_ddl,
-            &normalize_sql(sql),
+            sql,
             result,
         );
         drop(ddl_binlog_context);
@@ -5943,6 +6230,16 @@ impl StorageQueryEngine {
                         clear_session_lock_wait(&self.db, session);
                     }
                     return (Ok(response), wait_stats);
+                }
+                Err(err) if is_lock_wait_pending(&err) && crate::engine::http::sent() => {
+                    clear_session_lock_wait(&self.db, session);
+                    let failure = crate::engine::http::error("ER_HTTP_REPLAY_FORBIDDEN", "lock wait requires replay after an HTTP send; external effects may have occurred");
+                    if let Err(cleanup) =
+                        self.finalize_failed_statement_transaction(session, &failure)
+                    {
+                        return (Err(cleanup), wait_stats);
+                    }
+                    return (Err(failure), wait_stats);
                 }
                 Err(err) if is_lock_wait_pending(&err) => {
                     waited_for_lock = true;
@@ -6230,7 +6527,7 @@ impl StorageQueryEngine {
                     session.current_database,
                     err.code(),
                     err.sql_state(),
-                    if crate::engine::ai::sql::sql_may_have_ai(sql) { "[redacted AI statement error]" } else { err.message() },
+                    if crate::engine::ai::sql::sql_may_have_ai(sql) || crate::engine::http::sensitive(sql) { crate::engine::http::redaction_marker(sql, true) } else { err.message() },
                 ));
             }
         }

@@ -20,6 +20,8 @@
 //!   T_DATE  (10)       -> uvarint(len) || len bytes  ("YYYY-MM-DD")
 //!   T_TIME  (11)       -> uvarint(len) || len bytes  ("[-]HH:MM:SS[.ffffff]")
 //!   T_DATETIME(12)     -> uvarint(len) || len bytes  ("YYYY-MM-DD HH:MM:SS[.ffffff]")
+//!   T_OPAQUE(13)      -> uvarint(len) || mysql_type(u8) || raw bytes
+//!   T_TIMESTAMP(14)   -> uvarint(len) || canonical datetime text
 //! ```
 //!
 //! Tags 9-12 are *additive*: they never come from a `serde_json` DOM (which
@@ -54,6 +56,8 @@ pub(super) const T_DECIMAL: u8 = 9;
 pub(super) const T_DATE: u8 = 10;
 pub(super) const T_TIME: u8 = 11;
 pub(super) const T_DATETIME: u8 = 12;
+pub(super) const T_OPAQUE: u8 = 13;
+pub(super) const T_TIMESTAMP: u8 = 14;
 
 /// The MySQL `JSON_TYPE()` classification of a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,8 @@ pub(crate) enum JsonType {
     Date,
     Time,
     Datetime,
+    Timestamp,
+    Opaque,
 }
 
 impl JsonType {
@@ -89,6 +95,8 @@ impl JsonType {
             JsonType::Date => "DATE",
             JsonType::Time => "TIME",
             JsonType::Datetime => "DATETIME",
+            JsonType::Timestamp => "TIMESTAMP",
+            JsonType::Opaque => "OPAQUE",
         }
     }
 
@@ -115,7 +123,8 @@ impl JsonType {
             // "… < boolean < (date/time/datetime)" ascending order.
             JsonType::Date => 6,
             JsonType::Time => 7,
-            JsonType::Datetime => 8,
+            JsonType::Datetime | JsonType::Timestamp => 8,
+            JsonType::Opaque => 9,
         }
     }
 }
@@ -335,7 +344,7 @@ impl<'a> JsonbRef<'a> {
             T_NULL | T_TRUE | T_FALSE => 1,
             T_I64 | T_U64 | T_F64 => 9,
             // All length-prefixed text scalars share the string layout.
-            T_STRING | T_DECIMAL | T_DATE | T_TIME | T_DATETIME => {
+            T_STRING | T_DECIMAL | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP | T_OPAQUE => {
                 let mut p = 1;
                 let len = usize::try_from(read_uvarint(b, &mut p)?).map_err(|_| {
                     json_err(
@@ -343,6 +352,9 @@ impl<'a> JsonbRef<'a> {
                         "jsonb text length exceeds addressable memory",
                     )
                 })?;
+                if tag == T_OPAQUE && len == 0 {
+                    return Err(super::invalid_json_text(1, "opaque JSON"));
+                }
                 p.checked_add(len).ok_or_else(|| {
                     json_err(
                         crate::error::catalog::ER_INVALID_JSON_TEXT,
@@ -406,7 +418,28 @@ impl<'a> JsonbRef<'a> {
             T_DATE => JsonType::Date,
             T_TIME => JsonType::Time,
             T_DATETIME => JsonType::Datetime,
+            T_TIMESTAMP => JsonType::Timestamp,
+            T_OPAQUE => JsonType::Opaque,
             _ => JsonType::Object,
+        }
+    }
+
+    pub(crate) fn opaque_value(&self) -> Option<(u8, &'a [u8])> {
+        if self.tag() != T_OPAQUE {
+            return None;
+        }
+        let mut pos = 1;
+        let len = usize::try_from(read_uvarint(self.bytes, &mut pos).ok()?).ok()?;
+        let payload = self.bytes.get(pos..pos.checked_add(len)?)?;
+        Some((*payload.first()?, &payload[1..]))
+    }
+
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self.opaque_value().map(|(ty, _)| ty) {
+            Some(15 | 249..=254) => "BLOB",
+            Some(16) => "BIT",
+            Some(255) => "GEOMETRY",
+            _ => self.json_type().as_str(),
         }
     }
 
@@ -415,7 +448,7 @@ impl<'a> JsonbRef<'a> {
     /// the JSON-string-like tags.
     fn text_payload(&self) -> Option<&'a str> {
         match self.tag() {
-            T_STRING | T_DECIMAL | T_DATE | T_TIME | T_DATETIME => {
+            T_STRING | T_DECIMAL | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP => {
                 let mut p = 1;
                 let len = usize::try_from(read_uvarint(self.bytes, &mut p).ok()?).ok()?;
                 let end = p.checked_add(len)?;
@@ -527,7 +560,7 @@ impl<'a> JsonbRef<'a> {
     /// excluded here and handled through the numeric accessors.
     pub(crate) fn as_str(&self) -> Option<&'a str> {
         match self.tag() {
-            T_STRING | T_DATE | T_TIME | T_DATETIME => self.text_payload(),
+            T_STRING | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP => self.text_payload(),
             _ => None,
         }
     }
@@ -636,8 +669,14 @@ impl<'a> JsonbRef<'a> {
                 .unwrap_or_else(|| {
                     Json::String(self.text_payload().unwrap_or_default().to_string())
                 }),
-            T_STRING | T_DATE | T_TIME | T_DATETIME => {
+            T_STRING | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP => {
                 Json::String(self.text_payload().unwrap_or_default().to_string())
+            }
+            T_OPAQUE => {
+                let (ty, data) = self
+                    .opaque_value()
+                    .ok_or_else(|| super::invalid_json_text(1, "opaque JSON"))?;
+                Json::String(super::opaque_text(ty, data))
             }
             T_ARRAY => {
                 let mut arr = Vec::new();
@@ -675,8 +714,13 @@ impl<'a> JsonbRef<'a> {
             // A decimal renders as a bare number (`3.14`); a temporal renders
             // as a quoted string (`"2020-01-02"`) — MySQL's JSON text form.
             T_DECIMAL => out.push_str(self.text_payload().unwrap_or("0")),
-            T_STRING | T_DATE | T_TIME | T_DATETIME => {
+            T_STRING | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP => {
                 write_json_string(self.text_payload().unwrap_or_default(), out)
+            }
+            T_OPAQUE => {
+                if let Some((ty, data)) = self.opaque_value() {
+                    write_json_string(&super::opaque_text(ty, data), out);
+                }
             }
             T_ARRAY => {
                 out.push('[');

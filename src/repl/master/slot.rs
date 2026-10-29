@@ -62,6 +62,9 @@ pub struct SlotState {
     /// must leave the semi-sync quorum immediately.
     #[serde(default)]
     pub connected: bool,
+    /// In-flight base backup owns a retention lease until streaming starts.
+    #[serde(skip)]
+    pub seeding: bool,
 }
 
 impl SlotState {
@@ -74,6 +77,7 @@ impl SlotState {
             first_registered_ms: now_ms,
             status: SlotStatus::Active,
             connected: true,
+            seeding: false,
         }
     }
 }
@@ -144,6 +148,7 @@ impl SlotHandle {
             s.confirmed_acked_lsn = s.confirmed_acked_lsn.max(acked_lsn);
             s.last_seen_ms = now_ms;
             s.connected = true;
+            s.seeding = false;
             if s.status == SlotStatus::Abandoned {
                 s.status = SlotStatus::Active;
             }
@@ -266,7 +271,10 @@ impl SemiSyncWaiter {
             if now >= deadline {
                 return SemiSyncOutcome::TimedOut;
             }
-            let remaining = deadline - now;
+            if crate::engine::cancel::check_cancelled().is_err() {
+                return SemiSyncOutcome::Degraded;
+            }
+            let remaining = (deadline - now).min(Duration::from_millis(50));
             counter = lock.lock().unwrap();
             let (new_counter, _wait_res) = cvar.wait_timeout(counter, remaining).unwrap();
             counter = new_counter;

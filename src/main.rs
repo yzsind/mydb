@@ -337,6 +337,12 @@ fn print_help() {
          \x20 --slow-sql-ms MS               Legacy slow SQL threshold\n\
          \x20 --ssl-mode auto|disabled       TLS advertisement mode\n\
          \x20 --ssl-cert PATH --ssl-key PATH Configured TLS certificate and key\n\
+         \nHTTP SQL calls:\n\
+         \x20 --http-enabled ON|OFF          Enable HTTP SQL calls (default ON)\n\
+         \x20 --http-local-config PATH       Optional node egress/CA/account policy\n\
+         \x20 --http-max-inflight N          Maximum concurrent requests (default 32)\n\
+         \x20 --http-max-queue N             Maximum queued requests (default 128)\n\
+         \x20 --http-memory-limit-mb N       HTTP memory ceiling (default 128 MiB)\n\
          \nImmutable backup query:\n\
          \x20 --backup-repository PATH       Unified local repository (requires --base)\n\
          \x20 --base ID --runtime-dir PATH   Query a sealed baseline; runtime stays external\n\

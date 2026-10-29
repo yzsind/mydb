@@ -49,12 +49,13 @@ class SnapshotStartupTests(unittest.TestCase):
     def test_native_volume_snapshot_mount_is_read_only(self):
         with tempfile.TemporaryDirectory(dir='/tmp/mydb') as temporary:
             args = SimpleNamespace(output=Path(temporary), binary=Path('/tmp/mydb/server'),
-                                   backup_binary=Path('/tmp/mydb/backup'), storage_mode='volume')
+                                   backup_binary=Path('/tmp/mydb/backup'), cli_binary=Path('/tmp/mydb/client'), storage_mode='volume')
             with patch.object(compat, 'checked') as checked:
                 case = compat.Case(args, 'volume', 'fixture-image')
                 with patch.object(case, 'ready'):
                     case.start('snapshot', 4837, repository='repository', base='pinned-base')
             command = checked.call_args.args[0]
+            self.assertIn('/tmp/mydb/client:/opt/mydb/mydb-cli:ro', command)
             self.assertIn(f'{case.volume}:/tmp/mydb', command)
             self.assertIn(f'type=volume,src={case.volume},dst=/tmp/mydb/repository,readonly,volume-subpath=repository', command)
             self.assertEqual(case.result['storage_mode'], 'volume')
@@ -62,7 +63,7 @@ class SnapshotStartupTests(unittest.TestCase):
     def test_repository_start_has_readonly_mount_and_separate_runtime(self):
         with tempfile.TemporaryDirectory(dir='/tmp/mydb') as temporary:
             args = SimpleNamespace(output=Path(temporary), binary=Path('/tmp/mydb/server'),
-                                   backup_binary=Path('/tmp/mydb/backup'))
+                                   backup_binary=Path('/tmp/mydb/backup'), cli_binary=Path('/tmp/mydb/client'))
             case = compat.Case(args, 'startup', 'fixture-image')
             with patch.object(compat, 'checked') as checked, patch.object(case, 'ready'):
                 case.start('snapshot', 4837, repository='repository', base='pinned-base')

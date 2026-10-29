@@ -513,7 +513,7 @@ stays uniformly ascending, and DESC is realized through a reverse range cursor.
 - DATE/TIME/DATETIME/TIMESTAMP/YEAR map to tags 9..12.
 - Ordinary MySQL JSON columns must extract scalars through functional/multi-valued indexes; only direct paths store
   canonical jsonb bytes as `Bytes`.
-- SPATIAL indexes go through MBR/R-tree separately; the BTREE of a vector index uses only a NULL key as the persistent RowId
+- SPATIAL indexes use separate persistent `.rtree` files; the BTREE of a vector index uses only a NULL key as the persistent RowId
   registry, while HNSW/IVF candidate structures hold the vector search data.
 - FULLTEXT currently encodes the token and posting payload as two parts: `String(token), Bytes(payload)`.
 

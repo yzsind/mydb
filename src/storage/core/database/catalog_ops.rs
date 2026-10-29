@@ -49,8 +49,28 @@ impl Database {
             })
     }
 
-    /// Changes only at committed catalog publication (including replica
-    /// application), before the DDL publication barrier is released.
+    /// Source graph used only when the committed catalog epoch changes.
+    /// The boolean marks a trigger-bearing table, whose reads have no effect.
+    pub(crate) fn http_dependency_sources(&self) -> (u64, Vec<(String, String, bool)>) {
+        let catalog = self.catalog.read().unwrap_or_else(|e| e.into_inner());
+        let epoch = self.catalog.epoch();
+        let mut sources = Vec::new();
+        for r in catalog.routines.values() {
+            sources.push((r.name.clone(), r.body_sql.clone(), false));
+        }
+        for v in catalog.views.values() {
+            sources.push((v.name.clone(), v.sql.clone(), false));
+        }
+        for t in catalog.triggers.values() {
+            sources.push((t.table_name.clone(), t.body_sql.clone(), true));
+        }
+        for e in catalog.events.values() {
+            sources.push((e.name.clone(), e.body_sql.clone(), false));
+        }
+        (epoch, sources)
+    }
+
+    /// Changes at committed catalog publication, before releasing the DDL barrier.
     pub(crate) fn catalog_publication_epoch(&self) -> u64 {
         self.catalog.epoch()
     }
@@ -553,15 +573,33 @@ impl Database {
             return Ok(Some(table));
         }
         if is_temp_table_id(table_id) {
-            return Ok(self.temp_tables.read().map_err(|_| vector::persistence::corrupt())?
-                .values().find(|table| table.id == table_id).cloned());
+            return Ok(self
+                .temp_tables
+                .read()
+                .map_err(|_| vector::persistence::corrupt())?
+                .values()
+                .find(|table| table.id == table_id)
+                .cloned());
         }
-        let header = self.catalog.read().map_err(|_| vector::persistence::corrupt())?.tables.values()
-            .find(|table| table.id == table_id || table.storage_ids().contains(&table_id)).cloned();
-        let Some(header) = header else { return Ok(None); };
-        if !header.columns.is_empty() || header.system { return Ok(Some(header)); }
-        let table = self.load_table_descriptor_from_dd(header.id)?.ok_or_else(vector::persistence::corrupt)?;
-        self.catalog.install_descriptor(table_key(&table.database, &table.name), table.clone());
+        let header = self
+            .catalog
+            .read()
+            .map_err(|_| vector::persistence::corrupt())?
+            .tables
+            .values()
+            .find(|table| table.id == table_id || table.storage_ids().contains(&table_id))
+            .cloned();
+        let Some(header) = header else {
+            return Ok(None);
+        };
+        if !header.columns.is_empty() || header.system {
+            return Ok(Some(header));
+        }
+        let table = self
+            .load_table_descriptor_from_dd(header.id)?
+            .ok_or_else(vector::persistence::corrupt)?;
+        self.catalog
+            .install_descriptor(table_key(&table.database, &table.name), table.clone());
         Ok(Some(table))
     }
 
@@ -1752,10 +1790,27 @@ impl Database {
         candidate.default_roles.begin_mutation();
         candidate.restrictions.begin_mutation();
         f(&mut candidate)?;
-        let model_ids: Vec<_> = candidate.grants.iter().filter_map(|g| match &g.privilege { crate::engine::auth::Privilege::Dynamic(name)=>crate::engine::auth::ai_model_privilege_id(name),_=>None }).collect();
+        let model_ids: Vec<_> = candidate
+            .grants
+            .iter()
+            .filter_map(|g| match &g.privilege {
+                crate::engine::auth::Privilege::Dynamic(name) => {
+                    crate::engine::auth::ai_model_privilege_id(name)
+                }
+                _ => None,
+            })
+            .collect();
         if !model_ids.is_empty() {
-            let models=self.ai_catalog()?;
-            if model_ids.iter().any(|id|!models.models.values().any(|m|m.id==*id)) { return Err(crate::engine::ai::error("ER_AI_MODEL_NOT_FOUND","model grants require an existing stable model identity")); }
+            let models = self.ai_catalog()?;
+            if model_ids
+                .iter()
+                .any(|id| !models.models.values().any(|m| m.id == *id))
+            {
+                return Err(crate::engine::ai::error(
+                    "ER_AI_MODEL_NOT_FOUND",
+                    "model grants require an existing stable model identity",
+                ));
+            }
         }
 
         crate::engine::cancel::check_cancelled()?;

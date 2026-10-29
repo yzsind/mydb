@@ -345,6 +345,10 @@ pub(super) fn execute_insert(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
+    if let Some(predicate) = &mut stmt.view_check_predicate {
+        let table = db.table(&stmt.table)?;
+        super::dml::prepare_view_check(db, txn, predicate, &table, stmt.target_alias.as_deref())?;
+    }
     // M5.C2 — `INSERT INTO t PARTITION (p0, p1) ...` resolves to a set of
     // allowed storage_ids. Every routed row must land in one of them; if
     // not, MySQL error 1748. Resolve once, hand the set into the dispatch
@@ -426,6 +430,14 @@ pub(super) fn execute_insert_borrowed(
     registry: &SessionRegistry,
 ) -> Result<Option<QueryResponse>, QueryError> {
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
+    if stmt
+        .view_check_predicate
+        .as_ref()
+        .is_some_and(super::prepared_dml::expr_contains_subquery)
+    {
+        return execute_insert(db, session, txn, stmt.clone(), registry).map(Some);
+    }
+
     let partition_filter = if stmt.partitions.is_empty() {
         None
     } else {
@@ -633,6 +645,7 @@ fn dispatch_insert_chunk(
             for row in rows {
                 match validate_insert_view_check(
                     db,
+                    txn,
                     &stmt.table,
                     stmt.columns.as_deref(),
                     std::slice::from_ref(&row),
@@ -647,7 +660,14 @@ fn dispatch_insert_chunk(
             }
             rows = accepted;
         } else {
-            validate_insert_view_check(db, &stmt.table, stmt.columns.as_deref(), &rows, predicate)?;
+            validate_insert_view_check(
+                db,
+                txn,
+                &stmt.table,
+                stmt.columns.as_deref(),
+                &rows,
+                predicate,
+            )?;
         }
     }
     if ctx.needs_trigger_path {
@@ -1636,6 +1656,7 @@ fn execute_insert_from_select_parallel(
 
 fn validate_insert_view_check(
     db: &Arc<Database>,
+    txn: TxnView,
     table_name: &str,
     columns: Option<&[String]>,
     rows: &[Vec<Value>],
@@ -1660,7 +1681,7 @@ fn validate_insert_view_check(
             values[idx] = value.clone();
         }
         db.materialize_generated_columns_for_insert(&table, &mut values)?;
-        if !eval_bool(predicate, &table, &values)? {
+        if !super::dml::eval_view_check(db, txn, predicate, &table, &values, None)? {
             return Err(error(
                 crate::error::catalog::ER_VIEW_CHECK_FAILED,
                 "CHECK OPTION failed for view",
@@ -2773,7 +2794,7 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
             super::dml::apply_on_update_timestamps(table, &mut new_values, &on_update);
         }
         if let Some(predicate) = view_check {
-            if !eval_bool(predicate, table, &new_values)? {
+            if !super::dml::eval_view_check(db, txn, predicate, table, &new_values, None)? {
                 return Err(error(
                     crate::error::catalog::ER_VIEW_CHECK_FAILED,
                     "CHECK OPTION failed for view",

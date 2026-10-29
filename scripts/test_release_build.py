@@ -56,6 +56,37 @@ class SourceFingerprintTests(unittest.TestCase):
         self.write('vendor/mysql/src/lib.rs', 'patched TLS parser')
         self.assertNotEqual(source_hash(self.root), original)
 
+    def test_client_sources_and_lockfile_change_identity(self):
+        original = source_hash(self.root)
+        self.write('clients/mydb-cli/Cargo.lock', 'version = 4')
+        changed = source_hash(self.root)
+        self.assertNotEqual(changed, original)
+        self.write('clients/mydb-cli/src/main.rs', 'fn main() {}')
+        self.assertNotEqual(source_hash(self.root), changed)
+
+
+class LicenseCliTests(unittest.TestCase):
+    def test_additional_client_graph_and_lockfile_are_accepted(self):
+        import sys
+        import release_licenses
+        Path('/tmp/mydb').mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir='/tmp/mydb') as temporary:
+            root = Path(temporary)
+            server = root / 'server.json'
+            client = root / 'client.json'
+            server.write_text('{"kind":"server"}')
+            client.write_text('{"kind":"client"}')
+            lock = root / 'client.lock'
+            output = root / 'licenses'
+            argv = ['release_licenses.py', '--source', str(root), '--output', str(output),
+                    '--metadata', str(server), '--extra-metadata', str(client),
+                    '--extra-lockfile', str(lock)]
+            with patch.object(sys, 'argv', argv), patch.object(release_licenses, 'collect_third_party') as collect:
+                release_licenses.main()
+            self.assertEqual(collect.call_args.args, (root, output, {'kind': 'server'}))
+            self.assertEqual(collect.call_args.kwargs,
+                             {'extra_metadata': [{'kind': 'client'}], 'extra_lockfiles': [lock]})
+
 
 class RuntimeSetupTests(unittest.TestCase):
     def test_pinned_runner_satisfies_repository_version_requirement(self):
@@ -97,11 +128,13 @@ class RuntimeSetupTests(unittest.TestCase):
             (source / 'Cargo.toml').write_text('[package]\nversion = "1.0.0"\n')
             (source / 'Cargo.lock').write_text('version = 4\n')
             (source / 'LICENSE').write_text('fixture license\n')
+            (source / 'clients/mydb-cli').mkdir(parents=True)
+            (source / 'clients/mydb-cli/Cargo.lock').write_text('version = 4\n')
             (source / 'assets').mkdir()
             (source / 'assets/mydb-architecture.svg').write_text('<svg/>\n')
             artifacts = output / 'bin'
             artifacts.mkdir()
-            for binary in ['mydb', 'mydb-backup', 'mydb-test-seed']:
+            for binary in ['mydb', 'mydb-backup', 'mydb-test-seed', 'mydb-cli']:
                 (artifacts / binary).write_bytes(b'fixture binary')
             (output / 'abi.json').write_text('{}\n')
             (output / 'tests.tar.zst').write_bytes(b'fixture test archive')
@@ -123,6 +156,8 @@ class RuntimeSetupTests(unittest.TestCase):
                 builder.inside(args)
             with tarfile.open(output / 'mydb-1.0.0-x86-linux.tar.gz') as package:
                 self.assertIn('assets/mydb-architecture.svg', package.getnames())
+                self.assertIn('mydb-cli', package.getnames())
+                self.assertIn('mydb-cli.Cargo.lock', package.getnames())
             release = next(c for c in call.call_args_list if c.args[0][:2] == ['cargo', 'build'])
             archive = next(c for c in call.call_args_list if c.args[0][0] == 'cargo-nextest')
             self.assertNotIn('env', release.kwargs)

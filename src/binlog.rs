@@ -4709,33 +4709,60 @@ struct DdlTxnContext {
     database: String,
     sql: String,
     query: BinlogQueryContext,
+    account: crate::engine::auth::AccountKey,
     staged: bool,
 }
 
 #[must_use]
 pub struct DdlTxnContextGuard {
     prior: Option<DdlTxnContext>,
+    _replica_receipt: Option<crate::replication::DdlReceiptGuard>,
 }
 
 pub fn enter_ddl_txn_context(
     database: &str,
     sql: &str,
     query: &BinlogQueryContext,
+    account: &crate::engine::auth::AccountKey,
 ) -> DdlTxnContextGuard {
     let current = DdlTxnContext {
         database: database.to_string(),
         sql: sql.to_string(),
         query: query.clone(),
+        account: account.clone(),
         staged: false,
     };
     let prior = DDL_TXN_CONTEXT.with(|slot| slot.replace(Some(current)));
-    DdlTxnContextGuard { prior }
+    DdlTxnContextGuard {
+        prior,
+        _replica_receipt: None,
+    }
+}
+
+/// Render credentials from the candidate catalog before either commit log is
+/// durable. A rewrite failure aborts the catalog transaction without exposing
+/// plaintext credentials or publishing an unreplicated account change.
+pub(crate) fn prepare_auth_ddl_transaction(
+    auth: &crate::engine::auth::AuthCatalog,
+) -> Result<(), QueryError> {
+    DDL_TXN_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(context) = slot.as_mut() {
+            context.sql = crate::engine::executor::credential_safe_binlog_sql_from_catalog(
+                auth,
+                &context.account,
+                &context.sql,
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// Internal catalog compensation must not replicate the rejected outer DDL.
 pub(crate) fn suspend_ddl_txn_context() -> DdlTxnContextGuard {
     DdlTxnContextGuard {
         prior: DDL_TXN_CONTEXT.with(|slot| slot.take()),
+        _replica_receipt: Some(crate::replication::suspend_ddl_receipt()),
     }
 }
 

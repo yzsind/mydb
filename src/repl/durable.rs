@@ -45,7 +45,7 @@ pub fn atomic_write_sync(path: &Path, tmp: &Path, bytes: &[u8]) -> IoResult<()> 
     };
     let result = (|| {
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::platform::fs::sync_standard_before_atomic_rename_at(&file, &staging)?;
         drop(file);
         fs::rename(&staging, path)?;
         if let Some(parent) = path.parent() {

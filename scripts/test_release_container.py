@@ -171,7 +171,7 @@ def main():
         result['source_sha256']=manifest['source_sha256']
         result['linux_artifacts']=manifest['artifacts']
         context=root/'context';context.mkdir()
-        for name in ('mydb','mydb-backup'):shutil.copy2(build/'bin'/name,context/name)
+        for name in ('mydb','mydb-backup','mydb-cli'):shutil.copy2(build/'bin'/name,context/name)
         shutil.copytree(build/'bin/third-party',context/'third-party')
         shutil.copytree(ROOT/'docker',context/'docker')
         shutil.copy2(ROOT/'LICENSE',context/'LICENSE')
@@ -204,7 +204,8 @@ def main():
         name,port,conn=start('source',root/'data')
         assert command(['docker','exec',name,'id','-u'])=='10001'
         assert conn._sock.cipher()
-        command(['docker','exec',name,'sh','-ec','test -s /usr/share/licenses/mydb/third-party/packages.json; test -s /usr/local/bin/mydb-backup'])
+        command(['docker','exec',name,'sh','-ec','test -s /usr/share/licenses/mydb/third-party/packages.json; test -s /usr/local/bin/mydb-backup; test -s /usr/local/bin/mydb-cli'])
+        assert command(['docker','exec',name,'mydb-cli','--version']) == 'mydb-cli 1.0.0'
         query(conn,'CREATE TABLE image_rows(id INT PRIMARY KEY,v DECIMAL(20,4),b LONGBLOB,KEY kv(v))')
         with conn.cursor() as cursor:cursor.executemany('INSERT INTO image_rows VALUES(%s,%s,%s)',expected)
         verify(conn)

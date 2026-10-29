@@ -31,7 +31,7 @@ pub(super) fn lock_select_rows_for_update(
     if stmt.for_update && stmt.derived.is_some() {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            "locking a derived query requires a simple updatable view",
+            "locking a derived query requires mergeable base-table row provenance",
         ));
     }
     if !stmt.for_update || stmt.joins.len() > 0 || stmt.from.len() != 1 {
@@ -385,7 +385,7 @@ pub(super) fn execute_update(
         }
     }
     if let Some(check_predicate) = &mut stmt.view_check_predicate {
-        materialize_subqueries(db, txn, check_predicate)?;
+        prepare_view_check(db, txn, check_predicate, &table, outer_alias.as_deref())?;
     }
     for order in &mut stmt.order_by {
         if super::prepared_dml::expr_contains_subquery(&order.expr) {
@@ -525,7 +525,7 @@ pub(super) fn execute_update(
     };
     let validate_view_check = |values: &[Value]| -> Result<(), QueryError> {
         if let Some(predicate) = &view_check_predicate {
-            if !eval_bool(predicate, &table, values)? {
+            if !eval_view_check(db, txn, predicate, &table, values, outer_alias.as_deref())? {
                 return Err(error(
                     crate::error::catalog::ER_VIEW_CHECK_FAILED,
                     "CHECK OPTION failed for view",
@@ -2331,6 +2331,48 @@ pub(super) fn unique_row_ids_for_exact_delete(
     Ok(row_id.map(|id| vec![id]))
 }
 
+// Private lexical name for outer columns captured from a stored view body.
+// It cannot collide with a base-table alias introduced by a subquery.
+pub(in crate::engine::executor) const VIEW_CHECK_ROW_ALIAS: &str = "\0mydb_view_check_row";
+
+/// Materialize only row-independent subqueries once per statement. Correlated
+/// checks are evaluated against each candidate's post-image instead.
+pub(super) fn prepare_view_check(
+    db: &Arc<Database>,
+    txn: TxnView,
+    predicate: &mut Expr,
+    table: &TableSchema,
+    alias: Option<&str>,
+) -> Result<(), QueryError> {
+    if super::prepared_dml::expr_contains_subquery(predicate)
+        && !expr_has_correlated_subquery(db, predicate, alias, &table.name, &table.columns)
+    {
+        materialize_subqueries(db, txn, predicate)?;
+    }
+    Ok(())
+}
+
+pub(super) fn eval_view_check(
+    db: &Arc<Database>,
+    txn: TxnView,
+    predicate: &Expr,
+    table: &TableSchema,
+    values: &[Value],
+    alias: Option<&str>,
+) -> Result<bool, QueryError> {
+    if !super::prepared_dml::expr_contains_subquery(predicate) {
+        return eval_bool(predicate, table, values);
+    }
+    let outer = UpdateOuterRow {
+        alias,
+        table_name: &table.name,
+        table,
+        values,
+    };
+    let resolved = resolve_correlated_expr(db, txn, predicate, &outer)?;
+    eval_bool(&resolved, table, values)
+}
+
 pub(super) fn materialize_subqueries(
     db: &Arc<Database>,
     txn: TxnView,
@@ -2551,7 +2593,8 @@ fn compound_qualifier_matches_outer(
         return false;
     }
     let qualifier = &parts[parts.len() - 2];
-    alias.is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
+    qualifier == VIEW_CHECK_ROW_ALIAS
+        || alias.is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
         || table_name.eq_ignore_ascii_case(qualifier)
 }
 
@@ -2689,8 +2732,30 @@ fn substitute_outer_in_expr_scoped(
 
 fn substitute_outer_in_select(db: &Arc<Database>, sel: &mut Select, outer: &UpdateOuterRow) {
     let inner_columns = select_inner_columns(db, sel);
+    let shadows = |name: &str| {
+        sel.from
+            .iter()
+            .chain(sel.joins.iter().map(|join| &join.table))
+            .any(|source| {
+                source
+                    .alias
+                    .as_deref()
+                    .unwrap_or_else(|| source.name.rsplit('.').next().unwrap_or(&source.name))
+                    .eq_ignore_ascii_case(name)
+            })
+    };
+    let scoped_outer = UpdateOuterRow {
+        alias: outer.alias.filter(|name| !shadows(name)),
+        table_name: if shadows(outer.table_name) {
+            ""
+        } else {
+            outer.table_name
+        },
+        table: outer.table,
+        values: outer.values,
+    };
     for_each_expr_in_select_mut(sel, &mut |e| {
-        substitute_outer_in_expr_scoped(db, e, outer, inner_columns.as_ref())
+        substitute_outer_in_expr_scoped(db, e, &scoped_outer, inner_columns.as_ref())
     });
 }
 

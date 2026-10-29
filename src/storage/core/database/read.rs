@@ -792,6 +792,9 @@ impl Database {
             CachedMvccHeaderRead::Hit(header) => {
                 if self.row_version_visible(header, txn)? {
                     Ok(Some(!header.is_deleted()))
+                } else if header.undo_ptr.is_none() {
+                    // An invisible initial version has no earlier row.
+                    Ok(Some(false))
                 } else {
                     // Latest cached version not visible to this txn.
                     // The visible version may live on the undo chain;
@@ -1076,7 +1079,7 @@ impl Database {
         let mut idx = 0;
         while idx < row_ids.len() {
             let heap_read = heap.read();
-            let mut fallback_row: Option<RowId> = None;
+            let mut fallback_row: Option<(RowId, usize, bool)> = None;
             while idx < row_ids.len() {
                 if prefetch_cursor < row_ids.len()
                     && prefetch_cursor.saturating_sub(idx) < prefetch_window
@@ -1105,7 +1108,7 @@ impl Database {
                     &row_ids[start..end],
                     &mut header_scratch,
                 )?;
-                for (offset, header_read) in header_scratch.drain(..).enumerate() {
+                for (offset, header_read) in header_scratch.iter().copied().enumerate() {
                     let row_id = row_ids[start + offset];
                     match self.visible_from_cached_header(header_read, txn, &mut vis_cache)? {
                         Some(v) => {
@@ -1113,7 +1116,11 @@ impl Database {
                             idx += 1;
                         }
                         None => {
-                            fallback_row = Some(row_id);
+                            fallback_row = Some((
+                                row_id,
+                                offset,
+                                matches!(header_read, CachedMvccHeaderRead::MissingPage),
+                            ));
                             break;
                         }
                     }
@@ -1126,9 +1133,35 @@ impl Database {
                 break;
             }
             drop(heap_read);
-            let row_id = fallback_row.unwrap_or(row_ids[idx]);
+            let (row_id, offset, refill) =
+                fallback_row.expect("incomplete header batch needs a fallback");
             visible.push(fallback(row_id, idx)?);
             idx += 1;
+            let remaining_start = if refill {
+                // A cold-page fallback may have populated the buffer pool.
+                // Retry its suffix once, preserving that fast path without
+                // repeating this page scan after each forwarding/undo read.
+                let end = idx + header_scratch.len() - offset - 1;
+                heap.read().read_mvcc_headers_cached_same_page_into(
+                    &row_ids[idx..end],
+                    &mut header_scratch,
+                )?;
+                0
+            } else {
+                offset + 1
+            };
+            // The page batch is already decoded. Resolve its remaining rows
+            // after releasing the heap handle, rather than dropping those
+            // headers and rescanning the suffix after every fallback.
+            for header_read in header_scratch.drain(remaining_start..) {
+                let resolved =
+                    match self.visible_from_cached_header(header_read, txn, &mut vis_cache)? {
+                        Some(value) => value,
+                        None => fallback(row_ids[idx], idx)?,
+                    };
+                visible.push(resolved);
+                idx += 1;
+            }
         }
         Ok(visible)
     }
@@ -1143,6 +1176,8 @@ impl Database {
             CachedMvccHeaderRead::Hit(header) => {
                 if self.row_version_visible_cached(vis_cache, header, txn)? {
                     Ok(Some(!header.is_deleted()))
+                } else if header.undo_ptr.is_none() {
+                    Ok(Some(false))
                 } else {
                     Ok(None)
                 }

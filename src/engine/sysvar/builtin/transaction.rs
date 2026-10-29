@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::engine::api::{global_transaction_isolation, set_global_transaction_isolation};
 use crate::engine::sysvar::backend::SysVar;
 use crate::engine::sysvar::ctx::WriteCtx;
-use crate::engine::sysvar::meta::{DataType, Scope, SysVarDef};
+use crate::engine::sysvar::meta::{Access, DataType, Scope, SysVarDef};
 use crate::engine::sysvar::registry::Registry;
 use crate::engine::sysvar::value::SysVarValue;
 use crate::storage::IsolationLevel;
@@ -104,6 +104,7 @@ pub(crate) fn register(reg: &mut Registry) {
     // record this session's queries.
     reg.register(SysVar::settable(
         SysVarDef::new("sql_log_off", Scope::Session, DataType::Bool)
+            .with_access(Access::SuperReadWrite)
             .with_doc("Suppress this session from the general query log."),
         |ctx| match ctx.session {
             Some(s) => SysVarValue::Bool(s.sql_log_off),

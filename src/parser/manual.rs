@@ -2104,6 +2104,8 @@ pub(super) fn parse_manual_mysql_admin_statement(sql: &str) -> Option<Statement>
         }
         "SHOW PRIVILEGES" => return Some(Statement::ShowPrivileges),
         "SHOW PLUGINS" => return Some(Statement::ShowPlugins),
+        "ALTER SYSTEM RELOAD HTTP CONFIG" => return Some(Statement::AlterSystemReloadHttpConfig),
+        "SHOW HTTP STATUS" => return Some(Statement::ShowHttpStatus),
         "ALTER SYSTEM CHECKPOINT" => return Some(Statement::AlterSystemCheckpoint),
         "ALTER SYSTEM FLUSH DATA_CACHE" => return Some(Statement::AlterSystemFlushDataCache),
         "ALTER SYSTEM FLUSH SQL_CACHE" => return Some(Statement::AlterSystemFlushSqlCache),
@@ -3423,7 +3425,7 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
 /// Returns `None` if the statement isn't an XA command. Returns
 /// `Some(Statement::Unsupported)` if it's clearly XA syntax but a
 /// branch mydb doesn't implement (e.g. JOIN/RESUME/SUSPEND).
-pub(super) fn parse_xa_statement(sql: &str) -> Option<Statement> {
+pub(crate) fn parse_xa_statement(sql: &str) -> Option<Statement> {
     // Head guard — running the sqlparser tokenizer on a 1 MB INSERT just
     // to discover it isn't an `XA …` command would dominate the parse
     // cost. The head check exits in O(1) bytes.
@@ -3589,8 +3591,12 @@ fn parse_xa_xid<'a>(
     }
     // `iter.next()` may have consumed a non-comma token (the start of the
     // trailing keyword tail). Rebuild the slice off `consumed`.
-    let xid = Xid::new(format_id, gtrid, bqual)
-        .map_err(|err| unsupported_xa(&format!("invalid xid: {}", err.message()), sql))?;
+    // The parser entry validates lengths with the XA-specific error code.
+    let xid = Xid {
+        format_id,
+        gtrid,
+        bqual,
+    };
     Ok((xid, &tokens[consumed..]))
 }
 
@@ -5432,11 +5438,12 @@ fn parse_routine_signal(sql: &str) -> Result<RoutineStmt, ParseError> {
             "SIGNAL requires SQLSTATE or a declared condition name",
         ));
     }
-    let (message_text, mysql_errno) = parse_signal_information_items(sql, idx)?;
+    let (message_text, mysql_errno, information) = parse_signal_information_items(sql, idx)?;
     Ok(RoutineStmt::Signal {
         condition,
         message_text,
         mysql_errno,
+        information,
     })
 }
 
@@ -5458,27 +5465,29 @@ fn parse_routine_resignal(sql: &str) -> Result<RoutineStmt, ParseError> {
         } else {
             None
         };
-    let (message_text, mysql_errno) = parse_signal_information_items(sql, idx)?;
+    let (message_text, mysql_errno, information) = parse_signal_information_items(sql, idx)?;
     Ok(RoutineStmt::Resignal {
         condition,
         message_text,
         mysql_errno,
+        information,
     })
 }
 
 fn parse_signal_information_items(
     sql: &str,
     idx: usize,
-) -> Result<(Option<Expr>, Option<Expr>), ParseError> {
+) -> Result<(Option<Expr>, Option<Expr>, Vec<(DiagItem, Expr)>), ParseError> {
     let mut message_text = None;
     let mut mysql_errno = None;
+    let mut information = Vec::new();
     let Some(next) = consume_keyword_at(sql, idx, "SET") else {
         if !sql[idx..].trim().is_empty() {
             return Err(parse_error_at_zero(
                 "unexpected SIGNAL condition information",
             ));
         }
-        return Ok((message_text, mysql_errno));
+        return Ok((message_text, mysql_errno, information));
     };
     for (lhs, value) in parse_routine_assignments(sql[next..].trim(), "SIGNAL SET item requires =")?
     {
@@ -5495,13 +5504,22 @@ fn parse_signal_information_items(
                 }
             }
             _ => {
-                return Err(parse_error_at_zero(
-                    "unsupported SIGNAL condition information item",
-                ));
+                let item = parse_diag_item(&name)?;
+                if item.condition_information_name().is_none() {
+                    return Err(parse_error_at_zero(
+                        "unsupported SIGNAL condition information item",
+                    ));
+                }
+                if information.iter().any(|(existing, _)| *existing == item) {
+                    return Err(parse_error_at_zero(
+                        "duplicate SIGNAL condition information item",
+                    ));
+                }
+                information.push((item, value));
             }
         }
     }
-    Ok((message_text, mysql_errno))
+    Ok((message_text, mysql_errno, information))
 }
 
 fn parse_routine_prepare(sql: &str) -> Result<RoutineStmt, ParseError> {

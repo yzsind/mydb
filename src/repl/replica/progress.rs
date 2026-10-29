@@ -43,12 +43,34 @@ pub struct ReplicaProgress {
     #[serde(default)]
     pub source_generation: u64,
     #[serde(default)]
+    pub source_heartbeat_ms: u64,
+    #[serde(default)]
     pub source_frozen: bool,
     #[serde(default)]
     pub source_fence_lsn: u64,
     #[serde(default)]
     pub source_fence_token_hash: String,
     pub last_update_ms: u64,
+}
+
+/// Advance only to records the live engine actually applied and the WAL
+/// durably contains. Never infer application from the received WAL tail.
+pub(crate) fn reconcile_applied(
+    progress: &mut ReplicaProgress,
+    db: &crate::storage::Database,
+    log: &std::sync::Arc<crate::wal::LogMutex>,
+) {
+    if progress.last_master_uuid.is_empty() && progress.timeline_uuid.is_empty() {
+        return;
+    }
+    let applied = db.replica_applied_lsn();
+    let durable = applied.min(log.lock().durable_lsn());
+    if durable > progress.durable_applied_lsn {
+        progress.received_lsn = progress.received_lsn.max(durable);
+        progress.durable_lsn = progress.durable_lsn.max(durable);
+        progress.applied_lsn = progress.applied_lsn.max(applied);
+        progress.durable_applied_lsn = durable;
+    }
 }
 
 pub fn progress_path(data_dir: impl AsRef<Path>) -> PathBuf {
@@ -147,6 +169,7 @@ mod tests {
             source_current_lsn: 12349,
             source_durable_lsn: 12348,
             source_generation: 9,
+            source_heartbeat_ms: 1000,
             source_frozen: true,
             source_fence_lsn: 12345,
             source_fence_token_hash: "hash".into(),

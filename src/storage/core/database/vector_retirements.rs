@@ -64,10 +64,8 @@ impl Database {
             writer.finish().map_err(io_err)?;
         }
         out.flush().map_err(io_err)?;
-        out.into_inner()
-            .map_err(|err| io_err(err.into_error()))?
-            .sync_all()
-            .map_err(io_err)?;
+        let file = out.into_inner().map_err(|err| io_err(err.into_error()))?;
+        crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
         fs::rename(&tmp, &path).map_err(io_err)?;
         crate::platform::fs::sync_path(path.parent().expect("system directory")).map_err(io_err)
     }

@@ -482,11 +482,9 @@ fn compile_timestamp_date_plus_integer_cmp(
     // only a successful, warning-free constant. Invalid STR_TO_DATE values,
     // zero-date policy, parameters and session-dependent expressions retain
     // their runtime oracle behavior.
-    let diagnostics = Arc::new(parking_lot::Mutex::new(
-        crate::engine::api::SqlWarnings::new(),
-    ));
+    let diagnostics = crate::engine::api::StatementWarningSink::default();
     let constant_value =
-        crate::engine::api::with_statement_warning_sink(Arc::clone(&diagnostics), || {
+        crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
             crate::engine::expr::eval_const(constant)
         })
         .ok()?;
@@ -1699,8 +1697,13 @@ pub(crate) fn try_column_const_cmp_bitmap_parts(
             if data.len() != n {
                 return None;
             }
-            let rhs =
-                crate::storage::parse_datetime_to_micros(crate::types::value_str(rhs)?).ok()?;
+            let Value::DateTime(rhs) = crate::engine::expr::coerce_comparison_constant_for_type(
+                rhs,
+                &crate::storage::DataTypeKind::DateTime { fsp: 6 },
+            )?
+            else {
+                return None;
+            };
             dispatch_i64_const_cmp(op, data, rhs, &mut out)?;
             nulls.as_ref()
         }
@@ -1713,7 +1716,13 @@ pub(crate) fn try_column_const_cmp_bitmap_parts(
             if data.len() != n {
                 return None;
             }
-            let rhs = crate::storage::parse_time_to_micros(crate::types::value_str(rhs)?).ok()?;
+            let Value::Time(rhs) = crate::engine::expr::coerce_comparison_constant_for_type(
+                rhs,
+                &crate::storage::DataTypeKind::Time { fsp: 6 },
+            )?
+            else {
+                return None;
+            };
             dispatch_i64_const_cmp(op, data, rhs, &mut out)?;
             nulls.as_ref()
         }
@@ -3041,10 +3050,18 @@ fn regexp_replace_utf8_column(
                 continue;
             }
         }
-        if single_match {
-            crate::engine::expr::regexp_replace_single_into(regex, value, replacement, &mut output);
+        let success = if single_match {
+            crate::engine::expr::regexp_replace_single_into(regex, value, replacement, &mut output)
         } else {
-            crate::engine::expr::regexp_replace_all_into(regex, value, replacement, &mut output);
+            crate::engine::expr::regexp_replace_all_into(regex, value, replacement, &mut output)
+        };
+        if !success {
+            output.truncate(output_start);
+            validity.set(row, false);
+            retain_nulls = true;
+            previous = None;
+            output_offsets.push(u32::try_from(output.len()).ok()?);
+            continue;
         }
         output_offsets.push(u32::try_from(output.len()).ok()?);
         previous = Some((start, end, output_start, output.len()));

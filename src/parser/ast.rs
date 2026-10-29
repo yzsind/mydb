@@ -435,6 +435,8 @@ pub enum Statement {
     AlterSystemCheckpoint,
     AlterSystemFlushDataCache,
     AlterSystemFlushSqlCache,
+    AlterSystemReloadHttpConfig,
+    ShowHttpStatus,
     ShowPrivileges,
     CreateUser(CreateUser),
     AlterUser(AlterUser),
@@ -1054,11 +1056,13 @@ pub enum RoutineStmt {
         condition: RoutineCondition,
         message_text: Option<Expr>,
         mysql_errno: Option<Expr>,
+        information: Vec<(DiagItem, Expr)>,
     },
     Resignal {
         condition: Option<RoutineCondition>,
         message_text: Option<Expr>,
         mysql_errno: Option<Expr>,
+        information: Vec<(DiagItem, Expr)>,
     },
     Call(RoutineCall),
     Prepare {
@@ -1111,6 +1115,24 @@ pub enum DiagItem {
     TableName,
     ColumnName,
     CursorName,
+}
+
+impl DiagItem {
+    pub(crate) fn condition_information_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ClassOrigin => "CLASS_ORIGIN",
+            Self::SubclassOrigin => "SUBCLASS_ORIGIN",
+            Self::ConstraintCatalog => "CONSTRAINT_CATALOG",
+            Self::ConstraintSchema => "CONSTRAINT_SCHEMA",
+            Self::ConstraintName => "CONSTRAINT_NAME",
+            Self::CatalogName => "CATALOG_NAME",
+            Self::SchemaName => "SCHEMA_NAME",
+            Self::TableName => "TABLE_NAME",
+            Self::ColumnName => "COLUMN_NAME",
+            Self::CursorName => "CURSOR_NAME",
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

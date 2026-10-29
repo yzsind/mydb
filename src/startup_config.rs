@@ -113,6 +113,47 @@ macro_rules! spec {
 // it a supported option-file setting.  Registered GLOBAL sysvars are handled
 // separately below, using their registry metadata as the whitelist.
 static OPTION_SPECS: &[OptionSpec] = &[
+    spec!("http_enabled", "MYDB_HTTP_ENABLED", OptionKind::Bool),
+    spec!(
+        "http_local_config",
+        "MYDB_HTTP_LOCAL_CONFIG",
+        OptionKind::String
+    ),
+    spec!(
+        "http_max_inflight",
+        "MYDB_HTTP_MAX_INFLIGHT",
+        OptionKind::U64Range(1, 256)
+    ),
+    spec!(
+        "http_max_queue",
+        "MYDB_HTTP_MAX_QUEUE",
+        OptionKind::U64Range(1, 4096)
+    ),
+    spec!(
+        "http_memory_limit_mb",
+        "MYDB_HTTP_MEMORY_LIMIT_MB",
+        OptionKind::U64Range(1, 65536)
+    ),
+    spec!(
+        "http_max_request_bytes",
+        "MYDB_HTTP_MAX_REQUEST_BYTES",
+        OptionKind::U64Range(1, 67108864)
+    ),
+    spec!(
+        "http_max_response_bytes",
+        "MYDB_HTTP_MAX_RESPONSE_BYTES",
+        OptionKind::U64Range(1, 67108864)
+    ),
+    spec!(
+        "http_max_header_bytes",
+        "MYDB_HTTP_MAX_HEADER_BYTES",
+        OptionKind::U64Range(1, 1048576)
+    ),
+    spec!(
+        "http_max_calls_per_statement",
+        "MYDB_HTTP_MAX_CALLS_PER_STATEMENT",
+        OptionKind::U64Range(1, 1000000)
+    ),
     spec!("ai_enabled", "MYDB_AI_ENABLED", OptionKind::Bool),
     spec!(
         "ai_local_config",

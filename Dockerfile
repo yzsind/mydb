@@ -36,6 +36,7 @@ WORKDIR /usr/src/mydb
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
 COPY vendor ./vendor
+COPY clients/mydb-cli ./clients/mydb-cli
 COPY assets/mysql80 ./assets/mysql80
 COPY assets/third-party-licenses ./assets/third-party-licenses
 COPY scripts/release_licenses.py ./scripts/release_licenses.py
@@ -57,7 +58,10 @@ RUN --mount=type=cache,id=mydb-cargo-registry,target=/usr/local/cargo/registry,s
     && install -D "target/$(cat /rust-target)/release/mydb" /out/mydb \
     && install -D "target/$(cat /rust-target)/release/mydb-backup" /out/mydb-backup \
     && cargo metadata --locked --features tools --filter-platform "$(cat /rust-target)" --format-version 1 > /out/metadata.json \
-    && python3 scripts/release_licenses.py --source /usr/src/mydb --output /out --metadata /out/metadata.json
+    && cargo build --manifest-path clients/mydb-cli/Cargo.toml --jobs "$CARGO_BUILD_JOBS" --release --locked --target "$(cat /rust-target)" --target-dir target \
+    && install -D "target/$(cat /rust-target)/release/mydb-cli" /out/mydb-cli \
+    && cargo metadata --manifest-path clients/mydb-cli/Cargo.toml --locked --filter-platform "$(cat /rust-target)" --format-version 1 > /out/cli-metadata.json \
+    && python3 scripts/release_licenses.py --source /usr/src/mydb --output /out --metadata /out/metadata.json --extra-metadata /out/cli-metadata.json --extra-lockfile clients/mydb-cli/Cargo.lock
 
 FROM ${RUNTIME_IMAGE} AS runtime
 
@@ -83,6 +87,7 @@ RUN apt-get update \
 
 COPY --from=builder /out/mydb /usr/local/bin/mydb
 COPY --from=builder /out/mydb-backup /usr/local/bin/mydb-backup
+COPY --from=builder /out/mydb-cli /usr/local/bin/mydb-cli
 COPY --from=builder /out/third-party /usr/share/licenses/mydb/third-party
 COPY --chmod=0755 docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --chmod=0644 docker/mydb.cnf /etc/mydb/mydb.cnf

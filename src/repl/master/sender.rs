@@ -151,9 +151,26 @@ pub async fn run_sender(
         }
     };
 
+    if !env.config.auth_token.matches(&req.auth_token) || req.replica_uuid == [0; 16] {
+        protocol::write_frame_async(
+            &mut writer,
+            &Message::Close(Close {
+                reason: "native replication authentication failed".into(),
+            }),
+        )
+        .await
+        .map_err(io_err)?;
+        writer.flush().await.map_err(io_err)?;
+        return Err(error(
+            crate::error::catalog::MYDB_ER_REPLICATION_SECURITY,
+            "native replication authentication failed",
+        ));
+    }
+
     if req.protocol_version != PROTOCOL_VERSION {
         let source = source_wire_state(&env);
         let ack = HandshakeAck {
+            heartbeat_ms: 1000,
             master_uuid: env.master_uuid,
             current_lsn: 0,
             durable_lsn: 0,
@@ -255,6 +272,7 @@ pub async fn run_sender(
         )
     };
     let ack = HandshakeAck {
+        heartbeat_ms: 1000,
         master_uuid: env.master_uuid,
         current_lsn,
         durable_lsn: env.log.lock().durable_lsn(),
@@ -326,13 +344,21 @@ pub async fn run_sender(
         return Ok(());
     }
     let slot = slot_for(&replica_uuid);
+    let preserve_seed = slot.snapshot().seeding;
+    let mut session = SenderSession {
+        tracker: Arc::clone(&tracker),
+        slot: slot.clone(),
+        preserve_seed,
+    };
     if needs_base_backup {
         // The backup checkpoint is taken at or after the handshake's current
         // LSN, so this new slot never needs older WAL. Seed before checkpoint
         // to prevent an ack=0 slot from being invalidated by the retention cap
         // while its own backup is being produced.
+        let slots = env.slots.lock();
         slot.activate_at(current_lsn.saturating_sub(1));
-        env.slots.lock().persist(&replica_uuid)?;
+        slot.state.lock().seeding = true;
+        slots.persist(&replica_uuid)?;
     }
     // Item 3: if the replica needs a base backup, stream it inline
     // *before* taking over to the WAL streaming loop. The
@@ -351,13 +377,24 @@ pub async fn run_sender(
                 effective_start_lsn = snapshot.backup_lsn.saturating_add(1);
             }
             Err(err) => {
-                tracker.leave(&replica_uuid);
-                disconnect_slot(&slot);
                 return Err(err);
             }
         }
     }
     drop(backup_permit);
+    if needs_base_backup {
+        let mut state = slot.state.lock();
+        // A successful send only fills the TCP buffers. Keep the seed lease
+        // until a real stream ACK proves installation/recovery completed.
+        session.preserve_seed = true;
+        state.last_seen_ms = now_ms();
+        if state.status != crate::repl::SlotStatus::Active {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                "base backup exceeded the WAL retention limit; seed again or increase the limit",
+            ));
+        }
+    }
     // Seed the slot's retention floor to just below where this replica
     // starts streaming, so a not-yet-acked slot (acked_lsn == 0) doesn't
     // pin the master's WAL retention to LSN 0. A validated resume may move
@@ -381,18 +418,30 @@ pub async fn run_sender(
         ..req
     };
     if env.shutdown_flag.load(std::sync::atomic::Ordering::Acquire) {
-        tracker.leave(&replica_uuid);
-        disconnect_slot(&slot);
         return Ok(());
     }
     let result = run_stream_loop(effective_req, slot.clone(), env, reader, writer).await;
-    tracker.leave(&replica_uuid);
     // Connection membership and WAL retention are different concepts. A
     // disconnected replica keeps its slot/history but leaves semi-sync quorum
     // immediately, avoiding a timeout on every commit for slot_timeout.
     // `run_stream_loop` owns `env`, so use the slot's shared state directly.
-    disconnect_slot(&slot);
     result
+}
+
+struct SenderSession {
+    tracker: Arc<SenderTracker>,
+    slot: SlotHandle,
+    preserve_seed: bool,
+}
+
+impl Drop for SenderSession {
+    fn drop(&mut self) {
+        self.tracker.leave(&self.slot.uuid);
+        if !self.preserve_seed {
+            self.slot.state.lock().seeding = false;
+        }
+        disconnect_slot(&self.slot);
+    }
 }
 
 fn disconnect_slot(slot: &SlotHandle) {
@@ -504,6 +553,22 @@ where
             last_known_lsn
         };
         while inflight_bytes < max_inflight_bytes {
+            if slot.status() != crate::repl::SlotStatus::Active {
+                let new_start_lsn = env.log.lock().min_available_lsn();
+                protocol::write_frame_async(
+                    &mut writer,
+                    &Message::Resync(Resync {
+                        new_start_lsn,
+                        reason:
+                            "replication slot no longer retains this stream; base backup required"
+                                .into(),
+                    }),
+                )
+                .await
+                .map_err(io_err)?;
+                writer.flush().await.map_err(io_err)?;
+                return Ok(());
+            }
             let chunk = if cap_to_durable {
                 wal_reader.next_durable_chunk(safe_high_lsn, requested_chunk_bytes)
             } else {

@@ -1275,7 +1275,7 @@ impl VectorIndexFile {
                 .map_err(io_err)?;
             file.flush().map_err(io_err)?;
             if self.durability == DurabilityMode::Strict {
-                file.sync_data().map_err(io_err)?;
+                crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
             }
             self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes;
         } else if let Some(file) = self.file.lock().as_mut() {
@@ -1283,7 +1283,7 @@ impl VectorIndexFile {
                 .map_err(io_err)?;
             file.flush().map_err(io_err)?;
             if self.durability == DurabilityMode::Strict {
-                file.sync_data().map_err(io_err)?;
+                crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
             }
         }
 

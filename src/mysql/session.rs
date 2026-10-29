@@ -50,6 +50,54 @@ use crate::storage::error;
 use crate::types::{Column, QueryError};
 use crate::util::logging::log_message;
 
+mod routine_results;
+mod tls_names;
+
+async fn local_infile_cancelled(
+    handle: Option<&SessionHandle>,
+    token: Option<&crate::engine::cancel::QueryCancelToken>,
+) {
+    loop {
+        let Some(handle) = handle else {
+            std::future::pending::<()>().await;
+            continue;
+        };
+        let notified = handle.notified();
+        tokio::pin!(notified);
+        // Register the waiter before checking generations: KILL QUERY uses
+        // notify_waiters, so checking first could lose a wake in this gap.
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(notified.as_mut(), cx))
+        })
+        .await;
+        if token.is_some_and(|token| token.check().is_err())
+            || handle.kill_flag().load(Ordering::Acquire)
+        {
+            return;
+        }
+        if first.is_pending() {
+            notified.await;
+        }
+    }
+}
+
+fn server_status_for_context(context: &SessionContext) -> u16 {
+    let mut status = 0;
+    if context.autocommit {
+        status |= SERVER_STATUS_AUTOCOMMIT;
+    }
+    if context.in_transaction() {
+        status |= SERVER_STATUS_IN_TRANS;
+        if context.read_only_txn {
+            status |= 0x2000;
+        }
+    }
+    if context.temporal_sql_mode_bits & crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES != 0 {
+        status |= 0x0200;
+    }
+    status
+}
+
 /// The worker owns the real context while an engine call runs. If it panics,
 /// the blocking pool catches the panic after this guard has put the context
 /// back where the session can recover and roll back its transaction.
@@ -178,6 +226,7 @@ pub struct Session<E: QueryEngine> {
     /// the handshake, COM_INIT_DB, or USE selects a schema.
     process_database: Option<String>,
     command_response_sequence: u8,
+    routine_response_sequence: Option<u8>,
     /// Transaction-admission permit (opt-in via `MYDB_TXN_ADMISSION`). Held
     /// from this session's first lock-taking statement until the transaction
     /// commits or rolls back, bounding the
@@ -231,7 +280,7 @@ type PreparedMap = hashbrown::HashMap<u32, PreparedStatement, ahash::RandomState
 #[cfg(not(unix))]
 const LOCAL_INFILE_MEMORY_LIMIT: usize = 1024 * 1024;
 const ASYNC_ROW_LOCK_RETRY_LIMIT: usize = 1;
-const ASYNC_ROW_LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+const ASYNC_ROW_LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 static ASYNC_ROW_LOCK_RETRIES: AtomicU64 = AtomicU64::new(0);
 static ASYNC_ROW_LOCK_WAKEUPS: AtomicU64 = AtomicU64::new(0);
 static ASYNC_ROW_LOCK_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -567,6 +616,9 @@ impl<E: QueryEngine> Drop for Session<E> {
 struct PreparedStatement {
     /// Client text retained only for general/slow logging.
     original_sql: Arc<str>,
+    /// Redaction verdict for `original_sql`, which every EXECUTE publishes to
+    /// the process list and performance_schema.
+    original_sql_sensitivity: crate::engine::http::SensitivityMemo,
     /// Equal-length, version-gated SQL used by every semantic path. `Arc<str>`
     /// avoids a full text copy on each COM_STMT_EXECUTE.
     sql: Arc<str>,
@@ -592,6 +644,9 @@ struct PreparedStatement {
     /// `statement_has_computed_ordering(parsed)`, derived once: the parsed
     /// template never changes for the lifetime of the handle.
     computed_ordering: bool,
+    /// `prepared_dml_transactional_inline_retry_allowed(parsed)`, derived once
+    /// for the same reason: its HTTP probe walks the whole statement.
+    dml_inline_retry: bool,
     /// `Com_*` status classification of `sql`, derived once at PREPARE.
     com_kind: Option<crate::engine::status_counters::ComKind>,
     long_data: Vec<Option<Vec<u8>>>,
@@ -850,30 +905,32 @@ where
     }
 
     fn result_fallback_collation_id(&self) -> u16 {
+        thread_local! {
+            /// Last resolved `character_set_results`; it rarely changes, while
+            /// every result set asks for its default collation.
+            static LAST: std::cell::RefCell<Option<(Box<str>, u16)>> =
+                const { std::cell::RefCell::new(None) };
+        }
         let Some(charset) = self.context.character_set_results.as_deref() else {
             return 0;
         };
-        crate::charset::default_collation_for_charset(charset)
-            .ok()
-            .and_then(|name| crate::charset::resolve_collation(name).ok())
-            .map(|collation| collation.id)
-            .unwrap_or(crate::charset::UTF8MB4_0900_AI_CI_ID)
+        LAST.with(|last| {
+            let mut last = last.borrow_mut();
+            if let Some((_, id)) = last.as_ref().filter(|(name, _)| name.as_ref() == charset) {
+                return *id;
+            }
+            let id = crate::charset::default_collation_for_charset(charset)
+                .ok()
+                .and_then(|name| crate::charset::resolve_collation(name).ok())
+                .map(|collation| collation.id)
+                .unwrap_or(crate::charset::UTF8MB4_0900_AI_CI_ID);
+            *last = Some((Box::from(charset), id));
+            id
+        })
     }
 
     fn server_status(&self) -> u16 {
-        let mut status = 0;
-        if self.context.autocommit {
-            status |= SERVER_STATUS_AUTOCOMMIT;
-        }
-        if self.context.in_transaction() {
-            status |= SERVER_STATUS_IN_TRANS;
-        }
-        if self.context.temporal_sql_mode_bits & crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES
-            != 0
-        {
-            status |= 0x0200; // SERVER_STATUS_NO_BACKSLASH_ESCAPES
-        }
-        status
+        server_status_for_context(&self.context)
     }
 
     /// Drop every prepared statement for this session, keeping the global
@@ -932,7 +989,7 @@ where
                     self.prepared_statement_snapshot(statement_id, prepared)
                 })
                 .collect();
-            handle.publish_pfs_prepared(prepared);
+            handle.publish_pfs_redacted_prepared(prepared);
         }
     }
 
@@ -945,7 +1002,17 @@ where
             statement_name: None,
             object_instance: ((self.connection_id as u64) << 32) | statement_id as u64,
             statement_id: statement_id as u64,
-            sql_text: Arc::clone(&prepared.original_sql),
+            sql_text: if prepared
+                .original_sql_sensitivity
+                .is_sensitive(&prepared.original_sql)
+            {
+                Arc::from(crate::engine::http::redaction_marker(
+                    &prepared.original_sql,
+                    false,
+                ))
+            } else {
+                Arc::clone(&prepared.original_sql)
+            },
             owner_thread_id: self.connection_id as u64,
             timer_prepare: prepared.timer_prepare,
             count_execute: prepared.count_execute,
@@ -969,7 +1036,7 @@ where
             return;
         };
         handle.set_protocol_prepared_memory_bytes(self.prepared_memory_bytes);
-        handle.publish_pfs_prepared_statement(
+        handle.publish_pfs_redacted_prepared_statement(
             self.prepared_statement_snapshot(statement_id, prepared),
         );
     }
@@ -1262,6 +1329,7 @@ where
             next_statement_id: 1,
             process_database: None,
             command_response_sequence: 1,
+            routine_response_sequence: None,
             txn_admission: None,
             registered_replica_guard: None,
             semi_sync_replica_requested: false,
@@ -1824,6 +1892,7 @@ where
         auth_plugin: Option<&'a str>,
     ) -> AuthRequest<'a> {
         AuthRequest {
+            replacing_account: self.authenticated.then_some(&self.context.authenticated_as),
             username,
             host,
             auth_response,
@@ -2078,7 +2147,7 @@ where
                 let (_, connection) = tls_stream.get_ref();
                 self.context.ssl_cipher = connection
                     .negotiated_cipher_suite()
-                    .map(|suite| format!("{:?}", suite.suite()));
+                    .map(|suite| tls_names::cipher_name(suite.suite()));
                 self.context.ssl_version = connection
                     .protocol_version()
                     .map(mysql_tls_version_name)
@@ -2088,8 +2157,10 @@ where
                     .and_then(|certs| certs.first())
                 {
                     if let Ok((_, parsed)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
-                        self.context.x509_subject = Some(parsed.subject().to_string());
-                        self.context.x509_issuer = Some(parsed.issuer().to_string());
+                        self.context.x509_subject =
+                            Some(tls_names::distinguished_name(parsed.subject()));
+                        self.context.x509_issuer =
+                            Some(tls_names::distinguished_name(parsed.issuer()));
                     }
                 }
                 self.stream = MysqlStream::Tls(Box::new(tls_stream));
@@ -2102,7 +2173,15 @@ where
         }
     }
 
+    fn sql_may_call_http(&self, sql: &str) -> bool {
+        self.engine
+            .sql_may_call_http(crate::engine::http::bound_sql(&self.context, sql))
+    }
+
     fn mark_busy(&self, command: &'static str, info: Option<String>) {
+        if let Some(sql) = &info {
+            self.sql_may_call_http(sql);
+        }
         if let Some(handle) = &self.handle {
             handle.mark_busy(
                 command,
@@ -2148,6 +2227,23 @@ where
             let Some(packet) = packet else {
                 return Ok(());
             };
+            if crate::engine::sysvar::builtin::replication::offline_mode()
+                && self
+                    .engine
+                    .authorize_global_privilege(
+                        &self.context,
+                        Privilege::Dynamic("CONNECTION_ADMIN".into()),
+                    )
+                    .is_err()
+            {
+                self.write_error_packet(
+                    packet.sequence_id.wrapping_add(1),
+                    &crate::error::catalog::ER_SERVER_OFFLINE_MODE
+                        .error("The server is currently in offline mode"),
+                )
+                .await?;
+                return Ok(());
+            }
             if packet.first_sequence_id != 0 {
                 let err = command_err_packet_for_spec(
                     crate::mysql::errors::ER_UNKNOWN_COM_ERROR,
@@ -2335,14 +2431,6 @@ where
                         1,
                     );
                     self.handle_query(sql_bytes).await?;
-                    // COMMIT/ROLLBACK ... RELEASE (or completion_type=RELEASE)
-                    // disconnects after the response is sent, like COM_QUIT.
-                    if self.context.close_after_response {
-                        self.context.close_after_response = false;
-                        self.engine.log_general_event(&self.context, "Quit", "");
-                        self.normal_close = true;
-                        return Ok(());
-                    }
                 }
                 COM_STMT_PREPARE => {
                     self.context.refresh_cancel_generations();
@@ -2389,16 +2477,18 @@ where
                         .await?;
                     if let Some(statement_id) = command_statement_id(&packet.payload) {
                         self.refresh_prepared_memory(statement_id);
+                        self.publish_prepared_statement(statement_id);
                     }
-                    self.publish_prepared_memory();
                 }
                 COM_STMT_CLOSE => self.handle_stmt_close(&packet.payload[1..]).await?,
                 COM_STMT_RESET => {
                     self.handle_stmt_reset(&packet.payload[1..]).await?;
+                    // A reset mutates exactly one handle; republishing every
+                    // handle rebuilt and rescanned the session's whole set.
                     if let Some(statement_id) = command_statement_id(&packet.payload) {
                         self.refresh_prepared_memory(statement_id);
+                        self.publish_prepared_statement(statement_id);
                     }
-                    self.publish_prepared_memory();
                 }
                 COM_STMT_FETCH => {
                     let _memory_activity =
@@ -2448,6 +2538,15 @@ where
                         .write_packet(&mut self.stream, self.command_response_sequence, &err)
                         .await?;
                 }
+            }
+
+            // COMMIT/ROLLBACK ... RELEASE (or completion_type=RELEASE)
+            // disconnects after the response is sent, like COM_QUIT.
+            if self.context.close_after_response {
+                self.context.close_after_response = false;
+                self.engine.log_general_event(&self.context, "Quit", "");
+                self.normal_close = true;
+                return Ok(());
             }
 
             self.publish_pfs_variables();
@@ -2819,7 +2918,7 @@ where
         let mut context = SessionContext::default();
         context.current_database.clear();
         context.connection_id = self.connection_id;
-        context.host = self.peer_addr.to_string();
+        context.host = client_host.clone();
         context.ssl_cipher = self.context.ssl_cipher.clone();
         context.ssl_version = self.context.ssl_version.clone();
         context.x509_subject = self.context.x509_subject.clone();
@@ -2851,7 +2950,15 @@ where
             .engine
             .auth_plugin_for_user(&request.username, &client_host)
         {
-            Ok(Some(account_plugin)) if account_plugin != client_plugin => {
+            Ok(Some(account_plugin))
+                if account_plugin != client_plugin
+                    || (self.client_capabilities() & CLIENT_PLUGIN_AUTH != 0
+                        && ((!auth_response.is_empty() && auth_response != [0])
+                            || self
+                                .engine
+                                .auth_account_has_password(&request.username, &client_host)
+                                .unwrap_or(true))) =>
+            {
                 if self.client_capabilities() & CLIENT_PLUGIN_AUTH == 0 {
                     let err = command_err_packet_for_spec(
                         crate::mysql::errors::ER_NOT_SUPPORTED_AUTH_MODE,
@@ -2864,7 +2971,6 @@ where
                         .await?;
                     return Ok(());
                 }
-                self.handshake_nonce = crate::mysql::protocol::generate_auth_nonce();
                 auth_response = self
                     .switch_auth_plugin(
                         &account_plugin,
@@ -2901,6 +3007,9 @@ where
             Err(err) => {
                 self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
                     .await?;
+                if err.is(crate::error::catalog::ER_USER_LIMIT_REACHED) {
+                    return Ok(());
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "COM_CHANGE_USER authentication failed",
@@ -3658,12 +3767,18 @@ where
             }
         }
 
-        // Bare transaction control never waits for a row lock: COMMIT
-        // releases row locks before its durability barrier and ROLLBACK only
-        // applies this session's own undo. Its blocking work (group-commit
-        // fsync) therefore matches the autocommit DML that already executes
-        // inline on this runtime worker, so it follows the same policy instead
-        // of paying a blocking-pool round trip on every transaction.
+        // Catalog-aware dispatch includes HTTP hidden behind views, routines,
+        // or triggers before any inline SQL path can block a Tokio worker.
+        if self.sql_may_call_http(sql.as_str())
+            && !looks_like_load_data_local(sql.as_str(), lex_mode)
+        {
+            let result = self.execute_engine_blocking(sql.to_string()).await;
+            return self.write_query_response(result).await;
+        }
+
+        // A shared reactor must keep driving sibling lock holders while a
+        // COMMIT waits for durability/visibility or a ROLLBACK applies undo.
+        // Sole-connection reactors retain the inline control path.
         // A plain session-variable SET (e.g. JDBC's per-query
         // `SET SQL_SELECT_LIMIT`) is bounded the same way: it evaluates no
         // subquery or function and changes only this session's state.
@@ -3671,7 +3786,13 @@ where
             && (crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
                 || is_simple_session_set_sql(sql.as_str()))
         {
-            let result = self.engine.execute(&mut self.context, &sql);
+            let result = if crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
+                && crate::util::connection_dispatch::current_worker_has_sibling_connections()
+            {
+                self.execute_engine_blocking(sql).await
+            } else {
+                self.engine.execute(&mut self.context, &sql)
+            };
             if self.kill_flag.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -3800,12 +3921,17 @@ where
                                     Arc::clone(&shape_sql),
                                     || {
                                         crate::engine::api::with_shared_result_metadata(|| {
-                                            self.engine.execute_prepared_select(
-                                                &mut self.context,
-                                                &mut memo.state,
-                                                compile_parsed,
-                                                sql.as_str(),
+                                            crate::engine::params::with_auto_params_slice(
                                                 &params,
+                                                || {
+                                                    self.engine.execute_prepared_select(
+                                                        &mut self.context,
+                                                        &mut memo.state,
+                                                        compile_parsed,
+                                                        sql.as_str(),
+                                                        &params,
+                                                    )
+                                                },
                                             )
                                         })
                                     },
@@ -4019,6 +4145,19 @@ where
         &mut self,
         result: Result<QueryResponse, QueryError>,
     ) -> io::Result<()> {
+        let original = self.command_response_sequence;
+        if let Some(sequence) = self.routine_response_sequence.take() {
+            self.command_response_sequence = sequence;
+        }
+        let result = self.write_query_response_inner(result).await;
+        self.command_response_sequence = original;
+        result
+    }
+
+    async fn write_query_response_inner(
+        &mut self,
+        result: Result<QueryResponse, QueryError>,
+    ) -> io::Result<()> {
         if let Some(handle) = &self.handle {
             handle.set_base_state(ProcessState::QueryEnd);
         }
@@ -4175,7 +4314,7 @@ where
             }
             _ => None,
         })
-        .unwrap_or(true);
+        .unwrap_or(false);
         if !local_infile_on {
             let err = error(
                 crate::error::catalog::ER_CLIENT_LOCAL_FILES_DISABLED,
@@ -4225,15 +4364,14 @@ where
             let mut staging = LocalInfileStaging::new();
             let mut staging_error: Option<QueryError> = None;
             let last_seq: u8;
+            let input_cancel = self.context.current_cancel_token().cloned();
             loop {
-                match self
-                    .codec
-                    .read_packet_with_timeout(
-                        &mut self.stream,
-                        crate::mysql::packet::net_read_timeout(),
-                    )
-                    .await?
-                {
+                let read = tokio::select! {
+                    biased;
+                    _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                    packet = self.codec.read_packet_with_timeout(&mut self.stream, crate::mysql::packet::net_read_timeout()) => packet,
+                };
+                match read? {
                     Some(packet) if packet.payload.is_empty() => {
                         last_seq = packet.sequence_id;
                         break;
@@ -4327,14 +4465,12 @@ where
 
         let mut pipe_error: Option<QueryError> = None;
         let last_seq = loop {
-            let packet = match self
-                .codec
-                .read_packet_with_timeout(
-                    &mut self.stream,
-                    crate::mysql::packet::net_read_timeout(),
-                )
-                .await
-            {
+            let read = tokio::select! {
+                biased;
+                _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                packet = self.codec.read_packet_with_timeout(&mut self.stream, crate::mysql::packet::net_read_timeout()) => packet,
+            };
+            let packet = match read {
                 Ok(packet) => packet,
                 Err(err) => {
                     if let Some(token) = &input_cancel {
@@ -4351,7 +4487,22 @@ where
                 Some(packet) if packet.payload.is_empty() => break packet.sequence_id,
                 Some(packet) => {
                     if pipe_error.is_none() {
-                        if let Err(err) = writer.write_all(&packet.payload).await {
+                        let write = tokio::select! {
+                            biased;
+                            _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                            result = writer.write_all(&packet.payload) => result,
+                        };
+                        if let Err(err) = write {
+                            if err.kind() == io::ErrorKind::Interrupted {
+                                if let Some(token) = &input_cancel {
+                                    token.cancel_local();
+                                }
+                                drop(writer);
+                                if let Ok((context, _)) = execution.await {
+                                    self.restore_context(context);
+                                }
+                                return Err(err);
+                            }
                             // Keep draining through the empty terminator so the
                             // command exchange remains framed. A closed reader
                             // normally means the executor already has a more
@@ -4561,8 +4712,9 @@ where
             return Ok(());
         };
         let mut prepared = PreparedStatement {
+            original_sql_sensitivity: crate::engine::http::SensitivityMemo::new(&sql),
             original_sql: Arc::from(sql.as_str()),
-            sql: Arc::from(effective_sql.as_str()),
+            sql: crate::engine::perf_events::prepared_statement_sql(&perf_texts),
             normalized_sql,
             database,
             parser_sql_mode_bits: mode_bits,
@@ -4572,6 +4724,9 @@ where
             computed_ordering: parsed
                 .as_deref()
                 .is_some_and(|statement| statement_has_computed_ordering(statement)),
+            dml_inline_retry: parsed
+                .as_deref()
+                .is_some_and(prepared_dml_transactional_inline_retry_allowed),
             com_kind: crate::engine::status_counters::classify_query_com(&effective_sql),
             parsed,
             long_data: vec![None; param_count],
@@ -4744,6 +4899,7 @@ where
             parser_sql_mode_bits,
             perf_texts,
             com_kind,
+            original_sql_sensitive,
             parse_result,
         ) = {
             let Some(prepared) = self.prepared.get(&statement_id) else {
@@ -4784,6 +4940,9 @@ where
                 prepared.parser_sql_mode_bits,
                 prepared.perf_texts.clone(),
                 prepared.com_kind,
+                prepared
+                    .original_sql_sensitivity
+                    .is_sensitive(&prepared.original_sql),
                 parse_result,
             )
         };
@@ -4791,7 +4950,7 @@ where
             crate::engine::status_counters::record_session_com(&self.context, kind);
         }
         if let Some(handle) = &self.handle {
-            handle.set_process_info_shared(Arc::clone(&original_sql));
+            handle.set_process_info_prechecked(Arc::clone(&original_sql), original_sql_sensitive);
             handle.set_base_state(ProcessState::Executing);
         }
         self.engine
@@ -5053,12 +5212,16 @@ where
             // the blocking pool; they must never park a Tokio worker while
             // waiting for another connection to commit and release its lock.
             if !cursor_requested {
-                let (parsed_arc, dml_state) = {
+                let (parsed_arc, dml_inline_retry, dml_state) = {
                     let entry = self
                         .prepared
                         .get_mut(&statement_id)
                         .expect("prepared entry present moments ago");
-                    (entry.parsed.clone(), std::mem::take(&mut entry.dml_state))
+                    (
+                        entry.parsed.clone(),
+                        entry.dml_inline_retry,
+                        std::mem::take(&mut entry.dml_state),
+                    )
                 };
                 let (dml_state, dml_result) = if let Some(arc) = parsed_arc {
                     if prepared_dml_inline_allowed(&self.context)
@@ -5071,7 +5234,8 @@ where
                             &values,
                             &perf_texts,
                         )
-                    } else if prepared_dml_transactional_inline_retry_allowed(arc.as_ref()) {
+                    } else if dml_inline_retry && prepared_dml_retry_context_allowed(&self.context)
+                    {
                         // Explicit / autocommit-off transaction: attempt
                         // inline with nonblocking lock waits. On conflict,
                         // the savepoint path rolls back cleanly before the
@@ -5185,6 +5349,7 @@ where
                     values,
                     Some((Arc::clone(&normalized_sql), Arc::clone(&database))),
                     perf_texts.clone(),
+                    cursor_requested,
                 )
                 .await
             {
@@ -5259,6 +5424,22 @@ where
     }
 
     async fn write_stmt_execute_response_for(
+        &mut self,
+        statement_id: Option<u32>,
+        result: Result<QueryResponse, crate::types::QueryError>,
+    ) -> io::Result<()> {
+        let original = self.command_response_sequence;
+        if let Some(sequence) = self.routine_response_sequence.take() {
+            self.command_response_sequence = sequence;
+        }
+        let result = self
+            .write_stmt_execute_response_inner(statement_id, result)
+            .await;
+        self.command_response_sequence = original;
+        result
+    }
+
+    async fn write_stmt_execute_response_inner(
         &mut self,
         statement_id: Option<u32>,
         result: Result<QueryResponse, crate::types::QueryError>,
@@ -5792,6 +5973,7 @@ where
         let found_rows = result.found_rows;
         let mut cursor = result.cursor;
         let external = cursor.external_io();
+        let http = cursor.external_http_io();
         let batch_rows = if external {
             cursor
                 .external_batch_rows()
@@ -5806,7 +5988,11 @@ where
             let cols = Arc::clone(&columns);
             let zf = Arc::clone(&zerofill);
             let _admission = if external {
-                match crate::engine::ai::runtime::admit_coordinator() {
+                match if http {
+                    crate::engine::http::admit_coordinator()
+                } else {
+                    crate::engine::ai::runtime::admit_coordinator()
+                } {
                     Ok(p) => Some(p),
                     Err(e) => {
                         return finish_failed_stream(batch, sequence_id, &e, &mut self.text_batch)
@@ -5877,7 +6063,9 @@ where
                 }
                 (cursor, encoded, err, exhausted, memory_charge)
             };
-            let pulled = if external {
+            let pulled = if http {
+                crate::engine::http::spawn_coordinator(work)
+            } else if external {
                 crate::engine::ai::runtime::spawn_coordinator(work)
             } else {
                 crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -6210,8 +6398,13 @@ where
             .cloned()
             .unwrap_or_else(crate::engine::cancel::QueryCancelToken::noop);
         let external = cursor.external_io();
+        let http = cursor.external_http_io();
         let _admission = if external {
-            match crate::engine::ai::runtime::admit_coordinator() {
+            match if http {
+                crate::engine::http::admit_coordinator()
+            } else {
+                crate::engine::ai::runtime::admit_coordinator()
+            } {
                 Ok(p) => Some(p),
                 Err(e) => {
                     self.write_error_packet(self.command_response_sequence, &e)
@@ -6226,7 +6419,9 @@ where
             let first = cancel.check().and_then(|()| cursor.next_row());
             (cursor, first)
         };
-        let peek = if external {
+        let peek = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if external {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else {
             crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -6447,8 +6642,13 @@ where
         while remaining != 0 && !exhausted {
             let cols = columns.clone();
             let external = prepared_cursor.inner.external_io();
+            let http = prepared_cursor.inner.external_http_io();
             let _admission = if external {
-                match crate::engine::ai::runtime::admit_coordinator() {
+                match if http {
+                    crate::engine::http::admit_coordinator()
+                } else {
+                    crate::engine::ai::runtime::admit_coordinator()
+                } {
                     Ok(p) => Some(p),
                     Err(e) => {
                         fetch_err = Some(e);
@@ -6523,7 +6723,9 @@ where
                 }
                 (prepared_cursor, encoded, err, memory_charge)
             };
-            let join_result = if external {
+            let join_result = if http {
+                crate::engine::http::spawn_coordinator(work)
+            } else if external {
                 crate::engine::ai::runtime::spawn_coordinator(work)
             } else {
                 crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
@@ -6869,12 +7071,15 @@ where
     /// write transaction (commit / rollback). Keyed off `current_txn` rather
     /// than `in_transaction()` — the latter is permanently true whenever
     /// `autocommit=0` (as JDBC/BenchmarkSQL run), which would pin every permit
-    /// forever. `current_txn` is `None` exactly when no transaction is holding
-    /// row locks, so the permit is released the moment the transaction ends and
-    /// re-acquired (holding no locks) at the next transaction's first
+    /// forever. An IDLE XA branch still owns row locks after detaching
+    /// `current_txn`. Release only when both session transaction owners end.
+    /// Re-acquire (holding no locks) at the next transaction's first
     /// lock-taking statement — the invariant that keeps admission deadlock-free.
     fn release_txn_admission_if_idle(&mut self) {
-        if self.txn_admission.is_some() && self.context.current_txn.is_none() {
+        if self.txn_admission.is_some()
+            && self.context.current_txn.is_none()
+            && self.context.xa_branch.is_none()
+        {
             self.txn_admission = None;
         }
     }
@@ -6887,23 +7092,37 @@ where
         // pulled lazily during socket writeback, so server memory stays
         // bounded even on a `SELECT * FROM huge_table`.
         let ai = crate::engine::ai::sql::sql_may_have_ai(&sql);
-        let _admission = if ai {
+        let http = self.sql_may_call_http(&sql);
+        let _http_session = if http {
+            Some(crate::engine::http::admit_session(&self.context).await?)
+        } else {
+            None
+        };
+        let _admission = if http {
+            Some(crate::engine::http::admit_coordinator()?)
+        } else if ai {
             Some(crate::engine::ai::runtime::admit_coordinator()?)
         } else {
             None
         };
+        let (sink, receiver) = self.routine_packet_stream(&sql, false);
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
         let work = move || {
-            let result = engine.execute(&mut context, &sql);
+            let result = routine_results::with_sink(sink, || engine.execute(&mut context, &sql));
             (context, result)
         };
-        let job = if ai {
+        let job = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
         };
-        let (context, result) = job.await.map_err(|err| self.recover_join_error(err))?;
+        let (context, result) = self
+            .finish_routine_job(job, receiver)
+            .await
+            .map_err(|err| self.recover_join_error(err))?;
         self.restore_context(context);
 
         result
@@ -6920,7 +7139,15 @@ where
         // there is no reason to throw away that authoritative AST and parse
         // the identical COM_QUERY a second time on the worker.
         let ai = crate::engine::ai::sql::statement_has_ai(&statement);
-        let _admission = if ai {
+        let http = self.sql_may_call_http(&sql);
+        let _http_session = if http {
+            Some(crate::engine::http::admit_session(&self.context).await?)
+        } else {
+            None
+        };
+        let _admission = if http {
+            Some(crate::engine::http::admit_coordinator()?)
+        } else if ai {
             Some(crate::engine::ai::runtime::admit_coordinator()?)
         } else {
             None
@@ -6944,7 +7171,9 @@ where
             };
             (context, result)
         };
-        let job = if ai {
+        let job = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else if needs_async_progress {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
@@ -7043,7 +7272,9 @@ where
         if prepared_dml_inline_allowed(&self.context) {
             return self.run_text_dml_shape_inline(sql, parsed, dml_state, params, shape_sql);
         }
-        if prepared_dml_transactional_inline_retry_allowed(parsed.as_ref()) {
+        if prepared_dml_transactional_inline_retry_allowed(parsed.as_ref())
+            && prepared_dml_retry_context_allowed(&self.context)
+        {
             // The inline attempt may take this transaction's first row lock;
             // enter admission while it still holds no locks.
             self.acquire_txn_admission().await;
@@ -7204,15 +7435,19 @@ where
         sql: String,
         parser_sql_mode_bits: u16,
     ) -> Result<QueryResponse, QueryError> {
+        let (sink, receiver) = self.routine_packet_stream(&sql, false);
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
-        let (context, result) =
+        let job =
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), move || {
                 let _override =
                     crate::parser::ParserSqlModeOverrideGuard::activate(parser_sql_mode_bits);
-                let result = engine.execute(&mut context, &sql);
+                let result =
+                    routine_results::with_sink(sink, || engine.execute(&mut context, &sql));
                 (context, result)
-            })
+            });
+        let (context, result) = self
+            .finish_routine_job(job, receiver)
             .await
             .map_err(|err| self.recover_join_error(err))?;
         self.restore_context(context);
@@ -7254,7 +7489,13 @@ where
         params: Vec<crate::types::Value>,
         hint_keys: Option<(Arc<str>, Arc<str>)>,
         perf_texts: crate::engine::perf_events::PreparedStatementTexts,
+        cursor_requested: bool,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if cursor_requested && matches!(statement, Statement::Call(_)) {
+            return Some(Err(crate::mysql::errors::unsupported(
+                "server-side cursors for multi-result prepared statements",
+            )));
+        }
         // Statements that may take row locks have to run on the
         // `spawn_blocking` pool: the executor's row-lock acquire path
         // parks the OS thread on `Condvar::wait_timeout`. Running such a
@@ -7283,7 +7524,8 @@ where
         // demand. Materializing up front would defeat server-side cursor
         // fetching (`useCursorFetch=true`) by buffering the full result
         // set in memory before the FETCH loop even starts.
-        if statement_is_lock_safe_read(&statement)
+        if !self.sql_may_call_http(&sql)
+            && statement_is_lock_safe_read(&statement)
             && !statement_has_computed_ordering(&statement)
             && context_allows_inline_lock_safe_read(&self.context)
         {
@@ -7319,18 +7561,37 @@ where
             self.acquire_txn_admission().await;
         }
         let ai = crate::engine::ai::sql::statement_has_ai(&statement);
-        let _admission = if ai {
-            match crate::engine::ai::runtime::admit_coordinator() {
+        let http = self.sql_may_call_http(&sql);
+        let _http_session = if http {
+            match crate::engine::http::admit_session(&self.context).await {
                 Ok(p) => Some(p),
                 Err(e) => return Some(Err(e)),
             }
         } else {
             None
         };
+        let _admission = if http {
+            match crate::engine::http::admit_coordinator() {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(e)),
+            }
+        } else if ai {
+            match if http {
+                crate::engine::http::admit_coordinator()
+            } else {
+                crate::engine::ai::runtime::admit_coordinator()
+            } {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            None
+        };
+        let (sink, receiver) = self.routine_packet_stream(&sql, true);
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
         let work = move || {
-            let result =
+            let result = routine_results::with_sink(sink, || {
                 crate::engine::perf_events::with_prepared_statement_texts(&perf_texts, || {
                     crate::engine::params::with_params(params, || {
                         let run =
@@ -7348,15 +7609,18 @@ where
                             None => run(),
                         }
                     })
-                });
+                })
+            });
             (context, result)
         };
-        let job = if ai {
+        let job = if http {
+            crate::engine::http::spawn_coordinator(work)
+        } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
         };
-        match job.await {
+        match self.finish_routine_job(job, receiver).await {
             Ok((context, result)) => {
                 self.restore_context(context);
 
@@ -7366,14 +7630,10 @@ where
         }
     }
 
-    /// After an inline exact-point command reports an internal row-lock
-    /// conflict, keep the connection task on Tokio and wait for storage's
-    /// monotonic row-release signal. Each retry still runs under the
-    /// nonblocking lock policy, so it can never park a runtime worker. The
-    /// The conflict records the release generation before probing, so a
-    /// release racing with subscription is observed without an unconditional
-    /// replay. Complex/long waits retain the bounded blocking-pool oracle
-    /// after one directed wake opportunity (or a quiet 2ms slice).
+    /// Join the exact row FIFO and await its directed release token. Recheck
+    /// eligibility before sleeping and after waking, then replay once under
+    /// the nonblocking lock policy. A fixed deadline bounds cancellation
+    /// latency and hands long/complex waits to the blocking executor.
     async fn retry_prepared_dml_after_async_row_wake(
         &mut self,
         sql: &str,
@@ -7386,21 +7646,26 @@ where
         Option<Result<QueryResponse, QueryError>>,
         bool,
     ) {
-        if !async_row_lock_retry_enabled() {
+        if !async_row_lock_retry_enabled()
+            || self.context.sysvars.innodb_lock_wait_timeout == Some(0)
+        {
             return (state, None, false);
         }
         let Some(mut signal) = self.engine.row_lock_async_signal() else {
             ASYNC_ROW_LOCK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             return (state, None, false);
         };
+        let deadline = tokio::time::Instant::now() + ASYNC_ROW_LOCK_WAIT_SLICE;
         for _ in 0..ASYNC_ROW_LOCK_RETRY_LIMIT {
-            match tokio::time::timeout(ASYNC_ROW_LOCK_WAIT_SLICE, signal.changed()).await {
-                Ok(Ok(())) => {
-                    ASYNC_ROW_LOCK_WAKEUPS.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(Err(_)) | Err(_) => {
-                    ASYNC_ROW_LOCK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                    return (state, None, false);
+            while !self.engine.row_lock_async_ready(&signal) {
+                match tokio::time::timeout_at(deadline, signal.changed()).await {
+                    Ok(Ok(())) => {
+                        ASYNC_ROW_LOCK_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        ASYNC_ROW_LOCK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                        return (state, None, false);
+                    }
                 }
             }
             ASYNC_ROW_LOCK_RETRIES.fetch_add(1, Ordering::Relaxed);
@@ -7499,6 +7764,9 @@ where
         crate::engine::api::PreparedDmlState,
         Option<Result<QueryResponse, QueryError>>,
     ) {
+        if self.sql_may_call_http(sql) {
+            return (dml_state, None);
+        }
         // The storage engine is synchronous: even an uncontended autocommit
         // DML reaches WAL pwrite/fsync and group-commit Condvar waits. Tokio's
         // `block_in_place` can compensate for that by starting replacement
@@ -7598,7 +7866,9 @@ fn prepared_dml_inline_enabled() -> bool {
 /// That matches MySQL, where a rolled-back INSERT likewise leaves an
 /// auto-increment gap.
 fn prepared_dml_transactional_inline_retry_allowed(statement: &Statement) -> bool {
-    prepared_dml_inline_enabled() && prepared_dml_statement_candidate(statement)
+    prepared_dml_inline_enabled()
+        && prepared_dml_statement_candidate(statement)
+        && !crate::engine::http::statement_has_http(statement)
 }
 
 fn prepared_dml_statement_candidate(statement: &Statement) -> bool {
@@ -7637,6 +7907,14 @@ fn prepared_dml_inline_allowed(context: &SessionContext) -> bool {
         && context.autocommit
         && !context.explicit_txn
         && context.current_txn.is_none()
+        && !crate::util::connection_dispatch::current_worker_has_sibling_connections()
+}
+
+fn prepared_dml_retry_context_allowed(context: &SessionContext) -> bool {
+    !context.autocommit
+        || context.explicit_txn
+        || context.current_txn.is_some()
+        || !crate::util::connection_dispatch::current_worker_has_sibling_connections()
 }
 
 fn mysql_tls_version_name(version: ProtocolVersion) -> &'static str {
@@ -9699,6 +9977,7 @@ fn expr_contains_blocking_function(expr: &Expr) -> bool {
         Expr::WindowFunction { .. } => true,
         Expr::Function { name, .. } => {
             crate::engine::ai::is_function(name)
+                || crate::engine::http::is_function(name)
                 || name.eq_ignore_ascii_case("SLEEP")
                 || name.eq_ignore_ascii_case("GET_LOCK")
                 || name.eq_ignore_ascii_case("NEXTVAL")
@@ -9906,6 +10185,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn expression_audit_cached_text_read_keeps_literal_diagnostics() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE test.temporal_literal_cache(dt DATETIME(6), KEY k(dt))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO test.temporal_literal_cache VALUES('2020-01-01')")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut session = Session::try_new(
+            4243,
+            peer,
+            stream,
+            None,
+            engine,
+            Arc::new(SessionRegistry::new()),
+        )
+        .unwrap();
+        session.authenticated = true;
+        session.context.current_database = "test".into();
+        for _ in 0..4 {
+            session
+                .handle_single_query(
+                    "SELECT COUNT(*) FROM temporal_literal_cache WHERE dt='0000-00-00'".into(),
+                )
+                .await
+                .unwrap();
+            let packet = crate::mysql::packet::read_packet(&mut client)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(packet.payload[0], 0xff);
+            assert_eq!(
+                u16::from_le_bytes(packet.payload[1..3].try_into().unwrap()),
+                1525
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn source_audit_b1_worker_panic_releases_real_mdl_and_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
@@ -10036,6 +10360,126 @@ mod tests {
     }
 
     #[test]
+    fn shared_reactor_txn_control_keeps_sibling_timer_runnable() {
+        std::thread::spawn(|| {
+            crate::util::connection_dispatch::test_set_worker_connection_count(2);
+            let mut context = SessionContext::default();
+            assert!(!prepared_dml_inline_allowed(&context));
+            assert!(!prepared_dml_retry_context_allowed(&context));
+            context.autocommit = false;
+            assert!(prepared_dml_retry_context_allowed(&context));
+
+            struct Engine {
+                entered: AtomicBool,
+                completed: AtomicBool,
+                release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            }
+            impl QueryEngine for Engine {
+                fn execute(
+                    &self,
+                    _: &mut SessionContext,
+                    _: &str,
+                ) -> Result<QueryResponse, QueryError> {
+                    self.entered.store(true, Ordering::Release);
+                    let released = self
+                        .release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .is_ok();
+                    self.completed.store(released, Ordering::Release);
+                    Ok(QueryResponse::Ok)
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let _client = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (stream, peer) = listener.accept().await.unwrap();
+                let (release, receiver) = std::sync::mpsc::channel();
+                let engine = Arc::new(Engine {
+                    entered: AtomicBool::new(false),
+                    completed: AtomicBool::new(false),
+                    release: std::sync::Mutex::new(receiver),
+                });
+                let mut session = Session::new(
+                    1,
+                    peer,
+                    stream,
+                    None,
+                    engine.clone(),
+                    Arc::new(SessionRegistry::new()),
+                );
+                let sibling = async {
+                    while !engine.entered.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    release.send(()).ok();
+                };
+                let (response, ()) =
+                    tokio::join!(session.handle_single_query("COMMIT".into()), sibling);
+                response.unwrap();
+                assert!(
+                    engine.completed.load(Ordering::Acquire),
+                    "the shared reactor stalled its sibling behind COMMIT"
+                );
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_lock_timeout_skips_async_fifo_wait() {
+        struct Engine;
+        impl QueryEngine for Engine {
+            fn execute(
+                &self,
+                _: &mut SessionContext,
+                _: &str,
+            ) -> Result<QueryResponse, QueryError> {
+                Ok(QueryResponse::Ok)
+            }
+            fn row_lock_async_signal(&self) -> Option<crate::engine::api::AsyncRowLockSignal> {
+                panic!("zero timeout must use the synchronous immediate-timeout path");
+            }
+        }
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ASYNC_ROW_LOCK_RETRY_ENABLED.store(self.0, Ordering::Release);
+            }
+        }
+        let _reset = Reset(TEST_ASYNC_ROW_LOCK_RETRY_ENABLED.swap(true, Ordering::AcqRel));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut session = Session::new(
+            1,
+            peer,
+            stream,
+            None,
+            Arc::new(Engine),
+            Arc::new(SessionRegistry::new()),
+        );
+        session.context.sysvars.innodb_lock_wait_timeout = Some(0);
+        let sql = "UPDATE t SET v = 1 WHERE id = 1";
+        let parsed = Arc::new(parse_statement(sql).unwrap());
+        let texts = crate::engine::perf_events::prepared_statement_texts(sql);
+        let (_, result, completed) = session
+            .retry_prepared_dml_after_async_row_wake(sql, &parsed, Default::default(), &[], &texts)
+            .await;
+        assert!(result.is_none());
+        assert!(!completed);
+    }
+    #[test]
     fn protocol_audit_blocking_failures_encode_server_errors() {
         for failure in [
             crate::util::blocking_pool::BlockingError::Cancelled,
@@ -10141,6 +10585,7 @@ mod tests {
 
     fn empty_prepared_statement() -> PreparedStatement {
         PreparedStatement {
+            original_sql_sensitivity: crate::engine::http::SensitivityMemo::new("SELECT ?"),
             original_sql: Arc::from("SELECT ?"),
             sql: Arc::from("SELECT ?"),
             normalized_sql: Arc::from("select ?"),
@@ -10151,6 +10596,7 @@ mod tests {
             value_scratch: Vec::with_capacity(1),
             parsed: None,
             computed_ordering: false,
+            dml_inline_retry: false,
             com_kind: None,
             long_data: vec![None],
             long_data_error: None,

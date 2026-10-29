@@ -1,6 +1,325 @@
 use super::*;
 
 #[test]
+fn memory_index_mutations_do_not_reencode_resident_leaf_for_each_entry() {
+    for kind in 0..8 {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let log = test_log(dir.path());
+        let pool = BufferPool::new_with_options(
+            16,
+            Arc::clone(&log),
+            DurabilityMode::Memory,
+            Duration::ZERO,
+            1,
+            0,
+        );
+        let mut index = IndexFile::open_with_durability(
+            dir.path().join("memory.idx"),
+            log.clone(),
+            DurabilityMode::Memory,
+            pool,
+        )
+        .unwrap();
+        let entries = (0..128)
+            .map(|value| IndexEntry {
+                key: IndexKey::from(match kind {
+                    0 => vec![KeyPart::Int(value)],
+                    1 => vec![KeyPart::UInt(value as u64)],
+                    2 => vec![KeyPart::Decimal {
+                        value: value as i128 * 101,
+                        scale: 2,
+                    }],
+                    3 => vec![KeyPart::Date(18000 + value as i32)],
+                    4 => vec![KeyPart::Float64(
+                        crate::util::ordered_float::f64_to_order_u64(value as f64 / 4.0),
+                    )],
+                    5 => vec![KeyPart::Bytes(format!("key-{value:04}").into_bytes())],
+                    6 => vec![KeyPart::String(format!("key-{value:04}"))],
+                    _ => vec![KeyPart::Int(value), KeyPart::UInt(value as u64 * 3)],
+                }),
+                row_id: RowId {
+                    page_id: value as u32 + 1,
+                    slot_id: 0,
+                },
+            })
+            .collect::<Vec<_>>();
+        index.bulk_load_sorted(7, entries.clone()).unwrap();
+        let wal_before = log.lock().last_lsn();
+        let encodings_before = INDEX_TREE_PAGE_ENCODINGS.with(|count| count.get());
+        for entry in &entries[32..64] {
+            index.delete(entry.key.clone(), entry.row_id).unwrap();
+        }
+        let actual = index.entries().unwrap();
+        let expected = entries[..32]
+            .iter()
+            .chain(&entries[64..])
+            .map(|entry| (entry.key.clone(), entry.row_id))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "kind={kind}");
+        for entry in &entries[32..64] {
+            index
+                .insert(entry.key.clone(), entry.row_id, false)
+                .unwrap();
+        }
+        assert_eq!(
+            index.entries().unwrap(),
+            entries
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.row_id))
+                .collect::<Vec<_>>(),
+            "kind={kind}"
+        );
+        assert_eq!(
+            log.lock().last_lsn(),
+            wal_before,
+            "memory mutations must not append WAL"
+        );
+        let encodings = INDEX_TREE_PAGE_ENCODINGS.with(|count| count.get()) - encodings_before;
+        assert!(
+            encodings <= 4,
+            "resident mutations encoded {encodings} whole pages; kind={kind}"
+        );
+        let root = index.page_key(index.root_page.load(Ordering::Acquire));
+        let frame = index.buffer_pool.lookup_frame(&root).unwrap().unwrap();
+        assert_eq!(frame.dirty_lsn.load(Ordering::Acquire), 0);
+
+        // Explicit replay still supplies a logical anchor even when the
+        // index's resident cache uses memory durability.
+        let logical_lsn = log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        assert!(logical_lsn > 0);
+        index
+            .apply_batch_with_lsn(
+                8,
+                vec![IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entries[96].key.clone(),
+                    row_id: entries[96].row_id,
+                }],
+                Some(logical_lsn),
+            )
+            .unwrap();
+        assert!(frame.dirty_lsn.load(Ordering::Acquire) >= logical_lsn);
+        assert!(index.get(&entries[96].key, false).unwrap().is_empty());
+
+        // Unlogged physical replay must keep the source's last applied LSN,
+        // rather than the next reservation used by local logical mutations.
+        log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        let source_lsn = log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        with_physical_wal_apply(|| {
+            index.apply_batch_with_lsn(
+                8,
+                vec![IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entries[97].key.clone(),
+                    row_id: entries[97].row_id,
+                }],
+                None,
+            )
+        })
+        .unwrap();
+        let frame = index.buffer_pool.lookup_frame(&root).unwrap().unwrap();
+        assert_eq!(frame.dirty_lsn.load(Ordering::Acquire), source_lsn);
+        assert!(index.get(&entries[97].key, false).unwrap().is_empty());
+
+        let source_lsn = log.lock().append(8, WalPayload::CheckpointBegin).unwrap();
+        log.lock().set_physical_replica(true);
+        index
+            .apply_batch_with_lsn(
+                8,
+                vec![IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entries[98].key.clone(),
+                    row_id: entries[98].row_id,
+                }],
+                None,
+            )
+            .unwrap();
+        let frame = index.buffer_pool.lookup_frame(&root).unwrap().unwrap();
+        assert_eq!(frame.dirty_lsn.load(Ordering::Acquire), source_lsn);
+        assert!(index.get(&entries[98].key, false).unwrap().is_empty());
+        log.lock().set_physical_replica(false);
+    }
+}
+
+#[test]
+fn batched_index_visibility_reads_each_heap_header_once() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = open_memory_test_db(dir.path());
+    db.create_table(
+        "header_batch",
+        vec![
+            checkpoint_test_pk_column(),
+            ColumnDef {
+                name: "v".into(),
+                primary_key: false,
+                ..checkpoint_test_pk_column()
+            },
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let committed = db.begin_txn().unwrap();
+    db.insert_rows(
+        committed,
+        "test.header_batch",
+        (0..128)
+            .map(|id| vec![Value::Int(id), Value::Int(0)])
+            .collect(),
+    )
+    .unwrap();
+    db.commit_txn(committed.txn_id).unwrap();
+    let pending = db.begin_txn().unwrap();
+    db.update_rows_with_changed_columns(
+        pending,
+        "test.header_batch",
+        None,
+        Some(&[1]),
+        |values| Ok(matches!(values[0], Value::Int(id) if id >= 16)),
+        |values| Ok(vec![values[0].clone(), Value::Int(1)]),
+    )
+    .unwrap();
+    let table = db.table("test.header_batch").unwrap();
+    let index = table.indexes.iter().find(|index| index.primary).unwrap();
+    let entries = db
+        .range_index_entries_chunk(&table, index, None, None, None, 256)
+        .unwrap();
+    assert_eq!(entries.len(), 128);
+    assert!(entries
+        .iter()
+        .all(|(_, row)| row.page_id == entries[0].1.page_id));
+    let borrowed: Vec<_> = entries.iter().map(|(key, row)| (key, *row)).collect();
+    let integers: Vec<_> = entries
+        .iter()
+        .map(|(key, row)| {
+            let KeyPart::Int(value) = key.0[0] else {
+                panic!("integer primary key")
+            };
+            (Some(value), *row)
+        })
+        .collect();
+    let row_ids: Vec<_> = entries.iter().map(|(_, row)| *row).collect();
+    let heap = db.heap_handle(table.id).unwrap();
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    for variant in 0..4 {
+        let before = HEAP_BATCH_HEADER_SLOTS_READ.with(|count| count.get());
+        let mask = match variant {
+            0 => db.filter_visible_index_entries_mask_with_handle(
+                &heap, &table, index, &entries, view,
+            ),
+            1 => db.filter_visible_index_entries_refs_mask_with_handle(
+                &heap, &table, index, &borrowed, view,
+            ),
+            2 => db.filter_visible_index_i64_entries_mask_with_handle(
+                &heap, &table, index, &integers, 0, view,
+            ),
+            _ => db.filter_visible_row_ids_mask_with_handle(&heap, &table, &row_ids, view),
+        }
+        .unwrap();
+        assert_eq!(mask, vec![true; 128], "variant={variant}");
+        let examined = HEAP_BATCH_HEADER_SLOTS_READ.with(|count| count.get()) - before;
+        assert_eq!(
+            examined,
+            entries.len(),
+            "a fallback must retain the remaining same-page headers: variant={variant}"
+        );
+    }
+    db.rollback_txn(pending.txn_id).unwrap();
+}
+
+#[test]
+fn batched_visibility_invisible_insert_needs_no_heap_fallback() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = open_memory_test_db(dir.path());
+    db.create_table(
+        "invisible_headers",
+        vec![checkpoint_test_pk_column()],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let pending = db.begin_txn().unwrap();
+    db.insert_rows(
+        pending,
+        "test.invisible_headers",
+        (0..32).map(|id| vec![Value::Int(id)]).collect(),
+    )
+    .unwrap();
+    let table = db.table("test.invisible_headers").unwrap();
+    let entries = db
+        .range_index_entries_chunk(&table, &table.indexes[0], None, None, None, 64)
+        .unwrap();
+    let row_ids: Vec<_> = entries.iter().map(|(_, row)| *row).collect();
+    assert_eq!(row_ids.len(), 32);
+    let heap = db.heap_handle(table.id).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let mask = db
+        .filter_visible_via_heap_with_handle(&heap, &table, &row_ids, view, |row, _| {
+            calls.set(calls.get() + 1);
+            db.is_row_id_visible(&table, row, view)
+        })
+        .unwrap();
+    assert_eq!(mask, vec![false; 32]);
+    assert_eq!(
+        calls.get(),
+        0,
+        "an invisible initial version has no older row to decode"
+    );
+    db.rollback_txn(pending.txn_id).unwrap();
+}
+
+#[test]
+fn batched_visibility_cold_page_refills_headers_once() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let mut config = test_storage_config(DurabilityMode::Relaxed, false);
+    config.buffer_pool_prefetch_pages = 0;
+    let db = Database::open_with_config(dir.path(), config).unwrap();
+    db.create_table(
+        "cold_headers",
+        vec![checkpoint_test_pk_column()],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let committed = db.begin_txn().unwrap();
+    db.insert_rows(
+        committed,
+        "test.cold_headers",
+        (0..128).map(|id| vec![Value::Int(id)]).collect(),
+    )
+    .unwrap();
+    db.commit_txn(committed.txn_id).unwrap();
+    let table = db.table("test.cold_headers").unwrap();
+    let entries = db
+        .range_index_entries_chunk(&table, &table.indexes[0], None, None, None, 256)
+        .unwrap();
+    let row_ids: Vec<_> = entries.iter().map(|(_, row)| *row).collect();
+    assert_eq!(row_ids.len(), 128);
+    db.checkpoint().unwrap();
+    let heap = db.heap_handle(table.id).unwrap();
+    db.buffer_pool.discard_file(&heap.read().file_key).unwrap();
+    assert!(matches!(
+        heap.read().read_mvcc_header_cached(row_ids[0]).unwrap(),
+        CachedMvccHeaderRead::MissingPage
+    ));
+    let calls = std::cell::Cell::new(0);
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let mask = db
+        .filter_visible_via_heap_with_handle(&heap, &table, &row_ids, view, |row, _| {
+            calls.set(calls.get() + 1);
+            db.is_row_id_visible(&table, row, view)
+        })
+        .unwrap();
+    assert_eq!(mask, vec![true; 128]);
+    assert_eq!(
+        calls.get(),
+        1,
+        "the first disk read must restore the remaining header fast path"
+    );
+}
+
+#[test]
 fn contiguous_unique_insert_ranges_keep_prepared_lock_snapshots_complete() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
@@ -2018,7 +2337,7 @@ fn secondary_index_rowid_reads_migrated_heap_row() {
 }
 
 #[test]
-fn spatial_index_rtree_search_over_durable_btree() {
+fn spatial_index_search_over_persistent_pages() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     db.create_table(
@@ -2092,7 +2411,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
     db.commit_txn(txn.txn_id).unwrap();
 
     let table_id = db.table("test.places").unwrap().id;
-    assert!(db.index_mutation_generations.read().is_empty());
     // R-tree (built from the durable MBR B-tree) returns every point whose MBR
     // intersects the window [5,5]×[10,10] — points (5,5)…(10,10) ⇒ 6 rows.
     let hits = db
@@ -2103,16 +2421,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
         )
         .unwrap();
     assert_eq!(hits.len(), 6, "spatial_search window hits");
-    let cache_key = (table_id, normalize_name("sp"));
-    let warm_cache = db
-        .spatial_rtree_cache
-        .read()
-        .get(&cache_key)
-        .cloned()
-        .expect("spatial search should warm the R-tree cache");
-
-    // After deleting one in-window row, commit updates the same warm R-tree
-    // incrementally instead of making the next query rebuild all entries.
     let table = db.table("test.places").unwrap();
     let primary = table.indexes.iter().find(|i| i.primary).cloned().unwrap();
     let row_id = db
@@ -2129,16 +2437,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
         )
         .unwrap();
     assert_eq!(hits2.len(), 5, "spatial_search after delete");
-    let cache_after = db
-        .spatial_rtree_cache
-        .read()
-        .get(&cache_key)
-        .cloned()
-        .expect("incremental delete should keep the cache warm");
-    assert!(Arc::ptr_eq(&warm_cache, &cache_after));
-
-    // A projection registered after the initial load must also observe later
-    // inserts; lazily tracking generations cannot leave the first cache valid.
     let txn = db.begin_txn().unwrap();
     let geometry = crate::engine::geo::parse_wkt_internal("POINT(8 8)", 0).unwrap();
     db.insert_rows(
@@ -2148,7 +2446,6 @@ fn spatial_index_rtree_search_over_durable_btree() {
     )
     .unwrap();
     db.commit_txn(txn.txn_id).unwrap();
-    assert_eq!(db.index_mutation_generations.read().len(), 1);
     assert_eq!(
         db.spatial_search(
             table_id,
@@ -8491,9 +8788,9 @@ fn txn_wal_buffer_follows_transaction_across_worker_threads() {
 }
 
 #[test]
-fn failed_txn_wal_flush_detaches_unlogged_dirty_frames_and_requires_recovery() {
+fn btree_release_failed_txn_wal_flush_logs_diagnostic_and_requires_recovery() {
     std::env::set_var("MYDB_WAL_TXN_BUFFER", "1");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let db = open_relaxed_test_db(dir.path());
     let column = |name: &str, primary_key: bool| ColumnDef {
         name: name.into(),
@@ -8554,8 +8851,31 @@ fn failed_txn_wal_flush_detaches_unlogged_dirty_frames_and_requires_recovery() {
     };
     assert!(deferred() > 0, "test must exercise deferred WAL pins");
     FAIL_TXN_WAL_BUFFER_FLUSH.with(|fail| fail.set(true));
-    assert!(db.commit_txn(txn.txn_id).is_err());
-    assert!(db.ensure_operational().is_err());
+    let err = db.commit_txn(txn.txn_id).unwrap_err();
+    assert!(err
+        .diagnostic_detail()
+        .unwrap()
+        .contains("injected transaction WAL flush failure"));
+    assert!(!db
+        .ensure_operational()
+        .unwrap_err()
+        .message()
+        .contains("injected transaction WAL flush failure"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logged = crate::engine::logging::error_log_rows().iter().any(|row| {
+            matches!(row.get(5), Some(Value::String(data))
+                if data.contains("transaction WAL flush: injected transaction WAL flush failure"))
+        });
+        if logged {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server log must retain the underlying I/O diagnostic"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(!txn_wal_buffering_active(&db.log, txn.txn_id));
     assert_eq!(deferred(), 0);
     drop(db);
@@ -8963,6 +9283,17 @@ fn replica_restartpoint_waits_for_apply_and_prunes_only_applied_durable_wal() {
     assert!(durable_lsn > applied_lsn);
     db.replica_applied_lsn_atomic
         .store(applied_lsn, Ordering::Release);
+    // A throttled progress file can lag behind the successfully applied WAL.
+    // Reconnect must still be able to validate the overlap at persisted + 1.
+    let persisted_lsn = applied_lsn - 2;
+    let mut progress = crate::repl::replica::ReplicaProgress {
+        received_lsn: latest_lsn,
+        durable_lsn,
+        applied_lsn: persisted_lsn,
+        durable_applied_lsn: persisted_lsn,
+        ..Default::default()
+    };
+    crate::repl::replica::save_progress(dir.path(), &progress).unwrap();
 
     // Model an applier paused in the middle of a complete outer WAL frame.
     // Restartpoint must not enter its sync/prune phase until that frame exits.
@@ -8994,14 +9325,30 @@ fn replica_restartpoint_waits_for_apply_and_prunes_only_applied_durable_wal() {
     assert!(
         log.segment_snapshot()
             .iter()
-            .all(|segment| segment.last_lsn >= applied_lsn),
-        "restartpoint may prune only segments strictly below applied_lsn"
+            .all(|segment| segment.last_lsn >= persisted_lsn),
+        "restartpoint must preserve the persisted resume watermark"
     );
     assert!(
         log.segment_snapshot()
             .iter()
             .any(|segment| segment.last_lsn > applied_lsn),
         "received/durable WAL above applied_lsn must remain available"
+    );
+    drop(log);
+    assert!(crate::wal::WalReader::open(&db.log, persisted_lsn + 1).is_ok());
+
+    progress.applied_lsn = applied_lsn;
+    progress.durable_applied_lsn = applied_lsn;
+    crate::repl::replica::save_progress(dir.path(), &progress).unwrap();
+    db.replica_restartpoint(std::time::Instant::now(), CHECKPOINT_TRIGGER_MANUAL)
+        .unwrap();
+    assert!(
+        db.log
+            .lock()
+            .segment_snapshot()
+            .iter()
+            .all(|segment| segment.last_lsn >= applied_lsn),
+        "persisting progress permits reclaiming the older overlap"
     );
 }
 
@@ -9685,6 +10032,99 @@ fn create_concurrent_index_update_table(db: &Database, rows: i64) {
     )
     .unwrap();
     db.commit_txn(txn.txn_id).unwrap();
+}
+
+#[test]
+fn combined_undo_publication_preserves_commits_and_rollbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        Database::open_with_config(
+            dir.path(),
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .unwrap(),
+    );
+    let workers = 16i64;
+    let rows_per_worker = 4i64;
+    let rounds = 40i64;
+    db.create_table(
+        "undo_combine",
+        vec![
+            concurrent_index_test_column("id", true),
+            concurrent_index_test_column("v", false),
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let txn = db.begin_txn().unwrap();
+    db.insert_rows(
+        txn,
+        "test.undo_combine",
+        (0..workers * rows_per_worker)
+            .map(|id| vec![Value::Int(id), Value::Int(0)])
+            .collect(),
+    )
+    .unwrap();
+    db.commit_txn(txn.txn_id).unwrap();
+    let table = db.table("test.undo_combine").unwrap();
+    let snapshot = db.begin_txn().unwrap();
+    let ids: std::collections::HashMap<i64, RowId> = db
+        .scan_rows("test.undo_combine", snapshot)
+        .unwrap()
+        .into_iter()
+        .map(|row| match row.values[0] {
+            Value::Int(id) => (id, row.row_id),
+            ref other => panic!("unexpected id {other:?}"),
+        })
+        .collect();
+    db.commit_txn(snapshot.txn_id).unwrap();
+    // Every update publishes one undo record; many writers publish at once,
+    // so most records go through the combiner on another thread. Rolled-back
+    // rounds must restore exactly the published before-images.
+    std::thread::scope(|scope| {
+        for worker in 0..workers {
+            let db = &db;
+            let table = &table;
+            let ids = &ids;
+            scope.spawn(move || {
+                for round in 0..rounds {
+                    let txn = db.begin_txn().unwrap();
+                    for offset in 0..rows_per_worker {
+                        let row_id = ids[&(worker * rows_per_worker + offset)];
+                        db.update_row_by_id(txn, table, row_id, |values| {
+                            let mut values = values.to_vec();
+                            let Value::Int(v) = values[1] else {
+                                panic!("unexpected value");
+                            };
+                            values[1] = Value::Int(v + 1);
+                            Ok(values)
+                        })
+                        .unwrap();
+                    }
+                    if round % 2 == 0 {
+                        db.commit_txn(txn.txn_id).unwrap();
+                    } else {
+                        db.rollback_txn(txn.txn_id).unwrap();
+                    }
+                }
+            });
+        }
+    });
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let rows = db.scan_rows("test.undo_combine", view).unwrap();
+    assert_eq!(rows.len() as i64, workers * rows_per_worker);
+    for row in rows {
+        assert_eq!(
+            row.values[1],
+            Value::Int(rounds / 2),
+            "row {:?}",
+            row.values[0]
+        );
+    }
+    assert!(db.undo_publish.pending.lock().is_empty());
+    assert!(!db.undo_publish.combining.load(Ordering::SeqCst));
+    db.check_consistency().unwrap();
 }
 
 #[test]
@@ -13922,6 +14362,13 @@ fn wal_redo_recovers_committed_index_batch_without_page_fallback() {
         vec![],
     )
     .unwrap();
+    // Restore a valid older index image, not a flushed new root whose
+    // children were arbitrarily truncated. The latter is corruption and
+    // correctly requires the startup rebuild path instead of logical redo.
+    db.with_index_exclusive(1, "PRIMARY", |index| index.flush())
+        .unwrap();
+    db.buffer_pool.flush_all().unwrap();
+    let empty_index_image = fs::read(&index_path).unwrap();
     let catalog_stats = db.log.lock().stats();
     let catalog_index_batches = catalog_stats.index_batch_records;
     let txn = db.begin_txn().unwrap();
@@ -13946,11 +14393,18 @@ fn wal_redo_recovers_committed_index_batch_without_page_fallback() {
             .saturating_sub(catalog_stats.page_fallback_records)
             < 10
     );
+    // Force the metadata-publication ordering that made the old fixture
+    // depend on the background flusher's timing.
+    db.buffer_pool.flush_all().unwrap();
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
     {
-        let file = OpenOptions::new().write(true).open(&index_path).unwrap();
-        file.set_len(PAGE_SIZE as u64).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&index_path)
+            .unwrap();
+        file.write_all(&empty_index_image).unwrap();
         file.sync_data().unwrap();
     }
 
@@ -26654,6 +27108,60 @@ fn ddl_copy_swap_keeps_recovery_bases_until_commit() {
 }
 
 #[test]
+fn btree_release_unfenced_dictionary_index_is_validated_before_startup_probes() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let config = test_storage_config(DurabilityMode::Strict, true);
+    let db = Database::open_with_config(dir.path(), config.clone()).unwrap();
+    let table = crate::storage::data_dictionary::dd_table_schema(
+        crate::storage::data_dictionary::DD_DD_PROPERTIES,
+    )
+    .unwrap();
+    let index = table.indexes.iter().find(|index| index.primary).unwrap();
+    let properties = db.scan_dd_table(table.id).unwrap();
+    let path = db.index_path(table.id, &index.name);
+    db.checkpoint().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let meta = decode_index_meta(&read_index_page(&mut file, 0).unwrap()).unwrap();
+    // A valid root publishes a child that did not reach disk before the crash.
+    let child = meta.next_page_id;
+    write_index_page(
+        &mut file,
+        meta.root_page,
+        &encode_index_tree_page(&IndexPage::Internal(IndexInternalPage::new_generic(
+            vec![],
+            vec![child],
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    drop(file);
+    assert!(!path.with_extension("idx.failed").exists());
+    for _ in 0..2 {
+        let reopened = Database::open_with_config(dir.path(), config.clone()).unwrap();
+        assert_eq!(reopened.scan_dd_table(table.id).unwrap(), properties);
+        assert!(IndexFile::validate(path.clone()).is_ok());
+        assert!(!path.with_extension("idx.failed").exists());
+        for property in &properties {
+            assert_eq!(
+                reopened
+                    .catalog_rows_for_selector(
+                        table.id,
+                        CatalogRowSelector::PrimaryValues(vec![property[0].clone()]),
+                    )
+                    .unwrap(),
+                vec![property.clone()]
+            );
+        }
+        reopened.checkpoint().unwrap();
+    }
+}
+#[test]
 fn failed_dictionary_index_is_rebuilt_before_startup_property_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_storage_config(DurabilityMode::Strict, true);
@@ -26953,4 +27461,329 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
         .expect("startup must preserve the corruption fence");
         assert!(err.is(crate::error::catalog::ER_INDEX_CORRUPT), "{err:?}");
     }
+}
+
+#[test]
+fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
+    use crate::engine::api::QueryResponse;
+    use crate::engine::api::SessionContext;
+    use crate::engine::StorageQueryEngine;
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    fn count(engine: &StorageQueryEngine, session: &mut SessionContext) -> String {
+        let result=engine.execute_with_session(session,"SELECT COUNT(*) FROM spatial_repl WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap();
+        let QueryResponse::ResultSet(rs) = result else {
+            panic!("rows")
+        };
+        rs.rows[0][0].to_display_string()
+    }
+    fs::create_dir_all("/tmp/mydb").unwrap();
+    let master_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let replica_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+    let source = master.database_for_replication();
+    master.execute("CREATE TABLE spatial_repl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+    master
+        .execute("INSERT INTO spatial_repl VALUES(1,ST_GeomFromText('POINT(1 1)'))")
+        .unwrap();
+    source.checkpoint().unwrap();
+    copy_tree(master_dir.path(), replica_dir.path());
+    let mut role = crate::repl::role::RoleState::new_standalone();
+    role.role = crate::repl::role::Role::Replica;
+    crate::repl::role::save(replica_dir.path(), &role).unwrap();
+    let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+    let target = replica.database_for_replication().clone();
+    let mut reader_session = SessionContext::system_default();
+    replica
+        .execute_with_session(
+            &mut reader_session,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        )
+        .unwrap();
+    replica
+        .execute_with_session(
+            &mut reader_session,
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+        )
+        .unwrap();
+    assert_eq!(count(&replica, &mut reader_session), "1");
+    let log = source.wal_log();
+    let mut start = log.lock().next_lsn();
+    master
+        .execute("CREATE TABLE spatial_repl_ddl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0)")
+        .unwrap();
+    master
+        .execute("INSERT INTO spatial_repl_ddl VALUES(1,ST_GeomFromText('POINT(1 1)'))")
+        .unwrap();
+    master
+        .execute("CREATE SPATIAL INDEX sp ON spatial_repl_ddl(g)")
+        .unwrap();
+    let mut writer = SessionContext::system_default();
+    master.execute_with_session(&mut writer, "BEGIN").unwrap();
+    master
+        .execute_with_session(
+            &mut writer,
+            "UPDATE spatial_repl SET g=ST_GeomFromText('POINT(10 10)') WHERE id=1",
+        )
+        .unwrap();
+    let mut applier = crate::repl::replica::applier::Applier::with_database(
+        replica_dir.path(),
+        target.wal_log(),
+        target.clone(),
+        crate::repl::replica::progress::ReplicaProgress::default(),
+    );
+    for commit in [false, true] {
+        if commit {
+            master.execute_with_session(&mut writer, "COMMIT").unwrap();
+        }
+        let safe = log.lock().next_lsn() - 1;
+        LogManager::sync_durable_to(&log, safe).unwrap();
+        let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+        while let Some(chunk) = reader.next_chunk(safe, 1 << 20).unwrap() {
+            applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+        }
+        start = safe + 1;
+        assert_eq!(count(&replica, &mut reader_session), "1");
+    }
+    replica
+        .execute_with_session(&mut reader_session, "COMMIT")
+        .unwrap();
+    assert_eq!(count(&replica, &mut reader_session), "0");
+    let result=replica.execute("SELECT id FROM spatial_repl_ddl FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap();
+    let QueryResponse::ResultSet(rs) = result else {
+        panic!("rows")
+    };
+    assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+    master.execute_with_session(&mut writer, "BEGIN").unwrap();
+    master
+        .execute_with_session(&mut writer, "DELETE FROM spatial_repl_ddl WHERE id=1")
+        .unwrap();
+    let fork_lsn = log.lock().next_lsn() - 1;
+    LogManager::sync_durable_to(&log, fork_lsn).unwrap();
+    let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+    while let Some(chunk) = reader.next_chunk(fork_lsn, 1 << 20).unwrap() {
+        applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+    }
+    target.checkpoint().unwrap();
+    drop(applier);
+    drop(target);
+    drop(replica);
+    role.promote_to_master_at(fork_lsn);
+    crate::repl::role::save(replica_dir.path(), &role).unwrap();
+    let reopened = StorageQueryEngine::open(replica_dir.path()).unwrap();
+    assert_eq!(count(&reopened, &mut SessionContext::system_default()), "0");
+    let QueryResponse::ResultSet(rs)=reopened.execute("SELECT id FROM spatial_repl_ddl FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap() else {panic!("rows")};
+    assert_eq!(
+        rs.rows,
+        vec![vec![Value::Int(1)]],
+        "promotion must undo the source's uncommitted spatial deletion"
+    );
+    master
+        .execute_with_session(&mut writer, "ROLLBACK")
+        .unwrap();
+}
+
+#[test]
+fn spatial_index_crash_child() {
+    let Some(path) = std::env::var_os("MYDB_SPATIAL_CRASH_DATABASE") else {
+        return;
+    };
+    use crate::engine::{api::SessionContext, StorageQueryEngine};
+    if std::env::var_os("MYDB_SPATIAL_RECOVERY_ONLY").is_some() {
+        spatial_index::CRASH_AFTER_PAGES.with(|v| v.set(Some(2)));
+        let _engine = StorageQueryEngine::open(Path::new(&path)).unwrap();
+        std::process::exit(87);
+    }
+    let mode = std::env::var("MYDB_SPATIAL_CRASH_KIND").unwrap();
+    // The parent provides a private copy of the fully checkpointed input.
+    let engine = StorageQueryEngine::open(Path::new(&path)).unwrap();
+    let point = std::env::var("MYDB_SPATIAL_CRASH_POINT")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let mut session = SessionContext::system_default();
+    engine.execute_with_session(&mut session, "BEGIN").unwrap();
+    let arm = || {
+        if point < 5 {
+            spatial_index::CRASH_AFTER_PAGES.with(|v| v.set(Some(point)));
+        }
+        spatial_index::CRASH_STRUCTURAL_ONLY
+            .with(|v| v.set(matches!(mode.as_str(), "delete" | "reuse")));
+    };
+    if mode != "rollback" && mode != "savepoint" {
+        arm();
+    }
+    if mode == "savepoint" {
+        for sql in [
+            "INSERT INTO crash_spatial VALUES(999,ST_GeomFromText('POINT(999 999)'))",
+            "SAVEPOINT s",
+            "UPDATE crash_spatial SET g=ST_GeomFromText('POINT(888 888)') WHERE id=0",
+            "INSERT INTO crash_spatial VALUES(1000,ST_GeomFromText('POINT(1000 1000)'))",
+            "ROLLBACK TO SAVEPOINT s",
+        ] {
+            engine.execute_with_session(&mut session, sql).unwrap();
+        }
+        arm();
+        engine
+            .execute_with_session(
+                &mut session,
+                "INSERT INTO crash_spatial VALUES(1001,ST_GeomFromText('POINT(1000 1000)'))",
+            )
+            .unwrap();
+    } else if mode == "delete" {
+        engine
+            .execute_with_session(&mut session, "DELETE FROM crash_spatial")
+            .unwrap();
+    } else if mode == "reuse" {
+        let values = (1000..1409)
+            .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("INSERT INTO crash_spatial VALUES{values}"),
+            )
+            .unwrap();
+    } else {
+        engine
+            .execute_with_session(
+                &mut session,
+                "INSERT INTO crash_spatial VALUES(999,ST_GeomFromText('POINT(999 999)'))",
+            )
+            .unwrap();
+    }
+    if mode == "rollback" {
+        arm();
+        engine
+            .execute_with_session(&mut session, "ROLLBACK")
+            .unwrap();
+    } else if point == 5 {
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+    }
+    let log = engine.database_for_replication().wal_log();
+    let last = log.lock().last_lsn();
+    LogManager::sync_durable_to(&log, last).unwrap();
+    std::process::exit(86);
+}
+
+fn check_spatial_index_split_crash_recovery(initial: usize, clear: bool, modes: &[&str]) {
+    use crate::engine::{api::QueryResponse, StorageQueryEngine};
+    fs::create_dir_all("/tmp/mydb").unwrap();
+    let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let preparation = crate::platform::fs::FixtureSyncBatch::new(base.path()).unwrap();
+    let engine = StorageQueryEngine::open(base.path()).unwrap();
+    engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
+    let values = (0..initial)
+        .map(|i| format!("({i},ST_GeomFromText('POINT({i} {i})'))"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO crash_spatial VALUES{values}"))
+        .unwrap();
+    if clear {
+        engine.execute("DELETE FROM crash_spatial").unwrap();
+    }
+    engine.database_for_replication().checkpoint().unwrap();
+    drop(engine);
+    preparation.finish().unwrap();
+    for &mode in modes {
+        for point in 0..=5 {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            crate::util::file::copy_fixture_tree(base.path(), dir.path()).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::core::tests::spatial_index_crash_child",
+                    "--nocapture",
+                ])
+                .env("MYDB_SPATIAL_CRASH_DATABASE", dir.path())
+                .env("MYDB_SPATIAL_CRASH_KIND", mode)
+                .env("MYDB_SPATIAL_CRASH_POINT", point.to_string())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86), "{mode}, crash point {point}");
+            if mode == "delete" && point == 0 {
+                let interrupted = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "storage::core::tests::spatial_index_crash_child",
+                        "--nocapture",
+                    ])
+                    .env("MYDB_SPATIAL_CRASH_DATABASE", dir.path())
+                    .env("MYDB_SPATIAL_RECOVERY_ONLY", "1")
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    interrupted.code(),
+                    Some(86),
+                    "recovery must crash after a compensated spatial record"
+                );
+            }
+            let expected = match (mode, point) {
+                ("insert", 5) => "409",
+                ("savepoint", 5) => "410",
+                ("savepoint", _) => "408",
+                ("insert" | "rollback", _) => "408",
+                ("delete", 5) => "0",
+                ("delete", _) => "420",
+                ("reuse", 5) => "409",
+                ("reuse", _) => "0",
+                _ => unreachable!(),
+            };
+            for _ in 0..2 {
+                let engine = StorageQueryEngine::open(dir.path()).unwrap();
+                for hint in ["FORCE INDEX(sp)", "IGNORE INDEX(sp)"] {
+                    let result=engine.execute(&format!("SELECT COUNT(*) FROM crash_spatial {hint} WHERE MBRIntersects(g,ST_GeomFromText('POLYGON((-1 -1,2000 -1,2000 2000,-1 2000,-1 -1))'))")).unwrap().materialize().unwrap();
+                    let QueryResponse::ResultSet(rs) = result else {
+                        panic!("rows")
+                    };
+                    assert_eq!(
+                        rs.rows[0][0].to_display_string(),
+                        expected,
+                        "{mode}, crash point {point}"
+                    );
+                }
+                let db = engine.database_for_replication();
+                let table = db.table("test.crash_spatial").unwrap();
+                db.with_index_read(table.id, "sp", |index| {
+                    index.validate_structure()?;
+                    assert_eq!(
+                        index.entries()?.len(),
+                        expected.parse::<usize>().unwrap(),
+                        "{mode}, dangling or missing spatial entry at {point}"
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication() {
+    check_spatial_index_split_crash_recovery(408, false, &["insert", "rollback", "savepoint"]);
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication_delete() {
+    check_spatial_index_split_crash_recovery(420, false, &["delete"]);
+}
+
+#[test]
+fn spatial_index_crash_recovery_at_every_split_publication_reuse() {
+    check_spatial_index_split_crash_recovery(420, true, &["reuse"]);
 }

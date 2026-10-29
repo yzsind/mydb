@@ -209,7 +209,17 @@ fn context_free_expr_descriptor(expr: &Expr) -> crate::engine::expr_type::ExprTy
     crate::engine::expr_type::infer_expr_type(expr, &context)
 }
 
-fn expr_needs_bound_result_coercion(expr: &Expr) -> bool {
+fn expr_needs_bound_result_coercion(
+    expr: &Expr,
+    descriptor: crate::engine::expr_type::ExprType,
+) -> bool {
+    if matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("GREATEST") || name.eq_ignore_ascii_case("LEAST"))
+    {
+        return matches!(
+            descriptor.kind,
+            crate::engine::expr_type::ExprTypeKind::String { .. }
+        );
+    }
     matches!(expr, Expr::Case { .. })
         || matches!(
             expr,
@@ -2978,9 +2988,8 @@ pub(super) fn prepare_select_for_planning(
         planner::validate_select_column_references(db, stmt)?;
     }
     warn_group_by_resolution_diagnostics(db, stmt);
-    // A single base table can be validated completely here, including
-    // column-derived collations. Multi-source queries keep using the
-    // qualified planner/row schemas until their binding scope is available.
+    // Resolve typed comparisons before normalization can prune an empty
+    // input. Joins and derived sources use their own column binding scope.
     validate_single_base_select_exprs(db, stmt)?;
     // ENUM/SET numeric semantics (ordinal ORDER BY / numeric-literal
     // comparisons) rewrite on the executed statement — `plan_select`
@@ -3086,10 +3095,12 @@ fn warn_group_by_resolution_diagnostics(db: &Database, stmt: &Select) {
     }
 }
 
-fn validate_single_base_select_exprs(db: &Database, stmt: &Select) -> Result<(), QueryError> {
-    self::aggregate::clear_bit_aggregate_width_hints();
+pub(super) fn validate_cached_temporal_literals(
+    db: &Database,
+    stmt: &Select,
+) -> Result<(), QueryError> {
     if !stmt.joins.is_empty() || stmt.derived.is_some() {
-        return Ok(());
+        return validate_scoped_temporal_literals(db, stmt);
     }
     let Some(base) = stmt
         .from
@@ -3098,14 +3109,143 @@ fn validate_single_base_select_exprs(db: &Database, stmt: &Select) -> Result<(),
     else {
         return Ok(());
     };
+    if super::cte::has_cte(&base.name) {
+        return validate_scoped_temporal_literals(db, stmt);
+    }
     let Ok(table) = db.table(&base.name) else {
+        return validate_scoped_temporal_literals(db, stmt);
+    };
+    validate_select_collations_with(stmt, |expr| {
+        crate::engine::expr::validate_expr_temporal_literals(expr, &table)
+    })
+}
+
+fn validate_single_base_select_exprs(db: &Database, stmt: &Select) -> Result<(), QueryError> {
+    self::aggregate::clear_bit_aggregate_width_hints();
+    if !stmt.joins.is_empty() || stmt.derived.is_some() {
+        return validate_scoped_temporal_literals(db, stmt);
+    }
+    let Some(base) = stmt
+        .from
+        .first()
+        .filter(|base| base.generate_series.is_none())
+    else {
         return Ok(());
+    };
+    if super::cte::has_cte(&base.name) {
+        return validate_scoped_temporal_literals(db, stmt);
+    }
+    let Ok(table) = db.table(&base.name) else {
+        return validate_scoped_temporal_literals(db, stmt);
     };
     validate_select_collations_with(stmt, |expr| {
         validate_bit_aggregate_operand_widths(expr, &table)?;
         crate::engine::expr::validate_expr_numeric_operands(expr, &table)?;
         crate::engine::expr::validate_expr_collations(expr, &table)?;
         crate::engine::expr::validate_expr_temporal_literals(expr, &table)
+    })
+}
+
+/// Resolve temporal literals before pruning or executing a derived/CTE/join
+/// source. Metadata, rather than sampled rows, also diagnoses empty inputs.
+fn validate_scoped_temporal_literals(db: &Database, stmt: &Select) -> Result<(), QueryError> {
+    let mut scopes: smallvec::SmallVec<[(&TableRef, Arc<TableSchema>); 4]> =
+        smallvec::SmallVec::new();
+    let sources = stmt
+        .from
+        .iter()
+        .map(|table| (table, stmt.derived.as_ref()))
+        .chain(
+            stmt.joins
+                .iter()
+                .map(|join| (&join.table, join.derived.as_ref())),
+        );
+    for (source, derived) in sources {
+        // A CTE shadows a catalog table with the same name.
+        let cte = derived
+            .is_none()
+            .then(|| super::cte::lookup_cte(&source.name))
+            .flatten();
+        // Catalog schemas already own the names, types and fractional
+        // precision. A cached join must not rebuild all column descriptors.
+        if derived.is_none() && cte.is_none() && source.column_aliases.is_empty() {
+            if let Ok(schema) = db.table(&source.name) {
+                scopes.push((source, schema));
+                continue;
+            }
+        }
+        let mut columns = if let Some(derived) = derived {
+            describe_subquery_columns(db, derived)?
+        } else if let Some(cte) = cte {
+            cte.columns.clone()
+        } else if let Ok(table) = db.table(&source.name) {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| Column {
+                    name: column.name.clone(),
+                    column_type: table.result_type(index),
+                    source: table.wire_column_source(index),
+                })
+                .collect()
+        } else {
+            continue;
+        };
+        crate::planner::apply_derived_column_aliases(
+            source,
+            columns.iter_mut().map(|column| &mut column.name),
+        )?;
+        scopes.push((
+            source,
+            Arc::new(TableSchema::synthetic_for_planning(&source.name, &columns)),
+        ));
+    }
+    let resolve = |expr: &Expr| {
+        use std::borrow::Cow;
+        let (name, qualifier) = match expr {
+            Expr::Identifier(name) => (name.as_str(), None),
+            Expr::CompoundIdentifier(parts) => {
+                let name = parts.last()?.as_str();
+                let qualifier = (parts.len() > 1).then(|| {
+                    if parts.len() == 2 {
+                        Cow::Borrowed(parts[0].as_str())
+                    } else {
+                        Cow::Owned(parts[..parts.len() - 1].join("."))
+                    }
+                });
+                (name, qualifier)
+            }
+            _ => return None,
+        };
+        let mut found = None;
+        for (source, schema) in &scopes {
+            if let Some(qualifier) = qualifier.as_deref() {
+                let matches = if let Some(alias) = &source.alias {
+                    alias.eq_ignore_ascii_case(qualifier)
+                } else {
+                    source.name.eq_ignore_ascii_case(qualifier)
+                        || source
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|short| short.eq_ignore_ascii_case(qualifier))
+                };
+                if !matches {
+                    continue;
+                }
+            }
+            if let Some(index) = schema.find_column_index(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(&schema.columns[index].data_type);
+            }
+        }
+        found
+    };
+    validate_select_collations_with(stmt, |expr| {
+        crate::engine::expr::validate_expr_temporal_literals_with_resolver(expr, None, &resolve)
     })
 }
 
@@ -3695,8 +3835,8 @@ fn simple_order_expr_column_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// Preserve row-lock identity when a simple derived query (including an
-/// inlined CTE) is a projection/filter over exactly one base table.
+/// Preserve row-lock identity when a mergeable derived query (including an
+/// inlined view or CTE) is a projection/filter over base tables.
 pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select) -> Option<Select> {
     if !select.for_update
         || !select.group_by.is_empty()
@@ -3711,7 +3851,17 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
     let SubQuery::Select(inner) = candidate.derived.as_mut()? else {
         return None;
     };
-    if inner.from.len() != 1 || !inner.joins.is_empty() || inner.derived.is_some() {
+    if inner.from.len() != 1 || inner.derived.is_some() {
+        return None;
+    }
+    // A view-level OF target cannot be copied verbatim to flattened base
+    // aliases. Keep such queries on the explicit unsupported path.
+    if !inner.joins.is_empty()
+        && select
+            .lock_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.targets.is_empty())
+    {
         return None;
     }
     let table_ref = &inner.from[0];
@@ -3724,6 +3874,9 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
     for item in &inner.projection {
         match item {
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                if !inner.joins.is_empty() {
+                    return None;
+                }
                 for (_, column) in table.iter_select_columns() {
                     projection.push(SelectItem::Expr {
                         expr: Expr::CompoundIdentifier(vec![
@@ -3773,7 +3926,11 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
         }
     }
     candidate.projection = projection;
+    let limit = candidate.limit.take();
+    let offset = candidate.offset.take();
     let mut flat = try_flatten_simple_derived_select(&candidate)?;
+    flat.limit = limit;
+    flat.offset = offset;
     flat.for_update = select.for_update;
     flat.lock_clause = select.lock_clause.clone();
     Some(flat)
@@ -4034,17 +4191,20 @@ fn derived_inner_expr_unsafe(expr: &Expr) -> bool {
 fn expr_has_observable_side_effect(expr: &Expr) -> bool {
     match expr {
         Expr::Function { name, args, .. } => {
-            matches!(
-                name.to_ascii_uppercase().as_str(),
-                "__SET_USER_VAR"
-                    | "NEXTVAL"
-                    | "SETVAL"
-                    | "SLEEP"
-                    | "GET_LOCK"
-                    | "RELEASE_LOCK"
-                    | "RELEASE_ALL_LOCKS"
-                    | "LOAD_FILE"
-            ) || args.iter().any(expr_has_observable_side_effect)
+            crate::engine::http::is_function(name)
+                || crate::engine::expr::function_has_external_effect(name)
+                || matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "__SET_USER_VAR"
+                        | "NEXTVAL"
+                        | "SETVAL"
+                        | "SLEEP"
+                        | "GET_LOCK"
+                        | "RELEASE_LOCK"
+                        | "RELEASE_ALL_LOCKS"
+                        | "LOAD_FILE"
+                )
+                || args.iter().any(expr_has_observable_side_effect)
         }
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)
@@ -5141,9 +5301,16 @@ fn json_table_jsonb_to_value(
         ),
         JsonType::Double => Value::Double(node.as_f64().unwrap_or_default()),
         JsonType::Decimal => Value::Decimal(node.number_text().unwrap_or_default()),
-        JsonType::String | JsonType::Date | JsonType::Time | JsonType::Datetime => {
-            Value::String(node.as_str().unwrap_or_default().to_string())
-        }
+        JsonType::String
+        | JsonType::Date
+        | JsonType::Time
+        | JsonType::Datetime
+        | JsonType::Timestamp => Value::String(node.as_str().unwrap_or_default().to_string()),
+        JsonType::Opaque => Value::Bytes(
+            node.opaque_value()
+                .map(|(_, data)| data.to_vec())
+                .unwrap_or_default(),
+        ),
         JsonType::Array | JsonType::Object => {
             return Err(crate::error::catalog::ER_WRONG_JSON_TABLE_VALUE
                 .error("Can't store an array or an object in the scalar JSON_TABLE column"));
@@ -6378,7 +6545,7 @@ pub(crate) fn execute_const_select(
         let value = if matches!(
             descriptor.kind,
             crate::engine::expr_type::ExprTypeKind::Unknown
-        ) || !expr_needs_bound_result_coercion(expr)
+        ) || !expr_needs_bound_result_coercion(expr, descriptor)
         {
             value
         } else {
@@ -6640,7 +6807,7 @@ fn execute_const_aggregate_select(
                     if matches!(
                         descriptor.kind,
                         crate::engine::expr_type::ExprTypeKind::Unknown
-                    ) || !expr_needs_bound_result_coercion(expr)
+                    ) || !expr_needs_bound_result_coercion(expr, descriptor)
                     {
                         value
                     } else {

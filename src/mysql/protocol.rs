@@ -1384,6 +1384,21 @@ pub fn binary_row_packet_into_with_charset(
                 let bytes = crate::types::write_decimal_compact_canonical(*mag, *scale, &mut buf);
                 write_lenenc_string(payload, bytes);
             }
+            value
+            @ (Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::Time(_))
+                if matches!(
+                    columns.get(idx).map(|column| column.column_type),
+                    Some(ColumnType::VarString | ColumnType::Blob)
+                ) =>
+            {
+                let column = columns.get(idx);
+                write_text_value_inner(
+                    payload,
+                    value,
+                    result_charset_for_column(charset, column),
+                    column.and_then(|column| column.source.decimals),
+                );
+            }
             Value::Date(d) => {
                 write_binary_date_from_days(payload, *d);
             }
@@ -2107,7 +2122,12 @@ pub fn parse_stmt_execute_params(
             }
             continue;
         }
-        if is_null {
+        if is_null
+            && long_data
+                .and_then(|items| items.get(idx))
+                .and_then(Option::as_ref)
+                .is_none()
+        {
             let value = StmtParamValue::Null;
             if let Some(name) = parameter_names.get(idx).filter(|name| !name.is_empty()) {
                 query_attributes.push((name.clone(), value.clone()));
@@ -2771,7 +2791,16 @@ pub fn column_definition_packet_full_into_with_fallback(
             default_length
         }
     });
-    write_u32_le(payload, length);
+    let wire_length = if source.wire_type == Some(MYSQL_TYPE_BLOB) && collation != BINARY_COLLATION
+    {
+        let width = crate::charset::resolve_collation_id(collation)
+            .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+            .map_or(1, |info| u32::from(info.max_len));
+        length.saturating_mul(width)
+    } else {
+        length
+    };
+    write_u32_le(payload, wire_length);
     let computed_lob = matches!(column_type, ColumnType::Blob)
         && source.org_table.is_empty()
         && source.decimals == Some(31);
@@ -3711,6 +3740,14 @@ mod tests {
             &[StmtParamValue::Bytes(b"hello world".to_vec())]
         );
         assert!(parsed.param_types.is_some());
+        payload[9] = 1;
+        let parsed = parse_stmt_execute_params(&payload, 1, None, Some(&long_data), false).unwrap();
+        assert_eq!(
+            parsed.params.as_slice(),
+            &[StmtParamValue::Bytes(b"hello world".to_vec())]
+        );
+        let parsed = parse_stmt_execute_params(&payload, 1, None, None, false).unwrap();
+        assert_eq!(parsed.params.as_slice(), &[StmtParamValue::Null]);
     }
 
     #[test]
@@ -4103,6 +4140,30 @@ mod tests {
             f64::from_le_bytes(packet[18..26].try_into().unwrap()),
             89.97
         );
+    }
+
+    #[test]
+    fn expression_audit_temporal_values_under_string_metadata() {
+        for column_type in [ColumnType::VarString, ColumnType::Blob] {
+            let columns = [Column {
+                source: Default::default(),
+                name: "v".into(),
+                column_type,
+            }];
+            for value in [
+                Value::Date(0),
+                Value::Date(crate::types::ZERO_DATE),
+                Value::DateTime(0),
+                Value::DateTime(crate::types::ZERO_DATETIME),
+                Value::Time(-6_000_000),
+                Value::Timestamp(1_000_000),
+            ] {
+                let text = value.to_display_string();
+                let mut expected = vec![0, 0];
+                write_lenenc_string(&mut expected, text.as_bytes());
+                assert_eq!(binary_row_packet(&columns, &[value]), expected);
+            }
+        }
     }
 
     #[test]

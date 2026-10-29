@@ -52,7 +52,11 @@ impl Database {
                     for key in table.index_keys(index, &visible.values)? {
                         entries.push((
                             IndexRepairKey {
-                                table_id: table.id,
+                                table_id: if index.is_spatial() {
+                                    record.table_id
+                                } else {
+                                    table.id
+                                },
                                 index_name: normalize_name(&index.name),
                                 key,
                             },
@@ -150,8 +154,10 @@ impl Database {
         }
         // Dictionary heaps are authoritative too. The ordinary index pass
         // below only visits user tables, but later startup steps already use
-        // indexed DD property/sequence probes. Repair fenced dictionary trees
-        // before those probes, including after a previously interrupted repair.
+        // indexed DD property/sequence probes. Validate dictionary trees even
+        // without a fence: a torn structural flush may never have been opened
+        // by index REDO. Repair them before those probes and preserve repair
+        // intent across an interrupted rebuild.
         recovery.repaired_indexes += self.rebuild_failed_dictionary_indexes()?;
         recovery.startup_validation_mode = Some(self.config.startup_validation);
         let path = match self.config.startup_validation {
@@ -245,9 +251,18 @@ impl Database {
         for table in crate::storage::data_dictionary::dd_tables() {
             let mut markers = Vec::new();
             for index in &table.indexes {
-                let marker = self
-                    .index_path(table.id, &index.name)
-                    .with_extension("idx.failed");
+                let path = self.index_path(table.id, &index.name);
+                let marker = path.with_extension("idx.failed");
+                if !marker.try_exists().map_err(io_err)? {
+                    match IndexFile::validate(path.clone()) {
+                        Ok(()) => continue,
+                        Err(err) if is_rebuildable_index_redo_error(&err) => {
+                            self.ensure_writable()?;
+                            IndexFile::persist_rebuild_marker(&path)?;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
                 if marker.try_exists().map_err(io_err)? {
                     markers.push(marker);
                 }
@@ -310,6 +325,17 @@ impl Database {
             };
             let table = &tables[position];
             for storage_id in table.storage_ids() {
+                if crate::storage::data_dictionary::index_is_spatial(&row) {
+                    let path = crate::storage::naming::index_object_path_by_id(
+                        &self.data_dir,
+                        storage_id,
+                        table.active_generation.max(1),
+                        index_id,
+                        "rtree",
+                    );
+                    spatial_index::SpatialIndexFile::quick_validate(path)?;
+                    continue;
+                }
                 tasks.push((
                     position,
                     storage_id,
@@ -417,7 +443,9 @@ impl Database {
                         )
                     })?;
                 if table.is_partitioned() {
-                    self.rebuild_indexes_for_partition_storage_ids(&table, &storage_ids)?;
+                    let mut repair = (*table).clone();
+                    repair.indexes.retain(|i| !i.is_spatial());
+                    self.rebuild_indexes_for_partition_storage_ids(&repair, &storage_ids)?;
                 } else {
                     self.rebuild_indexes(&table)?;
                 }

@@ -128,6 +128,16 @@ pub(in crate::engine::executor) fn eval_contextual_subquery_expr(
     // against the routine/trigger database before planning, just like body SQL.
     if let Some(frame) = current_subquery_frame() {
         super::super::qualification::qualify_expr_tables(&frame.db, session, expr)?;
+        // Unlike a subquery inside an ordinary SELECT, routine control-flow
+        // expressions have no enclosing statement privilege check.
+        let access = Statement::Select(Select {
+            projection: vec![SelectItem::Expr {
+                expr: expr.clone(),
+                alias: None,
+            }],
+            ..Select::default()
+        });
+        super::super::dispatch::authorize_statement(&frame.db, session, &access)?;
         // The caller owns a temporary bound AST. Its addresses can be reused
         // by the next routine expression, and bound locals can change between
         // evaluations. Keep pointer-keyed plans/results within this AST's
@@ -3336,6 +3346,30 @@ pub(super) fn plan_expr_collation(
                     })
                 });
         }
+        // Other built-ins share the bind-time result-domain algebra. In
+        // particular, string transforms retain their argument's collation,
+        // while casts and formatters may use the connection collation.
+        let resolve_column = |column_expr: &Expr| {
+            let field = match column_expr {
+                Expr::Identifier(name) => resolve_plan_field(row, None, name).ok(),
+                Expr::CompoundIdentifier(parts) => {
+                    let column = parts.last()?;
+                    let qualifier = (parts.len() >= 2).then(|| parts[parts.len() - 2].as_str());
+                    resolve_plan_field(row, qualifier, column).ok()
+                }
+                _ => None,
+            }?;
+            Some(crate::engine::expr_type::ExprType::from_column_type(
+                field.column_type,
+                &field.source,
+            ))
+        };
+        let no_placeholder = |_: usize| None;
+        let context =
+            crate::engine::expr_type::TypeContext::context_free(&resolve_column, &no_placeholder);
+        return crate::engine::expr_type::infer_expr_type(expr, &context)
+            .collation_id
+            .and_then(crate::charset::resolve_collation_id);
     }
     if let Expr::Case {
         results,

@@ -7717,6 +7717,14 @@ impl FixedWidthDecimalPartitionPartial {
         }
     }
 
+    fn take_numeric_state(&mut self, group: usize) -> NumericAggState {
+        if self.narrow_scale.is_some() {
+            self.numeric_state(group)
+        } else {
+            std::mem::take(&mut self.sums[group])
+        }
+    }
+
     fn into_buckets(self) -> Vec<GroupBucketSnapshot> {
         let mut buckets = Vec::with_capacity(self.len());
         for group in 0..self.len() {
@@ -8397,8 +8405,26 @@ fn push_compressed_decimal_row(
     key_is_null: bool,
     magnitude: Option<i128>,
     scale: u8,
+    promoted: &NumericAggState,
     final_filter: Option<&AggregateFinalFilter>,
 ) -> Result<(), QueryError> {
+    if !matches!(promoted, NumericAggState::Empty) {
+        let value = numeric_state_to_value(promoted);
+        if let Some(filter) = final_filter {
+            if !filter.keeps(0, &value)? {
+                return Ok(());
+            }
+        }
+        rows.push(vec![
+            if key_is_null {
+                Value::Null
+            } else {
+                Value::Int(key)
+            },
+            value,
+        ]);
+        return Ok(());
+    }
     let Some(magnitude) = magnitude else {
         if final_filter.is_some() {
             return Ok(());
@@ -8466,6 +8492,7 @@ fn merge_compressed_i64_decimal_partials(
 
     let mut rows = Vec::new();
     let mut current: Option<(i64, bool, Option<i128>)> = None;
+    let mut promoted = NumericAggState::Empty;
     for run in &runs {
         for (key, key_is_null, sum) in run.cursor() {
             match current.as_mut() {
@@ -8473,13 +8500,23 @@ fn merge_compressed_i64_decimal_partials(
                     if *current_key == key && *current_null == key_is_null =>
                 {
                     if let Some(sum) = sum {
-                        *current_sum =
-                            Some(current_sum.unwrap_or(0).checked_add(sum).ok_or_else(|| {
-                                crate::storage::error(
-                                    crate::error::catalog::ER_DATA_OUT_OF_RANGE,
-                                    "DECIMAL aggregate overflow",
-                                )
-                            })?);
+                        if matches!(promoted, NumericAggState::Empty) {
+                            let previous = current_sum.unwrap_or(0);
+                            if let Some(total) = previous.checked_add(sum) {
+                                *current_sum = Some(total);
+                            } else {
+                                // Preserve the compact i128 merge until this
+                                // group's exact sum needs arbitrary precision.
+                                accumulate_numeric_state_decimal_parts(
+                                    &mut promoted,
+                                    previous,
+                                    scale,
+                                );
+                                accumulate_numeric_state_decimal_parts(&mut promoted, sum, scale);
+                            }
+                        } else {
+                            accumulate_numeric_state_decimal_parts(&mut promoted, sum, scale);
+                        }
                     }
                 }
                 _ => {
@@ -8492,15 +8529,25 @@ fn merge_compressed_i64_decimal_partials(
                             old_null,
                             old_sum,
                             scale,
+                            &promoted,
                             final_filter,
                         )?;
                     }
+                    promoted = NumericAggState::Empty;
                 }
             }
         }
     }
     if let Some((key, key_is_null, sum)) = current {
-        push_compressed_decimal_row(&mut rows, key, key_is_null, sum, scale, final_filter)?;
+        push_compressed_decimal_row(
+            &mut rows,
+            key,
+            key_is_null,
+            sum,
+            scale,
+            &promoted,
+            final_filter,
+        )?;
     }
     Ok(rows)
 }
@@ -8652,7 +8699,7 @@ fn merge_sorted_i64_decimal_partitions(
     };
     while let Some(Reverse((non_null, key, input, group))) = heap.pop() {
         let nullmask = inputs[input].nulls[group];
-        let mut sum = std::mem::take(&mut inputs[input].sums[group]);
+        let mut sum = inputs[input].take_numeric_state(group);
         push_next_sorted_partial(&inputs, &mut heap, input, group + 1);
 
         while let Some(Reverse((next_non_null, next_key, _, _))) = heap.peek().copied() {
@@ -8661,7 +8708,7 @@ fn merge_sorted_i64_decimal_partitions(
             }
             let Reverse((_, _, next_input, next_group)) =
                 heap.pop().expect("peeked sorted aggregate entry exists");
-            let next_sum = std::mem::take(&mut inputs[next_input].sums[next_group]);
+            let next_sum = inputs[next_input].take_numeric_state(next_group);
             merge_numeric_state(&mut sum, next_sum);
             push_next_sorted_partial(&inputs, &mut heap, next_input, next_group + 1);
         }
@@ -10794,6 +10841,72 @@ mod tests {
             arena.decimal_state_columns[0].as_ref().unwrap().status[0],
             COMPACT_SUM_PROMOTED
         );
+    }
+
+    #[test]
+    fn audit1027_compressed_decimal_merge_widens_on_overflow() {
+        let schema = schema_key_decimal(0);
+        let specs = vec![AggregateSpec {
+            comparison_collation: None,
+            func: AggregateKind::Sum,
+            input_column: 1,
+        }];
+        let magnitude = 10i128.pow(38) - 1;
+        let mut partials = Vec::new();
+        for _ in 0..2 {
+            let batch = decimal_batch(
+                &schema,
+                vec![Value::Int(1)],
+                vec![Value::Decimal128(magnitude, 0)],
+            );
+            let mut arena = FixedWidthStateArena::try_new(&[0], &specs, &batch).unwrap();
+            arena.defer_i64_decimal_dedup = true;
+            arena.consume_batch(&[0], &specs, &batch).unwrap();
+            assert!(!arena.compressed_i64_decimal_runs.is_empty());
+            partials.push(CompressedI64DecimalPartial {
+                runs: std::mem::take(&mut arena.compressed_i64_decimal_runs),
+                scale: arena.compressed_i64_decimal_scale.take().unwrap(),
+            });
+        }
+        let rows = merge_compressed_i64_decimal_partials(partials, None).unwrap();
+        assert_eq!(
+            rows[0][1].to_display_string(),
+            "199999999999999999999999999999999999998"
+        );
+    }
+
+    #[test]
+    fn audit1027_sorted_decimal_merge_accepts_mixed_worker_widths() {
+        let schema = schema_key_decimal(0);
+        let specs = vec![AggregateSpec {
+            comparison_collation: None,
+            func: AggregateKind::Sum,
+            input_column: 1,
+        }];
+        let mut partials = Vec::new();
+        for value in [
+            Value::DecimalCompact(1, 0),
+            Value::Decimal128(i128::from(i64::MAX) + 1, 0),
+        ] {
+            let batch = decimal_batch(&schema, vec![Value::Int(1)], vec![value]);
+            let mut arena = FixedWidthStateArena::try_new(&[0], &specs, &batch).unwrap();
+            arena.consume_batch(&[0], &specs, &batch).unwrap();
+            let partition = arena
+                .partition_groups
+                .iter()
+                .position(|groups| !groups.is_empty())
+                .unwrap();
+            let mut partial = fixed_width_partition_partial(&arena, partition)
+                .unwrap()
+                .fixed_width_decimal
+                .unwrap();
+            partial.sorted_i64 = true;
+            partials.push(partial);
+        }
+        assert!(partials[0].narrow_scale.is_some());
+        assert!(partials[1].narrow_scale.is_none());
+        let rows = merge_fixed_width_decimal_partitions(partials);
+        assert_eq!(rows[0][1].to_display_string(), "9223372036854775809");
     }
 
     #[test]

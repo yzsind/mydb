@@ -22,7 +22,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use crc32fast::Hasher as Crc32;
 
 pub const MAGIC: [u8; 4] = *b"REPL";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const FRAME_HEADER_LEN: usize = 4 + 1 + 4;
 pub const FRAME_TRAILER_LEN: usize = 4;
@@ -86,6 +86,7 @@ pub enum Message {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
+    pub auth_token: crate::repl::config::ReplAuthToken,
     pub protocol_version: u32,
     pub replica_uuid: [u8; 16],
     pub requested_start_lsn: u64,
@@ -112,6 +113,7 @@ pub struct Handshake {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAck {
+    pub heartbeat_ms: u64,
     pub master_uuid: [u8; 16],
     pub current_lsn: u64,
     pub durable_lsn: u64,
@@ -419,14 +421,99 @@ pub async fn read_frame_async<R>(r: &mut R) -> IoResult<Message>
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
+    read_frame_async_inner(r, MAX_PAYLOAD_BYTES, false, false)
+        .await
+        .map(|(message, _memory)| message)
+}
+
+#[cfg(test)]
+pub(crate) async fn read_frame_async_limited<R>(
+    r: &mut R,
+    max_wal_bytes: usize,
+) -> IoResult<Message>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    read_frame_async_inner(r, max_wal_bytes, true, true)
+        .await
+        .map(|(message, _memory)| message)
+}
+
+pub(crate) async fn read_frame_async_window<R>(
+    r: &mut R,
+    window: usize,
+) -> IoResult<(
+    Message,
+    Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+)>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    read_frame_async_inner(r, window, true, false).await
+}
+
+async fn read_frame_async_inner<R>(
+    r: &mut R,
+    max_wal_bytes: usize,
+    precharged: bool,
+    hard_limit: bool,
+) -> IoResult<(
+    Message,
+    Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+)>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
     let mut header = [0u8; FRAME_HEADER_LEN];
     r.read_exact(&mut header).await?;
     let (msg_type, payload_len) = decode_header(&header)?;
+    if precharged
+        && matches!(
+            msg_type,
+            MsgType::BaseBackupStart | MsgType::BaseBackupChunk | MsgType::BaseBackupEnd
+        )
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "unexpected base backup frame on WAL stream",
+        ));
+    }
+    let limit = match msg_type {
+        MsgType::WalChunk if hard_limit => max_wal_bytes.saturating_add(24),
+        MsgType::WalChunk => MAX_PAYLOAD_BYTES,
+        MsgType::BaseBackupStart => MAX_PAYLOAD_BYTES,
+        MsgType::BaseBackupChunk => 1024 * 1024 + 8192,
+        _ => 8192,
+    };
+    if payload_len > limit {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "replication frame exceeds admitted receive limit",
+        ));
+    }
+    // A physical WAL frame cannot be split. Reserve additional decode/apply
+    // scratch for a single wide frame that exceeds the normal chunk window,
+    // and retain that charge until the receiver has finished applying it.
+    let extra = if precharged {
+        payload_len.saturating_sub(max_wal_bytes).saturating_mul(3)
+    } else {
+        payload_len
+    };
+    let memory = if extra == 0 {
+        None
+    } else {
+        Some(
+        crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::NativeReplicationTransient,
+            extra,
+        ).map_err(|err| Error::new(ErrorKind::OutOfMemory, err.message().to_string()))?
+    )
+    };
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload).await?;
     let mut trailer = [0u8; FRAME_TRAILER_LEN];
     r.read_exact(&mut trailer).await?;
-    decode_frame_payload(&header, msg_type, payload, trailer)
+    decode_frame_payload(&header, msg_type, payload, trailer).map(|message| (message, memory))
 }
 
 fn decode_payload_owned(msg_type: MsgType, mut payload: Vec<u8>) -> IoResult<Message> {
@@ -503,6 +590,7 @@ fn encode_handshake(m: &Handshake, out: &mut Vec<u8>) {
     out.push(if m.request_base_backup { 1 } else { 0 });
     put_u32(out, m.max_chunk_bytes);
     put_str(out, &m.format_compatibility);
+    put_str(out, m.auth_token.as_str());
 }
 
 fn decode_handshake(r: &mut Reader<'_>) -> IoResult<Handshake> {
@@ -518,6 +606,7 @@ fn decode_handshake(r: &mut Reader<'_>) -> IoResult<Handshake> {
         request_base_backup: r.get_u8()? != 0,
         max_chunk_bytes: r.get_u32()?,
         format_compatibility: r.get_str()?,
+        auth_token: r.get_str()?.into(),
     })
 }
 
@@ -538,6 +627,7 @@ fn encode_handshake_ack(m: &HandshakeAck, out: &mut Vec<u8>) {
     out.push(u8::from(m.source_frozen));
     put_u64(out, m.fence_lsn);
     put_str(out, &m.fence_token_hash);
+    put_u64(out, m.heartbeat_ms);
 }
 
 fn decode_handshake_ack(r: &mut Reader<'_>) -> IoResult<HandshakeAck> {
@@ -558,6 +648,7 @@ fn decode_handshake_ack(r: &mut Reader<'_>) -> IoResult<HandshakeAck> {
         source_frozen: r.get_u8()? != 0,
         fence_lsn: r.get_u64()?,
         fence_token_hash: r.get_str()?,
+        heartbeat_ms: r.get_u64()?,
     })
 }
 
@@ -736,7 +827,7 @@ impl<'a> Reader<'a> {
     }
 
     fn require(&self, n: usize) -> IoResult<()> {
-        if self.pos + n > self.buf.len() {
+        if n > self.buf.len().saturating_sub(self.pos) {
             return Err(Error::new(ErrorKind::UnexpectedEof, "truncated payload"));
         }
         Ok(())
@@ -839,6 +930,7 @@ mod tests {
     #[test]
     fn handshake_round_trip() {
         let msg = Message::Handshake(Handshake {
+            auth_token: crate::repl::config::ReplConfig::test_defaults().auth_token,
             protocol_version: PROTOCOL_VERSION,
             replica_uuid: [1; 16],
             requested_start_lsn: 12345,
@@ -859,6 +951,7 @@ mod tests {
         let mut payload = Vec::new();
         super::encode_handshake(
             &Handshake {
+                auth_token: crate::repl::config::ReplConfig::test_defaults().auth_token,
                 protocol_version: PROTOCOL_VERSION,
                 replica_uuid: [3; 16],
                 requested_start_lsn: 1,
@@ -908,6 +1001,7 @@ mod tests {
     #[test]
     fn handshake_ack_round_trip() {
         let msg = Message::HandshakeAck(HandshakeAck {
+            heartbeat_ms: 1000,
             master_uuid: [9; 16],
             current_lsn: 99_999,
             durable_lsn: 99_990,
@@ -1082,6 +1176,7 @@ mod tests {
 
         let (mut client, mut server) = duplex(64 * 1024);
         let handshake = Message::Handshake(Handshake {
+            auth_token: crate::repl::config::ReplConfig::test_defaults().auth_token,
             protocol_version: PROTOCOL_VERSION,
             replica_uuid: [5; 16],
             requested_start_lsn: 42,
@@ -1282,5 +1377,54 @@ mod framing_tests {
                 .kind(),
             ErrorKind::InvalidInput
         );
+    }
+}
+
+#[cfg(test)]
+mod release_audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn oversized_wal_header_is_rejected_before_body_read() {
+        let header = encode_header(MsgType::WalChunk as u8, 1024 * 1024).unwrap();
+        let mut input = &header[..];
+        let err = read_frame_async_limited(&mut input, 4096)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("receive limit"));
+    }
+    #[tokio::test]
+    async fn wide_wal_frame_keeps_extra_memory_reserved_through_apply() {
+        let mut encoded = Vec::new();
+        write_frame(
+            &mut encoded,
+            &Message::WalChunk(WalChunk {
+                start_lsn: 1,
+                end_lsn: 1,
+                frame_count: 1,
+                frames_bytes: vec![7; 8192],
+            }),
+        )
+        .unwrap();
+        let (message, memory) = read_frame_async_window(&mut &encoded[..], 4096)
+            .await
+            .unwrap();
+        assert!(matches!(message, Message::WalChunk(chunk) if chunk.frames_bytes.len() == 8192));
+        assert!(
+            memory.is_some(),
+            "a wide physical frame must retain its extra reservation"
+        );
+        let header = encode_header(MsgType::BaseBackupStart as u8, MAX_PAYLOAD_BYTES).unwrap();
+        let err = read_frame_async_window(&mut &header[..], 4096)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reader_length_overflow_is_rejected() {
+        let mut reader = Reader::new(&[0, 1]);
+        reader.pos = 1;
+        assert!(reader.require(usize::MAX).is_err());
     }
 }

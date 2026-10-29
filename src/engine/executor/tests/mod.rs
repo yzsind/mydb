@@ -3,13 +3,17 @@ mod critical_audit;
 mod ddl_lock_contract;
 mod fresh_release_audit;
 mod github_release_audit;
+mod http;
 mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;
 mod sql_execution_audit_1015;
+mod sql_execution_audit_1027;
 mod sql_execution_fixes;
 mod support;
 mod table_ddl_audit_1012;
+mod table_ddl_audit_1027;
+mod temporal_comparison_consistency;
 
 use super::*;
 use crate::parser::Assignment;
@@ -263,6 +267,7 @@ mod a2_vec_agg_distinct;
 mod agg_projection_fast_path;
 mod aggregate_in_scalar_fn;
 mod api;
+mod audit_20261029;
 mod auto_analyze;
 mod c_vec_rollup;
 mod cast_column_name;
@@ -473,6 +478,7 @@ mod schema_show_audit;
 
 mod mysql_schema_audit;
 mod sys_schema_audit;
+mod view_audit_20261028;
 mod view_source_audit;
 
 mod table_ddl_audit;
@@ -517,3 +523,5 @@ mod parser_audit_1014;
 mod release_audit_1023;
 mod release_audit_1024;
 mod release_audit_1025;
+
+mod expression_functions_1028;

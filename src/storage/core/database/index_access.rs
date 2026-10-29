@@ -304,92 +304,25 @@ impl Database {
             .history_index_stats(table_id, index_name)
     }
 
-    /// Query the R-tree spatial index: build an in-memory R-tree from the
-    /// spatial index's persisted MBR B-tree entries and return every row whose
-    /// stored MBR intersects `query`. This is a correct *superset* for all
-    /// spatial-index-driving predicates — the caller re-checks the exact
-    /// predicate against each candidate's heap row. The durable storage is the
-    /// MBR B-tree (crash-safe via the WAL); the R-tree is the 2-D search
-    /// structure built from it.
+    /// Probe persisted R-tree pages without constructing a derived index.
     pub(crate) fn spatial_search(
         &self,
         table_id: u64,
         index_name: &str,
         query: crate::engine::geo::Mbr,
-    ) -> Result<Vec<RowId>, QueryError> {
-        let cache_key = (table_id, normalize_name(index_name));
-        let registered_generation = self
-            .index_mutation_generations
-            .read()
-            .get(&cache_key)
-            .copied();
-        // Publish interest before scanning the durable index. A mutation
-        // completed before registration is included in the scan; one that
-        // completes afterwards must invalidate its captured generation.
-        let generation = registered_generation.unwrap_or_else(|| {
-            *self
-                .index_mutation_generations
-                .write()
-                .entry(cache_key.clone())
-                .or_insert(0)
-        });
-        if let Some(cache) = self.spatial_rtree_cache.read().get(&cache_key).cloned() {
-            if cache.generation.load(Ordering::Acquire) == generation {
-                return Ok(cache.tree.read().search(&query));
-            }
-        }
-
-        let entries = self.with_index_read(table_id, index_name, |idx| idx.entries())?;
-        let generation_after_scan = self
-            .index_mutation_generations
-            .read()
-            .get(&cache_key)
-            .copied()
-            .unwrap_or(0);
-        let direct_search = || {
-            entries
-                .iter()
-                .filter_map(|(key, row)| {
-                    decode_mbr_key(key)
-                        .filter(|mbr| mbr.intersects(&query))
-                        .map(|_| *row)
-                })
-                .collect()
-        };
-        if generation_after_scan != generation {
-            return Ok(direct_search());
-        }
-
-        let initial_charge = entries.capacity().saturating_mul(128).saturating_add(4096);
-        let Some(mut charge) =
-            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
-                crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
-                initial_charge,
-            )
-        else {
-            return Ok(direct_search());
-        };
-        let tree = rtree::RTree::from_entries(
-            entries
-                .iter()
-                .filter_map(|(key, row)| decode_mbr_key(key).map(|m| (m, *row))),
-        );
-        let actual_capacity = tree.memory_capacity_bytes();
-        if actual_capacity > charge.bytes()
-            && charge.try_grow(actual_capacity - charge.bytes()).is_err()
-        {
-            return Ok(direct_search());
-        }
-        let result = tree.search(&query);
-        self.spatial_rtree_cache.write().insert(
-            cache_key,
-            Arc::new(SpatialRtreeCache {
-                generation: AtomicU64::new(generation),
-                tree: parking_lot::RwLock::new(tree),
-                _charge: charge,
-            }),
-        );
-        Ok(result)
+    ) -> Result<spatial_index::SpatialCandidates, QueryError> {
+        self.with_index_read(table_id, index_name, |index| {
+            index
+                .spatial
+                .as_ref()
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_INDEX_CORRUPT,
+                        "expected persistent spatial index",
+                    )
+                })?
+                .search(query)
+        })
     }
 
     /// Add old spatial keys needed by this snapshot after probing the physical
@@ -402,7 +335,7 @@ impl Database {
         index: &IndexSchema,
         query: crate::engine::geo::Mbr,
         txn: TxnView,
-    ) -> Result<Vec<RowId>, QueryError> {
+    ) -> Result<spatial_index::SpatialCandidates, QueryError> {
         self.check_index_read_view(table, index, txn)?;
         let version_before = self.index_repair_version.load(Ordering::Acquire);
         let mut ids = self.spatial_search(table.id, &index.name, query)?;
@@ -418,7 +351,7 @@ impl Database {
         let previous_len = ids.len();
         let key_matches =
             |key: &IndexKey| decode_mbr_key(key).is_some_and(|mbr| mbr.intersects(&query));
-        ids.extend(txns.index_visibility_repair_row_ids(
+        ids.extend_checked(txns.index_visibility_repair_row_ids(
             txn,
             table.id,
             &index.name,
@@ -428,94 +361,21 @@ impl Database {
                     .txn_commit(txn_id)
                     .map(|entry| entry.commit_scn)
             },
-        ));
+        ))?;
         if txn.historical {
             self.record_temporal_history_index_hit();
-            ids.extend(
+            ids.extend_checked(
                 self.temporal_history
                     .history_index_entries(txn, table.id, &index.name, key_matches)
                     .into_iter()
                     .map(|(_, row_id)| row_id),
-            );
+            )?;
         }
         if ids.len() != previous_len {
             ids.sort_unstable();
             ids.dedup();
         }
         Ok(ids)
-    }
-
-    /// Apply a committed DELETE to an already-warm R-tree. Deletes may leave
-    /// stale candidates while a multi-row commit is being drained, but can
-    /// never omit a live row, so publishing the current generation remains a
-    /// correct superset. INSERT/UPDATE deltas are invalidated instead: without
-    /// associating every delta with its durable B-tree generation, publishing
-    /// them incrementally could race another commit and cause false negatives.
-    pub(crate) fn update_warm_spatial_cache(
-        &self,
-        storage_id: u64,
-        index_name: &str,
-        row_id: RowId,
-        old_key: Option<&IndexKey>,
-        new_key: Option<&IndexKey>,
-    ) {
-        let cache_key = (storage_id, normalize_name(index_name));
-        let Some(cache) = self.spatial_rtree_cache.read().get(&cache_key).cloned() else {
-            return;
-        };
-        let old_mbr = old_key.and_then(decode_mbr_key);
-        let new_mbr = new_key.and_then(decode_mbr_key);
-        if new_mbr.is_some() {
-            let mut caches = self.spatial_rtree_cache.write();
-            if caches
-                .get(&cache_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &cache))
-            {
-                caches.remove(&cache_key);
-            }
-            return;
-        }
-        let Some(old_mbr) = old_mbr else {
-            return;
-        };
-
-        let cached_generation = cache.generation.load(Ordering::Acquire);
-        let generation = self
-            .index_mutation_generations
-            .read()
-            .get(&cache_key)
-            .copied()
-            .unwrap_or(0);
-        let next_generation = cached_generation.wrapping_add(1).max(1);
-        if generation != cached_generation && generation != next_generation {
-            let mut caches = self.spatial_rtree_cache.write();
-            if caches
-                .get(&cache_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &cache))
-            {
-                caches.remove(&cache_key);
-            }
-            return;
-        }
-
-        cache.tree.write().delete(old_mbr, row_id);
-        let generation_after_delete = self
-            .index_mutation_generations
-            .read()
-            .get(&cache_key)
-            .copied()
-            .unwrap_or(0);
-        if generation_after_delete == generation {
-            cache.generation.store(generation, Ordering::Release);
-        } else {
-            let mut caches = self.spatial_rtree_cache.write();
-            if caches
-                .get(&cache_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &cache))
-            {
-                caches.remove(&cache_key);
-            }
-        }
     }
 
     /// Whether any pending index-visibility-repair entries exist that
@@ -1046,12 +906,11 @@ impl Database {
             return self.lookup_index(table, index, key);
         }
         if index.unique {
-            self.lock_manager().check_unique_key_lock(
+            self.check_unique_key_reservation(
                 txn.txn_id,
                 table.id,
                 &index.name,
                 &key,
-                &self.lock_owner_status(),
             )?;
         }
         let ids = self.lookup_index(table, index, key.clone())?;
@@ -1146,12 +1005,11 @@ impl Database {
         // Write-path probe keys are concrete; unsatisfiable is always false.
         let (key, _) = resolve_index_key(index, key)?;
         if index.unique {
-            self.lock_manager().check_unique_key_lock(
+            self.check_unique_key_reservation(
                 txn.txn_id,
                 table.id,
                 &index.name,
                 &key,
-                &self.lock_owner_status(),
             )?;
         }
         self.lookup_index(&table, index, key).map(Some)
@@ -1517,6 +1375,22 @@ impl Database {
         low: Option<IndexBound>,
         high: Option<IndexBound>,
     ) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+        if index.is_spatial() {
+            if low.is_some() || high.is_some() {
+                return Err(error(
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    "Ordered bounds are not supported by a spatial index",
+                ));
+            }
+            let mut entries = Vec::new();
+            for storage_id in crate::engine::executor::partition_router::in_scope_storage_ids(table)
+            {
+                entries
+                    .extend(self.with_index_read(storage_id, &index.name, |file| file.entries())?);
+            }
+            entries.sort_unstable();
+            return Ok(entries);
+        }
         let (low, low_unsat) = resolve_index_bound(index, low)?;
         let (high, high_unsat) = resolve_index_bound(index, high)?;
         if low_unsat || high_unsat {

@@ -3,8 +3,8 @@
 fn constraint_capture_is_empty(jobs: &[Arc<AlterCopyJob>]) -> Result<bool, QueryError> {
     for job in jobs {
         Database::check_alter_copy_cancelled(job)?;
-        let log = job.changes.lock().unwrap_or_else(|p| p.into_inner());
-        if log.invalidated {
+        let log = &job.changes;
+        if log.invalidated.load(Ordering::Acquire) {
             return Err(error(
                 crate::error::catalog::ER_OUTOFMEMORY,
                 "online constraint capture was invalidated",
@@ -45,6 +45,32 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn last_constraint_used_index_merge_for_test(&self) -> bool {
         CONSTRAINT_LAST_INDEX_MERGE.with(|used| used.get())
+    }
+
+    fn constraint_merge_has_repairs(
+        &self,
+        validation: &OnlineConstraintValidation,
+        targets: &[OnlineIndexTarget],
+    ) -> bool {
+        validation.fks.iter().any(|state| {
+            let child_index = validation
+                .child
+                .indexes
+                .iter()
+                .find(|index| index.index_id == state.fk.backing_index_id)
+                .or_else(|| {
+                    targets
+                        .iter()
+                        .find(|target| target.index.index_id == state.fk.backing_index_id)
+                        .map(|target| &target.index)
+                });
+            child_index.is_none_or(|index| {
+                self.index_repair_state
+                    .has_entries_for(validation.child.id, &index.name)
+            }) || self
+                .index_repair_state
+                .has_entries_for(state.parent.id, &state.index.name)
+        })
     }
 
     fn try_constraint_index_merge(

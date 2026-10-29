@@ -90,6 +90,9 @@ pub struct ReplicationStatus {
     pub applied_transactions: u64,
     pub last_event_timestamp: u64,
     pub seconds_behind_source: Option<u64>,
+    /// SQL-thread deadline while enforcing SOURCE_DELAY; None when idle.
+    #[serde(default)]
+    pub sql_delay_until: Option<u64>,
     /// Count of binlog events received from the source whose CRC32 trailer
     /// disagreed with the recomputed digest. Persisted to the status JSON
     /// so reconnects don't reset it; exposed via SHOW REPLICA STATUS.

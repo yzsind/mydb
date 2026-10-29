@@ -366,7 +366,6 @@ fn recover_from_wal_with_options(
         summary.redone_records += redone_total.load(std::sync::atomic::Ordering::Relaxed);
     }
 
-    let native_recovery_ceiling = (!physical_replica).then_some(scan.next_lsn);
     let precheck_indexes = precheck_indexes
         && !physical_replica
         && prepared.len() == 0
@@ -381,7 +380,6 @@ fn recover_from_wal_with_options(
             )?));
             log.lock().set_local_recovery(context.is_restore());
             let mut state = RedoState::with_context(Some(log), context);
-            state.native_recovery_ceiling = native_recovery_ceiling;
             if precheck_indexes {
                 for partition in index_partitions.values() {
                     precheck_recovery_index(data_dir, &scan.records, partition, &mut state)?;
@@ -440,7 +438,6 @@ fn recover_from_wal_with_options(
                                 }
                             };
                         let mut state = RedoState::with_context(Some(shared_log), context);
-                        state.native_recovery_ceiling = native_recovery_ceiling;
                         'outer: loop {
                             let work_index =
                                 next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -540,6 +537,12 @@ fn recover_from_wal_with_options(
         };
         log.lock().set_local_recovery(context.is_restore());
         set_recovery_undo_log(&log);
+        // Spatial compensation reads through its own bounded buffer pool.
+        // Make the completed redo prefix coherent before opening those files.
+        _recovery_io.finish()?;
+        let mut spatial_pool: Option<Arc<BufferPool>> = None;
+        let mut spatial_files = BTreeMap::<String, spatial_index::SpatialIndexFile>::new();
+        let mut spatial_incarnations = BTreeMap::<String, u64>::new();
         let mut last_by_txn = HashMap::new();
         let pending_path = data_dir.join("system/recovery-indexes.pending");
         let mut pending_indexes: BTreeSet<String> = if pending_path.try_exists().map_err(io_err)? {
@@ -552,6 +555,24 @@ fn recover_from_wal_with_options(
         let mut skipped_by_txn: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
         for record_index in 0..scan.records.len() {
             let header = scan.records.header(record_index)?;
+            if header.txn_id == 0 || committed.contains(&header.txn_id) {
+                use crate::wal::WalRecordType as T;
+                if matches!(header.record_type, T::FileCreate | T::FileDelete) {
+                    if let Some(path) = scan.records.redo_path(record_index)? {
+                        if path.ends_with(".rtree") {
+                            spatial_incarnations.insert(path.into_owned(), header.lsn);
+                        }
+                    }
+                } else if header.record_type == T::DdlCommit {
+                    if let WalPayload::DdlCommit { retired_paths, .. } =
+                        &scan.records.record(record_index)?.payload
+                    {
+                        for path in retired_paths.iter().filter(|p| p.ends_with(".rtree")) {
+                            spatial_incarnations.insert(path.clone(), header.lsn);
+                        }
+                    }
+                }
+            }
             if !losers.contains(&header.txn_id) {
                 continue;
             }
@@ -602,8 +623,6 @@ fn recover_from_wal_with_options(
                 true,
             )
             .map_err(io_err)?;
-            crate::platform::fs::sync_path(pending_path.parent().expect("system directory"))
-                .map_err(io_err)?;
         }
         // Ordinary crash losers without a rolled-back savepoint need no
         // predecessor index. Keep the additional memory proportional to the
@@ -666,19 +685,89 @@ fn recover_from_wal_with_options(
                     continue;
                 }
             }
-            let record = scan.records.find_lsn(lsn)?.ok_or_else(|| {
-                error(
+            let Some(record) = scan.records.find_lsn(lsn)? else {
+                if !context.is_restore() && crate::wal::wal_force_recover_enabled() {
+                    log_message(format_args!(
+                        "WARNING: WAL force-recover: transaction {txn_id} references missing undo LSN {lsn}; terminating its undo chain after the retained suffix; data may be incomplete"
+                    ));
+                    continue;
+                }
+                return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
                     format!(
-                        "corrupt WAL undo chain: transaction {txn_id} references missing LSN {lsn}"
+                        "corrupt WAL undo chain: transaction {txn_id} references missing LSN {lsn}; restore a verified backup, or explicitly use MYDB_WAL_FORCE_RECOVER=1 for salvage (may lose data)"
                     ),
-                )
-            })?;
+                ));
+            };
             if record.txn_id != txn_id || record.prev_txn_lsn >= lsn {
                 return Err(error(crate::error::catalog::ER_GET_ERRNO,
                     format!("corrupt WAL undo chain at LSN {lsn}: expected transaction {txn_id}, found {}, predecessor {}", record.txn_id, record.prev_txn_lsn)));
             }
             match &record.payload {
+                WalPayload::SpatialIndexUndo { path, bytes } => {
+                    if !spatial_incarnations
+                        .get(path)
+                        .is_some_and(|floor| record.lsn < *floor)
+                    {
+                        if !path.ends_with(".rtree")
+                            || Path::new(path).is_absolute()
+                            || path.split('/').any(|p| p == "..")
+                        {
+                            return Err(error(
+                                crate::error::catalog::ER_INDEX_CORRUPT,
+                                "invalid spatial undo path",
+                            ));
+                        }
+                        if !spatial_files.contains_key(path) {
+                            if spatial_files.len() >= 64 {
+                                if let Some((_, file)) = spatial_files.pop_first() {
+                                    file.flush()?;
+                                }
+                            }
+                            let pool = spatial_pool
+                                .get_or_insert_with(|| {
+                                    BufferPool::new(
+                                        64,
+                                        log.clone(),
+                                        DurabilityMode::Strict,
+                                        Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+                                    )
+                                })
+                                .clone();
+                            let file = spatial_index::SpatialIndexFile::open(
+                                data_dir.join(path),
+                                log.clone(),
+                                DurabilityMode::Strict,
+                                pool,
+                                false,
+                            )?;
+                            spatial_files.insert(path.clone(), file);
+                        }
+                        spatial_files
+                            .get(path)
+                            .expect("opened spatial undo file")
+                            .apply(0, spatial_index::decode_inverse(bytes)?)?;
+                    }
+                    log.lock().append(
+                        txn_id,
+                        WalPayload::SpatialIndexClr {
+                            undo_next_lsn: record.prev_txn_lsn,
+                        },
+                    )?;
+                }
+                WalPayload::SpatialIndexClr { undo_next_lsn } => {
+                    if *undo_next_lsn >= record.lsn {
+                        return Err(error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "corrupt spatial compensation cursor",
+                        ));
+                    }
+                    if *undo_next_lsn != 0 {
+                        undo_queue.push((*undo_next_lsn, txn_id));
+                    }
+                    continue;
+                }
+
                 WalPayload::PageUpdate {
                     path,
                     page_id,
@@ -885,6 +974,9 @@ fn recover_from_wal_with_options(
                 undo_queue.push((record.prev_txn_lsn, txn_id));
             }
         }
+        for file in spatial_files.values() {
+            file.flush()?;
+        }
         let mut end_lsn = 0;
         for txn_id in losers {
             summary.undone_transactions += 1;
@@ -1070,7 +1162,6 @@ fn skip_prechecked_index_record(
 struct RedoState {
     context: RecoveryContext,
     recovery_log: Option<Arc<crate::wal::LogMutex>>,
-    native_recovery_ceiling: Option<u64>,
     recovery_indexes: HashMap<String, IndexFile>,
     skipped_index_redo_paths: HashSet<String>,
     redone_records: usize,
@@ -1090,7 +1181,6 @@ impl RedoState {
         Self {
             context,
             recovery_log,
-            native_recovery_ceiling: None,
             recovery_indexes: HashMap::new(),
             skipped_index_redo_paths: HashSet::new(),
             redone_records: 0,
@@ -1153,7 +1243,15 @@ fn apply_redo_record_inner(
     state: &mut RedoState,
 ) -> Result<(), QueryError> {
     match &record.payload {
-        WalPayload::VectorIndexManifest { path, bytes } if should_redo_record(record, redoable, redo_cutoff) => {
+        WalPayload::SpatialPageBatch { path, bytes }
+            if should_redo_record(record, redoable, redo_cutoff) =>
+        {
+            spatial_index::redo(data_dir, path, bytes, record.lsn)?;
+            state.redone_records += 1;
+        }
+        WalPayload::VectorIndexManifest { path, bytes }
+            if should_redo_record(record, redoable, redo_cutoff) =>
+        {
             redo_vector_manifest(data_dir, path, bytes)?;
             state.redone_records += 1;
         }
@@ -1394,13 +1492,15 @@ fn apply_redo_record_inner(
                 record.lsn,
                 record.txn_id,
                 ops,
-                state.native_recovery_ceiling,
-                state.context,
             ) {
                 Ok(()) => {
                     state.redone_records += 1;
                 }
                 Err(err) if is_rebuildable_index_redo_error(&err) => {
+                    // An open/validation failure has no IndexFile on which to
+                    // set the fence. Persist it here before advancing recovery,
+                    // including for DD indexes and a second crash during redo.
+                    IndexFile::persist_rebuild_marker(&data_dir.join(path))?;
                     state.skipped_index_redo_paths.insert(path.clone());
                     state.recovery_indexes.remove(path);
                     state.skipped_index_redo_records += 1;
@@ -2102,8 +2202,6 @@ fn redo_index_batch(
     lsn: u64,
     txn_id: u64,
     ops: &[WalIndexOp],
-    native_recovery_ceiling: Option<u64>,
-    context: RecoveryContext,
 ) -> Result<(), QueryError> {
     let _routing = btree_logical_wal::LsnScope::new(Some(lsn));
     let index = match indexes.entry(relative.to_string()) {
@@ -2120,11 +2218,11 @@ fn redo_index_batch(
             row_id: wal_row_id_to_row_id(op.row_id),
         });
     }
-    if let Some(ceiling) = native_recovery_ceiling.filter(|_| !context.must_redo(lsn)) {
-        if index.recovery_batch_already_persisted(&entries, lsn, ceiling)? {
-            return Ok(());
-        }
-    }
+    // Leaf LSNs are flush watermarks, not proof that all earlier logical
+    // batches were applied. Concurrent append/apply order can differ and a
+    // structural operation publishes several independent pages. Replay every
+    // retained batch on the validated tree; duplicate inserts/missing deletes
+    // are idempotent. Cost-based skips require a durable heap-rebuild marker.
     // Shared with online physical replication: empty all-insert batches build
     // bottom-up, later strictly increasing chunks append at the right edge,
     // and mixed/unsorted batches retain the per-op correctness oracle.
@@ -2161,6 +2259,81 @@ fn wal_row_id_to_row_id(row_id: WalRowId) -> RowId {
 #[cfg(test)]
 mod undo_audit_recovery_tests {
     use super::*;
+
+    #[test]
+    fn btree_release_missing_undo_predecessor_requires_explicit_salvage() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let relative = "objects/tables/101/1.heap";
+        let mut page = Page::new();
+        let slot = page.insert(b"uncommitted").unwrap();
+        let mut log = LogManager::open(dir.path()).unwrap();
+        let first_path = log.path().to_owned();
+        log.append(7, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        log.rotate_segment().unwrap();
+        let lsn = log
+            .append(
+                7,
+                WalPayload::HeapInsert {
+                    path: relative.into(),
+                    page_id: 0,
+                    slot_id: slot,
+                    payload: b"uncommitted".to_vec(),
+                    undo_lsn: None,
+                },
+            )
+            .unwrap();
+        log.flush().unwrap();
+        drop(log);
+        write_recovery_heap_page(dir.path(), relative, 0, lsn, page).unwrap();
+        fs::remove_file(first_path).unwrap();
+        crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", None)], || {
+            let err = recover_from_wal(dir.path(), DurabilityMode::Strict)
+                .err()
+                .unwrap();
+            assert!(err.message().contains("references missing LSN"));
+        });
+        crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", Some("1"))], || {
+            recover_from_wal(dir.path(), DurabilityMode::Strict).unwrap();
+        });
+        let page = Page::decode(&fs::read(dir.path().join(relative)).unwrap()).unwrap();
+        assert!(
+            page.read(slot).is_none(),
+            "the retained undo suffix must still be applied"
+        );
+        crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", None)], || {
+            recover_from_wal(dir.path(), DurabilityMode::Strict).unwrap();
+        });
+    }
+
+    #[test]
+    fn btree_release_force_recover_preserves_undo_chain_integrity_checks() {
+        for predecessor in [1u64, 2] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(dir.path()).unwrap();
+            log.append(8, WalPayload::BeginTxn { start_scn: 1 })
+                .unwrap();
+            log.append(7, WalPayload::BeginTxn { start_scn: 1 })
+                .unwrap();
+            log.flush().unwrap();
+            let path = log.path().to_owned();
+            drop(log);
+            let mut bytes = fs::read(&path).unwrap();
+            let frame = crate::wal::WAL_HEADER_LEN + crate::wal::WAL_FRAME_HEADER_LEN + 8;
+            bytes[frame + 16..frame + 24].copy_from_slice(&predecessor.to_le_bytes());
+            let mut checksum = crc32fast::Hasher::new();
+            checksum.update(&bytes[frame..frame + 44]);
+            checksum.update(&bytes[frame + 48..frame + 56]);
+            bytes[frame + 44..frame + 48].copy_from_slice(&checksum.finalize().to_le_bytes());
+            fs::write(path, bytes).unwrap();
+            crate::util::env::with_vars(&[("MYDB_WAL_FORCE_RECOVER", Some("1"))], || {
+                let err = recover_from_wal(dir.path(), DurabilityMode::Strict)
+                    .err()
+                    .unwrap();
+                assert!(err.message().contains("corrupt WAL undo chain at LSN"));
+            });
+        }
+    }
 
     #[test]
     fn audit1022_heap_update_replays_at_absolute_slot_after_skipped_inserts() {
@@ -2941,7 +3114,7 @@ pub(crate) fn redo_vector_image(
     file.write_all(bytes).map_err(io_err)?;
     if offset + bytes.len() as u64 == total {
         file.set_len(total).map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
+        crate::platform::fs::sync_standard_file_at(&file, &incoming).map_err(io_err)?;
         drop(file);
         invalidate_recovery_page_io(data_dir, relative);
         fs::rename(&incoming, &path).map_err(io_err)?;
@@ -2957,7 +3130,7 @@ pub(crate) fn persist_vector_image_receipt(path: &Path, lsn: u64) -> Result<(), 
     bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
     let mut file = fs::File::create(&tmp).map_err(io_err)?;
     file.write_all(&bytes).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
     fs::rename(&tmp, &receipt).map_err(io_err)?;
     crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }
@@ -2984,7 +3157,7 @@ pub(crate) fn redo_vector_manifest(data_dir: &Path, relative: &str, bytes: &[u8]
     let tmp = path.with_extension("vmanifest.incoming");
     let mut file = fs::File::create(&tmp).map_err(io_err)?;
     file.write_all(bytes).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
     fs::rename(tmp, &path).map_err(io_err)?;
     crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }

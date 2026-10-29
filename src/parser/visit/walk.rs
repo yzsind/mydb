@@ -140,6 +140,8 @@ macro_rules! define_walk {
                 | Statement::AlterSystemCheckpoint
                 | Statement::AlterSystemFlushDataCache
                 | Statement::AlterSystemFlushSqlCache
+                | Statement::AlterSystemReloadHttpConfig
+                | Statement::ShowHttpStatus
                 | Statement::ShowPrivileges
                 | Statement::CreateUser(_)
                 | Statement::AlterUser(_)
@@ -600,13 +602,18 @@ let crate::parser::WindowSpec { partition_by, order_by, frame, .. } = & $($mutab
                     RoutineStmt::Signal {
                         message_text,
                         mysql_errno,
+                        information,
                         ..
                     }
                     | RoutineStmt::Resignal {
                         message_text,
                         mysql_errno,
+                        information,
                         ..
                     } => {
+                        for (_, expr) in information {
+                            walk_expr(visitor, expr);
+                        }
                         if let Some(expr) = message_text {
                             walk_expr(visitor, expr);
                         }

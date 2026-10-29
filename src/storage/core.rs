@@ -73,6 +73,9 @@ use super::wait_events::{WaitEvent, WaitEventHistory, WaitEventSample};
 // P0/4 — slot-reclaim retry tuning. Shared by `Database` field defs
 // (txn_ops.rs::reclaim_tombstoned_slots) and the regression tests
 // that reach in via `cfg(test)` accessors.
+const PENDING_LIVE_ROW_DELTA_SHARDS: usize = 64;
+type PendingLiveRowDeltaShard = parking_lot::Mutex<FastHashMap<u64, HashMap<u64, i64>>>;
+
 pub(crate) const SLOT_RECLAIM_MAX_ATTEMPTS: u8 = 8;
 pub(crate) const SLOT_RECLAIM_QUARANTINE_CAP: usize = 4096;
 pub(crate) const SLOT_RECLAIM_QUARANTINE_DRAIN_PER_RUN: usize = 256;
@@ -871,6 +874,7 @@ enum CachedMvccRead {
 /// Cheaper sibling of [`CachedMvccRead`] that carries only the row's
 /// MVCC header. Returned by the buffered fast path that index-only
 /// scans use to test visibility without paying for value decoding.
+#[derive(Clone, Copy)]
 pub(crate) enum CachedMvccHeaderRead {
     Hit(RowHeader),
     /// Page not in the buffer pool, or the row needs forwarding/piece
@@ -974,13 +978,12 @@ struct ReorgStorageLocation {
     // idle-handle eviction until publication or rollback removes this entry.
     heap_codec: Option<Arc<RowCodec>>,
     index_ids: Option<Arc<BTreeMap<String, u64>>>,
+    spatial_indexes: Option<Arc<HashSet<String>>>,
 }
 
 type HeapCacheMap = hashbrown::HashMap<u64, HeapHandle, ahash::RandomState>;
 type IndexCacheMap = hashbrown::HashMap<(u64, String), IndexHandle, ahash::RandomState>;
 type OverflowCacheMap = hashbrown::HashMap<u64, OverflowHandle, ahash::RandomState>;
-type IndexGenerationMap = HashMap<(u64, String), u64>;
-type SpatialRtreeCacheMap = HashMap<(u64, String), Arc<SpatialRtreeCache>>;
 type BufferFrameMap = hashbrown::HashMap<PageKey, Arc<Frame>, ahash::RandomState>;
 /// Values are shared atomic cells so the hot paths (per-miss load, per-flush
 /// generation check) read them with one atomic load under the map's read
@@ -994,13 +997,6 @@ type BufferFileCacheMap =
 /// Sharded snapshot table — each shard sees ~1/N of the statement
 /// register / drop traffic, so the hash speedup compounds across shards.
 type ActiveSnapshotMap = hashbrown::HashMap<u64, ActiveSnapshot, ahash::RandomState>;
-
-#[derive(Debug)]
-struct SpatialRtreeCache {
-    generation: AtomicU64,
-    tree: parking_lot::RwLock<rtree::RTree>,
-    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
-}
 
 /// Undo directory latch. Cold segment I/O is prepared under a read guard and
 /// completed after releasing it, so this lock covers metadata only. Shared
@@ -1074,6 +1070,11 @@ pub struct Database {
     // take the read guard so they don't serialise against each other. Stripe
     // later only if the write side becomes the hot spot.
     lock_manager: parking_lot::RwLock<TxnLockManager>,
+    /// Lock-free summary of `lock_manager`'s unique-key reservations; lets
+    /// read-only point probes skip the latch when a table has none.
+    unique_reservations: Arc<super::txn::UniqueReservationFilter>,
+    /// Lock-free summary of which transactions own a `lock_manager` lock log.
+    lock_log_presence: Arc<super::txn::LockLogPresence>,
     mdl: MdlManager,
     // parking_lot for the same metastable-convoy reason as `txns`: every
     // row-level DML appends an undo record under this lock.
@@ -1084,6 +1085,8 @@ pub struct Database {
     undo_append_shards: Arc<[UndoWriteShardHandle]>,
     undo_resident_admission: crate::storage::undo::UndoResidentAdmission,
     undo_append_next_shard: AtomicU64,
+    /// Flat-combining queue for concurrent undo directory publication.
+    undo_publish: UndoPublishQueue,
     /// Mirrors the two runtime gates that require append admission before IO.
     /// Disabling is published before changing either gate; enabling is
     /// published after, so runtime changes cannot admit an unsafe fast append.
@@ -1110,13 +1113,11 @@ pub struct Database {
     sequences: crate::storage::sequence::SequenceManager,
     lock_wait_mutex: Mutex<()>,
     lock_wait_signal: Condvar,
-    /// Async-runtime mirror of row-lock release progress. Inline prepared
-    /// point commands subscribe only after an immediate lock conflict; a
-    /// monotonically changing watch value closes the release-before-await
-    /// race without parking an OS blocking-pool worker. The synchronous
-    /// condvar/parker path remains the correctness oracle and fallback.
-    row_lock_async_signals: Box<[tokio::sync::watch::Sender<u64>]>,
-    row_lock_async_waiters: Arc<AtomicU64>,
+    /// Exact async wake tokens for row FIFO waiters. Registration followed
+    /// by an eligibility recheck closes the release-before-await race without
+    /// parking an OS worker or waking unrelated rows. Long waits retain the
+    /// synchronous condvar/parker fallback.
+    row_lock_async_registry: Arc<crate::engine::api::AsyncRowLockRegistry>,
     /// Number of threads currently parked on `lock_wait_signal` (MDL /
     /// unique-key / table-lock waiters). `notify_lock_waiters` reads this and
     /// skips the broadcast when it is 0: the overwhelmingly common
@@ -1156,13 +1157,6 @@ pub struct Database {
     /// need no epoch lookup, and unrelated tables cannot invalidate an open.
     storage_handle_open_epochs: Mutex<HashMap<u64, std::sync::Weak<AtomicU64>>>,
     index_cache: parking_lot::RwLock<IndexCacheMap>,
-    /// Mutation generations registered before the first spatial projection
-    /// scan. Ordinary B-trees need no entry. Spatial R-tree cache entries are
-    /// usable only when their captured generation matches.
-    index_mutation_generations: parking_lot::RwLock<IndexGenerationMap>,
-    /// Optional, governor-accounted R-tree projections of durable spatial
-    /// B-trees. The B-tree remains the only WAL/recovery source of truth.
-    spatial_rtree_cache: parking_lot::RwLock<SpatialRtreeCacheMap>,
     /// Per-table overflow (LOB) file handles, opened lazily on first
     /// externalization. Mirrors `heap_cache` / `index_cache`.
     overflow_cache: parking_lot::RwLock<OverflowCacheMap>,
@@ -1271,6 +1265,7 @@ pub struct Database {
     /// `wal::LogStateAtomics` doc for the rationale.
     log_state_atomics: Arc<crate::wal::LogStateAtomics>,
     group_commit: GroupCommitCoordinator,
+    flush_group_commit: GroupCommitCoordinator,
     durability_worker: DurabilityWorker,
     plan_cache_hits: AtomicU64,
     plan_cache_misses: AtomicU64,
@@ -1531,7 +1526,7 @@ pub struct Database {
     /// publishes it here and rollback discards it, so estimates never expose
     /// uncommitted or rolled-back population changes.
     table_live_row_deltas: parking_lot::RwLock<HashMap<u64, Arc<AtomicI64>>>,
-    pending_live_row_deltas: parking_lot::Mutex<HashMap<(u64, u64), i64>>,
+    pending_live_row_deltas: Box<[PendingLiveRowDeltaShard]>,
     /// Monotonic per-table data-change epoch for the CTE result cache.
     /// Unlike `table_modification_deltas` (reset by `take`/`drop` to fold
     /// into persisted stats), this only ever increases — bumped on every
@@ -1563,6 +1558,8 @@ pub struct Database {
     analyze_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     ddl_backfill_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    create_finalize_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_index_replay_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
@@ -1946,7 +1943,6 @@ struct AlterCopyJobProgress {
 #[derive(Debug)]
 struct AlterCopyChangeLog {
     touched_rows: Vec<(u64, u64, RowId)>,
-    invalidated: bool,
     spill: Option<File>,
     spilled_rows: u64,
     data_dir: PathBuf,
@@ -1957,7 +1953,6 @@ impl AlterCopyChangeLog {
     fn new(data_dir: &Path) -> Self {
         Self {
             touched_rows: Vec::new(),
-            invalidated: false,
             spill: None,
             spilled_rows: 0,
             data_dir: data_dir.to_path_buf(),
@@ -1971,6 +1966,71 @@ impl AlterCopyChangeLog {
 }
 
 #[derive(Debug)]
+struct AlterCopyCapture {
+    shards: [Mutex<AlterCopyChangeLog>; 16],
+    rows: AtomicUsize,
+    invalidated: AtomicBool,
+}
+
+impl AlterCopyCapture {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(AlterCopyChangeLog::new(data_dir))),
+            rows: AtomicUsize::new(0),
+            invalidated: AtomicBool::new(false),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.load(Ordering::Acquire)
+    }
+
+    fn record(
+        &self,
+        txn: u64,
+        storage: u64,
+        rows: impl IntoIterator<Item = RowId>,
+    ) -> Result<(), QueryError> {
+        let shard = (txn ^ (txn >> 32)) as usize % self.shards.len();
+        let mut log = self.shards[shard].lock().unwrap_or_else(|p| p.into_inner());
+        for row in rows {
+            if self.invalidated.load(Ordering::Acquire)
+                || self
+                    .rows
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                        (n < 64 * 1024 * 1024 / 24).then_some(n + 1)
+                    })
+                    .is_err()
+            {
+                self.invalidated.store(true, Ordering::Release);
+                return Err(error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "online ALTER change log reached its 64 MiB limit",
+                ));
+            }
+            if let Err(err) = log.record_buffered((txn, storage, row), 4096 / self.shards.len()) {
+                self.rows.fetch_sub(1, Ordering::AcqRel);
+                self.invalidated.store(true, Ordering::Release);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn take(&self, data_dir: &Path) -> Vec<AlterCopyChangeLog> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let mut log = shard.lock().unwrap_or_else(|p| p.into_inner());
+                let batch = std::mem::replace(&mut *log, AlterCopyChangeLog::new(data_dir));
+                self.rows.fetch_sub(batch.len(), Ordering::AcqRel);
+                batch
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
 struct AlterCopyJob {
     job_id: u64,
     table_id: u64,
@@ -1979,9 +2039,10 @@ struct AlterCopyJob {
     operation: &'static str,
     object_name: String,
     capture_rows: bool,
+    auto_increment_max: AtomicU64,
     cancel_token: crate::engine::cancel::QueryCancelToken,
     progress: Mutex<AlterCopyJobProgress>,
-    changes: Mutex<AlterCopyChangeLog>,
+    changes: AlterCopyCapture,
     cancel_requested: AtomicBool,
     retired_vector_graphs: Mutex<Vec<Arc<VectorGraph>>>,
     retired_files: Mutex<Vec<PathBuf>>,
@@ -3065,6 +3126,10 @@ pub struct SnapshotGuard {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum BufferPageFileKind {
+    Spatial {
+        table_id: u64,
+        name: String,
+    },
     Heap {
         table_id: u64,
     },
@@ -3719,7 +3784,7 @@ impl BufferPageFileKind {
     pub(crate) fn slot(&self) -> usize {
         match self {
             BufferPageFileKind::Heap { .. } => 0,
-            BufferPageFileKind::Index { .. } => 1,
+            BufferPageFileKind::Index { .. } | BufferPageFileKind::Spatial { .. } => 1,
             BufferPageFileKind::Overflow { .. } => 2,
             BufferPageFileKind::Vector { .. } => 3,
             BufferPageFileKind::ZoneMap { .. } => 4,
@@ -4443,6 +4508,7 @@ include!("core/database/vector_replication.rs");
 include!("core/database/vector_generations.rs");
 include!("core/database/vector_retirements.rs");
 include!("core/database/mvcc.rs");
+include!("core/database/undo_publish.rs");
 include!("core/database/startup.rs");
 include!("core/database/stats_ops.rs");
 include!("core/database/io_handles.rs");
@@ -4796,9 +4862,9 @@ include!("core/errors.rs");
 mod auto_increment_tests;
 #[cfg(test)]
 mod btree_batch_tests;
-pub(crate) mod rtree;
 #[cfg(test)]
 mod sequence_tests;
+mod spatial_index;
 #[cfg(test)]
 mod tests;
 

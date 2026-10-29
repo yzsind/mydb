@@ -1,5 +1,6 @@
 pub(crate) mod ai;
 pub mod api;
+mod async_row_wait;
 pub mod audit_log;
 pub mod auth;
 pub mod auto_analyze;
@@ -11,6 +12,7 @@ pub(crate) mod cancel;
 pub mod cbo;
 pub mod cursor_registry;
 pub(crate) mod executor;
+pub(crate) mod http;
 pub use executor::mem_budget::controlled_memory_snapshot;
 pub mod vector_maintenance;
 pub mod zone_map_maintenance;

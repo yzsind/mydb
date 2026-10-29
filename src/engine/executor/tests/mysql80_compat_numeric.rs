@@ -1435,7 +1435,7 @@ fn temporal_expression_and_wide_decimal_bit_aggregate_keep_mysql_type_coercion()
         .unwrap();
     assert_eq!(
         one_row_s(&engine, &mut session, "SELECT v FROM temporal_decimal_t")[0].to_display_string(),
-        "19700101000000.000014"
+        "20101112000000.000014"
     );
 
     let row = one_row_s(

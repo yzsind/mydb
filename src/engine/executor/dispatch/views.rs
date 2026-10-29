@@ -1,7 +1,7 @@
 //! View expansion, validation and DML binding.
 use super::*;
 
-pub(super) fn expand_views(
+pub(in crate::engine::executor) fn expand_views(
     db: &Arc<Database>,
     session: &SessionContext,
     statement: &mut Statement,
@@ -173,6 +173,10 @@ fn expand_view_body(
     });
     let mut context = session.clone();
     context.current_database = view.database.clone();
+    let security = effective_view_security_account(db, session, view, None)?;
+    context.authenticated_as = security.authenticated_as;
+    context.active_roles = security.active_roles;
+    super::super::routines::bind_view_stored_functions(db, &context, &mut expanded)?;
     expand_views_in_select(db, &context, &mut expanded, depth + 1, trail)?;
     compact_expanded_view_body(&mut expanded)?;
     trail.remove(&trail_key(view));
@@ -195,7 +199,15 @@ fn expand_views_in_select(
     // Lock a simple updatable view using exactly the base-row DML mapping.
     // Returning an unlocked derived result would violate FOR UPDATE/SHARE.
     if stmt.for_update && stmt.derived.is_none() && stmt.from.len() == 1 && stmt.joins.is_empty() {
-        if let Some(mut plan) = resolve_updatable_view(db, session, &stmt.from[0].name)? {
+        let plan = match resolve_updatable_view(db, session, &stmt.from[0].name) {
+            Ok(plan) => plan,
+            // DML updatability is stricter than locking-read eligibility.
+            // Let the generic derived-query path preserve base-row identity
+            // or explicitly reject shapes it cannot safely lock.
+            Err(err) if err.is(crate::error::catalog::ER_NON_UPDATABLE_TABLE) => None,
+            Err(err) => return Err(err),
+        };
+        if let Some(mut plan) = plan {
             // Bind against the view before replacing its namespace with the
             // base table. In particular, correlated subqueries must not gain
             // access to base columns through outer-scope fallback.
@@ -1484,7 +1496,7 @@ fn derive_view_output_columns(
         match item {
             PSelectItem::Wildcard => {
                 if let Some(table) = &primary_table {
-                    for col in table.columns.iter().filter(|col| !col.invisible) {
+                    for (_, col) in table.iter_select_columns() {
                         out.push(ViewColumnDef {
                             name: col.name.clone(),
                             data_type: Some(col.data_type.clone()),
@@ -1514,7 +1526,7 @@ fn derive_view_output_columns(
             }
             PSelectItem::QualifiedWildcard(_qualifier) => {
                 if let Some(table) = &primary_table {
-                    for col in table.columns.iter().filter(|col| !col.invisible) {
+                    for (_, col) in table.iter_select_columns() {
                         out.push(ViewColumnDef {
                             name: col.name.clone(),
                             data_type: Some(col.data_type.clone()),
@@ -1549,11 +1561,7 @@ fn derive_view_output_columns(
                     // or any in-scope base table (joins).
                     Some(col_name) => primary_table
                         .as_ref()
-                        .and_then(|t| {
-                            t.columns
-                                .iter()
-                                .find(|col| col.name.eq_ignore_ascii_case(col_name))
-                        })
+                        .and_then(|t| t.find_column_index(col_name).map(|index| &t.columns[index]))
                         .map(|col| (Some(col.data_type.clone()), col.nullable))
                         .or_else(|| {
                             view_scope_column(db, current_database, select, col_name)
@@ -1573,9 +1581,8 @@ fn derive_view_output_columns(
                     .and_then(|col_name| {
                         primary_table.as_ref().and_then(|table| {
                             table
-                                .columns
-                                .iter()
-                                .find(|column| column.name.eq_ignore_ascii_case(col_name))
+                                .find_column_index(col_name)
+                                .map(|index| &table.columns[index])
                                 .map(|column| (column.charset.clone(), column.collation.clone()))
                         })
                     })
@@ -1647,9 +1654,8 @@ fn view_scope_column(
             continue;
         };
         if let Some(col) = table
-            .columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+            .find_column_index(col_name)
+            .map(|index| &table.columns[index])
         {
             if found.is_some() {
                 // Ambiguous across tables — don't guess.
@@ -2047,7 +2053,18 @@ fn resolve_updatable_view_schema(
         }
         let mut current_predicate = body.selection.clone();
         if let Some(predicate) = &mut current_predicate {
-            rewrite_expr_view_columns(predicate, &inner.column_map)?;
+            if super::super::prepared_dml::expr_contains_subquery(predicate) {
+                bind_view_predicate_outer_row(
+                    db,
+                    session,
+                    &view.database,
+                    &body.from[0],
+                    predicate,
+                    &inner.column_map,
+                )?;
+            } else {
+                rewrite_expr_view_columns(predicate, &inner.column_map)?;
+            }
         }
         let view_predicate = and_where(inner.view_predicate.clone(), current_predicate.clone());
         let check_predicate = match view.check_option.as_deref() {
@@ -2083,6 +2100,23 @@ fn resolve_updatable_view_schema(
         returning_columns.push((visible_name, referenced_name));
     }
     let base_qualified = qualify_table_name_in_database(&view.database, source_name);
+    if let Some(predicate) = &mut body.selection {
+        if super::super::prepared_dml::expr_contains_subquery(predicate) {
+            let table = db.table_required(&view.database, source_name)?;
+            let identity = table
+                .iter_visible_columns()
+                .map(|(_, column)| (column.name.to_ascii_lowercase(), column.name.clone()))
+                .collect();
+            bind_view_predicate_outer_row(
+                db,
+                session,
+                &view.database,
+                &body.from[0],
+                predicate,
+                &identity,
+            )?;
+        }
+    }
     let check_predicate = view
         .check_option
         .as_ref()
@@ -2441,6 +2475,31 @@ fn rewrite_scoped_view_expr(
     visitor.result
 }
 
+/// Preserve lexical ownership of captured outer columns through view aliases
+/// and renamed nested views. Inner subquery sources retain their own bindings.
+fn bind_view_predicate_outer_row(
+    db: &Arc<Database>,
+    session: &SessionContext,
+    database: &str,
+    source: &TableRef,
+    predicate: &mut Expr,
+    mapping: &std::collections::HashMap<String, String>,
+) -> Result<(), QueryError> {
+    let mut context = session.clone();
+    context.current_database = database.to_string();
+    let mut binding = view_dml_binding(db, &context, source, None, Some(mapping.clone()))?;
+    binding.alias = super::super::dml::VIEW_CHECK_ROW_ALIAS.to_string();
+    let mut visitor = ViewDmlRewriter {
+        db,
+        session: &context,
+        scopes: vec![vec![binding]],
+        aliases: Vec::new(),
+        result: Ok(()),
+    };
+    crate::parser::visit::visit_expr_mut(&mut visitor, predicate);
+    visitor.result
+}
+
 /// Bind column rewrites to the original lexical namespaces. Inner query
 /// bindings shadow outer bindings; base-table columns never inherit a view map.
 struct ViewDmlBinding {
@@ -2655,6 +2714,12 @@ fn qualify_view_predicate(predicate: &mut Option<Expr>, alias: &str) {
             self.1 -= 1;
         }
         fn enter_expr(&mut self, expr: &mut Expr) {
+            if let Expr::CompoundIdentifier(parts) = expr {
+                if parts.len() == 2 && parts[0] == super::super::dml::VIEW_CHECK_ROW_ALIAS {
+                    parts[0] = self.0.to_string();
+                    return;
+                }
+            }
             if self.1 != 0 {
                 return;
             }
@@ -2748,7 +2813,15 @@ fn rewrite_view_update_delete(
         };
         let alias = rewriter.scopes[0][index].alias.clone();
         qualify_view_predicate(&mut plan.view_predicate, &alias);
-        qualify_view_predicate(&mut plan.check_predicate, &alias);
+        // Correlated checks keep their private lexical outer-row name;
+        // selection predicates instead bind to the statement's table alias.
+        if !plan
+            .check_predicate
+            .as_ref()
+            .is_some_and(super::super::prepared_dml::expr_contains_subquery)
+        {
+            qualify_view_predicate(&mut plan.check_predicate, &alias);
+        }
         match &mut statement {
             Statement::Update(s) => {
                 let writes = s.assignments.iter().any(|a| {

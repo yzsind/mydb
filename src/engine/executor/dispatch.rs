@@ -19,14 +19,13 @@ use mdl::{
 };
 mod views;
 use views::{
-    effective_view_security_account, expand_views, materialize_alter_view_options,
-    materialize_view_options, reject_unsupported_view_query, revalidate_altered_table_views,
-    stored_view_query, trail_key, validate_view_definition, view_query_from_query,
-    warn_if_view_definer_missing,
+    effective_view_security_account, materialize_alter_view_options, materialize_view_options,
+    reject_unsupported_view_query, revalidate_altered_table_views, stored_view_query, trail_key,
+    validate_view_definition, view_query_from_query, warn_if_view_definer_missing,
 };
 pub(super) use views::{
-    revalidate_routine_views, rewrite_delete_through_view, rewrite_insert_through_view,
-    rewrite_update_through_view,
+    expand_views, revalidate_routine_views, rewrite_delete_through_view,
+    rewrite_insert_through_view, rewrite_update_through_view,
 };
 mod setop;
 pub(in crate::engine::executor) use setop::{coerce_setop_value, set_row_key};
@@ -575,6 +574,7 @@ fn execute_statement_inner(
     inherit_view_security: bool,
 ) -> Result<QueryResponse, QueryError> {
     use crate::engine::session_registry::ProcessState;
+    let _http_scope = crate::engine::http::enter(db);
 
     if session.current_database.is_empty()
         && auth_required_privileges(session, &statement)
@@ -675,6 +675,7 @@ fn execute_statement_inner(
             std::ptr::NonNull::from(db),
             std::ptr::NonNull::from(&mut *session),
             std::ptr::NonNull::from(registry),
+            inherit_view_security,
         )
     };
     let mut statement = statement;
@@ -706,7 +707,9 @@ fn execute_statement_inner(
             super::routines::resolve_stored_functions(db, session, &mut statement, registry)?;
         // Resolve user references before inserting persistently bound view bodies.
         qualify_statement_tables(db, session, &mut statement)?;
-        expand_views(db, session, &mut statement, 0)?;
+        super::routines::with_view_function_binding(|| {
+            expand_views(db, session, &mut statement, 0)
+        })?;
         let has_fusion = select::hybrid::statement_has_fusion(&statement);
         let _fulltext_scoring = select::fulltext_context::enter_fusion(has_fusion);
         if has_fusion {
@@ -724,13 +727,14 @@ fn execute_statement_inner(
                     || (db.has_stored_functions()
                         && (name.contains('.')
                             || !crate::engine::cbo::function_cost::is_known_builtin_function(name))
-                        && db
-                            .routine_definition(
-                                &session.current_database,
-                                crate::storage::RoutineKindSchema::Function,
-                                name,
-                            )
-                            .is_some())
+                        && (crate::engine::expr::resolved_view_stored_function(name).is_some()
+                            || db
+                                .routine_definition(
+                                    &session.current_database,
+                                    crate::storage::RoutineKindSchema::Function,
+                                    name,
+                                )
+                                .is_some()))
             })
             .map_err(|error| error.spec.error(error.message))?;
         }
@@ -759,8 +763,13 @@ fn execute_statement_inner(
         let sequence_dependent = crate::parser::collect_statement_function_names(&statement)
             .iter()
             .any(|name| crate::storage::sequence::is_sequence_function(name));
-        let _serial_guard = (function_resolution.needs_serial || sequence_dependent)
-            .then(crate::planner::force_serial_scope);
+        let http_dependent = crate::engine::http::statement_has_http(&statement);
+        if http_dependent {
+            crate::engine::http::activate();
+        }
+        let _serial_guard =
+            (function_resolution.needs_serial || sequence_dependent || http_dependent)
+                .then(crate::planner::force_serial_scope);
         // Even a read-only stored function may execute nested DO/SELECT
         // statements. Hold their transaction finalization until the owning
         // statement boundary; otherwise an inner autocommit statement can
@@ -792,6 +801,8 @@ fn execute_statement_inner(
         };
         if sequence_dependent {
             response.and_then(QueryResponse::materialize)
+        } else if http_dependent {
+            response.map(crate::engine::http::wrap_response)
         } else {
             response
         }
@@ -3300,7 +3311,13 @@ pub(super) fn execute_statement_with_qualification(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     if already_qualified
+        && !crate::engine::http::statement_has_http(&statement)
         && !matches!(statement, Statement::Call(_))
+        // PREPARE qualifies names but leaves stored views unexpanded. Such
+        // executions still need the full security and expansion lifecycle.
+        && !collect_statement_table_uses(&statement).iter().any(|usage| {
+            db.view_definition(&session.current_database, &usage.table).is_some()
+        })
         && !super::routines::statement_references_stored_function(
             db,
             &session.current_database,
@@ -3463,6 +3480,9 @@ fn auth_required_privileges(
     };
     match statement {
         Statement::Ai(_) => Vec::new(),
+        Statement::AlterSystemReloadHttpConfig | Statement::ShowHttpStatus => {
+            vec![global(Privilege::Dynamic("HTTP_ADMIN".into()))]
+        }
         Statement::CreateDatabase { name, .. } => vec![database(Privilege::Create, name)],
         Statement::AlterDatabase { name, .. } => vec![database(
             Privilege::Alter,
@@ -3756,7 +3776,10 @@ fn auth_required_privileges(
                 collect_statement_table_uses_scoped(select, &cte_names, &mut uses);
                 out.extend(
                     uses.into_iter()
-                        .filter(|table_use| !table_use.table.is_empty())
+                        .filter(|table_use| {
+                            !table_use.table.is_empty()
+                                && !reads_freely_readable_system_schema(session, &table_use.table)
+                        })
                         .map(|table_use| table(Privilege::Select, &table_use.table)),
                 );
             } else if let InsertSource::Values(rows) = &stmt.source {
@@ -3796,7 +3819,10 @@ fn auth_required_privileges(
                 }
                 out.extend(
                     uses.into_iter()
-                        .filter(|table_use| !table_use.table.is_empty())
+                        .filter(|table_use| {
+                            !table_use.table.is_empty()
+                                && !reads_freely_readable_system_schema(session, &table_use.table)
+                        })
                         .map(|table_use| table(Privilege::Select, &table_use.table)),
                 );
             }
@@ -3808,6 +3834,10 @@ fn auth_required_privileges(
             let mut out = uses
                 .iter()
                 .into_iter()
+                .filter(|table_use| {
+                    table_use.write
+                        || !reads_freely_readable_system_schema(session, &table_use.table)
+                })
                 .map(|table_use| {
                     table(
                         if table_use.write {
@@ -3836,6 +3866,10 @@ fn auth_required_privileges(
             let mut out = uses
                 .iter()
                 .into_iter()
+                .filter(|table_use| {
+                    table_use.write
+                        || !reads_freely_readable_system_schema(session, &table_use.table)
+                })
                 .map(|table_use| {
                     table(
                         if table_use.write {
@@ -3917,10 +3951,16 @@ fn auth_required_privileges(
         Statement::AlterSystemCheckpoint
         | Statement::AlterSystemFlushDataCache
         | Statement::AlterSystemFlushSqlCache
-        | Statement::ReplicationAdmin { .. }
         | Statement::MydbReplicationAdmin { .. } => vec![global(Privilege::Dynamic(
             "SYSTEM_VARIABLES_ADMIN".to_string(),
         ))],
+        Statement::ReplicationAdmin { sql } => {
+            if sql.trim_start().to_ascii_uppercase().starts_with("SHOW ") {
+                vec![global(Privilege::ReplClient)]
+            } else {
+                vec![global(Privilege::Dynamic("REPLICATION_SLAVE_ADMIN".into()))]
+            }
+        }
         Statement::BackupAdmin { .. } => {
             vec![global(Privilege::Dynamic("BACKUP_ADMIN".to_string()))]
         }
@@ -4302,10 +4342,23 @@ pub(super) fn authorize_prepared_statement_with_epoch(
             {
                 continue;
             }
-            if view_security_override_allows(auth, session, &required)
+            if view_security_override_allows(db, auth, session, statement, &required)
                 || auth.account_has_privilege(&ctx, &required, false)
                 || column_privilege_fallback(db, auth, &ctx, session, statement, &required)
             {
+                continue;
+            }
+            if matches!(
+                statement,
+                Statement::CreateRole { .. } | Statement::DropRole { .. }
+            ) && auth.account_has_privilege(
+                &ctx,
+                &RequiredPrivilege {
+                    privilege: Privilege::CreateUser,
+                    scope: PrivilegeScope::Global,
+                },
+                false,
+            ) {
                 continue;
             }
             if required.privilege == Privilege::CreateUser
@@ -4334,10 +4387,31 @@ pub(super) fn authorize_prepared_statement_with_epoch(
                     ),
                 ));
             }
+            if let PrivilegeScope::Routine {
+                database, routine, ..
+            } = &required.scope
+            {
+                return Err(error(
+                    crate::error::catalog::ER_PROCACCESS_DENIED_ERROR,
+                    format!(
+                        "{} command denied to user '{}'@'{}' for routine '{}.{}'",
+                        required.privilege.sql_name().to_ascii_lowercase(),
+                        ctx.authenticated_as.user,
+                        ctx.authenticated_as.host,
+                        database,
+                        routine,
+                    ),
+                ));
+            }
             return Err(privilege_denied(&required.privilege, &required.scope));
         }
         Ok(auth.epoch)
     })??;
+    // Keep the EXPLAIN-only catalog walk and its stack frame off normal
+    // SELECT/DML authorization paths, including unoptimized builds.
+    if matches!(statement, Statement::Explain { .. }) {
+        authorize_explain_view_dependencies(db, session, statement)?;
+    }
     // Trigger-privilege check runs after the auth-catalog read lock is
     // released because `trigger_definition` itself takes the catalog
     // read lock, and `std::sync::RwLock` is not re-entrant on the same
@@ -4359,6 +4433,75 @@ pub(super) fn authorize_prepared_statement_with_epoch(
         }
     }
     Ok(generation)
+}
+
+fn authorize_explain_view_dependencies(
+    db: &Arc<Database>,
+    session: &SessionContext,
+    statement: &Statement,
+) -> Result<(), QueryError> {
+    let Statement::Explain { target, .. } = statement else {
+        return Ok(());
+    };
+    let mut pending = Vec::new();
+    for usage in collect_statement_table_uses(target) {
+        if !session.has_temp_table(&usage.table) {
+            if let Some(view) = db.view_definition(&session.current_database, &usage.table) {
+                pending.push(view);
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let auth = db.auth_catalog();
+    let caller = session.authorization_context();
+    let mut visited = BTreeSet::new();
+    let denied = || {
+        error(
+            crate::error::catalog::ER_VIEW_NO_EXPLAIN,
+            "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table",
+        )
+    };
+    while let Some(view) = pending.pop() {
+        if !visited.insert((
+            view.database.to_ascii_lowercase(),
+            view.name.to_ascii_lowercase(),
+        )) {
+            continue;
+        }
+        let required = RequiredPrivilege {
+            privilege: Privilege::ShowView,
+            scope: PrivilegeScope::Table {
+                database: view.database.clone(),
+                table: view.name.clone(),
+            },
+        };
+        if !auth.account_has_privilege(&caller, &required, false) {
+            return Err(denied());
+        }
+        for dependency in &view.dependencies {
+            let required = RequiredPrivilege {
+                privilege: Privilege::Select,
+                scope: PrivilegeScope::Table {
+                    database: dependency.database.clone(),
+                    table: dependency.name.clone(),
+                },
+            };
+            // EXPLAIN exposes the implementation of a DEFINER view. Its
+            // dependencies must be authorized as the caller, never via the
+            // execution-only security overrides.
+            if !auth.account_has_privilege(&caller, &required, false) {
+                return Err(denied());
+            }
+            if dependency.is_view {
+                if let Some(nested) = db.view_definition(&dependency.database, &dependency.name) {
+                    pending.push(nested);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn explain_dml_view_privileges(
@@ -4393,8 +4536,10 @@ fn explain_dml_view_privileges(
 }
 
 fn view_security_override_allows(
+    db: &Database,
     auth: &crate::engine::auth::AuthCatalog,
     session: &SessionContext,
+    statement: &Statement,
     required: &crate::engine::auth::RequiredPrivilege,
 ) -> bool {
     if required.privilege != Privilege::Select {
@@ -4410,6 +4555,7 @@ fn view_security_override_allows(
         return false;
     };
     auth.account_has_privilege(&override_.context, required, false)
+        || column_privilege_fallback(db, auth, &override_.context, session, statement, required)
 }
 
 fn required_privilege_targets_session_temp(
@@ -4471,6 +4617,9 @@ fn column_privilege_fallback(
     ) && matches!(
         statement,
         Statement::Select(_)
+            | Statement::CreateView { .. }
+            | Statement::AlterView { .. }
+            | Statement::CreateTableAsSelect { .. }
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -4740,7 +4889,7 @@ fn trigger_name_for_table_privilege(statement: &Statement) -> Option<&str> {
 
 /// INSTALL/UNINSTALL COMPONENT. mydb only implements the opt-in
 /// `validate_password` component; any other component URN is rejected (no
-/// silent no-op). Installation state is process-global and resets on restart.
+/// silent no-op). The installation is durable and exposed by mysql.component.
 fn execute_component(
     db: &Arc<Database>,
     session: &mut SessionContext,
@@ -4748,6 +4897,10 @@ fn execute_component(
     install: bool,
 ) -> Result<QueryResponse, QueryError> {
     use crate::engine::password_policy as pol;
+    static COMPONENT_CHANGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _change = COMPONENT_CHANGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     implicit_commit_for_ddl(db, session)?;
     for name in names {
         if !pol::is_validate_password_component(name) {
@@ -4757,9 +4910,15 @@ fn execute_component(
             ));
         }
     }
+    if names.len() != 1 {
+        return Err(error(
+            crate::error::catalog::ER_COMPONENTS_CANT_LOAD,
+            "Duplicate validate_password component in one statement",
+        ));
+    }
     for name in names {
         if install {
-            if pol::is_installed() {
+            if db.auth_catalog().password_validation_component {
                 return Err(error(
                     crate::error::catalog::ER_COMPONENTS_CANT_LOAD,
                     format!(
@@ -4767,9 +4926,9 @@ fn execute_component(
                     ),
                 ));
             }
-            pol::set_installed(true);
+            db.set_password_validation_component(true)?;
         } else {
-            if !pol::is_installed() {
+            if !db.auth_catalog().password_validation_component {
                 return Err(error(
                     crate::error::catalog::ER_COMPONENTS_LOAD_CANT_REGISTER_SERVICE_IMPLEMENTATION,
                     format!(
@@ -4777,7 +4936,7 @@ fn execute_component(
                     ),
                 ));
             }
-            pol::set_installed(false);
+            db.set_password_validation_component(false)?;
         }
     }
     Ok(QueryResponse::Ok)
@@ -4923,7 +5082,11 @@ fn execute_create_user(
             // for `IDENTIFIED WITH ... AS '<hash>'` (pre-hashed) and no-ops
             // unless the component is installed. Rejects weak passwords (1819).
             if has_explicit_password && !spec.password_is_pre_hashed {
-                crate::engine::password_policy::validate(&password, Some(&key.user))?;
+                crate::engine::password_policy::validate_with_installation(
+                    auth.password_validation_component,
+                    &password,
+                    Some(&key.user),
+                )?;
             }
             // G3: `IDENTIFIED WITH plugin AS '<hash>'` stores the credential
             // verbatim — used by mysqldump backups and replication mirroring
@@ -5195,7 +5358,11 @@ fn apply_alter_user(
             } else {
                 // Stage 3: validate_password enforcement on the new plaintext
                 // (no-op unless the component is installed).
-                crate::engine::password_policy::validate(&password, Some(&account.key.user))?;
+                crate::engine::password_policy::validate_with_installation(
+                    auth.password_validation_component,
+                    &password,
+                    Some(&account.key.user),
+                )?;
                 Some(checked_password_auth_string(&account.plugin, &password)?)
             }
         } else {
@@ -5283,10 +5450,6 @@ fn apply_alter_user(
             account.authentication_string = new_auth;
             account.password_last_changed_ms = Some(current_time_ms());
             account.password_expired = false;
-            account.failed_login_count = 0;
-            account.locked_until_ms = None;
-            // Reset the in-memory failed-login budget/temporary lock too.
-            clear_login_failures = true;
         }
         if stmt.discard_old_password {
             account.secondary_authentication_string = None;
@@ -5782,7 +5945,7 @@ fn execute_set_password(
         };
         // Stage 3: validate_password enforcement (SET PASSWORD always takes a
         // plaintext string in MySQL 8.0). No-op unless the component is on.
-        crate::engine::password_policy::validate(&password, Some(&key.user))?;
+        crate::engine::password_policy::validate_with_installation(auth.password_validation_component, &password, Some(&key.user))?;
         // PASSWORD REQUIRE CURRENT: the account policy mandates that the
         // operator supply the old password before switching. MySQL 4047:
         // ER_CURRENT_PASSWORD_NOT_REQUIRED-style — actually 4047 is
@@ -5848,11 +6011,8 @@ fn execute_set_password(
         cache_credential = account.authentication_string.clone();
         account.password_last_changed_ms = Some(current_time_ms());
         account.password_expired = false;
-        account.failed_login_count = 0;
-        account.locked_until_ms = None;
         Ok(())
     })?;
-    crate::engine::auth::failed_login_clear(&key);
     crate::engine::auth::auth_cache_forget(&key);
     crate::engine::auth::auth_cache_remember_password(&key, &password, &cache_credential);
     if random_password {
@@ -5962,6 +6122,30 @@ fn execute_grant(
 
     if let GrantKind::Privileges { privileges, scope } = &stmt.kind {
         let resolved = grant_scope_to_privilege_scope(session, scope);
+        if let PrivilegeScope::Routine {
+            database,
+            routine,
+            kind,
+        } = &resolved
+        {
+            let routine_kind = if kind.eq_ignore_ascii_case("function") {
+                crate::storage::RoutineKindSchema::Function
+            } else {
+                crate::storage::RoutineKindSchema::Procedure
+            };
+            if db
+                .routine_definition(database, routine_kind, routine)
+                .is_none()
+            {
+                return Err(error(
+                    crate::error::catalog::ER_SP_DOES_NOT_EXIST,
+                    format!(
+                        "{} {database}.{routine} does not exist",
+                        kind.to_ascii_uppercase()
+                    ),
+                ));
+            }
+        }
         for spec in privileges.iter().filter(|spec| !spec.columns.is_empty()) {
             let PrivilegeScope::Table { database, table } = &resolved else {
                 return Err(error(
@@ -6326,6 +6510,14 @@ fn grant_entries_for_spec(
             for privilege in crate::engine::auth::all_privileges_for_scope(&scope) {
                 out.push((privilege.clone(), scope.clone()));
             }
+            if matches!(scope, PrivilegeScope::Global) {
+                out.extend(
+                    crate::engine::auth::default_dynamic_privileges()
+                        .iter()
+                        .cloned()
+                        .map(|privilege| (privilege, scope.clone())),
+                );
+            }
         } else {
             out.push((
                 if spec.name.eq_ignore_ascii_case("USAGE") {
@@ -6464,6 +6656,7 @@ fn execute_revoke(
                     }
                     return Ok(());
                 }
+                let revoke_all = privileges.iter().any(|p| p.name.eq_ignore_ascii_case("ALL") || p.name.eq_ignore_ascii_case("ALL PRIVILEGES"));
                 let privileges: Vec<_> = privileges
                     .iter()
                     .filter(|p|!p.name.eq_ignore_ascii_case("USAGE"))
@@ -6501,6 +6694,28 @@ fn execute_revoke(
                 // normal retain pass — and the restriction is what keeps
                 // the schema denied via the global fallback.
                 let partial = crate::engine::auth::partial_revokes_enabled();
+                for grantee in &targets {
+                    for (privilege, scope) in &privileges {
+                        if matches!(scope, PrivilegeScope::Global) || revoke_all {
+                            continue;
+                        }
+                        let has_grant = auth.grants.iter().any(|g| {
+                            if &g.grantee != grantee { return false; }
+                            if matches!(privilege, Privilege::GrantOption) || (stmt.grant_option_only && !matches!(privilege, Privilege::Dynamic(_))) {
+                                !matches!(g.privilege, Privilege::Dynamic(_))
+                                    && (g.grant_option || matches!(g.privilege, Privilege::GrantOption))
+                                    && crate::engine::auth::scope_equal(&crate::engine::auth::grant_option_level(&g.scope), &crate::engine::auth::grant_option_level(scope))
+                            } else {
+                                &g.privilege == privilege && crate::engine::auth::scope_equal(&g.scope, scope)
+                            }
+                        });
+                        let may_restrict = partial && !stmt.grant_option_only && matches!(scope, PrivilegeScope::Database { .. })
+                            && auth.grants.iter().any(|g| &g.grantee == grantee && &g.privilege == privilege && matches!(g.scope, PrivilegeScope::Global));
+                        if !has_grant && !may_restrict {
+                            return Err(error(crate::error::catalog::ER_NONEXISTING_GRANT, format!("There is no such grant defined for user {}", grantee.display())));
+                        }
+                    }
+                }
                 if partial {
                     for grantee in &targets {
                         for (privilege, scope) in &privileges {
@@ -6512,7 +6727,8 @@ fn execute_revoke(
                                     && &g.privilege == privilege
                                     && matches!(g.scope, PrivilegeScope::Global)
                             });
-                            if has_global {
+                            let has_schema = auth.grants.iter().any(|g| &g.grantee == grantee && &g.privilege == privilege && crate::engine::auth::scope_equal(&g.scope, scope));
+                            if has_global && !has_schema && !stmt.grant_option_only {
                                 let already_restricted = auth.restrictions.iter().any(|r| {
                                     &r.grantee == grantee
                                         && &r.privilege == privilege
@@ -6552,15 +6768,13 @@ fn execute_revoke(
                     // (grantee, priv, db), we may also need to drop a matching
                     // restriction entry the user inserted earlier so the
                     // privilege state remains coherent.
-                    if !partial {
-                        auth.restrictions.retain(|r| {
+                    auth.restrictions.retain(|r| {
                             !(targets.contains(&r.grantee)
                                 && privileges.iter().any(|(privilege, scope)| {
                                     privilege == &r.privilege
-                                        && matches!(scope, PrivilegeScope::Database { database } if database.eq_ignore_ascii_case(&r.database))
+                                        && (matches!(scope, PrivilegeScope::Global) || (!partial && matches!(scope, PrivilegeScope::Database { database } if database.eq_ignore_ascii_case(&r.database))))
                                 }))
-                        });
-                    }
+                    });
                 }
             }
             GrantKind::Roles(roles) => {
@@ -6596,6 +6810,13 @@ fn execute_revoke(
                                     role.display()
                                 ),
                             ));
+                        }
+                    }
+                }
+                for role in &roles {
+                    for target in &targets {
+                        if !auth.role_edges.iter().any(|edge| &edge.from_role == role && &edge.to_account == target) {
+                            return Err(error(crate::error::catalog::ER_ROLE_NOT_GRANTED, format!("Role {} has not been granted to {}", role.display(), target.display())));
                         }
                     }
                 }
@@ -6839,12 +7060,7 @@ fn execute_set_default_role(
                     // this check, an admin could set an unrelated role as
                     // default and the user would silently activate it
                     // (with the role's privileges) on every login.
-                    let granted: std::collections::BTreeSet<_> = auth
-                        .role_edges
-                        .iter()
-                        .filter(|e| e.to_account == to_account)
-                        .map(|e| e.from_role.clone())
-                        .collect();
+                    let granted = auth.applicable_roles(&to_account);
                     for role in &roles {
                         if !granted.contains(role) {
                             return Err(error(
@@ -7088,6 +7304,7 @@ fn execute_sql_prepare(
     session: &mut SessionContext,
     name: String,
     source: Expr,
+    registry: &SessionRegistry,
 ) -> Result<(), QueryError> {
     let prepare_started = std::time::Instant::now();
     let key = name.to_ascii_lowercase();
@@ -7135,8 +7352,16 @@ fn execute_sql_prepare(
     // but bind a private copy to the current database/temporary-table scope
     // for diagnostics that MySQL reports at PREPARE rather than EXECUTE.
     let mut validation_statement = statement.clone();
-    expand_views(db, session, &mut validation_statement, 0)?;
+    super::routines::with_view_function_binding(|| {
+        expand_views(db, session, &mut validation_statement, 0)
+    })?;
     qualify_statement_tables(db, session, &mut validation_statement)?;
+    let routine_resolution = super::routines::resolve_stored_functions(
+        db,
+        session,
+        &mut validation_statement,
+        registry,
+    )?;
     if let Statement::Select(select) = &validation_statement {
         crate::engine::executor::select::warn_prepared_select_temporal_constants(db, select);
     }
@@ -7145,7 +7370,15 @@ fn execute_sql_prepare(
             session.group_concat_max_len,
             || {
                 crate::engine::expr::with_session_expr_info(session, || {
-                    super::select::describe_statement_columns(db, session, &validation_statement)
+                    // The new statement's placeholders must not see parameters
+                    // belonging to the surrounding PREPARE command.
+                    crate::engine::params::with_params(Vec::new(), || {
+                        super::select::describe_statement_columns(
+                            db,
+                            session,
+                            &validation_statement,
+                        )
+                    })
                 })
             },
         )?
@@ -7188,6 +7421,7 @@ fn execute_sql_prepare(
             database: session.current_database.clone(),
             parameter_count,
             result_columns,
+            routine_result_metadata: !routine_resolution.routines.is_empty(),
             memory_charge,
         },
     )?;
@@ -7212,6 +7446,10 @@ fn execute_sql_prepared(
                 format!("Unknown prepared statement handler ({name}) given to EXECUTE"),
             )
         })?;
+    if crate::engine::http::may_call(db, &prepared.original_sql) {
+        crate::engine::http::activate();
+        crate::engine::cbo::trace::redact_external();
+    }
     let execute_started = std::time::Instant::now();
     if using.len() != prepared.parameter_count {
         session.record_sql_prepared_execute(name, execute_started.elapsed(), true);
@@ -7250,7 +7488,9 @@ fn execute_sql_prepared(
     });
     session.current_database = saved_database;
     if let Ok(result) = &mut response {
-        apply_sql_prepared_result_columns(result, &prepared.result_columns);
+        if !prepared.routine_result_metadata {
+            apply_sql_prepared_result_columns(result, &prepared.result_columns);
+        }
         super::select::cap_prepared_group_concat_limit_warnings(&prepared.statement, result);
         // PREPARE validates source syntax, but EXECUTE starts a fresh
         // diagnostics area. Re-publish lexical deprecation diagnostics for
@@ -7367,6 +7607,9 @@ pub(super) fn execute_qualified_statement(
             Statement::Revoke(r) => Some(&r.kind),
             _ => None,
         };
+        if session.sql_log_bin && kind.is_some_and(|kind| matches!(kind, GrantKind::Privileges { privileges, .. } if privileges.iter().any(|p| p.name.to_ascii_uppercase().starts_with("HTTP_")))) {
+            return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP privileges cannot be written to MySQL binlog"));
+        }
         if kind.is_some_and(|kind|matches!(kind,GrantKind::Privileges{privileges,..} if privileges.iter().any(|p|p.name.to_ascii_uppercase().starts_with("AI_")))) {return Err(crate::engine::ai::error("ER_AI_UNSUPPORTED_CONTEXT","AI privileges cannot be written to MySQL binlog"));}
     }
     if let Statement::DropDatabase { name, .. } = &statement {
@@ -7404,6 +7647,32 @@ pub(super) fn execute_qualified_statement(
     let temporal_context = super::temporal::preflight_statement(db, &statement)?;
     let _temporal_scope = temporal_context.map(|context| super::temporal::enter(Some(context)));
     match statement {
+        Statement::AlterSystemReloadHttpConfig => {
+            crate::engine::http::authorize(db, &session.authorization_context(), "HTTP_ADMIN")?;
+            crate::engine::http::reload()?;
+            Ok(QueryResponse::Ok)
+        }
+        Statement::ShowHttpStatus => {
+            crate::engine::http::authorize(db, &session.authorization_context(), "HTTP_ADMIN")?;
+            Ok(QueryResponse::ResultSet(ResultSet {
+                columns: vec![
+                    Column {
+                        name: "Variable_name".into(),
+                        column_type: ColumnType::VarString,
+                        source: Default::default(),
+                    },
+                    Column {
+                        name: "Value".into(),
+                        column_type: ColumnType::LongLong,
+                        source: Default::default(),
+                    },
+                ],
+                rows: crate::engine::http::status()
+                    .into_iter()
+                    .map(|(k, v)| vec![Value::String(k), Value::UInt(v)])
+                    .collect(),
+            }))
+        }
         Statement::Ai(command) => ai::admin(db, session, command, registry),
         Statement::Begin {
             read_only,
@@ -7425,7 +7694,7 @@ pub(super) fn execute_qualified_statement(
         }
         Statement::Savepoint(name) => {
             // M1.2 - Named user savepoints
-            ensure_no_xa_branch_for_local_txn(session, "SAVEPOINT")?;
+            tx::ensure_xa_savepoint_allowed(session)?;
             if session.autocommit && !session.explicit_txn && session.current_txn.is_none() {
                 return Ok(QueryResponse::Ok);
             }
@@ -7436,7 +7705,7 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::RollbackToSavepoint(name) => {
-            ensure_no_xa_branch_for_local_txn(session, "ROLLBACK TO SAVEPOINT")?;
+            tx::ensure_xa_savepoint_allowed(session)?;
             let Some(txn_id) = session.current_txn else {
                 return Err(error(
                     crate::error::catalog::ER_SP_DOES_NOT_EXIST,
@@ -7447,7 +7716,7 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::ReleaseSavepoint(name) => {
-            ensure_no_xa_branch_for_local_txn(session, "RELEASE SAVEPOINT")?;
+            tx::ensure_xa_savepoint_allowed(session)?;
             let Some(txn_id) = session.current_txn else {
                 return Err(error(
                     crate::error::catalog::ER_SP_DOES_NOT_EXIST,
@@ -7458,7 +7727,7 @@ pub(super) fn execute_qualified_statement(
             Ok(QueryResponse::Ok)
         }
         Statement::Prepare { name, source } => {
-            execute_sql_prepare(db, session, name, source)?;
+            execute_sql_prepare(db, session, name, source, registry)?;
             Ok(QueryResponse::Ok)
         }
         Statement::ExecutePrepared { name, using } => {
@@ -7506,8 +7775,21 @@ pub(super) fn execute_qualified_statement(
                 .iter()
                 .any(|a| super::prepared_dml::expr_contains_subquery(&a.value))
             {
+                let statement_owned_txn =
+                    session.autocommit && !session.explicit_txn && session.current_txn.is_none();
                 execute_in_transaction_with_session(db, session, |db, session, _| {
-                    execute_set_statement(db, session, &assignments)
+                    let result = execute_set_statement(db, session, &assignments);
+                    // SET may disable autocommit after reading its subqueries.
+                    // That read belongs to the old autocommit statement, not
+                    // to the next user transaction selected by the new value.
+                    if statement_owned_txn && !session.autocommit {
+                        if result.is_ok() {
+                            commit_session_txn(db, session)?;
+                        } else {
+                            rollback_session_txn(db, session)?;
+                        }
+                    }
+                    result
                 })
             } else {
                 execute_set_statement(db, session, &assignments)
@@ -9549,6 +9831,7 @@ pub(super) fn execute_qualified_statement(
                 for (from, to) in &renames {
                     let from = account_key(from);
                     let to = account_key(to);
+                    validate_account_key(&to)?;
                     check_definer_account_change(auth, session, &references, &from, "RENAME USER")?;
                     check_definer_account_change(auth, session, &references, &to, "RENAME USER")?;
                     if !auth.accounts.contains_key(&account_id(&from))
@@ -9675,6 +9958,7 @@ pub(super) fn execute_qualified_statement(
         ),
         Statement::SetDefaultRole(stmt) => execute_set_default_role(db, session, stmt),
         Statement::FlushPrivileges => {
+            implicit_commit_for_ddl(db, session)?;
             // mydb does not read grants from `mysql.*` tables — the catalog
             // is the single source of truth — so FLUSH PRIVILEGES has no
             // "reload from table" semantics. We bump the auth epoch anyway
@@ -10092,9 +10376,7 @@ pub(super) fn take_single_into_row(
                 }
                 Ok(first)
             })();
-            for warning in stream.cursor.take_warnings() {
-                crate::engine::api::push_sql_warning(warning);
-            }
+            crate::engine::api::append_statement_warnings(stream.cursor.take_warnings());
             result
         }
         other => Err(error(
@@ -10533,17 +10815,38 @@ fn execute_select_calc_found_rows(
     stmt.limit = None;
     stmt.offset = None;
     stmt.sql_calc_found_rows = false;
+    let _streaming = super::select::force_streaming_response_scope();
     let response = run_select_response(db, session, stmt, registry)?;
-    let (columns, rows) = match response.materialize()? {
-        QueryResponse::ResultSet(rs) => (rs.columns, rs.rows),
-        // A SELECT always resolves to a result set; anything else means an
-        // upstream already produced a terminal response — pass it through.
-        other => return Ok(other),
-    };
-    let total = rows.len() as u64;
     let offset = crate::engine::executor::select::limit_value_or_zero(user_offset.as_ref())?;
     let limit = crate::engine::executor::select::limit_value_or_max(user_limit.as_ref())?;
-    let window: Vec<Vec<Value>> = rows.into_iter().skip(offset).take(limit).collect();
+    let (columns, mut cursor): (_, Box<dyn ResultCursor>) = match response {
+        QueryResponse::StreamingResultSet(rs) => (rs.columns, rs.cursor),
+        QueryResponse::ResultSet(rs) => (
+            rs.columns,
+            Box::new(crate::engine::api::VecResultCursor::new(rs.rows)),
+        ),
+        QueryResponse::SharedResultSet(rs) => (
+            rs.columns.to_vec(),
+            Box::new(crate::engine::api::VecResultCursor::new(rs.rows)),
+        ),
+        other => return Ok(other),
+    };
+    let mut total = 0u64;
+    let mut window = Vec::new();
+    let drained = (|| -> Result<(), QueryError> {
+        while let Some(row) = cursor.next_row()? {
+            if total >= offset as u64 && window.len() < limit {
+                window.push(row);
+            }
+            total = total.saturating_add(1);
+            if total % 1024 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+        }
+        Ok(())
+    })();
+    crate::engine::api::append_statement_warnings(cursor.take_warnings());
+    drained?;
     Ok(QueryResponse::StreamingResultSet(StreamingResultSet {
         columns,
         found_rows: Some(total),

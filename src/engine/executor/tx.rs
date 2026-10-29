@@ -39,22 +39,24 @@ pub(super) fn can_use_lazy_read_only_transaction_select(
     session: &SessionContext,
     stmt: &Select,
 ) -> bool {
-    !select_has_locking_read(stmt)
-        && session.effective_isolation() != IsolationLevel::Serializable
-        && session.current_txn.is_none()
+    // Session checks first: the locking-read probe walks the whole AST and
+    // runs on every prepared SELECT execution.
+    session.current_txn.is_none()
         && session.xa_branch.is_none()
         && (session.explicit_txn || !session.autocommit)
+        && session.effective_isolation() != IsolationLevel::Serializable
+        && !select_has_locking_read(stmt)
 }
 
 pub(super) fn can_use_current_transaction_read_select(
     session: &SessionContext,
     stmt: &Select,
 ) -> bool {
-    !select_has_locking_read(stmt)
+    session.current_txn.is_some()
+        && session.xa_branch.is_none()
         && stmt.lock_clause.is_none()
         && session.effective_isolation() != IsolationLevel::Serializable
-        && session.current_txn.is_some()
-        && session.xa_branch.is_none()
+        && !select_has_locking_read(stmt)
 }
 
 /// Shared view policy for cached and uncached prepared reads. Keep the
@@ -255,7 +257,7 @@ pub(super) fn begin_transaction_with(
             // raises a warning.
             crate::engine::api::push_statement_warning(
                 crate::error::ConditionLevel::Warning,
-                crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
+                crate::error::catalog::WARN_OPTION_IGNORED,
                 "WITH CONSISTENT SNAPSHOT is only effective at the REPEATABLE READ isolation level"
                     .to_string(),
             );
@@ -1027,12 +1029,12 @@ fn xa_err(spec: crate::error::ErrorSpec, message: impl Into<String>) -> QueryErr
 
 fn xa_outside_msg(action: &str) -> String {
     format!(
-        "XAER_OUTSIDE: {} is not allowed inside an active XA branch",
+        "XAER_RMFAIL: {} is not allowed while an XA branch is bound",
         action
     )
 }
 
-/// `Begin/Commit/Rollback/Savepoint` and friends must error out while a
+/// `Begin/Commit/Rollback` and friends must error out while a
 /// session holds an ACTIVE or IDLE XA branch. Called from dispatch before
 /// the normal local-transaction handlers run.
 pub(super) fn ensure_no_xa_branch_for_local_txn(
@@ -1041,8 +1043,23 @@ pub(super) fn ensure_no_xa_branch_for_local_txn(
 ) -> Result<(), QueryError> {
     if session.xa_branch.is_some() {
         return Err(xa_err(
-            crate::error::catalog::ER_XAER_OUTSIDE,
+            crate::error::catalog::ER_XAER_RMFAIL,
             xa_outside_msg(action),
+        ));
+    }
+    Ok(())
+}
+
+/// Savepoints operate on the branch transaction only while it is ACTIVE.
+pub(super) fn ensure_xa_savepoint_allowed(session: &SessionContext) -> Result<(), QueryError> {
+    if session
+        .xa_branch
+        .as_ref()
+        .is_some_and(|b| b.state != XaBranchState::Active)
+    {
+        return Err(xa_err(
+            crate::error::catalog::ER_XAER_RMFAIL,
+            "XAER_RMFAIL: XA branch is not ACTIVE",
         ));
     }
     Ok(())
@@ -1159,6 +1176,7 @@ pub(super) fn xa_prepare(
     let owner_id = session.connection_id as u64;
     db.prepare_xa(txn_id, owner_id, xid)?;
     db.transfer_transaction_mdl_to_prepared(owner_id, txn_id);
+    session.advance_mdl_txn_generation();
     session.xa_branch = None;
     session.explicit_txn = false;
     session.read_only_txn = session.sysvars.transaction_read_only;

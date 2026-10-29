@@ -191,6 +191,14 @@ impl Iterator for SqlSegments<'_> {
                     continue;
                 }
                 self.pos += 1;
+                if quote == b'`' || (quote == b'"' && self.mode.ansi_quotes) {
+                    if let Some(offset) = memchr::memchr(0, &self.bytes[start..self.pos]) {
+                        return Some(Err(SqlLexError {
+                            offset: start + offset,
+                            message: "NUL is not allowed in an SQL identifier",
+                        }));
+                    }
+                }
                 return Some(Ok(SqlSegment {
                     range: start..self.pos,
                     kind: SqlSegmentKind::Quoted { quote },
@@ -327,6 +335,13 @@ impl<'a> PreparedSql<'a> {
             }
         }
         let effective = String::from_utf8(bytes).expect("same-length SQL masking preserves UTF-8");
+        // An active executable comment can expose quoted identifiers that
+        // the outer comment scan did not visit. String-literal NULs stay valid.
+        if effective.as_bytes().contains(&0) {
+            for segment in segments(&effective, mode, server_version) {
+                segment?;
+            }
+        }
         Ok(Self {
             effective: Cow::Owned(effective),
         })
@@ -930,6 +945,10 @@ mod tests {
                     for quote in ["'", "\"", "`"] {
                         let source = format!("{quote}{body}{quote}");
                         let mut cursor = SqlTokenCursor::new(&source, mode, VERSION);
+                        if body.contains('\0') && (quote == "`" || (quote == "\"" && ansi_quotes)) {
+                            assert!(cursor.next().is_err());
+                            continue;
+                        }
                         let token = cursor.next().unwrap().unwrap();
                         assert_eq!(cursor.decoded_quoted_text(&token).as_deref(), Some(body));
                     }

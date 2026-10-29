@@ -318,7 +318,11 @@ impl OnlineConstraintValidation {
                 coerce_column_value_for_schema(value.clone(), column).err()
             };
             if let Some(err) = violation {
-                self.memory.grow(96 + err.message().len())?;
+                // A known data violation remains the cause of failure even
+                // when retaining more repairable violations exhausts the budget.
+                if !self.memory.try_grow(96 + err.message().len()) {
+                    return Err(err);
+                }
                 self.column_errors.insert(location, err);
                 break;
             }
@@ -1114,7 +1118,8 @@ impl Database {
             // Raw index walks are only candidates. Remember repair state while
             // writers are drained; certification below also drains writers and
             // verifies the *unconsumed* transaction-qualified capture logs.
-            let merge_allowed = validation.columns.is_empty() && !self.has_pending_index_repairs();
+            let merge_allowed = validation.columns.is_empty()
+                && !self.constraint_merge_has_repairs(validation, &targets);
             let snapshot = self.begin_read_only_txn()?;
             let _snapshot_pin = self.register_statement_snapshot(snapshot.snapshot_scn);
             validation.watermark = Some(snapshot);
@@ -1160,7 +1165,7 @@ impl Database {
                     hold = Some(ConstraintHoldTimer(Instant::now()));
                     self.try_online_index_data_barrier_mode(lock_txn.txn_id, &ids, true)?;
                     if constraint_capture_is_empty(&jobs)?
-                        && !self.has_pending_index_repairs()
+                        && !self.constraint_merge_has_repairs(validation, &targets)
                         && targets.iter().all(|target| {
                             let log = target.log.state.lock();
                             !log.failed && log.entries.is_empty()
@@ -1279,7 +1284,7 @@ impl Database {
                         self.try_online_index_data_barrier_mode(lock_txn.txn_id, &ids, true)?;
                         let tail: usize = jobs
                             .iter()
-                            .map(|j| j.changes.lock().unwrap_or_else(|p| p.into_inner()).len())
+                            .map(|j| j.changes.len())
                             .sum();
                         let index_tail: usize = targets
                             .iter()
@@ -1319,7 +1324,7 @@ impl Database {
                     )?;
                     if jobs
                         .iter()
-                        .any(|j| j.changes.lock().unwrap_or_else(|p| p.into_inner()).len() != 0)
+                        .any(|j| j.changes.len() != 0)
                     {
                         return Err(error(
                             crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,

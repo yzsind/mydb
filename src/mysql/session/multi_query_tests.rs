@@ -476,3 +476,129 @@ async fn audit1022_self_kill_connection_sends_a_final_ok_packet() {
     h.ok(1, 0, 0, false).await;
     assert!(h.session.context.close_after_response);
 }
+
+#[tokio::test]
+async fn txn_audit_prepared_release_closes_before_next_command() {
+    use tokio::io::AsyncWriteExt;
+    let mut h = Harness::new(0).await;
+    h.session
+        .handle_stmt_prepare(b"COMMIT RELEASE")
+        .await
+        .unwrap();
+    let packet = h.packet(1).await;
+    assert_eq!(packet.payload[0], 0);
+    let id = &packet.payload[1..5];
+    let mut execute = vec![COM_STMT_EXECUTE];
+    execute.extend_from_slice(id);
+    execute.extend_from_slice(&[0, 1, 0, 0, 0]);
+    let mut command = vec![execute.len() as u8, 0, 0, 0];
+    command.extend_from_slice(&execute);
+    h.client.write_all(&command).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), h.session.command_loop())
+        .await
+        .expect("RELEASE must end the command loop immediately")
+        .unwrap();
+    assert_eq!(h.packet(1).await.payload[0], 0);
+    assert!(h.session.normal_close);
+}
+
+#[tokio::test]
+async fn txn_audit_read_only_status() {
+    let mut h = Harness::new(0).await;
+    h.setup("START TRANSACTION READ ONLY");
+    assert_ne!(h.session.server_status() & 0x2000, 0);
+    h.setup("COMMIT");
+    assert_eq!(h.session.server_status() & 0x2000, 0);
+    h.setup("START TRANSACTION READ WRITE");
+    assert_eq!(h.session.server_status() & 0x2000, 0);
+    h.setup("ROLLBACK");
+}
+
+#[tokio::test]
+async fn txn_audit_idle_xa_retains_admission() {
+    let mut h = Harness::new(0).await;
+    h.setup("XA START 'admission'");
+    h.session.acquire_txn_admission().await;
+    if crate::util::exec_permit::global().is_none() {
+        h.setup("XA ROLLBACK 'admission'");
+        return;
+    }
+    assert!(h.session.txn_admission.is_some());
+    h.setup("XA END 'admission'");
+    h.session.release_txn_admission_if_idle();
+    assert!(h.session.txn_admission.is_some());
+    h.setup("XA ROLLBACK 'admission'");
+    h.session.release_txn_admission_if_idle();
+    assert!(h.session.txn_admission.is_none());
+}
+
+#[tokio::test]
+async fn routine_audit_1028_call_streams_before_body_finishes() {
+    let mut h = Harness::new(0).await;
+    h.setup("CREATE PROCEDURE early_result() BEGIN SELECT 17; DO SLEEP(1); SELECT 23; END");
+    let query = h.session.handle_query(b"CALL early_result()");
+    tokio::pin!(query);
+    let first = tokio::select! {
+        packet = read_packet(&mut h.client) => packet.unwrap().unwrap(),
+        result = &mut query => panic!("CALL finished before client received the first result: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(700)) => panic!("CALL retained its first result"),
+    };
+    assert_eq!(first.sequence_id, 1);
+    assert_eq!(first.payload, [1]);
+    // The session future must be polled to make network progress.
+    query.await.unwrap();
+}
+
+#[tokio::test]
+async fn routine_audit_1028_nested_call_results_keep_sequence_and_error() {
+    for flags in [0, CLIENT_DEPRECATE_EOF] {
+        let mut h = Harness::new(flags).await;
+        h.setup("CREATE PROCEDURE child_results() BEGIN SELECT 2; SELECT 3; END");
+        h.setup("CREATE PROCEDURE parent_results() BEGIN SELECT 1; CALL child_results(); SELECT 4; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='after results'; END");
+        h.query("SELECT 0; CALL parent_results(); SELECT 99").await;
+        let mut seq = h.scalar(1, "0", true).await;
+        for expected in ["1", "2", "3", "4"] {
+            seq = h.scalar(seq, expected, true).await;
+        }
+        h.error(seq, 1644).await;
+    }
+}
+
+#[tokio::test]
+async fn routine_audit_1028_streaming_loop_keeps_all_result_sets() {
+    let mut h = Harness::new(0).await;
+    h.setup("CREATE PROCEDURE many_results() BEGIN DECLARE i INT DEFAULT 0; WHILE i<64 DO SELECT i; SET i=i+1; END WHILE; END");
+    h.query("CALL many_results()").await;
+    let mut seq = 1;
+    for i in 0..64 {
+        seq = h.scalar(seq, &i.to_string(), true).await;
+    }
+    h.ok(seq, 0, 0, false).await;
+}
+
+#[tokio::test]
+async fn routine_audit_1028_kill_unblocks_backpressured_call() {
+    let mut h = Harness::new(0).await;
+    h.setup("CREATE PROCEDURE backpressured() BEGIN LOOP SELECT REPEAT('x',100); END LOOP; END");
+    let handle = h
+        .session
+        .registry
+        .register(1, "root".into(), "localhost".into(), "test".into());
+    h.session
+        .context
+        .set_cancel_handle(Some(handle.cancel_handle()));
+    h.session.kill_flag = Arc::clone(handle.kill_flag());
+    h.session.handle = Some(Arc::clone(&handle));
+    // Keep the client socket open without reading until the send buffer fills.
+    let call = h.session.handle_query(b"CALL backpressured()");
+    let kill = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        handle.peer_disconnected();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(call, kill)
+    })
+    .await
+    .expect("KILL must wake the final socket flush and the bounded producer");
+    result.unwrap();
+}

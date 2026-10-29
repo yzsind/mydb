@@ -46,6 +46,7 @@ const DEFAULT_APPLY_BATCH_BYTES: u64 = 4 * 1024 * 1024;
 
 static GLOBAL_MANAGER: OnceLock<Arc<ReplicationManager>> = OnceLock::new();
 include!("replication_state.rs");
+include!("replication_apply_state.rs");
 
 thread_local! {
     /// Set for the duration of crash-recovery relay replay so apply is
@@ -180,6 +181,7 @@ impl ReplicationStatus {
             applied_transactions: 0,
             last_event_timestamp: 0,
             seconds_behind_source: None,
+            sql_delay_until: None,
             binlog_checksum_failures: 0,
             filtered_events: 0,
             last_io_error: None,
@@ -318,32 +320,34 @@ impl ReplicationStatus {
                 cfg.ssl_mode,
                 ReplicationSslMode::VerifyCa | ReplicationSslMode::VerifyIdentity
             )), // 34 Source_SSL_Verify_Server_Cert
-            Value::UInt(io_errno),                          // 35 Last_IO_Errno
-            Value::String(io_error_msg),                    // 36 Last_IO_Error
-            Value::UInt(sql_errno),                         // 37 Last_SQL_Errno
-            Value::String(sql_error_msg),                   // 38 Last_SQL_Error
-            Value::String(String::new()),                   // 39 Replicate_Ignore_Server_Ids
-            Value::UInt(self.source_server_id as u64),      // 40 Source_Server_Id
-            Value::String(self.source_uuid.clone()),        // 41 Source_UUID
-            Value::String(String::new()),                   // 42 Source_Info_File
-            Value::UInt(cfg.source_delay_secs),             // 43 SQL_Delay
-            Value::Null,                                    // 44 SQL_Remaining_Delay
-            Value::String(self.sql_state.clone()),          // 45 Replica_SQL_Running_State
-            Value::UInt(86400),                             // 46 Source_Retry_Count
-            Value::String(String::new()),                   // 47 Source_Bind
-            Value::String(io_error_ts),                     // 48 Last_IO_Error_Timestamp
-            Value::String(sql_error_ts),                    // 49 Last_SQL_Error_Timestamp
-            Value::String(String::new()),                   // 50 Source_SSL_Crl
-            Value::String(String::new()),                   // 51 Source_SSL_Crlpath
+            Value::UInt(io_errno),                     // 35 Last_IO_Errno
+            Value::String(io_error_msg),               // 36 Last_IO_Error
+            Value::UInt(sql_errno),                    // 37 Last_SQL_Errno
+            Value::String(sql_error_msg),              // 38 Last_SQL_Error
+            Value::String(String::new()),              // 39 Replicate_Ignore_Server_Ids
+            Value::UInt(self.source_server_id as u64), // 40 Source_Server_Id
+            Value::String(self.source_uuid.clone()),   // 41 Source_UUID
+            Value::String(String::new()),              // 42 Source_Info_File
+            Value::UInt(cfg.source_delay_secs),        // 43 SQL_Delay
+            self.sql_delay_until
+                .map(|until| Value::UInt(until.saturating_sub(unix_secs())))
+                .unwrap_or(Value::Null), // 44 SQL_Remaining_Delay
+            Value::String(self.sql_state.clone()),     // 45 Replica_SQL_Running_State
+            Value::UInt(86400),                        // 46 Source_Retry_Count
+            Value::String(String::new()),              // 47 Source_Bind
+            Value::String(io_error_ts),                // 48 Last_IO_Error_Timestamp
+            Value::String(sql_error_ts),               // 49 Last_SQL_Error_Timestamp
+            Value::String(String::new()),              // 50 Source_SSL_Crl
+            Value::String(String::new()),              // 51 Source_SSL_Crlpath
             Value::String(self.retrieved_gtid_set.clone()), // 52 Retrieved_Gtid_Set
-            Value::String(self.executed_gtid_set.clone()),  // 53 Executed_Gtid_Set
+            Value::String(self.executed_gtid_set.clone()), // 53 Executed_Gtid_Set
             Value::UInt(if cfg.auto_position { 1 } else { 0 }), // 54 Auto_Position
-            Value::String(String::new()),                   // 55 Replicate_Rewrite_DB
-            Value::String(self.channel.clone()),            // 56 Channel_Name
-            Value::String(String::new()),                   // 57 Source_TLS_Version
-            Value::String(String::new()),                   // 58 Source_public_key_path
-            Value::UInt(0),                                 // 59 Get_Source_public_key
-            Value::String(String::new()),                   // 60 Network_Namespace
+            Value::String(String::new()),              // 55 Replicate_Rewrite_DB
+            Value::String(self.channel.clone()),       // 56 Channel_Name
+            Value::String(String::new()),              // 57 Source_TLS_Version
+            Value::String(String::new()),              // 58 Source_public_key_path
+            Value::UInt(0),                            // 59 Get_Source_public_key
+            Value::String(String::new()),              // 60 Network_Namespace
         ]
     }
 }
@@ -416,6 +420,8 @@ enum RelayOp {
         commit_ts: u64,
     },
     Ddl {
+        #[serde(default)]
+        source_ts: u64,
         database: String,
         sql: String,
         #[serde(default)]
@@ -423,6 +429,15 @@ enum RelayOp {
         /// True when this QUERY_EVENT is part of an atomic CTAS transaction.
         #[serde(default)]
         transactional: bool,
+    },
+    XaPrepare {
+        xid: crate::xa::Xid,
+        source_ts: u64,
+    },
+    XaFinish {
+        xid: crate::xa::Xid,
+        commit: bool,
+        source_ts: u64,
     },
     WriteRows {
         database: String,
@@ -456,6 +471,8 @@ struct TxnBuffer {
     /// this transaction; becomes the commit marker's `commit_ts`.
     last_ts: u64,
     active: bool,
+    xa_xid: Option<crate::xa::Xid>,
+    xa_ended: bool,
 }
 
 struct PendingRelayCommit {
@@ -873,7 +890,7 @@ impl ReplicationManager {
         // already-open connection is a classic silent-config-drift trap
         // (monitoring shows the new config; the running thread stays on the
         // old one until it happens to reconnect). Report `ER_REPLICA_CHANNEL_MUST_STOP`
-        // (3080) so orchestrator/HA scripts notice and issue STOP first.
+        // (3081) so orchestrator/HA scripts notice and issue STOP first.
         let io_running = runtime
             .io_join
             .lock()
@@ -892,7 +909,7 @@ impl ReplicationManager {
             if sql_running {
                 parts.push("SQL");
             }
-            return Err(error(crate::error::catalog::ER_REPLICA_MAX_CHANNELS_EXCEEDED,
+            return Err(error(crate::error::catalog::ER_REPLICA_CHANNEL_MUST_STOP,
                 format!(
                     "This operation cannot be performed with a running replication thread ({}); run STOP REPLICA first (channel '{}')",
                     parts.join("/"),
@@ -1239,6 +1256,19 @@ impl ReplicationManager {
             ));
         }
         let runtime = self.ensure_channel(channel)?;
+        let branch_scope = replication_property_key("xa-channel", channel, b"").into_bytes();
+        if self
+            .engine
+            .database_for_replication()
+            .list_prepared_xa()
+            .iter()
+            .any(|p| p.xid.format_id == REPLICA_XA_FORMAT_ID && p.xid.bqual == branch_scope)
+        {
+            return Err(xa_relay_error("cannot reset a channel with prepared source XA transactions; complete them on the source and let the SQL thread apply the outcome first"));
+        }
+        self.engine
+            .database_for_replication()
+            .set_replication_property(&replication_property_key("ddl", channel, b""), None)?;
         {
             let cfg = runtime
                 .config
@@ -1971,6 +2001,8 @@ impl ChannelRunner {
             let boundary = matches!(
                 &record.op,
                 RelayOp::TxnCommit { .. }
+                    | RelayOp::XaPrepare { .. }
+                    | RelayOp::XaFinish { .. }
                     | RelayOp::Ddl {
                         transactional: false,
                         ..
@@ -2013,6 +2045,66 @@ impl ChannelRunner {
         txn_bytes: u64,
     ) -> Result<(), QueryError> {
         match &record.op {
+            RelayOp::XaPrepare { xid, source_ts } | RelayOp::XaFinish { xid, source_ts, .. } => {
+                let gtid = record
+                    .gtid
+                    .clone()
+                    .or_else(|| txn_records.iter().find_map(|r| r.gtid.clone()));
+                self.flush_pending_relay_commits(path, pending_commits, pending_bytes)?;
+                if self.until_should_stop_before(gtid.as_deref()) {
+                    self.stop_on_until();
+                    return Ok(());
+                }
+                if !self.enforce_source_delay(*source_ts) {
+                    return Ok(());
+                }
+                let duplicate = gtid.as_ref().is_some_and(|g| {
+                    gtid_set_contains(&self.status_snapshot().executed_gtid_set, g)
+                });
+                let event_count = txn_records.len() as u64 + 1;
+                if !duplicate {
+                    match &record.op {
+                        RelayOp::XaPrepare { .. } => {
+                            self.apply_xa_prepare(xid, txn_records, &record)?
+                        }
+                        RelayOp::XaFinish { commit, .. } => {
+                            if !txn_records.is_empty() {
+                                return Err(xa_relay_error(
+                                    "XA completion contains unexpected row records",
+                                ));
+                            }
+                            self.apply_xa_finish(xid, *commit)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                txn_records.clear();
+                if let Some(g) = &gtid {
+                    self.update_status(|status| {
+                        status.executed_gtid_set = append_gtid(&status.executed_gtid_set, g)
+                    });
+                }
+                self.record_applied_boundary(
+                    path,
+                    next_offset,
+                    &record.source_file,
+                    record.source_pos,
+                    event_count,
+                    *source_ts,
+                    true,
+                )?;
+                // Only retire recovery evidence after the cursor is durable.
+                if matches!(&record.op, RelayOp::XaFinish { .. }) {
+                    self.cleanup_xa_receipts(xid)?;
+                }
+                if self.until_should_stop_after(
+                    &record.source_file,
+                    record.source_pos,
+                    gtid.as_deref(),
+                ) {
+                    self.stop_on_until();
+                }
+            }
             RelayOp::TxnCommit {
                 event_count,
                 commit_ts,
@@ -2030,7 +2122,9 @@ impl ChannelRunner {
                 if self.source_delay_enabled() {
                     self.flush_pending_relay_commits(path, pending_commits, pending_bytes)?;
                 }
-                self.enforce_source_delay(*event_count);
+                if !self.enforce_source_delay(*commit_ts) {
+                    return Ok(());
+                }
                 let ops = txn_records.drain(..).map(|r| r.op).collect::<Vec<_>>();
                 // Row events have before/after images and crash-recovery replay
                 // is idempotent. DDL is not generally idempotent (for example,
@@ -2040,7 +2134,7 @@ impl ChannelRunner {
                 let count = *event_count;
                 if contains_ddl {
                     self.flush_pending_relay_commits(path, pending_commits, pending_bytes)?;
-                    self.apply_records(ops, gtid.clone())?;
+                    self.apply_records_at_boundary(ops, gtid.clone(), &record)?;
                     self.record_applied_boundary(
                         path,
                         next_offset,
@@ -2049,7 +2143,7 @@ impl ChannelRunner {
                         count,
                         *commit_ts,
                         true,
-                    );
+                    )?;
                 } else {
                     let duplicate_in_batch = gtid.as_ref().is_some_and(|candidate| {
                         pending_commits
@@ -2103,7 +2197,7 @@ impl ChannelRunner {
                 transactional: true,
                 ..
             } => txn_records.push(record),
-            RelayOp::Ddl { .. } => {
+            RelayOp::Ddl { source_ts, .. } => {
                 if !txn_records.is_empty() {
                     self.flush_pending_relay_commits(path, pending_commits, pending_bytes)?;
                     return Err(error(
@@ -2118,16 +2212,19 @@ impl ChannelRunner {
                     return Ok(());
                 }
                 self.flush_pending_relay_commits(path, pending_commits, pending_bytes)?;
-                self.apply_records(vec![record.op.clone()], gtid.clone())?;
+                if !self.enforce_source_delay(*source_ts) {
+                    return Ok(());
+                }
+                self.apply_records_at_boundary(vec![record.op.clone()], gtid.clone(), &record)?;
                 self.record_applied_boundary(
                     path,
                     next_offset,
                     &record.source_file,
                     record.source_pos,
                     1,
-                    0,
+                    *source_ts,
                     true,
-                );
+                )?;
                 if self.until_should_stop_after(
                     &record.source_file,
                     record.source_pos,
@@ -2174,10 +2271,15 @@ impl ChannelRunner {
             .map(|op| self.decode_relay_rows(op))
             .collect::<Result<Vec<_>, _>>()?;
         let db = self.engine.database_for_replication();
+        let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
+        let logical_apply_lease = logical_gate.read_arc();
         let txn = db.begin_txn()?;
         let result = with_replication_applier(|| apply_ops_to_storage(&self.engine, db, txn, &ops));
         match result {
-            Ok(()) => db.commit_txn_deferred(txn.txn_id).map(Some),
+            Ok(()) => db.commit_txn_deferred(txn.txn_id).map(|mut commit| {
+                commit.logical_apply_lease = Some(logical_apply_lease);
+                Some(commit)
+            }),
             Err(err) => {
                 let _ = db.rollback_txn(txn.txn_id);
                 Err(err)
@@ -2216,7 +2318,7 @@ impl ChannelRunner {
                 item.event_count,
                 item.commit_ts,
                 false,
-            );
+            )?;
         }
         *pending_bytes = 0;
         Ok(())
@@ -2231,7 +2333,7 @@ impl ChannelRunner {
         event_count: u64,
         commit_ts: u64,
         force_persist: bool,
-    ) {
+    ) -> Result<(), QueryError> {
         self.advance_applied(
             path,
             relay_offset,
@@ -2239,7 +2341,7 @@ impl ChannelRunner {
             source_pos,
             None,
             force_persist,
-        );
+        )?;
         self.update_status(|status| {
             status.applied_transactions = status.applied_transactions.saturating_add(1);
             status.applied_events = status.applied_events.saturating_add(event_count);
@@ -2252,6 +2354,7 @@ impl ChannelRunner {
                 handle.set_time_reference_unix_secs(Some(commit_ts));
             }
         }
+        Ok(())
     }
 
     /// Advance the SQL-thread durable progress after applying a transaction:
@@ -2265,7 +2368,8 @@ impl ChannelRunner {
         source_pos: u64,
         _gtid: Option<String>,
         force_persist: bool,
-    ) {
+    ) -> Result<(), QueryError> {
+        let previous = self.status_snapshot();
         self.update_status(|status| {
             status.relay_log_file = path.to_string_lossy().into_owned();
             status.relay_log_pos = relay_offset;
@@ -2278,10 +2382,18 @@ impl ChannelRunner {
         // idempotent. DDL must publish its restart point immediately because
         // replaying arbitrary DDL is not generally idempotent.
         if force_persist {
-            self.persist_runtime_force();
+            if let Err(err) = self.persist_runtime_force() {
+                self.update_status(|status| {
+                    status.relay_log_pos = previous.relay_log_pos;
+                    status.exec_source_log_file = previous.exec_source_log_file;
+                    status.exec_source_log_pos = previous.exec_source_log_pos;
+                });
+                return Err(err);
+            }
         } else {
             self.persist_runtime_maybe();
         }
+        Ok(())
     }
 
     /// IO thread: after durably writing a commit/DDL boundary to the relay log,
@@ -2319,6 +2431,8 @@ impl ChannelRunner {
         txn.event_count = 0;
         txn.ops.clear();
         txn.active = false;
+        txn.xa_xid = None;
+        txn.xa_ended = false;
         Ok(())
     }
 
@@ -2343,19 +2457,21 @@ impl ChannelRunner {
         }
     }
 
-    fn persist_runtime_force(&self) {
-        let Ok(mut progress) = self.runtime.progress_persist.lock() else {
-            return;
-        };
+    fn persist_runtime_force(&self) -> Result<(), QueryError> {
+        let mut progress = self
+            .runtime
+            .progress_persist
+            .lock()
+            .map_err(|_| relay_lock_error())?;
         let manager = ReplicationManager {
             data_dir: self.data_dir.clone(),
             engine: Arc::clone(&self.engine),
             channels: Mutex::new(HashMap::new()),
         };
-        if manager.persist_runtime(&self.runtime).is_ok() {
-            progress.pending_updates = 0;
-            progress.last_sync = Instant::now();
-        }
+        manager.persist_runtime(&self.runtime)?;
+        progress.pending_updates = 0;
+        progress.last_sync = Instant::now();
+        Ok(())
     }
 
     /// Common `START REPLICA UNTIL` self-stop: set the master stop so both
@@ -2548,7 +2664,9 @@ impl ChannelRunner {
                 if next_pos != 0 {
                     status.source_log_pos = next_pos;
                 }
-                status.last_event_timestamp = event_ts;
+                if event_ts != 0 {
+                    status.last_event_timestamp = event_ts;
+                }
                 // Seconds_Behind_Source is computed SQL-side at commit (see
                 // dispatch_relay_record) so it reflects *applied* lag, not IO
                 // receive progress — otherwise a dead applier with a live IO
@@ -2659,6 +2777,14 @@ impl ChannelRunner {
                         return Err(err);
                     }
                 };
+                if sql
+                    .split_ascii_whitespace()
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("XA"))
+                {
+                    self.handle_xa_query(&sql, current_file, progress_pos, txn)?;
+                    return Ok(());
+                }
                 if sql.eq_ignore_ascii_case("BEGIN") {
                     txn.ops.clear();
                     txn.event_count = 0;
@@ -2678,6 +2804,7 @@ impl ChannelRunner {
                 }
                 let db = ev.schema().into_owned();
                 let op = RelayOp::Ddl {
+                    source_ts: txn.last_ts,
                     database: db,
                     sql,
                     session,
@@ -2698,6 +2825,30 @@ impl ChannelRunner {
                 // GTID; the SQL thread advances exec progress + executed GTID.
                 self.append_relay(current_file, progress_pos, txn.gtid.clone(), &op)?;
                 self.persist_io_progress(current_file, progress_pos, txn.gtid.take());
+            }
+            EventData::XaPrepareLogEvent(bytes) => {
+                let (one_phase, xid) = decode_xa_prepare_event(&bytes)?;
+                if txn.xa_xid.as_ref() != Some(&xid) || !txn.xa_ended {
+                    mark_io_error_fatal();
+                    return Err(xa_relay_error(
+                        "XA_PREPARE_LOG_EVENT does not match XA START/END",
+                    ));
+                }
+                if one_phase {
+                    self.io_commit_txn(current_file, progress_pos, txn)?;
+                } else {
+                    self.append_relay(
+                        current_file,
+                        progress_pos,
+                        txn.gtid.clone(),
+                        &RelayOp::XaPrepare {
+                            xid,
+                            source_ts: txn.last_ts,
+                        },
+                    )?;
+                    self.persist_io_progress(current_file, progress_pos, txn.gtid.take());
+                    *txn = TxnBuffer::default();
+                }
             }
             EventData::XidEvent(_) => {
                 self.io_commit_txn(current_file, progress_pos, txn)?;
@@ -2753,7 +2904,9 @@ impl ChannelRunner {
                     txn.last_ts = header.timestamp() as u64;
                     self.update_status(|status| {
                         status.received_events = status.received_events.saturating_add(1);
-                        status.last_event_timestamp = header.timestamp() as u64;
+                        if header.timestamp() != 0 {
+                            status.last_event_timestamp = header.timestamp() as u64;
+                        }
                     });
                     self.handle_source_event(
                         &inner_event,
@@ -2974,7 +3127,15 @@ impl ChannelRunner {
         .map_err(|err| io_error("decode source column metadata", err))?;
         let mut charsets = meta.iter_charset();
         let mut enum_charsets = meta.iter_enum_and_set_charset();
-        for index in 0..target.columns.len().min(table_map.columns_count() as usize) {
+        let source_columns = target
+            .iter_visible_columns()
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        for (index, target_index) in source_columns
+            .into_iter()
+            .take(table_map.columns_count() as usize)
+            .enumerate()
+        {
             let ty = table_map.get_column_type(index).map_err(|err| {
                 error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -2989,39 +3150,25 @@ impl ChannelRunner {
             if let Some(id) = id {
                 let id = id.map_err(|err| io_error("decode source charset", err))?;
                 let charset = crate::charset::resolve_collation_id_checked(id)?.charset;
-                Arc::make_mut(&mut target).columns[index].charset = Some(charset.to_owned());
+                Arc::make_mut(&mut target).columns[target_index].charset = Some(charset.to_owned());
             }
         }
-        // MySQL 8.0 `TABLE_MAP_EVENT.columns_count` counts *all* columns of
-        // the source table — including VIRTUAL generated columns — because
-        // it describes the schema layout, not the row-image payload. What is
-        // asymmetric is the row events themselves: WRITE/UPDATE/DELETE_ROWS
-        // only pack the physically-stored columns (regular + STORED
-        // generated). So the TABLE_MAP-level count must match `target.columns.len()`,
-        // and the per-row-image bitmap width follows the same total. The
-        // *row values* on the wire drop virtual columns, which is why
-        // `convert_binlog_row` iterates `non_virtual_target_indices` rather
-        // than every column.
-        if table_map.columns_count() as usize != target.columns.len() {
+        // TABLE_MAP includes all live columns (including virtual/invisible
+        // columns), ordered by their logical source position. Heap tombstones
+        // and physical target slots must never change the source wire layout.
+        let column_indices = target
+            .iter_visible_columns()
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let col_count = column_indices.len();
+        if table_map.columns_count() as usize != col_count {
             return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!(
                     "schema mismatch for replicated table {database}.{table}: source declares {} columns, target has {}",
-                    table_map.columns_count(),
-                    target.columns.len(),
+                    table_map.columns_count(), col_count,
                 ),
             ));
         }
-        let physical_index_map = non_virtual_target_indices(&target);
-        let physical_col_count = physical_index_map.len();
-        let col_count = target.columns.len();
-        // In `binlog_row_image=FULL` the source sets every bit of the
-        // before/after-image bitmap — the bitmap width equals
-        // `columns_count` (i.e. all columns, including VIRTUAL generated
-        // ones). MINIMAL/NOBLOB modes clear bits on unchanged or virtual
-        // columns; we hard-refuse those at connect time, so here we just
-        // require all bits set. The actual row values that follow still
-        // only cover the non-virtual columns — `mysql_common` handles the
-        // asymmetry when it emits row values.
         if let Some(bitmap) = rows.columns_before_image() {
             if bitmap.count_ones() != col_count {
                 return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -3036,7 +3183,6 @@ impl ChannelRunner {
                 ));
             }
         }
-        let _ = physical_col_count;
 
         let mut writes = Vec::new();
         let mut updates = Vec::new();
@@ -3056,7 +3202,7 @@ impl ChannelRunner {
                             "write rows event has no after image",
                         )
                     })?;
-                    writes.push(convert_binlog_row(&target, row, None)?);
+                    writes.push(convert_binlog_row(&target, &column_indices, row, None)?);
                 }
                 RowsEventData::UpdateRowsEvent(_)
                 | RowsEventData::UpdateRowsEventV1(_)
@@ -3073,8 +3219,8 @@ impl ChannelRunner {
                             "update rows event has no after image",
                         )
                     })?;
-                    let before = convert_binlog_row(&target, before, None)?;
-                    let after = convert_binlog_row(&target, after, Some(&before))?;
+                    let before = convert_binlog_row(&target, &column_indices, before, None)?;
+                    let after = convert_binlog_row(&target, &column_indices, after, Some(&before))?;
                     updates.push(RowUpdate { before, after });
                 }
                 RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => {
@@ -3084,7 +3230,7 @@ impl ChannelRunner {
                             "delete rows event has no before image",
                         )
                     })?;
-                    deletes.push(convert_binlog_row(&target, row, None)?);
+                    deletes.push(convert_binlog_row(&target, &column_indices, row, None)?);
                 }
             }
         }
@@ -3123,43 +3269,34 @@ impl ChannelRunner {
         filter_allows_table(&cfg, database, table)
     }
 
-    fn enforce_source_delay(&self, _event_count: u64) {
+    /// Delay the transaction being applied, independently of later IO events.
+    /// Return false on STOP so the caller leaves its relay boundary unapplied.
+    fn enforce_source_delay(&self, commit_ts: u64) -> bool {
         let delay = self
             .runtime
             .config
             .lock()
             .map(|cfg| cfg.source_delay_secs)
             .unwrap_or(0);
-        if delay == 0 {
-            return;
+        if delay == 0 || commit_ts == 0 {
+            return !self.sql_should_stop();
         }
-        let last_ts = self
-            .runtime
-            .status
-            .lock()
-            .map(|s| s.last_event_timestamp)
-            .unwrap_or(0);
-        if last_ts == 0 {
-            return;
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let earliest_apply = last_ts.saturating_add(delay);
-        if now < earliest_apply {
+        let earliest_apply = commit_ts.saturating_add(delay);
+        while unix_secs() < earliest_apply && !self.sql_should_stop() {
             self.set_process_state(
                 crate::engine::session_registry::ProcessState::WaitingForSourceDelay,
             );
-            // Sleep but bail out early if the SQL thread is told to stop.
-            let mut remaining = earliest_apply - now;
-            while remaining > 0 && !self.sql_should_stop() {
-                let step = remaining.min(1);
-                std::thread::sleep(std::time::Duration::from_secs(step));
-                remaining = remaining.saturating_sub(step);
-            }
-            self.set_process_state(crate::engine::session_registry::ProcessState::ReadingRelayLog);
+            self.update_status(|status| {
+                status.sql_delay_until = Some(earliest_apply);
+                status.sql_state = "waiting for SOURCE_DELAY".to_string();
+                status.seconds_behind_source = seconds_behind(commit_ts);
+            });
+            // Recheck wall time and cancellation without holding channel locks.
+            std::thread::sleep(Duration::from_millis(50));
         }
+        self.update_status(|status| status.sql_delay_until = None);
+        self.set_process_state(crate::engine::session_registry::ProcessState::ReadingRelayLog);
+        !self.sql_should_stop()
     }
 
     fn until_should_stop_before(&self, gtid: Option<&str>) -> bool {
@@ -3241,9 +3378,18 @@ impl ChannelRunner {
         // not-yet-published group: persisted source progress is capped by
         // `durable_io_progress`, so that group is fetched again.
         let durable_boundary = force_sync_override != Some(false)
-            && matches!(&record.op, RelayOp::TxnCommit { .. } | RelayOp::Ddl { .. });
-        let ddl_barrier =
-            force_sync_override != Some(false) && matches!(&record.op, RelayOp::Ddl { .. });
+            && matches!(
+                &record.op,
+                RelayOp::TxnCommit { .. }
+                    | RelayOp::Ddl { .. }
+                    | RelayOp::XaPrepare { .. }
+                    | RelayOp::XaFinish { .. }
+            );
+        let ddl_barrier = force_sync_override != Some(false)
+            && matches!(
+                &record.op,
+                RelayOp::Ddl { .. } | RelayOp::XaPrepare { .. } | RelayOp::XaFinish { .. }
+            );
         let mut slot = self
             .runtime
             .relay_writer
@@ -3397,6 +3543,9 @@ impl ChannelRunner {
     }
 
     fn apply_records(&self, ops: Vec<RelayOp>, gtid: Option<String>) -> Result<(), QueryError> {
+        let logical_gate =
+            crate::storage::capture::logical_apply_gate(self.engine.database_for_replication())?;
+        let _logical_apply = logical_gate.read_arc();
         // Called only from the SQL thread; a failure propagates up to
         // `set_sql_error` and stops the SQL thread while IO keeps buffering.
         self.update_status(|status| status.sql_state = "applying relay transaction".to_string());
@@ -3462,7 +3611,7 @@ impl ChannelRunner {
                 .lock()
                 .map(|c| c.clone())
                 .unwrap_or_default();
-            for op in &ops {
+            for (ordinal, op) in ops.iter().enumerate() {
                 let RelayOp::Ddl {
                     database,
                     sql,
@@ -3546,6 +3695,37 @@ impl ChannelRunner {
                 } else {
                     sql
                 };
+                // The receipt is written with the final catalog mutation,
+                // so a stale channel cursor cannot replay non-idempotent DDL.
+                DDL_RECEIPT.with(|slot| {
+                    if let Some((_, receipt)) = slot.borrow_mut().as_mut() {
+                        receipt.ordinal = ordinal;
+                    }
+                });
+                if let Some((key, expected)) = current_ddl_receipt()? {
+                    if let Some(value) = self
+                        .engine
+                        .database_for_replication()
+                        .replication_property(&key)?
+                    {
+                        let applied: DdlReceipt = serde_json::from_str(&value).map_err(|err| {
+                            error(
+                                crate::error::catalog::ER_GET_ERRNO,
+                                format!("invalid replication DDL receipt: {err}"),
+                            )
+                        })?;
+                        let expected: DdlReceipt =
+                            serde_json::from_str(&expected).map_err(|err| {
+                                error(
+                                    crate::error::catalog::ER_GET_ERRNO,
+                                    format!("invalid replication DDL context: {err}"),
+                                )
+                            })?;
+                        if applied.boundary == expected.boundary && applied.ordinal >= ordinal {
+                            continue;
+                        }
+                    }
+                }
                 self.set_process_info(Some(sql.to_string()));
                 let result = with_replication_applier(|| {
                     QueryEngine::execute(self.engine.as_ref(), &mut session, sql_to_run)
@@ -3717,6 +3897,9 @@ fn apply_ops_to_storage(
                 ))
             }
             RelayOp::Noop | RelayOp::TxnCommit { .. } | RelayOp::Ddl { .. } => {}
+            RelayOp::XaPrepare { .. } | RelayOp::XaFinish { .. } => {
+                return Err(xa_relay_error("XA boundary reached ordinary row apply"))
+            }
             RelayOp::WriteRows {
                 database,
                 table,
@@ -3801,13 +3984,7 @@ fn apply_update_rows(
             let after = update.after.clone();
             db.update_row_by_id(txn, &schema, row_id, move |_| Ok(after.clone()))?;
         } else {
-            let after_present = match keyless.as_ref() {
-                Some(m) => m.contains(&update.after),
-                None => find_matching_row(db, txn, &schema, &update.after)?.is_some(),
-            };
-            if after_present || apply_is_idempotent() {
-                // After-image already present (idempotent re-apply) or
-                // slave_exec_mode=IDEMPOTENT / crash recovery — skip silently.
+            if apply_is_idempotent() {
                 continue;
             }
             return Err(error(
@@ -3907,7 +4084,7 @@ fn find_matching_row(
         let authoritative = index.primary || index_columns_all_not_null(table, index);
         for row_id in ids {
             if let Some(row) = db.read_row(table, row_id, txn)? {
-                if authoritative || row_values_match(&row.values, image) {
+                if authoritative || row_values_match(table, &row.values, image) {
                     return Ok(Some(row.row_id));
                 }
             }
@@ -3919,16 +4096,28 @@ fn find_matching_row(
     let rows = db.scan_rows(&table.qualified_name(), txn)?;
     Ok(rows
         .into_iter()
-        .find(|row| row_values_match(&row.values, image))
+        .find(|row| row_values_match(table, &row.values, image))
         .map(|row| row.row_id))
 }
 
-fn row_values_match(left: &[Value], right: &[Value]) -> bool {
+fn row_values_match(table: &TableSchema, left: &[Value], right: &[Value]) -> bool {
     left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(l, r)| value_to_string(l) == value_to_string(r))
+        && replicated_image_indices(table)
+            .all(|idx| value_to_string(&left[idx]) == value_to_string(&right[idx]))
+}
+
+/// Only source-authoritative values identify a FULL row image. Tombstones
+/// and replica-recomputed virtual values are placeholders in decoded images.
+fn replicated_image_indices(table: &TableSchema) -> impl Iterator<Item = usize> + '_ {
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| {
+            col.state != crate::storage::schema::ColumnState::Dropped
+                && (col.generated_expr.is_none() || col.generated_stored)
+        })
+        .map(|(idx, _)| idx)
 }
 
 /// True when every column referenced by `index` is declared NOT NULL — the
@@ -3964,40 +4153,38 @@ fn has_usable_unique_index(table: &TableSchema) -> bool {
 /// `HASH_SCAN`). Matched row-ids are consumed so duplicate keyless rows and
 /// repeated images in one event map to distinct physical rows.
 struct KeylessRowIndex {
+    indices: Vec<usize>,
     map: std::collections::HashMap<Vec<String>, Vec<RowId>>,
 }
 
 impl KeylessRowIndex {
     fn build(db: &Arc<Database>, txn: TxnView, table: &TableSchema) -> Result<Self, QueryError> {
         let rows = db.scan_rows(&table.qualified_name(), txn)?;
-        let mut map: std::collections::HashMap<Vec<String>, Vec<RowId>> =
-            std::collections::HashMap::with_capacity(rows.len());
+        let indices = replicated_image_indices(table).collect::<Vec<_>>();
+        let mut map: HashMap<Vec<String>, Vec<RowId>> = HashMap::with_capacity(rows.len());
         for row in rows {
-            let key = row.values.iter().map(value_to_string).collect::<Vec<_>>();
-            map.entry(key).or_default().push(row.row_id);
+            map.entry(Self::image_key(&indices, &row.values))
+                .or_default()
+                .push(row.row_id);
         }
-        Ok(Self { map })
+        Ok(Self { indices, map })
     }
 
-    fn image_key(image: &[Value]) -> Vec<String> {
-        image.iter().map(value_to_string).collect()
+    fn image_key(indices: &[usize], image: &[Value]) -> Vec<String> {
+        indices
+            .iter()
+            .map(|&idx| value_to_string(&image[idx]))
+            .collect()
     }
 
-    /// Locate and consume a row matching `image` (so it is not matched again
-    /// within the same event).
     fn take_match(&mut self, image: &[Value]) -> Option<RowId> {
-        let ids = self.map.get_mut(&Self::image_key(image))?;
+        let key = Self::image_key(&self.indices, image);
+        let ids = self.map.get_mut(&key)?;
         let id = ids.pop();
         if ids.is_empty() {
-            self.map.remove(&Self::image_key(image));
+            self.map.remove(&key);
         }
         id
-    }
-
-    fn contains(&self, image: &[Value]) -> bool {
-        self.map
-            .get(&Self::image_key(image))
-            .is_some_and(|ids| !ids.is_empty())
     }
 }
 
@@ -4028,12 +4215,6 @@ fn binlog_file_byte(byte: u8) -> bool {
     )
 }
 
-/// Returns the target column indices whose values are physically present in
-/// a MySQL row event. MySQL row events carry only *non-virtual* columns (i.e.
-/// regular columns and STORED generated columns; VIRTUAL generated columns
-/// are absent from the row image and re-materialized on both sides). The
-/// vector is ordered by the column's position in the source table, so
-/// `non_virtual_target_indices()[phys_idx] == target_col_idx`.
 /// Decode row-image strings strictly. FULL metadata supplies the source
 /// charset; MINIMAL metadata requires matching source/destination schemas.
 /// Invalid bytes must stop SQL apply, never become replacement characters.
@@ -4064,29 +4245,20 @@ fn decode_replicated_string(
     Ok(Value::String(text))
 }
 
-fn non_virtual_target_indices(table: &TableSchema) -> Vec<usize> {
-    table
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.generated_expr.is_none() || c.generated_stored)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 fn convert_binlog_row(
     table: &TableSchema,
+    column_indices: &[usize],
     row: mysql::binlog::row::BinlogRow,
     before_image: Option<&[Value]>,
 ) -> Result<Vec<Value>, QueryError> {
-    if row.len() != table.columns.len() {
+    if row.len() != column_indices.len() {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             format!(
                 "binlog row image for {} has {} columns, target has {}",
                 table.qualified_name(),
                 row.len(),
-                table.columns.len(),
+                column_indices.len(),
             ),
         ));
     }
@@ -4101,12 +4273,12 @@ fn convert_binlog_row(
     // pass through, and the constraints layer's replica-authoritative path
     // preserves them (see A6).
     let mut out = vec![Value::Null; table.columns.len()];
-    for idx in 0..row.len() {
+    for (wire_idx, &idx) in column_indices.iter().enumerate() {
         let column = &table.columns[idx];
         if column.generated_expr.is_some() && !column.generated_stored {
             continue;
         }
-        let value = row.as_ref(idx).ok_or_else(|| {
+        let value = row.as_ref(wire_idx).ok_or_else(|| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 "binlog row value was already taken",
@@ -4161,21 +4333,7 @@ fn binlog_value_to_mydb(
             for diff in diffs {
                 let value = diff
                     .value()
-                    .map(|value| {
-                        let mut rendered = String::new();
-                        render_jsonb_value(value, &mut rendered).map_err(|err| {
-                            error(
-                                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                                format!("decode PARTIAL_JSON value failed: {err}"),
-                            )
-                        })?;
-                        serde_json::from_str(&rendered).map_err(|err| {
-                            error(
-                                crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
-                                format!("decode PARTIAL_JSON value failed: {err}"),
-                            )
-                        })
-                    })
+                    .map(|value| decode_jsonb_node(value, 1))
                     .transpose()?;
                 decoded.push((diff.operation() as u8, diff.path_str().into_owned(), value));
             }
@@ -4184,125 +4342,119 @@ fn binlog_value_to_mydb(
     }
 }
 
-/// Decode a MySQL binlog JSONB value into a native mydb JSON value.
-///
-/// We bypass `serde_json::Value::try_from(jsonb_value)` because
-/// `mysql_common` returns `Value::Opaque(...)` for any typed JSON leaf that
-/// serde_json cannot represent — that is: `DATE`, `TIME`, `DATETIME`,
-/// `TIMESTAMP`, `DECIMAL`, `OPAQUE(BLOB)`, and any user-added type tag.
-/// The `serde_json::Value::try_from` conversion hard-errors on Opaque, so
-/// any legal source-side JSON that embeds a temporal/decimal value (via
-/// `JSON_OBJECT('d', DATE '…')`, `CAST(…) AS JSON`, or by inserting into a
-/// JSON column from a typed expression) would poison the SQL applier
-/// thread with `"JSONB contains an opaque value"`. Instead we render the
-/// document ourselves — leaves become the same string form MySQL produces
-/// server-side (`"2024-01-01"`, `"12:30:45.000000"`, `"1234.5678"`) and
-/// unknown OPAQUE bytes become base64 as a defensive fallback rather than
-/// being dropped.
+/// Decode directly into native JSONB so rich scalar tags and DECIMAL
+/// precision survive both full row images and PARTIAL_JSON replacements.
 fn decode_jsonb_to_mydb(
     json: &mysql_common::binlog::jsonb::Value<'_>,
 ) -> Result<Value, QueryError> {
-    let mut out = String::new();
-    render_jsonb_value(json, &mut out).map_err(|err| {
-        error(
-            crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            format!("decode JSON binlog value failed: {err}"),
-        )
-    })?;
-    let bytes = crate::engine::json::parse_text(&out, 1, "replication")?;
-    Ok(Value::Json(bytes))
+    Ok(Value::Json(decode_jsonb_node(json, 1)?))
 }
 
-fn render_jsonb_value(
+fn decode_jsonb_node(
     value: &mysql_common::binlog::jsonb::Value<'_>,
-    out: &mut String,
-) -> std::fmt::Result {
+    depth: usize,
+) -> Result<Vec<u8>, QueryError> {
+    use crate::engine::json::{build_array, build_object, scalar_from_value, JsonType};
     use mysql_common::binlog::jsonb::Value as J;
-    use std::fmt::Write;
-    match value {
-        J::Null => out.push_str("null"),
-        J::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        J::I16(v) => write!(out, "{v}")?,
-        J::I32(v) => write!(out, "{v}")?,
-        J::I64(v) => write!(out, "{v}")?,
-        J::U16(v) => write!(out, "{v}")?,
-        J::U32(v) => write!(out, "{v}")?,
-        J::U64(v) => write!(out, "{v}")?,
-        J::F64(v) => {
-            // MySQL renders JSON doubles the same way serde_json does: no
-            // trailing zero on integers, `e` notation for very large/small
-            // magnitudes. `serde_json::Number::from_f64` gives us that shape.
-            if let Some(n) = serde_json::Number::from_f64(*v) {
-                out.push_str(&n.to_string());
-            } else {
-                out.push_str("null");
-            }
+    use mysql_common::constants::ColumnType as C;
+    if depth > crate::engine::json::MAX_JSON_DEPTH {
+        return Err(crate::engine::json::json_too_deep());
+    }
+    let malformed = || {
+        error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "malformed MySQL binary JSON value",
+        )
+    };
+    let scalar = match value {
+        J::Null => Value::Null,
+        J::Bool(v) => {
+            return Ok(crate::engine::json::from_serde(&serde_json::Value::Bool(
+                *v,
+            )))
         }
-        J::String(s) => {
-            let text = s.str();
-            render_json_string(text.as_ref(), out)?;
-        }
+        J::I16(v) => Value::Int(*v as i64),
+        J::I32(v) => Value::Int(*v as i64),
+        J::I64(v) => Value::Int(*v),
+        J::U16(v) => Value::UInt(*v as u64),
+        J::U32(v) => Value::UInt(*v as u64),
+        J::U64(v) => Value::UInt(*v),
+        J::F64(v) if v.is_finite() => Value::Double(*v),
+        J::F64(_) => return Err(malformed()),
+        J::String(v) => Value::String(
+            std::str::from_utf8(v.str_raw())
+                .map_err(|_| malformed())?
+                .to_owned(),
+        ),
         J::SmallArray(arr) => {
-            out.push('[');
-            let mut first = true;
-            for item in arr.iter() {
-                let item = item.map_err(|_| std::fmt::Error)?;
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                render_jsonb_value(&item, out)?;
-            }
-            out.push(']');
+            let nodes = arr
+                .iter()
+                .map(|item| decode_jsonb_node(&item.map_err(|_| malformed())?, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(build_array(&nodes));
         }
         J::LargeArray(arr) => {
-            out.push('[');
-            let mut first = true;
-            for item in arr.iter() {
-                let item = item.map_err(|_| std::fmt::Error)?;
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                render_jsonb_value(&item, out)?;
-            }
-            out.push(']');
+            let nodes = arr
+                .iter()
+                .map(|item| decode_jsonb_node(&item.map_err(|_| malformed())?, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(build_array(&nodes));
         }
         J::SmallObject(obj) => {
-            out.push('{');
-            let mut first = true;
-            for entry in obj.iter() {
-                let (k, v) = entry.map_err(|_| std::fmt::Error)?;
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                let key_text = k.value();
-                render_json_string(key_text.as_ref(), out)?;
-                out.push_str(": ");
-                render_jsonb_value(&v, out)?;
-            }
-            out.push('}');
+            let pairs = obj
+                .iter()
+                .map(|item| {
+                    let (key, value) = item.map_err(|_| malformed())?;
+                    Ok((
+                        std::str::from_utf8(key.value_raw())
+                            .map_err(|_| malformed())?
+                            .to_owned(),
+                        decode_jsonb_node(&value, depth + 1)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            return Ok(build_object(&pairs));
         }
         J::LargeObject(obj) => {
-            out.push('{');
-            let mut first = true;
-            for entry in obj.iter() {
-                let (k, v) = entry.map_err(|_| std::fmt::Error)?;
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                let key_text = k.value();
-                render_json_string(key_text.as_ref(), out)?;
-                out.push_str(": ");
-                render_jsonb_value(&v, out)?;
-            }
-            out.push('}');
+            let pairs = obj
+                .iter()
+                .map(|item| {
+                    let (key, value) = item.map_err(|_| malformed())?;
+                    Ok((
+                        std::str::from_utf8(key.value_raw())
+                            .map_err(|_| malformed())?
+                            .to_owned(),
+                        decode_jsonb_node(&value, depth + 1)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            return Ok(build_object(&pairs));
         }
-        J::Opaque(op) => render_jsonb_opaque(op, out)?,
-    }
-    Ok(())
+        J::Opaque(op) => {
+            let mut rendered = String::new();
+            render_jsonb_opaque(op, &mut rendered).map_err(|_| malformed())?;
+            if op.value_type() == C::MYSQL_TYPE_NEWDECIMAL {
+                Value::Decimal(rendered)
+            } else {
+                let text: String = serde_json::from_str(&rendered).map_err(|_| malformed())?;
+                let ty = match op.value_type() {
+                    C::MYSQL_TYPE_DATE => Some(JsonType::Date),
+                    C::MYSQL_TYPE_TIME => Some(JsonType::Time),
+                    C::MYSQL_TYPE_DATETIME => Some(JsonType::Datetime),
+                    C::MYSQL_TYPE_TIMESTAMP => Some(JsonType::Timestamp),
+                    _ => None,
+                };
+                if let Some(ty) = ty {
+                    return crate::engine::json::typed_text_scalar(ty, &text);
+                }
+                return Ok(crate::engine::json::opaque_scalar(
+                    op.value_type() as u8,
+                    op.data_raw(),
+                ));
+            }
+        }
+    };
+    Ok(scalar_from_value(&scalar))
 }
 
 fn render_jsonb_opaque(
@@ -4311,140 +4463,103 @@ fn render_jsonb_opaque(
 ) -> std::fmt::Result {
     use mysql_common::constants::ColumnType;
     use std::fmt::Write;
-    // MySQL's JSON_VALUE format for typed leaves. Each arm produces the
-    // literal string a `JSON_UNQUOTE(CAST(v AS JSON))` on the source would
-    // yield, wrapped in JSON quotes for correctness.
     let bytes = op.data_raw();
-    let mut s = String::new();
     match op.value_type() {
-        ColumnType::MYSQL_TYPE_NEWDECIMAL | ColumnType::MYSQL_TYPE_DECIMAL => {
-            // The 2-byte precision/scale header is followed by MySQL's
-            // packed decimal. Rather than re-implement its bit-packed
-            // decoder here, fall back to lossless base64 — the caller can
-            // still store the row (JSON text stays as-is), but downstream
-            // queries seeing the base64 will notice, unlike a silent drop.
-            if bytes.len() >= 2 {
-                let precision = bytes[0];
-                let scale = bytes[1];
-                write!(s, "decimal({},{}):", precision, scale).ok();
+        ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            // JSON uses precision/scale followed by binary DECIMAL. Validate
+            // each base-10 group before invoking the vendor decoder, which
+            // assumes trusted group ranges and precision >= scale.
+            use mysql_common::binlog::decimal::{decimal_bin_size, Decimal, DIG_TO_BYTES};
+            if bytes.len() < 3 {
+                return Err(std::fmt::Error);
             }
-            write!(s, "{}", base64_url_of(bytes)).ok();
+            let (precision, scale) = (bytes[0] as usize, bytes[1] as usize);
+            // Json_decimal stores decimal_t::intg + frac, including leading
+            // group padding. SQL DECIMAL(65,30) can therefore carry 66 here.
+            if precision == 0
+                || precision > 81
+                || scale > precision
+                || (precision - scale).div_ceil(9) + scale.div_ceil(9) > 9
+                || bytes.len() != 2 + decimal_bin_size(precision, scale)
+            {
+                return Err(std::fmt::Error);
+            }
+            let mut payload = bytes[2..].to_vec();
+            let mask = if payload[0] & 0x80 != 0 { 0 } else { 0xff };
+            payload[0] ^= 0x80;
+            let intg = precision - scale;
+            let groups = std::iter::once(intg % 9)
+                .chain(std::iter::repeat_n(9, intg / 9 + scale / 9))
+                .chain(std::iter::once(scale % 9));
+            let mut offset = 0;
+            for digits in groups.filter(|digits| *digits != 0) {
+                let len = DIG_TO_BYTES[digits] as usize;
+                let group = payload[offset..offset + len]
+                    .iter()
+                    .fold(0_u32, |v, b| (v << 8) | (b ^ mask) as u32);
+                if group >= 10_u32.pow(digits as u32) {
+                    return Err(std::fmt::Error);
+                }
+                offset += len;
+            }
+            let decimal = Decimal::read_packed(bytes, false).map_err(|_| std::fmt::Error)?;
+            write!(out, "{decimal}")
         }
-        ColumnType::MYSQL_TYPE_DATE => {
-            format_packed_datetime(bytes, DateOnly::Yes, &mut s).ok();
-        }
-        ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => {
-            format_packed_time(bytes, &mut s).ok();
-        }
-        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_DATETIME2 => {
-            format_packed_datetime(bytes, DateOnly::No, &mut s).ok();
-        }
-        ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_TIMESTAMP2 => {
-            format_packed_datetime(bytes, DateOnly::No, &mut s).ok();
+        ColumnType::MYSQL_TYPE_DATE
+        | ColumnType::MYSQL_TYPE_TIME
+        | ColumnType::MYSQL_TYPE_DATETIME
+        | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+            // Json_datetime::to_packed stores TIME_to_longlong_packed as a
+            // signed eight-byte little-endian integer, without disk offsets.
+            let packed = i64::from_le_bytes(bytes.try_into().map_err(|_| std::fmt::Error)?);
+            let negative = packed < 0;
+            let value = packed.unsigned_abs();
+            let fraction = value & 0xffffff;
+            let int_part = value >> 24;
+            let is_time = op.value_type() == ColumnType::MYSQL_TYPE_TIME;
+            let is_date = op.value_type() == ColumnType::MYSQL_TYPE_DATE;
+            let hms = if is_time {
+                int_part
+            } else {
+                int_part & 0x1ffff
+            };
+            let (hour, minute, second) = (hms >> 12, (hms >> 6) & 63, hms & 63);
+            if fraction > 999999
+                || minute > 59
+                || second > 59
+                || hour > if is_time { 838 } else { 23 }
+                || (!is_time && negative)
+            {
+                return Err(std::fmt::Error);
+            }
+            let mut text = String::new();
+            if is_time {
+                if negative {
+                    text.push('-');
+                }
+            } else {
+                let ymd = int_part >> 17;
+                let ym = ymd >> 5;
+                let (year, month, day) = (ym / 13, ym % 13, ymd & 31);
+                if year > 9999 || (is_date && (hms != 0 || fraction != 0)) {
+                    return Err(std::fmt::Error);
+                }
+                write!(text, "{year:04}-{month:02}-{day:02}")?;
+                if is_date {
+                    return render_json_string(&text, out);
+                }
+                text.push(' ');
+            }
+            write!(text, "{hour:02}:{minute:02}:{second:02}.{fraction:06}")?;
+            render_json_string(&text, out)
         }
         _ => {
-            // Unknown/blob OPAQUE: preserve losslessly as base64 so a
-            // future read can distinguish "we saw an opaque value" from
-            // "the field is empty".
-            s.push_str(&base64_url_of(bytes));
+            // MySQL renders other opaque types as tagged, padded base64,
+            // wrapping at 76 characters. This is the source JSON text value.
+            let text = crate::engine::json::opaque_text(op.value_type() as u8, bytes);
+            render_json_string(&text, out)
         }
     }
-    if s.is_empty() {
-        s.push_str(&base64_url_of(bytes));
-    }
-    render_json_string(&s, out)
-}
-
-/// Minimal (non-cryptographic) base64 encoder used only for the JSONB
-/// OPAQUE fallback path. Standard alphabet, no padding — the goal is
-/// "stable, non-lossy text representation", not roundtrip parseability
-/// (MySQL's own OPAQUE rendering is likewise implementation-defined).
-fn base64_url_of(bytes: &[u8]) -> String {
-    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() * 4 + 2) / 3);
-    let mut chunk = 0u32;
-    let mut bits = 0u32;
-    for &b in bytes {
-        chunk = (chunk << 8) | b as u32;
-        bits += 8;
-        while bits >= 6 {
-            bits -= 6;
-            let idx = ((chunk >> bits) & 0x3F) as usize;
-            out.push(ALPHA[idx] as char);
-        }
-    }
-    if bits > 0 {
-        let idx = ((chunk << (6 - bits)) & 0x3F) as usize;
-        out.push(ALPHA[idx] as char);
-    }
-    out
-}
-
-#[derive(Copy, Clone)]
-enum DateOnly {
-    Yes,
-    No,
-}
-
-fn format_packed_datetime(bytes: &[u8], date_only: DateOnly, out: &mut String) -> std::fmt::Result {
-    use std::fmt::Write;
-    match date_only {
-        // MySQL `MYSQL_TYPE_DATE` packs as 3 bytes big-endian (24 bits):
-        //   bits 23..9  → year (15 bits)
-        //   bits  8..5  → month (4 bits)
-        //   bits  4..0  → day (5 bits)
-        DateOnly::Yes if bytes.len() >= 3 => {
-            let raw = ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32);
-            let year = (raw >> 9) & 0x7FFF;
-            let month = (raw >> 5) & 0xF;
-            let day = raw & 0x1F;
-            write!(out, "{year:04}-{month:02}-{day:02}")
-        }
-        // MySQL 5.6+ `MYSQL_TYPE_DATETIME2` / `MYSQL_TYPE_TIMESTAMP2` packs the
-        // base 5 bytes big-endian (40 bits) as:
-        //   bit 39:       sign (1 for positive; DATETIME uses +offset so it is
-        //                 effectively "the value is positive")
-        //   bits 22..38:  year_month = year*13 + month (17 bits)
-        //   bits 17..21:  day (5 bits)
-        //   bits 12..16:  hour (5 bits)
-        //   bits  6..11:  minute (6 bits)
-        //   bits  0..5:   second (6 bits)
-        // Fractional-seconds bytes may follow but for JSON rendering the
-        // millisecond precision suffices.
-        DateOnly::No if bytes.len() >= 5 => {
-            let mut acc: u64 = 0;
-            for &b in bytes.iter().take(5) {
-                acc = (acc << 8) | b as u64;
-            }
-            let year_month = (acc >> 22) & 0x1_FFFF;
-            let year = year_month / 13;
-            let month = year_month % 13;
-            let day = (acc >> 17) & 0x1F;
-            let hour = (acc >> 12) & 0x1F;
-            let minute = (acc >> 6) & 0x3F;
-            let second = acc & 0x3F;
-            write!(
-                out,
-                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
-            )
-        }
-        _ => write!(out, "{}", base64_url_of(bytes)),
-    }
-}
-
-fn format_packed_time(bytes: &[u8], out: &mut String) -> std::fmt::Result {
-    use std::fmt::Write;
-    if bytes.len() >= 3 {
-        let mut acc: u64 = 0;
-        for &b in bytes.iter().take(6) {
-            acc = (acc << 8) | b as u64;
-        }
-        let hour = (acc >> 12) & 0x3FF;
-        let minute = (acc >> 6) & 0x3F;
-        let second = acc & 0x3F;
-        return write!(out, "{hour:02}:{minute:02}:{second:02}");
-    }
-    write!(out, "{}", base64_url_of(bytes))
 }
 
 fn render_json_string(s: &str, out: &mut String) -> std::fmt::Result {
@@ -6311,6 +6426,8 @@ fn relay_op_event_type(op: &RelayOp, gtid: &Option<String>) -> &'static str {
         RelayOp::RawRows { .. } => "Rows_log_event",
         RelayOp::Noop => "Rotate_log_event",
         RelayOp::TxnCommit { .. } => "Xid_log_event",
+        RelayOp::XaPrepare { .. } => "XA_prepare_log_event",
+        RelayOp::XaFinish { .. } => "Query_log_event",
         RelayOp::Ddl { .. } => "Query_log_event",
         RelayOp::WriteRows { .. } => "Write_rows_log_event_v2",
         RelayOp::UpdateRows { .. } => "Update_rows_log_event_v2",
@@ -6328,6 +6445,12 @@ fn relay_op_info(op: &RelayOp, gtid: &Option<String>) -> String {
         RelayOp::RawRows { event_type, .. } => format!("source rows event type {event_type}"),
         RelayOp::Noop => String::new(),
         RelayOp::TxnCommit { event_count, .. } => format!("COMMIT /* events={event_count} */"),
+        RelayOp::XaPrepare { xid, .. } => format!("XA PREPARE {}", xid.render_data(true)),
+        RelayOp::XaFinish { xid, commit, .. } => format!(
+            "XA {} {}",
+            if *commit { "COMMIT" } else { "ROLLBACK" },
+            xid.render_data(true)
+        ),
         RelayOp::Ddl { database, sql, .. } => {
             if database.is_empty() {
                 sql.clone()
@@ -6551,6 +6674,8 @@ fn recover_relay_boundary(path: &Path) -> Result<(u64, Option<RelayRecord>), Que
                 if matches!(
                     record.op,
                     RelayOp::TxnCommit { .. }
+                        | RelayOp::XaPrepare { .. }
+                        | RelayOp::XaFinish { .. }
                         | RelayOp::Ddl {
                             transactional: false,
                             ..
@@ -8131,6 +8256,7 @@ mod tests {
                 source_pos: 900,
                 gtid: None,
                 op: RelayOp::Ddl {
+                    source_ts: 0,
                     database: "test".into(),
                     sql: "CREATE TABLE t(id INT)".into(),
                     transactional: true,
@@ -8640,6 +8766,60 @@ mod tests {
     }
 
     #[test]
+    fn release_audit_logical_applier_pauses_for_native_capture_and_covers_deferred_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+            .unwrap();
+        let (_runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        let db = engine.database_for_replication();
+        let gate = crate::storage::capture::logical_apply_gate(db).unwrap();
+        let capture = gate.write_arc();
+        let (started, starting) = std::sync::mpsc::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = runner.apply_records(
+                vec![RelayOp::WriteRows {
+                    database: "test".into(),
+                    table: "t".into(),
+                    rows: vec![vec![Value::Int(1)]],
+                }],
+                None,
+            );
+            done.send(result).unwrap();
+            runner
+        });
+        starting.recv().unwrap();
+        assert!(completed.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(capture);
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let runner = worker.join().unwrap();
+        let mut commit = runner
+            .prepare_row_records(
+                vec![RelayOp::WriteRows {
+                    database: "test".into(),
+                    table: "t".into(),
+                    rows: vec![vec![Value::Int(2)]],
+                }],
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            gate.try_write_arc().is_none(),
+            "capture must include deferred durability/sidecars"
+        );
+        db.finish_deferred_commits(&mut [&mut commit]).unwrap();
+        drop(commit);
+        assert!(gate.try_write_arc().is_some());
+    }
+
+    #[test]
     fn sql_applier_batches_independent_source_commits_under_one_durability_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
@@ -8800,7 +8980,9 @@ mod tests {
         }
 
         let relay_path = relay_log_path(dir.path(), DEFAULT_CHANNEL);
-        runner.advance_applied(&relay_path, 91, "bin.000001", 180, None, true);
+        runner
+            .advance_applied(&relay_path, 91, "bin.000001", 180, None, true)
+            .unwrap();
 
         let persisted: PersistedChannel = serde_json::from_slice(
             &std::fs::read(channel_path(dir.path(), DEFAULT_CHANNEL)).unwrap(),
@@ -9105,6 +9287,7 @@ mod tests {
         out.extend(body);
         out
     }
+    include!("replication_audit_1028_tests.rs");
 }
 
 fn poisoned_lock(message: &str) -> QueryError {

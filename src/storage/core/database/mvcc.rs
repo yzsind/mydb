@@ -1343,8 +1343,7 @@ impl Database {
             // only ~2–7% of wall time, so it stays off in production.
             let lock_started = undo_publish_lock_probe_enabled().then(std::time::Instant::now);
             if let Some(((ptr, segment_id, segment_end), reservation)) = concurrent_frame {
-                let mut undo = self.undo_lock()?;
-                let out = undo.finish_concurrent_persistent_append(
+                let out = self.publish_concurrent_undo_frame(
                     record,
                     encoded,
                     ptr,
@@ -1352,7 +1351,6 @@ impl Database {
                     segment_end,
                     reservation,
                 )?;
-                drop(undo);
                 self.record_undo_publish_lock(lock_started);
                 out
             } else {

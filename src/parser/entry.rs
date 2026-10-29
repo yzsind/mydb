@@ -1555,6 +1555,18 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
         }
         if head_is(b"XA") {
             if let Some(statement) = parse_xa_statement(sql) {
+                if let Statement::XaStart { xid }
+                | Statement::XaEnd { xid }
+                | Statement::XaPrepare { xid }
+                | Statement::XaCommit { xid, .. }
+                | Statement::XaRollback { xid } = &statement
+                {
+                    xid.validate().map_err(|err| {
+                        let mut parsed = ParseError::at_zero(err.message());
+                        parsed.spec = crate::error::catalog::ER_XAER_INVAL;
+                        parsed
+                    })?;
+                }
                 return Ok(statement);
             }
         }
@@ -1693,7 +1705,9 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
         let (sql, create_index_fulltext) = rewrite_sql_with(sql, |sql| {
             strip_create_index_fulltext(sql, prescan.has_fulltext)
         });
+        let (sql, create_index_spatial) = rewrite_sql_with(sql, strip_create_index_spatial);
         let post_parse = PostParseState {
+            create_index_spatial,
             ddl_query_hints,
             ddl_hint_warnings,
             window_frame_exclusions,

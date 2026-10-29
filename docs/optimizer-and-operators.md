@@ -305,7 +305,7 @@ cost is higher.
 | `IndexFastScan` | Full or range scans over covering indexes | Reads only B-tree leaves and never touches heap payloads |
 | `IndexInLookup` | Index driven by `column IN (subquery)` | The subquery first forms a key set, then prefix+IN probes run |
 | `FulltextScan` | FULLTEXT postings and BM25 | MATCH postings produce candidates while the ordinary residual still rechecks; can be combined with B-tree/Zone Map candidate intersection |
-| `SpatialScan` | MBR candidates from the in-memory R-tree | The R-tree returns a superset; exact spatial predicates must be rechecked |
+| `SpatialScan` | MBR candidates from persistent R-tree pages | The R-tree returns a superset; exact spatial predicates must be rechecked |
 | `VectorIndexScan` | HNSW/IVF vector KNN | After candidates are generated, re-ranks using MVCC-visible heap vectors; the approximate index affects recall but never relaxes visibility |
 | `VectorBruteScan` | Exact brute-force KNN | Scans all visible vectors with a bounded Top-K; materializes only the winners |
 

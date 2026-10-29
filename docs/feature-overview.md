@@ -76,7 +76,7 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 | Zone Map | Table/partition-level typed min/max, NULL, string-prefix, and selective-membership summaries; serial/parallel/vectorized scans all retain the heap residual |
 | JSON MVI | Multi-valued keys via `CAST(json_expr AS ... ARRAY)`; one MVI part can combine with a regular part to form a composite key |
 | FULLTEXT | Natural-language BM25, boolean mode, ngram parser; MATCH and safe LIKE ngram pre-filtering; [immutable backup queries](backup-and-recovery.md#51-fulltext-queries) |
-| SPATIAL | Persistent MBR B-tree plus a governor-managed derived R-tree, with a final heap lookup to recheck exact predicates |
+| SPATIAL | Page-backed persistent R-tree, with WAL recovery, physical replication, partition-local searches, and final heap predicate rechecks |
 | HNSW | Graph-based ANN over native numeric/BINARY vectors; explicit none/SQ8/SQ4/PQ/BQ payloads, visible heap re-ranking, memory/paged backends |
 | IVF | Inverted-file ANN over native numeric/BINARY vectors; nlist/nprobe, explicit none/SQ8/SQ4/PQ/BQ payloads, retraining, memory/paged backends |
 
@@ -137,7 +137,7 @@ Every build includes the MySQL replica receiver. The IO thread pulls binlog into
 
 ### 7.3 Native mydb physical replication
 
-mydb provides native WAL physical replication independent of MySQL binlog, managed with `MYDB` keywords. It includes protocol v2/mTLS, async/semi-sync, four-watermark ACKs, slots, timeline/fork detection, retention, staged base physical backups, manually controlled promote/demote, and status queries.
+mydb provides native WAL physical replication independent of MySQL binlog, managed with `MYDB` keywords. It includes protocol v3/mTLS, async/semi-sync, four-watermark ACKs, slots, timeline/fork detection, retention, staged base physical backups, manually controlled promote/demote, and status queries.
 
 ### 7.4 Online Backup and PITR
 

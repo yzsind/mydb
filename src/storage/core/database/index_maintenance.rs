@@ -836,7 +836,8 @@ impl Database {
         let generation_lsn = (!emit_logical_wal).then(|| self.log.lock().last_lsn());
         let mut plans = Vec::with_capacity(table.indexes.len());
         for index in &table.indexes {
-            let empty_at_start = index.state == IndexState::Public
+            let empty_at_start = !index.is_spatial()
+                && index.state == IndexState::Public
                 && self.with_index_read(table.id, &index.name, |file| file.is_empty())?;
             let sorter = if encoded_btree_build_eligible(index) {
                 let program = Arc::new(CompiledIndexKeyProgram::compile(table, index)?);
@@ -2485,6 +2486,7 @@ impl Database {
     fn register_changed_index_repair_keys(
         &self,
         txn_id: u64,
+        storage_id: u64,
         table: &TableSchema,
         old_values: &[Value],
         new_values: &[Value],
@@ -2510,7 +2512,11 @@ impl Database {
                     if !new_keys.contains(&old_key) {
                         repairs.push((
                             IndexRepairKey {
-                                table_id: table.id,
+                                table_id: if index.is_spatial() {
+                                    storage_id
+                                } else {
+                                    table.id
+                                },
                                 index_name: normalize_name(&index.name),
                                 key: old_key,
                             },
@@ -2527,7 +2533,11 @@ impl Database {
             }
             repairs.push((
                 IndexRepairKey {
-                    table_id: table.id,
+                    table_id: if index.is_spatial() {
+                        storage_id
+                    } else {
+                        table.id
+                    },
                     index_name: normalize_name(&index.name),
                     key: old_key,
                 },
@@ -2767,8 +2777,8 @@ impl Database {
 
     /// Updates the secondary indexes touched by `changed_columns`, operating
     /// on the index files at `storage_id` (the partition's physical storage
-    /// id). The repair-key registry is bound to the logical `table.id` since
-    /// repair operates table-wide.
+    /// id). Spatial repairs retain the physical partition identity; ordinary
+    /// B-tree repairs preserve their table-wide registration contract.
     pub(crate) fn update_changed_indexes_deferred_at(
         &self,
         txn_id: u64,
@@ -2782,6 +2792,7 @@ impl Database {
     ) -> Result<(), QueryError> {
         self.register_changed_index_repair_keys(
             txn_id,
+            storage_id,
             table,
             old_values,
             new_values,
@@ -3794,8 +3805,7 @@ impl Database {
     }
 
     /// Drops the index entry from the per-partition index file at
-    /// `storage_id`. Repair-key registration stays bound to the
-    /// logical `table.id`.
+    /// `storage_id`. Spatial repairs use that same physical identity.
     pub(crate) fn delete_indexes_deferred_at(
         &self,
         txn_id: u64,
@@ -3810,7 +3820,11 @@ impl Database {
             for key in table.index_keys(index, values)? {
                 repairs.push((
                     IndexRepairKey {
-                        table_id: table.id,
+                        table_id: if index.is_spatial() {
+                            storage_id
+                        } else {
+                            table.id
+                        },
                         index_name: normalize_name(&index.name),
                         key: key.clone(),
                     },
@@ -3917,6 +3931,7 @@ impl Database {
         let names = table
             .indexes
             .iter()
+            .filter(|index| !index.is_spatial())
             .map(|index| index.name.clone())
             .collect::<Vec<_>>();
         self.rebuild_indexes_offline_bulk_batch_with_options(
@@ -3935,6 +3950,29 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        // Pin the explicitly typed backend while a private/temporary candidate
+        // is not yet visible in the catalog used by cold handle resolution.
+        let _spatial_build_handle = if index.is_spatial() {
+            self.remove_index_cache_entry(table.id, &index.name)?;
+            let file = IndexFile::create_rebuilt_from_sorted_with_durability(
+                self.index_path_for_table_schema(table, table.id, &index.name),
+                Vec::new(),
+                self.log.clone(),
+                if is_temp_table_id(table.id) {
+                    DurabilityMode::Memory
+                } else {
+                    self.config.durability
+                },
+                self.buffer_pool.clone(),
+            )?;
+            let handle = Arc::new(parking_lot::RwLock::new(file));
+            self.index_cache
+                .write()
+                .insert((table.id, normalize_name(&index.name)), handle.clone());
+            Some(handle)
+        } else {
+            None
+        };
         // Online ADD INDEX previously used the generic external sorter without
         // a governor owner. On wide/composite keys its source Vec, parallel
         // merge Vec and allocator-retained pages could therefore coexist with
@@ -4353,6 +4391,24 @@ impl Database {
         self.collect_sorted_index_entries_with_scan::<true>(table, index, degree, scratch_bytes)
     }
 
+    fn initialize_empty_spatial_indexes(&self, table: &TableSchema) -> Result<(), QueryError> {
+        self.initialize_empty_spatial_indexes_at(table, &table.storage_ids())
+    }
+
+    fn initialize_empty_spatial_indexes_at(
+        &self,
+        table: &TableSchema,
+        storage_ids: &[u64],
+    ) -> Result<(), QueryError> {
+        for &storage_id in storage_ids {
+            for index in table.indexes.iter().filter(|i| i.is_spatial()) {
+                let path = self.index_path_for_table_schema(table, storage_id, &index.name);
+                self.prepare_empty_index_file_at_path(storage_id, &index.name, path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_empty_index_file_at_path(
         &self,
         table_id: u64,
@@ -4365,7 +4421,11 @@ impl Database {
             path,
             Vec::new(),
             self.log.clone(),
-            self.config.durability,
+            if is_temp_table_id(table_id) {
+                DurabilityMode::Memory
+            } else {
+                self.config.durability
+            },
             self.buffer_pool.clone(),
         )?;
         empty.flush()?;

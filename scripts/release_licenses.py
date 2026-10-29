@@ -13,19 +13,23 @@ def sha256(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
-def collect_third_party(root, payload, metadata):
+def collect_third_party(root, payload, metadata, *, extra_metadata=(), extra_lockfiles=()):
     root = root.resolve()
-    resolved = {node['id'] for node in metadata['resolve']['nodes']}
-    lock = tomllib.loads((root / 'Cargo.lock').read_text())
-    checksums = {(p['name'], p['version']): p.get('checksum') for p in lock['package']}
+    graphs = [metadata, *extra_metadata]
+    resolved = {node['id'] for graph in graphs for node in graph['resolve']['nodes']}
+    checksums = {}
+    for lockfile in [root / 'Cargo.lock', *extra_lockfiles]:
+        lock = tomllib.loads(Path(lockfile).read_text())
+        checksums.update({(p['name'], p['version']): p.get('checksum') for p in lock['package']})
+    all_packages = {p['id']: p for graph in graphs for p in graph['packages']}
     notice_root = root / 'assets/third-party-licenses'
     notices = {(p['name'], p['version']): p for p in json.loads((notice_root / 'manifest.json').read_text())}
     packages = []
-    for package in metadata["packages"]:
+    for package in all_packages.values():
         if package["id"] not in resolved:
             continue
         source = Path(package["manifest_path"]).parent
-        if source == root:
+        if source in (root, root / 'clients/mydb-cli'):
             continue
         origin = None
         if package["source"] is None:
@@ -85,9 +89,13 @@ def main():
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--metadata', required=True, type=Path)
+    parser.add_argument('--extra-metadata', type=Path, action='append', default=[])
+    parser.add_argument('--extra-lockfile', type=Path, action='append', default=[])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    collect_third_party(args.source, args.output, json.loads(args.metadata.read_text()))
+    collect_third_party(args.source, args.output, json.loads(args.metadata.read_text()),
+                        extra_metadata=[json.loads(p.read_text()) for p in args.extra_metadata],
+                        extra_lockfiles=args.extra_lockfile)
 
 
 if __name__ == '__main__':

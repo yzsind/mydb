@@ -2804,6 +2804,13 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
     plan: Arc<PhysicalPlan>,
     execution_context: super::execution_context::ExecutionContext,
 ) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
+    // Worker producers cannot borrow the live connection's routine, sequence,
+    // or external-effect context. Callers retain their synchronous native/row
+    // fallback instead of moving connection-local effects onto a worker.
+    if crate::planner::connection_thread_execution_required() {
+        return Ok(None);
+    }
+
     preflight_runtime_parameters(&plan)?;
     let Some(template) = preflight_query_output_template(&plan)? else {
         return Ok(None);

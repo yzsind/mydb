@@ -1,5 +1,5 @@
 # Keep the build context deliberately small. The Dockerfile only needs the
-# server sources, build metadata, the embedded MySQL fixtures, and runtime
+# server/client sources, build metadata, embedded MySQL fixtures, and runtime
 # packaging files.
 *
 !Cargo.toml
@@ -11,6 +11,11 @@
 !src/**
 !vendor/
 !vendor/**
+!clients/
+!clients/mydb-cli/
+!clients/mydb-cli/**
+clients/mydb-cli/target/
+clients/mydb-cli/tests/
 !assets/
 assets/*
 !assets/mysql80/

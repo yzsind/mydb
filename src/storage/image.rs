@@ -34,7 +34,7 @@ fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
         .open(path)
         .map_err(|e| io_err("create image lock", e))?;
     file.write_all(bytes)
-        .and_then(|_| file.sync_all())
+        .and_then(|_| crate::platform::fs::sync_standard_file_at(&file, path))
         .map_err(|e| io_err("sync image lock", e))
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

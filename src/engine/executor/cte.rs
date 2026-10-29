@@ -35,12 +35,7 @@ pub(crate) fn cte_materialization_active() -> bool {
 }
 
 fn with_cte_materialization<T>(f: impl FnOnce() -> Result<T, QueryError>) -> Result<T, QueryError> {
-    CTE_MATERIALIZATION_ACTIVE.with(|flag| {
-        let prev = flag.replace(true);
-        let result = f();
-        flag.set(prev);
-        result
-    })
+    with_cte_materialization_active(true, f)
 }
 
 /// Run `f` with the CTE-materialization-active flag forced to `active`,
@@ -50,25 +45,39 @@ fn with_cte_materialization<T>(f: impl FnOnce() -> Result<T, QueryError>) -> Res
 /// does not cross a spawned thread boundary on its own.
 pub(crate) fn with_cte_materialization_active<T>(active: bool, f: impl FnOnce() -> T) -> T {
     CTE_MATERIALIZATION_ACTIVE.with(|flag| {
-        let prev = flag.replace(active);
-        let result = f();
-        flag.set(prev);
-        result
+        struct RestoreFlag<'a> {
+            flag: &'a std::cell::Cell<bool>,
+            previous: bool,
+        }
+        impl Drop for RestoreFlag<'_> {
+            fn drop(&mut self) {
+                self.flag.set(self.previous);
+            }
+        }
+        let _restore = RestoreFlag {
+            flag,
+            previous: flag.replace(active),
+        };
+        f()
     })
 }
 
 /// Install `map` as the active CTE registry for the duration of `f`. Restores
-/// the previous registry afterwards regardless of whether `f` errors.
+/// the previous registry afterwards, including on errors and panic unwinding.
 pub(crate) fn with_cte_registry<T>(
     map: HashMap<String, Arc<CteResult>>,
     f: impl FnOnce() -> T,
 ) -> T {
-    let prev = CTE_REGISTRY.with(|r| r.replace(map));
-    let result = f();
-    CTE_REGISTRY.with(|r| {
-        *r.borrow_mut() = prev;
-    });
-    result
+    struct RestoreRegistry(HashMap<String, Arc<CteResult>>);
+    impl Drop for RestoreRegistry {
+        fn drop(&mut self) {
+            CTE_REGISTRY.with(|registry| {
+                *registry.borrow_mut() = std::mem::take(&mut self.0);
+            });
+        }
+    }
+    let _restore = RestoreRegistry(CTE_REGISTRY.with(|registry| registry.replace(map)));
+    f()
 }
 
 /// Like [`with_cte_registry`] but *extends* the currently-active registry with
@@ -7615,6 +7624,11 @@ fn placeholder_table_ref(alias: String) -> TableRef {
 /// body containing one of these must not let flatten duplicate it across outer
 /// references, so we force `no_merge` (materialise once).
 fn function_is_nondeterministic(name: &str) -> bool {
+    if crate::engine::http::is_function(name)
+        || crate::engine::expr::function_has_external_effect(name)
+    {
+        return true;
+    }
     matches!(
         name.to_ascii_uppercase().as_str(),
         "RAND"
@@ -7903,6 +7917,43 @@ fn count_frame_bound_refs(bound: &crate::parser::WindowFrameBound, name: &str) -
         crate::parser::WindowFrameBound::Preceding(expr)
         | crate::parser::WindowFrameBound::Following(expr) => count_expr_refs(expr, name),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod audit1027_scope_tests {
+    use super::*;
+
+    #[test]
+    fn audit1027_cte_scopes_restore_after_unwind() {
+        let outer = Arc::new(CteResult::materialized(Vec::new(), Vec::new()));
+        with_cte_registry(HashMap::from([("outer".into(), outer.clone())]), || {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_cte_registry_extended(
+                    HashMap::from([("inner".into(), outer.clone())]),
+                    || {
+                        assert!(has_cte("inner"));
+                        panic!("scope unwind probe");
+                    },
+                );
+            }));
+            assert!(caught.is_err());
+            assert!(Arc::ptr_eq(&lookup_cte("outer").unwrap(), &outer));
+            assert!(!has_cte("inner"));
+        });
+        assert!(current_cte_registry().is_empty());
+        for active in [false, true] {
+            with_cte_materialization_active(active, || {
+                let caught = std::panic::catch_unwind(|| {
+                    with_cte_materialization(|| -> Result<(), QueryError> {
+                        assert!(cte_materialization_active());
+                        panic!("materialization unwind probe");
+                    })
+                });
+                assert!(caught.is_err());
+                assert_eq!(cte_materialization_active(), active);
+            });
+        }
     }
 }
 

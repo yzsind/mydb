@@ -21,6 +21,7 @@ pub(in crate::engine::executor) struct ExecutionContext {
     params: Option<crate::engine::params::ParamContextSnapshot>,
     budget: Arc<MemBudget>,
     session_expr_info: Option<SessionExprInfo>,
+    http_context: Option<crate::engine::http::Context>,
     // Owned per-context clone: SessionContext is Send but intentionally not
     // Sync (it contains connection-local RefCells). ExecutionContext clones
     // give each worker an independent immutable view instead of sharing it.
@@ -199,6 +200,7 @@ impl ExecutionContext {
             params: crate::engine::params::snapshot_current_context(),
             budget,
             session_expr_info: crate::engine::expr::current_session_expr_info(),
+            http_context: crate::engine::http::capture(),
             session_context: crate::engine::expr::current_session_context_snapshot(),
             zone_map_optimizer_enabled: crate::storage::schema::zone_map_optimizer_enabled(),
             dml_expression: crate::engine::expr::strict_dml_expression(),
@@ -219,8 +221,7 @@ impl ExecutionContext {
             kernel_mode: crate::engine::executor::vec::config::effective_mode(),
             rollup_window_topk_hint: super::plan::current_rollup_window_topk_hint(),
             group_concat_max_len: super::aggregate::group_concat_max_len(),
-            warning_sink: crate::engine::api::current_statement_warning_sink()
-                .unwrap_or_else(|| Arc::new(parking_lot::Mutex::new(Default::default()))),
+            warning_sink: crate::engine::api::current_statement_warning_sink().unwrap_or_default(),
             rows_examined: crate::engine::perf_events::current_rows_examined_counter(),
         }
     }
@@ -320,6 +321,11 @@ impl ExecutionContext {
         f: impl FnOnce() -> R,
     ) -> R {
         let txn = self.txn;
+        let _http_scope = crate::engine::http::enter_context(self.http_context.as_ref());
+        let _http_serial = self
+            .http_context
+            .as_ref()
+            .map(|_| crate::planner::force_serial_scope());
         let _fulltext_scoring = super::fulltext_context::enter(self.fulltext_scoring.clone());
         #[cfg(test)]
         let _rrf_branch_hook = super::hybrid::enter_branch_hook(self.rrf_branch_hook.clone());
