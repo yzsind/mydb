@@ -1392,10 +1392,15 @@ impl BatchOperator for ParallelStorageBatchStream {
             .saturating_add(
                 std::mem::size_of::<AggregateScanWork>() + 2 * std::mem::size_of::<usize>(),
             );
-        let charge = Arc::new(mem_budget::ControlledMemoryCharge::try_new(
+        // Worker transfer is optional. Refusal must leave the unopened
+        // source usable without latching a terminal OOM on the query.
+        let Some(charge) = mem_budget::ControlledMemoryCharge::try_new_optional(
             mem_budget::ControlledMemoryCategory::StorageScratch,
             metadata_bytes,
-        )?);
+        ) else {
+            return Ok(None);
+        };
+        let charge = Arc::new(charge);
         self.execution.txn_pressure = self
             .execution
             .worker_context
@@ -1808,19 +1813,22 @@ pub(super) fn try_build_direct_batch_scan<'a>(
         if let Some(mut stream) =
             FilteredStorageBatchStream::new(db, txn, table, f, proj, &[], morsel_pages)?
         {
+            if let Some(decoded) = stream.decoded.as_mut() {
+                decoded.prepare_for_scan(predicate_access_rows);
+            }
             for runtime_filter in runtime_filters {
                 if !stream.install_runtime_filter(runtime_filter.clone()) {
                     return Ok(None);
                 }
             }
-            // LIKE can match borrowed variable-width data before it becomes
+            // Text kernels can match borrowed variable-width data before it becomes
             // an owned String/Value, which remains a win at a high match
             // rate. Fixed-width/date comparisons use predicate-first only
             // when the CBO selectivity/column-width rule selects it.
-            let borrowed_like = stream.decoded.as_ref().is_some_and(
-                crate::engine::executor::select::plan::DecodedPredicateProgram::has_string_like,
+            let borrowed_string = stream.decoded.as_ref().is_some_and(
+                crate::engine::executor::select::plan::DecodedPredicateProgram::has_borrowed_string_predicate,
             );
-            if predicate_first || borrowed_like || !runtime_filters.is_empty() {
+            if predicate_first || borrowed_string || !runtime_filters.is_empty() {
                 let scan_tasks = build_batch_scan_tasks(
                     db,
                     table,

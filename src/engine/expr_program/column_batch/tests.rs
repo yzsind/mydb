@@ -477,3 +477,167 @@ fn trim_rechecks_binary_lanes_under_text_metadata() {
         );
     }
 }
+
+#[test]
+fn digest_columns_match_scalar_for_all_hashes_octets_nulls_and_selections() {
+    for sql in [
+        "HEX(x)",
+        "MD5(x)",
+        "SHA(x)",
+        "SHA1(x)",
+        "SHA2(x,0)",
+        "SHA2(x,224)",
+        "SHA2(x,256)",
+        "SHA2(x,384)",
+        "SHA2(x,512)",
+        "SHA2(MD5(x),256)",
+        "LENGTH(SHA1(x))",
+    ] {
+        let values = vec![
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("a\0ß中文🙂".into()),
+            Value::String("abc".into()),
+            Value::String("x".repeat(70000)),
+        ];
+        parity(sql, ColumnType::VarString, values.clone());
+        for binary in [false, true] {
+            let (program, schema) = compile(
+                sql,
+                if binary {
+                    ColumnType::Blob
+                } else {
+                    ColumnType::VarString
+                },
+            );
+            let values = if binary {
+                vec![
+                    Value::Bytes(vec![0xff, 0, 0xc3]),
+                    Value::Null,
+                    Value::Bytes(vec![]),
+                    Value::Bytes(b"abc".to_vec()),
+                    Value::Bytes(vec![0; 70000]),
+                ]
+            } else {
+                values.clone()
+            };
+            let mut batch = Batch::new(schema, vec![ColumnVector::from_values(values)]);
+            let expected = oracle(&program, &batch).unwrap();
+            batch.selection = Some(crate::engine::executor::vec::batch::Selection::Indices(
+                vec![4, 0, 4, 2],
+            ));
+            let output =
+                crate::engine::executor::vec::expr_batch::eval_to_column(&program, &batch).unwrap();
+            for index in batch.visible_indices() {
+                assert_eq!(
+                    output.value_at(index),
+                    expected[index],
+                    "{sql}, binary={binary}, row={index}"
+                );
+            }
+        }
+        parity(sql, ColumnType::VarString, vec![Value::Null; 3]);
+    }
+    for sql in ["SHA2(x,123)", "SHA2(x,NULL)", "SHA2(x,x)"] {
+        let (program, schema) = compile(sql, ColumnType::VarString);
+        assert!(!program.column_parallel_safe(&schema), "{sql}");
+        assert!(program
+            .try_eval_column(&Batch::new(
+                schema,
+                vec![ColumnVector::from_values(vec![Value::String("abc".into())])]
+            ))
+            .is_none());
+    }
+}
+
+#[test]
+fn digest_scalar_preserves_typed_oracle_and_charset_octets() {
+    for (kind, value) in [
+        (ColumnType::LongLong, Value::Int(-123)),
+        (ColumnType::Float, Value::Float(1.25)),
+        (ColumnType::Double, Value::Double(1.25)),
+        (
+            ColumnType::Decimal {
+                precision: 20,
+                scale: 3,
+            },
+            Value::DecimalCompact(12340, 3),
+        ),
+        (ColumnType::Bit { bits: 9 }, Value::UInt(257)),
+        (ColumnType::Date, Value::Date(19782)),
+        (ColumnType::DateTime, Value::DateTime(1710000000123456)),
+        (ColumnType::Timestamp, Value::Timestamp(1710000000123456)),
+        (ColumnType::Json, Value::String("{\"x\":1}".into())),
+        (ColumnType::VarString, Value::String("é中文".into())),
+        (ColumnType::Blob, Value::Bytes(vec![0, 0xff, 0xc3])),
+    ] {
+        for sql in [
+            "HEX(x)",
+            "MD5(x)",
+            "SHA(x)",
+            "SHA1(x)",
+            "SHA2(x,0)",
+            "SHA2(x,224)",
+            "SHA2(x,512)",
+        ] {
+            let (program, schema) = compile(sql, kind);
+            let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+            let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+            let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+            let values = [value.clone()];
+            let row = RowView::from_values(&values);
+            let expected = with_eval_scratch(|scratch| legacy.eval_row(&row, scratch)).unwrap();
+            assert_eq!(
+                with_eval_scratch(|scratch| program.eval_row(&row, scratch)).unwrap(),
+                expected,
+                "{kind:?} {sql}"
+            );
+        }
+    }
+    for collation in [8, 54, 63, 255] {
+        let (_, schema) = compile("MD5(x)", ColumnType::VarString);
+        let mut field = schema.fields()[0].clone();
+        field.source.collation_id = Some(collation);
+        let schema = BatchSchema::new(vec![field]);
+        let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+        for sql in ["MD5(x)", "SHA1(x)", "SHA2(x,256)"] {
+            let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+            let program = ExprCompiler::compile(&ast, &input).unwrap();
+            let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+            let values = [Value::String("é".into())];
+            let row = RowView::from_values(&values);
+            assert_eq!(
+                with_eval_scratch(|scratch| program.eval_row(&row, scratch)).unwrap(),
+                with_eval_scratch(|scratch| legacy.eval_row(&row, scratch)).unwrap(),
+                "{collation} {sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sha2_length_parameters_rebind_without_reusing_a_previous_kernel() {
+    let (program, schema) = compile("SHA2(x,?)", ColumnType::VarString);
+    let batch = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::String("abc".into()),
+            Value::Null,
+        ])],
+    );
+    for length in [0, 224, 512, 123, 256] {
+        crate::engine::params::with_params(vec![Value::Int(length)], || {
+            if length == 123 {
+                assert!(!program.column_parallel_safe(&schema));
+                assert!(program.try_eval_column(&batch).is_none());
+            } else {
+                assert!(program.column_parallel_safe(&schema));
+                let column = program.try_eval_column(&batch).unwrap();
+                assert_eq!(
+                    (0..2).map(|i| column.value_at(i)).collect::<Vec<_>>(),
+                    oracle(&program, &batch).unwrap()
+                );
+            }
+        });
+    }
+}

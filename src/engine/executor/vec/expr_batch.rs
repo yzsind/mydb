@@ -1164,6 +1164,7 @@ pub fn compile_post_aggregate(
 /// executor's evaluation count/order for volatile expressions and prevents an
 /// error in an already-filtered row from leaking into the query.
 pub fn eval_value_per_row(program: &ExprProgram, batch: &Batch) -> Result<Vec<Value>, QueryError> {
+    crate::engine::cancel::check_cancelled()?;
     if !matches!(super::config::effective_mode(), super::config::VecMode::Off) {
         if let Some(column) = program.try_eval_column(batch) {
             return Ok((0..batch.num_rows())
@@ -1206,7 +1207,12 @@ fn visit_scalar_rows(
     let ncols = batch.columns().len();
     let referenced_columns = program.referenced_columns();
     let mut row_values = vec![Value::Null; ncols];
+    let mut visited = 0usize;
     let mut eval_row = |r: usize| -> Result<(), QueryError> {
+        if visited & crate::engine::cancel::SCALAR_ROW_CANCEL_MASK == 0 {
+            crate::engine::cancel::check_cancelled()?;
+        }
+        visited += 1;
         for &column in referenced_columns {
             let Some(vector) = batch.columns().get(column) else {
                 return Err(crate::error::catalog::ER_BAD_FIELD_ERROR

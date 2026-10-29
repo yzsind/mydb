@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURE_DIR = ROOT / "src/engine/executor/tests/function_compat/fixtures"
+FIXTURE_DIR = ROOT / "tests/fixtures/function-compat"
 ERROR_RE = re.compile(r"ERROR\s+(\d+)\s+\(([0-9A-Z]{5})\)", re.I)
 BEGIN_RESULT = "__MYDB_FUNCTION_RESULT_BEGIN__"
 END_RESULT = "__MYDB_FUNCTION_RESULT_END__"

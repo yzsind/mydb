@@ -173,6 +173,7 @@ pub(crate) struct NodeStats {
     /// only; these fields never participate in plan or execution routing.
     pub expression_mode: Option<&'static str>,
     pub native_expression_rows: u64,
+    pub expression_workers: u32,
     pub fallback_expression_rows: u64,
     /// Aggregate kernel selected inside the physical aggregate node.
     /// Observability only; never read by CBO or routing.
@@ -1449,6 +1450,15 @@ pub(super) fn add_vector_runtime(
     let Some(key) = plan_key(plan) else {
         return;
     };
+    add_vector_runtime_key(key, batches, conversion_rows, workers);
+}
+
+pub(super) fn add_vector_runtime_key(
+    key: PlanNodeId,
+    batches: u64,
+    conversion_rows: u64,
+    workers: u32,
+) {
     STATS_COLLECTOR.with(|cell| {
         if let Some(collector) = cell.borrow().as_ref().cloned() {
             if let Ok(mut map) = collector.stats.lock() {
@@ -1460,6 +1470,22 @@ pub(super) fn add_vector_runtime(
                 entry.batches = entry.batches.saturating_add(batches);
                 entry.conversion_rows = entry.conversion_rows.saturating_add(conversion_rows);
                 entry.workers = entry.workers.max(workers.max(1));
+            }
+        }
+    });
+}
+
+pub(super) fn add_parallel_projection_runtime(key: Option<PlanNodeId>, rows: u64, workers: u32) {
+    let Some(key) = key else {
+        return;
+    };
+    STATS_COLLECTOR.with(|cell| {
+        if let Some(collector) = cell.borrow().as_ref().cloned() {
+            if let Ok(mut map) = collector.stats.lock() {
+                let entry = map.entry(key).or_default();
+                entry.expression_mode = Some("parallel_column");
+                entry.native_expression_rows = entry.native_expression_rows.saturating_add(rows);
+                entry.expression_workers = entry.expression_workers.max(workers);
             }
         }
     });
@@ -1719,6 +1745,8 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
                     entry.native_expression_rows = entry
                         .native_expression_rows
                         .saturating_add(stats.native_expression_rows);
+                    entry.expression_workers =
+                        entry.expression_workers.max(stats.expression_workers);
                     entry.fallback_expression_rows = entry
                         .fallback_expression_rows
                         .saturating_add(stats.fallback_expression_rows);
@@ -2008,6 +2036,9 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
             }
             if let Some(mode) = s.expression_mode {
                 suffix.push_str(&format!(" expression_mode={mode}"));
+                if s.expression_workers > 0 {
+                    suffix.push_str(&format!(" expression_workers={}", s.expression_workers));
+                }
                 if s.native_expression_rows > 0 {
                     suffix.push_str(&format!(
                         " native_expression_rows={}",

@@ -146,6 +146,7 @@ macro_rules! scalar_catalog {
         enum FunctionKernel {
             Field(crate::engine::expr::FieldComparisonDomain),
             Math(crate::engine::expr::math::MathFunction),
+            GeometryConstructor(&'static str, bool),
             $($variant,)*
             LegacyDeterministic(&'static str),
             LegacySession(&'static str),
@@ -155,13 +156,13 @@ macro_rules! scalar_catalog {
             fn may_error(self, arity: usize) -> bool {
                 match self {
                     $(Self::$variant => ($diagnostic)(arity),)*
-                    Self::Field(_) | Self::Math(_) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
                 }
             }
             fn is_deterministic(self) -> bool {
                 match self {
                     $(Self::$variant => $deterministic,)*
-                    Self::Field(_) | Self::Math(_) | Self::LegacyDeterministic(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) => true,
                     Self::LegacySession(_) => false,
                 }
             }
@@ -299,6 +300,21 @@ scalar_catalog! {
         }
         Crc32 => (true, |arity| arity != 1) {
             [("CRC32", "crc32")] => (CryptoHash, Long, ( Crc32, 1, 1, Immutable, fixed_integer_result(Int, true, true)), false);
+        }
+        Hex => (true, |_arity| true) {
+            [("HEX", "hex")] => (CheapString, VarString, (Hex, 1, 1, Immutable, fixed_string_result(None, true)), true);
+        }
+        Md5 => (true, |arity| arity != 1) {
+            [("MD5", "md5")] => (CryptoHash, VarString, None, false);
+        }
+        Sha1 => (true, |arity| arity != 1) {
+            [("SHA1", "sha1")] => (CryptoHash, VarString, None, false);
+        }
+        Sha => (true, |arity| arity != 1) {
+            [("SHA", "sha")] => (CryptoHash, VarString, None, false);
+        }
+        Sha2 => (true, |_arity| true) {
+            [("SHA2", "sha2")] => (CryptoHash, VarString, None, false);
         }
         AnyValue => (true, |arity| arity != 1) {
             [("ANY_VALUE", "any_value")] => (CheapString, VarString, None, false);
@@ -450,7 +466,6 @@ scalar_catalog! {
             [("PI", "pi")] => (IntegerArith, Double, None, true);
             [("BIN", "bin")] => (CheapString, VarString, (Bin, 1, 1, Immutable, fixed_string_result(None, true)), true);
             [("OCT", "oct")] => (CheapString, VarString, None, true);
-            [("HEX", "hex")] => (CheapString, VarString, (Hex, 1, 1, Immutable, fixed_string_result(None, true)), true);
             [("UNHEX", "unhex")] => (CheapString, Blob, None, false);
             [("FIND_IN_SET", "find_in_set"), ("BIT_LENGTH", "bit_length")] => (CheapString, LongLong, None, false);
             [("ELT", "elt"), ("FORMAT", "format"), ("QUOTE", "quote")] => (CheapString, VarString, None, false);
@@ -464,8 +479,6 @@ scalar_catalog! {
             [("JSON_KEYS", "json_keys"), ("JSON_OBJECT", "json_object"), ("JSON_ARRAY", "json_array"), ("JSON_MERGE_PATCH", "json_merge_patch"), ("JSON_MERGE_PRESERVE", "json_merge_preserve"), ("JSON_QUOTE", "json_quote")] => (RegexOrComplex, Json, None, false);
             [("JSON_STORAGE_SIZE", "json_storage_size"), ("JSON_STORAGE_FREE", "json_storage_free")] => (RegexOrComplex, VarString, ( JsonStorage, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
             [("FROM_BASE64", "from_base64")] => (RegexOrComplex, Blob, None, false);
-            [("MD5", "md5"), ("SHA1", "sha1"), ("SHA2", "sha2")] => (CryptoHash, VarString, None, false);
-            [("SHA", "sha")] => (CryptoHash, VarString, None, true);
             [("BIT_COUNT", "bit_count"), ("JSON_SCHEMA_VALID", "json_schema_valid"), ("INET_ATON", "inet_aton"), ("IS_IPV4", "is_ipv4"), ("IS_IPV6", "is_ipv6")] => (Unknown, LongLong, None, false);
             [("DEGREES", "degrees"), ("RADIANS", "radians"), ("SIN", "sin"), ("COS", "cos"), ("TAN", "tan"), ("ASIN", "asin"), ("ACOS", "acos"), ("ATAN", "atan"), ("ATAN2", "atan2"), ("COT", "cot")] => (Unknown, Double, None, false);
             [("__AT_TIME_ZONE", "__at_time_zone")] => (Unknown, DateTime, None, false);

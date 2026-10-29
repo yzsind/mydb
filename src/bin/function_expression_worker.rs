@@ -18,6 +18,12 @@ struct Request {
     prepared: bool,
     #[serde(default)]
     params: Vec<i64>,
+    #[serde(default = "sample_limit")]
+    sample_limit: usize,
+}
+
+fn sample_limit() -> usize {
+    4
 }
 
 fn cell(value: &Value) -> Json {
@@ -25,7 +31,9 @@ fn cell(value: &Value) -> Json {
         Value::NULL => Json::Null,
         Value::Bytes(bytes) => match std::str::from_utf8(bytes) {
             Ok(text) => Json::String(text.to_owned()),
-            Err(_) => json!({"binary": bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()}),
+            Err(_) => {
+                json!({"binary": bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()})
+            }
         },
         Value::Int(v) => Json::String(v.to_string()),
         Value::UInt(v) => Json::String(v.to_string()),
@@ -36,7 +44,11 @@ fn cell(value: &Value) -> Json {
 }
 
 fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Error>> {
-    let mut output = request.capture.map(File::create).transpose()?.map(BufWriter::new);
+    let mut output = request
+        .capture
+        .map(File::create)
+        .transpose()?
+        .map(BufWriter::new);
     let mut rows = 0_u64;
     let mut bytes = 0_u64;
     let mut sample = Vec::new();
@@ -60,9 +72,9 @@ fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Er
                 for value in row.as_ref(0).into_iter() {
                     if let Value::Bytes(value) = value { bytes += value.len() as u64; }
                 }
-                if output.is_some() || sample.len() < 4 {
+                if output.is_some() || sample.len() < request.sample_limit {
                     let values: Vec<Json> = row.unwrap().iter().map(cell).collect();
-                    if sample.len() < 4 { sample.push(values.clone()); }
+                    if sample.len() < request.sample_limit { sample.push(values.clone()); }
                     if let Some(writer) = output.as_mut() {
                         let key = values.first().and_then(Json::as_str).unwrap_or("0");
                         write!(writer, "{key}\t")?;
@@ -79,7 +91,9 @@ fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Er
         consume!(conn.query_iter(&request.sql)?);
     }
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    if let Some(writer) = output.as_mut() { writer.flush()?; }
+    if let Some(writer) = output.as_mut() {
+        writer.flush()?;
+    }
     Ok(json!({"status":"ok", "elapsed_ms":elapsed_ms, "rows":rows,
         "first_column_bytes":bytes, "sample":sample, "columns":columns}))
 }
@@ -87,17 +101,24 @@ fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Er
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = std::env::args().nth(1).ok_or("port required")?.parse()?;
     let database = std::env::args().nth(2);
-    let opts = OptsBuilder::new().ip_or_hostname(Some("127.0.0.1"))
-        .tcp_port(port).user(Some("root"))
+    let opts = OptsBuilder::new()
+        .ip_or_hostname(Some("127.0.0.1"))
+        .tcp_port(port)
+        .user(Some("root"))
         .pass(Some(std::env::var("FEB_PASSWORD").unwrap_or_default()))
-        .db_name(database).prefer_socket(false)
+        .db_name(database)
+        .prefer_socket(false)
         .tcp_connect_timeout(Some(Duration::from_secs(5)))
         .read_timeout(Some(Duration::from_secs(600)))
         .write_timeout(Some(Duration::from_secs(30)));
     let mut conn = Conn::new(opts)?;
     let stdout = io::stdout();
     let mut writer = stdout.lock();
-    writeln!(writer, "{}", json!({"event":"connected", "connection_id":conn.connection_id()}))?;
+    writeln!(
+        writer,
+        "{}",
+        json!({"event":"connected", "connection_id":conn.connection_id()})
+    )?;
     writer.flush()?;
     for line in io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
@@ -108,7 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(value) => value,
             Err(error) => {
                 let identity = error.downcast_ref::<mysql::Error>().and_then(|e| match e {
-                    mysql::Error::MySqlError(e) => Some((e.code, e.state.clone())), _ => None,
+                    mysql::Error::MySqlError(e) => Some((e.code, e.state.clone())),
+                    _ => None,
                 });
                 json!({"status":"error", "elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
                     "error":error.to_string(), "identity":identity})

@@ -1897,6 +1897,17 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 );
             }
             match normalized.as_str() {
+                "CONVERT_USING" if matches!(args.len(), 2 | 3) => {
+                    // Octet consumers must bind the target encoding before
+                    // constant folding erases the conversion's syntax.
+                    let mut descriptor = ExprType::from_column_type(
+                        column_type::expr_result_type(expr),
+                        &ColumnSource::default(),
+                    );
+                    descriptor.collation_id =
+                        crate::engine::expr::expression_metadata_collation_id(expr);
+                    descriptor
+                }
                 "__TEMPORAL_COMPARISON_KEY" if args.len() == 1 => ExprType::new(
                     Temporal {
                         kind: TemporalKind::DateTime,

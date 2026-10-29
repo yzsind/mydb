@@ -5760,6 +5760,13 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 return Err(CompileError::Unsupported);
             };
             if let FunctionKernel::LegacyDeterministic(known_name) = kernel {
+                if crate::engine::geo::sql::is_geometry_collection_constructor(known_name) {
+                    kernel = FunctionKernel::GeometryConstructor(
+                        known_name,
+                        args.iter()
+                            .all(|arg| input_expr_result_type(arg, schema) == ColumnType::Geometry),
+                    );
+                }
                 if let Some(function) =
                     crate::engine::expr::math::MathFunction::from_name(known_name)
                 {
@@ -7189,6 +7196,17 @@ impl FunctionKernel {
             FunctionKernel::LegacyDeterministic(name) => {
                 eval_legacy_by_name(name, args, row, scratch)
             }
+            FunctionKernel::GeometryConstructor(name, geometry_arguments) => {
+                let values = args
+                    .iter()
+                    .map(|arg| arg.eval(row, scratch))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::engine::geo::sql::eval_geometry_constructor(
+                    name,
+                    &values,
+                    geometry_arguments,
+                )
+            }
             FunctionKernel::LegacySession(name) => eval_legacy_by_name(name, args, row, scratch),
             FunctionKernel::RegexpLike => eval_regexp_like(args, row, scratch),
             FunctionKernel::RegexpReplace => eval_regexp_replace(args, row, scratch),
@@ -7212,6 +7230,35 @@ impl FunctionKernel {
                 expect_len("CRC32", args, 1)?;
                 let value = args[0].eval_ref(row, scratch)?;
                 Ok(crate::engine::expr::crc32_value(value.as_value()))
+            }
+            FunctionKernel::Hex => {
+                expect_len("HEX", args, 1)?;
+                let value = args[0].eval_ref(row, scratch)?;
+                crate::engine::expr::hex_value(value.as_value())
+            }
+            FunctionKernel::Md5 | FunctionKernel::Sha | FunctionKernel::Sha1 => {
+                use crate::engine::expr::digest::{hash_value, HashAlgorithm};
+                let name = match self {
+                    FunctionKernel::Md5 => "MD5",
+                    FunctionKernel::Sha => "SHA",
+                    _ => "SHA1",
+                };
+                expect_len(name, args, 1)?;
+                let value = args[0].eval_ref(row, scratch)?;
+                hash_value(
+                    if matches!(self, FunctionKernel::Md5) {
+                        HashAlgorithm::Md5
+                    } else {
+                        HashAlgorithm::Sha1
+                    },
+                    value.as_value(),
+                )
+            }
+            FunctionKernel::Sha2 => {
+                expect_len("SHA2", args, 2)?;
+                let value = args[0].eval_ref(row, scratch)?;
+                let length = args[1].eval_ref(row, scratch)?;
+                crate::engine::expr::digest::sha2_value(value.as_value(), length.as_value())
             }
             FunctionKernel::AnyValue => {
                 expect_len("ANY_VALUE", args, 1)?;

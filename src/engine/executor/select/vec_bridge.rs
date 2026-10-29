@@ -64,6 +64,8 @@ mod aggregation;
 pub(super) use aggregation::*;
 mod compute;
 use compute::*;
+mod analyzed_workers;
+mod projection_parallel;
 
 mod compact_window;
 mod scan_batch;
@@ -1525,6 +1527,7 @@ pub(crate) struct VecResultBatchInput<'a> {
     pub row_major_projection: bool,
 }
 
+#[derive(Clone)]
 pub(crate) enum VecResultProjection {
     Column(usize),
     Expr(Arc<ExprProgram>),
@@ -2061,7 +2064,10 @@ pub(crate) fn try_native_result_batch_input<'a>(
         return Ok(None);
     };
 
-    let Some(VecBatchInput { stream, template }) = try_native_vec_input_stream(db, txn, plan)?
+    let Some(VecBatchInput {
+        mut stream,
+        mut template,
+    }) = try_native_vec_input_stream(db, txn, plan)?
     else {
         return Ok(None);
     };
@@ -2076,6 +2082,33 @@ pub(crate) fn try_native_result_batch_input<'a>(
         ));
     }
     NATIVE_RESULT_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut output = output;
+    let mut row_major_projection = row_major_projection;
+    if stream.is_native_parallel_scan()
+        && output
+            .iter()
+            .any(|item| matches!(item, VecResultProjection::Expr(_)))
+    {
+        if let Some(projected_template) = query_projection_template(projection, &template, &output)
+        {
+            if let Some(projected) = projection_parallel::try_parallel_projection(
+                db,
+                txn,
+                plan,
+                &mut stream,
+                &output,
+                &projected_template,
+            )? {
+                stream = projected;
+                template = projected_template;
+                output = (0..template.len())
+                    .map(VecResultProjection::Column)
+                    .collect();
+                row_major_projection = false;
+            }
+        }
+    }
+
     Ok(Some(VecResultBatchInput {
         stream,
         projection: output,
@@ -2335,6 +2368,27 @@ impl AnalyzedBatchOperator<'_> {
 }
 
 impl BatchOperator for AnalyzedBatchOperator<'_> {
+    fn is_native_parallel_scan(&self) -> bool {
+        self.inner.is_native_parallel_scan()
+    }
+
+    fn take_parallel_workers(
+        &mut self,
+        degree: usize,
+    ) -> Result<
+        Option<Vec<Box<dyn crate::engine::executor::vec::stream::ParallelBatchWorker>>>,
+        QueryError,
+    > {
+        let Some(workers) = self.inner.take_parallel_workers(degree)? else {
+            return Ok(None);
+        };
+        Ok(Some(analyzed_workers::wrap(
+            workers,
+            self.plan,
+            self.partition_visits.clone(),
+        )))
+    }
+
     fn prefer_key_locality(&mut self, columns: &[usize]) -> bool {
         self.inner.prefer_key_locality(columns)
     }
@@ -3081,7 +3135,10 @@ impl BatchOperator for QueryProjectionBatchOperator<'_> {
                             && precomputed.get(index).and_then(Option::as_ref).is_none()
                 });
             let mut row_values = Vec::with_capacity(batch.columns().len());
-            for row in visible {
+            for (ordinal, row) in visible.into_iter().enumerate() {
+                if ordinal & crate::engine::cancel::SCALAR_ROW_CANCEL_MASK == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
                 if needs_row {
                     row_values.clear();
                     row_values.extend(
@@ -3429,12 +3486,22 @@ fn try_build_query_output_batch<'a>(
     else {
         return Ok(None);
     };
-    let Some(input) = try_native_vec_input_stream(db, txn, plan)? else {
+    let Some(mut input) = try_native_vec_input_stream(db, txn, plan)? else {
         return Ok(None);
     };
     let Some(template) = query_projection_template(projection, &planned_template, &lowered) else {
         return Ok(None);
     };
+    if let Some(stream) = projection_parallel::try_parallel_projection(
+        db,
+        txn,
+        plan,
+        &mut input.stream,
+        &lowered,
+        &template,
+    )? {
+        return Ok(Some(VecBatchInput { stream, template }));
+    }
     let schema = template_to_batch_schema(&template);
     Ok(Some(VecBatchInput {
         stream: Box::new(QueryProjectionBatchOperator {

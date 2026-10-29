@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/spatial.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/spatial.json"
+));
 
 function_fixture_test!(geomcollection, "GEOMCOLLECTION", FIXTURE);
 function_fixture_test!(geometrycollection, "GEOMETRYCOLLECTION", FIXTURE);

@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/numeric-bit.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/numeric-bit.json"
+));
 
 function_fixture_test!(abs, "ABS", FIXTURE);
 function_fixture_test!(acos, "ACOS", FIXTURE);

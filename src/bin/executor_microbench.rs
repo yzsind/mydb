@@ -49,6 +49,13 @@ struct CaseReport {
 }
 
 const CASES: &[(&str, &str)] = &[
+    ("project_md5_serial","SELECT /*+ NO_PARALLEL FULL_SCAN(t) */ MD5(pad) FROM t"),
+    ("project_md5_parallel2","SELECT /*+ PARALLEL(2) FULL_SCAN(t) */ MD5(pad) FROM t"),
+    ("project_sha2_serial","SELECT /*+ NO_PARALLEL FULL_SCAN(t) */ SHA2(pad,256) FROM t"),
+    ("project_sha2_parallel2","SELECT /*+ PARALLEL(2) FULL_SCAN(t) */ SHA2(pad,256) FROM t"),
+    ("project_unicode_serial","SELECT /*+ NO_PARALLEL FULL_SCAN(t) */ CHAR_LENGTH(UPPER(pad)) FROM t"),
+    ("project_unicode_parallel2","SELECT /*+ PARALLEL(2) FULL_SCAN(t) */ CHAR_LENGTH(UPPER(pad)) FROM t"),
+
     ("window_direct", "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) FROM t"),
     ("window_expression", "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v+id) FROM t"),
     ("window_range", "SELECT id, SUM(v) OVER (PARTITION BY k ORDER BY v RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM t"),

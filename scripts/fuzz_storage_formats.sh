@@ -33,7 +33,7 @@ fuzz_target!(|bytes: &[u8]| mydb::fuzzing::storage_formats(bytes));
 ''')
 PY
 cp "$repo_root/Cargo.lock" "$fuzz_root/Cargo.lock"
-cp "$repo_root"/src/storage/fixtures/release-v1/*.bin "$fuzz_root/corpus/"
+cp "$repo_root"/tests/fixtures/storage-format-v1/*.bin "$fuzz_root/corpus/"
 export TMPDIR=/tmp/mydb
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/mydb/storage-format-fuzz-target}"
 fuzz_profile=()

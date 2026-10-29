@@ -1,4 +1,5 @@
 pub(crate) mod date_format;
+pub(crate) mod digest;
 pub(crate) mod math;
 crate::engine::builtin_catalog::declare_retains_ast!();
 mod string_kernels;
@@ -1095,6 +1096,7 @@ pub(crate) fn eval_lastval() -> Result<Value, QueryError> {
 
 /// `setval('seq', value [, is_called])` — non-transactional counter reset.
 pub(crate) fn eval_setval(name: &str, value: i64, is_called: bool) -> Result<Value, QueryError> {
+    crate::engine::cancel::check_cancelled()?;
     with_seq_ctx(|db, session| {
         let _write = db.acquire_sequence_write_lease()?;
         authorize_sequence_value(db, session, name, true)?;
@@ -4308,6 +4310,17 @@ fn eval_expr_legacy_inner(
             )
         }
         Expr::Function { name, args, .. } => {
+            if crate::engine::geo::sql::is_geometry_collection_constructor(name) {
+                let geometry_arguments = args
+                    .iter()
+                    .all(|arg| expr_result_type_in_table(arg, table) == ColumnType::Geometry);
+                let evaluated = eval_args(args, &mut |arg| eval_expr_legacy(arg, table, values))?;
+                return crate::engine::geo::sql::eval_geometry_constructor(
+                    name,
+                    &evaluated,
+                    geometry_arguments,
+                );
+            }
             if name.eq_ignore_ascii_case("FIELD") {
                 let domain = field_comparison_domain(
                     args.iter()
@@ -5235,7 +5248,7 @@ where
             }
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::Int(value_bytes(&value).len() as i64))
+                Ok(Value::Int(value_bytes_ref(&value).len() as i64))
             })
         }
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
@@ -6206,37 +6219,7 @@ where
                 }
             }
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| match &value {
-                // Numeric input follows CONV(N, 10, 16) per MySQL 8.0 manual:
-                // FLOAT/DOUBLE/DECIMAL are rounded half-away-from-zero to an
-                // integer first (HEX(1.5) → "2"); negative values use the
-                // unsigned two's-complement representation, matching CONV.
-                Value::Int(v) => Ok(Value::String(format!("{:X}", *v as u64))),
-                Value::UInt(v) => Ok(Value::String(format!("{:X}", v))),
-                Value::Float(_)
-                | Value::Double(_)
-                | Value::Decimal(_)
-                | Value::DecimalCompact(_, _)
-                | Value::Decimal128(..)
-                | Value::DecimalWide(..) => {
-                    let n = cast_to_integer(&value, false)?;
-                    let as_int = match n {
-                        Value::Int(v) => v as u64,
-                        Value::UInt(v) => v,
-                        _ => int_value(&n)? as u64,
-                    };
-                    Ok(Value::String(format!("{:X}", as_int)))
-                }
-                // BLOB/binary string: hex-encode the raw bytes. Routing
-                // through string_value would lossily map invalid UTF-8
-                // (e.g. 0xFF) to U+FFFD before encoding.
-                Value::Bytes(b) => Ok(Value::String(hex_upper_encode(b))),
-                // Any other value (String, temporal, ...) is treated as a
-                // byte string: HEX(str) hex-encodes each byte per MySQL 8.0.
-                // Do NOT dispatch to numeric based on parse::<i64>() success —
-                // MySQL keys off the argument type, not on its content.
-                _ => Ok(Value::String(hex_upper_encode(&value_bytes(&value)))),
-            })
+            hex_value(&value)
         }
         "UNHEX" => {
             let value = eval_one(name, args, &mut eval_arg)?;
@@ -6644,7 +6627,7 @@ where
             }
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::Int((value_bytes(&value).len() * 8) as i64))
+                Ok(Value::Int((value_bytes_ref(&value).len() * 8) as i64))
             })
         }
         "OCTET_LENGTH" => {
@@ -6658,7 +6641,7 @@ where
             }
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::Int(value_bytes(&value).len() as i64))
+                Ok(Value::Int(value_bytes_ref(&value).len() as i64))
             })
         }
         "QUOTE" => {
@@ -7152,18 +7135,21 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
-                let is_datetime = |value: &Value| {
-                    if matches!(
-                        value,
-                        Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_)
-                    ) {
-                        return true;
+                let temporal_kind = |value: &Value| {
+                    match value {
+                        Value::Date(_) => return 0u8,
+                        Value::DateTime(_) | Value::Timestamp(_) => return 1,
+                        Value::Time(_) => return 2,
+                        _ => {}
                     }
                     let text = string_value(value);
-                    let bytes = text.as_bytes();
-                    bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-')
+                    let bytes = text.trim_ascii().as_bytes();
+                    if bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-') {
+                        return u8::from(bytes.len() > 10);
+                    }
+                    2
                 };
-                if is_datetime(&values[0]) != is_datetime(&values[1]) {
+                if temporal_kind(&values[0]) != temporal_kind(&values[1]) {
                     return Ok(Value::Null);
                 }
                 // MySQL: both args must be the same kind (both TIME or
@@ -7620,48 +7606,16 @@ where
         // -- Hash functions --
         "MD5" => {
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| {
-                use md5::Digest;
-                let hash = md5::Md5::digest(value_bytes_ref(&value));
-                Ok(Value::String(crate::util::hex::encode_lower(&hash)))
-            })
+            digest::hash_value(digest::HashAlgorithm::Md5, &value)
         }
         "SHA1" | "SHA" => {
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| {
-                use sha1::Digest;
-                let hash = sha1::Sha1::digest(value_bytes_ref(&value));
-                Ok(Value::String(crate::util::hex::encode_lower(&hash)))
-            })
+            digest::hash_value(digest::HashAlgorithm::Sha1, &value)
         }
         "SHA2" => {
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, &mut eval_arg)?;
-            // MySQL distinguishes the two NULL positions: NULL data
-            // propagates silently, while a NULL/invalid digest length is an
-            // invalid native-function parameter and emits warning 1583.
-            if matches!(values[1], Value::Null) {
-                warn_invalid_sha2_length();
-                return Ok(Value::Null);
-            }
-            use sha2::Digest;
-            let hash_len = int_value(&values[1])?;
-            if !matches!(hash_len, 0 | 224 | 256 | 384 | 512) {
-                warn_invalid_sha2_length();
-                return Ok(Value::Null);
-            }
-            if matches!(values[0], Value::Null) {
-                return Ok(Value::Null);
-            }
-            let input = value_bytes_ref(&values[0]);
-            let hex = match hash_len {
-                224 => crate::util::hex::encode_lower(&sha2::Sha224::digest(&input)),
-                256 | 0 => crate::util::hex::encode_lower(&sha2::Sha256::digest(&input)),
-                384 => crate::util::hex::encode_lower(&sha2::Sha384::digest(&input)),
-                512 => crate::util::hex::encode_lower(&sha2::Sha512::digest(&input)),
-                _ => unreachable!("SHA2 length validated above"),
-            };
-            Ok(Value::String(hex))
+            digest::sha2_value(&values[0], &values[1])
         }
         // -- JSON functions --
         "JSON_EXTRACT" => {
@@ -8035,6 +7989,12 @@ where
     // dispatch into the geometry SQL surface.
     if crate::engine::geo::sql::is_geo_function(upper) {
         let values = eval_args(args, eval_arg)?;
+        if crate::engine::geo::sql::is_geometry_collection_constructor(upper) {
+            let typed = args
+                .iter()
+                .all(|arg| const_expr_type(arg) == ColumnType::Geometry);
+            return crate::engine::geo::sql::eval_geometry_constructor(name, &values, typed);
+        }
         return crate::engine::geo::sql::eval(upper, name, &values);
     }
     // Vector functions (DISTANCE / STRING_TO_VECTOR / VECTOR_DIM / …) dispatch
@@ -8054,7 +8014,8 @@ where
                 // single-line encoding round-trips through mydb's own
                 // FROM_BASE64 but not through the client's when the
                 // client's decoder is strict about line length.
-                let encoded = base64::engine::general_purpose::STANDARD.encode(value_bytes(&value));
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(value_bytes_ref(&value));
                 let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 + 1);
                 for (i, ch) in encoded.chars().enumerate() {
                     if i > 0 && i % 76 == 0 {
@@ -14640,6 +14601,46 @@ pub(crate) fn value_bytes_ref(value: &Value) -> std::borrow::Cow<'_, [u8]> {
             Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
             Cow::Owned(text) => Cow::Owned(text.into_bytes()),
         },
+    }
+}
+
+/// Shared HEX value semantics; encoding provenance is bound by the caller.
+pub(crate) fn hex_value(value: &Value) -> Result<Value, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match value {
+        // Numeric input follows CONV(N, 10, 16) per MySQL 8.0 manual:
+        // FLOAT/DOUBLE/DECIMAL are rounded half-away-from-zero to an
+        // integer first (HEX(1.5) → "2"); negative values use the
+        // unsigned two's-complement representation, matching CONV.
+        Value::Int(v) => Ok(Value::String(format!("{:X}", *v as u64))),
+        Value::UInt(v) => Ok(Value::String(format!("{:X}", v))),
+        Value::Float(_)
+        | Value::Double(_)
+        | Value::Decimal(_)
+        | Value::DecimalCompact(_, _)
+        | Value::Decimal128(..)
+        | Value::DecimalWide(..) => {
+            let n = cast_to_integer(value, false)?;
+            let as_int = match n {
+                Value::Int(v) => v as u64,
+                Value::UInt(v) => v,
+                _ => int_value(&n)? as u64,
+            };
+            Ok(Value::String(format!("{:X}", as_int)))
+        }
+        // BLOB/binary string: hex-encode the raw bytes. Routing
+        // through string_value would lossily map invalid UTF-8
+        // (e.g. 0xFF) to U+FFFD before encoding.
+        Value::Bytes(b) => Ok(Value::String(hex_upper_encode(b))),
+        // Any other value (String, temporal, ...) is treated as a
+        // byte string: HEX(str) hex-encodes each byte per MySQL 8.0.
+        // Do NOT dispatch to numeric based on parse::<i64>() success —
+        // MySQL keys off the argument type, not on its content.
+        _ => Ok(Value::String(hex_upper_encode(
+            value_bytes_ref(value).as_ref(),
+        ))),
     }
 }
 
@@ -27182,7 +27183,7 @@ pub(crate) fn format_bytes(n: f64) -> String {
     } else if abs >= KIB {
         (n / KIB, "KiB")
     } else {
-        return format!("{} bytes", n as i64);
+        return format!("{:4} bytes", n as i64);
     };
     format!("{:.2} {}", val, unit)
 }
@@ -27194,7 +27195,7 @@ pub(crate) fn format_pico_time(n: f64) -> String {
     }
     let abs = n.abs();
     if abs < 1.0e3 {
-        return format!("{} ps", n as i64);
+        return format!("{:3} ps", n as i64);
     }
     if abs < 1.0e6 {
         return format!("{:.2} ns", n / 1.0e3);

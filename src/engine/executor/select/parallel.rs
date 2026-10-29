@@ -154,7 +154,100 @@ impl crate::storage::RowDecodeSink for DecodedPredicateSink<'_> {
         }
     }
 
-    reject_decode_lanes!(unsupported; put_i64, put_u64, put_f32, put_f64, put_decimal_compact, put_decimal_wide, put_date, put_year, put_time, put_datetime, put_bytes, put_json, put_geometry, put_vector, put_value);
+    fn put_i64(&mut self, col: usize, value: i64) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::I64(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_u64(&mut self, col: usize, value: u64) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::U64(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_f32(&mut self, col: usize, value: f32) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::F64(f64::from(value)),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_f64(&mut self, col: usize, value: f64) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::F64(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_date(&mut self, col: usize, value: i32) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::Date(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_year(&mut self, col: usize, value: u8) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::Year(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_time(&mut self, col: usize, value: i64) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::Time(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_datetime(&mut self, col: usize, value: i64) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::DateTime(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_timestamp(&mut self, col: usize, value: i64) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::Timestamp(value),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    fn put_decimal_compact(&mut self, col: usize, value: i64, scale: u8) {
+        self.put_decimal_wide(col, i128::from(value), scale);
+    }
+    fn put_decimal_wide(&mut self, col: usize, value: i128, scale: u8) {
+        if !self.program.put_numeric(
+            col,
+            super::super::vec::scan_bridge::PredicateValue::Decimal(value, scale),
+            self.results,
+        ) {
+            self.unsupported();
+        }
+    }
+    reject_decode_lanes!(unsupported; put_bytes, put_json, put_geometry, put_vector, put_value);
 }
 
 impl ScanTask {
@@ -2599,7 +2692,7 @@ pub(super) fn execute_parallel_sort(
                     order_by,
                     p,
                     Some((db, super::execution_context::ExecutionContext::capture(txn))),
-                )
+                );
             }
         }
     }

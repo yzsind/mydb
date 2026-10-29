@@ -1119,6 +1119,10 @@ impl HashJoinBatchOperator<'_> {
             })?;
             let mut build_rows = 0u64;
             let mut match_rows = 0u64;
+            // Existence joins need only one match per key. Ordered inputs
+            // commonly repeat it many times; reuse the last successful
+            // membership proof without repeating two hash/set lookups.
+            let mut last_matched_key = None;
             while let Some(batch) = self.build.next_batch()? {
                 let column = &batch.columns()[build_key];
                 let Some(values) = column.as_i64_slice() else {
@@ -1136,9 +1140,15 @@ impl HashJoinBatchOperator<'_> {
                 };
                 for row in batch.visible_indices() {
                     build_rows = build_rows.saturating_add(1);
-                    if !column.is_null(row) && candidates.contains(i128::from(values[row])) {
+                    if !column.is_null(row)
+                        && (last_matched_key == Some(values[row])
+                            || candidates.contains(i128::from(values[row])))
+                    {
                         match_rows = match_rows.saturating_add(1);
-                        matched.insert(values[row]);
+                        if last_matched_key != Some(values[row]) {
+                            matched.insert(values[row]);
+                            last_matched_key = Some(values[row]);
+                        }
                     } else {
                         analyze_stats::add_pending_runtime_filter_rejected(1);
                     }

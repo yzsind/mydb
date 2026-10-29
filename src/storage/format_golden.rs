@@ -20,7 +20,7 @@ macro_rules! golden {
             $actual,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/src/storage/fixtures/release-v1/",
+                "/tests/fixtures/storage-format-v1/",
                 $name,
                 ".bin"
             )),

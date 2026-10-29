@@ -35,6 +35,11 @@ impl ExprProgram {
     pub(crate) fn column_parallel_safe(&self, schema: &BatchSchema) -> bool {
         contract(&self.root, schema).is_some_and(|c| c.parallel)
     }
+    /// Reservation for a retained output, independent of speculative workspace limits.
+    pub(crate) fn column_retained_bound(&self, batch: &Batch) -> Option<usize> {
+        contract(&self.root, batch.schema())?;
+        workspace(&self.root, batch)?.0.checked_mul(2)
+    }
     pub(crate) fn column_output_bound(&self, batch: &Batch) -> Option<usize> {
         contract(&self.root, batch.schema())?;
         let (payload, work) = workspace(&self.root, batch)?;
@@ -319,6 +324,30 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                         }
                         (Domain::Integer(0, u32::MAX as i64), child.parallel)
                     }
+                    (
+                        FunctionKernel::Hex
+                        | FunctionKernel::Md5
+                        | FunctionKernel::Sha
+                        | FunctionKernel::Sha1,
+                        [arg],
+                    ) => {
+                        let child = contract(arg, schema)?;
+                        if !matches!(child.domain, Domain::Text | Domain::Binary | Domain::Null) {
+                            return None;
+                        }
+                        (Domain::Text, child.parallel)
+                    }
+                    (FunctionKernel::Sha2, [arg, length])
+                        if integer(length)
+                            .and_then(crate::engine::expr::digest::HashAlgorithm::from_sha2_length)
+                            .is_some() =>
+                    {
+                        let child = contract(arg, schema)?;
+                        if !matches!(child.domain, Domain::Text | Domain::Binary | Domain::Null) {
+                            return None;
+                        }
+                        (Domain::Text, child.parallel)
+                    }
                     (FunctionKernel::Concat, args) if !args.is_empty() => {
                         let mut binary = false;
                         for arg in args {
@@ -428,6 +457,14 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             }
             let (input, work) = workspace(args.first()?, batch)?;
             let bytes = match kernel {
+                FunctionKernel::Hex => input.checked_mul(2)?.checked_add(offsets)?,
+                FunctionKernel::Md5
+                | FunctionKernel::Sha
+                | FunctionKernel::Sha1
+                | FunctionKernel::Sha2 => hash_algorithm(*kernel, args)?
+                    .hex_len()
+                    .checked_mul(batch.num_rows())?
+                    .checked_add(offsets)?,
                 FunctionKernel::Length
                 | FunctionKernel::CharLength
                 | FunctionKernel::Abs
@@ -722,6 +759,17 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
                     }
                     Some(ColumnVector::I64 { data, nulls })
                 }
+                FunctionKernel::Hex => {
+                    let column = operand(args.first()?, batch)?;
+                    hex_column(column.as_ref())
+                }
+                FunctionKernel::Md5
+                | FunctionKernel::Sha
+                | FunctionKernel::Sha1
+                | FunctionKernel::Sha2 => {
+                    let column = operand(&args[0], batch)?;
+                    hash_column(hash_algorithm(*kernel, args)?, column.as_ref())
+                }
                 FunctionKernel::Length | FunctionKernel::CharLength => {
                     let col = operand(&args[0], batch)?;
                     let mut data = Vec::with_capacity(rows);
@@ -894,6 +942,64 @@ fn slice(column: &ColumnVector, start: i64, len: Option<i64>) -> Option<ColumnVe
         }
     })
 }
+fn hex_column(column: &ColumnVector) -> Option<ColumnVector> {
+    let mut data = String::with_capacity(column.memory_bytes().checked_mul(2)?);
+    let mut offsets = Vec::with_capacity(column.len() + 1);
+    offsets.push(0);
+    for row in 0..column.len() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if !column.is_null(row) {
+            crate::util::hex::append_upper(&mut data, bytes_at(column, row)?);
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    Some(ColumnVector::Utf8 {
+        data: data.into_bytes(),
+        offsets,
+        nulls: validity(column),
+    })
+}
+
+fn hash_algorithm(
+    kernel: FunctionKernel,
+    args: &[ExprNode],
+) -> Option<crate::engine::expr::digest::HashAlgorithm> {
+    use crate::engine::expr::digest::HashAlgorithm;
+    match kernel {
+        FunctionKernel::Md5 => Some(HashAlgorithm::Md5),
+        FunctionKernel::Sha | FunctionKernel::Sha1 => Some(HashAlgorithm::Sha1),
+        FunctionKernel::Sha2 => HashAlgorithm::from_sha2_length(integer(args.get(1)?)?),
+        _ => None,
+    }
+}
+
+fn hash_column(
+    algorithm: crate::engine::expr::digest::HashAlgorithm,
+    column: &ColumnVector,
+) -> Option<ColumnVector> {
+    let mut data = Vec::with_capacity(column.len().checked_mul(algorithm.hex_len())?);
+    let mut offsets = Vec::with_capacity(column.len() + 1);
+    offsets.push(0);
+    for row in 0..column.len() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if !column.is_null(row) {
+            algorithm
+                .append_hex(bytes_at(column, row)?, &mut data)
+                .ok()?;
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    Some(ColumnVector::Utf8 {
+        data,
+        offsets,
+        nulls: validity(column),
+    })
+}
+
 fn right(column: &ColumnVector, count: i64) -> Option<ColumnVector> {
     let binary = matches!(column, ColumnVector::Bytes { .. });
     let mut data = Vec::new();

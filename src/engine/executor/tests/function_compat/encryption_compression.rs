@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/encryption-compression.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/encryption-compression.json"
+));
 
 function_fixture_test!(aes_decrypt, "AES_DECRYPT", FIXTURE);
 function_fixture_test!(aes_encrypt, "AES_ENCRYPT", FIXTURE);
