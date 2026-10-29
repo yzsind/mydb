@@ -474,6 +474,7 @@ pub(super) fn finish(
     };
     // Inherited service configuration must not turn an isolated preparation
     // into a replica/archiver or redirect it to the source instance.
+    command.env_remove("MYDB_ROLE");
     command.env_remove("MYDB_BACKUP_REPOSITORY");
     command.env_remove("MYDB_WAL_FORCE_RECOVER");
     command.env_remove("MYDB_UNDO_FORCE_RECOVER");

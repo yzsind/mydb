@@ -731,14 +731,14 @@ fn spatial_index_ddl_dml_and_metadata() {
     );
     assert_eq!(stat.to_ascii_uppercase(), "SPATIAL");
 
-    // The spatial predicate returns correct results (window [2,5]×[2,5]
-    // contains points (2,2),(3,3),(4,4),(5,5)).
+    // Contains excludes boundary points; Covers includes all four points.
     let cnt = cell(
         &engine,
         "SELECT COUNT(*) FROM places \
          WHERE MBRContains(ST_GeomFromText('POLYGON((2 2,5 2,5 5,2 5,2 2))'), loc)",
     );
-    assert_eq!(cnt, "4");
+    assert_eq!(cnt, "2");
+    assert_eq!(cell(&engine,"SELECT COUNT(*) FROM places WHERE MBRCovers(ST_GeomFromText('POLYGON((2 2,5 2,5 5,2 5,2 2))'),loc)"),"4");
 
     // DELETE then re-query stays correct (index entry removed too).
     engine.execute("DELETE FROM places WHERE id = 3").unwrap();
@@ -747,7 +747,7 @@ fn spatial_index_ddl_dml_and_metadata() {
         "SELECT COUNT(*) FROM places \
          WHERE MBRContains(ST_GeomFromText('POLYGON((2 2,5 2,5 5,2 5,2 2))'), loc)",
     );
-    assert_eq!(cnt2, "3");
+    assert_eq!(cnt2, "1");
 
     // DROP the index.
     engine.execute("DROP INDEX loc ON places").unwrap();
@@ -778,13 +778,17 @@ fn spatial_index_drives_query_and_matches_full_scan() {
         }
     }
 
-    // Window query driven by the spatial index. Window MBR = [3,7]×[3,7];
-    // points with x,y ∈ {3,4,5,6,7} ⇒ 25 rows.
+    // Window query driven by the spatial index. Contains excludes boundary
+    // points, so x,y in {4,5,6} yields nine rows; Covers yields 25.
     let q = "SELECT id FROM places \
              WHERE MBRContains(ST_GeomFromText('POLYGON((3 3,7 3,7 7,3 7,3 3))'), loc) \
              ORDER BY id";
     let got = rows(&engine, q);
-    assert_eq!(got.len(), 25, "indexed spatial query row count");
+    assert_eq!(got.len(), 9, "indexed spatial query row count");
+    assert_eq!(
+        rows(&engine, &q.replace("MBRContains", "MBRCovers")).len(),
+        25
+    );
 
     // EXPLAIN confirms the spatial index is chosen.
     let explained = rows(&engine, &format!("EXPLAIN {q}"));

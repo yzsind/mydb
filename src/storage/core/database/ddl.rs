@@ -8379,13 +8379,14 @@ impl Database {
                 .collect();
             self.publish_copied_vector_owners(&candidate, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
-                .append_wal(
+                .log_copied_generation(ddl_txn_id, &file_swap)
+                .and_then(|_| self.append_wal(
                     ddl_txn_id,
                     WalPayload::DdlCommit {
                         job_id: job.job_id,
                         retired_paths,
                     },
-                )
+                ))
                 .and_then(|_| self.commit_catalog_txn_existing(ddl_txn));
             if let Err(err) = publish {
                 if let Ok(mut catalog) = self.catalog_write() {
@@ -8994,6 +8995,64 @@ impl Database {
             old_to_backup,
             shadow_to_live,
         })
+    }
+
+    /// Direct COPY output is durable locally but has no row redo. Publish a
+    /// bounded physical baseline at its final paths before committing the DD.
+    /// Replication and backup replay cannot follow local hard links or intents.
+    fn log_copied_generation(
+        &self,
+        txn_id: u64,
+        swap: &ShadowGenerationFileSwap,
+    ) -> Result<(), QueryError> {
+        if self.config.durability == DurabilityMode::Memory {
+            return Ok(());
+        }
+        let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+            4 * PAGE_SIZE,
+        )?;
+        for (_, path) in &swap.shadow_to_live {
+            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+            if matches!(ext, "idx" | "vmanifest") || !path.try_exists().map_err(io_err)? {
+                continue;
+            }
+            let relative = self.relative_path(path);
+            let mut file = File::open(path).map_err(io_err)?;
+            let total = file.metadata().map_err(io_err)?.len();
+            if matches!(ext, "hvec" | "hnsw") {
+                let _vector_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+                    2 * 1024 * 1024,
+                )?;
+                let mut bytes = vec![0; 1024 * 1024];
+                let mut offset = 0;
+                while offset < total {
+                    let count = (total - offset).min(bytes.len() as u64) as usize;
+                    file.read_exact(&mut bytes[..count]).map_err(io_err)?;
+                    self.append_wal(txn_id, WalPayload::VectorIndexImage {
+                        path: relative.clone(), offset, total, bytes: bytes[..count].to_vec(),
+                    })?;
+                    offset += count as u64;
+                }
+                continue;
+            }
+            if total == 0 || total % PAGE_SIZE as u64 != 0 {
+                return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                    "copied generation has invalid page file length"));
+            }
+            let mut page = vec![0; PAGE_SIZE];
+            file.read_exact(&mut page).map_err(io_err)?;
+            self.append_wal(txn_id, WalPayload::FileCreate {
+                path: relative.clone(), after: page.clone(),
+            })?;
+            for page_id in 1..total / PAGE_SIZE as u64 {
+                crate::engine::cancel::check_cancelled()?;
+                file.read_exact(&mut page).map_err(io_err)?;
+                self.append_wal(txn_id, WalPayload::full_page_image(relative.clone(), page_id, page.clone()))?;
+            }
+        }
+        Ok(())
     }
 
     fn rollback_shadow_generation_file_swap(

@@ -673,6 +673,10 @@ For example, after `SET @j=CAST('5' AS JSON)`, `@j='5'` returns 0 while
 `(@j) MEMBER OF(CAST('[5]' AS JSON))` returns 1; both use consistent JSON typing
 rules. Applications relying on MySQL's user-variable stringification must
 convert explicitly.
+Boolean contexts use JSON numeric coercion: JSON `false`, zero and nonnumeric
+objects/arrays are false. This deliberately avoids MySQL's implicit comparison
+that can treat JSON `false` as true. JSON-to-number comparisons retain JSON type
+ordering; use an explicit numeric cast when numeric range semantics are wanted.
 MEMBER OF distinguishes a JSON DATE from a JSON string with the same text,
 consistently whether using a multi-valued index or a scan;
 it does not follow MySQL's plan-dependent behavior where a DATE multi-valued

@@ -37,8 +37,10 @@ pub(crate) fn mbr_predicate(op: MbrOp, a: &Geom, b: &Geom) -> Option<bool> {
     let ma = a.mbr()?;
     let mb = b.mbr()?;
     Some(match op {
-        MbrOp::Contains | MbrOp::Covers => ma.contains(&mb),
-        MbrOp::Within | MbrOp::CoveredBy => mb.contains(&ma),
+        MbrOp::Contains => contains_interior(&ma, &mb),
+        MbrOp::Within => contains_interior(&mb, &ma),
+        MbrOp::Covers => ma.contains(&mb),
+        MbrOp::CoveredBy => mb.contains(&ma),
         MbrOp::Intersects => ma.intersects(&mb),
         MbrOp::Disjoint => !ma.intersects(&mb),
         MbrOp::Equals => ma.equals(&mb),
@@ -47,6 +49,21 @@ pub(crate) fn mbr_predicate(op: MbrOp, a: &Geom, b: &Geom) -> Option<bool> {
             interiors_overlap(&ma, &mb) && !ma.contains(&mb) && !mb.contains(&ma) && !ma.equals(&mb)
         }
     })
+}
+
+#[inline]
+fn contains_interior(a: &Mbr, b: &Mbr) -> bool {
+    a.contains(b)
+        && (if a.minx == a.maxx {
+            b.minx == a.minx && b.maxx == a.maxx
+        } else {
+            b.minx < a.maxx && b.maxx > a.minx
+        })
+        && (if a.miny == a.maxy {
+            b.miny == a.miny && b.maxy == a.maxy
+        } else {
+            b.miny < a.maxy && b.maxy > a.miny
+        })
 }
 
 #[inline]

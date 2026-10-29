@@ -361,12 +361,10 @@ impl Database {
         }
         for path in important_paths {
             let marker = path.with_extension("idx.failed");
-            let planned = match fs::read(&marker) {
-                Ok(bytes) => bytes == b"planned logical redo rebuild",
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-                Err(err) => return Err(io_err(err)),
-            };
-            if !planned {
+            // A structural-redo failure fences a derived tree for the same
+            // heap rebuild as a planned logical redo. Persistent posting
+            // corruption is still rejected by the idx.corrupt fence above.
+            if !marker.try_exists().map_err(io_err)? {
                 validation.validate(path.clone()).map_err(|err| err.map_message(|message|
                     format!("important FULLTEXT index validation failed ({}): {message}", path.display())))?;
             }

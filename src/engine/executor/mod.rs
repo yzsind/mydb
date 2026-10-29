@@ -5537,6 +5537,35 @@ impl StorageQueryEngine {
 /// Keep the first cut to single-statement autocommit DML: multi-statement
 /// transaction retry semantics stay on the legacy path, whose savepoint
 /// and lock-wait behavior is already covered by the executor tests.
+fn validate_text_bind_markers(sql: &str, statement: &Statement) -> Result<(), QueryError> {
+    if !sql.as_bytes().contains(&b'?') {
+        return Ok(());
+    }
+    struct Markers(bool);
+    impl crate::parser::visit::AstVisitor for Markers {
+        fn enter_expr(&mut self, expr: &Expr) {
+            self.0 |= matches!(expr, Expr::Placeholder(_));
+        }
+        fn enter_limit(&mut self, limit: &crate::parser::LimitValue) {
+            self.0 |= matches!(
+                limit,
+                crate::parser::LimitValue::Placeholder(_)
+                    | crate::parser::LimitValue::OffsetCommaPlaceholder(_)
+            );
+        }
+    }
+    let mut markers = Markers(false);
+    crate::parser::visit::visit_statement(&mut markers, statement);
+    if markers.0 {
+        Err(error(
+            crate::error::catalog::ER_PARSE_ERROR,
+            "Parameter markers are only allowed in prepared statements",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn can_use_prepared_dml(session: &SessionContext) -> bool {
     // Originally `autocommit && !explicit_txn && current_txn.is_none()`.
     // Relaxed to also cover explicit / non-autocommit transactions
@@ -5756,6 +5785,10 @@ impl StorageQueryEngine {
             }
         };
 
+        if let Err(err) = validate_text_bind_markers(sql, &statement) {
+            return (Err(err), QueryLogMetadata::default());
+        }
+
         // Phase 2 auto-parameterization. SELECT statements get their safe
         // literals extracted into `Expr::Placeholder` + a parallel
         // `Vec<Value>`, so two queries that differ only in literal values
@@ -5808,6 +5841,9 @@ impl StorageQueryEngine {
                 Ok(statement) => statement,
                 Err(error) => return (Err(parse_error_to_query_error(error)), metadata),
             };
+            if let Err(err) = validate_text_bind_markers(child_sql, &statement) {
+                return (Err(err), metadata);
+            }
             let statement_auto_mode =
                 auto_param_mode_for_statement(&self.db, session, &statement, auto_mode);
             let promoted_safe_counter = auto_mode

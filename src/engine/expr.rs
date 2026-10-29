@@ -5813,8 +5813,8 @@ where
                     };
                     cast_to_decimal(&value, precision, scale)
                 }
-                "DOUBLE" => Ok(Value::Double(numeric(&value)?)),
-                "FLOAT" => Ok(Value::Float(numeric(&value)? as f32)),
+                "DOUBLE" => cast_to_float(&value, false),
+                "FLOAT" => cast_to_float(&value, true),
                 "BINARY" => {
                     // MySQL 8.0 CAST AS BINARY(n): if `n` is given, pad the
                     // right with 0x00 up to n bytes or truncate down to n
@@ -16393,8 +16393,8 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
             cast_to_integer(&json_value_numeric_input(value)?, false)
         }
         "UNSIGNED" | "UNSIGNED INTEGER" => cast_to_integer(&json_value_numeric_input(value)?, true),
-        "FLOAT" => Ok(Value::Float(numeric(&value)? as f32)),
-        "DOUBLE" | "REAL" => Ok(Value::Double(numeric(&value)?)),
+        "FLOAT" => cast_to_float(&value, true),
+        "DOUBLE" | "REAL" => cast_to_float(&value, false),
         "DECIMAL" => json_value_require_conversion(cast_to_decimal(
             &json_value_numeric_input(value)?,
             params.first().copied().unwrap_or(10).clamp(1, 65) as u8,
@@ -22160,6 +22160,25 @@ fn round_fsp_fraction(nanos: u32, fsp: u8) -> (String, bool) {
     (digits[..fsp as usize].to_string(), carry)
 }
 
+fn cast_to_float(value: &Value, single: bool) -> Result<Value, QueryError> {
+    let number = numeric(value)?;
+    if !number.is_finite() || (single && !(number as f32).is_finite()) {
+        return Err(error(
+            crate::error::catalog::ER_DATA_OUT_OF_RANGE,
+            if single {
+                "FLOAT value is out of range"
+            } else {
+                "DOUBLE value is out of range"
+            },
+        ));
+    }
+    Ok(if single {
+        Value::Float(number as f32)
+    } else {
+        Value::Double(number)
+    })
+}
+
 pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, QueryError> {
     if let Value::UInt(value) = value {
         return Ok(if unsigned {
@@ -25397,8 +25416,7 @@ pub(crate) fn coerce_result_to_expr_type(
         ExprTypeKind::Decimal {
             precision, scale, ..
         } => cast_to_decimal(&value, precision, scale),
-        ExprTypeKind::Float { single: true, .. } => Ok(Value::Float(numeric(&value)? as f32)),
-        ExprTypeKind::Float { single: false, .. } => Ok(Value::Double(numeric(&value)?)),
+        ExprTypeKind::Float { single, .. } => cast_to_float(&value, single),
         ExprTypeKind::String {
             kind: StringKind::Binary | StringKind::Blob,
         } => {

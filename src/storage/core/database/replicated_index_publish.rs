@@ -104,6 +104,14 @@ impl Database {
         // A cold handle must still resolve every candidate index identity.
         for (_, table) in tables {
             if let Some(table) = table {
+                if let Some(old) = old_tables.iter().find(|old| old.id == table.id
+                    && old.active_generation != table.active_generation) {
+                    for id in old.storage_ids() {
+                        self.remove_heap_cache_entry(id)?;
+                        self.remove_overflow_cache_entry(id)?;
+                        self.forget_zone_map(id)?;
+                    }
+                }
                 self.register_reorg_storage_definition(&table.storage_ids(), table);
             }
         }

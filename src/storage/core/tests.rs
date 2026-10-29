@@ -27471,6 +27471,139 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
 }
 
 #[test]
+fn blackbox_fulltext_structural_recovery_rebuilds_from_heap() {
+    use crate::engine::{QueryResponse, StorageQueryEngine};
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let path;
+    {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO docs VALUES(1,'alpha beta'),(2,'alpha gamma'),(3,'delta')")
+            .unwrap();
+        let db = engine.database();
+        db.checkpoint().unwrap();
+        let table = db.table("docs").unwrap();
+        path = db.index_path_for_table_schema(&table, table.id, "ft");
+    }
+    // Recovery fences an incomplete structural redo with this durable marker.
+    // Unlike a corrupt posting payload, the index remains derived from the heap.
+    fs::write(path.with_extension("idx.failed"), b"").unwrap();
+    for _ in 0..2 {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        let QueryResponse::ResultSet(rs) = engine
+            .execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha') ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        assert!(!path.with_extension("idx.failed").exists());
+    }
+}
+
+#[test]
+fn blackbox_generated_column_replication_preserves_rows_after_reopen() {
+    use crate::engine::{QueryResponse, StorageQueryEngine};
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let dest = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    for kind in ["STORED", "VIRTUAL"] {
+        let master_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let replica_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+        master
+            .execute("CREATE TABLE t(id INT PRIMARY KEY,a INT)")
+            .unwrap();
+        master
+            .execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)")
+            .unwrap();
+        let source = master.database_for_replication();
+        source.checkpoint().unwrap();
+        copy_tree(master_dir.path(), replica_dir.path());
+        let mut role = crate::repl::role::RoleState::new_standalone();
+        role.role = crate::repl::role::Role::Replica;
+        crate::repl::role::save(replica_dir.path(), &role).unwrap();
+        let start = source.wal_log().lock().next_lsn();
+        {
+            let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+            let target = replica.database_for_replication().clone();
+            master
+                .execute(&format!(
+                    "ALTER TABLE t ADD COLUMN g INT GENERATED ALWAYS AS (a*2) {kind}"
+                ))
+                .unwrap();
+            master.execute("INSERT INTO t(id,a) VALUES(4,40)").unwrap();
+            master.execute("UPDATE t SET a=21 WHERE id=2").unwrap();
+            let log = source.wal_log();
+            let safe = log.lock().next_lsn() - 1;
+            crate::wal::LogManager::sync_durable_to(&log, safe).unwrap();
+            let mut applier = crate::repl::replica::applier::Applier::with_database(
+                replica_dir.path(),
+                target.wal_log(),
+                target.clone(),
+                crate::repl::replica::progress::ReplicaProgress::default(),
+            );
+            let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+            while let Some(chunk) = reader.next_chunk(safe, 1 << 20).unwrap() {
+                applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+            }
+            let QueryResponse::ResultSet(rs) = replica
+                .execute("SELECT id,a,g FROM t ORDER BY id")
+                .unwrap()
+                .materialize()
+                .unwrap()
+            else {
+                panic!("rows")
+            };
+            assert_eq!(
+                rs.rows,
+                vec![
+                    vec![Value::Int(1), Value::Int(10), Value::Int(20)],
+                    vec![Value::Int(2), Value::Int(21), Value::Int(42)],
+                    vec![Value::Int(3), Value::Int(30), Value::Int(60)],
+                    vec![Value::Int(4), Value::Int(40), Value::Int(80)]
+                ],
+                "{kind}"
+            );
+            crate::wal::LogManager::sync_durable_to(&target.wal_log(), safe).unwrap();
+            target.flush_dirty_data().unwrap();
+        }
+        let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+        let QueryResponse::ResultSet(rs) = replica
+            .execute("SELECT id,a,g FROM t ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        let QueryResponse::ResultSet(expected) = master
+            .execute("SELECT id,a,g FROM t ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        assert_eq!(rs.rows, expected.rows, "{kind} after restart");
+    }
+}
+
+#[test]
 fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
     use crate::engine::api::QueryResponse;
     use crate::engine::api::SessionContext;

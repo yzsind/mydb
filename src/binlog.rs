@@ -3159,7 +3159,12 @@ impl BinlogSourceManager {
     ///    checksum-algorithm descriptor byte. Without this, the SQL
     ///    thread defaults to NONE-checksum and chokes on the CRC32
     ///    trailer attached to every subsequent event.
-    pub fn dump_preamble(&self, file: &str, start_position: u64) -> Vec<Vec<u8>> {
+    pub fn dump_preamble(
+        &self,
+        file: &str,
+        start_position: u64,
+        initial_checksum: BinlogChecksum,
+    ) -> Vec<Vec<u8>> {
         let state = self.state.lock();
         let target_file = if file.is_empty() {
             state.active_file.clone()
@@ -3181,9 +3186,20 @@ impl BinlogSourceManager {
         let mut rotate_payload = Vec::with_capacity(8 + target_file.len());
         rotate_payload.extend_from_slice(&start_position.max(4).to_le_bytes());
         rotate_payload.extend_from_slice(target_file.as_bytes());
-        let mut rotate =
-            encode_event_with_timestamp(&self.config, ROTATE_EVENT, 0, 0, &rotate_payload, false);
-        mark_dump_event_artificial(&mut rotate, self.config.checksum == BinlogChecksum::Crc32);
+        // Before the FDE, the client only knows its negotiated checksum.
+        // Appending the source's CRC unconditionally makes raw clients treat
+        // four checksum bytes as part of the artificial rotate's filename.
+        let mut initial_config = self.config.clone();
+        initial_config.checksum = initial_checksum;
+        let mut rotate = encode_event_with_timestamp(
+            &initial_config,
+            ROTATE_EVENT,
+            0,
+            0,
+            &rotate_payload,
+            false,
+        );
+        mark_dump_event_artificial(&mut rotate, initial_checksum == BinlogChecksum::Crc32);
         out.push(rotate);
         // At file start the real FDE is already the next event. Mid-file
         // requests need a synthetic FDE to negotiate the checksum first.
@@ -8583,7 +8599,7 @@ mod tests {
         let manager =
             BinlogSourceManager::open(dir.path().to_path_buf(), test_config(dir.path())).unwrap();
         let file = manager.current_position().unwrap().file;
-        let preamble = manager.dump_preamble(&file, 4);
+        let preamble = manager.dump_preamble(&file, 4, BinlogChecksum::Crc32);
         assert_eq!(preamble.len(), 1);
         let rotate = &preamble[0];
         assert_eq!(rotate[4], ROTATE_EVENT);
@@ -8592,7 +8608,7 @@ mod tests {
         assert_eq!(u64::from_le_bytes(rotate[19..27].try_into().unwrap()), 4);
         let events = manager.events_after(&file, 4).unwrap();
         assert_eq!(events[0].bytes[4], FORMAT_DESCRIPTION_EVENT);
-        let middle = manager.dump_preamble(&file, 1234);
+        let middle = manager.dump_preamble(&file, 1234, BinlogChecksum::Crc32);
         assert_eq!(middle.len(), 2);
         assert_eq!(middle[1][4], FORMAT_DESCRIPTION_EVENT);
         for event in &middle {

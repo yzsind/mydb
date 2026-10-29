@@ -270,6 +270,7 @@ mod aggregate_in_scalar_fn;
 mod api;
 mod audit_20261029;
 mod auto_analyze;
+mod blackbox_audit;
 mod c_vec_rollup;
 mod cast_column_name;
 mod catalog_startup;
