@@ -970,40 +970,18 @@ enum AlgorithmState {
 /// `inflate_buf` keeps decompressed bytes between `read_packet` calls
 /// (one compressed packet may carry several raw frames).
 ///
-/// MySQL's CLIENT_COMPRESS / CLIENT_ZSTD_COMPRESSION_ALGORITHM protocol
-/// uses the **inner MySQL frame's sequence id as the compressed
-/// packet's sequence id** (so each command starts at 0 and increments
-/// per compressed packet). Connector/J 8.0 enforces this strictly;
-/// tracking an independent counter results in `compressed sequence id
-/// 0 out of order; expected 1` failures on the second command. We
-/// therefore derive the compressed seq from the wrapped inner frame
-/// instead of maintaining a separate counter.
+/// The compressed counter is independent of inner frame numbers. Each
+/// command resets it on the client; each server response continues at the
+/// last received compressed packet's sequence plus one, including LOCAL and
+/// authentication exchanges.
 pub struct CompressionState {
     inflate_buf: Vec<u8>,
     inflate_charge: ProtocolCharge,
     inflate_pos: usize,
     scratch: Vec<u8>,
     scratch_charge: ProtocolCharge,
-    /// The compressed sequence id to use for the NEXT outbound
-    /// compressed packet. Per MySQL spec, every server reply increments
-    /// the wire-level compressed seq by 1 per compressed packet,
-    /// independently of the inner MySQL frame's seq. The two only
-    /// coincide for the FIRST compressed packet of a response (when
-    /// `inner_first_seq == 1` for a single-OK reply, that compressed
-    /// packet also gets seq 1). For multi-frame responses (a SELECT
-    /// header batch followed by a rows batch), the rows batch's first
-    /// inner seq jumps to e.g. 3 because col_count + col_def already
-    /// burned inner seqs 1+2, but only ONE compressed packet has been
-    /// emitted — so its comp_seq must be 2, not 3. The codec tracks
-    /// the next outbound comp_seq here and resets it whenever it
-    /// observes `inner_first_seq` going backward (the signal that a
-    /// new response has started, since the per-response inner counter
-    /// always restarts at 1).
-    ///
-    /// `None` means "no compressed packet has been emitted yet on this
-    /// connection" — the first call seeds the counter from
-    /// `inner_first_seq`, so the very first server reply lines up with
-    /// the client's expected seq (1 for a fresh handshake).
+    /// Next outer packet number, advanced by both request and response
+    /// packets. None is only used before the first compressed exchange.
     next_out_compressed_seq: Option<u8>,
     state: AlgorithmState,
 }
@@ -1412,13 +1390,11 @@ where
     crate::engine::status_counters::add_bytes_received(1);
     read_exact_with_timeout(reader, &mut hdr[1..], net_read_timeout()).await?;
     let comp_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8) | ((hdr[2] as usize) << 16);
-    let _comp_seq = hdr[3];
+    let comp_seq = hdr[3];
+    state.next_out_compressed_seq = Some(comp_seq.wrapping_add(1));
     let uncomp_len = (hdr[4] as usize) | ((hdr[5] as usize) << 8) | ((hdr[6] as usize) << 16);
-    // The compressed sequence id is informational on the read side: the
-    // inner MySQL frame already carries the authoritative seq, and
-    // Connector/J resets the compressed seq per command. Tracking the
-    // counter independently here would race the client's reset and
-    // tear down the connection on the second command.
+    // Request and response share the outer counter; inner frame sequence
+    // numbers cannot identify compressed packet boundaries.
 
     if comp_len > MAX_COMPRESSED_PAYLOAD {
         return Err(io::Error::new(
@@ -1592,19 +1568,9 @@ where
     if raw.is_empty() {
         return Ok(());
     }
-    // Detect a new response: the inner frame seq for a server reply
-    // restarts at 1 (or 0 for handshake), so if `first_inner_seq` is
-    // smaller than what we expect for a continuation, we treat it as a
-    // boundary and resync the compressed counter to match. Equal-or-
-    // larger inner seqs mean we are still inside the same response and
-    // the compressed seq simply continues from where the previous
-    // packet left off — the rule that fixes
-    // `INSERT … ; SELECT FROM table` on mysql 8.4 zstd / zlib.
-    let resync = match state.next_out_compressed_seq {
-        None => true,
-        Some(prev_next) => first_inner_seq < prev_next,
-    };
-    if resync {
+    // Inbound reads establish response boundaries. Comparing inner numbers
+    // with outer numbers fails for multi-packet requests and sequence wrap.
+    if state.next_out_compressed_seq.is_none() {
         state.next_out_compressed_seq = Some(first_inner_seq);
     }
     // Compressed packets carry up to MAX_COMPRESSED_PAYLOAD bytes of
@@ -2378,6 +2344,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_1029_compressed_response_continues_request_counter() {
+        let mut state = CompressionState::new_zlib();
+        for (last_request_seq, expected_response_seq) in [(1u8, 2u8), (0, 1), (255, 0)] {
+            let mut request = Vec::new();
+            write_single_compressed_block(
+                &mut request,
+                &mut CompressionState::new_zlib(),
+                &[3, 0, 0, 0, b'a'],
+                last_request_seq.wrapping_sub(1),
+            )
+            .await
+            .unwrap();
+            write_single_compressed_block(
+                &mut request,
+                &mut CompressionState::new_zlib(),
+                b"bc",
+                last_request_seq,
+            )
+            .await
+            .unwrap();
+            let packet = read_packet_compressed(&mut request.as_slice(), &mut state, 1024)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(packet.payload, b"abc");
+            let mut reply = Vec::new();
+            write_packet_compressed_seq(&mut reply, &mut state, 1, b"OK")
+                .await
+                .unwrap();
+            assert_eq!(reply[3], expected_response_seq);
+            let next = reply.len();
+            write_packet_compressed_seq(&mut reply, &mut state, 3, b"row")
+                .await
+                .unwrap();
+            assert_eq!(reply[next + 3], expected_response_seq.wrapping_add(1));
+        }
+    }
+
+    #[tokio::test]
     async fn compressed_seq_monotonic_across_batches_in_same_response() {
         // Regression for the W3 bug: a SELECT response that crosses
         // multiple batched flushes (header + rows + terminator) must
@@ -2398,6 +2403,18 @@ mod tests {
         codec
             .write_packet(&mut sink, 1, b"insert-ok")
             .await
+            .unwrap();
+        let mut request = Vec::new();
+        let mut client_codec = PacketCodec::plain();
+        client_codec.enable_zlib_compression();
+        client_codec
+            .write_packet(&mut request, 0, b"select")
+            .await
+            .unwrap();
+        codec
+            .read_packet(&mut request.as_slice())
+            .await
+            .unwrap()
             .unwrap();
         {
             let mut batch = codec.batch_writer(&mut sink);

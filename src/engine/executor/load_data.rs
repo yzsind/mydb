@@ -6683,6 +6683,9 @@ mod tests {
         let input: String = (0..5003).map(|id| format!("{id}|\n")).collect();
         std::fs::write(&path, input).unwrap();
         let mut session = SessionContext::default();
+        engine
+            .execute_with_session(&mut session, "SET max_error_count=65535")
+            .unwrap();
         let response = engine.execute_with_session(&mut session, &format!(
             "LOAD DATA /*+ PARALLEL(8) */ INFILE '{}' INTO TABLE warning_rows FIELDS TERMINATED BY '|'",
             crate::util::file::sql_path(&path)
@@ -8288,6 +8291,15 @@ mod tests {
 
     #[test]
     fn direct_delimiter_scan_matches_serial_for_escaped_and_plain_rows() {
+        crate::engine::sysvar::registry()
+            .write(
+                "max_error_count",
+                crate::engine::sysvar::SetScope::Global,
+                &mut SessionContext::default(),
+                None,
+                crate::engine::sysvar::SysVarValue::UInt(65535),
+            )
+            .unwrap();
         let (engine, tmp) = setup_strict_load_engine();
         for (case, delimiter, escape, options) in [
             ("ascii", '|', '\\', "FIELDS TERMINATED BY '|'"),

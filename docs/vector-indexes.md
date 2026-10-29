@@ -101,6 +101,12 @@ neighbors. Full probing of unquantized IVF evaluates all lists with exact native
 scores. Quantized IVF still uses approximate candidate scores: full probing
 with a finite candidate pool does not guarantee global exact TopK.
 
+When evaluating recall on duplicated or zero vectors, allow interchangeable
+rows at the exact kth distance. Comparing only against one fixed set of row IDs
+can report low recall even when the returned distances are optimal. Strictly
+closer missing neighbors still count as misses; increase search breadth when
+the measured coverage is insufficient.
+
 Large cold HNSW builds can use temporary calibrated SQ8 codes for construction
 navigation and neighbor selection, independently of persistent quantization.
 Compact topology and buffers have governed memory reservations; large construction

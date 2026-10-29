@@ -1039,7 +1039,10 @@ pub(super) fn seed_rollup_accumulator_owned(
 /// `SET SESSION group_concat_max_len = N` takes effect on the next
 /// query without re-threading SessionContext through every aggregator.
 pub(crate) fn group_concat_max_len() -> usize {
-    GROUP_CONCAT_MAX_LEN.with(|cell| cell.get())
+    GROUP_CONCAT_MAX_LEN.with(|cell| cell.get()).min(
+        crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes().saturating_add(1)
+            as usize,
+    )
 }
 
 thread_local! {
@@ -2677,6 +2680,12 @@ impl Accumulator for GroupConcatAcc {
                     .saturating_mul(self.parts.len().saturating_sub(1)),
             );
         self.truncated |= total > self.max_len_bytes;
+        if crate::engine::expr::string_result_exceeds_packet(
+            "group_concat",
+            total.min(self.max_len_bytes) as u64,
+        ) {
+            return Ok(Value::Null);
+        }
         let _output = crate::engine::executor::mem_budget::force_charge_scoped(
             total.min(self.max_len_bytes),
         )?;

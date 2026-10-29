@@ -22,13 +22,16 @@ fn grant_all_keeps_dynamic_privileges_explicit() {
     engine
         .execute_with_session(&mut root, "GRANT ALL ON *.* TO 'ms_lackey'@'%'")
         .unwrap();
+    let registered = crate::engine::auth::default_dynamic_privileges()
+        .len()
+        .to_string();
     assert_eq!(
         scalar(
             &engine,
             &mut root,
             "SELECT COUNT(*) FROM mysql.global_grants WHERE USER='ms_lackey'"
         ),
-        "0"
+        registered
     );
     engine
         .execute_with_session(&mut root, "GRANT SYSTEM_USER ON *.* TO 'ms_lackey'@'%'")
@@ -39,7 +42,7 @@ fn grant_all_keeps_dynamic_privileges_explicit() {
             &mut root,
             "SELECT COUNT(*) FROM mysql.global_grants WHERE USER='ms_lackey'"
         ),
-        "1"
+        registered
     );
 }
 

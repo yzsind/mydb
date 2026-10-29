@@ -1922,12 +1922,16 @@ mod lifecycle_tests {
         let dir = TempDir::new().unwrap();
         let mut manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        Arc::get_mut(&mut manager).unwrap().config.bind_port = occupied.local_addr().unwrap().port();
+        Arc::get_mut(&mut manager).unwrap().config.bind_port =
+            occupied.local_addr().unwrap().port();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         manager.install_runtime_handle_for_tests(runtime.handle().clone());
         manager.set_role(Role::Master, None).unwrap();
         let err = manager
-            .handle_promote("PROMOTE TO MASTER", &crate::engine::SessionContext::default())
+            .handle_promote(
+                "PROMOTE TO MASTER",
+                &crate::engine::SessionContext::default(),
+            )
             .unwrap_err();
         assert!(err.message().contains("bind"));
     }

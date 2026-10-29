@@ -341,7 +341,11 @@ impl BoundAccessRecipe {
             self.writes.get(&(required.privilege.clone(), key.clone()))
         };
         let Some(columns) = columns else {
-            return false;
+            // Syntactic DML access collection may conservatively request a
+            // SELECT for an opaque subquery. A complete bound recipe proves
+            // whether the modified object actually contributes any reads.
+            return required.privilege == Privilege::Select
+                && self.writes.keys().any(|(_, object)| object == &key);
         };
         let allows = |column: &String| {
             auth.account_has_privilege(

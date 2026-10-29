@@ -2669,7 +2669,7 @@ fn rounded_integer_assignment_text(
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-            format!("Incorrect integer value: '{raw}' for column '{column}' at row 1"),
+            format!("Incorrect integer value: '{}' for column '{column}' at row 1", crate::engine::expr::diagnostic_value(raw)),
         );
         return Ok((BigInt::zero(), true));
     };
@@ -4353,8 +4353,8 @@ fn index_key_part_max_bytes(column: &ColumnSchema, prefix_len: Option<usize>) ->
         DataTypeKind::VarBinary { len } => byte_part(len.unwrap_or(255)),
         // LOB key parts reach here only with a prefix (ER 1170 fires
         // first otherwise) or under the full-column escape hatch.
-        DataTypeKind::Text { .. } => prefix_len.map_or(0, |p| p as u64 * mbmaxlen()),
-        DataTypeKind::Blob { .. } => prefix_len.map_or(0, |p| p as u64),
+        DataTypeKind::Text { max_len } => prefix_len.map_or(u64::from(*max_len), |p| p as u64 * mbmaxlen()),
+        DataTypeKind::Blob { max_len } => prefix_len.map_or(u64::from(*max_len), |p| p as u64),
         DataTypeKind::Date => 3,
         DataTypeKind::Time { fsp } => 3 + fsp_bytes(*fsp),
         DataTypeKind::DateTime { fsp } => 5 + fsp_bytes(*fsp),
@@ -4490,7 +4490,6 @@ fn validate_index_key_parts(
                     ),
                 ));
             }
-            continue;
         }
         total_bytes += index_key_part_max_bytes(column, prefix_len);
     }

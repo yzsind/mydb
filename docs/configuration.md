@@ -1080,6 +1080,11 @@ summaries whose trusted state was revoked do not become trusted again by
 replaying increments.
 
 Recovery time depends on the volume of WAL, data pages, and index repairs.
+Recovery also requires writable disk headroom for REDO and UNDO. If startup
+reports `No space left on device`, free space outside the database's data/WAL
+files and retry startup. Do not delete database files or expose an incompletely
+recovered directory for reads; a failed startup does not mean committed data
+has been lost.
 `MYDB_MEMORY_TARGET` is a working-set target; system-level hard limits should still be set through
 cgroups or the like, and it must not be taken as a guarantee that any historical
 WAL can be recovered within a fixed amount of memory.
@@ -1144,6 +1149,14 @@ or other writes; it is recommended to be owned by the service account with mode
 `0600`.
 
 ### Shutdown, Corruption Recovery, and Replication Initialization
+
+`KILL CONNECTION` closes a connection even while it is waiting for LOCAL INFILE
+data. Canceling a LOCAL upload also rolls back the incomplete statement; an
+interrupted upload may close the connection because a partially received frame
+cannot safely become the next SQL command. During result transmission,
+`KILL QUERY` completes the current frame before reporting interruption. If the
+client stops reading, `net_write_timeout` bounds that wait; `KILL CONNECTION`
+can close immediately.
 
 - `SIGINT`, `SIGTERM`, SQL `SHUTDOWN`, and `RESTART` all perform a controlled
   shutdown; `SIGHUP` does not trigger shutdown. If the final checkpoint fails, the

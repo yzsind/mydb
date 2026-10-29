@@ -554,10 +554,11 @@ where
         };
         while inflight_bytes < max_inflight_bytes {
             if slot.status() != crate::repl::SlotStatus::Active {
+                let new_start_lsn = env.log.lock().min_available_lsn();
                 protocol::write_frame_async(
                     &mut writer,
                     &Message::Resync(Resync {
-                        new_start_lsn: env.log.lock().min_available_lsn(),
+                        new_start_lsn,
                         reason:
                             "replication slot no longer retains this stream; base backup required"
                                 .into(),

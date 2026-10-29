@@ -812,6 +812,10 @@ impl<'a> CatalogTxn<'a> {
 }
 
 impl Database {
+    pub(crate) fn set_password_validation_component(&self, installed: bool) -> Result<(), QueryError> {
+        self.mutate_auth_catalog(|auth| { auth.password_validation_component = installed; Ok(()) })
+    }
+
     fn delete_auto_increment_metadata(&self, table_id: u64) -> Result<(), QueryError> {
         use crate::storage::data_dictionary::DD_INNODB_DYNAMIC_METADATA;
         let mut txn = CatalogTxn::new(self);
@@ -884,6 +888,7 @@ impl Database {
         before: &crate::engine::auth::AuthCatalog,
         after: &crate::engine::auth::AuthCatalog,
     ) -> Result<(), QueryError> {
+        crate::binlog::prepare_auth_ddl_transaction(after)?;
         use crate::storage::data_dictionary::{
             auth_grant_key, auth_restriction_key, auth_role_edge_key, DD_DD_PROPERTIES,
             DD_GLOBAL_PRIVILEGES, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_USERS,
@@ -891,6 +896,11 @@ impl Database {
 
         let mut txn = CatalogTxn::new(self);
         txn.set_delta(Vec::new(), true);
+        if before.password_validation_component != after.password_validation_component {
+            txn.replace(DD_DD_PROPERTIES,
+                CatalogRowSelector::PrimaryValues(vec![Value::String("component_validate_password".into())]),
+                vec![vec![Value::String("component_validate_password".into()), Value::String(if after.password_validation_component { "1" } else { "0" }.into())]]);
+        }
         #[cfg(test)]
         {
             txn.auth_mutation = true;
@@ -1042,9 +1052,9 @@ impl Database {
                 Value::String(after.epoch.to_string()),
             ]],
         );
-        // Account SQL is rendered from the published password hashes by the
-        // executor. Never stage its original cleartext authentication clause.
-        txn.commit()
+        // The candidate hashes have already replaced cleartext credentials.
+        // Commit the logical binlog event together with the dictionary delta.
+        txn.commit_ddl()
     }
 
     pub(crate) fn count_catalog_index_parts(
@@ -1521,20 +1531,10 @@ impl Database {
                     ] {
                         txn.replace(dd_table_id, CatalogRowSelector::All, family);
                     }
-                    let auth_epoch = rows
-                        .dd_properties
-                        .into_iter()
-                        .filter(|row| {
-                            row.first().and_then(crate::types::value_str) == Some("auth_epoch")
-                        })
-                        .collect();
-                    txn.replace(
-                        DD_DD_PROPERTIES,
-                        CatalogRowSelector::PrimaryValues(vec![Value::String(
-                            "auth_epoch".to_string(),
-                        )]),
-                        auth_epoch,
-                    );
+                    for property in rows.dd_properties {
+                        let name = property.first().and_then(crate::types::value_str).unwrap_or_default().to_string();
+                        txn.replace(DD_DD_PROPERTIES, CatalogRowSelector::PrimaryValues(vec![Value::String(name)]), vec![property]);
+                    }
                 }
             }
         }
@@ -2078,7 +2078,7 @@ impl Database {
         })?;
         let primary = Self::dd_primary_index(&table)?;
         let key = Self::dd_selector_key(&table, primary, &[Value::String(key.to_owned())])?;
-        let txn = self.begin_txn()?;
+        let txn = self.begin_read_only_txn()?;
         let result = (|| {
             for id in self.lookup_index_visible(&table, primary, key, txn)? {
                 if let Some(row) = self.read_row(&table, id, txn)? {

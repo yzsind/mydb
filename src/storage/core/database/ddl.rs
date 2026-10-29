@@ -2046,6 +2046,8 @@ impl Database {
         }
         self.drop_table_vector_graphs(&table)?;
         self.initialize_empty_spatial_indexes(&table)?;
+        let vector_names = table.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+        self.warm_vector_graphs_after_ddl(&table, &vector_names)?;
         Ok(())
     }
 
@@ -3430,7 +3432,7 @@ impl Database {
         candidate.build_column_index();
         let retired = self.build_drop_table_intent(&table)?;
         let retired_path = self.write_drop_table_intent(&retired)?;
-        let private = DropTableIntent {
+        let mut private = DropTableIntent {
             retired_index: None,
             table_id: candidate.id,
             had_auto_increment: candidate.auto_increment_column_index().is_some(),
@@ -3455,6 +3457,26 @@ impl Database {
             self.create_logged_file(txn_id_for_ddl(), self.data_dir.join(path), Vec::new())?;
         }
         self.initialize_empty_spatial_indexes(&candidate)?;
+        let vector_names = candidate.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+        if let Err(err) = self.warm_vector_graphs_after_ddl(&candidate, &vector_names) {
+            self.evict_table_vector_graphs(candidate.id);
+            let cleanup = self.build_drop_table_intent(&candidate)?;
+            if self.purge_dropped_table_files(&cleanup) {
+                self.remove_drop_table_intent(private_path.as_ref());
+                self.remove_drop_table_intent(retired_path.as_ref());
+            }
+            return Err(err);
+        }
+        // Record generated vector filenames before publishing the new identity.
+        // Recovery must retire these files too if the catalog commit aborts.
+        private = self.build_drop_table_intent(&candidate)?;
+        self.write_drop_table_intent(&private)?;
+        // The private identity is not in the catalog yet. An empty vector
+        // build may open its heap with a provisional empty codec. Reopen it
+        // from the published schema before accepting any DML.
+        for storage_id in candidate.storage_ids() {
+            self.remove_heap_cache_entry(storage_id)?;
+        }
         let candidate = Arc::new(candidate);
         let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
             crate::engine::executor::mem_budget::ControlledMemoryCategory::SystemMetadata,
@@ -3486,6 +3508,7 @@ impl Database {
                 .insert(key.clone(), table.clone());
             Self::take_catalog_mutations();
             // Preserve both intents if commit durability is ambiguous.
+            self.evict_table_vector_graphs(candidate.id);
             if self.ensure_operational().is_ok() && self.purge_dropped_table_files(&private) {
                 self.remove_drop_table_intent(private_path.as_ref());
                 self.remove_drop_table_intent(retired_path.as_ref());

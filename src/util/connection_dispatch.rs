@@ -59,7 +59,8 @@ pub fn current_worker_owns_single_connection() -> bool {
 /// runtimes keep their existing caller-provided scheduling policy.
 pub fn current_worker_has_sibling_connections() -> bool {
     WORKER_LOAD.with(|load| {
-        load.get().is_some_and(|load| load.load(Ordering::Acquire) > 1)
+        load.get()
+            .is_some_and(|load| load.load(Ordering::Acquire) > 1)
     })
 }
 
@@ -217,7 +218,8 @@ pub fn shutdown() {
 #[cfg(test)]
 pub(crate) fn test_set_worker_connection_count(connections: usize) {
     WORKER_LOAD.with(|slot| {
-        slot.set(Arc::new(AtomicUsize::new(connections))).expect("fresh test reactor thread");
+        slot.set(Arc::new(AtomicUsize::new(connections)))
+            .expect("fresh test reactor thread");
     });
 }
 

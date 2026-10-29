@@ -128,6 +128,16 @@ pub(in crate::engine::executor) fn eval_contextual_subquery_expr(
     // against the routine/trigger database before planning, just like body SQL.
     if let Some(frame) = current_subquery_frame() {
         super::super::qualification::qualify_expr_tables(&frame.db, session, expr)?;
+        // Unlike a subquery inside an ordinary SELECT, routine control-flow
+        // expressions have no enclosing statement privilege check.
+        let access = Statement::Select(Select {
+            projection: vec![SelectItem::Expr {
+                expr: expr.clone(),
+                alias: None,
+            }],
+            ..Select::default()
+        });
+        super::super::dispatch::authorize_statement(&frame.db, session, &access)?;
         // The caller owns a temporary bound AST. Its addresses can be reused
         // by the next routine expression, and bound locals can change between
         // evaluations. Keep pointer-keyed plans/results within this AST's

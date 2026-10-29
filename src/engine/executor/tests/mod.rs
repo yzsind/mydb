@@ -266,6 +266,7 @@ mod a2_vec_agg_distinct;
 mod agg_projection_fast_path;
 mod aggregate_in_scalar_fn;
 mod api;
+mod audit_20261029;
 mod auto_analyze;
 mod c_vec_rollup;
 mod cast_column_name;

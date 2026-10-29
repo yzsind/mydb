@@ -3050,10 +3050,18 @@ fn regexp_replace_utf8_column(
                 continue;
             }
         }
-        if single_match {
-            crate::engine::expr::regexp_replace_single_into(regex, value, replacement, &mut output);
+        let success = if single_match {
+            crate::engine::expr::regexp_replace_single_into(regex, value, replacement, &mut output)
         } else {
-            crate::engine::expr::regexp_replace_all_into(regex, value, replacement, &mut output);
+            crate::engine::expr::regexp_replace_all_into(regex, value, replacement, &mut output)
+        };
+        if !success {
+            output.truncate(output_start);
+            validity.set(row, false);
+            retain_nulls = true;
+            previous = None;
+            output_offsets.push(u32::try_from(output.len()).ok()?);
+            continue;
         }
         output_offsets.push(u32::try_from(output.len()).ok()?);
         previous = Some((start, end, output_start, output.len()));

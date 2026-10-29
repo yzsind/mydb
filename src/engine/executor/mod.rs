@@ -897,7 +897,7 @@ fn maybe_log_binlog_ddl_lazy(
         && !crate::binlog::current_ddl_transaction_staged()
     {
         let _sql_log_bin_guard = crate::binlog::SessionSqlLogBinGuard::new(session.sql_log_bin);
-        let normalized = credential_safe_binlog_sql(db, session, &normalize_sql(sql))?;
+        let normalized = credential_safe_binlog_sql(db, session, sql)?;
         let ctx = binlog_ctx_from_session(session);
         crate::binlog::record_ddl_autocommit_with(&session.current_database, &normalized, &ctx)?;
     }
@@ -1004,6 +1004,42 @@ fn alter_users_shared_options_sql(sql: &str) -> Result<&str, QueryError> {
     Ok(&sql[tokens.get(idx).map_or(sql.len(), |token| token.span.start)..])
 }
 
+fn create_users_shared_options_sql(sql: &str) -> Result<&str, QueryError> {
+    use crate::sql_lex::{SqlLexMode, SqlTokenCursor, SqlTokenKind};
+    let mut cursor = SqlTokenCursor::new(
+        sql,
+        SqlLexMode::from_parser_bits(crate::parser::current_parser_sql_mode_bits()),
+        crate::parser::MYSQL_VERSION_ID,
+    );
+    while let Some(token) = cursor.next().map_err(|_| {
+        crate::error::catalog::ER_PARSE_ERROR.error("Cannot locate CREATE USER options")
+    })? {
+        if token.kind != SqlTokenKind::Word
+            || ![
+                "REQUIRE",
+                "WITH",
+                "PASSWORD",
+                "ACCOUNT",
+                "ATTRIBUTE",
+                "COMMENT",
+                "FAILED_LOGIN_ATTEMPTS",
+                "PASSWORD_LOCK_TIME",
+                "DEFAULT",
+            ]
+            .iter()
+            .any(|word| cursor.token_text(&token).eq_ignore_ascii_case(word))
+        {
+            continue;
+        }
+        let tail = &sql[token.span.start..];
+        if matches!(parse_statement(&format!("CREATE USER __binlog_options__ {tail}")), Ok(Statement::CreateUser(create)) if create.accounts.len() == 1)
+        {
+            return Ok(tail);
+        }
+    }
+    Ok("")
+}
+
 /// Account DDL must never put cleartext credentials in QUERY_EVENT. MySQL
 /// rewrites successful CREATE/ALTER USER and SET PASSWORD statements to the
 /// plugin hash before binlogging; rebuild that replay SQL from the committed
@@ -1013,11 +1049,143 @@ fn credential_safe_binlog_sql(
     session: &SessionContext,
     sql: &str,
 ) -> Result<String, QueryError> {
-    let Ok(statement) = parse_statement(sql) else {
+    credential_safe_binlog_sql_from_catalog(&db.auth_catalog(), &session.authenticated_as, sql)
+}
+
+fn ddl_binlog_source_sql(sql: &str, statement: &Statement) -> String {
+    if matches!(
+        statement,
+        Statement::CreateUser(_)
+            | Statement::AlterUser(_)
+            | Statement::AlterUsers(_)
+            | Statement::SetPassword { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::DropUser { .. }
+            | Statement::RenameUser { .. }
+            | Statement::Grant(_)
+            | Statement::Revoke(_)
+            | Statement::SetDefaultRole(_)
+    ) {
+        sql.to_string()
+    } else {
+        normalize_sql(sql)
+    }
+}
+
+fn bind_binlog_account_targets(
+    sql: &str,
+    targets: &[crate::parser::AccountIdent],
+    grant: bool,
+    roles: bool,
+    account: &AccountKey,
+) -> Result<String, QueryError> {
+    use crate::sql_lex::{SqlLexMode, SqlTokenCursor, SqlTokenKind};
+    let count = targets
+        .iter()
+        .filter(|target| target.user == "CURRENT_USER()" && target.host.is_empty())
+        .count();
+    if count == 0 {
         return Ok(sql.to_string());
+    }
+    let mut cursor = SqlTokenCursor::new(
+        sql,
+        SqlLexMode::from_parser_bits(crate::parser::current_parser_sql_mode_bits()),
+        crate::parser::MYSQL_VERSION_ID,
+    );
+    let mut tokens = Vec::new();
+    while let Some(token) = cursor.next().map_err(|_| {
+        crate::error::catalog::ER_PARSE_ERROR.error("Cannot bind binary-log account targets")
+    })? {
+        tokens.push(token);
+    }
+    let delimiter = if grant { "TO" } else { "FROM" };
+    let prefix = match (grant, roles) {
+        (true, true) => "GRANT placeholder TO ",
+        (false, true) => "REVOKE placeholder FROM ",
+        (true, false) => "GRANT USAGE ON *.* TO ",
+        (false, false) => "REVOKE SELECT ON *.* FROM ",
     };
+    let start = tokens
+        .iter()
+        .position(|token| {
+            if token.kind != SqlTokenKind::Word
+                || !sql[token.span.clone()].eq_ignore_ascii_case(delimiter)
+            {
+                return false;
+            }
+            // Parsing the suffix distinguishes the delimiter from identically
+            // named roles, objects, accounts, or hosts in earlier productions.
+            match parse_statement(&format!("{prefix}{}", &sql[token.span.end..])) {
+                Ok(Statement::Grant(parsed)) => parsed.targets == targets,
+                Ok(Statement::Revoke(parsed)) => parsed.targets == targets,
+                _ => false,
+            }
+        })
+        .ok_or_else(|| {
+            crate::error::catalog::ER_PARSE_ERROR.error("Cannot locate binary-log account targets")
+        })?;
+    let mut result = String::with_capacity(sql.len());
+    let mut copied = 0;
+    let mut bound = 0;
+    for (i, token) in tokens.iter().enumerate().skip(start + 1) {
+        if bound == count {
+            break;
+        }
+        if token.kind != SqlTokenKind::Word
+            || !sql[token.span.clone()].eq_ignore_ascii_case("CURRENT_USER")
+            || tokens
+                .get(i.wrapping_sub(1))
+                .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'@'))
+            || tokens
+                .get(i + 1)
+                .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'@'))
+        {
+            continue;
+        }
+        let end = if tokens
+            .get(i + 1)
+            .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'('))
+        {
+            tokens
+                .get(i + 2)
+                .filter(|token| token.kind == SqlTokenKind::Symbol(b')'))
+                .map_or(token.span.end, |token| token.span.end)
+        } else {
+            token.span.end
+        };
+        result.push_str(&sql[copied..token.span.start]);
+        result.push_str(&account.display());
+        copied = end;
+        bound += 1;
+    }
+    if bound != count {
+        return Err(crate::error::catalog::ER_PARSE_ERROR
+            .error("Cannot resolve binary-log account targets"));
+    }
+    result.push_str(&sql[copied..]);
+    Ok(result)
+}
+
+pub(crate) fn credential_safe_binlog_sql_from_catalog(
+    auth: &crate::engine::auth::AuthCatalog,
+    account: &AccountKey,
+    sql: &str,
+) -> Result<String, QueryError> {
+    let session = SessionContext {
+        authenticated_as: account.clone(),
+        ..SessionContext::default()
+    };
+    let statement = parse_statement(sql).map_err(|_| {
+        error(
+            crate::error::catalog::ER_PARSE_ERROR,
+            "Cannot safely rewrite DDL for the binary log",
+        )
+    })?;
     let account_sql = |account: &AccountKey| -> Result<String, QueryError> {
-        let QueryResponse::ResultSet(result) = show_create_user_result(db, account)? else {
+        let QueryResponse::ResultSet(result) =
+            crate::engine::show::show_create_user_from_catalog(auth, account)?
+        else {
             unreachable!("SHOW CREATE USER returns a result set")
         };
         result
@@ -1033,6 +1201,20 @@ fn credential_safe_binlog_sql(
             })
     };
     match statement {
+        Statement::Grant(grant) => bind_binlog_account_targets(
+            sql,
+            &grant.targets,
+            true,
+            matches!(grant.kind, crate::parser::GrantKind::Roles(_)),
+            account,
+        ),
+        Statement::Revoke(revoke) => bind_binlog_account_targets(
+            sql,
+            &revoke.targets,
+            false,
+            matches!(revoke.kind, crate::parser::GrantKind::Roles(_)),
+            account,
+        ),
         Statement::CreateUser(create) => {
             let mut rendered = create
                 .accounts
@@ -1047,31 +1229,18 @@ fn credential_safe_binlog_sql(
                     sql
                 });
             }
-            let tail_start = |value: &str| {
-                [
-                    " REQUIRE ",
-                    " WITH ",
-                    " PASSWORD ",
-                    " ACCOUNT ",
-                    " ATTRIBUTE ",
-                ]
-                .into_iter()
-                .filter_map(|marker| value.find(marker))
-                .min()
-                .unwrap_or(value.len())
+            // IF NOT EXISTS may skip the last account, whose existing policy
+            // can differ from the policy applied to newly created accounts.
+            let options = create_users_shared_options_sql(sql)?;
+            let tail = if options.is_empty() {
+                String::new()
+            } else {
+                format!(" {options}")
             };
-            let tail_pos = tail_start(rendered.last().expect("non-empty CREATE USER"));
-            let tail = rendered.last().unwrap()[tail_pos..].to_string();
             let accounts = rendered
                 .iter()
-                .map(|value| {
-                    let end = tail_start(value);
-                    value[..end]
-                        .strip_prefix("CREATE USER ")
-                        .unwrap_or(&value[..end])
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
+                .map(|value| auth_account_prefix(value))
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             let if_not_exists = if create.if_not_exists {
                 " IF NOT EXISTS"
@@ -1133,11 +1302,11 @@ fn credential_safe_binlog_sql(
         }
         Statement::SetPassword { account, .. } => {
             let account = account
-                .map(|account| dispatch::show_account_key(&account, session))
+                .map(|account| dispatch::show_account_key(&account, &session))
                 .unwrap_or_else(|| session.authenticated_as.clone());
             Ok(account_sql(&account)?.replacen("CREATE USER", "ALTER USER", 1))
         }
-        _ => Ok(sql.to_string()),
+        _ => Ok(ddl_binlog_source_sql(sql, &statement)),
     }
 }
 
@@ -2598,6 +2767,11 @@ impl StorageQueryEngine {
             crate::engine::cbo::trace::activate(session.connection_id, trace_enabled);
         crate::engine::cbo::trace::begin(sql);
         let preserve_warnings = begin_statement_diagnostics(session, sql);
+        if !preserve_warnings {
+            session
+                .warnings
+                .set_limit(session.sysvars.max_error_count as usize);
+        }
         let warning_scope = crate::engine::api::StatementWarningSinkScope::enter();
         let _executor_tuning = crate::engine::executor::tuning::enter(
             crate::engine::executor::tuning::ExecutorTuningSnapshot::capture_for_session(
@@ -2810,7 +2984,14 @@ fn enforce_tls_requirement(
             issuer,
             subject,
         } => {
-            enforce_tls_requirement(&SslRequirement::X509, request)?;
+            enforce_tls_requirement(
+                if issuer.is_some() || subject.is_some() {
+                    &SslRequirement::X509
+                } else {
+                    &SslRequirement::Ssl
+                },
+                request,
+            )?;
             if let Some(required) = cipher {
                 if !request
                     .tls_cipher
@@ -3569,6 +3750,18 @@ impl QueryEngine for StorageQueryEngine {
         })
     }
 
+    fn auth_account_has_password(&self, username: &str, host: &str) -> Result<bool, QueryError> {
+        self.db.with_auth_catalog(|auth| {
+            auth.match_account(username, host).is_some_and(|account| {
+                !account.authentication_string.is_empty()
+                    && account
+                        .secondary_authentication_string
+                        .as_ref()
+                        .is_none_or(|password| !password.is_empty())
+            })
+        })
+    }
+
     /// Plaintext-password verify path, used by `caching_sha2_password`
     /// full authentication after RSA decrypt (N1/N2/N6). We recompute the
     /// plugin-specific stored-hash form of the plaintext and constant-time
@@ -3629,7 +3822,7 @@ impl QueryEngine for StorageQueryEngine {
                     .expect("verified secondary credential")
             },
         );
-        login.finish(effective_expired)
+        login.finish(effective_expired, request.replacing_account)
     }
 
     fn is_in_auth_cache(&self, username: &str, peer_host: &str) -> bool {
@@ -3731,7 +3924,7 @@ impl QueryEngine for StorageQueryEngine {
             return Err(access_denied(request.username, request.host));
         }
         let effective_expired = login.validate_verified(request.username, &request)?;
-        login.finish(effective_expired)
+        login.finish(effective_expired, request.replacing_account)
     }
 
     fn kill_session(&self, session: &SessionContext, connection_id: u32) -> Result<(), QueryError> {
@@ -5792,8 +5985,9 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &normalize_sql(sql),
+                    &ddl_binlog_source_sql(sql, &statement),
                     &ctx,
+                    &session.authenticated_as,
                 )
             });
         if let Some((result, wait_stats)) =
@@ -5854,8 +6048,9 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &normalize_sql(sql),
+                    &ddl_binlog_source_sql(sql, &statement),
                     &ctx,
+                    &session.authenticated_as,
                 )
             });
         let (result, wait_stats) = self.execute_statement_with_lock_wait(session, statement);
@@ -5864,7 +6059,7 @@ impl StorageQueryEngine {
             session,
             is_ddl,
             binloggable_ddl,
-            &normalize_sql(sql),
+            sql,
             result,
         );
         drop(ddl_binlog_context);
@@ -5892,8 +6087,9 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &normalize_sql(sql),
+                    &ddl_binlog_source_sql(sql, &statement),
                     &ctx,
+                    &session.authenticated_as,
                 )
             });
         let already_qualified = !statement_refs_temp_table(session, &statement);
@@ -5904,7 +6100,7 @@ impl StorageQueryEngine {
             session,
             is_ddl,
             binloggable_ddl,
-            &normalize_sql(sql),
+            sql,
             result,
         );
         drop(ddl_binlog_context);

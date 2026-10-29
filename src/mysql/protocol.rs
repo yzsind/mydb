@@ -2122,7 +2122,12 @@ pub fn parse_stmt_execute_params(
             }
             continue;
         }
-        if is_null {
+        if is_null
+            && long_data
+                .and_then(|items| items.get(idx))
+                .and_then(Option::as_ref)
+                .is_none()
+        {
             let value = StmtParamValue::Null;
             if let Some(name) = parameter_names.get(idx).filter(|name| !name.is_empty()) {
                 query_attributes.push((name.clone(), value.clone()));
@@ -2786,7 +2791,16 @@ pub fn column_definition_packet_full_into_with_fallback(
             default_length
         }
     });
-    write_u32_le(payload, length);
+    let wire_length = if source.wire_type == Some(MYSQL_TYPE_BLOB) && collation != BINARY_COLLATION
+    {
+        let width = crate::charset::resolve_collation_id(collation)
+            .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+            .map_or(1, |info| u32::from(info.max_len));
+        length.saturating_mul(width)
+    } else {
+        length
+    };
+    write_u32_le(payload, wire_length);
     let computed_lob = matches!(column_type, ColumnType::Blob)
         && source.org_table.is_empty()
         && source.decimals == Some(31);
@@ -3726,6 +3740,14 @@ mod tests {
             &[StmtParamValue::Bytes(b"hello world".to_vec())]
         );
         assert!(parsed.param_types.is_some());
+        payload[9] = 1;
+        let parsed = parse_stmt_execute_params(&payload, 1, None, Some(&long_data), false).unwrap();
+        assert_eq!(
+            parsed.params.as_slice(),
+            &[StmtParamValue::Bytes(b"hello world".to_vec())]
+        );
+        let parsed = parse_stmt_execute_params(&payload, 1, None, None, false).unwrap();
+        assert_eq!(parsed.params.as_slice(), &[StmtParamValue::Null]);
     }
 
     #[test]

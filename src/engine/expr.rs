@@ -6384,9 +6384,16 @@ where
                     let end = if len < 0 {
                         s.len()
                     } else {
-                        (start + len as usize).min(s.len())
+                        start.saturating_add(len as usize).min(s.len())
                     };
-                    let mut out = Vec::with_capacity(s.len() + new_bytes.len());
+                    let size = s
+                        .len()
+                        .saturating_sub(end - start)
+                        .saturating_add(new_bytes.len());
+                    if string_result_exceeds_packet("insert", size as u64) {
+                        return Ok(Value::Null);
+                    }
+                    let mut out = Vec::with_capacity(size);
                     out.extend_from_slice(&s[..start]);
                     out.extend_from_slice(&new_bytes);
                     out.extend_from_slice(&s[end..]);
@@ -6405,8 +6412,15 @@ where
                 let end = if len < 0 {
                     chars.len()
                 } else {
-                    (start + len as usize).min(chars.len())
+                    start.saturating_add(len as usize).min(chars.len())
                 };
+                let removed: usize = chars[start..end].iter().map(|c| c.len_utf8()).sum();
+                if string_result_exceeds_packet(
+                    "insert",
+                    (s.len() - removed).saturating_add(new_str.len()) as u64,
+                ) {
+                    return Ok(Value::Null);
+                }
                 let mut out: String = chars[..start].iter().collect();
                 out.push_str(&new_str);
                 out.extend(&chars[end..]);
@@ -13183,7 +13197,10 @@ fn coerce_implicit_day_interval(amount: Value) -> Result<Value, QueryError> {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-            format!("Truncated incorrect INTEGER value: '{text}'"),
+            format!(
+                "Truncated incorrect INTEGER value: '{}'",
+                diagnostic_value(&text)
+            ),
         );
         return Ok(Value::Int(-1));
     }
@@ -14288,7 +14305,7 @@ fn format_round_fixed(value: &Value, decimals: usize) -> Result<String, QueryErr
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
             format!(
                 "Truncated incorrect DOUBLE value: '{}'",
-                string_value(value)
+                diagnostic_value(&string_value(value))
             ),
         );
         // Character-to-DOUBLE overflow saturates at DBL_MAX for FORMAT;
@@ -14937,22 +14954,126 @@ pub(crate) fn regexp_replace_all_into(
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
-) {
-    if replacement.contains('$') {
-        output.extend_from_slice(re.replace_all(input, replacement).as_bytes());
-        return;
-    }
-    if regexp_replace_has_single_match(re) {
-        regexp_replace_single_into(re, input, replacement, output);
-        return;
+) -> bool {
+    regexp_replace_all_bounded(re, input, replacement, output, output.len())
+}
+
+fn regexp_replace_all_bounded(
+    re: &regex::Regex,
+    input: &str,
+    replacement: &str,
+    output: &mut Vec<u8>,
+    base: usize,
+) -> bool {
+    if base == output.len() && !replacement.contains('$') && regexp_replace_has_single_match(re) {
+        return regexp_replace_single_into(re, input, replacement, output);
     }
     let mut last = 0usize;
-    for matched in re.find_iter(input) {
-        output.extend_from_slice(&input.as_bytes()[last..matched.start()]);
-        output.extend_from_slice(replacement.as_bytes());
-        last = matched.end();
+    if replacement.contains('$') {
+        for captures in re.captures_iter(input) {
+            let matched = captures.get(0).expect("capture zero exists");
+            if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
+                || !regexp_expand(&captures, replacement, output, base)
+            {
+                return false;
+            }
+            last = matched.end();
+        }
+    } else {
+        for matched in re.find_iter(input) {
+            if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
+                || !regexp_append(output, base, replacement.as_bytes())
+            {
+                return false;
+            }
+            last = matched.end();
+        }
     }
-    output.extend_from_slice(&input.as_bytes()[last..]);
+    regexp_append(output, base, &input.as_bytes()[last..])
+}
+
+#[inline]
+fn regexp_append(output: &mut Vec<u8>, base: usize, bytes: &[u8]) -> bool {
+    if string_result_exceeds_packet(
+        "regexp_replace",
+        output
+            .len()
+            .saturating_sub(base)
+            .saturating_add(bytes.len()) as u64,
+    ) {
+        return false;
+    }
+    output.extend_from_slice(bytes);
+    true
+}
+
+// mysql_regexp_replacement emits literal $$ and braced capture references.
+// Expand directly into the bounded row lane instead of allocating an unbounded
+// temporary with Captures::expand or Regex::replace_all.
+fn regexp_expand(
+    captures: &regex::Captures<'_>,
+    replacement: &str,
+    output: &mut Vec<u8>,
+    base: usize,
+) -> bool {
+    let bytes = replacement.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let start = pos;
+        while pos < bytes.len() && bytes[pos] != b'$' {
+            pos += 1;
+        }
+        if !regexp_append(output, base, &bytes[start..pos]) {
+            return false;
+        }
+        if pos == bytes.len() {
+            break;
+        }
+        pos += 1;
+        if bytes.get(pos) == Some(&b'$') {
+            if !regexp_append(output, base, b"$") {
+                return false;
+            }
+            pos += 1;
+            continue;
+        }
+        let braced = bytes.get(pos) == Some(&b'{');
+        if braced {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < bytes.len()
+            && (if braced {
+                bytes[pos] != b'}'
+            } else {
+                bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_'
+            })
+        {
+            pos += 1;
+        }
+        if pos == start || (braced && bytes.get(pos) != Some(&b'}')) {
+            if !regexp_append(output, base, b"$") {
+                return false;
+            }
+            pos = start - usize::from(braced);
+            continue;
+        }
+        let name = &replacement[start..pos];
+        let matched = name
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| captures.get(index))
+            .or_else(|| captures.name(name));
+        if let Some(matched) = matched {
+            if !regexp_append(output, base, matched.as_str().as_bytes()) {
+                return false;
+            }
+        }
+        if braced {
+            pos += 1;
+        }
+    }
+    true
 }
 
 #[inline]
@@ -14972,25 +15093,25 @@ pub(crate) fn regexp_replace_single_into(
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
-) {
+) -> bool {
+    let base = output.len();
     if !input.ends_with('\n') {
-        if re.is_match(input) {
-            output.extend_from_slice(replacement.as_bytes());
-        } else {
-            output.extend_from_slice(input.as_bytes());
-        }
-        return;
+        return regexp_append(
+            output,
+            base,
+            if re.is_match(input) {
+                replacement.as_bytes()
+            } else {
+                input.as_bytes()
+            },
+        );
     }
-    // A single, non-alternating whole-string expression can yield at most
-    // one match. Avoid constructing and advancing `Matches` for every row;
-    // `find` preserves prefix/suffix behavior for `$` before a final
-    // newline and is byte-for-byte equivalent to the loop below.
     if let Some(matched) = re.find(input) {
-        output.extend_from_slice(&input.as_bytes()[..matched.start()]);
-        output.extend_from_slice(replacement.as_bytes());
-        output.extend_from_slice(&input.as_bytes()[matched.end()..]);
+        regexp_append(output, base, &input.as_bytes()[..matched.start()])
+            && regexp_append(output, base, replacement.as_bytes())
+            && regexp_append(output, base, &input.as_bytes()[matched.end()..])
     } else {
-        output.extend_from_slice(input.as_bytes());
+        regexp_append(output, base, input.as_bytes())
     }
 }
 
@@ -15031,29 +15152,26 @@ pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, Qu
         } else {
             std::borrow::Cow::Borrowed(repl.as_str())
         };
-        let mut out = expr[..start_byte].to_string();
-        if occurrence == 0 {
-            let mut bytes = out.into_bytes();
-            regexp_replace_all_into(&re, tail, &repl, &mut bytes);
-            return Ok(Value::String(
-                String::from_utf8(bytes).expect("regexp replacement preserves UTF-8"),
-            ));
-        } else {
-            let mut last = 0;
-            let mut seen = 0;
-            for captures in re.captures_iter(tail) {
-                seen += 1;
-                if seen == occurrence {
-                    let matched = captures.get(0).expect("capture zero exists");
-                    out.push_str(&tail[last..matched.start()]);
-                    captures.expand(&repl, &mut out);
-                    last = matched.end();
-                    break;
-                }
-            }
-            out.push_str(&tail[last..]);
+        if string_result_exceeds_packet("regexp_replace", start_byte as u64) {
+            return Ok(Value::Null);
         }
-        Ok(Value::String(out))
+        let mut bytes = expr[..start_byte].as_bytes().to_vec();
+        let success = if occurrence == 0 {
+            regexp_replace_all_bounded(&re, tail, &repl, &mut bytes, 0)
+        } else if let Some(captures) = re.captures_iter(tail).nth((occurrence - 1) as usize) {
+            let matched = captures.get(0).expect("capture zero exists");
+            regexp_append(&mut bytes, 0, &tail.as_bytes()[..matched.start()])
+                && regexp_expand(&captures, &repl, &mut bytes, 0)
+                && regexp_append(&mut bytes, 0, &tail.as_bytes()[matched.end()..])
+        } else {
+            regexp_append(&mut bytes, 0, tail.as_bytes())
+        };
+        if !success {
+            return Ok(Value::Null);
+        }
+        Ok(Value::String(
+            String::from_utf8(bytes).expect("regexp replacement preserves UTF-8"),
+        ))
     })
 }
 
@@ -18824,7 +18942,10 @@ fn mysql_year_equality_number(value: &Value) -> Result<Option<i64>, QueryError> 
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
                     crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    format!("Truncated incorrect DOUBLE value: '{text}'"),
+                    format!(
+                        "Truncated incorrect DOUBLE value: '{}'",
+                        diagnostic_value(&text)
+                    ),
                 );
             }
             (parsed.value, true, parsed.clean)
@@ -18836,7 +18957,10 @@ fn mysql_year_equality_number(value: &Value) -> Result<Option<i64>, QueryError> 
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
                     crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    format!("Truncated incorrect DOUBLE value: '{text}'"),
+                    format!(
+                        "Truncated incorrect DOUBLE value: '{}'",
+                        diagnostic_value(&text)
+                    ),
                 );
             }
             (parsed.value, true, parsed.clean)
@@ -18848,7 +18972,10 @@ fn mysql_year_equality_number(value: &Value) -> Result<Option<i64>, QueryError> 
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
                     crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    format!("Truncated incorrect DOUBLE value: '{text}'"),
+                    format!(
+                        "Truncated incorrect DOUBLE value: '{}'",
+                        diagnostic_value(&text)
+                    ),
                 );
             }
             (parsed.value, true, parsed.clean)
@@ -22542,7 +22669,10 @@ fn to_u64_bitwise_with_string_mode(
             || parsed.value < i128::from(i64::MIN))
             && !suppress_string_truncation
         {
-            let message = format!("Truncated incorrect INTEGER value: '{raw}'");
+            let message = format!(
+                "Truncated incorrect INTEGER value: '{}'",
+                diagnostic_value(raw)
+            );
             if strict_numeric_conversion_is_error() {
                 return Err(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error(message));
             }
@@ -22560,7 +22690,10 @@ fn to_u64_bitwise_with_string_mode(
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-            format!("Truncated incorrect INTEGER value: '{raw}'"),
+            format!(
+                "Truncated incorrect INTEGER value: '{}'",
+                diagnostic_value(raw)
+            ),
         );
     };
     Ok(match value {
@@ -25360,7 +25493,10 @@ fn string_truthy(text: &str) -> bool {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-            format!("Truncated incorrect DOUBLE value: '{text}'"),
+            format!(
+                "Truncated incorrect DOUBLE value: '{}'",
+                diagnostic_value(&text)
+            ),
         );
     }
     parsed.value != 0.0
@@ -25787,6 +25923,18 @@ pub(crate) fn compare_numeric_for_sort(left: &Value, right: &Value) -> Option<Or
     })
 }
 
+/// Bound diagnostic values before formatting or inserting dedup keys.
+pub(crate) fn diagnostic_value(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= 128 {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = 128;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}...", &s[..end]))
+}
+
 /// MySQL implicit string→number coercion: longest numeric prefix, with
 /// warning 1292 when trailing characters were discarded (`'123abc'` → 123)
 /// or nothing parsed from a non-empty string (`'abc'` → 0). An empty
@@ -25798,6 +25946,8 @@ fn lenient_str_to_f64(s: &str) -> Result<f64, QueryError> {
             .error("Truncated incorrect DOUBLE value: ''"));
     }
     if !parsed.clean {
+        let s = diagnostic_value(s);
+        let s = s.as_ref();
         let context = NUMERIC_COMPARISON_CONTEXT.with(std::cell::Cell::get);
         let distinct_aggregate = DISTINCT_AGG_NUMERIC_CONTEXT.with(std::cell::Cell::get);
         let (spec, message) = if distinct_aggregate {
@@ -25842,6 +25992,7 @@ fn lenient_str_to_f64(s: &str) -> Result<f64, QueryError> {
 fn lenient_str_to_i64(s: &str) -> Result<i64, QueryError> {
     let parsed = crate::util::decimal::parse_lenient_int(s);
     if s.is_empty() || !parsed.clean {
+        let s = diagnostic_value(s);
         let message = format!("Truncated incorrect INTEGER value: '{s}'");
         if strict_numeric_conversion_is_error() {
             return Err(error(

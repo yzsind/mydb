@@ -9,10 +9,19 @@ struct Run {
     count: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlConditions {
     runs: Vec<Run>,
     len: usize,
+    discarded: usize,
+    discarded_errors: usize,
+    limit: usize,
+}
+
+impl Default for SqlConditions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqlConditions {
@@ -20,11 +29,31 @@ impl SqlConditions {
         Self {
             runs: Vec::new(),
             len: 0,
+            discarded: 0,
+            discarded_errors: 0,
+            limit: usize::MAX,
         }
     }
 
     pub fn len(&self) -> usize {
         self.len
+    }
+    pub fn total_len(&self) -> usize {
+        self.len.saturating_add(self.discarded)
+    }
+    pub fn take(&mut self) -> Self {
+        let limit = self.limit;
+        let value = std::mem::take(self);
+        self.limit = limit;
+        value
+    }
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        if self.len > limit {
+            let suffix = self.split_off(limit);
+            self.discarded = self.discarded.saturating_add(suffix.total_len());
+            self.discarded_errors = self.discarded_errors.saturating_add(suffix.error_count());
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -32,6 +61,8 @@ impl SqlConditions {
     pub fn clear(&mut self) {
         self.runs.clear();
         self.len = 0;
+        self.discarded = 0;
+        self.discarded_errors = 0;
     }
 
     pub fn push(&mut self, condition: SqlCondition) {
@@ -39,6 +70,12 @@ impl SqlConditions {
     }
 
     fn push_run(&mut self, condition: SqlCondition, count: usize) {
+        let kept = count.min(self.limit.saturating_sub(self.len));
+        self.discarded = self.discarded.saturating_add(count - kept);
+        if condition.level() == super::ConditionLevel::Error {
+            self.discarded_errors = self.discarded_errors.saturating_add(count - kept);
+        }
+        let count = kept;
         if count == 0 {
             return;
         }
@@ -55,14 +92,18 @@ impl SqlConditions {
     }
 
     pub fn append(&mut self, other: &mut Self) {
-        if self.is_empty() {
+        if self.total_len() == 0 && self.limit == usize::MAX {
             std::mem::swap(self, other);
             return;
         }
         for run in other.runs.drain(..) {
             self.push_run(run.condition, run.count);
         }
+        self.discarded = self.discarded.saturating_add(other.discarded);
+        self.discarded_errors = self.discarded_errors.saturating_add(other.discarded_errors);
         other.len = 0;
+        other.discarded = 0;
+        other.discarded_errors = 0;
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &SqlCondition> + Clone {
@@ -78,6 +119,10 @@ impl SqlConditions {
             .filter(|run| matches(&run.condition))
             .map(|run| run.count)
             .sum()
+    }
+    pub fn error_count(&self) -> usize {
+        self.count_matching(|condition| condition.level() == super::ConditionLevel::Error)
+            .saturating_add(self.discarded_errors)
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&SqlCondition) -> bool) {

@@ -16,6 +16,15 @@ pub(super) fn account(cursor: &mut Cursor<'_>) -> Result<AccountIdent, ParseErro
                 host: String::new(),
             });
         }
+        if !cursor
+            .peek()?
+            .is_some_and(|token| token.kind == SqlTokenKind::Symbol(b'@'))
+        {
+            return Ok(AccountIdent {
+                user: "CURRENT_USER()".into(),
+                host: String::new(),
+            });
+        }
         let host = if cursor.symbol(b'@')? {
             cursor.account_text()?
         } else {
@@ -317,7 +326,8 @@ mod tests {
         };
         assert!(!revoke.revoke_all_from_target);
         assert!(matches!(revoke.kind, GrantKind::Roles(_)));
-        assert_eq!(revoke.targets[0].user, "current_user");
+        assert_eq!(revoke.targets[0].user, "CURRENT_USER()");
+        assert_eq!(revoke.targets[0].host, "");
         let Some(Statement::Grant(grant)) =
             parse_privilege_statement("GRANT 'PROXY' TO u").unwrap()
         else {

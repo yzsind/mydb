@@ -156,9 +156,7 @@ impl Encoder {
             }
             session.check_cancelled()
         })();
-        for warning in cursor.take_warnings() {
-            crate::engine::api::push_sql_warning(warning);
-        }
+        crate::engine::api::append_statement_warnings(cursor.take_warnings());
         if let Err(err) = result {
             self.flush()?;
             return Err(err);

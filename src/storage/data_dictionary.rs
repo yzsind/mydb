@@ -1217,6 +1217,14 @@ pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> DdRowSet {
         .push(vec![sv("ai_catalog"), jsonv(catalog.ai.as_ref())]);
     set.dd_properties
         .push(vec![sv("auth_epoch"), sv(catalog.auth.epoch.to_string())]);
+    set.dd_properties.push(vec![
+        sv("component_validate_password"),
+        sv(if catalog.auth.password_validation_component {
+            "1"
+        } else {
+            "0"
+        }),
+    ]);
     set.dd_properties
         .push(vec![sv("catalog_version"), sv(CATALOG_VERSION.to_string())]);
     set.dd_properties.push(vec![
@@ -1504,8 +1512,12 @@ pub(crate) fn dd_rows_for_auth(auth: &AuthCatalog) -> DdRowSet {
     catalog.databases.clear();
     catalog.auth = std::sync::Arc::new(auth.clone());
     let mut set = catalog_to_dd_rows(&catalog);
-    set.dd_properties
-        .retain(|row| row.first().and_then(crate::types::value_str) == Some("auth_epoch"));
+    set.dd_properties.retain(|row| {
+        matches!(
+            row.first().and_then(crate::types::value_str),
+            Some("auth_epoch" | "component_validate_password")
+        )
+    });
     set
 }
 
@@ -1924,6 +1936,9 @@ fn reconstruct_auth(set: &DdRowSet) -> AuthCatalog {
     for row in &set.dd_properties {
         if r_str(row, 0) == "auth_epoch" {
             auth.epoch = r_str(row, 1).parse().unwrap_or(0);
+        }
+        if r_str(row, 0) == "component_validate_password" {
+            auth.password_validation_component = r_str(row, 1) == "1";
         }
     }
     auth.rebuild_runtime_indexes();

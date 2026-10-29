@@ -3776,7 +3776,10 @@ fn auth_required_privileges(
                 collect_statement_table_uses_scoped(select, &cte_names, &mut uses);
                 out.extend(
                     uses.into_iter()
-                        .filter(|table_use| !table_use.table.is_empty())
+                        .filter(|table_use| {
+                            !table_use.table.is_empty()
+                                && !reads_freely_readable_system_schema(session, &table_use.table)
+                        })
                         .map(|table_use| table(Privilege::Select, &table_use.table)),
                 );
             } else if let InsertSource::Values(rows) = &stmt.source {
@@ -3816,7 +3819,10 @@ fn auth_required_privileges(
                 }
                 out.extend(
                     uses.into_iter()
-                        .filter(|table_use| !table_use.table.is_empty())
+                        .filter(|table_use| {
+                            !table_use.table.is_empty()
+                                && !reads_freely_readable_system_schema(session, &table_use.table)
+                        })
                         .map(|table_use| table(Privilege::Select, &table_use.table)),
                 );
             }
@@ -3828,6 +3834,10 @@ fn auth_required_privileges(
             let mut out = uses
                 .iter()
                 .into_iter()
+                .filter(|table_use| {
+                    table_use.write
+                        || !reads_freely_readable_system_schema(session, &table_use.table)
+                })
                 .map(|table_use| {
                     table(
                         if table_use.write {
@@ -3856,6 +3866,10 @@ fn auth_required_privileges(
             let mut out = uses
                 .iter()
                 .into_iter()
+                .filter(|table_use| {
+                    table_use.write
+                        || !reads_freely_readable_system_schema(session, &table_use.table)
+                })
                 .map(|table_use| {
                     table(
                         if table_use.write {
@@ -3937,10 +3951,16 @@ fn auth_required_privileges(
         Statement::AlterSystemCheckpoint
         | Statement::AlterSystemFlushDataCache
         | Statement::AlterSystemFlushSqlCache
-        | Statement::ReplicationAdmin { .. }
         | Statement::MydbReplicationAdmin { .. } => vec![global(Privilege::Dynamic(
             "SYSTEM_VARIABLES_ADMIN".to_string(),
         ))],
+        Statement::ReplicationAdmin { sql } => {
+            if sql.trim_start().to_ascii_uppercase().starts_with("SHOW ") {
+                vec![global(Privilege::ReplClient)]
+            } else {
+                vec![global(Privilege::Dynamic("REPLICATION_SLAVE_ADMIN".into()))]
+            }
+        }
         Statement::BackupAdmin { .. } => {
             vec![global(Privilege::Dynamic("BACKUP_ADMIN".to_string()))]
         }
@@ -4322,10 +4342,23 @@ pub(super) fn authorize_prepared_statement_with_epoch(
             {
                 continue;
             }
-            if view_security_override_allows(auth, session, &required)
+            if view_security_override_allows(db, auth, session, statement, &required)
                 || auth.account_has_privilege(&ctx, &required, false)
                 || column_privilege_fallback(db, auth, &ctx, session, statement, &required)
             {
+                continue;
+            }
+            if matches!(
+                statement,
+                Statement::CreateRole { .. } | Statement::DropRole { .. }
+            ) && auth.account_has_privilege(
+                &ctx,
+                &RequiredPrivilege {
+                    privilege: Privilege::CreateUser,
+                    scope: PrivilegeScope::Global,
+                },
+                false,
+            ) {
                 continue;
             }
             if required.privilege == Privilege::CreateUser
@@ -4503,8 +4536,10 @@ fn explain_dml_view_privileges(
 }
 
 fn view_security_override_allows(
+    db: &Database,
     auth: &crate::engine::auth::AuthCatalog,
     session: &SessionContext,
+    statement: &Statement,
     required: &crate::engine::auth::RequiredPrivilege,
 ) -> bool {
     if required.privilege != Privilege::Select {
@@ -4520,6 +4555,7 @@ fn view_security_override_allows(
         return false;
     };
     auth.account_has_privilege(&override_.context, required, false)
+        || column_privilege_fallback(db, auth, &override_.context, session, statement, required)
 }
 
 fn required_privilege_targets_session_temp(
@@ -4581,6 +4617,9 @@ fn column_privilege_fallback(
     ) && matches!(
         statement,
         Statement::Select(_)
+            | Statement::CreateView { .. }
+            | Statement::AlterView { .. }
+            | Statement::CreateTableAsSelect { .. }
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -4850,7 +4889,7 @@ fn trigger_name_for_table_privilege(statement: &Statement) -> Option<&str> {
 
 /// INSTALL/UNINSTALL COMPONENT. mydb only implements the opt-in
 /// `validate_password` component; any other component URN is rejected (no
-/// silent no-op). Installation state is process-global and resets on restart.
+/// silent no-op). The installation is durable and exposed by mysql.component.
 fn execute_component(
     db: &Arc<Database>,
     session: &mut SessionContext,
@@ -4858,6 +4897,10 @@ fn execute_component(
     install: bool,
 ) -> Result<QueryResponse, QueryError> {
     use crate::engine::password_policy as pol;
+    static COMPONENT_CHANGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _change = COMPONENT_CHANGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     implicit_commit_for_ddl(db, session)?;
     for name in names {
         if !pol::is_validate_password_component(name) {
@@ -4867,9 +4910,15 @@ fn execute_component(
             ));
         }
     }
+    if names.len() != 1 {
+        return Err(error(
+            crate::error::catalog::ER_COMPONENTS_CANT_LOAD,
+            "Duplicate validate_password component in one statement",
+        ));
+    }
     for name in names {
         if install {
-            if pol::is_installed() {
+            if db.auth_catalog().password_validation_component {
                 return Err(error(
                     crate::error::catalog::ER_COMPONENTS_CANT_LOAD,
                     format!(
@@ -4877,9 +4926,9 @@ fn execute_component(
                     ),
                 ));
             }
-            pol::set_installed(true);
+            db.set_password_validation_component(true)?;
         } else {
-            if !pol::is_installed() {
+            if !db.auth_catalog().password_validation_component {
                 return Err(error(
                     crate::error::catalog::ER_COMPONENTS_LOAD_CANT_REGISTER_SERVICE_IMPLEMENTATION,
                     format!(
@@ -4887,7 +4936,7 @@ fn execute_component(
                     ),
                 ));
             }
-            pol::set_installed(false);
+            db.set_password_validation_component(false)?;
         }
     }
     Ok(QueryResponse::Ok)
@@ -5033,7 +5082,11 @@ fn execute_create_user(
             // for `IDENTIFIED WITH ... AS '<hash>'` (pre-hashed) and no-ops
             // unless the component is installed. Rejects weak passwords (1819).
             if has_explicit_password && !spec.password_is_pre_hashed {
-                crate::engine::password_policy::validate(&password, Some(&key.user))?;
+                crate::engine::password_policy::validate_with_installation(
+                    auth.password_validation_component,
+                    &password,
+                    Some(&key.user),
+                )?;
             }
             // G3: `IDENTIFIED WITH plugin AS '<hash>'` stores the credential
             // verbatim — used by mysqldump backups and replication mirroring
@@ -5305,7 +5358,11 @@ fn apply_alter_user(
             } else {
                 // Stage 3: validate_password enforcement on the new plaintext
                 // (no-op unless the component is installed).
-                crate::engine::password_policy::validate(&password, Some(&account.key.user))?;
+                crate::engine::password_policy::validate_with_installation(
+                    auth.password_validation_component,
+                    &password,
+                    Some(&account.key.user),
+                )?;
                 Some(checked_password_auth_string(&account.plugin, &password)?)
             }
         } else {
@@ -5393,10 +5450,6 @@ fn apply_alter_user(
             account.authentication_string = new_auth;
             account.password_last_changed_ms = Some(current_time_ms());
             account.password_expired = false;
-            account.failed_login_count = 0;
-            account.locked_until_ms = None;
-            // Reset the in-memory failed-login budget/temporary lock too.
-            clear_login_failures = true;
         }
         if stmt.discard_old_password {
             account.secondary_authentication_string = None;
@@ -5892,7 +5945,7 @@ fn execute_set_password(
         };
         // Stage 3: validate_password enforcement (SET PASSWORD always takes a
         // plaintext string in MySQL 8.0). No-op unless the component is on.
-        crate::engine::password_policy::validate(&password, Some(&key.user))?;
+        crate::engine::password_policy::validate_with_installation(auth.password_validation_component, &password, Some(&key.user))?;
         // PASSWORD REQUIRE CURRENT: the account policy mandates that the
         // operator supply the old password before switching. MySQL 4047:
         // ER_CURRENT_PASSWORD_NOT_REQUIRED-style — actually 4047 is
@@ -5958,11 +6011,8 @@ fn execute_set_password(
         cache_credential = account.authentication_string.clone();
         account.password_last_changed_ms = Some(current_time_ms());
         account.password_expired = false;
-        account.failed_login_count = 0;
-        account.locked_until_ms = None;
         Ok(())
     })?;
-    crate::engine::auth::failed_login_clear(&key);
     crate::engine::auth::auth_cache_forget(&key);
     crate::engine::auth::auth_cache_remember_password(&key, &password, &cache_credential);
     if random_password {
@@ -6072,6 +6122,30 @@ fn execute_grant(
 
     if let GrantKind::Privileges { privileges, scope } = &stmt.kind {
         let resolved = grant_scope_to_privilege_scope(session, scope);
+        if let PrivilegeScope::Routine {
+            database,
+            routine,
+            kind,
+        } = &resolved
+        {
+            let routine_kind = if kind.eq_ignore_ascii_case("function") {
+                crate::storage::RoutineKindSchema::Function
+            } else {
+                crate::storage::RoutineKindSchema::Procedure
+            };
+            if db
+                .routine_definition(database, routine_kind, routine)
+                .is_none()
+            {
+                return Err(error(
+                    crate::error::catalog::ER_SP_DOES_NOT_EXIST,
+                    format!(
+                        "{} {database}.{routine} does not exist",
+                        kind.to_ascii_uppercase()
+                    ),
+                ));
+            }
+        }
         for spec in privileges.iter().filter(|spec| !spec.columns.is_empty()) {
             let PrivilegeScope::Table { database, table } = &resolved else {
                 return Err(error(
@@ -6436,6 +6510,14 @@ fn grant_entries_for_spec(
             for privilege in crate::engine::auth::all_privileges_for_scope(&scope) {
                 out.push((privilege.clone(), scope.clone()));
             }
+            if matches!(scope, PrivilegeScope::Global) {
+                out.extend(
+                    crate::engine::auth::default_dynamic_privileges()
+                        .iter()
+                        .cloned()
+                        .map(|privilege| (privilege, scope.clone())),
+                );
+            }
         } else {
             out.push((
                 if spec.name.eq_ignore_ascii_case("USAGE") {
@@ -6574,6 +6656,7 @@ fn execute_revoke(
                     }
                     return Ok(());
                 }
+                let revoke_all = privileges.iter().any(|p| p.name.eq_ignore_ascii_case("ALL") || p.name.eq_ignore_ascii_case("ALL PRIVILEGES"));
                 let privileges: Vec<_> = privileges
                     .iter()
                     .filter(|p|!p.name.eq_ignore_ascii_case("USAGE"))
@@ -6611,6 +6694,28 @@ fn execute_revoke(
                 // normal retain pass — and the restriction is what keeps
                 // the schema denied via the global fallback.
                 let partial = crate::engine::auth::partial_revokes_enabled();
+                for grantee in &targets {
+                    for (privilege, scope) in &privileges {
+                        if matches!(scope, PrivilegeScope::Global) || revoke_all {
+                            continue;
+                        }
+                        let has_grant = auth.grants.iter().any(|g| {
+                            if &g.grantee != grantee { return false; }
+                            if matches!(privilege, Privilege::GrantOption) || (stmt.grant_option_only && !matches!(privilege, Privilege::Dynamic(_))) {
+                                !matches!(g.privilege, Privilege::Dynamic(_))
+                                    && (g.grant_option || matches!(g.privilege, Privilege::GrantOption))
+                                    && crate::engine::auth::scope_equal(&crate::engine::auth::grant_option_level(&g.scope), &crate::engine::auth::grant_option_level(scope))
+                            } else {
+                                &g.privilege == privilege && crate::engine::auth::scope_equal(&g.scope, scope)
+                            }
+                        });
+                        let may_restrict = partial && !stmt.grant_option_only && matches!(scope, PrivilegeScope::Database { .. })
+                            && auth.grants.iter().any(|g| &g.grantee == grantee && &g.privilege == privilege && matches!(g.scope, PrivilegeScope::Global));
+                        if !has_grant && !may_restrict {
+                            return Err(error(crate::error::catalog::ER_NONEXISTING_GRANT, format!("There is no such grant defined for user {}", grantee.display())));
+                        }
+                    }
+                }
                 if partial {
                     for grantee in &targets {
                         for (privilege, scope) in &privileges {
@@ -6622,7 +6727,8 @@ fn execute_revoke(
                                     && &g.privilege == privilege
                                     && matches!(g.scope, PrivilegeScope::Global)
                             });
-                            if has_global {
+                            let has_schema = auth.grants.iter().any(|g| &g.grantee == grantee && &g.privilege == privilege && crate::engine::auth::scope_equal(&g.scope, scope));
+                            if has_global && !has_schema && !stmt.grant_option_only {
                                 let already_restricted = auth.restrictions.iter().any(|r| {
                                     &r.grantee == grantee
                                         && &r.privilege == privilege
@@ -6662,15 +6768,13 @@ fn execute_revoke(
                     // (grantee, priv, db), we may also need to drop a matching
                     // restriction entry the user inserted earlier so the
                     // privilege state remains coherent.
-                    if !partial {
-                        auth.restrictions.retain(|r| {
+                    auth.restrictions.retain(|r| {
                             !(targets.contains(&r.grantee)
                                 && privileges.iter().any(|(privilege, scope)| {
                                     privilege == &r.privilege
-                                        && matches!(scope, PrivilegeScope::Database { database } if database.eq_ignore_ascii_case(&r.database))
+                                        && (matches!(scope, PrivilegeScope::Global) || (!partial && matches!(scope, PrivilegeScope::Database { database } if database.eq_ignore_ascii_case(&r.database))))
                                 }))
-                        });
-                    }
+                    });
                 }
             }
             GrantKind::Roles(roles) => {
@@ -6706,6 +6810,13 @@ fn execute_revoke(
                                     role.display()
                                 ),
                             ));
+                        }
+                    }
+                }
+                for role in &roles {
+                    for target in &targets {
+                        if !auth.role_edges.iter().any(|edge| &edge.from_role == role && &edge.to_account == target) {
+                            return Err(error(crate::error::catalog::ER_ROLE_NOT_GRANTED, format!("Role {} has not been granted to {}", role.display(), target.display())));
                         }
                     }
                 }
@@ -6949,12 +7060,7 @@ fn execute_set_default_role(
                     // this check, an admin could set an unrelated role as
                     // default and the user would silently activate it
                     // (with the role's privileges) on every login.
-                    let granted: std::collections::BTreeSet<_> = auth
-                        .role_edges
-                        .iter()
-                        .filter(|e| e.to_account == to_account)
-                        .map(|e| e.from_role.clone())
-                        .collect();
+                    let granted = auth.applicable_roles(&to_account);
                     for role in &roles {
                         if !granted.contains(role) {
                             return Err(error(
@@ -9725,6 +9831,7 @@ pub(super) fn execute_qualified_statement(
                 for (from, to) in &renames {
                     let from = account_key(from);
                     let to = account_key(to);
+                    validate_account_key(&to)?;
                     check_definer_account_change(auth, session, &references, &from, "RENAME USER")?;
                     check_definer_account_change(auth, session, &references, &to, "RENAME USER")?;
                     if !auth.accounts.contains_key(&account_id(&from))
@@ -10269,9 +10376,7 @@ pub(super) fn take_single_into_row(
                 }
                 Ok(first)
             })();
-            for warning in stream.cursor.take_warnings() {
-                crate::engine::api::push_sql_warning(warning);
-            }
+            crate::engine::api::append_statement_warnings(stream.cursor.take_warnings());
             result
         }
         other => Err(error(
@@ -10710,17 +10815,38 @@ fn execute_select_calc_found_rows(
     stmt.limit = None;
     stmt.offset = None;
     stmt.sql_calc_found_rows = false;
+    let _streaming = super::select::force_streaming_response_scope();
     let response = run_select_response(db, session, stmt, registry)?;
-    let (columns, rows) = match response.materialize()? {
-        QueryResponse::ResultSet(rs) => (rs.columns, rs.rows),
-        // A SELECT always resolves to a result set; anything else means an
-        // upstream already produced a terminal response — pass it through.
-        other => return Ok(other),
-    };
-    let total = rows.len() as u64;
     let offset = crate::engine::executor::select::limit_value_or_zero(user_offset.as_ref())?;
     let limit = crate::engine::executor::select::limit_value_or_max(user_limit.as_ref())?;
-    let window: Vec<Vec<Value>> = rows.into_iter().skip(offset).take(limit).collect();
+    let (columns, mut cursor): (_, Box<dyn ResultCursor>) = match response {
+        QueryResponse::StreamingResultSet(rs) => (rs.columns, rs.cursor),
+        QueryResponse::ResultSet(rs) => (
+            rs.columns,
+            Box::new(crate::engine::api::VecResultCursor::new(rs.rows)),
+        ),
+        QueryResponse::SharedResultSet(rs) => (
+            rs.columns.to_vec(),
+            Box::new(crate::engine::api::VecResultCursor::new(rs.rows)),
+        ),
+        other => return Ok(other),
+    };
+    let mut total = 0u64;
+    let mut window = Vec::new();
+    let drained = (|| -> Result<(), QueryError> {
+        while let Some(row) = cursor.next_row()? {
+            if total >= offset as u64 && window.len() < limit {
+                window.push(row);
+            }
+            total = total.saturating_add(1);
+            if total % 1024 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+        }
+        Ok(())
+    })();
+    crate::engine::api::append_statement_warnings(cursor.take_warnings());
+    drained?;
     Ok(QueryResponse::StreamingResultSet(StreamingResultSet {
         columns,
         found_rows: Some(total),

@@ -4697,6 +4697,13 @@ pub(crate) fn show_create_user_result(
     account: &AccountKey,
 ) -> Result<QueryResponse, QueryError> {
     let auth = db.auth_catalog();
+    show_create_user_from_catalog(&auth, account)
+}
+
+pub(crate) fn show_create_user_from_catalog(
+    auth: &crate::engine::auth::AuthCatalog,
+    account: &AccountKey,
+) -> Result<QueryResponse, QueryError> {
     let Some(user) = auth.accounts.get(&crate::engine::auth::account_id(account)) else {
         return Err(crate::storage::error(
             crate::error::catalog::ER_CANNOT_USER,

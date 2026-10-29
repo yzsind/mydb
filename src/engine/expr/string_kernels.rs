@@ -1,7 +1,7 @@
 //! Value kernels shared by interpreted and compiled scalar execution.
 use super::{
     mysql_bytes_replace, mysql_case_map, mysql_str_replace, null_or, str_value,
-    string_value_for_connection, value_bytes,
+    string_result_exceeds_packet, string_value_for_connection, value_bytes,
 };
 use crate::types::{QueryError, Value};
 
@@ -110,14 +110,51 @@ pub(crate) fn eval_case_map_value(value: Value, upper: bool) -> Result<Value, Qu
 #[inline]
 pub(crate) fn eval_replace_values(values: &[Value]) -> Result<Value, QueryError> {
     if matches!(values[0], Value::Bytes(_)) {
-        return Ok(Value::Bytes(mysql_bytes_replace(
-            &value_bytes(&values[0]),
-            &value_bytes(&values[1]),
-            &value_bytes(&values[2]),
-        )));
+        let subject = value_bytes(&values[0]);
+        let from = value_bytes(&values[1]);
+        let to = value_bytes(&values[2]);
+        if replace_exceeds_packet(&subject, &from, to.len()) {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Bytes(mysql_bytes_replace(&subject, &from, &to)));
     }
     let subject = string_value_for_connection(&values[0])?;
     let from = string_value_for_connection(&values[1])?;
     let to = string_value_for_connection(&values[2])?;
+    if replace_exceeds_packet(subject.as_bytes(), from.as_bytes(), to.len()) {
+        return Ok(Value::Null);
+    }
     Ok(Value::String(mysql_str_replace(&subject, &from, &to)))
+}
+
+fn replace_exceeds_packet(subject: &[u8], from: &[u8], to_len: usize) -> bool {
+    let mut total = subject.len() as u64;
+    let cap = crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes();
+    if !from.is_empty() && to_len < from.len() && total > cap {
+        let shrink = (from.len() - to_len) as u64;
+        let mut rest = subject;
+        while let Some(start) = memchr::memmem::find(rest, from) {
+            total = total.saturating_sub(shrink);
+            if total <= cap {
+                return false;
+            }
+            rest = &rest[start + from.len()..];
+        }
+    }
+    if !from.is_empty() && to_len > from.len() {
+        let growth = (to_len - from.len()) as u64;
+        // Normal small results retain the single-pass replacement kernel.
+        if total.saturating_add(((subject.len() / from.len()) as u64).saturating_mul(growth)) > cap
+        {
+            let mut rest = subject;
+            while let Some(start) = memchr::memmem::find(rest, from) {
+                total = total.saturating_add(growth);
+                if total > cap {
+                    return string_result_exceeds_packet("replace", total);
+                }
+                rest = &rest[start + from.len()..];
+            }
+        }
+    }
+    string_result_exceeds_packet("replace", total)
 }

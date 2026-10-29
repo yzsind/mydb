@@ -763,10 +763,10 @@ impl StatementWarningSinkScope {
 
     pub(crate) fn drain_to_local(&self) {
         flush_statement_warning_batch();
-        let mut pending = std::mem::take(&mut *self.sink.lock());
+        let mut pending = self.sink.lock().take();
         STATEMENT_WARNINGS.with(|warnings| {
             let mut warnings = warnings.borrow_mut();
-            if warnings.is_empty() {
+            if warnings.total_len() == 0 {
                 // Transfer the allocation as well as the conditions. Copying
                 // a large bulk statement's diagnostics one element at a time
                 // doubles live storage and serializes statement completion.
@@ -790,10 +790,9 @@ pub(crate) fn take_statement_warnings() -> SqlWarnings {
     // Reset any per-statement "warn once" flags so the same connection's
     // next statement gets a fresh chance to emit its diagnostics.
     JSON_MERGE_DEPRECATION_WARNED.with(|c| c.set(false));
-    let mut warnings =
-        STATEMENT_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()));
+    let mut warnings = STATEMENT_WARNINGS.with(|warnings| warnings.borrow_mut().take());
     if let Some(sink) = current_statement_warning_sink() {
-        warnings.append(&mut std::mem::take(&mut *sink.lock()));
+        warnings.append(&mut sink.lock().take());
     }
     warnings
 }
@@ -837,9 +836,9 @@ pub(crate) fn warn_json_merge_deprecation_once() {
 /// `Records: N Deleted: M Skipped: K Warnings: W` info trailer while the
 /// warnings themselves are still pending drain into the session.
 pub(crate) fn statement_warning_count() -> usize {
-    STATEMENT_WARNINGS.with(|warnings| warnings.borrow().len())
+    STATEMENT_WARNINGS.with(|warnings| warnings.borrow().total_len())
         + current_statement_warning_sink()
-            .map(|sink| sink.lock().len())
+            .map(|sink| sink.lock().total_len())
             .unwrap_or(0)
 }
 
@@ -1364,16 +1363,12 @@ impl QueryResponse {
                         Ok(Some(row)) => rows.push(row),
                         Ok(None) => break,
                         Err(err) => {
-                            for warning in result.cursor.take_warnings() {
-                                push_sql_warning(warning);
-                            }
+                            append_statement_warnings(result.cursor.take_warnings());
                             return Err(err);
                         }
                     }
                 }
-                for warning in result.cursor.take_warnings() {
-                    push_sql_warning(warning);
-                }
+                append_statement_warnings(result.cursor.take_warnings());
                 Ok(QueryResponse::ResultSet(ResultSet {
                     columns: result.columns,
                     rows,
@@ -1617,8 +1612,8 @@ pub enum PreparedDmlState {
     Ready(Arc<PreparedDmlPlan>),
 }
 
-pub use super::async_row_wait::AsyncRowLockSignal;
 pub(crate) use super::async_row_wait::AsyncRowLockRegistry;
+pub use super::async_row_wait::AsyncRowLockSignal;
 
 /// Statement-local metadata retained by the compiled text-DML batch executor.
 /// These plans cannot run triggers or change tracked session variables.
@@ -1663,7 +1658,6 @@ pub trait QueryEngine: Send + Sync + 'static {
     fn row_lock_async_ready(&self, _signal: &AsyncRowLockSignal) -> bool {
         true
     }
-
 
     /// Bind protocol-memory reclamation for the current synchronous poll.
     fn enter_memory_reclaim_scope(
@@ -2011,6 +2005,12 @@ pub trait QueryEngine: Send + Sync + 'static {
     /// every connection on a stub engine takes the full path.
     fn is_in_auth_cache(&self, _username: &str, _peer_host: &str) -> bool {
         false
+    }
+
+    /// COM_CHANGE_USER clients may send an empty placeholder and wait for
+    /// a fresh challenge even when the account requires a password.
+    fn auth_account_has_password(&self, _username: &str, _host: &str) -> Result<bool, QueryError> {
+        Ok(false)
     }
 
     fn authenticate_request(&self, request: AuthRequest<'_>) -> Result<AuthOutcome, QueryError> {
@@ -2411,6 +2411,7 @@ pub struct SessionContext {
 /// like a stock MySQL session.
 #[derive(Debug, Clone)]
 pub struct SessionSysVarState {
+    pub max_error_count: u64,
     pub auto_increment_increment: u64,
     pub auto_increment_offset: u64,
     pub transaction_read_only: bool,
@@ -2613,6 +2614,7 @@ impl Default for SessionSysVarState {
             crate::engine::sysvar::builtin::charset::server_charset_defaults();
         const RAND_MAX: u64 = 0x3FFF_FFFF;
         Self {
+            max_error_count: crate::engine::sysvar::builtin::orm_stubs::max_error_count(),
             max_allowed_packet:
                 crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes(),
             max_user_connections: crate::engine::sysvar::builtin::connection::max_user_connections(
@@ -3443,16 +3445,19 @@ impl SessionContext {
 
     pub fn set_warnings(&mut self, warnings: impl Into<SqlWarnings>) {
         self.warnings = warnings.into();
+        // Internal diagnostics remain available to strict conversion and
+        // stored-program handlers until execution finishes. Only the client
+        // condition area is truncated; counts include discarded conditions.
+        self.warnings
+            .set_limit(self.sysvars.max_error_count as usize);
     }
 
     pub fn warning_count(&self) -> u16 {
-        self.warnings.len().min(u16::MAX as usize) as u16
+        self.warnings.total_len().min(u16::MAX as usize) as u16
     }
 
     pub fn error_count(&self) -> u16 {
-        self.warnings
-            .count_matching(|condition| condition.level() == crate::error::ConditionLevel::Error)
-            .min(u16::MAX as usize) as u16
+        self.warnings.error_count().min(u16::MAX as usize) as u16
     }
 
     pub fn is_strict_sql_mode(&self) -> bool {

@@ -51,6 +51,35 @@ use crate::types::{Column, QueryError};
 use crate::util::logging::log_message;
 
 mod routine_results;
+mod tls_names;
+
+async fn local_infile_cancelled(
+    handle: Option<&SessionHandle>,
+    token: Option<&crate::engine::cancel::QueryCancelToken>,
+) {
+    loop {
+        let Some(handle) = handle else {
+            std::future::pending::<()>().await;
+            continue;
+        };
+        let notified = handle.notified();
+        tokio::pin!(notified);
+        // Register the waiter before checking generations: KILL QUERY uses
+        // notify_waiters, so checking first could lose a wake in this gap.
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(notified.as_mut(), cx))
+        })
+        .await;
+        if token.is_some_and(|token| token.check().is_err())
+            || handle.kill_flag().load(Ordering::Acquire)
+        {
+            return;
+        }
+        if first.is_pending() {
+            notified.await;
+        }
+    }
+}
 
 fn server_status_for_context(context: &SessionContext) -> u16 {
     let mut status = 0;
@@ -1863,6 +1892,7 @@ where
         auth_plugin: Option<&'a str>,
     ) -> AuthRequest<'a> {
         AuthRequest {
+            replacing_account: self.authenticated.then_some(&self.context.authenticated_as),
             username,
             host,
             auth_response,
@@ -2117,7 +2147,7 @@ where
                 let (_, connection) = tls_stream.get_ref();
                 self.context.ssl_cipher = connection
                     .negotiated_cipher_suite()
-                    .map(|suite| format!("{:?}", suite.suite()));
+                    .map(|suite| tls_names::cipher_name(suite.suite()));
                 self.context.ssl_version = connection
                     .protocol_version()
                     .map(mysql_tls_version_name)
@@ -2127,8 +2157,10 @@ where
                     .and_then(|certs| certs.first())
                 {
                     if let Ok((_, parsed)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
-                        self.context.x509_subject = Some(parsed.subject().to_string());
-                        self.context.x509_issuer = Some(parsed.issuer().to_string());
+                        self.context.x509_subject =
+                            Some(tls_names::distinguished_name(parsed.subject()));
+                        self.context.x509_issuer =
+                            Some(tls_names::distinguished_name(parsed.issuer()));
                     }
                 }
                 self.stream = MysqlStream::Tls(Box::new(tls_stream));
@@ -2195,6 +2227,23 @@ where
             let Some(packet) = packet else {
                 return Ok(());
             };
+            if crate::engine::sysvar::builtin::replication::offline_mode()
+                && self
+                    .engine
+                    .authorize_global_privilege(
+                        &self.context,
+                        Privilege::Dynamic("CONNECTION_ADMIN".into()),
+                    )
+                    .is_err()
+            {
+                self.write_error_packet(
+                    packet.sequence_id.wrapping_add(1),
+                    &crate::error::catalog::ER_SERVER_OFFLINE_MODE
+                        .error("The server is currently in offline mode"),
+                )
+                .await?;
+                return Ok(());
+            }
             if packet.first_sequence_id != 0 {
                 let err = command_err_packet_for_spec(
                     crate::mysql::errors::ER_UNKNOWN_COM_ERROR,
@@ -2869,7 +2918,7 @@ where
         let mut context = SessionContext::default();
         context.current_database.clear();
         context.connection_id = self.connection_id;
-        context.host = self.peer_addr.to_string();
+        context.host = client_host.clone();
         context.ssl_cipher = self.context.ssl_cipher.clone();
         context.ssl_version = self.context.ssl_version.clone();
         context.x509_subject = self.context.x509_subject.clone();
@@ -2901,7 +2950,15 @@ where
             .engine
             .auth_plugin_for_user(&request.username, &client_host)
         {
-            Ok(Some(account_plugin)) if account_plugin != client_plugin => {
+            Ok(Some(account_plugin))
+                if account_plugin != client_plugin
+                    || (self.client_capabilities() & CLIENT_PLUGIN_AUTH != 0
+                        && ((!auth_response.is_empty() && auth_response != [0])
+                            || self
+                                .engine
+                                .auth_account_has_password(&request.username, &client_host)
+                                .unwrap_or(true))) =>
+            {
                 if self.client_capabilities() & CLIENT_PLUGIN_AUTH == 0 {
                     let err = command_err_packet_for_spec(
                         crate::mysql::errors::ER_NOT_SUPPORTED_AUTH_MODE,
@@ -2914,7 +2971,6 @@ where
                         .await?;
                     return Ok(());
                 }
-                self.handshake_nonce = crate::mysql::protocol::generate_auth_nonce();
                 auth_response = self
                     .switch_auth_plugin(
                         &account_plugin,
@@ -2951,6 +3007,9 @@ where
             Err(err) => {
                 self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
                     .await?;
+                if err.is(crate::error::catalog::ER_USER_LIMIT_REACHED) {
+                    return Ok(());
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "COM_CHANGE_USER authentication failed",
@@ -4255,7 +4314,7 @@ where
             }
             _ => None,
         })
-        .unwrap_or(true);
+        .unwrap_or(false);
         if !local_infile_on {
             let err = error(
                 crate::error::catalog::ER_CLIENT_LOCAL_FILES_DISABLED,
@@ -4305,15 +4364,14 @@ where
             let mut staging = LocalInfileStaging::new();
             let mut staging_error: Option<QueryError> = None;
             let last_seq: u8;
+            let input_cancel = self.context.current_cancel_token().cloned();
             loop {
-                match self
-                    .codec
-                    .read_packet_with_timeout(
-                        &mut self.stream,
-                        crate::mysql::packet::net_read_timeout(),
-                    )
-                    .await?
-                {
+                let read = tokio::select! {
+                    biased;
+                    _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                    packet = self.codec.read_packet_with_timeout(&mut self.stream, crate::mysql::packet::net_read_timeout()) => packet,
+                };
+                match read? {
                     Some(packet) if packet.payload.is_empty() => {
                         last_seq = packet.sequence_id;
                         break;
@@ -4407,14 +4465,12 @@ where
 
         let mut pipe_error: Option<QueryError> = None;
         let last_seq = loop {
-            let packet = match self
-                .codec
-                .read_packet_with_timeout(
-                    &mut self.stream,
-                    crate::mysql::packet::net_read_timeout(),
-                )
-                .await
-            {
+            let read = tokio::select! {
+                biased;
+                _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                packet = self.codec.read_packet_with_timeout(&mut self.stream, crate::mysql::packet::net_read_timeout()) => packet,
+            };
+            let packet = match read {
                 Ok(packet) => packet,
                 Err(err) => {
                     if let Some(token) = &input_cancel {
@@ -4431,7 +4487,22 @@ where
                 Some(packet) if packet.payload.is_empty() => break packet.sequence_id,
                 Some(packet) => {
                     if pipe_error.is_none() {
-                        if let Err(err) = writer.write_all(&packet.payload).await {
+                        let write = tokio::select! {
+                            biased;
+                            _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                            result = writer.write_all(&packet.payload) => result,
+                        };
+                        if let Err(err) = write {
+                            if err.kind() == io::ErrorKind::Interrupted {
+                                if let Some(token) = &input_cancel {
+                                    token.cancel_local();
+                                }
+                                drop(writer);
+                                if let Ok((context, _)) = execution.await {
+                                    self.restore_context(context);
+                                }
+                                return Err(err);
+                            }
                             // Keep draining through the empty terminator so the
                             // command exchange remains framed. A closed reader
                             // normally means the executor already has a more
@@ -5163,7 +5234,8 @@ where
                             &values,
                             &perf_texts,
                         )
-                    } else if dml_inline_retry && prepared_dml_retry_context_allowed(&self.context) {
+                    } else if dml_inline_retry && prepared_dml_retry_context_allowed(&self.context)
+                    {
                         // Explicit / autocommit-off transaction: attempt
                         // inline with nonblocking lock waits. On conflict,
                         // the savepoint path rolls back cleanly before the
@@ -7574,7 +7646,9 @@ where
         Option<Result<QueryResponse, QueryError>>,
         bool,
     ) {
-        if !async_row_lock_retry_enabled() || self.context.sysvars.innodb_lock_wait_timeout == Some(0) {
+        if !async_row_lock_retry_enabled()
+            || self.context.sysvars.innodb_lock_wait_timeout == Some(0)
+        {
             return (state, None, false);
         }
         let Some(mut signal) = self.engine.row_lock_async_signal() else {
@@ -7837,7 +7911,9 @@ fn prepared_dml_inline_allowed(context: &SessionContext) -> bool {
 }
 
 fn prepared_dml_retry_context_allowed(context: &SessionContext) -> bool {
-    !context.autocommit || context.explicit_txn || context.current_txn.is_some()
+    !context.autocommit
+        || context.explicit_txn
+        || context.current_txn.is_some()
         || !crate::util::connection_dispatch::current_worker_has_sibling_connections()
 }
 

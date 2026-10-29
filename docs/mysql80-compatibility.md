@@ -536,6 +536,12 @@ Query hints (`/*+ ... */` and table-level `USE/FORCE/IGNORE INDEX`) are covered 
 
 ➕/✅ opt-in via `INSTALL COMPONENT 'file://component_validate_password'` (off by default, aligned with MySQL; unknown components report 3529). Once enabled, plaintext passwords in CREATE/ALTER USER and SET PASSWORD are policy-checked (LOW/MEDIUM/STRONG); weak passwords report 1819. `authentication_policy` is settable with format validation (violations report 1231).
 
+Component installation survives restart and is visible in `mysql.component`.
+Dictionary files are unsupported: setting a nonempty
+`validate_password.dictionary_file` returns a clear unsupported-feature error.
+Password rotation preserves a failed-login temporary lock; use
+`ALTER USER ... ACCOUNT UNLOCK` to clear it explicitly.
+
 ---
 
 ## 6. Built-in Function Library

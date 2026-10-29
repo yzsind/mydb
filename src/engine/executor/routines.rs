@@ -1016,9 +1016,9 @@ fn validate_binlog_function_creator(
         return Ok(());
     }
     if !def.characteristics.deterministic
-        || matches!(
+        && !matches!(
             def.characteristics.sql_data_access,
-            RoutineSqlDataAccess::ContainsSql | RoutineSqlDataAccess::ModifiesSqlData
+            RoutineSqlDataAccess::NoSql | RoutineSqlDataAccess::ReadsSqlData
         )
     {
         return Err(error(crate::error::catalog::ER_BINLOG_UNSAFE_ROUTINE,
@@ -1761,19 +1761,21 @@ struct RoutineInvocationSnapshot {
     temporal_sql_mode_bits: u16,
     authenticated_as: AccountKey,
     active_roles: crate::engine::auth::AuthCow<BTreeSet<AccountKey>>,
+    view_security_overrides: Vec<crate::engine::api::ViewSecurityOverride>,
     last_insert_id: u64,
     last_row_count: i64,
     statement_insert_id: crate::engine::api::StatementInsertIdSnapshot,
 }
 
 impl RoutineInvocationSnapshot {
-    fn capture(session: &SessionContext) -> Self {
+    fn capture(session: &mut SessionContext) -> Self {
         Self {
             current_database: session.current_database.clone(),
             sql_mode: session.sql_mode.clone(),
             temporal_sql_mode_bits: session.temporal_sql_mode_bits,
             authenticated_as: session.authenticated_as.clone(),
             active_roles: session.active_roles.clone(),
+            view_security_overrides: std::mem::take(&mut session.view_security_overrides),
             last_row_count: session.last_row_count,
             statement_insert_id: crate::engine::api::snapshot_statement_insert_id(),
             last_insert_id: session
@@ -1788,6 +1790,7 @@ impl RoutineInvocationSnapshot {
         session.temporal_sql_mode_bits = self.temporal_sql_mode_bits;
         session.authenticated_as = self.authenticated_as;
         session.active_roles = self.active_roles;
+        session.view_security_overrides = self.view_security_overrides;
         if restore_last_insert_id {
             session.last_row_count = self.last_row_count;
             session
@@ -2213,6 +2216,17 @@ fn execute_routine_inner(
         return Err(err);
     }
     let invocation_snapshot = RoutineInvocationSnapshot::capture(session);
+    // RETURN/IF/SET expressions can evaluate subqueries without dispatching
+    // a separate SQL statement. Isolate the entire body from view bindings.
+    // SAFETY: db, session and registry remain pinned throughout this call.
+    let _function_context = unsafe {
+        crate::engine::expr::install_stored_fn_context(
+            std::ptr::NonNull::from(db),
+            std::ptr::NonNull::from(&mut *session),
+            std::ptr::NonNull::from(registry),
+            false,
+        )
+    };
     session.current_database = routine.database.clone();
     // Empty sql_mode is a real captured value, not a legacy "missing" marker.
     // Replaying it is required when the invoker currently runs in strict mode.
@@ -2428,6 +2442,15 @@ fn execute_trigger_body_inner(
     // the caller's session mode. Same enter/restore pattern as stored
     // routines. Empty is itself a captured mode and must override the caller.
     let invocation_snapshot = RoutineInvocationSnapshot::capture(session);
+    // SAFETY: all pointers outlive the trigger body and its nested routines.
+    let _function_context = unsafe {
+        crate::engine::expr::install_stored_fn_context(
+            std::ptr::NonNull::from(db),
+            std::ptr::NonNull::from(&mut *session),
+            std::ptr::NonNull::from(registry),
+            false,
+        )
+    };
     session.current_database = trigger.database.clone();
     session.sql_mode = trigger.sql_mode.clone();
     session.temporal_sql_mode_bits =
@@ -3746,9 +3769,7 @@ fn select_into_single_row(response: QueryResponse) -> Result<Vec<Value>, Routine
         QueryResponse::StreamingResultSet(mut result) => {
             let first = result.cursor.next_row()?;
             let second = result.cursor.next_row()?;
-            for warning in result.cursor.take_warnings() {
-                crate::engine::api::push_sql_warning(warning);
-            }
+            crate::engine::api::append_statement_warnings(result.cursor.take_warnings());
             match (first, second) {
                 (None, _) => Err(not_found_condition()),
                 (Some(row), None) => Ok(row),

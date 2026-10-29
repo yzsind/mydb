@@ -1869,6 +1869,9 @@ fn copy_modify_non_strict_workers_preserve_all_conversion_warnings() {
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
     engine
+        .execute_with_session(&mut session, "SET max_error_count=65535")
+        .unwrap();
+    engine
         .execute_with_session(&mut session, "SET sql_mode='NO_ENGINE_SUBSTITUTION'")
         .unwrap();
     engine
