@@ -1698,6 +1698,69 @@ fn compact_window_batches_match_spill_for_multiple_fixed_width_windows() {
 }
 
 #[test]
+fn compact_window_expression_partitions_and_correlated_bucket_cache_match_oracles() {
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE bucket_outer(id BIGINT PRIMARY KEY,n BIGINT,s VARCHAR(128),j JSON,f DOUBLE)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE bucket_inner(v BIGINT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO bucket_inner VALUES (0),(1),(1),(3),(NULL)")
+        .unwrap();
+    let values = (-128..384)
+        .map(|n| {
+            format!(
+                "({n},{})",
+                if n % 11 == 0 {
+                    "NULL".into()
+                } else {
+                    n.to_string()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO bucket_outer(id,n) VALUES {values}"))
+        .unwrap();
+    engine
+        .execute("UPDATE bucket_outer SET s=REPEAT('row',30),j=JSON_OBJECT('n',n),f=n/8.0")
+        .unwrap();
+    let sql = "SELECT id,RANK() OVER(PARTITION BY n%17 ORDER BY id),LAG(n) OVER(PARTITION BY n%17 ORDER BY id),LAST_VALUE(n) OVER(PARTITION BY n%17 ORDER BY id) FROM bucket_outer ORDER BY id";
+    let run = |limit| {
+        with_query_budget(Arc::new(MemBudget::new(limit)), || {
+            collect_select_response_rows(engine.execute(sql).unwrap())
+        })
+    };
+    let expected = run(16 * 1024);
+    let before = crate::engine::executor::select::vec_bridge::COMPACT_WINDOW_BATCH_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(run(64 * 1024 * 1024), expected);
+    assert!(
+        crate::engine::executor::select::vec_bridge::COMPACT_WINDOW_BATCH_HITS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > before
+    );
+    for sql in [
+        "SELECT o.id,EXISTS(SELECT 1 FROM bucket_inner i WHERE i.v=o.n%7),NOT EXISTS(SELECT 1 FROM bucket_inner i WHERE i.v=o.n%7) FROM bucket_outer o ORDER BY o.id",
+        "SELECT o.id,(SELECT COUNT(*) FROM bucket_inner i WHERE i.v=(o.n%7)%3),o.n IN (SELECT i.v FROM bucket_inner i WHERE i.v=o.n%7) FROM bucket_outer o ORDER BY o.id",
+        "SELECT o.id,EXISTS(SELECT 1 FROM bucket_inner i WHERE i.v=o.n%7 AND i.v=o.id%3) FROM bucket_outer o ORDER BY o.id",
+        "SELECT o.id,EXISTS(SELECT 1 FROM bucket_inner i WHERE i.v=o.f%7),EXISTS(SELECT 1 FROM bucket_inner i WHERE i.v=o.n%7 AND i.v=o.f%3) FROM bucket_outer o ORDER BY o.id",
+    ] {
+        std::env::set_var("MYDB_SUBQUERY_PLAN_CACHE", "off");
+        let expected = collect_select_response_rows(engine.execute(sql).unwrap());
+        std::env::set_var("MYDB_SUBQUERY_PLAN_CACHE", "on");
+        assert_eq!(collect_select_response_rows(engine.execute(sql).unwrap()), expected, "{sql}");
+    }
+    std::env::remove_var("MYDB_SUBQUERY_PLAN_CACHE");
+}
+
+#[test]
 fn columnar_window_shared_orders_match_spill_with_nulls_and_mixed_frames() {
     use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
     use std::sync::Arc;

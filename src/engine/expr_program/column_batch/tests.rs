@@ -1532,7 +1532,8 @@ fn typed_binary_values(values: Vec<Value>) -> ColumnVector {
 fn checked_legacy_column(sql: &str, schema: Arc<BatchSchema>, columns: Vec<ColumnVector>) {
     let ast = crate::parser::parse_expr_fragment(sql).unwrap();
     let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
-    let program = ExprCompiler::compile(&ast, &input).unwrap();
+    let program =
+        ExprCompiler::compile(&ast, &input).unwrap_or_else(|e| panic!("compile {sql}: {e:?}"));
     let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
     let batch = Batch::new(schema, columns);
     let expected = oracle(&legacy, &batch).unwrap();
@@ -2034,6 +2035,653 @@ fn borrowed_string_columns_match_legacy_unicode_binary_null_and_overlap_rules() 
             vec![ColumnVector::from_values(vec![Value::String("Ā".into())])]
         ))
         .is_none());
+}
+
+#[test]
+fn insert_columns_keep_character_positions_binary_octets_and_extreme_extents() {
+    let (_, schema) = compile("x", ColumnType::VarString);
+    let values = vec![
+        Value::Null,
+        Value::String("".into()),
+        Value::String("a文🙂e\u{301}\0z".into()),
+        Value::String("abcdef".into()),
+    ];
+    for pos in [i64::MIN, -1, 0, 1, 2, 4, 7, i64::MAX] {
+        for len in [i64::MIN, -1, 0, 1, 3, i64::MAX] {
+            checked_legacy_column(
+                &format!("INSERT(x,{pos},{len},'替🙂')"),
+                schema.clone(),
+                vec![ColumnVector::from_values(values.clone())],
+            );
+        }
+    }
+    let mut field = schema.fields()[0].clone();
+    field.column_type = ColumnType::Blob;
+    field.source.flags |= crate::mysql::protocol::BINARY_FLAG;
+    field.source.collation_id = Some(crate::charset::BINARY_COLLATION_ID);
+    let binary = Arc::new(BatchSchema::new(vec![field]));
+    for sql in [
+        "INSERT(x,2,3,'文')",
+        "INSERT(x,1,-1,'')",
+        "INSERT(x,2,0,'x')",
+        "INSERT(x,0,9,'x')",
+    ] {
+        checked_legacy_column(
+            sql,
+            binary.clone(),
+            vec![typed_binary_values(vec![
+                Value::Null,
+                Value::Bytes(vec![]),
+                Value::Bytes(vec![255, 0, 128, 65, 66]),
+            ])],
+        );
+    }
+}
+
+#[test]
+fn conv_columns_keep_all_bases_unsigned_limits_and_ordered_diagnostic_fallback() {
+    let (_, schema) = compile("x", ColumnType::VarString);
+    for from in 2..=36 {
+        let mut digits = Vec::new();
+        crate::engine::expr::append_conv_digits(u64::MAX, from, &mut digits);
+        let maximum = String::from_utf8(digits).unwrap();
+        for to in [2, 8, 10, 16, 36, -2, -10, -16, -36] {
+            for from in [from, -from] {
+                checked_legacy_column(
+                    &format!("CONV(x,{from},{to})"),
+                    schema.clone(),
+                    vec![ColumnVector::from_values(vec![
+                        Value::Null,
+                        Value::String("0".into()),
+                        Value::String(" -1 ".into()),
+                        Value::String("+1".into()),
+                        Value::String(maximum.clone()),
+                        Value::String(format!("-{maximum}")),
+                    ])],
+                );
+            }
+        }
+    }
+    let mut field = schema.fields()[0].clone();
+    field.column_type = ColumnType::LongLong;
+    field.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    checked_legacy_column(
+        "CONV(CAST(x AS CHAR),10,16)",
+        Arc::new(BatchSchema::new(vec![field])),
+        vec![ColumnVector::from_values(vec![
+            Value::Null,
+            Value::UInt(0),
+            Value::UInt(u64::MAX),
+        ])],
+    );
+    for value in ["", " ", "1z", "-", "18446744073709551616", "文"] {
+        let (program, schema) = compile("CONV(x,10,16)", ColumnType::VarString);
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![Value::String(value.into())])],
+        );
+        assert!(program.try_eval_column(&batch).is_none(), "{value}");
+    }
+    // Selection must not evaluate an unselected diagnostic-producing value.
+    let (program, schema) = compile("CONV(x,10,16)", ColumnType::VarString);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![
+            Value::String("255".into()),
+            Value::String("invalid".into()),
+            Value::Null,
+        ])],
+    )
+    .with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+        vec![0, 2],
+    ));
+    let output = program.try_eval_column(&batch).unwrap();
+    assert_eq!(output.value_at(0), Value::String("FF".into()));
+    assert_eq!(output.value_at(2), Value::Null);
+}
+
+#[test]
+fn strcmp_columns_keep_collation_padding_expansions_and_nulls() {
+    let (_, schema) = compile("x", ColumnType::VarString);
+    for collation in [
+        "utf8mb4_0900_ai_ci",
+        "utf8mb4_general_ci",
+        "utf8mb4_bin",
+        "utf8mb4_unicode_ci",
+        "utf8mb4_0900_as_cs",
+        "utf8mb4_turkish_ci",
+    ] {
+        let mut field = schema.fields()[0].clone();
+        field.source.collation_id = Some(crate::charset::resolve_collation(collation).unwrap().id);
+        let schema = Arc::new(BatchSchema::new(vec![field]));
+        for needle in ["", "a", "a ", "ss", "ß", "É", "中🙂", "İ"] {
+            checked_legacy_column(
+                &format!("STRCMP(x,'{needle}')"),
+                schema.clone(),
+                vec![ColumnVector::from_values(vec![
+                    Value::Null,
+                    Value::String("".into()),
+                    Value::String("A ".into()),
+                    Value::String("ß".into()),
+                    Value::String("e\u{301}".into()),
+                    Value::String("中🙂".into()),
+                    Value::String("ı".into()),
+                ])],
+            );
+        }
+    }
+}
+
+#[test]
+fn format_columns_keep_exact_rounding_all_locale_groups_and_padding() {
+    let (_, schema) = compile(
+        "x",
+        ColumnType::Decimal {
+            precision: 20,
+            scale: 6,
+        },
+    );
+    let values = vec![
+        Value::Null,
+        Value::DecimalCompact(0, 6),
+        Value::DecimalCompact(1234567890000, 6),
+        Value::DecimalCompact(-2675000, 6),
+        Value::DecimalCompact(999999995000, 6),
+        Value::DecimalCompact(-1, 6),
+    ];
+    for locale in [
+        "en_US", "de_DE", "ru_RU", "fr_FR", "de_CH", "en_IN", "ta_IN", "ar_SA", " EN_us ",
+    ] {
+        for decimals in [-1, 0, 2, 6, 30, 99] {
+            checked_legacy_column(
+                &format!("FORMAT(x,{decimals},'{locale}')"),
+                schema.clone(),
+                vec![ColumnVector::from_values(values.clone())],
+            );
+        }
+    }
+    parity(
+        "FORMAT(x,2,'en_IN')",
+        ColumnType::LongLong,
+        vec![Value::Int(i64::MIN), Value::Int(i64::MAX), Value::Null],
+    );
+    let mut unsigned = schema.fields()[0].clone();
+    unsigned.column_type = ColumnType::LongLong;
+    unsigned.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    checked_legacy_column(
+        "FORMAT(x,2)",
+        Arc::new(BatchSchema::new(vec![unsigned])),
+        vec![ColumnVector::from_values(vec![
+            Value::UInt(u64::MAX),
+            Value::UInt(0),
+            Value::Null,
+        ])],
+    );
+    let (program, schema) = compile(
+        "FORMAT(x,30)",
+        ColumnType::Decimal {
+            precision: 38,
+            scale: 0,
+        },
+    );
+    assert!(program
+        .try_eval_column(&Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![Value::Decimal128(
+                i128::MAX,
+                0
+            )])]
+        ))
+        .is_none());
+    for sql in [
+        "FORMAT(x,2,'unknown')",
+        "FORMAT(x,2,NULL)",
+        "FORMAT(x,'bad')",
+    ] {
+        let (program, schema) = compile(sql, ColumnType::LongLong);
+        assert!(!program.has_column_contract(&schema), "{sql}");
+    }
+    for (locale, expected) in [
+        ("en_US", "1,234,567.89"),
+        ("en_IN", "12,34,567.89"),
+        ("de_DE", "1.234.567,89"),
+        ("fr_FR", "1234567,89"),
+        ("de_CH", "1'234'567.89"),
+    ] {
+        let (program, schema) = compile(
+            &format!("FORMAT(x,2,'{locale}')"),
+            ColumnType::Decimal {
+                precision: 20,
+                scale: 6,
+            },
+        );
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![Value::DecimalCompact(
+                1234567890000,
+                6,
+            )])],
+        );
+        assert_eq!(
+            program.try_eval_column(&batch).unwrap().value_at(0),
+            Value::String(expected.into())
+        );
+    }
+}
+
+#[test]
+fn integer_text_producers_keep_null_skip_full_bits_unicode_and_boundaries() {
+    let (_, signed) = compile("x", ColumnType::LongLong);
+    let values = vec![
+        Value::Null,
+        Value::Int(0),
+        Value::Int(1),
+        Value::Int(-1),
+        Value::Int(i64::MIN),
+        Value::Int(i64::MAX),
+        Value::Int(0x12345678),
+    ];
+    for sql in [
+        "CHAR(x,66,NULL)",
+        "CHAR(x%26+65,66)",
+        "SPACE(x%16)",
+        "EXPORT_SET(x,'文','🙂',':',16)",
+        "EXPORT_SET(x,'Y','N')",
+        "EXPORT_SET(x,'Y','N','',0)",
+        "EXPORT_SET(x,'Y','N',',',-1)",
+        "MAKE_SET(x,'a',NULL,'文','','🙂')",
+        "ELT(x%7,'a',NULL,'文','','🙂')",
+    ] {
+        checked_legacy_column(
+            sql,
+            signed.clone(),
+            vec![ColumnVector::from_values(values.clone())],
+        );
+    }
+    let mut unsigned = signed.fields()[0].clone();
+    unsigned.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    let unsigned = Arc::new(BatchSchema::new(vec![unsigned]));
+    for sql in [
+        "CHAR(x)",
+        "EXPORT_SET(x,'Y','N',',',64)",
+        "MAKE_SET(x,'a','b','c')",
+        "ABS(x)",
+    ] {
+        checked_legacy_column(
+            sql,
+            unsigned.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::UInt(0),
+                Value::UInt(1),
+                Value::UInt(u64::MAX),
+            ])],
+        );
+    }
+    for sql in ["ABS(x)"] {
+        checked_legacy_column(
+            sql,
+            compile("x", ColumnType::Double).1,
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::Double(-2.5),
+                Value::Double(-0.0),
+                Value::Double(f64::MAX),
+            ])],
+        );
+        checked_legacy_column(
+            sql,
+            compile(
+                "x",
+                ColumnType::Decimal {
+                    precision: 38,
+                    scale: 6,
+                },
+            )
+            .1,
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::DecimalCompact(-1001, 6),
+                Value::Decimal128(-999999999999999999999, 6),
+            ])],
+        );
+    }
+    let (_, text) = compile("x", ColumnType::VarString);
+    for sql in [
+        "SOUNDEX(x)",
+        "FIND_IN_SET('a',x)",
+        "FIND_IN_SET('',x)",
+        "FIND_IN_SET('É',x)",
+    ] {
+        checked_legacy_column(
+            sql,
+            text.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("".into()),
+                Value::String(",a,A,,é,É".into()),
+                Value::String("a文🙂ÀRobert Ashcraft".into()),
+            ])],
+        );
+    }
+    let (program, schema) = compile("SPACE(x)", ColumnType::LongLong);
+    let selected = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![
+            Value::Int(3),
+            Value::Int(i64::MAX),
+            Value::Null,
+        ])],
+    )
+    .with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+        vec![0, 2],
+    ));
+    let output = program.try_eval_column(&selected).unwrap();
+    assert_eq!(output.value_at(0), Value::String("   ".into()));
+    assert_eq!(output.value_at(2), Value::Null);
+}
+
+#[test]
+fn spatial_programs_lower_without_ast_escape_and_preserve_aliases_and_nulls() {
+    let schema = compile("x", ColumnType::Geometry).1;
+    let geom = crate::engine::geo::write_geometry(
+        &crate::engine::geo::read_wkb(&[
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ])
+        .map(|geom| crate::engine::geo::types::Geometry { srid: 0, geom })
+        .unwrap(),
+    );
+    let batch = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::Null,
+            Value::Geometry(geom),
+        ])],
+    );
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+    for sql in [
+        "ST_ASTEXT(x)",
+        "HEX(ST_ASWKB(x))",
+        "ST_DIMENSION(x)",
+        "ST_ISEMPTY(x)",
+        "ST_ASTEXT(ST_SWAPXY(x))",
+        "ST_ASTEXT(GEOMETRYCOLLECTION(x,x))",
+        "ST_ASWKT(x)",
+    ] {
+        let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+        let program = ExprCompiler::compile(&ast, &input).unwrap();
+        let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+        assert!(!program.capability().legacy_escape, "{sql}");
+        assert_eq!(
+            oracle(&program, &batch).unwrap(),
+            oracle(&legacy, &batch).unwrap(),
+            "{sql}"
+        );
+    }
+    let (program, schema) = compile(
+        "ST_GEOMFROMGEOJSON(JSON_OBJECT('type','Point','coordinates',JSON_ARRAY(x=1,x>0)))",
+        ColumnType::LongLong,
+    );
+    assert!(program.capability().legacy_escape);
+    let batch = Batch::new(schema, vec![ColumnVector::from_values(vec![Value::Int(1)])]);
+    assert!(oracle(&program, &batch).is_err());
+    let (program, schema) = compile("ELT(1,CAST(x>0 AS JSON))", ColumnType::LongLong);
+    assert!(program.capability().legacy_escape);
+    let batch = Batch::new(schema, vec![ColumnVector::from_values(vec![Value::Int(1)])]);
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(batch.schema());
+    let ast = crate::parser::parse_expr_fragment("ELT(1,CAST(x>0 AS JSON))").unwrap();
+    let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+    assert_eq!(
+        oracle(&program, &batch).unwrap(),
+        oracle(&legacy, &batch).unwrap()
+    );
+}
+
+#[test]
+fn new_codecs_parsers_and_unsigned_arithmetic_keep_scalar_semantics() {
+    let (_, strings) = compile("x", ColumnType::VarString);
+    for sql in ["FROM_BASE64(TO_BASE64(x))", "TO_BASE64(x)"] {
+        checked_legacy_column(
+            sql,
+            strings.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("".into()),
+                Value::String("文🙂\0".repeat(40)),
+                Value::String("hello".into()),
+            ])],
+        );
+    }
+    checked_legacy_column(
+        "STR_TO_DATE(x,'%Y-%m-%d %H:%i:%s.%f')",
+        strings.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::Null,
+            Value::String("2024-02-29 23:59:59.123456".into()),
+            Value::String("1999-01-01 00:00:00.000001".into()),
+        ])],
+    );
+    let mut aes_field = strings.fields()[0].clone();
+    aes_field.source.collation_id = Some(crate::charset::UTF8MB4_0900_AI_CI_ID);
+    let aes_schema = Arc::new(BatchSchema::new(vec![aes_field]));
+    checked_legacy_column(
+        "AES_DECRYPT(AES_ENCRYPT(x,'key'),'key')",
+        aes_schema,
+        vec![ColumnVector::from_values(vec![
+            Value::Null,
+            Value::String("".into()),
+            Value::String("文🙂\0".repeat(40)),
+            Value::String("hello".into()),
+        ])],
+    );
+    let mut source = strings.fields()[0].clone();
+    source.source.collation_id = Some(crate::charset::UTF8MB4_0900_AI_CI_ID);
+    let mut password = source.clone();
+    password.name = "password".into();
+    password.column_type = ColumnType::Double;
+    password.source.decimals = Some(2);
+    let schema = Arc::new(BatchSchema::new(vec![source, password]));
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+    let ast = crate::parser::parse_expr_fragment("AES_ENCRYPT(x,password)").unwrap();
+    assert!(ExprCompiler::compile(&ast, &input).is_err());
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    let mut field = schema.fields()[0].clone();
+    field.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    let schema = Arc::new(BatchSchema::new(vec![field]));
+    for sql in [
+        "x+7",
+        "CAST(x+9223372036854775808 AS UNSIGNED)>9223372036854775809",
+        "CAST(x AS UNSIGNED)%7",
+        "x*3",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::UInt(0),
+                Value::UInt(1),
+                Value::UInt(100),
+            ])],
+        );
+    }
+    let (program, schema) = compile("CAST(x AS UNSIGNED)+1", ColumnType::LongLong);
+    assert!(!program.has_column_contract(&schema));
+}
+
+#[test]
+fn deep_numeric_contract_binding_remains_linear_when_unsigned_kernels_decline() {
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    let mut unsigned = schema.fields()[0].clone();
+    unsigned.name = "u".into();
+    unsigned.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    let schema = Arc::new(BatchSchema::new(vec![schema.fields()[0].clone(), unsigned]));
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+    for seed in ["x", "x+u"] {
+        let mut sql = seed.to_string();
+        for _ in 0..48 {
+            sql = format!("({sql}+1)");
+        }
+        let ast = crate::parser::parse_expr_fragment(&sql).unwrap();
+        let program = ExprCompiler::compile(&ast, &input).unwrap();
+        CONTRACT_BIND_VISITS.with(|visits| visits.set(0));
+        let _ = program.has_column_contract(&schema);
+        let visits = CONTRACT_BIND_VISITS.with(std::cell::Cell::get);
+        assert!(visits < 256, "{seed}: {visits} binding visits");
+    }
+}
+
+#[test]
+fn conditional_and_bit_columns_preserve_null_truth_short_circuit_and_overflow_fallback() {
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    for sql in [
+        "IF(x<0,1,2)",
+        "CASE x%3 WHEN 0 THEN x WHEN 1 THEN 7 ELSE NULL END",
+        "CASE WHEN x<0 THEN 1 WHEN x=0 THEN 2 ELSE 3 END",
+        "x&7",
+        "x|7",
+        "x^7",
+        "x<<2",
+        "x>>2",
+        "x<<64",
+        "x<<-1",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(i64::MAX),
+            ])],
+        );
+    }
+    for sql in ["IF(x<0,x+1,0)", "CASE WHEN x<0 THEN ABS(x) ELSE 1 END"] {
+        let (program, schema) = compile(sql, ColumnType::LongLong);
+        assert!(
+            program
+                .try_eval_column(&Batch::new(
+                    schema,
+                    vec![ColumnVector::from_values(vec![Value::Int(i64::MIN)])]
+                ))
+                .is_none(),
+            "{sql}"
+        );
+    }
+    let (_, schema) = compile("x", ColumnType::VarString);
+    for sql in [
+        "IF(LENGTH(x)>2,x,'小')",
+        "CASE WHEN LENGTH(x)=0 THEN '' ELSE x END",
+        "TRIM(BOTH 'xy' FROM x)",
+        "TRIM(LEADING '文' FROM x)",
+        "TRIM(TRAILING '🙂' FROM x)",
+        "TRIM(BOTH '' FROM x)",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("".into()),
+                Value::String("xyxy文hello🙂xyxy".into()),
+                Value::String("文文abc🙂🙂".into()),
+            ])],
+        );
+    }
+}
+
+#[test]
+fn regexp_columns_keep_collation_flags_unicode_offsets_occurrences_and_nulls() {
+    let (_, schema) = compile("x", ColumnType::VarString);
+    for collation in [
+        "utf8mb4_0900_ai_ci",
+        "utf8mb4_general_ci",
+        "utf8mb4_0900_as_cs",
+        "utf8mb4_bin",
+        "utf8mb4_turkish_ci",
+    ] {
+        let mut field = schema.fields()[0].clone();
+        field.source.collation_id = Some(crate::charset::resolve_collation(collation).unwrap().id);
+        let schema = Arc::new(BatchSchema::new(vec![field]));
+        for pattern in ["[0-9]+", "é", "文|🙂", "^|$", ".", "a.*b", "[[:alpha:]]+"] {
+            for flags in ["", "i", "c", "ic", "ci", "m", "n", "u"] {
+                for expr in [
+                    format!("REGEXP_LIKE(x,'{pattern}','{flags}')"),
+                    format!("REGEXP_INSTR(x,'{pattern}',1,1,0,'{flags}')"),
+                    format!("REGEXP_INSTR(x,'{pattern}',1,2,1,'{flags}')"),
+                    format!("REGEXP_SUBSTR(x,'{pattern}',1,2,'{flags}')"),
+                ] {
+                    checked_legacy_column(
+                        &expr,
+                        schema.clone(),
+                        vec![ColumnVector::from_values(vec![
+                            Value::Null,
+                            Value::String("".into()),
+                            Value::String("文🙂12é34É".into()),
+                            Value::String("a\nb\0e\u{301}".into()),
+                        ])],
+                    );
+                }
+            }
+        }
+    }
+    for expr in [
+        "REGEXP_INSTR(x,'[0-9]+',2,0,1)",
+        "REGEXP_SUBSTR(x,'[0-9]+',2,2)",
+    ] {
+        checked_legacy_column(
+            expr,
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("文🙂12é34".into()),
+                Value::String("abcdef".into()),
+            ])],
+        );
+    }
+    for expr in [
+        "REGEXP_LIKE(x,'[')",
+        "REGEXP_SUBSTR(x,'a',0)",
+        "REGEXP_INSTR(x,'a',1,1,2)",
+        "REGEXP_LIKE(x,'a','bad')",
+        "REGEXP_INSTR(x,'a',3)",
+    ] {
+        let (program, schema) = compile(expr, ColumnType::VarString);
+        assert!(
+            program
+                .try_eval_column(&Batch::new(
+                    schema,
+                    vec![ColumnVector::from_values(vec![Value::String("a".into())])]
+                ))
+                .is_none(),
+            "{expr}"
+        );
+    }
+    for expr in [
+        "REGEXP_LIKE(x,'[')",
+        "REGEXP_INSTR(x,'[')",
+        "REGEXP_SUBSTR(x,'[')",
+    ] {
+        checked_legacy_column(expr, schema.clone(), vec![ColumnVector::Null { len: 3 }]);
+    }
+    // An invisible out-of-range position must not abort a selected row.
+    let (program, schema) = compile("REGEXP_SUBSTR(x,'a',2)", ColumnType::VarString);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![
+            Value::String("aaa".into()),
+            Value::String("".into()),
+            Value::Null,
+        ])],
+    )
+    .with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+        vec![0, 2],
+    ));
+    let output = program.try_eval_column(&batch).unwrap();
+    assert_eq!(output.value_at(0), Value::String("a".into()));
+    assert_eq!(output.value_at(2), Value::Null);
 }
 
 #[test]

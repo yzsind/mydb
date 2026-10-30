@@ -1785,11 +1785,23 @@ fn preflight_result_projection(
                 }
                 let mut source_sensitive_string_coercion = false;
                 let mut source_sensitive_number_rendering = false;
+                let mut source_sensitive_value_provenance = false;
                 crate::planner::walk_expr_for_idents(expr, &mut |node| {
                     let Some(index) = expr_column_index_in_template(node, &planned_template) else {
                         return;
                     };
                     let field = &planned_template[index];
+                    source_sensitive_value_provenance |= field.source.flags
+                        & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+                        != 0
+                        || matches!(
+                            field.column_type,
+                            ColumnType::Date
+                                | ColumnType::DateTime
+                                | ColumnType::Timestamp
+                                | ColumnType::Time
+                                | ColumnType::Year
+                        );
                     source_sensitive_number_rendering |= matches!(
                         field.column_type,
                         ColumnType::Float | ColumnType::Double | ColumnType::Bit { .. }
@@ -1811,7 +1823,9 @@ fn preflight_result_projection(
                     };
                 });
                 let value_string_operations = !source_sensitive_number_rendering
-                    && program.has_only_value_string_operations();
+                    && (program.has_only_value_string_operations()
+                        || (!source_sensitive_value_provenance
+                            && program.has_value_only_spatial_root()));
                 // Numeric coercions retain the catalog-aware oracle (TEXT/BLOB
                 // conversions are silent while bounded strings publish 1292).
                 // Proven value-only string operations can use compiled kernels;
@@ -1820,8 +1834,13 @@ fn preflight_result_projection(
                 // This is a kernel choice in the same pipeline: input is not
                 // replayed and the projection remains batch-driven.
                 let typed_value_operations = program.has_column_contract(&schema);
+                let ordered_value_kernel = !source_sensitive_number_rendering
+                    && !source_sensitive_value_provenance
+                    && !source_sensitive_string_coercion
+                    && program.has_ordered_value_kernel_root();
                 if crate::engine::expr::strict_numeric_materialization_active()
                     || (!typed_value_operations
+                        && !ordered_value_kernel
                         && (((source_sensitive_string_coercion || program.capability().may_error)
                             && !value_string_operations)
                             || !program.capability().deterministic

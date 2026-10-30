@@ -148,6 +148,7 @@ macro_rules! scalar_catalog {
             Math(crate::engine::expr::math::MathFunction),
             Network(crate::engine::expr::network::NetworkFunction),
             GeometryConstructor(&'static str, bool),
+            Spatial(crate::engine::geo::sql::SpatialFunctionSpec),
             $($variant,)*
             LegacyDeterministic(&'static str),
             LegacySession(&'static str),
@@ -157,13 +158,13 @@ macro_rules! scalar_catalog {
             fn may_error(self, arity: usize) -> bool {
                 match self {
                     $(Self::$variant => ($diagnostic)(arity),)*
-                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
                 }
             }
             fn is_deterministic(self) -> bool {
                 match self {
                     $(Self::$variant => $deterministic,)*
-                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) => true,
                     Self::LegacySession(_) => false,
                 }
             }
@@ -280,6 +281,15 @@ scalar_catalog! {
         }
         RegexpLike => (true, |_arity| true) {
             [("REGEXP_LIKE", "regexp_like")] => (RegexOrComplex, LongLong, None, false);
+        }
+        Char => (true, |_arity| true) {
+            [("CHAR", "char")] => (CheapString, VarString, None, false);
+        }
+        MakeSet => (true, |_arity| true) {
+            [("MAKE_SET", "make_set")] => (RegexOrComplex, VarString, None, false);
+        }
+        Benchmark => (false, |_arity| true) {
+            [("BENCHMARK", "benchmark")] => (Volatile, LongLong, None, false);
         }
         RegexpReplace => (true, |_arity| true) {
             [("REGEXP_REPLACE", "regexp_replace")] => (RegexOrComplex, VarString, None, false);
@@ -497,7 +507,7 @@ scalar_catalog! {
         }
         None {
             [("RAND_SEEDED", "rand_seeded")] => (IntegerArith, VarString, None, false);
-            [("CHAR", "char"), ("FORMAT_BYTES", "format_bytes"), ("FORMAT_PICO_TIME", "format_pico_time"), ("VALIDATE_PASSWORD_STRENGTH", "validate_password_strength"), ("STATEMENT_DIGEST_TEXT", "statement_digest_text"), ("INTERVAL", "interval"), ("GROUPING", "grouping"), ("NAME_CONST", "name_const")] => (CheapString, VarString, None, false);
+            [("FORMAT_BYTES", "format_bytes"), ("FORMAT_PICO_TIME", "format_pico_time"), ("VALIDATE_PASSWORD_STRENGTH", "validate_password_strength"), ("STATEMENT_DIGEST_TEXT", "statement_digest_text"), ("INTERVAL", "interval"), ("GROUPING", "grouping"), ("NAME_CONST", "name_const")] => (CheapString, VarString, None, false);
             [("LOCATE", "locate"), ("INSTR", "instr"), ("POSITION", "position")] => (CheapString, LongLong, None, false);
             [("WEIGHT_STRING", "weight_string")] => (CheapString, Blob, None, true);
             [("DAYNAME", "dayname"), ("MONTHNAME", "monthname"), ("TIME_FORMAT", "time_format")] => (DateTimeImmutable, VarString, None, false);
@@ -513,7 +523,7 @@ scalar_catalog! {
             [("SYSTEM_USER", "system_user"), ("CURRENT_ROLE", "current_role"), ("CHARSET", "charset"), ("COLLATION", "collation"), ("ICU_VERSION", "icu_version")] => (SessionDependent, VarString, None, false);
             [("LAST_INSERT_ID", "last_insert_id")] => (SessionDependent, LongLong, ( StatementCounter, 0, 1, Volatile, fixed_integer_result(Big, false, false)), false);
             [("COERCIBILITY", "coercibility")] => (SessionDependent, LongLong, ( Coercibility, 1, 1, Immutable, fixed_integer_result(Int, false, false)), false);
-            [("REGEXP", "regexp"), ("REGEXP_SUBSTR", "regexp_substr"), ("JSON_VALUE", "json_value"), ("MAKE_SET", "make_set")] => (RegexOrComplex, VarString, None, false);
+            [("REGEXP", "regexp"), ("REGEXP_SUBSTR", "regexp_substr"), ("JSON_VALUE", "json_value")] => (RegexOrComplex, VarString, None, false);
             [("REGEXP_INSTR", "regexp_instr")] => (RegexOrComplex, LongLong, None, false);
             [("JSON_SET", "json_set"), ("JSON_INSERT", "json_insert"), ("JSON_REPLACE", "json_replace"), ("JSON_REMOVE", "json_remove"), ("JSON_ARRAY_APPEND", "json_array_append"), ("JSON_ARRAY_INSERT", "json_array_insert"), ("JSON_MERGE", "json_merge"), ("JSON_SEARCH", "json_search")] => (RegexOrComplex, Json, None, false);
             [("STATEMENT_DIGEST", "statement_digest")] => (CryptoHash, VarString, None, true);
@@ -524,7 +534,7 @@ scalar_catalog! {
             [("AI_GENERATE", "ai_generate")] => (Volatile, VarString, ( AiGenerate, 2, 3, Volatile, fixed_ai_text_result()), false);
             [("AI_GENERATE_DETAIL", "ai_generate_detail"), ("AI_EMBED_DETAIL", "ai_embed_detail")] => (Volatile, Json, ( AiDetail, 2, 3, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
             [("AI_EMBED", "ai_embed")] => (Volatile, Vector, ( AiEmbed, 2, 3, Volatile, fixed_ai_vector_result()), false);
-            [("SLEEP", "sleep"), ("BENCHMARK", "benchmark")] => (Volatile, LongLong, None, false);
+            [("SLEEP", "sleep")] => (Volatile, LongLong, None, false);
             [("GET_LOCK", "get_lock"), ("RELEASE_LOCK", "release_lock"), ("IS_FREE_LOCK", "is_free_lock"), ("IS_USED_LOCK", "is_used_lock"), ("RELEASE_ALL_LOCKS", "release_all_locks")] => (Volatile, VarString, None, false);
             [("LOAD_FILE", "load_file")] => (Volatile, Blob, None, false);
             [("__MATCH_AGAINST", "__match_against")] => (Unknown, Double, None, false);

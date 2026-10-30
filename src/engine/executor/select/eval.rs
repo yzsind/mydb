@@ -1477,6 +1477,7 @@ struct OuterBindingSpec {
     param_index: usize,
     qualifier: Option<String>,
     column: String,
+    remainder: Option<i64>,
 }
 
 /// Result of preparing a subquery call. `Cached` means we have a
@@ -4604,7 +4605,14 @@ fn collect_outer_params(
     let mut keys = Vec::with_capacity(bindings.len());
     for spec in bindings {
         let field = resolve_plan_field(outer_row, spec.qualifier.as_deref(), &spec.column)?;
-        let value = (field.value).clone();
+        let value = match spec.remainder {
+            Some(divisor) => crate::engine::expr::eval_arithmetic(
+                &field.value,
+                BinaryOp::Mod,
+                &Value::Int(divisor),
+            )?,
+            None => (field.value).clone(),
+        };
         keys.push(ValueKey::from_with_collation(
             &value,
             Some(crate::charset::BINARY_COLLATION_ID),
@@ -4735,6 +4743,64 @@ fn try_build_cached_subquery_plan(
     ) {
         // No outer references — caching still pays off (avoids replanning
         // per outer row that hits us). Continue.
+    }
+    let mut restore_remainders = HashMap::new();
+    for binding in bindings
+        .iter_mut()
+        .filter(|binding| binding.remainder.is_some())
+    {
+        let field =
+            resolve_plan_field(outer_row, binding.qualifier.as_deref(), &binding.column).ok()?;
+        if !matches!(
+            field.column_type,
+            ColumnType::Tiny
+                | ColumnType::Short
+                | ColumnType::MediumInt
+                | ColumnType::Long
+                | ColumnType::LongLong
+        ) || field.source.flags
+            & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+            != 0
+        {
+            let divisor = binding.remainder.take().expect("remainder binding");
+            restore_remainders.insert(
+                binding.param_index,
+                Expr::Binary {
+                    left: Box::new(Expr::Placeholder(binding.param_index)),
+                    op: BinaryOp::Mod,
+                    right: Box::new(Expr::Literal(crate::parser::Literal::Int(divisor))),
+                },
+            );
+        }
+    }
+    if !restore_remainders.is_empty() {
+        struct Restore<'a> {
+            values: &'a HashMap<usize, Expr>,
+            descend: bool,
+        }
+        impl crate::parser::visit::AstVisitorMut for Restore<'_> {
+            fn enter_expr(&mut self, expr: &mut Expr) {
+                self.descend = true;
+                if let Expr::Placeholder(index) = expr {
+                    if let Some(original) = self.values.get(index) {
+                        *expr = original.clone();
+                        self.descend = false;
+                    }
+                }
+            }
+            fn walk_expr_children(&self, _: &Expr) -> bool {
+                self.descend
+            }
+        }
+        // Ineligible source types keep the original reusable plan, rather
+        // than losing subquery plan caching as a side effect of this probe.
+        crate::parser::visit::visit_select_mut(
+            &mut Restore {
+                values: &restore_remainders,
+                descend: true,
+            },
+            &mut sub,
+        );
     }
     bind_outer_placeholder_collations(&mut sub, &bindings, outer_row);
     super::prepare_select_for_planning(db, &mut sub).ok()?;
@@ -4974,6 +5040,7 @@ fn substitute_outer_in_expr_placeholders(
                     param_index: idx,
                     qualifier: None,
                     column: name.clone(),
+                    remainder: None,
                 });
                 *expr = Expr::Placeholder(idx);
                 return true;
@@ -4990,6 +5057,7 @@ fn substitute_outer_in_expr_placeholders(
                     param_index: idx,
                     qualifier: Some(table),
                     column: col,
+                    remainder: None,
                 });
                 *expr = Expr::Placeholder(idx);
                 return true;
@@ -5007,6 +5075,31 @@ fn substitute_outer_in_expr_placeholders(
                     bindings,
                 );
             });
+            // Fold a diagnostic-free integer bucket into the outer binding.
+            // Cache identity then follows the value used by the subquery,
+            // rather than a wider source-column domain. Each lifted leaf
+            // has a unique placeholder, so other uses retain their own key.
+            if let Expr::Binary {
+                left,
+                op: BinaryOp::Mod,
+                right,
+            } = expr
+            {
+                if let (
+                    Expr::Placeholder(index),
+                    Expr::Literal(crate::parser::Literal::Int(divisor)),
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    if *divisor > 0 {
+                        if let Some(binding) = bindings.iter_mut().find(|binding| {
+                            binding.param_index == *index && binding.remainder.is_none()
+                        }) {
+                            binding.remainder = Some(*divisor);
+                            *expr = Expr::Placeholder(*index);
+                        }
+                    }
+                }
+            }
             found
         }
         // Nested subqueries — caller gates these off via

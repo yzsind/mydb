@@ -28,6 +28,61 @@ from function_expression_merge import merge
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_unordered_release_lock_checks_ownership_and_exactly_one_release(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
+            path = Path(directory) / "release.capture"
+            path.write_text('16\t["16","1"]\n1\t["1",null]\n8\t["8",null]\n')
+            self.assertEqual(check_contract(path, "RELEASE_LOCK")["status"], "contract_valid")
+            path.write_text('16\t["16","1"]\n8\t["8","1"]\n')
+            self.assertEqual(check_contract(path, "RELEASE_LOCK")["status"], "contract_invalid")
+            path.write_text('1\t["1","1"]\n')
+            self.assertEqual(check_contract(path, "RELEASE_LOCK")["status"], "contract_invalid")
+
+    def test_single_execution_warms_each_shared_dataset_once_and_never_replays_functions(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
+            root = Path(directory)
+            worker = root / "worker"
+            worker.write_text("worker")
+            (root / "mydb").write_text("engine")
+            cases = [dict(id=name, name=name.upper(), category="test", comparison="exact",
+                          sql=f"SELECT id,{name}(x) FROM bench") for name in ["f", "g"]]
+            (root / "manifest.json").write_text(json.dumps(dict(cases=cases)))
+            calls = []
+
+            def endpoint(name, args):
+                ep = Mock()
+                ep.port = 34926 if name.startswith("baseline_") else 34927
+                ep.worker.connection_id = 7
+                ep.control.query.return_value = dict(status="ok", rows=0, sample=[])
+                def execute(sql, **options):
+                    calls.append(sql)
+                    if options.get("capture"):
+                        Path(options["capture"]).write_text('1\t["1","value"]\n')
+                    return dict(status="ok", rows=1, elapsed_ms=7, sample=[])
+                ep.execute.side_effect = execute
+                return ep
+
+            args = SimpleNamespace(directory=root, worker=worker, rows=100000,
+                timeout=1, repeats=1, warmup=0,
+                modes=["baseline_serial", "baseline_parallel2", "serial", "parallel2"],
+                filter=None, limit=None, skip_invalid=True, plan_once=False,
+                single_pass=True, dataset_warmup=True, rerun=False)
+            with patch("function_expression_bench.Endpoint", side_effect=endpoint):
+                run(args)
+            self.assertEqual(sum(sql.startswith("SELECT * FROM") for sql in calls), 6)
+            self.assertFalse(any(sql.startswith("EXPLAIN") for sql in calls))
+            self.assertEqual(len(calls), 14)  # Six fixture reads and eight measured executions.
+            for case in cases:
+                result = json.loads((root / "cases" / case["id"] / "result.json").read_text())
+                for mode in ("serial", "parallel2"):
+                    self.assertEqual(result["correctness"]["baseline_vs_" + mode]["status"], "match")
+                for engine in result["engines"].values():
+                    samples = engine["metrics"]["end_to_end"]["samples"]
+                    self.assertEqual(len(samples), 1)
+                    self.assertFalse(samples[0]["warmup"])
+                    self.assertEqual(samples[0]["elapsed_ms"], 7)
+                    self.assertNotIn("plan_observation", engine)
+
     def test_single_plan_observation_preserves_end_to_end_samples_and_resume_identity(self):
         with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
             root = Path(directory)

@@ -39,7 +39,7 @@ from function_expression_cases import (
     registered_names,
 )
 
-DEFAULT_DIR = Path("/tmp/mydb/function-expression")
+DEFAULT_DIR = Path("/tmp/mydb/function-expression-100k")
 SESSION = [
     "SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'",
     "SET SESSION time_zone='+00:00'",
@@ -512,8 +512,8 @@ def sql_for(case, name, token):
     sql = case.get("mysql_sql", case["sql"]) if name == "mysql" else case["sql"]
     hint = (
         "NO_PARALLEL"
-        if name == "serial"
-        else "PARALLEL(2)" if name == "parallel2" else ""
+        if name == "serial" or name.endswith("_serial")
+        else "PARALLEL(2)" if name == "parallel2" or name.endswith("_parallel2") else ""
     )
     return re.sub(
         r"^(SELECT|INSERT)\s+",
@@ -680,6 +680,7 @@ def compare_captures(left, right, comparison, numeric_columns=False):
 def check_contract(path, name, expected=None):
     invalid = []
     count = 0
+    released = 0
     distinct = (
         set()
         if name in {"UUID", "UUID_SHORT", "RANDOM_BYTES", "RAND", "NEXTVAL"}
@@ -714,6 +715,10 @@ def check_contract(path, name, expected=None):
                 "NEXTVAL",
             }:
                 valid = value is not None and int(value) > 0
+            elif name == "RELEASE_LOCK":
+                valid = value is None or (value == "1" and int(values[0]) % 8 == 0)
+                if value == "1":
+                    released += 1
             elif name == "IS_USED_LOCK":
                 valid = (int(values[0]) % 8 != 0 and value is None) or (
                     int(values[0]) % 8 == 0 and value is not None and int(value) > 0
@@ -730,6 +735,8 @@ def check_contract(path, name, expected=None):
                 distinct.add(payload if name == "RANDOM_BYTES" else value)
     if not count:
         invalid.append(dict(reason="empty contract result"))
+    if name == "RELEASE_LOCK" and not invalid and released != 1:
+        invalid.append(dict(reason="exactly one owned feb-0 lock must be released", released=released))
     if not invalid and distinct is not None:
         unique = len(distinct)
         if name in {"UUID", "UUID_SHORT", "NEXTVAL"} and unique != count:
@@ -829,6 +836,8 @@ def parallel_evidence(plan, name):
 
 
 def run(args, validate_only=False):
+    single_pass = getattr(args, "single_pass", False)
+    dataset_warmup = getattr(args, "dataset_warmup", single_pass)
     manifest = json.loads((args.directory / "manifest.json").read_text())
     manifest_hash = digest_file(args.directory / "manifest.json")
     cases = [
@@ -847,6 +856,11 @@ def run(args, validate_only=False):
         repeats=args.repeats,
         warmup=args.warmup,
         plan_once=args.plan_once,
+        single_pass=single_pass,
+        dataset_warmup=dataset_warmup,
+        database=getattr(args, "database", "feb"),
+        timing_includes_capture=single_pass,
+        engine_binaries=getattr(args, "engine_binaries", {}),
         tool_sha256=digest_file(Path(__file__)),
         worker_sha256=digest_file(args.worker),
         modes=args.modes,
@@ -855,7 +869,10 @@ def run(args, validate_only=False):
     )
     # Freeze actual executable and data identities, not just the Git commit.
     binary = args.worker.parent / "mydb"
-    context["mydb_binary_sha256"] = digest_file(binary) if binary.exists() else None
+    context["mydb_binary_sha256"] = (
+        None if context["engine_binaries"]
+        else digest_file(binary) if binary.exists() else None
+    )
     context["prepared"] = {
         name: json.loads((args.directory / f"prepared-{name}.json").read_text())
         for name in args.modes
@@ -880,6 +897,9 @@ def run(args, validate_only=False):
             "prepared",
             "skip_invalid",
             "plan_once",
+            "single_pass",
+            "dataset_warmup",
+            "engine_binaries",
         ):
             if previous.get(key, False) != context.get(key, False):
                 raise RuntimeError(f"resume context differs: {key}")
@@ -895,6 +915,26 @@ def run(args, validate_only=False):
                     "UPDATE performance_schema.setup_consumers SET ENABLED='YES' WHERE NAME IN ('events_statements_current','events_statements_history')"
                 )
             )
+        if dataset_warmup:
+            warmup_path = args.directory / "dataset-warmup.json"
+            if warmup_path.exists():
+                warmup = json.loads(warmup_path.read_text())
+                if warmup["context_sha256"] != digest_file(context_path):
+                    raise RuntimeError("dataset warmup context differs")
+            else:
+                warmed_ports = set()
+                warmup = dict(context_sha256=digest_file(context_path), datasets={})
+                for name, ep in endpoints.items():
+                    if ep.port in warmed_ports:
+                        continue
+                    observed = []
+                    for table in ("bench", "text_bench", "lookup"):
+                        response = ep.execute(f"SELECT * FROM {table}", timeout=args.timeout, sample_limit=0)
+                        require_ok(response)
+                        observed.append(dict(sql=f"SELECT * FROM {table}", response=response))
+                    warmup["datasets"][name] = dict(port=ep.port, observations=observed)
+                    warmed_ports.add(ep.port)
+                dump(warmup_path, warmup)
         for index, case in enumerate(cases):
             case_dir = args.directory / "cases" / case["id"]
             case_dir.mkdir(parents=True, exist_ok=True)
@@ -922,6 +962,13 @@ def run(args, validate_only=False):
                         status="unavailable", reason=case["mysql_unavailable"]
                     )
                     continue
+                if case["category"] == "locking":
+                    # Several mode connections may share one test server.
+                    # Remove this tool's other connections' advisory locks
+                    # before preparing the current connection's lock state.
+                    for other in endpoints.values():
+                        if other is not ep and other.port == ep.port:
+                            require_ok(other.execute("SELECT RELEASE_ALL_LOCKS()"))
                 setup_error = apply_case_setup(ep, case)
                 if setup_error:
                     result["engines"][name] = dict(
@@ -973,7 +1020,17 @@ def run(args, validate_only=False):
                     captures[name] = capture
                 else:
                     engine["status"] = validation["status"]
-                if not validate_only:
+                if not validate_only and single_pass:
+                    # One execution supplies both the complete result and its
+                    # latency. Capture serialization/I/O is explicitly part of
+                    # this fast measurement contract, unlike the legacy drain.
+                    measured = dict(validation.get("mutation", validation))
+                    measured["warmup"] = False
+                    engine["metrics"]["end_to_end"] = dict(samples=[measured])
+                    engine["metrics"]["analyze"] = dict(
+                        status="unavailable", reason="Single execution policy: no additional function or ANALYZE runs."
+                    )
+                if not validate_only and not single_pass:
                     for metric in ("end_to_end", "analyze"):
                         if validation.get("requires_reconnect") or (
                             args.skip_invalid and validation["status"] != "ok"
@@ -1065,12 +1122,12 @@ def run(args, validate_only=False):
                         )
                 else:
                     reference = None
-            for name in ("serial", "parallel2"):
+            for name in (label for label in endpoints if label != "mysql"):
                 if name not in captures:
                     result["correctness"][name] = dict(
                         status="unverified", reason="capture not completed"
                     )
-                elif case["comparison"] == "contract":
+                elif case["comparison"] == "contract" or case["name"] == "RELEASE_LOCK":
                     result["correctness"][name] = check_contract(
                         captures[name],
                         case["name"],
@@ -1102,6 +1159,7 @@ def run(args, validate_only=False):
                 "serial" in captures
                 and "parallel2" in captures
                 and case["comparison"] not in {"contract", "environment"}
+                and case["name"] != "RELEASE_LOCK"
             ):
                 columns = result["engines"]["serial"]["validation"].get("columns", [])
                 float_result = len(columns) > 1 and columns[1]["type"] in {
@@ -1117,6 +1175,25 @@ def run(args, validate_only=False):
                 result["correctness"]["serial_vs_parallel2"] = compare_captures(
                     captures["serial"], captures["parallel2"], comparison, float_result
                 )
+            for name in ("serial", "parallel2"):
+                baseline = "baseline_" + name
+                if (
+                    name in captures and baseline in captures
+                    and case["comparison"] not in {"contract", "environment"}
+                    and case["name"] != "RELEASE_LOCK"
+                ):
+                    columns = result["engines"][name]["validation"].get("columns", [])
+                    float_result = len(columns) > 1 and columns[1]["type"] in {
+                        "MYSQL_TYPE_DOUBLE", "MYSQL_TYPE_FLOAT",
+                    }
+                    comparison = (
+                        "exact" if case["comparison"] == "numeric" and not float_result
+                        else case["comparison"]
+                    )
+                    result["correctness"]["baseline_vs_" + name] = compare_captures(
+                        captures[baseline], captures[name],
+                        effective_comparison(comparison, columns), float_result,
+                    )
             dump(completed, result)
             for capture in case_dir.glob("*.capture"):
                 capture.unlink()
@@ -1364,10 +1441,14 @@ def main():
     )
     parser.add_argument("--mysql-cli", default="/opt/homebrew/opt/mysql@8.0/bin/mysql")
     parser.add_argument("--database", default="feb")
-    parser.add_argument("--rows", type=int, default=1_000_000)
+    parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--timeout", type=float, default=1)
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--single-pass", action=argparse.BooleanOptionalAction, default=True,
+                        help="Execute each case once, using its complete correctness capture as the timing sample")
+    parser.add_argument("--dataset-warmup", action=argparse.BooleanOptionalAction, default=None,
+                        help="Read each fixture table once per server before all cases")
     parser.add_argument(
         "--plan-once", action="store_true",
         help="Keep ordinary end-to-end samples and collect one independent plan instead of repeated ANALYZE timings",
@@ -1382,6 +1463,10 @@ def main():
         help="Skip timing repetitions after failed or timed-out validation",
     )
     args = parser.parse_args()
+    if args.dataset_warmup is None:
+        args.dataset_warmup = args.single_pass
+    if args.single_pass and (args.repeats != 1 or args.warmup != 0 or args.plan_once):
+        parser.error("single-pass requires repeats=1, warmup=0, and no plan-once; use --no-single-pass for legacy measurements")
     if args.rows <= 0 or args.timeout <= 0 or args.repeats <= 0 or args.warmup < 0:
         parser.error("invalid row count/timing parameters")
     if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]*", args.database):
@@ -1394,7 +1479,7 @@ def main():
     if args.command in {"prepare", "validate", "run"}:
         # Different output folders must never accidentally benchmark the same
         # server concurrently. Keep descriptors alive until process exit.
-        for port in sorted(MODES[name][0] for name in args.modes):
+        for port in sorted({MODES[name][0] for name in args.modes}):
             lock = Path(f"/tmp/mydb/function-expression-port-{port}.lock").open("a+")
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -9,6 +9,11 @@ use crate::engine::executor::dispatch::{
 use crate::engine::expr::ValueKey;
 use std::collections::VecDeque;
 
+enum PartitionInput {
+    Column(usize),
+    Expression(Arc<crate::engine::expr_program::ExprProgram>),
+}
+
 fn try_charge_work(charge: &mut mem_budget::ScopedCharge, bytes: usize, limit: usize) -> bool {
     if crate::engine::executor::cte::cte_materialization_active()
         && mem_budget::current_budget().is_some_and(|budget| budget.tracks_process())
@@ -258,6 +263,26 @@ fn supported_spec(window: &crate::planner::PhysicalWindowSpec, template: &[PlanF
         return false;
     }
     match window.name.to_ascii_uppercase().as_str() {
+        "FIRST_VALUE" | "LAST_VALUE" => {
+            matches!(window.args.as_slice(), [arg] if expr_column_index_in_template(arg,template).is_some())
+        }
+        "LAG" | "LEAD" => {
+            (1..=3).contains(&window.args.len())
+                && expr_column_index_in_template(&window.args[0], template).is_some()
+                && window.args.get(1).is_none_or(
+                    |arg| matches!(arg,Expr::Literal(crate::parser::Literal::Int(n)) if *n>=0),
+                )
+                && window
+                    .args
+                    .get(2)
+                    .is_none_or(|arg| matches!(arg, Expr::Literal(crate::parser::Literal::Null)))
+        }
+        "NTH_VALUE" => {
+            matches!(window.args.as_slice(),[arg,Expr::Literal(crate::parser::Literal::Int(n))] if *n>0 && expr_column_index_in_template(arg,template).is_some())
+        }
+        "NTILE" => {
+            matches!(window.args.as_slice(),[Expr::Literal(crate::parser::Literal::Int(n))] if *n>0)
+        }
         "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST" => {
             window.args.is_empty()
         }
@@ -268,6 +293,42 @@ fn supported_spec(window: &crate::planner::PhysicalWindowSpec, template: &[PlanF
         }
         _ => false,
     }
+}
+
+fn fixed_window_references(
+    window: &crate::planner::PhysicalWindowSpec,
+    template: &[PlanField],
+) -> bool {
+    let safe = |expr: &Expr| {
+        !crate::parser::visit::any_expr(expr, |node| {
+            if matches!(node, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                return expr_column_index_in_template(node, template)
+                    .is_none_or(|i| fixed_width(template[i].column_type).is_none());
+            }
+            false
+        })
+    };
+    if !window
+        .partition_by
+        .iter()
+        .chain(window.order_by.iter().map(|order| &order.expr))
+        .chain(window.args.iter())
+        .all(safe)
+    {
+        return false;
+    }
+    if let Some(frame) = &window.frame {
+        for bound in [&frame.start, &frame.end] {
+            if let crate::parser::WindowFrameBound::Preceding(expr)
+            | crate::parser::WindowFrameBound::Following(expr) = bound
+            {
+                if !safe(expr) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 // Wide SQL DECIMAL metadata does not imply wide physical payloads. SUM
@@ -480,10 +541,37 @@ pub(super) fn prepare_with_limit<'a>(
     let Some(leader) = windows.first() else {
         return Ok(Preparation::Streaming(input));
     };
+    // Newly admitted variable payloads must retain their existing bounded
+    // candidate prefilter instead of materializing all ranking input.
+    if windows.len() == 1
+        && leader.top_k.is_some()
+        && crate::engine::executor::dispatch::RankKind::from_name(&leader.name).is_some()
+        && template
+            .iter()
+            .any(|field| fixed_width(field.column_type).is_none())
+    {
+        return Ok(Preparation::Streaming(input));
+    }
     let positions = leader
         .partition_by
         .iter()
-        .map(|expr| expr_column_index_in_template(expr, template))
+        .map(|expr| {
+            if let Some(column) = expr_column_index_in_template(expr, template) {
+                return Some(PartitionInput::Column(column));
+            }
+            let program = expr_batch::compile_for_batch(expr, input.schema()).ok()??;
+            // Computed integer keys retain ValueKey's exact equality domain.
+            // Potential diagnostics and collated/coerced keys retain spill evaluation.
+            (matches!(
+                program.result_type().column_type(),
+                ColumnType::Tiny
+                    | ColumnType::Short
+                    | ColumnType::MediumInt
+                    | ColumnType::Long
+                    | ColumnType::LongLong
+            ) && program.column_parallel_safe(input.schema()))
+            .then_some(PartitionInput::Expression(program))
+        })
         .collect::<Option<Vec<_>>>();
     let widths = windows
         .iter()
@@ -494,12 +582,9 @@ pub(super) fn prepare_with_limit<'a>(
         return Ok(Preparation::Streaming(input));
     };
     if positions.is_empty()
-        || template
-            .iter()
-            .any(|field| fixed_width(field.column_type).is_none())
-        || windows
-            .iter()
-            .any(|window| !supported_spec(window, template))
+        || windows.iter().any(|window| {
+            !supported_spec(window, template) || !fixed_window_references(window, template)
+        })
     {
         trace_layout("input_type_or_expression", 0, 0, 0);
         return Ok(Preparation::Streaming(input));
@@ -531,7 +616,9 @@ pub(super) fn prepare_with_limit<'a>(
                 0
             });
         if batches.len() >= u32::MAX as usize
-            || !batch.columns().iter().all(fixed_column)
+            || !batch.columns().iter().zip(template).all(|(column, field)| {
+                fixed_width(field.column_type).is_none() || fixed_column(column)
+            })
             || input_bytes
                 .saturating_add(partition_reserved)
                 .saturating_add(bytes)
@@ -543,24 +630,61 @@ pub(super) fn prepare_with_limit<'a>(
             break;
         }
         input_bytes += bytes;
+        let computed_count = positions
+            .iter()
+            .filter(|key| matches!(key, PartitionInput::Expression(_)))
+            .count();
+        let scratch_bytes = batch
+            .num_rows()
+            .saturating_mul(64)
+            .saturating_mul(computed_count);
+        let mut scratch_charge = mem_budget::ScopedCharge::new(0);
+        if input_bytes
+            .saturating_add(partition_reserved)
+            .saturating_add(scratch_bytes)
+            > limit
+            || !try_charge_work(&mut scratch_charge, scratch_bytes, limit)
+        {
+            batches.push((batch, bytes));
+            declined = true;
+            break;
+        }
+        let keys = positions
+            .iter()
+            .map(|key| match key {
+                PartitionInput::Column(column) => {
+                    Some(std::borrow::Cow::Borrowed(&batch.columns()[*column]))
+                }
+                PartitionInput::Expression(program) => {
+                    program.try_eval_column(&batch).map(std::borrow::Cow::Owned)
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(keys) = keys else {
+            batches.push((batch, bytes));
+            declined = true;
+            break;
+        };
         slots = slots.saturating_add(batch.num_rows());
         let batch_index = batches.len() as u32;
         let index_bytes = batch.visible_rows().saturating_mul(16);
         if input_bytes
             .saturating_add(partition_reserved)
+            .saturating_add(scratch_bytes)
             .saturating_add(index_bytes)
             > limit
             || !try_charge_work(&mut partition_charge, index_bytes, limit)
         {
+            drop(keys);
             batches.push((batch, bytes));
             declined = true;
             break;
         }
         partition_reserved += index_bytes;
         for row in batch.visible_indices() {
-            let key = positions
+            let key = keys
                 .iter()
-                .map(|&column| ValueKey::from(&batch.columns()[column].value_at(row)))
+                .map(|column| ValueKey::from(&column.value_at(row)))
                 .collect::<smallvec::SmallVec<[_; 2]>>();
             let group = if let Some(&group) = lookup.get(&key) {
                 group
@@ -573,6 +697,7 @@ pub(super) fn prepare_with_limit<'a>(
                 );
                 if input_bytes
                     .saturating_add(partition_reserved)
+                    .saturating_add(scratch_bytes)
                     .saturating_add(bytes)
                     > limit
                     || !try_charge_work(&mut partition_charge, bytes, limit)
@@ -588,6 +713,7 @@ pub(super) fn prepare_with_limit<'a>(
             };
             partitions[group].push((batch_index, row as u32));
         }
+        drop(keys);
         batches.push((batch, bytes));
         if declined {
             break;
@@ -862,7 +988,14 @@ pub(super) fn prepare_with_limit<'a>(
                                 .0
                                 .columns()
                                 .iter()
-                                .map(|column| column.value_at(row as usize))
+                                .zip(template)
+                                .map(|(column, field)| {
+                                    if fixed_width(field.column_type).is_some() {
+                                        column.value_at(row as usize)
+                                    } else {
+                                        Value::Null
+                                    }
+                                })
                                 .collect::<Vec<_>>()
                         })
                         .collect::<Vec<_>>();

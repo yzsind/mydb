@@ -298,20 +298,20 @@ impl<'a> WktParser<'a> {
 
 /// Format a coordinate value the way MySQL renders WKT: integers without a
 /// decimal point, others via the shortest round-trip representation.
-fn fmt_num(v: f64) -> String {
+fn push_num(out: &mut String, v: f64) {
+    use std::fmt::Write;
     if v == 0.0 {
         // Avoid "-0".
-        "0".to_string()
+        out.push('0');
     } else {
-        let s = v.to_string();
-        s
+        let _ = write!(out,"{v}");
     }
 }
 
 fn push_coord(out: &mut String, c: Coord) {
-    out.push_str(&fmt_num(c.x));
+    push_num(out,c.x);
     out.push(' ');
-    out.push_str(&fmt_num(c.y));
+    push_num(out,c.y);
 }
 
 fn push_seq(out: &mut String, cs: &[Coord]) {

@@ -6301,34 +6301,18 @@ where
             // is tracked separately.
             expect_min_args(name, args, 1)?;
             let values = eval_args(args, &mut eval_arg)?;
-            let mut out: Vec<u8> = Vec::with_capacity(values.len());
-            for (arg, v) in args.iter().zip(&values) {
-                if matches!(v, Value::Null) {
-                    continue;
-                }
-                // MySQL takes the argument as an integer, so treat any
-                // string/float exactly like a numeric CAST would. Hex/bit
-                // literals retain binary Value storage in most contexts but
-                // are explicitly numeric arguments to CHAR().
-                let numeric;
-                let v = if expr_is_numeric_hexbit_literal(arg) {
-                    numeric = coerce_hex_bytes_to_uint(v.clone());
-                    &numeric
-                } else {
-                    v
-                };
-                let n = string_extent_arg(v) as u32;
-                if n == 0 {
-                    out.push(0);
-                    continue;
-                }
-                // Emit the minimum number of big-endian bytes required.
-                let leading_zero_bytes = (n.leading_zeros() / 8) as usize;
-                for shift in (0..4 - leading_zero_bytes).rev() {
-                    out.push((n >> (shift * 8)) as u8);
-                }
-            }
-            Ok(Value::Bytes(out))
+            let values = args
+                .iter()
+                .zip(values)
+                .map(|(arg, value)| {
+                    if expr_is_numeric_hexbit_literal(arg) {
+                        coerce_hex_bytes_to_uint(value)
+                    } else {
+                        value
+                    }
+                })
+                .collect::<smallvec::SmallVec<[Value; 4]>>();
+            Ok(eval_char_values(&values))
         }
         "CHAR_USING" => {
             expect_arg_count(name, args, 2)?;
@@ -6405,29 +6389,20 @@ where
                 }
                 let s = string_value(&values[0]);
                 let new_str = string_value(&values[3]);
-                let chars: Vec<char> = s.chars().collect();
                 // MySQL: pos outside 1..=CHAR_LENGTH(str) returns the
                 // original string; a negative length replaces through
                 // the end of the string.
-                if pos < 1 || pos as usize > chars.len() {
+                let Some(range) = insert_text_range(&s, pos, len) else {
                     return Ok(Value::String(s));
-                }
-                let start = pos as usize - 1;
-                let end = if len < 0 {
-                    chars.len()
-                } else {
-                    start.saturating_add(len as usize).min(chars.len())
                 };
-                let removed: usize = chars[start..end].iter().map(|c| c.len_utf8()).sum();
-                if string_result_exceeds_packet(
-                    "insert",
-                    (s.len() - removed).saturating_add(new_str.len()) as u64,
-                ) {
+                let size = (s.len() - range.len()).saturating_add(new_str.len());
+                if string_result_exceeds_packet("insert", size as u64) {
                     return Ok(Value::Null);
                 }
-                let mut out: String = chars[..start].iter().collect();
+                let mut out = String::with_capacity(size);
+                out.push_str(&s[..range.start]);
                 out.push_str(&new_str);
-                out.extend(&chars[end..]);
+                out.push_str(&s[range.end..]);
                 Ok(Value::String(out))
             })
         }
@@ -7619,7 +7594,11 @@ where
             } else {
                 let seconds = numeric(&value)?;
                 if seconds.is_sign_positive() && seconds.is_finite() {
-                    sleep_with_cancel(Duration::from_secs_f64(seconds))?;
+                    // MySQL's interruptible SLEEP treats sub-10us requests
+                    // as zero waits; preserve cancellation without entering
+                    // the operating-system sleep path for this domain.
+                    if seconds < 0.00001 { crate::engine::cancel::check_cancelled()?; }
+                    else { sleep_with_cancel(Duration::from_secs_f64(seconds))?; }
                 }
             }
             Ok(Value::Int(0))
@@ -10320,10 +10299,10 @@ fn warn_invalid_logarithm() -> Value {
 /// digit prefix of `n` is parsed in `from_base` (warning 1292 on trailing
 /// garbage), saturating at u64::MAX; a leading `-` wraps two's-complement.
 /// A negative `to_base` formats the value as signed.
-fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
+pub(crate) fn parse_conv(n: &str, from_base: u32) -> Option<(u64, bool)> {
     let trimmed = n.trim();
     if trimmed.is_empty() {
-        return Value::Null;
+        return None;
     }
     let (negative, body) = match trimmed.as_bytes().first() {
         Some(b'-') => (true, &trimmed[1..]),
@@ -10358,13 +10337,6 @@ fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
             break;
         }
     }
-    if saturated || consumed < body.len() || consumed == 0 {
-        crate::engine::api::push_statement_warning(
-            crate::error::ConditionLevel::Warning,
-            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-            format!("Truncated incorrect DECIMAL value: '{n}'"),
-        );
-    }
     if saturated {
         magnitude = u64::MAX;
     }
@@ -10373,31 +10345,68 @@ fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
     } else {
         magnitude
     };
-    let digits = |mut num: u64, base: u64| -> String {
-        if num == 0 {
-            return "0".to_string();
-        }
-        let mut out = Vec::new();
-        while num > 0 {
-            let d = (num % base) as u8;
-            out.push(if d < 10 { b'0' + d } else { b'A' + d - 10 });
-            num /= base;
-        }
-        out.reverse();
-        String::from_utf8(out).expect("radix digits are ASCII")
-    };
-    let text = if to_base < 0 {
-        // Signed output base.
-        let signed = value as i64;
-        if signed < 0 {
-            format!("-{}", digits(signed.unsigned_abs(), to_base.unsigned_abs()))
+    Some((value, saturated || consumed < body.len() || consumed == 0))
+}
+
+/// Append radix digits without allocating an intermediate per-row string.
+pub(crate) fn append_conv_digits(value: u64, to_base: i64, out: &mut Vec<u8>) {
+    debug_assert!((2..=36).contains(&to_base.unsigned_abs()));
+    let mut number = value;
+    if to_base < 0 && (value as i64) < 0 {
+        out.push(b'-');
+        number = (value as i64).unsigned_abs();
+    }
+    let base = to_base.unsigned_abs();
+    let mut digits = [0u8; 64];
+    let mut start = digits.len();
+    loop {
+        let digit = (number % base) as u8;
+        start -= 1;
+        digits[start] = if digit < 10 {
+            b'0' + digit
         } else {
-            digits(signed as u64, to_base.unsigned_abs())
+            b'A' + digit - 10
+        };
+        number /= base;
+        if number == 0 {
+            break;
         }
-    } else {
-        digits(value, to_base as u64)
+    }
+    out.extend_from_slice(&digits[start..]);
+}
+
+fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
+    let Some((value, warning)) = parse_conv(n, from_base) else {
+        return Value::Null;
     };
-    Value::String(text)
+    if warning {
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Warning,
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+            format!("Truncated incorrect DECIMAL value: '{n}'"),
+        );
+    }
+    let mut text = Vec::with_capacity(65);
+    append_conv_digits(value, to_base, &mut text);
+    Value::String(String::from_utf8(text).expect("radix digits are ASCII"))
+}
+
+/// Byte boundaries for INSERT on character strings; an invalid position
+/// leaves the source unchanged. No character array is needed.
+pub(crate) fn insert_text_range(s: &str, pos: i64, len: i64) -> Option<std::ops::Range<usize>> {
+    if pos < 1 {
+        return None;
+    }
+    let start = s.char_indices().nth(usize::try_from(pos - 1).ok()?)?.0;
+    let end = if len < 0 {
+        s.len()
+    } else {
+        s[start..]
+            .char_indices()
+            .nth(usize::try_from(len).ok()?)
+            .map_or(s.len(), |(offset, _)| start + offset)
+    };
+    Some(start..end)
 }
 
 pub(crate) fn eval_greatest_least<F>(
@@ -11157,6 +11166,9 @@ pub(crate) fn string_extent_arg(value: &Value) -> i64 {
 }
 
 fn sleep_with_cancel(duration: Duration) -> Result<(), QueryError> {
+    if duration.is_zero() {
+        return crate::engine::cancel::check_cancelled();
+    }
     let _sleeping = crate::engine::cancel::enter_process_stage(
         crate::engine::session_registry::ProcessState::UserSleep,
     );
@@ -11385,7 +11397,11 @@ pub(crate) fn mysql_case_map(s: &str, upper: bool) -> String {
 }
 
 /// MySQL simple case mapping shared by scalar and contiguous column output.
+#[inline]
 pub(crate) fn mysql_case_char(c: char, upper: bool) -> char {
+    if c.is_ascii() {
+        return if upper { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+    }
     if upper {
         let mut mapped = c.to_uppercase();
         let first = mapped.next().unwrap_or(c);
@@ -13573,7 +13589,7 @@ fn month_diff(dt1: NaiveDateTime, dt2: NaiveDateTime) -> i64 {
 /// Returns `None` on any mismatch; the caller renders that as NULL,
 /// matching MySQL's non-STRICT default (`STRICT` mode surfacing is
 /// handled at the DML boundary, not here).
-fn str_to_date_native(input: &str, fmt: &str) -> Option<Value> {
+pub(crate) fn str_to_date_native(input: &str, fmt: &str) -> Option<Value> {
     let mut b = StrToDateBuilder::default();
     let input = input.trim();
     let mut ib = input.as_bytes();
@@ -14161,7 +14177,7 @@ fn seconds_to_clamped_time_string(total_secs: i64) -> String {
 /// `[-838:59:59, 838:59:59]`. Used by TIMEDIFF (fsp-aware, range-clamped).
 /// Locale-specific number rendering for `FORMAT(X, D, locale)`.
 #[derive(Clone, Copy)]
-struct NumberStyle {
+pub(crate) struct NumberStyle {
     decimal_point: char,
     /// `None` means "no grouping" (e.g. several Asian locales without a
     /// thousands separator in MySQL's tables — not currently used).
@@ -14184,7 +14200,7 @@ impl NumberStyle {
 /// whether the locale was recognised; caller uses the `false` case to
 /// push MySQL's Warning 1649 `Unknown locale` before falling back to
 /// en_US.
-fn locale_number_style_checked(locale: &str) -> (NumberStyle, bool) {
+pub(crate) fn locale_number_style_checked(locale: &str) -> (NumberStyle, bool) {
     let lower = locale.trim().to_ascii_lowercase();
     let style = match lower.as_str() {
         // "12.332,20"
@@ -14343,31 +14359,59 @@ fn group_number_string(fixed: &str, style: NumberStyle) -> String {
         Some((i, d)) => (i, Some(d)),
         None => (rest, None),
     };
-    let mut grouped_rev = String::new();
-    for (i, ch) in integer_part.chars().rev().enumerate() {
-        if let Some(sep) = style.group_sep {
-            let boundary = if style.indian_grouping {
-                i == 3 || (i > 3 && (i - 3) % 2 == 0)
-            } else {
-                i > 0 && i % 3 == 0
-            };
-            if boundary {
-                grouped_rev.push(sep);
-            }
-        }
-        grouped_rev.push(ch);
-    }
-    let grouped: String = grouped_rev.chars().rev().collect();
-    let mut result = String::new();
+    let mut result = Vec::with_capacity(fixed.len().saturating_mul(2));
     if neg {
-        result.push('-');
+        result.push(b'-');
     }
-    result.push_str(&grouped);
+    style.append_integer(integer_part.as_bytes(), &mut result);
     if let Some(dec) = decimal_part {
-        result.push(style.decimal_point);
-        result.push_str(dec);
+        let mut buffer = [0; 4];
+        result.extend_from_slice(style.decimal_point.encode_utf8(&mut buffer).as_bytes());
+        result.extend_from_slice(dec.as_bytes());
     }
-    result
+    String::from_utf8(result).expect("number formatting produces UTF-8")
+}
+
+impl NumberStyle {
+    fn append_integer(self, digits: &[u8], out: &mut Vec<u8>) {
+        let mut buffer = [0; 4];
+        for (i, &digit) in digits.iter().enumerate() {
+            let remaining = digits.len() - i;
+            let boundary = i > 0
+                && if self.indian_grouping {
+                    remaining == 3 || remaining > 3 && (remaining - 3) % 2 == 0
+                } else {
+                    remaining % 3 == 0
+                };
+            if boundary {
+                if let Some(separator) = self.group_sep {
+                    out.extend_from_slice(separator.encode_utf8(&mut buffer).as_bytes());
+                }
+            }
+            out.push(digit);
+        }
+    }
+
+    /// Render an already rounded coefficient directly into the output lane.
+    pub(crate) fn append_exact(self, magnitude: i128, scale: u8, out: &mut Vec<u8>) {
+        let mut buffer = itoa::Buffer::new();
+        let digits = buffer.format(magnitude.unsigned_abs()).as_bytes();
+        let scale = usize::from(scale);
+        if magnitude < 0 {
+            out.push(b'-');
+        }
+        if digits.len() > scale {
+            self.append_integer(&digits[..digits.len() - scale], out);
+        } else {
+            out.push(b'0');
+        }
+        if scale > 0 {
+            let mut point = [0; 4];
+            out.extend_from_slice(self.decimal_point.encode_utf8(&mut point).as_bytes());
+            out.resize(out.len() + scale.saturating_sub(digits.len()), b'0');
+            out.extend_from_slice(&digits[digits.len().saturating_sub(scale)..]);
+        }
+    }
 }
 
 fn format_datetime_fsp(dt: NaiveDateTime, fsp: usize) -> String {
@@ -14788,7 +14832,7 @@ fn function_arg_with_table_octets(
     crate::charset::encode_string(charset, &text).map(Value::Bytes)
 }
 
-fn regexp_start_byte(subject: &str, pos: usize) -> Result<usize, QueryError> {
+pub(crate) fn regexp_start_byte(subject: &str, pos: usize) -> Result<usize, QueryError> {
     let index = pos - 1;
     if (!subject.is_empty() && index >= subject.chars().count())
         || (subject.is_empty() && index > 0)
@@ -15215,7 +15259,22 @@ pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, Qu
     })
 }
 
-fn soundex_mysql(input: &str) -> String {
+/// Shared numeric-to-octet CHAR rendering after argument evaluation.
+pub(crate) fn eval_char_values(values: &[Value]) -> Value {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        let n = string_extent_arg(value) as u32;
+        let bytes = n.to_be_bytes();
+        let start = ((n.leading_zeros() / 8) as usize).min(3);
+        out.extend_from_slice(&bytes[start..]);
+    }
+    Value::Bytes(out)
+}
+
+pub(crate) fn soundex_mysql(input: &str) -> String {
     fn code(ch: char) -> char {
         match ch.to_ascii_uppercase() {
             'B' | 'F' | 'P' | 'V' => '1',
@@ -17131,6 +17190,24 @@ fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
 /// Encrypt/decrypt under one `block_encryption_mode`. `iv` is required
 /// (and already validated to 16 bytes) for every mode except ECB.
 /// Returns `None` only on decrypt padding failure (MySQL → NULL).
+/// Query-local two-argument ECB setup. Warning-producing keys and other
+/// modes retain the scalar path with its original lazy argument evaluation.
+pub(crate) struct AesEcb(AnyAes);
+impl AesEcb {
+    pub(crate) fn prepare(key: &[u8], encrypt: bool) -> Option<Self> {
+        let mode = with_session_view(|view| view.map(|v| v.block_encryption_mode().to_string()))
+            .unwrap_or_else(|| "aes-128-ecb".to_string());
+        let (width, mode) = parse_block_encryption_mode(&mode).unwrap_or((16, AesChainMode::Ecb));
+        if mode != AesChainMode::Ecb || encrypt && key.len() > width {
+            return None;
+        }
+        AnyAes::new(&mysql_aes_key(key, width)).map(Self)
+    }
+    pub(crate) fn run(&self, encrypt: bool, data: &[u8]) -> Option<Vec<u8>> {
+        aes_run(&self.0, AesChainMode::Ecb, encrypt, data, &[0; 16])
+    }
+}
+
 fn aes_run(
     cipher: &AnyAes,
     mode: AesChainMode,
@@ -24223,6 +24300,16 @@ pub(crate) fn compare_values_as_strings(
     left: &Value,
     right: &Value,
 ) -> Result<Ordering, QueryError> {
+    fn text(value: &Value) -> Option<&str> {
+        match value {
+            Value::String(s) => Some(s.as_str()),
+            Value::SmallString(s) => std::str::from_utf8(s).ok(),
+            _ => None,
+        }
+    }
+    if let (Some(left), Some(right)) = (text(left), text(right)) {
+        return Ok(compare_strings_with_scope(left, right));
+    }
     if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
         let left_string;
         let right_string;

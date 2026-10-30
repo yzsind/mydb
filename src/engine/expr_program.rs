@@ -1016,6 +1016,53 @@ pub(crate) enum CompiledNumericExpr {
 }
 
 impl ExprProgram {
+    /// Spatial kernels consume already evaluated Values and retain bound
+    /// constructor provenance. Their scalar IR does not need a row-schema
+    /// interpreter when every descendant lowered successfully.
+    pub(crate) fn has_value_only_spatial_root(&self) -> bool {
+        if self.capability.legacy_escape {
+            return false;
+        }
+        fn spatial(node: &ExprNode) -> bool {
+            match node {
+                ExprNode::Function {
+                    kernel: FunctionKernel::Spatial(_) | FunctionKernel::GeometryConstructor(..),
+                    ..
+                } => true,
+                ExprNode::Function {
+                    kernel: FunctionKernel::Hex,
+                    args,
+                    ..
+                } if args.len() == 1 => spatial(&args[0]),
+                _ => false,
+            }
+        }
+        spatial(&self.root)
+    }
+
+    /// These kernels evaluate already-bound Values and retain eager/lazy
+    /// evaluation order themselves. Scheduling still follows capability flags.
+    pub(crate) fn has_ordered_value_kernel_root(&self) -> bool {
+        if self.capability.legacy_escape {
+            return false;
+        }
+        match &self.root {
+            ExprNode::Function {
+                kernel:
+                    FunctionKernel::Benchmark
+                    | FunctionKernel::Char
+                    | FunctionKernel::MakeSet
+                    | FunctionKernel::Field(_),
+                ..
+            } => true,
+            ExprNode::Function {
+                kernel: FunctionKernel::LegacyDeterministic("ELT"),
+                args,
+                ..
+            } => args.len() >= 2,
+            _ => false,
+        }
+    }
     #[inline]
     pub(crate) const fn result_type(&self) -> crate::engine::expr_type::ExprType {
         self.result_type
@@ -1950,7 +1997,7 @@ impl ExprCompiler {
         // and erase exactly the catalog provenance needed by MySQL's JSON
         // opaque-scalar rules. Fall back for the whole expression; table and
         // PlanRow legacy evaluators retain the real source descriptor.
-        if contains_source_sensitive_function(expr) {
+        if contains_source_sensitive_function(expr, schema) {
             SOURCE_SENSITIVE_REJECTIONS.fetch_add(1, AtomicOrdering::Relaxed);
             return Err(CompileError::Unsupported);
         }
@@ -2228,7 +2275,55 @@ impl ExprCompiler {
     }
 }
 
-fn contains_source_sensitive_function(expr: &Expr) -> bool {
+fn borrowed_aes_shape(expr: &Expr, schema: &InputSchema, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Expr::Function {
+        name,
+        args,
+        distinct: false,
+    } = expr
+    else {
+        return false;
+    };
+    if args.len() != 2
+        || !(name.eq_ignore_ascii_case("AES_ENCRYPT") || name.eq_ignore_ascii_case("AES_DECRYPT"))
+    {
+        return false;
+    }
+    // A column/expression password may itself need declared source octets
+    // (for example latin1 or FLOAT(M,D)). Keep that schema-aware path intact.
+    if !matches!(
+        &args[1],
+        Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
+    ) {
+        return false;
+    }
+    let column = match &args[0] {
+        Expr::Identifier(name) => schema.column_index(None, name).ok(),
+        Expr::CompoundIdentifier(parts) => parts.last().and_then(|name| {
+            schema
+                .column_index(
+                    parts.get(parts.len().saturating_sub(2)).map(String::as_str),
+                    name,
+                )
+                .ok()
+        }),
+        other => return borrowed_aes_shape(other, schema, depth + 1),
+    };
+    column
+        .and_then(|i| schema.columns.get(i))
+        .is_some_and(|column| {
+            matches!(column.column_type, ColumnType::VarString | ColumnType::Blob)
+                && column
+                    .collation_id
+                    .and_then(crate::charset::resolve_collation_id)
+                    .is_some_and(|info| matches!(info.charset, "utf8mb4" | "utf8mb3" | "binary"))
+        })
+}
+
+fn contains_source_sensitive_function(expr: &Expr, schema: &InputSchema) -> bool {
     crate::parser::visit::try_inspect_value_expr(expr, |expr| {
         if let Expr::Function { name, args, .. } = expr {
             let is_json_cast = name.eq_ignore_ascii_case("CAST")
@@ -2241,8 +2336,9 @@ fn contains_source_sensitive_function(expr: &Expr) -> bool {
                     args.first(),
                     Some(Expr::Identifier(_) | Expr::CompoundIdentifier(_))
                 );
-            let consumes_source_octets = name.eq_ignore_ascii_case("AES_ENCRYPT")
-                || name.eq_ignore_ascii_case("AES_DECRYPT");
+            let consumes_source_octets = (name.eq_ignore_ascii_case("AES_ENCRYPT")
+                || name.eq_ignore_ascii_case("AES_DECRYPT"))
+                && !borrowed_aes_shape(expr, schema, 0);
             let needs_source_type = name.eq_ignore_ascii_case("UNIX_TIMESTAMP");
             if is_json_cast || consumes_source_octets || needs_source_type {
                 return Err(());
@@ -3046,6 +3142,7 @@ impl From<QueryError> for CompileError {
 #[derive(Debug, Clone, Copy, Default)]
 struct BinarySemantics {
     unsigned_subtraction: bool,
+    unsigned_operands: bool,
     collation_id: Option<u16>,
     suppress_left_string_truncation: bool,
     suppress_right_string_truncation: bool,
@@ -5510,6 +5607,8 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 op: *op,
                 right: Box::new(rnode),
                 semantics: BinarySemantics {
+                    unsigned_operands: operand_unsigned(left, schema)
+                        || operand_unsigned(right, schema),
                     unsigned_subtraction: *op == BinaryOp::Sub
                         && (operand_unsigned(left, schema) || operand_unsigned(right, schema)),
                     collation_id,
@@ -5709,6 +5808,19 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             args,
             distinct,
         } => {
+            // Value-only lowering must retain JSON constructor syntax,
+            // especially booleans versus numeric 1/0, inside its arguments.
+            let value_surface = crate::engine::geo::sql::is_geo_function(
+                crate::engine::sys_schema::NormalizedFuncName::new(name).as_str(),
+            ) || ["CHAR", "MAKE_SET", "BENCHMARK", "ELT", "FIELD"]
+                .iter()
+                .any(|n| name.eq_ignore_ascii_case(n));
+            if value_surface && args.iter().any(|arg| crate::parser::visit::any_expr(arg, |node| {
+                matches!(node, Expr::Function { name, .. } if name.as_bytes().windows(4).any(|part| part.eq_ignore_ascii_case(b"JSON")))
+                        || matches!(node, Expr::Function {name,args,..} if name.eq_ignore_ascii_case("CAST") && matches!(args.get(1),Some(Expr::Literal(Literal::String(target))) if target.eq_ignore_ascii_case("JSON")))
+            })) {
+                return Err(CompileError::Unsupported);
+            }
             // Keep the original AST for NAME_CONST's protocol label while
             // lowering its already-validated literal value once per program.
             if !*distinct
@@ -5971,7 +6083,12 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             else {
                 return Err(CompileError::Unsupported);
             };
-            if let FunctionKernel::LegacyDeterministic(known_name) = kernel {
+            let delegated_name = match kernel {
+                FunctionKernel::LegacyDeterministic(name) => Some(name),
+                FunctionKernel::Spatial(spec) => Some(spec.sql_name),
+                _ => None,
+            };
+            if let Some(known_name) = delegated_name {
                 if crate::engine::geo::sql::is_geometry_collection_constructor(known_name) {
                     kernel = FunctionKernel::GeometryConstructor(
                         known_name,
@@ -6015,7 +6132,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                                 crate::engine::expr::FieldComparisonDomain::Double
                                     | crate::engine::expr::FieldComparisonDomain::ExactNumeric
                             )
-                        ) || matches!(kernel, FunctionKernel::Math(function) if function.numeric_hex_literals()) {
+                        ) || matches!(kernel, FunctionKernel::Char) || matches!(kernel, FunctionKernel::Math(function) if function.numeric_hex_literals()) {
                             if let Expr::Literal(
                                 Literal::HexBytes(bytes) | Literal::BitBytes(bytes),
                             ) = arg
@@ -7038,7 +7155,9 @@ impl FunctionRegistry {
 
     fn resolve(&self, name: &str) -> Option<FunctionKernel> {
         let name = crate::engine::sys_schema::NormalizedFuncName::uppercase(name);
-        self.kernels.get(name.as_str()).copied()
+        self.kernels.get(name.as_str()).copied().or_else(|| {
+            crate::engine::geo::sql::function_spec(name.as_str()).map(FunctionKernel::Spatial)
+        })
     }
 }
 
@@ -7050,6 +7169,89 @@ impl FunctionKernel {
         scratch: &mut EvalScratch,
     ) -> Result<Value, QueryError> {
         match self {
+            FunctionKernel::MakeSet => {
+                if args.len() < 2 {
+                    return Err(error(
+                        crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+                        "Incorrect parameter count in the call to native function 'MAKE_SET'",
+                    ));
+                }
+                let bits = args[0].eval(row, scratch)?;
+                if matches!(bits, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let bits = crate::engine::expr::to_u64_bitwise(&bits)?;
+                let mut output = String::new();
+                let mut first = true;
+                for (i, arg) in args.iter().skip(1).take(64).enumerate() {
+                    if bits & (1u64 << i) == 0 {
+                        continue;
+                    }
+                    let value = arg.eval(row, scratch)?;
+                    if !matches!(value, Value::Null) {
+                        let value = string_value(&value);
+                        let size = output
+                            .len()
+                            .saturating_add(value.len())
+                            .saturating_add(usize::from(!first));
+                        if crate::engine::expr::string_result_exceeds_packet(
+                            "make_set",
+                            size as u64,
+                        ) {
+                            return Ok(Value::Null);
+                        }
+                        if !first {
+                            output.push(',');
+                        }
+                        output.push_str(&value);
+                        first = false;
+                    }
+                }
+                Ok(Value::String(output))
+            }
+            FunctionKernel::Spatial(spec) => {
+                let values = args
+                    .iter()
+                    .map(|arg| arg.eval(row, scratch))
+                    .collect::<Result<smallvec::SmallVec<[Value; 3]>, _>>()?;
+                crate::engine::geo::sql::eval(spec.canonical_id, spec.sql_name, &values)
+            }
+            FunctionKernel::Char => {
+                if args.is_empty() {
+                    return Err(error(
+                        crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+                        "Incorrect parameter count in the call to native function 'CHAR'",
+                    ));
+                }
+                let values = args
+                    .iter()
+                    .map(|arg| arg.eval(row, scratch))
+                    .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()?;
+                Ok(crate::engine::expr::eval_char_values(&values))
+            }
+            FunctionKernel::Benchmark => {
+                expect_len("BENCHMARK", args, 2)?;
+                let value = args[0].eval(row, scratch)?;
+                if matches!(value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let count = int_value(&value)?;
+                if count < 0 {
+                    crate::engine::api::push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
+                        "Incorrect count value in function benchmark",
+                    );
+                    return Ok(Value::Null);
+                }
+                for i in 0..count {
+                    if i & 1023 == 0 {
+                        crate::engine::cancel::check_cancelled()?;
+                    }
+                    let _ = args[1].eval(row, scratch)?;
+                }
+                Ok(Value::Int(0))
+            }
             FunctionKernel::Network(function) => {
                 function.check_arity(args)?;
                 let value = args[0].eval_ref(row, scratch)?;

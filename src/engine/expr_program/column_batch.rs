@@ -1,11 +1,17 @@
 //! Composable, diagnostic-free column kernels. A decline is side-effect free:
 //! the caller retains the ordered scalar oracle for the complete expression.
+mod conditional;
+mod crypto_read;
+mod format_read;
+mod integer_string;
 mod json;
 mod numeric_read;
 mod producer;
+mod regexp_read;
 mod string_read;
 mod temporal_read;
 mod temporal_shift;
+mod unsigned_read;
 use super::*;
 use crate::engine::executor::vec::expr_batch::{
     transform_utf8_column, try_temporal_extract_column,
@@ -18,18 +24,25 @@ use crate::engine::executor::vec::{
 use crate::engine::expr::date_format::DateFormatPlan;
 use crate::engine::expr::network::{self, NetworkFunction};
 use chrono::{Datelike, NaiveDate};
+use conditional::Conditional;
+use crypto_read::CryptoRead;
+use format_read::FormatRead;
+use integer_string::IntegerString;
 use json::JsonRead;
 use numeric_read::NumericRead;
 use producer::Producer;
+use regexp_read::RegexpRead;
 use string_read::StringRead;
 use temporal_read::TemporalRead;
 use temporal_shift::TemporalShift;
+use unsigned_read::UnsignedRead;
 
 #[derive(Clone, Copy)]
 enum Domain {
     Integer(i64, i64),
     Unsigned,
     Exact,
+    Approximate,
     Text,
     Binary,
     Temporal,
@@ -39,6 +52,11 @@ enum Domain {
 struct Contract {
     domain: Domain,
     parallel: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTRACT_BIND_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl ExprProgram {
@@ -223,7 +241,29 @@ fn string_bound(node: &ExprNode, schema: &BatchSchema) -> Option<u64> {
 }
 
 fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
+    #[cfg(test)]
+    CONTRACT_BIND_VISITS.with(|visits| visits.set(visits.get() + 1));
     if let Some(read) = NumericRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = FormatRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = Conditional::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = CryptoRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if matches!(node, ExprNode::Function { .. }) {
+        if let Some(read) = UnsignedRead::bind(node, schema) {
+            return Some(read.contract());
+        }
+    }
+    if let Some(read) = IntegerString::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = RegexpRead::bind(node, schema) {
         return Some(read.contract());
     }
     if let Some(read) = StringRead::bind(node, schema) {
@@ -242,6 +282,11 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                 {
                     Domain::Integer(i64::MIN, i64::MAX)
                 }
+                ColumnType::Tiny
+                | ColumnType::Short
+                | ColumnType::MediumInt
+                | ColumnType::Long
+                | ColumnType::LongLong => Domain::Unsigned,
                 ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp => Domain::Temporal,
                 ColumnType::Json => Domain::Json,
                 ColumnType::VarString | ColumnType::Blob => {
@@ -260,6 +305,7 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
         ExprNode::Const(_) | ExprNode::Placeholder(_) => (
             match constant(node)?.as_ref() {
                 Value::Int(n) => Domain::Integer(*n, *n),
+                Value::UInt(_) => Domain::Unsigned,
                 Value::Null => Domain::Null,
                 Value::String(_) | Value::SmallString(_) => Domain::Text,
                 Value::Bytes(_) => Domain::Binary,
@@ -281,6 +327,16 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
             return Some(JsonRead::bind(node, schema)?.contract());
         }
         ExprNode::Binary {
+            left, right, op, ..
+        } if unsigned_read::bitwise(*op) => {
+            let (a, b) = (contract(left, schema)?, contract(right, schema)?);
+            let numeric = |d| matches!(d, Domain::Integer(..) | Domain::Unsigned | Domain::Null);
+            if !numeric(a.domain) || !numeric(b.domain) {
+                return None;
+            }
+            (Domain::Unsigned, a.parallel && b.parallel)
+        }
+        ExprNode::Binary {
             left,
             op,
             right,
@@ -293,7 +349,22 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
         {
             let (l, r) = (contract(left, schema)?, contract(right, schema)?);
             let (Domain::Integer(a, b), Domain::Integer(c, d)) = (l.domain, r.domain) else {
-                return None;
+                let nonnegative = |domain| {
+                    matches!(domain, Domain::Unsigned | Domain::Null)
+                        || matches!(domain,Domain::Integer(min,_) if min>=0)
+                };
+                return (nonnegative(l.domain)
+                    && nonnegative(r.domain)
+                    && (matches!(l.domain, Domain::Unsigned)
+                        || matches!(r.domain, Domain::Unsigned)))
+                .then_some(Contract {
+                    domain: if comparison(*op) {
+                        Domain::Integer(0, 1)
+                    } else {
+                        Domain::Unsigned
+                    },
+                    parallel: false,
+                });
             };
             if comparison(*op) {
                 return Some(Contract {
@@ -631,6 +702,24 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
     if let Some(read) = NumericRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
+    if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = Conditional::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = CryptoRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = UnsignedRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = IntegerString::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = RegexpRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
     if let Some(read) = StringRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
@@ -662,7 +751,7 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             let value = constant(node)?;
             let bytes = match value.as_ref() {
                 Value::Null => 0,
-                Value::Int(_) => numeric,
+                Value::Int(_) | Value::UInt(_) => numeric,
                 Value::String(s) => s
                     .len()
                     .checked_mul(batch.num_rows())?
@@ -1044,6 +1133,24 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
     if let Some(read) = NumericRead::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }
+    if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = Conditional::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = CryptoRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = UnsignedRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = IntegerString::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = RegexpRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
     if let Some(read) = StringRead::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }
@@ -1070,6 +1177,10 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
             let value = value.as_ref();
             Some(match value {
                 Value::Int(n) => ColumnVector::I64 {
+                    data: vec![*n; rows],
+                    nulls: None,
+                },
+                Value::UInt(n) => ColumnVector::U64 {
                     data: vec![*n; rows],
                     nulls: None,
                 },

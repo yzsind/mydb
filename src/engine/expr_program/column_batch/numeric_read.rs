@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    Abs,
     Floor,
     Ceil,
     Round,
@@ -18,6 +19,7 @@ enum Input {
     Signed,
     Unsigned,
     Decimal,
+    Double,
 }
 pub(super) struct NumericRead {
     column: usize,
@@ -62,6 +64,7 @@ impl NumericRead {
             return None;
         };
         let (kind, places, dynamic_scale) = match kernel {
+            FunctionKernel::Abs if args.len() == 1 => (Kind::Abs, 0, false),
             FunctionKernel::Floor if args.len() == 1 => (Kind::Floor, 0, false),
             FunctionKernel::Ceil if args.len() == 1 => (Kind::Ceil, 0, false),
             FunctionKernel::Round if (1..=2).contains(&args.len()) => {
@@ -129,7 +132,12 @@ impl NumericRead {
             ColumnType::Decimal { precision, scale }
                 if matches!(
                     kind,
-                    Kind::Floor | Kind::Ceil | Kind::Round | Kind::Truncate | Kind::Cast
+                    Kind::Abs
+                        | Kind::Floor
+                        | Kind::Ceil
+                        | Kind::Round
+                        | Kind::Truncate
+                        | Kind::Cast
                 ) =>
             {
                 if matches!(kind, Kind::Floor | Kind::Ceil)
@@ -139,10 +147,13 @@ impl NumericRead {
                 }
                 Input::Decimal
             }
+            ColumnType::Double if kind == Kind::Abs => Input::Double,
             _ => return None,
         };
         // Keep the existing signed integer identity kernels unchanged.
-        if input == Input::Signed && matches!(kind, Kind::Floor | Kind::Ceil | Kind::Cast) {
+        if input == Input::Signed
+            && matches!(kind, Kind::Abs | Kind::Floor | Kind::Ceil | Kind::Cast)
+        {
             return None;
         }
         if input == Input::Decimal && matches!(kind, Kind::Radix(_) | Kind::BitCount | Kind::Mod(_))
@@ -162,6 +173,8 @@ impl NumericRead {
     }
     pub(super) fn contract(&self) -> Contract {
         let domain = match self.kind {
+            Kind::Abs if self.input == Input::Double => Domain::Approximate,
+            Kind::Abs if self.input == Input::Decimal => Domain::Exact,
             Kind::Radix(_) | Kind::Cast => Domain::Text,
             Kind::BitCount => Domain::Integer(0, 64),
             Kind::Round | Kind::Truncate if self.input == Input::Decimal => Domain::Exact,
@@ -211,6 +224,22 @@ impl NumericRead {
         if matches!(input, ColumnVector::Null { .. }) {
             return Some(ColumnVector::Null { len: rows });
         }
+        if self.input == Input::Double {
+            let ColumnVector::F64 { data, nulls } = input else {
+                return None;
+            };
+            let mut output = Vec::with_capacity(rows);
+            for (row, value) in data.iter().enumerate() {
+                if row & 63 == 0 {
+                    crate::engine::cancel::check_cancelled().ok()?;
+                }
+                output.push(value.abs());
+            }
+            return Some(ColumnVector::F64 {
+                data: output,
+                nulls: nulls.clone(),
+            });
+        }
         match (self.input, input) {
             (Input::Signed, ColumnVector::I64 { .. })
             | (Input::Unsigned, ColumnVector::U64 { .. })
@@ -228,8 +257,8 @@ impl NumericRead {
             | ColumnVector::Decimal128 { scale, .. } => *scale,
             _ => 0,
         };
-        let decimal =
-            self.input == Input::Decimal && matches!(self.kind, Kind::Round | Kind::Truncate);
+        let decimal = self.input == Input::Decimal
+            && matches!(self.kind, Kind::Abs | Kind::Round | Kind::Truncate);
         let text = matches!(self.kind, Kind::Radix(_) | Kind::Cast);
         let mut exact = Vec::with_capacity(if decimal { rows } else { 0 });
         let mut signed = Vec::with_capacity(
@@ -255,7 +284,10 @@ impl NumericRead {
         if text {
             offsets.push(0);
         }
-        let mut output_scale = if decimal && !self.dynamic_scale {
+        let mut output_scale = if decimal
+            && matches!(self.kind, Kind::Round | Kind::Truncate)
+            && !self.dynamic_scale
+        {
             if self.kind == Kind::Round {
                 crate::util::decimal::round_exact_parts(0, scale, self.places)?.1
             } else {
@@ -295,6 +327,13 @@ impl NumericRead {
                 _ => return None,
             };
             match self.kind {
+                Kind::Abs => {
+                    if decimal {
+                        exact.push(magnitude.checked_abs()?);
+                    } else {
+                        unsigned.push(u64::try_from(magnitude).ok()?);
+                    }
+                }
                 Kind::Radix(base) => {
                     let mut value = magnitude as u64;
                     let mut buffer = [0u8; 64];
