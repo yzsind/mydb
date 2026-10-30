@@ -28486,3 +28486,61 @@ fn deferred_wal_page_budget_releases_headroom_for_eager_progress() {
     drop(replacement);
     assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 0);
 }
+
+#[test]
+fn buffered_heap_update_recovery_preserves_whole_row_fences_under_pin_pressure() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let mut value = concurrent_index_test_column("v", false);
+    value.data_type = DataType::VarChar(Some(1000));
+    db.create_table(
+        "redo_order",
+        vec![concurrent_index_test_column("id", true), value],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let rows = db
+        .insert_rows(
+            seed,
+            "test.redo_order",
+            vec![vec![Value::Int(1), Value::String("s".repeat(512))]],
+        )
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    db.buffer_pool.shutdown_flusher();
+    let table = db.table("test.redo_order").unwrap();
+    let heap_path = db.heap_handle(table.id).unwrap().read().path.clone();
+    let txn = db.begin_dml_txn().unwrap();
+    db.update_row_by_id(txn, &table, rows[0], |_| {
+        Ok(vec![Value::Int(1), Value::String("m".repeat(510))])
+    })
+    .unwrap();
+    let used = db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire);
+    assert!(used > 0, "first variable-length update must be buffered");
+    let limit = db.buffer_pool.capacity_pages() / 8;
+    let pressure = db
+        .buffer_pool
+        .reserve_deferred_wal_pages((limit - used) as usize)
+        .unwrap();
+    db.update_row_by_id(txn, &table, rows[0], |_| {
+        Ok(vec![Value::Int(1), Value::String("z".repeat(508))])
+    })
+    .unwrap();
+    db.commit_txn(txn.txn_id).unwrap();
+    drop(pressure);
+    std::mem::forget(db);
+    // Force redo instead of accepting a dirty in-memory/disk after-image.
+    fs::remove_file(heap_path).unwrap();
+    let recovered = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let rows = recovered
+        .scan_rows(
+            "test.redo_order",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[1], Value::String("z".repeat(508)));
+    recovered.check_consistency().unwrap();
+}

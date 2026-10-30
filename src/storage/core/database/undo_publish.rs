@@ -255,7 +255,7 @@ mod sharded_undo_tests {
 
     #[test]
     fn pointer_reads_and_cross_shard_depth_survive_maintenance_barriers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         let manager = UndoTablespace::open_with_segments(
             &Vec::<crate::wal::WalRecord>::new(),
             dir.path(),
