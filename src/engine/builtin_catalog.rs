@@ -146,6 +146,7 @@ macro_rules! scalar_catalog {
         enum FunctionKernel {
             Field(crate::engine::expr::FieldComparisonDomain),
             Math(crate::engine::expr::math::MathFunction),
+            Network(crate::engine::expr::network::NetworkFunction),
             GeometryConstructor(&'static str, bool),
             $($variant,)*
             LegacyDeterministic(&'static str),
@@ -156,13 +157,13 @@ macro_rules! scalar_catalog {
             fn may_error(self, arity: usize) -> bool {
                 match self {
                     $(Self::$variant => ($diagnostic)(arity),)*
-                    Self::Field(_) | Self::Math(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
                 }
             }
             fn is_deterministic(self) -> bool {
                 match self {
                     $(Self::$variant => $deterministic,)*
-                    Self::Field(_) | Self::Math(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::LegacyDeterministic(_) => true,
                     Self::LegacySession(_) => false,
                 }
             }
@@ -462,6 +463,8 @@ scalar_catalog! {
             [("FIELD", "field")] => (CheapString, LongLong, None, false);
         }
         LegacyDeterministic {
+            [("IS_UUID", "is_uuid")] => (Unknown, LongLong, ( IsUuid, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
+            [("IS_IPV4_COMPAT", "is_ipv4_compat"), ("IS_IPV4_MAPPED", "is_ipv4_mapped")] => (Unknown, LongLong, None, false);
             [("POW", "pow"), ("POWER", "power"), ("LN", "ln"), ("LOG", "log"), ("LOG2", "log2"), ("LOG10", "log10"), ("EXP", "exp")] => (IntegerArith, Double, None, false);
             [("PI", "pi")] => (IntegerArith, Double, None, true);
             [("BIN", "bin")] => (CheapString, VarString, (Bin, 1, 1, Immutable, fixed_string_result(None, true)), true);
@@ -525,8 +528,7 @@ scalar_catalog! {
             [("GET_LOCK", "get_lock"), ("RELEASE_LOCK", "release_lock"), ("IS_FREE_LOCK", "is_free_lock"), ("IS_USED_LOCK", "is_used_lock"), ("RELEASE_ALL_LOCKS", "release_all_locks")] => (Volatile, VarString, None, false);
             [("LOAD_FILE", "load_file")] => (Volatile, Blob, None, false);
             [("__MATCH_AGAINST", "__match_against")] => (Unknown, Double, None, false);
-            [("__IS_TRUE", "__is_true"), ("__IS_FALSE", "__is_false"), ("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("IS_IPV4_COMPAT", "is_ipv4_compat"), ("IS_IPV4_MAPPED", "is_ipv4_mapped"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
-            [("IS_UUID", "is_uuid")] => (Unknown, LongLong, ( IsUuid, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
+            [("__IS_TRUE", "__is_true"), ("__IS_FALSE", "__is_false"), ("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
             [("SYSDATE", "sysdate")] => (Unknown, DateTime, ( CurrentTemporal, 0, 1, Stable, fixed_temporal_result(DateTime, false)), false);
             [("TIMESTAMP", "timestamp")] => (Unknown, DateTime, ( Temporal, 1, 2, Immutable, fixed_temporal_result(DateTime, true)), false);
             [("CONVERT_TZ", "convert_tz")] => (Unknown, DateTime, ( Temporal, 2, 3, Stable, fixed_temporal_result(DateTime, true)), false);

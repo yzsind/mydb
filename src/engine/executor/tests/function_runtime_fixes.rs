@@ -332,3 +332,121 @@ fn optional_scan_worker_transfer_declines_without_consuming_or_poisoning_input()
     });
     db.rollback_txn(txn.txn_id).unwrap();
 }
+
+#[test]
+fn bound_column_charset_metadata_keeps_nulls_declared_collations_and_scope_errors() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE cm(id INT, s VARCHAR(30) CHARACTER SET latin1 COLLATE latin1_bin,b VARBINARY(30),n BIGINT,d DATE)").unwrap();
+    engine
+        .execute("INSERT INTO cm VALUES(1,NULL,NULL,NULL,NULL),(2,'abc',X'FF',123,'2024-02-29')")
+        .unwrap();
+    let sql="SELECT CHARSET(s),COLLATION(s),CHARSET(b),COLLATION(b),CHARSET(n),COLLATION(n),CHARSET(d),COLLATION(d) FROM cm ORDER BY id";
+    let expected = [
+        "latin1",
+        "latin1_bin",
+        "binary",
+        "binary",
+        "binary",
+        "binary",
+        "binary",
+        "binary",
+    ]
+    .map(|s| Value::String(s.into()))
+    .to_vec();
+    for mode in [
+        crate::engine::executor::vec::config::VecMode::On,
+        crate::engine::executor::vec::config::VecMode::Off,
+    ] {
+        crate::engine::executor::vec::config::with_vec_mode(mode, || {
+            assert_eq!(rows(&engine, sql), vec![expected.clone(), expected.clone()]);
+            for sql in [
+                "SELECT CHARSET(missing) FROM cm",
+                "SELECT COLLATION(missing) FROM cm",
+            ] {
+                assert_eq!(engine.execute(sql).unwrap_err().code(), 1054);
+            }
+            // Computed operands retain evaluation, even though their result's
+            // metadata could otherwise be known before execution.
+            assert!(engine
+                .execute("SELECT CHARSET(UUID_TO_BIN('invalid')) FROM cm")
+                .is_err());
+        });
+    }
+}
+
+#[test]
+fn json_column_prepared_paths_keep_parallel_parameters_and_scalar_errors() {
+    let _tuning = super::parallel::auto_parallel_test_tuning();
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine_with_buffer_pool_pages(dir.path(), 4096);
+    engine
+        .execute("CREATE TABLE json_paths(id BIGINT PRIMARY KEY,j JSON)")
+        .unwrap();
+    engine.execute("INSERT INTO json_paths SELECT n,IF(n%19=0,NULL,JSON_OBJECT('a',n,'b',JSON_ARRAY('文',n))) FROM generate_series(1,65537) AS s(n)").unwrap();
+    engine.execute("ANALYZE TABLE json_paths").unwrap();
+    let mut session = SessionContext::default();
+    engine.execute_with_session(&mut session,"PREPARE jp FROM 'SELECT /*+ PARALLEL(2) FULL_SCAN(json_paths) */ id,JSON_UNQUOTE(JSON_EXTRACT(j,?)) FROM json_paths'").unwrap();
+    for path in ["$.a", "$.b[0]", "$.missing", "$", "$.a"] {
+        engine
+            .execute_with_session(&mut session, &format!("SET @jp_path='{path}'"))
+            .unwrap();
+        let mut expected = crate::engine::executor::vec::config::with_vec_mode(
+            crate::engine::executor::vec::config::VecMode::Off,
+            || {
+                rows(&engine,&format!("SELECT /*+ NO_PARALLEL FULL_SCAN(json_paths) */ id,JSON_UNQUOTE(JSON_EXTRACT(j,'{path}')) FROM json_paths"))
+            },
+        );
+        let QueryResponse::ResultSet(result) = engine
+            .execute_with_session(&mut session, "EXECUTE jp USING @jp_path")
+            .and_then(QueryResponse::materialize)
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        let mut actual = result.rows;
+        let key = |r: &Vec<Value>| {
+            if let Value::Int(n) = r[0] {
+                n
+            } else {
+                panic!("id")
+            }
+        };
+        expected.sort_by_key(key);
+        actual.sort_by_key(key);
+        assert_eq!(actual, expected, "{path}");
+    }
+    engine
+        .execute_with_session(&mut session, "SET @jp_path='bad'")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute_with_session(&mut session, "EXECUTE jp USING @jp_path")
+            .and_then(QueryResponse::materialize)
+            .unwrap_err()
+            .code(),
+        3143
+    );
+    engine
+        .execute_with_session(&mut session, "SET @jp_path='$.a'")
+        .unwrap();
+    assert!(engine
+        .execute_with_session(&mut session, "EXECUTE jp USING @jp_path")
+        .and_then(QueryResponse::materialize)
+        .is_ok());
+    for sql in [
+        "SELECT JSON_EXTRACT(CAST(NULL AS JSON),'bad')",
+        "SELECT JSON_EXTRACT(NULL,'bad')",
+    ] {
+        assert_eq!(row(&engine, sql), vec![Value::Null]);
+    }
+    assert_eq!(
+        engine
+            .execute("SELECT JSON_EXTRACT('invalid','bad')")
+            .unwrap_err()
+            .code(),
+        3141
+    );
+}

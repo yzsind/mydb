@@ -2922,3 +2922,45 @@ fn read_only_projection_batch_precomputes_bounded_columns() {
     );
     assert!(crate::engine::expr_program::expr_program_stats().column_eval_rows - before >= 6);
 }
+
+#[test]
+fn native_cursor_finish_rechecks_worker_cancellation_and_deadline() {
+    for deadline in [false, true] {
+        let _deadline = deadline.then(|| {
+            crate::engine::cancel::install_statement_deadline(std::time::Duration::from_nanos(1))
+        });
+        let budget = Arc::new(mem_budget::MemBudget::new(1024));
+        let context = super::super::execution_context::ExecutionContext::capture_with_budget(
+            TxnView::read_only(0, crate::storage::IsolationLevel::ReadCommitted),
+            budget.clone(),
+        )
+        .fork_worker_cancellation();
+        let cancellation = context.cancellation().clone();
+        if deadline {
+            while cancellation.check().is_ok() {
+                std::thread::yield_now();
+            }
+        }
+        let producer = cancellation.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            if !deadline {
+                producer.cancel_local();
+            }
+            drop(tx);
+        });
+        let mut cursor = NativePlanBatchCursor {
+            rx: Some(rx),
+            worker: Some(worker),
+            cancellation,
+            budget,
+            current: None,
+            current_charge: None,
+            current_rows: Vec::new().into_iter(),
+            warning_sink: Default::default(),
+        };
+        let error = cursor.finish().unwrap_err();
+        assert_eq!(error.code(), if deadline { 3024 } else { 1317 });
+        assert!(cursor.worker.is_none());
+    }
+}

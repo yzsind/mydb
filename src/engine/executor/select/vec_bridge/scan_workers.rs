@@ -67,7 +67,14 @@ impl ScanWorkers {
                 Err(error)
             }
             Err(_) => {
-                self.finish()?;
+                // A producer may stop while recv is blocked. Channel closure
+                // is EOF only after joining and checking terminal state.
+                let joined = self.finish();
+                if let Some(error) = self.worker_context.budget().terminal_oom() {
+                    return Err(error);
+                }
+                joined?;
+                self.worker_context.cancellation().check()?;
                 Ok(None)
             }
         }
@@ -147,6 +154,48 @@ mod tests {
             assert!(group.workers.is_empty());
             assert!(group.receiver.is_none());
             assert!(group.next_batch().unwrap().is_none());
+        }
+    }
+    #[test]
+    fn channel_close_preserves_cancellation_and_primary_oom_without_error_message() {
+        for oom in [false, true] {
+            for panicked in [false, true] {
+                if panicked && !oom {
+                    continue;
+                }
+                let budget = Arc::new(mem_budget::MemBudget::new(4096));
+                let ctx = context(budget.clone());
+                let producer = ctx.clone();
+                let expected = if oom {
+                    crate::error::catalog::ER_OUTOFMEMORY.error("source output exhausted")
+                } else {
+                    crate::engine::cancel::interrupted_error()
+                };
+                let error = expected.clone();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let worker = std::thread::spawn(move || {
+                    if oom {
+                        producer.budget().latch_terminal_oom(error);
+                    } else {
+                        producer.cancellation().cancel_local();
+                    }
+                    drop(tx);
+                    if panicked {
+                        panic!("secondary producer failure");
+                    }
+                });
+                let mut group =
+                    ScanWorkers::new(ctx, "test worker panicked").with_channel(rx, vec![worker]);
+                assert_eq!(
+                    group.next_batch().unwrap_err(),
+                    expected,
+                    "oom={oom}, panic={panicked}"
+                );
+                assert!(group.workers.is_empty());
+                assert!(group.receiver.is_none());
+                assert!(group.next_batch().unwrap().is_none());
+                assert_eq!(budget.used(), 0);
+            }
         }
     }
 }

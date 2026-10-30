@@ -2744,7 +2744,12 @@ impl NativePlanBatchCursor {
             .unwrap_or(Ok(()));
         match self.budget.terminal_oom() {
             Some(error) => Err(error),
-            None => result,
+            None => {
+                result?;
+                // Cancellation can arrive while waiting for the final channel
+                // close or joining a producer, after the entry checkpoint.
+                self.check_cancelled()
+            }
         }
     }
 }

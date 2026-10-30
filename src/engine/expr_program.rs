@@ -4529,6 +4529,129 @@ pub(crate) fn input_expr_column_index(expr: &Expr, schema: &InputSchema) -> Opti
     }
 }
 
+/// JSON_VALUE's general evaluator observes AST/default-clause structure.
+/// Bind only literal NULL policies with a scalar integer RETURNING clause;
+/// every other grammar retains its original AST-preserving escape.
+fn json_value_integer_kernel(
+    name: &str,
+    args: &[Expr],
+    schema: &InputSchema,
+) -> Option<FunctionKernel> {
+    if !name.eq_ignore_ascii_case("JSON_VALUE")
+        || args.len() != 7
+        || !matches!(&args[0], Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        || input_expr_result_type(&args[0], schema) != ColumnType::Json
+        || !matches!(
+            &args[1],
+            Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
+        )
+    {
+        return None;
+    }
+    let returning = const_compile_value(&args[2])?;
+    let returning = crate::types::value_str(&returning)?.trim();
+    if !matches!(
+        returning.to_ascii_uppercase().as_str(),
+        "UNSIGNED" | "UNSIGNED INTEGER" | "SIGNED" | "SIGNED INTEGER" | "INTEGER"
+    ) {
+        return None;
+    }
+    for i in [3, 5] {
+        let value = const_compile_value(&args[i])?;
+        if !crate::types::value_str(&value)?.eq_ignore_ascii_case("NULL") {
+            return None;
+        }
+    }
+    if !matches!(const_compile_value(&args[4]), Some(Value::Null))
+        || !matches!(const_compile_value(&args[6]), Some(Value::Null))
+    {
+        return None;
+    }
+    Some(FunctionKernel::LegacyDeterministic("JSON_VALUE"))
+}
+
+/// JSON_SEARCH observes the escape AST. Keep general searches on their AST
+/// oracle and bind only unscoped first-match searches with plain constants.
+fn json_search_one_kernel(
+    name: &str,
+    args: &[Expr],
+    schema: &InputSchema,
+) -> Option<FunctionKernel> {
+    if !name.eq_ignore_ascii_case("JSON_SEARCH")
+        || !(3..=4).contains(&args.len())
+        || !matches!(&args[0], Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        || input_expr_result_type(&args[0], schema) != ColumnType::Json
+    {
+        return None;
+    }
+    for arg in &args[1..] {
+        if !matches!(arg, Expr::Literal(_) | Expr::BoundValue(_)) {
+            return None;
+        }
+    }
+    let mode = const_compile_value(&args[1])?;
+    if !crate::types::value_str(&mode)?.eq_ignore_ascii_case("one") {
+        return None;
+    }
+    let pattern = const_compile_value(&args[2])?;
+    crate::types::value_str(&pattern)?;
+    if let Some(arg) = args.get(3) {
+        let escape = const_compile_value(arg)?;
+        if !matches!(escape, Value::Null) && crate::types::value_str(&escape)?.chars().count() > 1 {
+            return None;
+        }
+    }
+    Some(FunctionKernel::LegacyDeterministic("JSON_SEARCH"))
+}
+
+/// These unary typed reads observe values and session settings, without
+/// inspecting argument syntax. Other source domains retain the AST oracle.
+fn temporal_read_kernel(name: &str, args: &[Expr], schema: &InputSchema) -> Option<FunctionKernel> {
+    let name = match name.to_ascii_uppercase().as_str() {
+        "DAYNAME" => "DAYNAME",
+        "MONTHNAME" => "MONTHNAME",
+        "TIME" => "TIME",
+        "TIMESTAMP" => "TIMESTAMP",
+        "TO_SECONDS" => "TO_SECONDS",
+        "YEARWEEK" => "YEARWEEK",
+        _ => return None,
+    };
+    if !(args.len() == 1 || name == "YEARWEEK" && args.len() == 2)
+        || !matches!(&args[0], Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+    {
+        return None;
+    }
+    let kind = input_expr_result_type(&args[0], schema);
+    if !matches!(
+        kind,
+        ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp
+    ) && !(name == "TIME" && kind == ColumnType::Time)
+    {
+        return None;
+    }
+    if let Some(mode) = args.get(1) {
+        let signed_integer = match mode {
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } => matches!(
+                const_compile_value(expr),
+                Some(Value::Int(_) | Value::UInt(_))
+            ),
+            _ => false,
+        };
+        if !signed_integer
+            && !matches!(
+                const_compile_value(mode),
+                Some(Value::Int(_) | Value::UInt(_))
+            )
+        {
+            return None;
+        }
+    }
+    Some(FunctionKernel::LegacySession(name))
+}
+
 fn input_expr_result_type(expr: &Expr, schema: &InputSchema) -> ColumnType {
     crate::engine::expr_type::column_type::schema_expr_result_type(expr, &mut |column| {
         input_expr_column_index(column, schema)
@@ -5586,6 +5709,68 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             args,
             distinct,
         } => {
+            // A bound column's character set and collation are properties of
+            // its descriptor, including NULL rows. Resolving the column still
+            // validates scope, but reading/copying its payload adds no semantics.
+            // Computed operands keep their evaluator for diagnostics/side effects.
+            if !*distinct
+                && args.len() == 1
+                && (name.eq_ignore_ascii_case("CHARSET") || name.eq_ignore_ascii_case("COLLATION"))
+            {
+                let source = match &args[0] {
+                    Expr::Function {
+                        name, args: bound, ..
+                    } if name.eq_ignore_ascii_case("__COLLATED_CONST")
+                        && bound.len() == 3
+                        && crate::engine::expr::expression_metadata_collation_id(&args[0])
+                            .is_some() =>
+                    {
+                        &bound[0]
+                    }
+                    source => source,
+                };
+                if matches!(source, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                    let index = match compile_node(source, schema)? {
+                        ExprNode::Column(index) => index,
+                        _ => return Err(CompileError::Unsupported),
+                    };
+                    let column = &schema.columns[index];
+                    let metadata = match column.column_type {
+                        ColumnType::VarString => {
+                            crate::engine::expr::expression_metadata_collation_id(&args[0])
+                                .or(column.collation_id)
+                                .and_then(crate::charset::resolve_collation_id)
+                                .map(|info| {
+                                    if name.eq_ignore_ascii_case("CHARSET") {
+                                        info.charset
+                                    } else {
+                                        info.name
+                                    }
+                                })
+                        }
+                        // BLOB wire lanes also carry aggregate TEXT results.
+                        // Keep their richer runtime descriptor on the oracle.
+                        ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                        | ColumnType::Float
+                        | ColumnType::Double
+                        | ColumnType::Decimal { .. }
+                        | ColumnType::Date
+                        | ColumnType::Time
+                        | ColumnType::DateTime
+                        | ColumnType::Timestamp
+                        | ColumnType::Year
+                        | ColumnType::Bit { .. } => Some("binary"),
+                        _ => None,
+                    };
+                    if let Some(metadata) = metadata {
+                        return Ok(ExprNode::Const(Value::String(metadata.to_owned())));
+                    }
+                }
+            }
             let result_coercion = match name.to_ascii_uppercase().as_str() {
                 "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE"
                     if !crate::engine::params::auto_parameterized_active()
@@ -5756,7 +5941,12 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     }
                 }
             }
-            let Some(mut kernel) = FunctionRegistry::global().resolve(name) else {
+            let Some(mut kernel) = FunctionRegistry::global()
+                .resolve(name)
+                .or_else(|| json_value_integer_kernel(name, args, schema))
+                .or_else(|| json_search_one_kernel(name, args, schema))
+                .or_else(|| temporal_read_kernel(name, args, schema))
+            else {
                 return Err(CompileError::Unsupported);
             };
             if let FunctionKernel::LegacyDeterministic(known_name) = kernel {
@@ -5766,6 +5956,11 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                         args.iter()
                             .all(|arg| input_expr_result_type(arg, schema) == ColumnType::Geometry),
                     );
+                }
+                if let Some(function) =
+                    crate::engine::expr::network::NetworkFunction::from_name(known_name)
+                {
+                    kernel = FunctionKernel::Network(function);
                 }
                 if let Some(function) =
                     crate::engine::expr::math::MathFunction::from_name(known_name)
@@ -6833,6 +7028,18 @@ impl FunctionKernel {
         scratch: &mut EvalScratch,
     ) -> Result<Value, QueryError> {
         match self {
+            FunctionKernel::Network(function) => {
+                function.check_arity(args)?;
+                let value = args[0].eval_ref(row, scratch)?;
+                let swap = args
+                    .get(1)
+                    .map(|arg| arg.eval_ref(row, scratch))
+                    .transpose()?;
+                function.evaluate(
+                    value.as_value(),
+                    swap.as_ref().map(|value| value.as_value()),
+                )
+            }
             FunctionKernel::Math(function) => {
                 function.check_arity(function.name(), args)?;
                 let mut values = smallvec::SmallVec::<[Value; 2]>::new();
@@ -7746,14 +7953,15 @@ fn eval_json_extract(
             "Incorrect parameter count in the call to native function 'JSON_EXTRACT'",
         ));
     }
-    let mut bound_args = smallvec::SmallVec::<[Expr; 4]>::with_capacity(args.len());
+    let mut values = smallvec::SmallVec::<[ValueRef<'_>; 4]>::with_capacity(args.len());
     for arg in args {
-        bound_args.push(Expr::BoundValue(arg.eval(row, scratch)?));
+        values.push(arg.eval_ref(row, scratch)?);
     }
-    crate::engine::expr::eval_function("JSON_EXTRACT", &bound_args, |arg| match arg {
-        Expr::BoundValue(value) => Ok(value.clone()),
-        _ => unreachable!(),
-    })
+    let paths = values[1..]
+        .iter()
+        .map(ValueRef::as_value)
+        .collect::<smallvec::SmallVec<[&Value; 4]>>();
+    crate::engine::expr::json_extract_value_refs(values[0].as_value(), &paths)
 }
 
 /// Evaluate a deterministic scalar function by delegating to the legacy

@@ -425,6 +425,15 @@ impl<T: AllocatedBytes> BoundedTopK<T> {
 }
 
 impl<T: AllocatedBytes, P: TiePolicy<T>> BoundedTopK<T, P> {
+    /// Borrow the leading cutoff only after K candidates exist. A strictly
+    /// worse leading key is rejectable under every suffix/payload tie policy.
+    pub(crate) fn worst_first_key(&self) -> Option<(&Value, SortField)> {
+        if self.k == 0 || self.heap.len() < self.k {
+            return None;
+        }
+        Some((self.heap.peek()?.keys.first()?, *self.fields.first()?))
+    }
+
     pub(crate) fn resident_bytes(&self) -> usize {
         self.charge.charged()
     }
