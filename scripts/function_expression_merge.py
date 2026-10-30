@@ -37,6 +37,8 @@ def merge(sources, destination):
                 source=str(source),
                 timeout_s=context["timeout_s"],
                 skip_invalid=context.get("skip_invalid", False),
+                plan_once=context.get("plan_once", False),
+                tool_sha256=context.get("tool_sha256"),
                 completed=len(files),
             )
         )

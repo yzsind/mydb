@@ -5,6 +5,7 @@ mod numeric_read;
 mod producer;
 mod string_read;
 mod temporal_read;
+mod temporal_shift;
 use super::*;
 use crate::engine::executor::vec::expr_batch::{
     transform_utf8_column, try_temporal_extract_column,
@@ -22,6 +23,7 @@ use numeric_read::NumericRead;
 use producer::Producer;
 use string_read::StringRead;
 use temporal_read::TemporalRead;
+use temporal_shift::TemporalShift;
 
 #[derive(Clone, Copy)]
 enum Domain {
@@ -99,9 +101,16 @@ fn constant(node: &ExprNode) -> Option<std::borrow::Cow<'_, Value>> {
     }
 }
 fn integer(node: &ExprNode) -> Option<i64> {
-    match constant(node)?.as_ref() {
+    let read = |value: &Value| match value {
         Value::Int(n) => Some(*n),
         Value::UInt(n) => i64::try_from(*n).ok(),
+        _ => None,
+    };
+    match node {
+        ExprNode::Const(value) => read(value),
+        ExprNode::Placeholder(index) => {
+            crate::engine::params::with_current_param(*index, |value| read(value?))
+        }
         _ => None,
     }
 }
@@ -325,7 +334,50 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                 None => (Domain::Integer(i64::MIN, i64::MAX), false),
             }
         }
-        ExprNode::Function { kernel, args, .. } => {
+        ExprNode::Function {
+            kernel,
+            args,
+            result_coercion,
+            ..
+        } => {
+            if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
+                return Some(TemporalShift::bind(node, schema)?.contract());
+            }
+            if matches!(
+                kernel,
+                FunctionKernel::LegacyDeterministic("GREATEST" | "LEAST")
+            ) {
+                if args.len() < 2 || result_coercion.is_some() {
+                    return None;
+                }
+                let mut parallel = true;
+                let mut all_null = false;
+                for arg in args {
+                    if let ExprNode::Column(index) = arg {
+                        if schema.fields().get(*index)?.source.flags
+                            & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+                            != 0
+                        {
+                            return None;
+                        }
+                    }
+                    let child = contract(arg, schema)?;
+                    match child.domain {
+                        Domain::Integer(..) => {}
+                        Domain::Null => all_null = true,
+                        _ => return None,
+                    }
+                    parallel &= child.parallel;
+                }
+                return Some(Contract {
+                    domain: if all_null {
+                        Domain::Null
+                    } else {
+                        Domain::Integer(i64::MIN, i64::MAX)
+                    },
+                    parallel,
+                });
+            }
             if let Some(read) = TemporalRead::bind(node, schema) {
                 return Some(read.contract());
             }
@@ -638,6 +690,22 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             Some((bytes, work.checked_add(bytes)?))
         }
         ExprNode::Function { kernel, args, .. } => {
+            if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
+                return TemporalShift::bind(node, batch.schema())?.workspace(batch);
+            }
+            if matches!(
+                kernel,
+                FunctionKernel::LegacyDeterministic("GREATEST" | "LEAST")
+            ) {
+                let mut work = numeric.checked_add(
+                    args.len()
+                        .checked_mul(std::mem::size_of::<std::borrow::Cow<'_, ColumnVector>>())?,
+                )?;
+                for arg in args {
+                    work = work.checked_add(workspace(arg, batch)?.1)?;
+                }
+                return Some((numeric, work));
+            }
             if temporal_column(*kernel, args).is_some() {
                 return Some((numeric, numeric.checked_mul(2)?));
             }
@@ -1081,6 +1149,12 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
             Some(ColumnVector::I64 { data, nulls })
         }
         ExprNode::Function { kernel, args, .. } => {
+            if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
+                return TemporalShift::bind(node, batch.schema())?.evaluate(batch);
+            }
+            if let FunctionKernel::LegacyDeterministic(name @ ("GREATEST" | "LEAST")) = kernel {
+                return integer_extrema_column(args, batch, *name == "GREATEST");
+            }
             if let Some((kind, index)) = temporal_column(*kernel, args) {
                 return try_temporal_extract_column(kind, batch, index);
             }
@@ -1251,6 +1325,57 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
         }
         _ => None,
     }
+}
+
+// A signed integer comparison never converts through DOUBLE or text.
+// Unsupported runtime lanes decline before any diagnostic is published.
+fn integer_extrema_column(
+    args: &[ExprNode],
+    batch: &Batch,
+    greatest: bool,
+) -> Option<ColumnVector> {
+    let columns = args
+        .iter()
+        .map(|arg| operand(arg, batch))
+        .collect::<Option<Vec<_>>>()?;
+    let rows = batch.num_rows();
+    let mut nulls = None;
+    for column in &columns {
+        match column.as_ref() {
+            ColumnVector::I64 { nulls: valid, .. } => {
+                nulls = crate::engine::executor::vec::expr_batch::merge_nulls(
+                    nulls.as_ref(),
+                    valid.as_ref(),
+                    rows,
+                );
+            }
+            ColumnVector::Null { .. } => nulls = Some(Bitmap::new_all_invalid(rows)),
+            _ => return None,
+        }
+    }
+    let mut data = Vec::with_capacity(rows);
+    for row in 0..rows {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if nulls.as_ref().is_some_and(|valid| !valid.get(row)) {
+            data.push(0);
+            continue;
+        }
+        let mut winner = if greatest { i64::MIN } else { i64::MAX };
+        for column in &columns {
+            let ColumnVector::I64 { data, .. } = column.as_ref() else {
+                return None;
+            };
+            winner = if greatest {
+                winner.max(data[row])
+            } else {
+                winner.min(data[row])
+            };
+        }
+        data.push(winner);
+    }
+    Some(ColumnVector::I64 { data, nulls })
 }
 
 fn validity(column: &ColumnVector) -> Option<Bitmap> {

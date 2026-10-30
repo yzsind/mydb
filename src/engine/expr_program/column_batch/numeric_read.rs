@@ -129,7 +129,7 @@ impl NumericRead {
             ColumnType::Decimal { precision, scale }
                 if matches!(
                     kind,
-                    Kind::Floor | Kind::Ceil | Kind::Round | Kind::Truncate
+                    Kind::Floor | Kind::Ceil | Kind::Round | Kind::Truncate | Kind::Cast
                 ) =>
             {
                 if matches!(kind, Kind::Floor | Kind::Ceil)
@@ -145,11 +145,7 @@ impl NumericRead {
         if input == Input::Signed && matches!(kind, Kind::Floor | Kind::Ceil | Kind::Cast) {
             return None;
         }
-        if input == Input::Decimal
-            && matches!(
-                kind,
-                Kind::Radix(_) | Kind::Cast | Kind::BitCount | Kind::Mod(_)
-            )
+        if input == Input::Decimal && matches!(kind, Kind::Radix(_) | Kind::BitCount | Kind::Mod(_))
         {
             return None;
         }
@@ -184,6 +180,16 @@ impl NumericRead {
             Kind::Radix(2) => 64,
             Kind::Radix(8) => 22,
             Kind::Radix(16) => 16,
+            Kind::Cast if self.input == Input::Decimal => {
+                let scale = match batch.columns().get(self.column)? {
+                    ColumnVector::Decimal32 { scale, .. }
+                    | ColumnVector::Decimal64 { scale, .. }
+                    | ColumnVector::Decimal128 { scale, .. } => *scale,
+                    ColumnVector::Null { .. } => 0,
+                    _ => return None,
+                };
+                usize::from(scale).max(39).checked_add(3)?
+            }
             Kind::Cast => 20,
             _ => 32,
         };
@@ -312,8 +318,12 @@ impl NumericRead {
                     offsets.push(u32::try_from(data.len()).ok()?);
                 }
                 Kind::Cast => {
-                    let mut buffer = itoa::Buffer::new();
-                    data.extend_from_slice(buffer.format(magnitude as u64).as_bytes());
+                    if self.input == Input::Decimal {
+                        append_decimal(magnitude, scale, &mut data);
+                    } else {
+                        let mut buffer = itoa::Buffer::new();
+                        data.extend_from_slice(buffer.format(magnitude as u64).as_bytes());
+                    }
                     offsets.push(u32::try_from(data.len()).ok()?);
                 }
                 Kind::BitCount => signed.push(i64::from((magnitude as u64).count_ones())),
@@ -375,5 +385,28 @@ impl NumericRead {
                 nulls,
             }
         })
+    }
+}
+
+// Preserve stored scale and the complete signed coefficient without a
+// per-row String allocation or a conversion through floating point.
+fn append_decimal(magnitude: i128, scale: u8, out: &mut Vec<u8>) {
+    let mut buffer = itoa::Buffer::new();
+    let digits = buffer.format(magnitude.unsigned_abs()).as_bytes();
+    let scale = usize::from(scale);
+    if magnitude < 0 {
+        out.push(b'-');
+    }
+    if scale == 0 {
+        out.extend_from_slice(digits);
+    } else if digits.len() > scale {
+        let split = digits.len() - scale;
+        out.extend_from_slice(&digits[..split]);
+        out.push(b'.');
+        out.extend_from_slice(&digits[split..]);
+    } else {
+        out.extend_from_slice(b"0.");
+        out.resize(out.len() + scale - digits.len(), b'0');
+        out.extend_from_slice(digits);
     }
 }

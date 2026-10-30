@@ -71,6 +71,7 @@ pub(crate) struct SessionExprInfo {
     auto_increment: (u64, u64),
     time_zone: String,
     timestamp_override: f64,
+    statement_now_micros: i64,
     explicit_defaults_for_timestamp: bool,
     block_encryption_mode: String,
     default_week_format: u32,
@@ -222,6 +223,15 @@ fn capture_session_expr_info_with_variables(
         ),
         time_zone: session.sysvars.time_zone.clone(),
         timestamp_override: session.sysvars.timestamp_override,
+        statement_now_micros: crate::engine::api::stmt_frozen_utc_now_micros(|| {
+            timestamp_override_parts(session.sysvars.timestamp_override)
+                .and_then(|(seconds, micros)| {
+                    seconds
+                        .checked_mul(1_000_000)?
+                        .checked_add(i64::from(micros))
+                })
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_micros())
+        }),
         explicit_defaults_for_timestamp: session.sysvars.explicit_defaults_for_timestamp,
         block_encryption_mode: session.sysvars.block_encryption_mode.clone(),
         default_week_format: session.sysvars.default_week_format as u32,
@@ -290,6 +300,7 @@ pub(crate) fn with_session_expr_info_snapshot<R>(
     info: SessionExprInfo,
     f: impl FnOnce() -> R,
 ) -> R {
+    let _statement_now = crate::engine::api::StatementNowScope::enter(info.statement_now_micros);
     struct SnapshotGuard {
         prev_ptr: Option<NonNull<crate::engine::api::SessionContext>>,
         prev_owned: Option<SessionExprInfo>,
@@ -1839,13 +1850,17 @@ fn checked_datetime_cast_value(micros: i64) -> Result<Value, QueryError> {
 pub(crate) fn session_timestamp_override() -> Option<(i64, u32)> {
     with_session_view(|view| {
         let raw = view.map(|v| v.timestamp_override()).unwrap_or(0.0);
-        if raw <= 0.0 {
-            return None;
-        }
-        let secs = raw.trunc() as i64;
-        let micros = ((raw - raw.trunc()) * 1e6).round() as u32;
-        Some((secs, micros.min(999_999)))
+        timestamp_override_parts(raw)
     })
+}
+
+fn timestamp_override_parts(raw: f64) -> Option<(i64, u32)> {
+    if raw <= 0.0 {
+        return None;
+    }
+    let secs = raw.trunc() as i64;
+    let micros = ((raw - raw.trunc()) * 1e6).round() as u32;
+    Some((secs, micros.min(999_999)))
 }
 
 pub(crate) fn session_explicit_defaults_for_timestamp() -> bool {
@@ -1867,7 +1882,12 @@ pub(crate) fn session_utc_now() -> chrono::NaiveDateTime {
     let micros = crate::engine::api::stmt_frozen_utc_now_micros(|| {
         // Recomputes on first call inside a statement.
         if let Some((secs, us)) = session_timestamp_override() {
-            return secs * 1_000_000 + us as i64;
+            if let Some(micros) = secs
+                .checked_mul(1_000_000)
+                .and_then(|s| s.checked_add(i64::from(us)))
+            {
+                return micros;
+            }
         }
         chrono::Utc::now().timestamp_micros()
     });

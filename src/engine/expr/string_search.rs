@@ -17,6 +17,7 @@ impl Default for Key {
 }
 pub(crate) struct SearchBuffer {
     collation: u16,
+    primary: bool,
     needle: Vec<u8>,
     ascii: [Key; 128],
     unicode: [Key; 64],
@@ -30,6 +31,7 @@ impl SearchBuffer {
         crate::charset::collation_search_key_by_id_into(collation, needle, &mut key);
         Self {
             collation,
+            primary: false,
             needle: key,
             ascii: std::array::from_fn(|_| Key::default()),
             unicode: std::array::from_fn(|_| Key::default()),
@@ -37,6 +39,68 @@ impl SearchBuffer {
             weights: Vec::new(),
             boundaries: Vec::new(),
         }
+    }
+    pub(crate) fn for_primary_weights() -> Self {
+        let mut buffer = Self::new(crate::charset::UTF8MB4_0900_AI_CI_ID, "");
+        buffer.primary = true;
+        buffer
+    }
+    #[inline]
+    fn append_character(&mut self, ch: char) {
+        let entry = if ch.is_ascii() {
+            &mut self.ascii[ch as usize]
+        } else {
+            &mut self.unicode[ch as usize % 64]
+        };
+        if entry.ch == ch && entry.len != usize::MAX {
+            // Fixed small widths let the compiler copy weights directly.
+            match entry.len {
+                0 => {}
+                1 => self.weights.push(entry.bytes[0]),
+                2 => self.weights.extend_from_slice(&entry.bytes[..2]),
+                4 => self.weights.extend_from_slice(&entry.bytes[..4]),
+                8 => self.weights.extend_from_slice(&entry.bytes[..8]),
+                _ => self.weights.extend_from_slice(&entry.bytes[..entry.len]),
+            }
+        } else {
+            let mut utf8 = [0; 4];
+            if self.primary {
+                crate::charset::uca9_primary_weights_into(
+                    ch.encode_utf8(&mut utf8),
+                    &mut self.character,
+                );
+            } else {
+                crate::charset::collation_search_key_by_id_into(
+                    self.collation,
+                    ch.encode_utf8(&mut utf8),
+                    &mut self.character,
+                );
+            }
+            if self.character.len() <= entry.bytes.len() {
+                entry.ch = ch;
+                entry.len = self.character.len();
+                entry.bytes[..entry.len].copy_from_slice(&self.character);
+            } else {
+                entry.len = usize::MAX;
+            }
+            self.weights.extend_from_slice(&self.character);
+        }
+    }
+    /// UCA 9 primary weights are scalar-local and do not trim trailing spaces.
+    /// This shares the bounded character cache with collation-aware searches.
+    pub(crate) fn primary_weights(&mut self, value: &str) -> &[u8] {
+        debug_assert!(self.primary);
+        debug_assert_eq!(
+            crate::charset::resolve_collation_id(self.collation)
+                .unwrap()
+                .name,
+            "utf8mb4_0900_ai_ci"
+        );
+        self.weights.clear();
+        for ch in value.chars() {
+            self.append_character(ch);
+        }
+        &self.weights
     }
     pub(crate) fn find(&mut self, haystack: &str, needle: &str, start: i64) -> usize {
         if start <= 0 {
@@ -60,37 +124,7 @@ impl SearchBuffer {
         self.boundaries.clear();
         self.boundaries.push(0);
         for ch in haystack.chars() {
-            let entry = if ch.is_ascii() {
-                &mut self.ascii[ch as usize]
-            } else {
-                &mut self.unicode[ch as usize % 64]
-            };
-            if entry.ch == ch && entry.len != usize::MAX {
-                // Fixed small widths let the compiler copy weights directly.
-                match entry.len {
-                    0 => {}
-                    1 => self.weights.push(entry.bytes[0]),
-                    2 => self.weights.extend_from_slice(&entry.bytes[..2]),
-                    4 => self.weights.extend_from_slice(&entry.bytes[..4]),
-                    8 => self.weights.extend_from_slice(&entry.bytes[..8]),
-                    _ => self.weights.extend_from_slice(&entry.bytes[..entry.len]),
-                }
-            } else {
-                let mut utf8 = [0; 4];
-                crate::charset::collation_search_key_by_id_into(
-                    self.collation,
-                    ch.encode_utf8(&mut utf8),
-                    &mut self.character,
-                );
-                if self.character.len() <= entry.bytes.len() {
-                    entry.ch = ch;
-                    entry.len = self.character.len();
-                    entry.bytes[..entry.len].copy_from_slice(&self.character);
-                } else {
-                    entry.len = usize::MAX;
-                }
-                self.weights.extend_from_slice(&self.character);
-            }
+            self.append_character(ch);
             self.boundaries.push(self.weights.len());
             // A complete prefix match is globally earliest: every earlier
             // start has an earlier weight offset and cannot require a later
@@ -115,6 +149,31 @@ impl SearchBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_primary_weights_match_weight_string_for_every_unicode_scalar() {
+        let mut buffer = SearchBuffer::for_primary_weights();
+        let mut text = String::new();
+        for ch in (0..=0x10ffff).filter_map(char::from_u32) {
+            text.push(ch);
+            if text.len() >= 8192 {
+                assert_eq!(
+                    buffer.primary_weights(&text),
+                    crate::charset::weight_string(&text, Some("utf8mb4_0900_ai_ci"))
+                );
+                assert!(
+                    buffer.primary_weights(&text).len()
+                        <= crate::charset::uca9_primary_byte_bound(text.as_bytes()).unwrap()
+                );
+                text.clear();
+            }
+        }
+        for text in [&text, "  aß\0\u{301}文🙂  ", "\u{fdfa}\u{fdfa}", ""] {
+            assert_eq!(
+                buffer.primary_weights(text),
+                crate::charset::weight_string(text, Some("utf8mb4_0900_ai_ci"))
+            );
+        }
+    }
     #[test]
     fn prefix_search_agrees_with_full_scalar_weights_on_boundaries_and_long_misses() {
         let texts = [

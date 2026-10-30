@@ -1656,6 +1656,42 @@ fn preflight_aggregate_result_layout(
     Some((layout.output_template, output, row_major))
 }
 
+// Keep metadata-sensitive string/mixed extrema on their existing oracle.
+// Direct signed integer operands can use the composable value-only kernel.
+fn integer_extrema_projection_shape(expr: &Expr, template: &[PlanField]) -> bool {
+    let Expr::Function { args, .. } = expr else {
+        return false;
+    };
+    args.len() >= 2
+        && args.iter().all(|arg| {
+            if let Some(index) = expr_column_index_in_template(arg, template) {
+                let field = &template[index];
+                return matches!(
+                    field.column_type,
+                    ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                ) && field.source.flags
+                    & (crate::mysql::protocol::UNSIGNED_FLAG
+                        | crate::mysql::protocol::ENUM_FLAG
+                        | crate::mysql::protocol::SET_FLAG)
+                    == 0;
+            }
+            match arg {
+                Expr::Literal(crate::parser::Literal::Int(_) | crate::parser::Literal::Null)
+                | Expr::BoundValue(Value::Int(_) | Value::Null) => true,
+                Expr::Placeholder(index) => {
+                    crate::engine::params::with_current_param(*index, |value| {
+                        matches!(value, Some(Value::Int(_) | Value::Null))
+                    })
+                }
+                _ => false,
+            }
+        })
+}
+
 fn preflight_result_projection(
     plan: &PhysicalPlan,
     projection: &[SelectItem],
@@ -1719,18 +1755,17 @@ fn preflight_result_projection(
                     output.push(VecResultProjection::Column(index));
                     continue;
                 }
-                // GREATEST/LEAST must aggregate MySQL coercibility and
-                // character-set metadata across every operand. That metadata
-                // can originate at a derived/CTE boundary and is richer than
-                // the value-only function kernel. Evaluate the expression
-                // row-wise against the PlanField template inside this batch;
-                // the input is still consumed exactly once.
-                if matches!(
+                // String/mixed GREATEST/LEAST operands aggregate coercibility
+                // and character-set metadata across derived/CTE boundaries.
+                // Direct signed integers have a value-only proof; other
+                // shapes retain their PlanField-aware row evaluator.
+                let extrema = matches!(
                     expr,
                     Expr::Function { name, .. }
                         if name.eq_ignore_ascii_case("GREATEST")
                             || name.eq_ignore_ascii_case("LEAST")
-                ) {
+                );
+                if extrema && !integer_extrema_projection_shape(expr, &planned_template) {
                     expression_count += 1;
                     has_erroring_expression = true;
                     output.push(VecResultProjection::Scalar(expr.clone()));
@@ -1742,6 +1777,12 @@ fn preflight_result_projection(
                     output.push(VecResultProjection::Scalar(expr.clone()));
                     continue;
                 };
+                if extrema && !program.has_column_contract(&schema) {
+                    expression_count += 1;
+                    has_erroring_expression = true;
+                    output.push(VecResultProjection::Scalar(expr.clone()));
+                    continue;
+                }
                 let mut source_sensitive_string_coercion = false;
                 let mut source_sensitive_number_rendering = false;
                 crate::planner::walk_expr_for_idents(expr, &mut |node| {

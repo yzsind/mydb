@@ -264,7 +264,7 @@ fn tagged_date_components_are_identical_in_scalar_and_composed_columns() {
 #[test]
 fn parsed_date_formats_cover_specifiers_locales_week_boundaries_and_time_zones() {
     let mut session = SessionContext::default();
-    let format="%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %f %j %w %a %W %b %M %p %r %T %D %U %u %V %v %X %x %% %q 中文%";
+    let format = "%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %f %j %w %a %W %b %M %p %r %T %D %U %u %V %v %X %x %% %q 中文%";
     for locale in [
         "en_US", "zh_CN", "de_DE", "fr_FR", "es_ES", "it_IT", "pt_BR", "ja_JP", "ko_KR",
     ] {
@@ -1723,6 +1723,250 @@ fn numeric_integer_columns_preserve_full_unsigned_range_and_signed_extremes() {
 }
 
 #[test]
+fn decimal_character_columns_keep_scale_full_coefficients_nulls_and_selection() {
+    for scale in [0, 1, 6, 30, 38, 255] {
+        let (program, schema) = compile(
+            "CAST(x AS CHAR)",
+            ColumnType::Decimal {
+                precision: 65,
+                scale,
+            },
+        );
+        let values = vec![
+            Value::Null,
+            Value::Decimal128(0, scale),
+            Value::Decimal128(1, scale),
+            Value::Decimal128(-1, scale),
+            Value::Decimal128(i128::MIN, scale),
+            Value::Decimal128(i128::MAX, scale),
+            Value::Decimal128(15000, scale),
+        ];
+        checked_legacy_column(
+            "CAST(x AS CHAR)",
+            schema.clone(),
+            vec![ColumnVector::from_values(values)],
+        );
+        let selected = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::Decimal128 {
+                data: vec![i128::MIN, 0, i128::MAX],
+                scale,
+                nulls: None,
+            }],
+        )
+        .with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+            vec![2, 0, 2],
+        ));
+        let actual = program.try_eval_column(&selected).unwrap();
+        for row in [0, 2] {
+            assert_eq!(
+                actual.value_at(row).to_display_string(),
+                crate::util::decimal::format_decimal_parts(
+                    if row == 0 { i128::MIN } else { i128::MAX },
+                    scale
+                )
+            );
+        }
+    }
+    // Width-limited casts retain their truncation diagnostics in the oracle.
+    let (program, schema) = compile(
+        "CAST(x AS CHAR(2))",
+        ColumnType::Decimal {
+            precision: 20,
+            scale: 6,
+        },
+    );
+    assert!(!program.has_column_contract(&schema));
+}
+
+#[test]
+fn statement_temporal_columns_rebind_clock_zone_precision_and_keep_invalid_fallback() {
+    let programs = [
+        "CURDATE()",
+        "CURRENT_DATE()",
+        "NOW(6)",
+        "CURRENT_TIMESTAMP(3)",
+        "CURTIME(2)",
+        "UTC_TIMESTAMP(5)",
+        "UTC_DATE()",
+        "UTC_TIME(4)",
+        "NOW(?)",
+    ]
+    .into_iter()
+    .map(|sql| (sql, compile(sql, ColumnType::LongLong)))
+    .collect::<Vec<_>>();
+    let mut session = SessionContext::default();
+    for timestamp in [1609459199.123456, 1710053999.654321, 1730613599.999999] {
+        session.sysvars.timestamp_override = timestamp;
+        for zone in ["+00:00", "+08:00", "America/New_York"] {
+            session.sysvars.time_zone = zone.into();
+            for precision in [0, 3, 6] {
+                crate::engine::api::clear_statement_now_freeze();
+                crate::engine::expr::with_session_expr_info(&session, || {
+                    crate::engine::params::with_params(vec![Value::Int(precision)], || {
+                        for (sql, (program, schema)) in &programs {
+                            let batch = Batch::new(
+                                schema.clone(),
+                                vec![ColumnVector::from_values(vec![Value::Int(1); 7])],
+                            );
+                            let expected = oracle(program, &batch).unwrap();
+                            let actual = program
+                                .try_eval_column(&batch)
+                                .unwrap_or_else(|| panic!("{sql}"));
+                            assert_eq!(
+                                (0..7).map(|r| actual.value_at(r)).collect::<Vec<_>>(),
+                                expected,
+                                "{sql}/{timestamp}/{zone}/{precision}"
+                            );
+                        }
+                    });
+                });
+            }
+        }
+    }
+    for sql in [
+        "NOW(7)",
+        "CURTIME(-1)",
+        "UTC_TIME('invalid')",
+        "NOW(x)",
+        "SYSDATE()",
+    ] {
+        let (program, schema) = compile(sql, ColumnType::LongLong);
+        assert!(!program.has_column_contract(&schema), "{sql}");
+    }
+    session.sysvars.timestamp_override = 253402290000.0;
+    session.sysvars.time_zone = "+14:00".into();
+    crate::engine::api::clear_statement_now_freeze();
+    crate::engine::expr::with_session_expr_info(&session, || {
+        let (program, schema) = compile("NOW(6)", ColumnType::LongLong);
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![Value::Int(1); 3])],
+        );
+        crate::engine::api::clear_statement_warnings();
+        assert!(program.try_eval_column(&batch).is_none());
+        assert_eq!(crate::engine::api::statement_warning_count(), 0);
+        let result = oracle(&program, &batch).unwrap();
+        assert_eq!(result, vec![Value::Null; 3]);
+        assert_eq!(crate::engine::api::statement_warning_count(), 3);
+        crate::engine::api::clear_statement_warnings();
+    });
+    crate::engine::api::clear_statement_now_freeze();
+}
+
+#[test]
+fn bound_coercibility_markers_and_weight_buffers_keep_typed_execution() {
+    let (_, source) = compile("x", ColumnType::VarString);
+    let mut field = source.fields()[0].clone();
+    field.source.collation_id = Some(crate::charset::UTF8MB4_0900_AI_CI_ID);
+    let schema = Arc::new(BatchSchema::new(vec![field]));
+    for level in [0, 2, 4, 5] {
+        checked_legacy_column(
+            &format!("COERCIBILITY(__COLLATED_CONST(x,'utf8mb4_bin',{level}))"),
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("aß文".into()),
+            ])],
+        );
+    }
+    let mut data = Vec::with_capacity(16 * 1024 * 1024);
+    let mut offsets = Vec::with_capacity(8192);
+    offsets.push(0);
+    for _ in 0..64 {
+        data.extend_from_slice("aß文🙂 ".as_bytes());
+        offsets.push(data.len() as u32);
+    }
+    let batch = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::Utf8 {
+            data,
+            offsets,
+            nulls: None,
+        }],
+    );
+    let ast = crate::parser::parse_expr_fragment("HEX(WEIGHT_STRING(x))").unwrap();
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+    let program = ExprCompiler::compile(&ast, &input).unwrap();
+    let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+    assert!(program.column_output_bound(&batch).is_some());
+    let actual = program.try_eval_column(&batch).unwrap();
+    assert_eq!(
+        (0..64).map(|r| actual.value_at(r)).collect::<Vec<_>>(),
+        oracle(&legacy, &batch).unwrap()
+    );
+}
+
+#[test]
+fn metadata_and_character_wrapper_columns_preserve_nulls_collations_and_comparisons() {
+    let (_, source) = compile("x", ColumnType::VarString);
+    let values = vec![
+        Value::Null,
+        Value::String("".into()),
+        Value::String("a".into()),
+        Value::String("A ".into()),
+        Value::String("ß\0\u{301}文🙂\u{fdfa}".into()),
+        Value::String("\u{feff}start".into()),
+    ];
+    for name in [
+        "utf8mb4_0900_ai_ci",
+        "utf8mb4_bin",
+        "utf8mb4_unicode_ci",
+        "latin1_swedish_ci",
+    ] {
+        let mut field = source.fields()[0].clone();
+        field.source.collation_id = Some(crate::charset::resolve_collation(name).unwrap().id);
+        let schema = Arc::new(BatchSchema::new(vec![field]));
+        for sql in [
+            "COERCIBILITY(x)",
+            "CONVERT(x USING utf8mb4)",
+            "CONVERT(x USING binary)",
+            "x COLLATE utf8mb4_bin",
+        ] {
+            checked_legacy_column(
+                sql,
+                schema.clone(),
+                vec![ColumnVector::from_values(values.clone())],
+            );
+        }
+    }
+    for collation in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_unicode_ci"] {
+        for op in ["=", "<>", "<", "<=", ">", ">="] {
+            for sql in [
+                format!("x COLLATE {collation} {op} 'a'"),
+                format!("'a' {op} x COLLATE {collation}"),
+            ] {
+                checked_legacy_column(
+                    &sql,
+                    source.clone(),
+                    vec![ColumnVector::from_values(values.clone())],
+                );
+            }
+        }
+    }
+    let mut field = source.fields()[0].clone();
+    field.source.collation_id = Some(crate::charset::UTF8MB4_0900_AI_CI_ID);
+    let schema = Arc::new(BatchSchema::new(vec![field]));
+    for sql in ["WEIGHT_STRING(x)", "HEX(WEIGHT_STRING(x))"] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(values.clone())],
+        );
+    }
+    // Nested failures and lossy conversions remain on their ordered oracle.
+    for sql in ["COERCIBILITY(SUBSTRING(x,1,1))", "CONVERT(x USING utf8mb3)"] {
+        let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+        let program = ExprCompiler::compile(
+            &ast,
+            &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+        )
+        .unwrap();
+        assert!(!program.has_column_contract(&schema), "{sql}");
+    }
+}
+
+#[test]
 fn borrowed_string_columns_match_legacy_unicode_binary_null_and_overlap_rules() {
     let text = vec![
         Value::Null,
@@ -2022,4 +2266,170 @@ fn string_binary_search_and_speculative_budget_declines_preserve_the_oracle() {
         });
         assert_eq!(budget.used(), 0);
     }
+}
+
+#[test]
+fn signed_extrema_columns_keep_extremes_nulls_selection_and_mixed_type_fallback() {
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    let values = vec![
+        Value::Null,
+        Value::Int(i64::MIN),
+        Value::Int(-7),
+        Value::Int(0),
+        Value::Int(7),
+        Value::Int(i64::MAX),
+    ];
+    for sql in [
+        "GREATEST(x,7)",
+        "LEAST(x,-7)",
+        "GREATEST(x,x,7)",
+        "LEAST(x,3,-5)",
+        "GREATEST(x,NULL)",
+        "GREATEST(LENGTH(CAST(x AS CHAR)),7)",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(values.clone())],
+        );
+    }
+    let (program, schema) = compile("GREATEST(ABS(x),7)", ColumnType::LongLong);
+    let hidden = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::Int(3),
+            Value::Int(i64::MIN),
+            Value::Null,
+        ])],
+    );
+    assert!(program.try_eval_column(&hidden).is_none());
+    assert!(oracle(&program, &hidden).is_err());
+    let selected = hidden.with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+        vec![0, 2, 0],
+    ));
+    let actual = program.try_eval_column(&selected).unwrap();
+    assert_eq!(
+        (0..3).map(|row| actual.value_at(row)).collect::<Vec<_>>(),
+        vec![Value::Int(7), Value::Null, Value::Null]
+    );
+    for kind in [
+        ColumnType::Double,
+        ColumnType::VarString,
+        ColumnType::Decimal {
+            precision: 20,
+            scale: 6,
+        },
+    ] {
+        let (program, schema) = compile("GREATEST(x,7)", kind);
+        assert!(!program.has_column_contract(&schema));
+    }
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    let mut field = schema.fields()[0].clone();
+    field.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    let schema = Arc::new(BatchSchema::new(vec![field]));
+    let ast = crate::parser::parse_expr_fragment("LEAST(x,7)").unwrap();
+    let program = ExprCompiler::compile(
+        &ast,
+        &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+    )
+    .unwrap();
+    assert!(!program.has_column_contract(&schema));
+}
+
+#[test]
+fn named_literal_programs_keep_value_and_reject_nonliteral_name_or_value() {
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    for sql in [
+        "NAME_CONST('answer',42)",
+        "NAME_CONST('',NULL)",
+        "NAME_CONST('a','标签🙂')",
+        "NAME_CONST('a',X'00FF')",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![Value::Int(1), Value::Null])],
+        );
+    }
+    let ast = crate::parser::parse_expr_fragment("NAME_CONST('a',42)").unwrap();
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+    assert!(ExprCompiler::compile_strict(&ast, &input).is_err());
+    for sql in [
+        "NAME_CONST(x,1)",
+        "NAME_CONST('a',x)",
+        "NAME_CONST('a',1/0)",
+    ] {
+        let (program, schema) = compile(sql, ColumnType::LongLong);
+        assert!(!program.has_column_contract(&schema), "{sql}");
+    }
+}
+
+#[test]
+fn fixed_temporal_shifts_keep_typed_lanes_zones_precision_and_overflow_fallback() {
+    let mut session = SessionContext::default();
+    let micros = chrono::NaiveDate::from_ymd_opt(2024, 3, 10)
+        .unwrap()
+        .and_hms_micro_opt(6, 30, 1, 123456)
+        .unwrap()
+        .and_utc()
+        .timestamp_micros();
+    for zone in ["+00:00", "+08:00", "America/New_York"] {
+        session.sysvars.time_zone = zone.into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for (kind, values) in [
+                (
+                    ColumnType::DateTime,
+                    vec![
+                        Value::Null,
+                        Value::DateTime(micros),
+                        Value::DateTime(micros + 86_400_000_000),
+                    ],
+                ),
+                (
+                    ColumnType::Timestamp,
+                    vec![
+                        Value::Null,
+                        Value::Timestamp(micros),
+                        Value::Timestamp(micros + 86_400_000_000),
+                    ],
+                ),
+                (
+                    ColumnType::Date,
+                    vec![Value::Null, Value::Date(19792), Value::Date(19793)],
+                ),
+            ] {
+                let (_, schema) = compile("x", kind);
+                for sql in [
+                    "DATE_ADD(x,INTERVAL 1 DAY)",
+                    "DATE_SUB(x,INTERVAL 1 DAY)",
+                    "ADDDATE(x,2)",
+                    "SUBDATE(x,2)",
+                    "DATE_ADD(x,INTERVAL 1 WEEK)",
+                    "DATE_ADD(x,INTERVAL 1 HOUR)",
+                    "DATE_SUB(x,INTERVAL 2 MINUTE)",
+                    "DATE_ADD(x,INTERVAL 7 SECOND)",
+                    "DATE_ADD(x,INTERVAL 123 MICROSECOND)",
+                ] {
+                    checked_legacy_column(
+                        sql,
+                        schema.clone(),
+                        vec![ColumnVector::from_values(values.clone())],
+                    );
+                }
+            }
+        });
+    }
+    let (program, schema) = compile("DATE_ADD(x,INTERVAL 1 DAY)", ColumnType::DateTime);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![Value::DateTime(
+            crate::types::MAX_DATETIME_MICROS,
+        )])],
+    );
+    crate::engine::api::clear_statement_warnings();
+    assert!(program.try_eval_column(&batch).is_none());
+    assert_eq!(crate::engine::api::statement_warning_count(), 0);
+    let _ = oracle(&program, &batch);
+    assert!(crate::engine::api::statement_warning_count() > 0);
+    crate::engine::api::clear_statement_warnings();
 }

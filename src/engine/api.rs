@@ -481,6 +481,20 @@ pub(crate) fn clear_statement_now_freeze() {
     STMT_NOW_MICROS.with(|c| c.set(None));
 }
 
+/// Install the invoking statement's clock on a reusable worker thread.
+/// Nested operators and unwinding restore the worker's preceding context.
+pub(crate) struct StatementNowScope(Option<i64>);
+impl StatementNowScope {
+    pub(crate) fn enter(micros: i64) -> Self {
+        Self(STMT_NOW_MICROS.with(|slot| slot.replace(Some(micros))))
+    }
+}
+impl Drop for StatementNowScope {
+    fn drop(&mut self) {
+        STMT_NOW_MICROS.with(|slot| slot.set(self.0));
+    }
+}
+
 /// Read the statement-frozen UTC now, computing and caching on first
 /// call. Callers pass a closure returning the microsecond value they
 /// would compute if not frozen — the closure only runs on the first

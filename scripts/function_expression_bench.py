@@ -846,6 +846,8 @@ def run(args, validate_only=False):
         skip_invalid=args.skip_invalid,
         repeats=args.repeats,
         warmup=args.warmup,
+        plan_once=args.plan_once,
+        tool_sha256=digest_file(Path(__file__)),
         worker_sha256=digest_file(args.worker),
         modes=args.modes,
         machine=platform.platform(),
@@ -877,9 +879,12 @@ def run(args, validate_only=False):
             "modes",
             "prepared",
             "skip_invalid",
+            "plan_once",
         ):
             if previous.get(key, False) != context.get(key, False):
                 raise RuntimeError(f"resume context differs: {key}")
+        if previous.get("tool_sha256", context["tool_sha256"]) != context["tool_sha256"]:
+            raise RuntimeError("resume context differs: tool_sha256")
     else:
         dump(context_path, context)
     endpoints = {name: Endpoint(name, args) for name in args.modes}
@@ -904,6 +909,7 @@ def run(args, validate_only=False):
                 name=case["name"],
                 category=case["category"],
                 comparison=case["comparison"],
+                plan_once=args.plan_once,
                 engines={},
             )
             captures = {}
@@ -990,6 +996,26 @@ def run(args, validate_only=False):
                             if metric == "analyze"
                             else sql
                         )
+                        if metric == "analyze" and args.plan_once:
+                            # A plan observation is not a timing repetition.
+                            # Preserve the complete response without creating
+                            # samples eligible for ANALYZE/statement ranking.
+                            setup_error = apply_case_setup(ep, case)
+                            response = setup_error or ep.execute(
+                                measured_sql,
+                                timeout=args.timeout,
+                                sample_limit=512,
+                                **query_options,
+                            )
+                            engine["plan_observation"] = response
+                            if response["status"] == "ok":
+                                engine["plan"] = response.get("sample")
+                                response["statement"] = statement_metrics(ep, token)
+                            engine["metrics"][metric] = dict(
+                                status="unavailable",
+                                reason="Single plan observation only; no repeated ANALYZE timing samples.",
+                            )
+                            continue
                         records = []
                         for iteration in range(args.warmup + args.repeats):
                             setup_error = apply_case_setup(ep, case)
@@ -1342,6 +1368,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=1)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--plan-once", action="store_true",
+        help="Keep ordinary end-to-end samples and collect one independent plan instead of repeated ANALYZE timings",
+    )
     parser.add_argument("--modes", nargs="+", choices=list(MODES), default=list(MODES))
     parser.add_argument("--filter")
     parser.add_argument("--limit", type=int)

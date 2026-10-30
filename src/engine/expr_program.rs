@@ -5709,6 +5709,28 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             args,
             distinct,
         } => {
+            // Keep the original AST for NAME_CONST's protocol label while
+            // lowering its already-validated literal value once per program.
+            if !*distinct
+                && !COMPILE_NO_ESCAPE.with(Cell::get)
+                && name.eq_ignore_ascii_case("NAME_CONST")
+                && args.len() == 2
+            {
+                let valid_name = matches!(
+                    &args[0],
+                    Expr::Literal(Literal::String(_))
+                        | Expr::BoundValue(
+                            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                        )
+                );
+                if valid_name {
+                    match &args[1] {
+                        Expr::Literal(value) => return Ok(ExprNode::Const(literal_value(value))),
+                        Expr::BoundValue(value) => return Ok(ExprNode::Const(value.clone())),
+                        _ => {}
+                    }
+                }
+            }
             // A bound column's character set and collation are properties of
             // its descriptor, including NULL rows. Resolving the column still
             // validates scope, but reading/copying its payload adds no semantics.

@@ -20,6 +20,9 @@ enum Kind {
     MonthName,
     Microsecond,
     TimeToSec,
+    CurrentDate,
+    CurrentTime,
+    CurrentDateTime,
 }
 #[derive(Clone, Copy)]
 enum Cell {
@@ -38,6 +41,35 @@ impl TemporalRead {
             return None;
         };
         let (kind, mode) = match kernel {
+            FunctionKernel::Curdate | FunctionKernel::UtcDate if args.is_empty() => (
+                Kind::CurrentDate,
+                u32::from(matches!(kernel, FunctionKernel::UtcDate)) << 3,
+            ),
+            FunctionKernel::Now
+            | FunctionKernel::Curtime
+            | FunctionKernel::UtcTimestamp
+            | FunctionKernel::UtcTime
+                if args.len() <= 1 =>
+            {
+                let fsp = match args.first() {
+                    Some(arg) => u32::try_from(integer(arg)?).ok()?,
+                    None => 0,
+                };
+                if fsp > 6 {
+                    return None;
+                }
+                (
+                    if matches!(kernel, FunctionKernel::Curtime | FunctionKernel::UtcTime) {
+                        Kind::CurrentTime
+                    } else {
+                        Kind::CurrentDateTime
+                    },
+                    fsp | (u32::from(matches!(
+                        kernel,
+                        FunctionKernel::UtcTime | FunctionKernel::UtcTimestamp
+                    )) << 3),
+                )
+            }
             FunctionKernel::Date => (Kind::Date, 0),
             FunctionKernel::Dayofweek => (Kind::DayOfWeek, 0),
             FunctionKernel::Dayofyear => (Kind::DayOfYear, 0),
@@ -75,6 +107,16 @@ impl TemporalRead {
             }
             _ => return None,
         };
+        if matches!(
+            kind,
+            Kind::CurrentDate | Kind::CurrentTime | Kind::CurrentDateTime
+        ) {
+            return Some(Self {
+                column: 0,
+                kind,
+                mode,
+            });
+        }
         if !matches!(kind, Kind::Week | Kind::YearWeek) && args.len() != 1 {
             return None;
         }
@@ -100,7 +142,13 @@ impl TemporalRead {
         Contract {
             domain: match self.kind {
                 Kind::DayName | Kind::MonthName => Domain::Text,
-                Kind::Date | Kind::LastDay | Kind::Time | Kind::Timestamp => Domain::Temporal,
+                Kind::Date
+                | Kind::LastDay
+                | Kind::Time
+                | Kind::Timestamp
+                | Kind::CurrentDate
+                | Kind::CurrentTime
+                | Kind::CurrentDateTime => Domain::Temporal,
                 _ => Domain::Integer(i64::MIN, i64::MAX),
             },
             parallel: false,
@@ -188,6 +236,48 @@ impl TemporalRead {
         })
     }
     pub(super) fn evaluate(&self, batch: &Batch) -> Option<ColumnVector> {
+        if matches!(
+            self.kind,
+            Kind::CurrentDate | Kind::CurrentTime | Kind::CurrentDateTime
+        ) {
+            // Read the statement-frozen clock at execution time, never bind
+            // it into a reusable expression program. Overflow keeps the
+            // per-row oracle and its original warning count.
+            let utc = self.mode & 8 != 0;
+            let now = if utc {
+                crate::engine::expr::session_utc_now()
+            } else {
+                crate::engine::expr::session_now()
+            };
+            if !(0..=9999).contains(&now.year()) {
+                return None;
+            }
+            let fsp = (self.mode & 7) as usize;
+            let value = match (self.kind, utc) {
+                (Kind::CurrentDate, false) => crate::engine::expr::eval_curdate_func(),
+                (Kind::CurrentDate, true) => crate::engine::expr::eval_utc_date_func(),
+                (Kind::CurrentTime, false) => crate::engine::expr::eval_curtime_fsp(fsp),
+                (Kind::CurrentTime, true) => crate::engine::expr::eval_utc_time_fsp(fsp),
+                (Kind::CurrentDateTime, false) => crate::engine::expr::eval_now_fsp(fsp),
+                (Kind::CurrentDateTime, true) => crate::engine::expr::eval_utc_timestamp_fsp(fsp),
+                _ => return None,
+            };
+            return Some(match value {
+                Value::Date(value) => ColumnVector::Date32 {
+                    data: vec![value; batch.num_rows()],
+                    nulls: None,
+                },
+                Value::Time(value) => ColumnVector::Time64 {
+                    data: vec![value; batch.num_rows()],
+                    nulls: None,
+                },
+                Value::DateTime(value) => ColumnVector::DateTime64 {
+                    data: vec![value; batch.num_rows()],
+                    nulls: None,
+                },
+                _ => return None,
+            });
+        }
         let input = batch.columns().get(self.column)?;
         let rows = batch.num_rows();
         if matches!(input, ColumnVector::Null { .. }) {

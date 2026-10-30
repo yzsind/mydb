@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from function_expression_bench import (
     InventoryParser,
@@ -19,6 +20,7 @@ from function_expression_bench import (
     report_result,
     sql_for,
     Worker,
+    run,
 )
 from function_expression_cases import build_cases, registered_names
 from function_expression_extend import unchanged_cases
@@ -26,6 +28,42 @@ from function_expression_merge import merge
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_single_plan_observation_preserves_end_to_end_samples_and_resume_identity(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
+            root = Path(directory)
+            worker = root / "worker"
+            worker.write_text("unchanged worker")
+            (root / "mydb").write_text("frozen engine")
+            (root / "manifest.json").write_text(json.dumps({"cases": [{
+                "id": "a", "name": "F", "category": "test", "comparison": "exact",
+                "sql": "SELECT id,F(x) FROM bench",
+            }]}))
+            endpoint = Mock()
+            endpoint.worker.connection_id = 7
+            endpoint.control.query.return_value = dict(status="ok", rows=0, sample=[])
+
+            def execute(sql, **options):
+                if options.get("capture"):
+                    Path(options["capture"]).write_text('1\t["1","value"]\n')
+                return dict(status="ok", rows=1, elapsed_ms=10, sample=[["plan"]])
+
+            endpoint.execute.side_effect = execute
+            args = SimpleNamespace(directory=root, worker=worker, rows=1000000,
+                timeout=10, repeats=3, warmup=1, modes=["mysql"], filter=None,
+                limit=None, skip_invalid=True, plan_once=True, rerun=False)
+            with patch("function_expression_bench.Endpoint", return_value=endpoint):
+                run(args)
+            result = json.loads((root / "cases/a/result.json").read_text())["engines"]["mysql"]
+            samples = result["metrics"]["end_to_end"]["samples"]
+            self.assertEqual([s["warmup"] for s in samples], [True, False, False, False])
+            self.assertEqual(result["metrics"]["analyze"]["status"], "unavailable")
+            self.assertNotIn("samples", result["metrics"]["analyze"])
+            self.assertEqual(result["plan_observation"]["elapsed_ms"], 10)
+            self.assertEqual(sum(call.args[0].startswith("EXPLAIN ANALYZE") for call in endpoint.execute.call_args_list), 1)
+            args.plan_once = False
+            with self.assertRaisesRegex(RuntimeError, "plan_once"):
+                run(args)
+
     def test_timeout_cohorts_keep_their_original_budgets(self):
         with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
             root = Path(directory)
