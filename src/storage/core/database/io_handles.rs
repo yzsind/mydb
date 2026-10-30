@@ -503,18 +503,16 @@ impl Database {
         let timed = matches!(payload, WalPayload::SequenceState { .. });
         if timed {
             let pre = crate::wal::LogManager::pre_encode_timed_record(txn_id, payload)?;
-            return self
-                .log
-                .lock()
-                .append_timed(
-                    pre,
-                    &self.commit_hlc_unix_us,
-                    Some(&self.temporal_hlc_rollback_total),
-                )
-                .map(|(lsn, _)| lsn);
+            return crate::wal::LogManager::append_timed_to(
+                &self.log,
+                pre,
+                &self.commit_hlc_unix_us,
+                Some(&self.temporal_hlc_rollback_total),
+            )
+            .map(|(lsn, _)| lsn);
         }
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-        self.log.lock().append_pre_encoded(pre)
+        crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
     }
 
     fn append_commit_wal(
@@ -527,7 +525,8 @@ impl Database {
             return Ok((0, self.next_commit_unix_us()));
         }
         let pre = crate::wal::LogManager::pre_encode_timed_record(txn_id, payload)?;
-        self.log.lock().append_timed(
+        crate::wal::LogManager::append_timed_to(
+            &self.log,
             pre,
             &self.commit_hlc_unix_us,
             Some(&self.temporal_hlc_rollback_total),

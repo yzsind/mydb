@@ -100,6 +100,7 @@ fn advance_time(clock: &AtomicU64, rollbacks: Option<&AtomicU64>) -> u64 {
 }
 
 impl LogManager {
+    #[cfg(test)]
     #[inline]
     pub(crate) fn append_timed(
         &mut self,

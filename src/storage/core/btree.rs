@@ -3874,7 +3874,9 @@ impl IndexFile {
                         // frames permanently unflushable. Fall back to the
                         // canonical eager append and always balance every pin.
                         let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
-                            .and_then(|pre| self.log.lock().append_pre_encoded(pre));
+                            .and_then(|pre| {
+                                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
+                            });
                         match appended {
                             Ok(lsn) => {
                                 for key in &keys {
@@ -3899,7 +3901,9 @@ impl IndexFile {
                         self.buffer_pool.finalize_deferred(key, 0);
                     }
                     let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                    let lsn = Some(self.log.lock().append_pre_encoded(pre)?);
+                    let lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
+                        &self.log, pre,
+                    )?);
                     return self.apply_batch_with_lsn(txn_id, entries.into_vec(), lsn);
                 }
                 Err(e) => {
@@ -3917,7 +3921,9 @@ impl IndexFile {
         let lsn = match payload {
             Some(payload) => {
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                Some(self.log.lock().append_pre_encoded(pre)?)
+                Some(crate::wal::LogManager::append_pre_encoded_to(
+                    &self.log, pre,
+                )?)
             }
             None => None,
         };
@@ -4599,7 +4605,7 @@ impl IndexFile {
         // Drop deferred collection before appending or entering an oracle.
         // No leaf or topology guard is held while touching the WAL mutex.
         let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
-            .and_then(|pre| self.log.lock().append_pre_encoded(pre));
+            .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre));
         let lsn = match appended {
             Ok(lsn) => {
                 for key in &keys {
@@ -4902,7 +4908,7 @@ impl IndexFile {
                 }
                 let pre =
                     LogManager::pre_encode_record(txn_id, WalPayload::IndexBatch { path, ops })?;
-                self.log.lock().append_pre_encoded(pre)?;
+                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                 compensated_last_record |= frame.header.lsn == last_lsn;
             }
         }
@@ -8743,7 +8749,9 @@ impl IndexFile {
                         ops: std::mem::take(&mut ops),
                     },
                 )?;
-                last_lsn = Some(self.log.lock().append_pre_encoded(pre)?);
+                last_lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
+                    &self.log, pre,
+                )?);
                 chunk_payload_bytes = fixed_payload_bytes;
             }
             chunk_payload_bytes = chunk_payload_bytes
@@ -8768,7 +8776,9 @@ impl IndexFile {
                 txn_id,
                 WalPayload::IndexBatch { path, ops },
             )?;
-            last_lsn = Some(self.log.lock().append_pre_encoded(pre)?);
+            last_lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
+                &self.log, pre,
+            )?);
         }
         Ok(last_lsn)
     }
@@ -8782,7 +8792,7 @@ impl IndexFile {
             return Ok(None);
         };
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         Ok(Some(lsn))
     }
 
@@ -8848,7 +8858,7 @@ impl IndexFile {
                 ops: vec![wal_op],
             },
         )?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(Some(lsn));
         let result = apply(self, entry);

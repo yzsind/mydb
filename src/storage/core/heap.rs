@@ -1249,7 +1249,7 @@ impl HeapFile {
             new_len: new_page_count.saturating_mul(PAGE_SIZE as u64),
         };
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         note_reduced_redo_file(&self.log, txn_id, relative_path);
         Ok(Some(lsn))
     }
@@ -2800,7 +2800,9 @@ impl HeapFile {
                     // WAL-before-data contract through an eager append and
                     // balance the pin on both success and failure.
                     let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
-                        .and_then(|pre| self.log.lock().append_pre_encoded(pre));
+                        .and_then(|pre| {
+                            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
+                        });
                     match appended {
                         Ok(lsn) => {
                             for key in &keys {
@@ -2818,7 +2820,7 @@ impl HeapFile {
             } else {
                 // Frame not resident — append eagerly with this record.
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                let lsn = self.log.lock().append_pre_encoded(pre)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                 self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
                     patch_heap_page_raw(bytes, row_id.slot_id, &apply_patches)
                 })?;
@@ -4577,7 +4579,7 @@ impl HeapFile {
             0, // FPI is a system record, not part of the transaction chain
             WalPayload::full_page_image(self.relative_path(), page_id as u64, after),
         )?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         if reduced {
             self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
                 write_u16(bytes, 6, 0);
@@ -4757,7 +4759,7 @@ impl HeapFile {
                 Ok(result) => result,
                 Err((payload, write)) => {
                     let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                    let lsn = self.log.lock().append_pre_encoded(pre)?;
+                    let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                     write(lsn)
                 }
             };
@@ -4780,7 +4782,7 @@ impl HeapFile {
                     inserts,
                 },
             )?;
-            self.log.lock().append_pre_encoded(pre)?
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         if txn_reduced_redo_active(&self.log, txn_id) && retained_fallback {
             REDUCED_REDO_FALLBACK_RECORDS.fetch_add(1, Ordering::Relaxed);
@@ -4935,7 +4937,7 @@ impl HeapFile {
                     undo_lsn,
                 },
             )?;
-            self.log.lock().append_pre_encoded(pre)?
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         if lsn != 0 {
             page.set_lsn(lsn);
@@ -5002,7 +5004,7 @@ impl HeapFile {
             Ok(result) => result,
             Err((redo, mut write)) => {
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, redo)?;
-                let lsn = self.log.lock().append_pre_encoded(pre)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                 write(lsn)
             }
         }
@@ -5030,7 +5032,7 @@ impl HeapFile {
                     undo_lsn,
                 },
             )?;
-            self.log.lock().append_pre_encoded(pre)?
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         if lsn != 0 {
             page.set_lsn(lsn);
@@ -5078,7 +5080,7 @@ impl HeapFile {
             Ok(result) => result,
             Err((redo, write)) => {
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, redo)?;
-                let lsn = self.log.lock().append_pre_encoded(pre)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                 write(lsn)
             }
         }
