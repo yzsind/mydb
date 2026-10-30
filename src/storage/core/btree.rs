@@ -4131,9 +4131,9 @@ impl IndexFile {
         else {
             return Ok(false);
         };
-        // A non-root leaf's first entry is its parent separator. Moving either
-        // endpoint through slot zero would require the structural slow path.
-        if leaf_id != root_page && (old_pos == 0 || target_pos == 0) {
+        // Parent separators are conservative lower bounds. Raising a leaf's
+        // minimum preserves that bound; only a decrease needs the oracle.
+        if leaf_id != root_page && target_pos == 0 && (old_pos != 0 || new_entry < old_entry) {
             return Ok(false);
         }
         let removed = apply_leaf_reposition(&mut leaf.entries, old_pos, target_pos, new_entry);
@@ -4217,7 +4217,10 @@ impl IndexFile {
                 else {
                     return Ok((false, false));
                 };
-                if leaf_id != root_page && (old_pos == 0 || target_pos == 0) {
+                if leaf_id != root_page
+                    && target_pos == 0
+                    && (old_pos != 0 || new_entry < old_entry)
+                {
                     return Ok((false, false));
                 }
                 let removed =
@@ -4269,7 +4272,6 @@ impl IndexFile {
         let root_page = self.root_page.load(Ordering::Acquire);
         let mut old_leaf = self.read_leaf(old_leaf_id)?;
         let mut new_leaf = self.read_leaf(new_leaf_id)?;
-        let old_original_first = old_leaf.entries.first().cloned();
         let new_original_first = new_leaf.entries.first().cloned();
         let Ok(delete_pos) = old_leaf.entries.binary_search(old_entry) else {
             return Ok(false);
@@ -4292,7 +4294,6 @@ impl IndexFile {
         if old_leaf_id != root_page {
             if old_leaf.entries.is_empty()
                 || encoded_leaf_page_len(&old_leaf) < INDEX_MIN_PAGE_BYTES
-                || old_leaf.entries.first().cloned() != old_original_first
             {
                 return Ok(false);
             }
@@ -4364,11 +4365,10 @@ impl IndexFile {
                     Ok(_) => return Ok((false, false)),
                     Err(pos) => pos,
                 };
-                // Changing a non-root leaf's first key requires refreshing its
-                // parent separator; leave that structural case to the oracle.
-                if (old_leaf_id != root_page && delete_pos == 0)
-                    || (new_leaf_id != root_page && insert_pos == 0)
-                {
+                // Source deletion raises its minimum and keeps the existing
+                // separator valid. Destination minimum decreases still use
+                // the structural oracle.
+                if new_leaf_id != root_page && insert_pos == 0 {
                     return Ok((false, false));
                 }
 
@@ -14964,7 +14964,7 @@ fn try_reposition_raw_leaf(
     if old_pos < new_pos {
         new_pos -= 1;
     }
-    if !may_change_first && (old_pos == 0 || new_pos == 0) {
+    if !may_change_first && new_pos == 0 && (old_pos != 0 || new_entry < old_entry) {
         return Ok(None);
     }
     let Some(encoded) = encode_leaf_entry_for_layout(
@@ -15161,7 +15161,7 @@ fn try_move_between_raw_leaves(
             Err(pos) => pos,
         }
     };
-    if (!old_may_change_first && old_pos == 0) || (!new_may_change_first && new_pos == 0) {
+    if !new_may_change_first && new_pos == 0 {
         return Ok(None);
     }
     let Some(encoded) = encode_leaf_entry_for_layout(
@@ -18569,6 +18569,168 @@ mod logged_delete_batch_tests {
                 (![10, 70].contains(&n)).then_some(entry.row_id)
             );
         }
+    }
+
+    #[test]
+    fn leaf_update_can_raise_a_nonroot_minimum_without_changing_topology() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..4000u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(i64::from(n) * 4)]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let first = file.read_leaf(file.leftmost_leaf().unwrap()).unwrap();
+        let leaf_id = first.next_leaf.unwrap();
+        let leaf = file.read_leaf(leaf_id).unwrap();
+        let old = leaf.entries[0].clone();
+        let [KeyPart::Int(value)] = old.key.0.as_slice() else {
+            panic!("integer fixture");
+        };
+        let new = IndexEntry {
+            key: IndexKey::from(vec![KeyPart::Int(value + 1)]),
+            row_id: old.row_id,
+        };
+        let changes = [
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Delete,
+                key: old.key.clone(),
+                row_id: old.row_id,
+            },
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Insert,
+                key: new.key.clone(),
+                row_id: new.row_id,
+            },
+        ];
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &changes)
+            .unwrap()
+            .unwrap();
+        assert!(
+            file.try_apply_two_op_update_batch_fast(7, &changes, Some(lsn))
+                .unwrap(),
+            "raising a leaf minimum preserves its parent lower bound"
+        );
+        file.buffer_pool.flush_and_evict_all().unwrap();
+        assert!(file.get(&old.key, false).unwrap().is_empty());
+        assert_eq!(file.get(&new.key, false).unwrap(), vec![old.row_id]);
+        let replacement_row = RowId {
+            page_id: 2,
+            slot_id: 1,
+        };
+        file.insert_with_txn(8, old.key.clone(), replacement_row)
+            .unwrap();
+        assert_eq!(file.get(&old.key, false).unwrap(), vec![replacement_row]);
+        let all = file.entries().unwrap();
+        assert_eq!(all.len(), entries.len() + 1);
+        assert!(all.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn cross_leaf_nullable_update_can_remove_the_source_minimum() {
+        let (_dir, file) = fixture();
+        let mut entries: Vec<_> = (0..4u16)
+            .flat_map(|group| {
+                (0..600u16).map(move |n| IndexEntry {
+                    key: IndexKey::from(vec![
+                        KeyPart::Int(1),
+                        KeyPart::Int(1),
+                        if group == 0 {
+                            KeyPart::Null
+                        } else {
+                            KeyPart::Int(i64::from(group))
+                        },
+                        KeyPart::Int(i64::from(n) * 4),
+                    ]),
+                    row_id: RowId {
+                        page_id: 1,
+                        slot_id: group * 600 + n,
+                    },
+                })
+            })
+            .collect();
+        entries.sort_unstable();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let first = file.read_leaf(file.leftmost_leaf().unwrap()).unwrap();
+        let source_id = first.next_leaf.unwrap();
+        let source = file.read_leaf(source_id).unwrap();
+        let old = source.entries[0].clone();
+        assert_eq!(old.key.0[2], KeyPart::Null);
+        let KeyPart::Int(order) = old.key.0[3] else {
+            panic!("integer order");
+        };
+        let new = IndexEntry {
+            key: IndexKey::from(vec![
+                KeyPart::Int(1),
+                KeyPart::Int(1),
+                KeyPart::Int(2),
+                KeyPart::Int(order + 1),
+            ]),
+            row_id: old.row_id,
+        };
+        let destination_id = file
+            .find_leaf_for_entry_with_candidate(&new, &new)
+            .unwrap()
+            .0
+            .frame
+            .key
+            .page_id;
+        assert_ne!(source_id, destination_id);
+        // Bulk construction can fill the destination completely. Make room
+        // through the ordinary delete path so this tests the separator rule,
+        // while leaving overflow/underflow on the structural oracle.
+        let destination = file.read_leaf(destination_id).unwrap();
+        let removed_destination = destination.entries[destination.entries.len() / 2].clone();
+        file.delete_deferred(
+            8,
+            removed_destination.key.clone(),
+            removed_destination.row_id,
+        )
+        .unwrap();
+        assert!(
+            encoded_leaf_page_len(&source) > INDEX_MIN_PAGE_BYTES + 128,
+            "source fixture must have deletion headroom: {}",
+            encoded_leaf_page_len(&source)
+        );
+        let changes = [
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Delete,
+                key: old.key.clone(),
+                row_id: old.row_id,
+            },
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Insert,
+                key: new.key.clone(),
+                row_id: new.row_id,
+            },
+        ];
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &changes)
+            .unwrap()
+            .unwrap();
+        assert!(
+            file.try_apply_two_op_update_batch_fast(7, &changes, Some(lsn))
+                .unwrap(),
+            "a non-underflowing source can retain a conservative separator"
+        );
+        file.buffer_pool.flush_and_evict_all().unwrap();
+        assert!(file.get(&old.key, false).unwrap().is_empty());
+        assert_eq!(file.get(&new.key, false).unwrap(), vec![old.row_id]);
+        let mut expected: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry != &old && entry != &removed_destination)
+            .map(|entry| (entry.key, entry.row_id))
+            .collect();
+        expected.push((new.key, new.row_id));
+        expected.sort_unstable();
+        assert_eq!(file.entries().unwrap(), expected);
     }
 
     #[test]
