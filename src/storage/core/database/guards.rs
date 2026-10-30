@@ -76,10 +76,7 @@ impl Database {
         &self,
         undo_ptr: u64,
     ) -> Result<Option<crate::storage::undo::UndoRecord>, QueryError> {
-        let prepared = {
-            let undo = self.undo_read()?;
-            undo.prepare_load_owned(undo_ptr)?
-        };
+        let prepared = self.undo.prepare_load_owned(undo_ptr)?;
         match prepared {
             Some(prepared) => prepared.finish(),
             None => Ok(None),

@@ -1051,11 +1051,7 @@ impl Database {
         }
         // The common admission check changes no state. Publication rechecks
         // the limits under the write latch, just as after the old preflight.
-        if self
-            .undo
-            .read()
-            .insert_admission_unpressured(row_count, true)
-        {
+        if self.undo.insert_admission_unpressured(row_count) {
             return Ok(());
         }
         // P2/12 — capture retention_pressure_count before/after admission

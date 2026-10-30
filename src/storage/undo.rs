@@ -1325,6 +1325,10 @@ struct PurgeKeepCache {
 
 pub(crate) type UndoTablespace = UndoManager;
 
+pub(crate) fn publication_shard(ptr: u64) -> usize {
+    shard_of_segment(undo_ptr_segment(ptr)) as usize
+}
+
 /// Stable admission owner shared with appenders. Reserving memory does not
 /// inspect undo directory metadata and must not queue behind its write latch.
 #[derive(Clone, Debug)]
@@ -2864,6 +2868,51 @@ impl UndoManager {
     /// every UPDATE as soon as operators enabled memory protection.
     pub(crate) fn concurrent_persistent_append_eligible(&self) -> bool {
         self.undo_dir.is_some() && self.txn_max_bytes == 0 && !self.retention_guarantee
+    }
+
+    /// Policies needing synchronous global accounting retain the canonical
+    /// publication path. Cache pressure alone can be handled at a directory
+    /// consolidation barrier, after reserving every record with the governor.
+    pub(crate) fn sharded_publication_eligible(&self) -> bool {
+        self.concurrent_persistent_append_eligible()
+            && self.tablespace_max_bytes == 0
+            && self.mem_soft_limit_bytes == 0
+    }
+
+    pub(crate) fn record_chain_depth(&self, ptr: u64) -> u32 {
+        self.records
+            .get(&self.resolve_forwarded(ptr).unwrap_or(ptr))
+            .map_or(0, |record| record.chain_depth)
+    }
+
+    /// A publication barrier exclusively fences new shard publications. Their
+    /// memory was admitted before publication, and ids come from disjoint
+    /// segment offsets, so consolidation cannot introduce an admission error.
+    pub(crate) fn consolidate_published_record(
+        &mut self,
+        record: UndoRecord,
+        reservation: UndoResidentReservation,
+    ) {
+        let depth = record.chain_depth;
+        let segment_id = undo_ptr_segment(record.id);
+        let end = undo_ptr_offset(record.id)
+            + UNDO_FRAME_HEADER_LEN as u64
+            + u64::from(record.encoded_len);
+        let tracked = self.segment_file_bytes.entry(segment_id).or_default();
+        let previous = *tracked;
+        *tracked = previous.max(end);
+        self.disk_bytes = self.disk_bytes.saturating_add(*tracked - previous);
+        assert!(
+            !self.records.contains_key(&record.id),
+            "duplicate published undo pointer"
+        );
+        self.insert_loaded_record_reserved(record, reservation)
+            .expect("pre-admitted undo consolidation is infallible");
+        self.refresh_peak_after_insert(depth);
+    }
+
+    pub(crate) fn finish_publication_barrier(&mut self) {
+        self.evict_to_cache_budget();
     }
 
     /// Clone the one authoritative eligibility gate used by Database. Refresh

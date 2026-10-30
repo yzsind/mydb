@@ -720,11 +720,10 @@ impl Database {
             lock_log_presence: lock_manager.lock_log_presence(),
             lock_manager: parking_lot::RwLock::new(lock_manager),
             mdl: MdlManager::default(),
-            undo: UndoLatch::new(undo),
+            undo: UndoLatch::new(undo)?,
             undo_append_shards,
             undo_resident_admission,
             undo_append_next_shard: AtomicU64::new(0),
-            undo_publish: UndoPublishQueue::default(),
             undo_concurrent_append_eligible,
             active_snapshots: (0..ACTIVE_SNAPSHOT_SHARDS)
                 .map(|_| Mutex::new(Default::default()))
