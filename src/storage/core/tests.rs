@@ -10128,7 +10128,7 @@ fn combined_undo_publication_preserves_commits_and_rollbacks() {
         );
     }
     drop(db.undo.read());
-    assert_eq!(db.undo.published_count.load(Ordering::Acquire), 0);
+    assert_eq!(db.undo.pending_count(), 0);
     db.check_consistency().unwrap();
 }
 

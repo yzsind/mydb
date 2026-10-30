@@ -903,10 +903,82 @@ fn encode_undo_manifest(value: &UndoManifest) -> Result<Vec<u8>, QueryError> {
 /// the hot append path locks ONLY the picked shard, so N concurrent pushes
 /// hitting distinct shards do their seek+write+flush in parallel instead of
 /// serializing on a single global undo lock.
+/// A segment cannot be retired while a frame is being appended or is live
+/// outside the canonical directory. The weak registry never resurrects a
+/// closed generation; a lease is acquired under its writer-shard mutex.
+#[derive(Debug)]
+#[repr(align(128))]
+struct UndoSegmentGeneration;
+
+#[derive(Debug, Clone)]
+pub(crate) struct UndoSegmentLease {
+    segment_id: u32,
+    _pin: Arc<UndoSegmentGeneration>,
+}
+
+#[derive(Debug)]
+struct UndoSegmentPins {
+    pins: FastHashMap<u32, std::sync::Weak<UndoSegmentGeneration>>,
+    charge: ControlledMemoryCharge,
+}
+impl Default for UndoSegmentPins {
+    fn default() -> Self {
+        Self {
+            pins: Default::default(),
+            charge: ControlledMemoryCharge::try_new(ControlledMemoryCategory::SystemMetadata, 0)
+                .expect("zero-byte segment registry reservation"),
+        }
+    }
+}
+impl UndoSegmentPins {
+    fn lease(&mut self, segment_id: u32) -> Result<UndoSegmentLease, QueryError> {
+        if let Some(pin) = self
+            .pins
+            .get(&segment_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(UndoSegmentLease {
+                segment_id,
+                _pin: pin,
+            });
+        }
+        if !self.pins.contains_key(&segment_id) && self.pins.len() == self.pins.capacity() {
+            let buckets = (self.pins.len() + 1).next_power_of_two().max(4) * 2;
+            let bytes = buckets
+                * (std::mem::size_of::<(u32, std::sync::Weak<UndoSegmentGeneration>)>() + 161);
+            // Registration runs under a writer-lane latch. Do not invoke
+            // reclaim callbacks that could reenter storage diagnostics.
+            if !self
+                .charge
+                .try_grow_optional(bytes.saturating_sub(self.charge.bytes()))
+            {
+                return Err(error(
+                    crate::error::catalog::ER_OUT_OF_RESOURCES,
+                    "undo segment pin registry cannot reserve memory within MYDB_MEMORY_TARGET",
+                ));
+            }
+            self.pins.try_reserve(1).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_OUT_OF_RESOURCES,
+                    "undo segment pin registry allocation failed",
+                )
+            })?;
+        }
+        let pin = Arc::new(UndoSegmentGeneration);
+        self.pins.insert(segment_id, Arc::downgrade(&pin));
+        Ok(UndoSegmentLease {
+            segment_id,
+            _pin: pin,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct UndoWriteShard {
     pub(crate) shard_id: u32,
     pub(crate) active_file: Option<File>,
+    active_pin: Option<UndoSegmentLease>,
+    segment_pins: Arc<parking_lot::Mutex<UndoSegmentPins>>,
     pub(crate) tail_buffer: Vec<u8>,
     pub(crate) buffer_start: u64,
     pub(crate) active_segment_id: u32,
@@ -940,6 +1012,7 @@ impl UndoWriteShard {
         segment_bytes: u64,
         buffer_limit: u64,
         undo_dir: Option<PathBuf>,
+        segment_pins: Arc<parking_lot::Mutex<UndoSegmentPins>>,
     ) -> Self {
         // The first segment for this shard is `(1 << SHARD_BITS) | shard_id`
         // so `seq=0` (which would collapse to `shard_id`) is never picked —
@@ -948,6 +1021,8 @@ impl UndoWriteShard {
         Self {
             shard_id,
             active_file: None,
+            active_pin: None,
+            segment_pins,
             tail_buffer: Vec::new(),
             buffer_start: UNDO_SEGMENT_HEADER_LEN,
             active_segment_id: make_segment_id(shard_id, 1),
@@ -978,6 +1053,13 @@ impl UndoWriteShard {
 
     fn ensure_active_segment(&mut self) -> Result<(), QueryError> {
         if self.active_file.is_some() {
+            if self
+                .active_pin
+                .as_ref()
+                .is_none_or(|pin| pin.segment_id != self.active_segment_id)
+            {
+                self.active_pin = Some(self.segment_pins.lock().lease(self.active_segment_id)?);
+            }
             return Ok(());
         }
         if self.undo_dir.is_none() {
@@ -1008,6 +1090,7 @@ impl UndoWriteShard {
         }
         file.seek(SeekFrom::Start(self.active_offset))
             .map_err(io_err)?;
+        self.active_pin = Some(self.segment_pins.lock().lease(self.active_segment_id)?);
         self.active_file = Some(file);
         self.tail_buffer.clear();
         self.buffer_start = self.active_offset;
@@ -1189,6 +1272,7 @@ pub(crate) struct UndoManager {
     /// and payload. Shared with short-lived pre-admission guards so the
     /// concurrent segment writer can reserve before doing frame I/O.
     resident_charge: Arc<parking_lot::Mutex<ControlledMemoryCharge>>,
+    segment_pins: Arc<parking_lot::Mutex<UndoSegmentPins>>,
     pub(crate) next_undo_id: u64,
     /// Keyed by `undo_ptr`. AHash keeps steady-state insert/remove/lookup O(1).
     /// Records stay inline: the directory reaches its small workload high-water
@@ -1463,6 +1547,7 @@ impl Default for UndoManager {
     fn default() -> Self {
         let shard_count = default_undo_write_shards();
         let buffer_limit = default_undo_buffer_bytes();
+        let segment_pins = Arc::new(parking_lot::Mutex::new(UndoSegmentPins::default()));
         let write_shards: Arc<[UndoWriteShardHandle]> = (0..shard_count)
             .map(|i| {
                 Arc::new(parking_lot::Mutex::new(UndoWriteShard::new(
@@ -1470,6 +1555,7 @@ impl Default for UndoManager {
                     DEFAULT_UNDO_SEGMENT_BYTES,
                     buffer_limit,
                     None,
+                    Arc::clone(&segment_pins),
                 )))
             })
             .collect();
@@ -1478,6 +1564,7 @@ impl Default for UndoManager {
                 ControlledMemoryCharge::try_new(ControlledMemoryCategory::SystemMetadata, 0)
                     .expect("zero-byte undo governor reservation must succeed"),
             )),
+            segment_pins,
             next_undo_id: 1,
             records: FastHashMap::default(),
             created_index: BTreeMap::new(),
@@ -2879,12 +2966,6 @@ impl UndoManager {
             && self.mem_soft_limit_bytes == 0
     }
 
-    pub(crate) fn record_chain_depth(&self, ptr: u64) -> u32 {
-        self.records
-            .get(&self.resolve_forwarded(ptr).unwrap_or(ptr))
-            .map_or(0, |record| record.chain_depth)
-    }
-
     /// A publication barrier exclusively fences new shard publications. Their
     /// memory was admitted before publication, and ids come from disjoint
     /// segment offsets, so consolidation cannot introduce an admission error.
@@ -2893,7 +2974,6 @@ impl UndoManager {
         record: UndoRecord,
         reservation: UndoResidentReservation,
     ) {
-        let depth = record.chain_depth;
         let segment_id = undo_ptr_segment(record.id);
         let end = undo_ptr_offset(record.id)
             + UNDO_FRAME_HEADER_LEN as u64
@@ -2906,9 +2986,8 @@ impl UndoManager {
             !self.records.contains_key(&record.id),
             "duplicate published undo pointer"
         );
-        self.insert_loaded_record_reserved(record, reservation)
+        self.insert_reserved(record, reservation)
             .expect("pre-admitted undo consolidation is infallible");
-        self.refresh_peak_after_insert(depth);
     }
 
     pub(crate) fn finish_publication_barrier(&mut self) {
@@ -2960,10 +3039,19 @@ impl UndoManager {
     /// that shard mutex. The caller must subsequently call
     /// `finish_concurrent_persistent_append` under the manager write lock to
     /// publish the in-memory mirror/accounting.
+    #[cfg(test)]
     pub(crate) fn write_concurrent_persistent_frame(
         shard: &UndoWriteShardHandle,
         bytes: &mut [u8],
     ) -> Result<(u64, u32, u64), QueryError> {
+        let (ptr, segment, end, _lease) = Self::write_leased_persistent_frame(shard, bytes)?;
+        Ok((ptr, segment, end))
+    }
+
+    pub(crate) fn write_leased_persistent_frame(
+        shard: &UndoWriteShardHandle,
+        bytes: &mut [u8],
+    ) -> Result<(u64, u32, u64, UndoSegmentLease), QueryError> {
         validate_undo_payload_len(bytes.len())?;
         let frame_len = UNDO_FRAME_HEADER_LEN as u64 + bytes.len() as u64;
         let mut shard = shard.lock();
@@ -2976,7 +3064,12 @@ impl UndoManager {
         let ptr = make_undo_ptr(shard.active_segment_id, shard.active_offset)?;
         Self::patch_encoded_id(bytes, ptr)?;
         shard.write_frame(ptr, bytes)?;
-        Ok((ptr, shard.active_segment_id, shard.active_offset))
+        let lease = shard
+            .active_pin
+            .as_ref()
+            .expect("open segment has a lifetime pin")
+            .clone();
+        Ok((ptr, shard.active_segment_id, shard.active_offset, lease))
     }
 
     /// Hot-path persistent append, phase 2: publish the frame written by
@@ -3642,20 +3735,8 @@ impl UndoManager {
         self.disk_cap_softfail_warn = enabled;
     }
 
-    /// P1/9 — write-buffer threshold getter / setter (runtime sysvar).
-    /// `0` reverts to write-through (one seek+write+flush per frame —
-    /// the pre-buffer path), any non-zero value is the maximum bytes
-    /// allowed to accumulate before the buffered tail is drained to
-    /// the segment file. With P1/6 sharding the limit is set per shard;
-    /// the getter reads shard 0 (all shards stay in sync via
-    /// `set_buffer_limit`).
-    pub(crate) fn buffer_limit(&self) -> u64 {
-        self.write_shards
-            .first()
-            .map(|s| s.lock().buffer_limit)
-            .unwrap_or(0)
-    }
-
+    /// Set every rollback lane's write-buffer threshold. Zero switches to
+    /// write-through; configuration reads use the authoritative lane directly.
     pub(crate) fn set_buffer_limit(&mut self, bytes: u64) -> Result<(), QueryError> {
         // Crossing into write-through must drain every shard's buffered
         // tail so subsequent appends observe the new policy on a clean
@@ -3784,6 +3865,18 @@ impl UndoManager {
     /// Set of segment ids that are some shard's current active segment.
     /// Used by `detach_empty_segments` to leave those alone — the shard's
     /// next append still expects to find the file.
+    fn protected_segment_ids(&self) -> HashSet<u32> {
+        let mut protected = self.active_segment_ids();
+        protected.extend(
+            self.segment_pins
+                .lock()
+                .pins
+                .iter()
+                .filter_map(|(id, pin)| (pin.strong_count() != 0).then_some(*id)),
+        );
+        protected
+    }
+
     fn active_segment_ids(&self) -> HashSet<u32> {
         self.write_shards
             .iter()
@@ -4900,7 +4993,7 @@ impl UndoManager {
         min_live_ratio_pct: u32,
         batch_limit: usize,
     ) -> Vec<u32> {
-        let active = self.active_segment_ids();
+        let active = self.protected_segment_ids();
         let estimated_bytes = self
             .segment_file_bytes
             .len()
@@ -4974,7 +5067,7 @@ impl UndoManager {
         if seg_ids.is_empty() {
             return Ok((0, Vec::new()));
         }
-        let active = self.active_segment_ids();
+        let active = self.protected_segment_ids();
         let mut remap: Vec<(u64, u64)> = Vec::new();
         // Snapshot the segment's old size so the caller can reason
         // about the disk bytes freed.
@@ -5479,7 +5572,7 @@ impl UndoManager {
         let Some(dir) = self.undo_dir.as_ref() else {
             return Vec::new();
         };
-        let active = self.active_segment_ids();
+        let active = self.protected_segment_ids();
         let removable = self
             .segment_file_bytes
             .keys()
@@ -5489,6 +5582,7 @@ impl UndoManager {
             .collect::<Vec<_>>();
         let mut paths = Vec::with_capacity(removable.len());
         for id in removable {
+            self.segment_pins.lock().pins.remove(&id);
             let bytes = self.segment_file_bytes.remove(&id).unwrap_or(0);
             self.segment_live_records.remove(&id);
             if let Some(shard) = self.write_shards.get(shard_of_segment(id) as usize) {
@@ -8341,6 +8435,36 @@ mod buffer_tests {
     /// configured rollback-segment shard, and each shard's active
     /// segment must have a distinct on-disk file (no shared file
     /// handle / no shared segment_id).
+    #[test]
+    fn unpublished_segment_lease_fences_compaction_and_empty_retirement() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut undo = open(dir.path());
+        let (seed, _, _) = undo.append_record(record(1), true).unwrap();
+        let segment = undo_ptr_segment(seed);
+        let lane = undo.write_shards[shard_of_segment(segment) as usize].clone();
+        let mut pending = record(2);
+        pending.before_values = Some(vec![Value::String("unpublished".repeat(1000))]);
+        let mut bytes = encode_undo_record(&pending).unwrap();
+        let (_, _, end, lease) =
+            UndoManager::write_leased_persistent_frame(&lane, &mut bytes).unwrap();
+        lane.lock().rotate().unwrap();
+        // Model a later completed publisher already advancing the tracked tail
+        // past this still-private frame. Lease protection must be independent
+        // of both the canonical record count and that allocation watermark.
+        undo.segment_file_bytes.insert(segment, end);
+        assert!(!undo.compaction_candidates(99, 100).contains(&segment));
+        undo.remove_record(seed).unwrap();
+        let path = undo
+            .undo_dir
+            .as_ref()
+            .unwrap()
+            .join(segment_file_name(segment));
+        assert!(!undo.detach_empty_segments().contains(&path));
+        assert!(path.exists());
+        drop(lease);
+        assert!(undo.detach_empty_segments().contains(&path));
+    }
+
     #[test]
     fn round_robin_spreads_pushes_across_shards() {
         let dir = tempfile::tempdir().unwrap();

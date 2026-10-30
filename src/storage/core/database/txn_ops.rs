@@ -2377,19 +2377,13 @@ impl Database {
     /// `mydb_undo_buffer_bytes`). Lives in the UndoManager since it is
     /// applied to its `buffer_limit` field directly.
     pub fn undo_buffer_bytes(&self) -> u64 {
-        self.undo
-            .try_read()
-            .map(|undo| undo.buffer_limit())
-            .unwrap_or(0)
+        self.undo_append_shards.first().map_or(0, |shard| shard.lock().buffer_limit)
     }
 
     /// P2/12 — disk-cap soft-fail warning toggle (sysvar
     /// `mydb_undo_disk_cap_softfail_warn`).
     pub fn undo_disk_cap_softfail_warn(&self) -> bool {
-        self.undo
-            .try_read()
-            .map(|undo| undo.disk_cap_softfail_warn())
-            .unwrap_or(false)
+        self.undo.disk_softfail_warn.load(Ordering::Acquire)
     }
 
     pub fn set_undo_disk_cap_softfail_warn(&self, enabled: bool) -> Result<(), QueryError> {
@@ -2411,10 +2405,7 @@ impl Database {
     /// `SHOW ENGINE MYDB STATUS` so operators can confirm
     /// `MYDB_UNDO_WRITE_SHARDS` took effect.
     pub fn undo_shard_count(&self) -> u64 {
-        self.undo
-            .try_read()
-            .map(|undo| undo.shard_count() as u64)
-            .unwrap_or(0)
+        self.undo_append_shards.len() as u64
     }
 
     /// P2/13 — surface the live undo mirror as a flat record list for

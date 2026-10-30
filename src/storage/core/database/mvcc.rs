@@ -1326,7 +1326,7 @@ impl Database {
                 // needs no undo-directory latch. Publication still takes the
                 // exclusive latch and rechecks the runtime admission policies.
                 let reservation = self.undo_resident_admission.reserve(&record)?;
-                let frame = crate::storage::undo::UndoManager::write_concurrent_persistent_frame(
+                let frame = crate::storage::undo::UndoManager::write_leased_persistent_frame(
                     &shard,
                     &mut encoded,
                 )?;
@@ -1338,7 +1338,7 @@ impl Database {
             // `Instant::now()` — the probe measured the undo publish lock at
             // only ~2–7% of wall time, so it stays off in production.
             let lock_started = undo_publish_lock_probe_enabled().then(std::time::Instant::now);
-            if let Some(((ptr, segment_id, segment_end), reservation)) = concurrent_frame {
+            if let Some(((ptr, segment_id, segment_end, segment_lease), reservation)) = concurrent_frame {
                 let out = self.publish_concurrent_undo_frame(
                     record,
                     encoded,
@@ -1346,6 +1346,7 @@ impl Database {
                     segment_id,
                     segment_end,
                     reservation,
+                    segment_lease,
                 )?;
                 self.record_undo_publish_lock(lock_started);
                 out

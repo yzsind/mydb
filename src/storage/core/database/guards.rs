@@ -65,7 +65,7 @@ impl Database {
         Ok(self.undo.read())
     }
 
-    fn undo_lock(&self) -> Result<parking_lot::RwLockWriteGuard<'_, UndoTablespace>, QueryError> {
+    fn undo_lock(&self) -> Result<UndoDirectoryWriteGuard<'_>, QueryError> {
         Ok(self.undo.write())
     }
 
