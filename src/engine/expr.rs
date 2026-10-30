@@ -7597,8 +7597,11 @@ where
                     // MySQL's interruptible SLEEP treats sub-10us requests
                     // as zero waits; preserve cancellation without entering
                     // the operating-system sleep path for this domain.
-                    if seconds < 0.00001 { crate::engine::cancel::check_cancelled()?; }
-                    else { sleep_with_cancel(Duration::from_secs_f64(seconds))?; }
+                    if seconds < 0.00001 {
+                        crate::engine::cancel::check_cancelled()?;
+                    } else {
+                        sleep_with_cancel(Duration::from_secs_f64(seconds))?;
+                    }
                 }
             }
             Ok(Value::Int(0))
@@ -9140,8 +9143,8 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let sub = parse_gtid_set(&string_value(&values[0]))?;
-                let sup = parse_gtid_set(&string_value(&values[1]))?;
+                let sub = parsed_gtid_argument(&args[0], &values[0])?;
+                let sup = parsed_gtid_argument(&args[1], &values[1])?;
                 Ok(Value::Int(gtid_set_is_subset(&sub, &sup) as i64))
             })
         }
@@ -9149,8 +9152,8 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let base = parse_gtid_set(&string_value(&values[0]))?;
-                let minus = parse_gtid_set(&string_value(&values[1]))?;
+                let base = parsed_gtid_argument(&args[0], &values[0])?;
+                let minus = parsed_gtid_argument(&args[1], &values[1])?;
                 Ok(Value::String(format_gtid_set(&gtid_set_subtract(
                     &base, &minus,
                 ))))
@@ -11400,7 +11403,11 @@ pub(crate) fn mysql_case_map(s: &str, upper: bool) -> String {
 #[inline]
 pub(crate) fn mysql_case_char(c: char, upper: bool) -> char {
     if c.is_ascii() {
-        return if upper { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+        return if upper {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
     }
     if upper {
         let mut mapped = c.to_uppercase();
@@ -17175,7 +17182,7 @@ fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn pkcs7_unpadded_len(data: &[u8]) -> Option<usize> {
     let pad = *data.last()? as usize;
     if pad == 0 || pad > 16 || pad > data.len() {
         return None;
@@ -17183,7 +17190,12 @@ fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
     if data[data.len() - pad..].iter().any(|b| *b as usize != pad) {
         return None;
     }
-    data.truncate(data.len() - pad);
+    Some(data.len() - pad)
+}
+
+fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
+    let length = pkcs7_unpadded_len(&data)?;
+    data.truncate(length);
     Some(data)
 }
 
@@ -17193,6 +17205,7 @@ fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
 /// Query-local two-argument ECB setup. Warning-producing keys and other
 /// modes retain the scalar path with its original lazy argument evaluation.
 pub(crate) struct AesEcb(AnyAes);
+pub(crate) type AesBlock = aes::cipher::Block<aes::Aes128>;
 impl AesEcb {
     pub(crate) fn prepare(key: &[u8], encrypt: bool) -> Option<Self> {
         let mode = with_session_view(|view| view.map(|v| v.block_encryption_mode().to_string()))
@@ -17203,8 +17216,16 @@ impl AesEcb {
         }
         AnyAes::new(&mysql_aes_key(key, width)).map(Self)
     }
-    pub(crate) fn run(&self, encrypt: bool, data: &[u8]) -> Option<Vec<u8>> {
-        aes_run(&self.0, AesChainMode::Ecb, encrypt, data, &[0; 16])
+    pub(crate) fn crypt_blocks(&self, encrypt: bool, blocks: &mut [AesBlock]) {
+        use aes::cipher::{BlockDecrypt, BlockEncrypt};
+        match (&self.0, encrypt) {
+            (AnyAes::A128(cipher), true) => cipher.encrypt_blocks(blocks),
+            (AnyAes::A192(cipher), true) => cipher.encrypt_blocks(blocks),
+            (AnyAes::A256(cipher), true) => cipher.encrypt_blocks(blocks),
+            (AnyAes::A128(cipher), false) => cipher.decrypt_blocks(blocks),
+            (AnyAes::A192(cipher), false) => cipher.decrypt_blocks(blocks),
+            (AnyAes::A256(cipher), false) => cipher.decrypt_blocks(blocks),
+        }
     }
 }
 
@@ -17474,7 +17495,31 @@ where
 /// Parsed GTID set: lowercase server-uuid → sorted, merged, non-empty
 /// interval list (1-based inclusive bounds). Pure string/set arithmetic
 /// for `GTID_SUBSET` / `GTID_SUBTRACT` — no replication state involved.
-type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+pub(crate) type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+
+enum GtidArgument {
+    Plain(GtidSet),
+    Cached(std::sync::Arc<crate::engine::func_cache::Governed<GtidSet>>),
+}
+impl std::ops::Deref for GtidArgument {
+    type Target = GtidSet;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Plain(value) => value,
+            Self::Cached(value) => value,
+        }
+    }
+}
+fn parsed_gtid_argument(expr: &Expr, value: &Value) -> Result<GtidArgument, QueryError> {
+    let text = string_value(value);
+    // Variable/high-cardinality expressions keep the original no-cache path.
+    // Literal and bound-parameter operands are stable within one execution.
+    if matches!(expr, Expr::Literal(_) | Expr::Placeholder(_)) {
+        crate::engine::func_cache::cached_gtid_set(&text).map(GtidArgument::Cached)
+    } else {
+        parse_gtid_set_uncached(&text).map(GtidArgument::Plain)
+    }
+}
 
 fn malformed_gtid_set(text: &str) -> QueryError {
     error(
@@ -17483,7 +17528,7 @@ fn malformed_gtid_set(text: &str) -> QueryError {
     )
 }
 
-fn parse_gtid_set(text: &str) -> Result<GtidSet, QueryError> {
+pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError> {
     let mut set = GtidSet::new();
     let trimmed = text.trim();
     if trimmed.is_empty() {

@@ -5812,9 +5812,17 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             // especially booleans versus numeric 1/0, inside its arguments.
             let value_surface = crate::engine::geo::sql::is_geo_function(
                 crate::engine::sys_schema::NormalizedFuncName::new(name).as_str(),
-            ) || ["CHAR", "MAKE_SET", "BENCHMARK", "ELT", "FIELD"]
-                .iter()
-                .any(|n| name.eq_ignore_ascii_case(n));
+            ) || [
+                "CHAR",
+                "MAKE_SET",
+                "BENCHMARK",
+                "ELT",
+                "FIELD",
+                "__IS_TRUE",
+                "__IS_FALSE",
+            ]
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n));
             if value_surface && args.iter().any(|arg| crate::parser::visit::any_expr(arg, |node| {
                 matches!(node, Expr::Function { name, .. } if name.as_bytes().windows(4).any(|part| part.eq_ignore_ascii_case(b"JSON")))
                         || matches!(node, Expr::Function {name,args,..} if name.eq_ignore_ascii_case("CAST") && matches!(args.get(1),Some(Expr::Literal(Literal::String(target))) if target.eq_ignore_ascii_case("JSON")))
@@ -7208,6 +7216,25 @@ impl FunctionKernel {
                     }
                 }
                 Ok(Value::String(output))
+            }
+            FunctionKernel::IsTrue | FunctionKernel::IsFalse => {
+                expect_len(
+                    if matches!(self, FunctionKernel::IsTrue) {
+                        "__IS_TRUE"
+                    } else {
+                        "__IS_FALSE"
+                    },
+                    args,
+                    1,
+                )?;
+                let value = args[0].eval_ref(row, scratch)?;
+                Ok(Value::Int(i64::from(
+                    if matches!(self, FunctionKernel::IsTrue) {
+                        truthy(value.as_value())
+                    } else {
+                        !value.is_null() && !truthy(value.as_value())
+                    },
+                )))
             }
             FunctionKernel::Spatial(spec) => {
                 let values = args

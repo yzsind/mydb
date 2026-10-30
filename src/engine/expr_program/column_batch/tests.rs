@@ -2593,6 +2593,90 @@ fn conditional_and_bit_columns_preserve_null_truth_short_circuit_and_overflow_fa
 }
 
 #[test]
+fn boolean_byte_and_bulk_crypto_columns_match_scalar_truth_and_payloads() {
+    let (_, base) = compile("x", ColumnType::LongLong);
+    let mut other = base.fields()[0].clone();
+    other.name = "y".into();
+    let schema = Arc::new(BatchSchema::new(vec![base.fields()[0].clone(), other]));
+    let values = [Value::Null, Value::Int(-1), Value::Int(0), Value::Int(1)];
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for a in &values {
+        for b in &values {
+            left.push(a.clone());
+            right.push(b.clone());
+        }
+    }
+    for sql in [
+        "x AND y",
+        "x OR y",
+        "x XOR y",
+        "NOT x",
+        "x IS TRUE",
+        "x IS FALSE",
+        "x IS NOT TRUE",
+        "x IS NOT FALSE",
+        "x<=>y",
+        "x IS NULL",
+        "x IS NOT NULL",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(left.clone()),
+                ColumnVector::from_values(right.clone()),
+            ],
+        );
+    }
+    let (_, schema) = compile("x", ColumnType::VarString);
+    for sql in ["ASCII(x)", "ORD(x)"] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("".into()),
+                Value::String("a\0".into()),
+                Value::String("文🙂é".into()),
+                Value::String("🙂".into()),
+            ])],
+        );
+    }
+    let mut field = schema.fields()[0].clone();
+    field.source.collation_id = Some(crate::charset::UTF8MB4_0900_AI_CI_ID);
+    let schema = Arc::new(BatchSchema::new(vec![field]));
+    let values = (0..80)
+        .map(|length| Value::String("x".repeat(length)))
+        .chain(std::iter::once(Value::Null))
+        .collect::<Vec<_>>();
+    for sql in [
+        "HEX(AES_ENCRYPT(x,'key'))",
+        "AES_DECRYPT(AES_ENCRYPT(x,'key'),'key')",
+        "AES_DECRYPT(x,'key')",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::from_values(values.clone())],
+        );
+    }
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    let (program, schema) = compile("SPACE(x%64)", ColumnType::LongLong);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(
+            (0..16384).map(Value::Int).collect(),
+        )],
+    );
+    with_query_budget(Arc::new(MemBudget::new(8 * 1024 * 1024)), || {
+        assert!(program.column_output_bound(&batch).is_some());
+        let output = program.try_eval_column(&batch).unwrap();
+        assert_eq!(output.value_at(63), Value::String(" ".repeat(63)));
+    });
+}
+
+#[test]
 fn regexp_columns_keep_collation_flags_unicode_offsets_occurrences_and_nulls() {
     let (_, schema) = compile("x", ColumnType::VarString);
     for collation in [

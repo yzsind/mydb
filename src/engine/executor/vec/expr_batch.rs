@@ -4725,9 +4725,17 @@ mod tests {
             op: BinaryOp::Or,
             right: Box::new(Expr::Unary {
                 op: UnaryOp::Not,
-                // IS NULL is deliberately not a typed leaf yet, so it proves
-                // that one safe long-tail leaf can fall back locally.
-                expr: Box::new(Expr::IsNull(column())),
+                // Negating a nonnegative string length is safe but still lacks
+                // a column kernel. Preserve local fallback and short circuit
+                // coverage now that IS NULL itself has a typed lane.
+                expr: Box::new(Expr::IsNull(Box::new(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(Expr::Function {
+                        name: "LENGTH".into(),
+                        args: vec![*column()],
+                        distinct: false,
+                    }),
+                }))),
             }),
         };
         let hybrid = BatchExprProgram::compile(&expr, &s)

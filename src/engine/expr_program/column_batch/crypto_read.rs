@@ -87,22 +87,43 @@ impl<'a> CryptoRead<'a> {
             parallel: false,
         }
     }
+    fn output_bytes(&self, batch: &Batch) -> Option<usize> {
+        match &self.input {
+            Input::Column(i) => {
+                let column = batch.columns().get(*i)?;
+                let mut bytes = 0usize;
+                for row in 0..batch.num_rows() {
+                    if column.is_null(row) {
+                        continue;
+                    }
+                    let length = bytes_at(column, row)?.len();
+                    bytes = bytes.checked_add(if self.encrypt {
+                        length.checked_div(16)?.checked_add(1)?.checked_mul(16)?
+                    } else {
+                        length
+                    })?;
+                }
+                Some(bytes)
+            }
+            Input::Child(child) => child.output_bytes(batch)?.checked_add(if self.encrypt {
+                batch.num_rows().checked_mul(16)?
+            } else {
+                0
+            }),
+        }
+    }
     pub(super) fn workspace(&self, batch: &Batch) -> Option<(usize, usize)> {
-        let (source, child) = match &self.input {
-            Input::Column(i) => (batch.columns().get(*i)?.memory_bytes(), 0),
-            Input::Child(child) => child.workspace(batch)?,
+        let bytes = self
+            .output_bytes(batch)?
+            .checked_add(batch.num_rows().checked_add(1)?.checked_mul(8)?)?;
+        let child = match &self.input {
+            Input::Column(_) => 0,
+            Input::Child(child) => child.workspace(batch)?.1,
         };
-        let bytes = source
-            .checked_add(
-                batch
-                    .num_rows()
-                    .checked_mul(if self.encrypt { 24 } else { 8 })?,
-            )?
-            .checked_add(8)?;
         Some((
             bytes,
             child
-                .checked_add(bytes.checked_mul(2)?)?
+                .checked_add(bytes.checked_mul(4)?)?
                 .checked_add(4096)?,
         ))
     }
@@ -119,9 +140,12 @@ impl<'a> CryptoRead<'a> {
             ) {
                 return None;
             }
-            let mut data = Vec::new();
-            let mut offsets = Vec::with_capacity(batch.num_rows() + 1);
-            offsets.push(0);
+            let bound = self.output_bytes(batch)?;
+            let mut blocks = Vec::<crate::engine::expr::AesBlock>::with_capacity(
+                bound.checked_add(15)?.checked_div(16)?,
+            );
+            let mut ends = Vec::with_capacity(batch.num_rows() + 1);
+            ends.push(0usize);
             let mut nulls =
                 validity(&column).unwrap_or_else(|| Bitmap::new_all_valid(batch.num_rows()));
             for row in 0..batch.num_rows() {
@@ -129,9 +153,51 @@ impl<'a> CryptoRead<'a> {
                     crate::engine::cancel::check_cancelled().ok()?;
                 }
                 if !column.is_null(row) {
-                    match cipher.run(self.encrypt, bytes_at(&column, row)?) {
-                        Some(bytes) => data.extend_from_slice(&bytes),
-                        None => nulls.set(row, false),
+                    let bytes = bytes_at(&column, row)?;
+                    if !self.encrypt && (bytes.is_empty() || bytes.len() % 16 != 0) {
+                        nulls.set(row, false);
+                    } else {
+                        let mut chunks = bytes.chunks_exact(16);
+                        for chunk in &mut chunks {
+                            blocks.push(crate::engine::expr::AesBlock::clone_from_slice(chunk));
+                        }
+                        if self.encrypt {
+                            let tail = chunks.remainder();
+                            let mut block = crate::engine::expr::AesBlock::default();
+                            block[..tail.len()].copy_from_slice(tail);
+                            block[tail.len()..].fill((16 - tail.len()) as u8);
+                            blocks.push(block);
+                        }
+                    }
+                }
+                ends.push(blocks.len());
+            }
+            // ECB has no cross-block state; the backend can process its full
+            // parallel block width across row boundaries without changing bytes.
+            cipher.crypt_blocks(self.encrypt, &mut blocks);
+            let mut data = Vec::with_capacity(bound);
+            let mut offsets = Vec::with_capacity(batch.num_rows() + 1);
+            offsets.push(0);
+            for row in 0..batch.num_rows() {
+                if row & 63 == 0 {
+                    crate::engine::cancel::check_cancelled().ok()?;
+                }
+                if nulls.get(row) {
+                    let row_blocks = &blocks[ends[row]..ends[row + 1]];
+                    if self.encrypt {
+                        for block in row_blocks {
+                            data.extend_from_slice(block);
+                        }
+                    } else {
+                        let last = row_blocks.last()?;
+                        if let Some(length) = crate::engine::expr::pkcs7_unpadded_len(last) {
+                            for block in &row_blocks[..row_blocks.len() - 1] {
+                                data.extend_from_slice(block);
+                            }
+                            data.extend_from_slice(&last[..length]);
+                        } else {
+                            nulls.set(row, false);
+                        }
                     }
                 }
                 offsets.push(u32::try_from(data.len()).ok()?);

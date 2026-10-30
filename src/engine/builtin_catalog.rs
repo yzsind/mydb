@@ -288,6 +288,12 @@ scalar_catalog! {
         MakeSet => (true, |_arity| true) {
             [("MAKE_SET", "make_set")] => (RegexOrComplex, VarString, None, false);
         }
+        IsTrue => (true, |_arity| true) {
+            [("__IS_TRUE", "__is_true")] => (Unknown, LongLong, None, false);
+        }
+        IsFalse => (true, |_arity| true) {
+            [("__IS_FALSE", "__is_false")] => (Unknown, LongLong, None, false);
+        }
         Benchmark => (false, |_arity| true) {
             [("BENCHMARK", "benchmark")] => (Volatile, LongLong, None, false);
         }
@@ -538,7 +544,7 @@ scalar_catalog! {
             [("GET_LOCK", "get_lock"), ("RELEASE_LOCK", "release_lock"), ("IS_FREE_LOCK", "is_free_lock"), ("IS_USED_LOCK", "is_used_lock"), ("RELEASE_ALL_LOCKS", "release_all_locks")] => (Volatile, VarString, None, false);
             [("LOAD_FILE", "load_file")] => (Volatile, Blob, None, false);
             [("__MATCH_AGAINST", "__match_against")] => (Unknown, Double, None, false);
-            [("__IS_TRUE", "__is_true"), ("__IS_FALSE", "__is_false"), ("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
+            [("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
             [("SYSDATE", "sysdate")] => (Unknown, DateTime, ( CurrentTemporal, 0, 1, Stable, fixed_temporal_result(DateTime, false)), false);
             [("TIMESTAMP", "timestamp")] => (Unknown, DateTime, ( Temporal, 1, 2, Immutable, fixed_temporal_result(DateTime, true)), false);
             [("CONVERT_TZ", "convert_tz")] => (Unknown, DateTime, ( Temporal, 2, 3, Stable, fixed_temporal_result(DateTime, true)), false);

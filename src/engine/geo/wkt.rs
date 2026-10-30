@@ -304,14 +304,14 @@ fn push_num(out: &mut String, v: f64) {
         // Avoid "-0".
         out.push('0');
     } else {
-        let _ = write!(out,"{v}");
+        let _ = write!(out, "{v}");
     }
 }
 
 fn push_coord(out: &mut String, c: Coord) {
-    push_num(out,c.x);
+    push_num(out, c.x);
     out.push(' ');
-    push_num(out,c.y);
+    push_num(out, c.y);
 }
 
 fn push_seq(out: &mut String, cs: &[Coord]) {

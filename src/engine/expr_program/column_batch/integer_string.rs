@@ -19,6 +19,58 @@ pub(super) struct IntegerString<'a> {
     kind: Kind<'a>,
 }
 impl<'a> IntegerString<'a> {
+    fn space_bytes(&self, batch: &Batch) -> Option<usize> {
+        if !matches!(self.kind, Kind::Space) {
+            return None;
+        }
+        let (input, divisor) = match &self.args[0] {
+            ExprNode::Column(i) => (*i, None),
+            ExprNode::Binary {
+                left,
+                op: BinaryOp::Mod,
+                right,
+                ..
+            } => {
+                let ExprNode::Column(i) = left.as_ref() else {
+                    return None;
+                };
+                (*i, Some(integer(right)?))
+            }
+            ExprNode::Function {
+                kernel: FunctionKernel::Mod,
+                args,
+                ..
+            } if args.len() == 2 => {
+                let ExprNode::Column(i) = args[0] else {
+                    return None;
+                };
+                (i, Some(integer(&args[1])?))
+            }
+            _ => return None,
+        };
+        let column = batch.columns().get(input)?;
+        let mut bytes = 0usize;
+        for row in 0..batch.num_rows() {
+            if column.is_null(row) {
+                continue;
+            }
+            let count = match column {
+                ColumnVector::I64 { data, .. } => {
+                    let n = match divisor {
+                        Some(divisor) => data[row].checked_rem(divisor)?,
+                        None => data[row],
+                    };
+                    usize::try_from(n.max(0)).ok()?
+                }
+                ColumnVector::U64 { data, .. } if divisor.is_none() => {
+                    usize::try_from(data[row].min(i64::MAX as u64)).ok()?
+                }
+                _ => return None,
+            };
+            bytes = bytes.checked_add(count)?;
+        }
+        Some(bytes)
+    }
     pub(super) fn bind(node: &'a ExprNode, schema: &BatchSchema) -> Option<Self> {
         let ExprNode::Function { kernel, args, .. } = node else {
             return None;
@@ -154,7 +206,10 @@ impl<'a> IntegerString<'a> {
                 bytes
             }
         };
-        let payload = rows.checked_mul(width.checked_add(8)?)?.checked_add(8)?;
+        let payload = match self.space_bytes(batch) {
+            Some(bytes) => bytes.checked_add(rows.checked_add(1)?.checked_mul(8)?)?,
+            None => rows.checked_mul(width.checked_add(8)?)?.checked_add(8)?,
+        };
         let mut work = payload.checked_mul(2)?.checked_add(512)?;
         for arg in self.args.iter().take(if matches!(self.kind, Kind::Char) {
             self.args.len()
@@ -208,7 +263,10 @@ impl<'a> IntegerString<'a> {
             _ => Vec::new(),
         };
         let packet = crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes();
-        let mut data = Vec::new();
+        let mut data = match self.space_bytes(batch) {
+            Some(bytes) => Vec::with_capacity(bytes),
+            None => Vec::new(),
+        };
         let mut elt_validity = if matches!(self.kind, Kind::Elt(_)) {
             Some(Bitmap::new_all_valid(batch.num_rows()))
         } else {

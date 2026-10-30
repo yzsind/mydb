@@ -84,7 +84,11 @@ pub(super) enum Unary<'a> {
     Trim(Text<'a>, bool, bool),
 }
 pub(super) enum StringRead<'a> {
-    ByteNumber { input: &'a ExprNode, binary: bool, ordinal: bool },
+    ByteNumber {
+        input: &'a ExprNode,
+        binary: bool,
+        ordinal: bool,
+    },
     ParseDate {
         input: &'a ExprNode,
         format: Text<'a>,
@@ -342,9 +346,13 @@ impl<'a> StringRead<'a> {
         else {
             return None;
         };
-        if matches!(kernel,FunctionKernel::Ascii|FunctionKernel::Ord) && args.len()==1 {
-            let domain=input_domain(&args[0],schema)?;
-            return Some(Self::ByteNumber {input:&args[0],binary:matches!(domain,Domain::Binary),ordinal:matches!(kernel,FunctionKernel::Ord)});
+        if matches!(kernel, FunctionKernel::Ascii | FunctionKernel::Ord) && args.len() == 1 {
+            let domain = input_domain(&args[0], schema)?;
+            return Some(Self::ByteNumber {
+                input: &args[0],
+                binary: matches!(domain, Domain::Binary),
+                ordinal: matches!(kernel, FunctionKernel::Ord),
+            });
         }
         if matches!(kernel, FunctionKernel::LegacyDeterministic("STR_TO_DATE"))
             && args.len() == 2
@@ -534,7 +542,9 @@ impl<'a> StringRead<'a> {
         Contract {
             domain: match self {
                 Self::ParseDate { .. } => Domain::Temporal,
-                Self::FindSet { .. } | Self::ByteLength { .. } | Self::ByteNumber {..} => Domain::Integer(0, i64::MAX),
+                Self::FindSet { .. } | Self::ByteLength { .. } | Self::ByteNumber { .. } => {
+                    Domain::Integer(0, i64::MAX)
+                }
                 Self::Strcmp { .. } => Domain::Integer(-1, 1),
                 Self::Weights { .. } => Domain::Binary,
                 Self::Compare { .. } => Domain::Integer(0, 1),
@@ -581,7 +591,9 @@ impl<'a> StringRead<'a> {
                     child.checked_add(bytes.checked_mul(2)?)?.checked_add(512)?,
                 ))
             }
-            Self::FindSet { input, .. } | Self::ByteLength { input, .. } | Self::ByteNumber {input,..} => {
+            Self::FindSet { input, .. }
+            | Self::ByteLength { input, .. }
+            | Self::ByteNumber { input, .. } => {
                 let (_, child) = super::workspace(input, batch)?;
                 let bytes = rows.checked_mul(16)?;
                 Some((
@@ -705,20 +717,44 @@ impl<'a> StringRead<'a> {
     }
     pub(super) fn evaluate(&self, batch: &Batch) -> Option<ColumnVector> {
         match self {
-            Self::ByteNumber {input,binary,ordinal}=>{
-                let column=operand(input,batch)?;
-                if !matches!((*binary,column.as_ref()),(false,ColumnVector::Utf8{..})|(true,ColumnVector::Bytes{..})|(_,ColumnVector::Null{..})){return None;}
-                let mut data=Vec::with_capacity(batch.num_rows());
-                for row in 0..batch.num_rows(){
-                    if row&63==0{crate::engine::cancel::check_cancelled().ok()?;}
-                    if column.is_null(row){data.push(0);continue;}
-                    let bytes=bytes_at(&column,row)?;
-                    let take=if !*ordinal||*binary||bytes.first().is_none_or(u8::is_ascii){1.min(bytes.len())}
-                        else{std::str::from_utf8(bytes).ok()?.chars().next()?.len_utf8()};
-                    let value=bytes[..take].iter().fold(0i64,|n,b|(n<<8)|i64::from(*b));
+            Self::ByteNumber {
+                input,
+                binary,
+                ordinal,
+            } => {
+                let column = operand(input, batch)?;
+                if !matches!(
+                    (*binary, column.as_ref()),
+                    (false, ColumnVector::Utf8 { .. })
+                        | (true, ColumnVector::Bytes { .. })
+                        | (_, ColumnVector::Null { .. })
+                ) {
+                    return None;
+                }
+                let mut data = Vec::with_capacity(batch.num_rows());
+                for row in 0..batch.num_rows() {
+                    if row & 63 == 0 {
+                        crate::engine::cancel::check_cancelled().ok()?;
+                    }
+                    if column.is_null(row) {
+                        data.push(0);
+                        continue;
+                    }
+                    let bytes = bytes_at(&column, row)?;
+                    let take = if !*ordinal || *binary || bytes.first().is_none_or(u8::is_ascii) {
+                        1.min(bytes.len())
+                    } else {
+                        std::str::from_utf8(bytes).ok()?.chars().next()?.len_utf8()
+                    };
+                    let value = bytes[..take]
+                        .iter()
+                        .fold(0i64, |n, b| (n << 8) | i64::from(*b));
                     data.push(value);
                 }
-                Some(ColumnVector::I64{data,nulls:validity(&column)})
+                Some(ColumnVector::I64 {
+                    data,
+                    nulls: validity(&column),
+                })
             }
             Self::ParseDate { input, format } => format.with(|format| {
                 let column = operand(input, batch)?;

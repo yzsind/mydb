@@ -1,5 +1,6 @@
 //! Composable, diagnostic-free column kernels. A decline is side-effect free:
 //! the caller retains the ordered scalar oracle for the complete expression.
+mod boolean_read;
 mod conditional;
 mod crypto_read;
 mod format_read;
@@ -23,6 +24,7 @@ use crate::engine::executor::vec::{
 };
 use crate::engine::expr::date_format::DateFormatPlan;
 use crate::engine::expr::network::{self, NetworkFunction};
+use boolean_read::BooleanRead;
 use chrono::{Datelike, NaiveDate};
 use conditional::Conditional;
 use crypto_read::CryptoRead;
@@ -249,6 +251,9 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
     if let Some(read) = FormatRead::bind(node, schema) {
         return Some(read.contract());
     }
+    if let Some(read) = BooleanRead::bind(node, schema) {
+        return Some(read.contract());
+    }
     if let Some(read) = Conditional::bind(node, schema) {
         return Some(read.contract());
     }
@@ -363,7 +368,7 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                     } else {
                         Domain::Unsigned
                     },
-                    parallel: false,
+                    parallel: comparison(*op) && l.parallel && r.parallel,
                 });
             };
             if comparison(*op) {
@@ -703,6 +708,9 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
         return read.workspace(batch);
     }
     if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = BooleanRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
     if let Some(read) = Conditional::bind(node, batch.schema()) {
@@ -1134,6 +1142,9 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
         return read.evaluate(batch);
     }
     if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = BooleanRead::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }
     if let Some(read) = Conditional::bind(node, batch.schema()) {
