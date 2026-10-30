@@ -242,11 +242,8 @@ struct ObjectLockState {
     waiting: Vec<MdlTicket>,
 }
 
-#[derive(Debug, Default)]
-struct MdlState {
-    next_ticket_id: u64,
-    objects: MdlObjectMap,
-}
+mod state;
+use state::{next_mdl_ticket_id, MdlState, MdlStateLatch};
 
 /// Per-object counters for compatible statement-duration shared grants.
 ///
@@ -380,15 +377,21 @@ fn count_fast_blockers(object: &ObjectLockState) -> u64 {
 
 type FastSlotMap = hashbrown::HashMap<MdlObjectKey, Arc<MdlFastSlot>, ahash::RandomState>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MdlManager {
     identity: Arc<()>,
-    state: parking_lot::Mutex<MdlState>,
+    state: MdlStateLatch,
     /// Persistent per-object fast-path slots. Entries are never removed
     /// (bounded by the number of distinct MDL objects ever touched), so
     /// a slot Arc cached by a reader can never go stale against a
     /// recreated object entry in `state.objects`.
     fast: parking_lot::RwLock<FastSlotMap>,
+}
+
+impl Default for MdlManager {
+    fn default() -> Self {
+        Self::try_new().expect("metadata lock manager memory admission")
+    }
 }
 
 #[derive(Debug)]
@@ -445,6 +448,16 @@ impl MdlFastCache {
 }
 
 impl MdlManager {
+    /// Database startup propagates memory admission errors before accepting
+    /// sessions. Optional owner routing has its own fallible cache budget.
+    pub(crate) fn try_new() -> Result<Self, QueryError> {
+        Ok(Self {
+            identity: Arc::new(()),
+            state: MdlStateLatch::try_new()?,
+            fast: Default::default(),
+        })
+    }
+
     /// Lock-free acquisition of a single statement-duration SHARED_READ
     /// metadata lock. Returns `None` (caller falls back to the ticketed
     /// slow path) whenever the request shape is not the hot one or any
@@ -568,7 +581,7 @@ impl MdlManager {
         });
         requests.dedup_by(|a, b| a.key == b.key && a.lock_type == b.lock_type);
 
-        let mut state = self.state.lock();
+        let batch = self.state.owner_requests(owner_id, &requests);
         let mut created_grants = Vec::new();
         let mut promoted_grants = Vec::new();
         // Keys of read-blocking tickets granted in this batch: the abort
@@ -577,6 +590,7 @@ impl MdlManager {
         // read-blocking grants are DDL-rare.
         let mut created_blocker_keys: Vec<MdlObjectKey> = Vec::new();
         for request in requests {
+            let mut state = batch.lock_key(&request.key);
             let blocker_key = blocks_fast_grants(request.lock_type).then(|| request.key.clone());
             match self.acquire_one(
                 &mut state,
@@ -600,12 +614,15 @@ impl MdlManager {
                 }
                 AcquireOne::AlreadyHeld => {}
                 AcquireOne::Pending => {
+                    drop(state);
+                    let mut state = batch.into_state();
                     remove_granted_tickets(&mut state, owner_id, &created_grants);
                     for previous in promoted_grants.into_iter().rev() {
                         restore_granted_ticket(&mut state, *previous);
                     }
                     self.refresh_fast_blockers_for_keys(&state, &created_blocker_keys);
-                    return self.pending_or_deadlock(&mut state, owner_id);
+                    drop(state);
+                    return self.pending_or_deadlock(&mut self.state.lock(), owner_id);
                 }
             }
         }
@@ -629,7 +646,7 @@ impl MdlManager {
                 source,
             );
         }
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_requests(owner_id, &requests);
         match self.acquire_one(
             &mut state,
             owner_id,
@@ -639,18 +656,22 @@ impl MdlManager {
             source,
         ) {
             AcquireOne::Granted(_) | AcquireOne::AlreadyHeld | AcquireOne::Promoted(_) => Ok(()),
-            AcquireOne::Pending => self.pending_or_deadlock(&mut state, owner_id),
+            AcquireOne::Pending => {
+                drop(state);
+                self.pending_or_deadlock(&mut self.state.lock(), owner_id)
+            }
         }
     }
 
     pub fn release_explicit_table_locks(&self, owner_id: u64) -> bool {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_owner(owner_id);
         let (released, changed) = release_where(&mut state, |ticket| {
             ticket.owner_id == owner_id
                 && ticket.duration == MdlDuration::Explicit
                 && ticket.key.object_type != MdlObjectType::Global
         });
         self.refresh_fast_blockers_for_keys(&state, &changed);
+        state.forget_if_empty(owner_id);
         released
     }
 
@@ -763,11 +784,12 @@ impl MdlManager {
     }
 
     pub fn release_duration(&self, owner_id: u64, duration: MdlDuration) -> bool {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_owner(owner_id);
         let (released, changed_blockers) = release_where(&mut state, |ticket| {
             ticket.owner_id == owner_id && ticket.duration == duration
         });
         self.refresh_fast_blockers_for_keys(&state, &changed_blockers);
+        state.forget_if_empty(owner_id);
         released
     }
 
@@ -780,7 +802,7 @@ impl MdlManager {
         // Cached recipes enumerate every object acquired by this statement.
         // Global write protection makes even a point UPDATE a two-object
         // recipe; releasing it must not scan every table in the database.
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_owner(owner_id);
         let mut released = false;
         for request in requests {
             let key = &request.key;
@@ -807,14 +829,16 @@ impl MdlManager {
                 self.refresh_fast_blockers(key, state.objects.get(key));
             }
         }
+        state.forget_if_empty(owner_id);
         released
     }
 
     pub fn release_owner(&self, owner_id: u64) -> bool {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_owner(owner_id);
         let (released, changed_blockers) =
             release_where(&mut state, |ticket| ticket.owner_id == owner_id);
         self.refresh_fast_blockers_for_keys(&state, &changed_blockers);
+        state.forget_if_empty(owner_id);
         released
     }
 
@@ -839,8 +863,7 @@ impl MdlManager {
         }
         drop(fast);
         for (key, lock_type) in keys {
-            state.next_ticket_id = state.next_ticket_id.saturating_add(1);
-            let id = state.next_ticket_id;
+            let id = next_mdl_ticket_id(state.next_ticket_id);
             state
                 .objects
                 .entry(key.clone())
@@ -858,6 +881,7 @@ impl MdlManager {
                     granted_unix_ms: coarse_unix_ms(),
                 });
         }
+        state.rebuild_owners();
         true
     }
 
@@ -874,8 +898,7 @@ impl MdlManager {
             .collect::<Vec<_>>();
         let retained = !copies.is_empty();
         for mut ticket in copies {
-            state.next_ticket_id = state.next_ticket_id.saturating_add(1);
-            ticket.id = state.next_ticket_id;
+            ticket.id = next_mdl_ticket_id(state.next_ticket_id);
             ticket.owner_id = cursor_owner;
             ticket.duration = MdlDuration::Statement;
             ticket.lock_type = if ticket.lock_type == MdlLockType::IntentionExclusive {
@@ -891,6 +914,7 @@ impl MdlManager {
                 .granted
                 .push(ticket);
         }
+        state.rebuild_owners();
         retained
     }
 
@@ -921,6 +945,7 @@ impl MdlManager {
                 transferred = true;
             }
         }
+        state.rebuild_owners();
         transferred
     }
 
@@ -939,6 +964,7 @@ impl MdlManager {
                 ticket.owner_id = prepared;
             }
         }
+        state.rebuild_owners();
     }
 
     /// Long-lived transactions and explicit locks cannot be drained by fencing
@@ -950,21 +976,26 @@ impl MdlManager {
         owner_id: u64,
         requested: MdlLockType,
     ) -> bool {
-        self.state.lock().objects.get(key).is_some_and(|object| {
-            object.granted.iter().any(|ticket| {
-                ticket.owner_id != owner_id
-                    && ticket.duration != MdlDuration::Statement
-                    && !compatible(ticket.lock_type, requested)
+        self.state
+            .lock_key(key)
+            .objects
+            .get(key)
+            .is_some_and(|object| {
+                object.granted.iter().any(|ticket| {
+                    ticket.owner_id != owner_id
+                        && ticket.duration != MdlDuration::Statement
+                        && !compatible(ticket.lock_type, requested)
+                })
             })
-        })
     }
 
     pub fn clear_pending_for_owner(&self, owner_id: u64) -> bool {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_owner(owner_id);
         let (released, changed_blockers) = release_where(&mut state, |ticket| {
             ticket.owner_id == owner_id && ticket.status == MdlStatus::Pending
         });
         self.refresh_fast_blockers_for_keys(&state, &changed_blockers);
+        state.forget_if_empty(owner_id);
         released
     }
 
@@ -1025,7 +1056,7 @@ impl MdlManager {
     }
 
     pub fn prepared_entries_for_owner(&self, owner_id: u64) -> Vec<PreparedMdlEntry> {
-        let state = self.state.lock();
+        let state = self.state.lock_owner(owner_id);
         let mut entries = Vec::new();
         for object in state.objects.values() {
             for ticket in &object.granted {
@@ -1071,8 +1102,7 @@ impl MdlManager {
             {
                 continue;
             }
-            state.next_ticket_id = state.next_ticket_id.saturating_add(1);
-            let id = state.next_ticket_id;
+            let id = next_mdl_ticket_id(state.next_ticket_id);
             state
                 .objects
                 .entry(key.clone())
@@ -1094,6 +1124,7 @@ impl MdlManager {
             }
             installed = true;
         }
+        state.rebuild_owners();
         installed
     }
 }
@@ -1236,8 +1267,7 @@ fn acquire_one_ticketed(
     if fast_slot.is_none_or(|slot| slot.compatible_with(request.lock_type))
         && can_grant_new(object, owner_id, request.lock_type)
     {
-        state.next_ticket_id = state.next_ticket_id.saturating_add(1);
-        let id = state.next_ticket_id;
+        let id = next_mdl_ticket_id(state.next_ticket_id);
         object.granted.push(MdlTicket {
             id,
             owner_id,
@@ -1252,9 +1282,9 @@ fn acquire_one_ticketed(
         return AcquireOne::Granted(id);
     }
 
-    state.next_ticket_id = state.next_ticket_id.saturating_add(1);
+    let id = next_mdl_ticket_id(state.next_ticket_id);
     object.waiting.push(MdlTicket {
-        id: state.next_ticket_id,
+        id,
         owner_id,
         owner_thread_id,
         key: request.key,

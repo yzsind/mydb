@@ -656,6 +656,14 @@ impl Database {
         crate::engine::executor::mem_budget::set_controlled_buffer_limit_pages(
             runtime_config.buffer_pool_pages,
         );
+        let undo_append_shards = undo.concurrent_persistent_append_shards();
+        let undo_resident_admission = undo.resident_admission();
+        let undo_concurrent_append_eligible =
+            undo.concurrent_persistent_append_eligibility_handle();
+        // Admit fixed metadata before starting background workers, so an OOM
+        // during startup cannot leave an unattached worker pool running.
+        let undo = UndoLatch::new(undo)?;
+        let mdl = MdlManager::try_new()?;
         let buffer_pool = BufferPool::new_with_options(
             runtime_config.buffer_pool_pages,
             log.clone(),
@@ -676,10 +684,6 @@ impl Database {
             } else {
                 DurabilityWorker::disabled()
             };
-        let undo_append_shards = undo.concurrent_persistent_append_shards();
-        let undo_resident_admission = undo.resident_admission();
-        let undo_concurrent_append_eligible =
-            undo.concurrent_persistent_append_eligibility_handle();
         let source_clock = log.lock().source_clock();
         source_clock.fetch_max(commit_hlc_seed, Ordering::Release);
         let mut db = Self {
@@ -719,8 +723,8 @@ impl Database {
             unique_reservations: lock_manager.unique_reservation_filter(),
             lock_log_presence: lock_manager.lock_log_presence(),
             lock_manager: parking_lot::RwLock::new(lock_manager),
-            mdl: MdlManager::default(),
-            undo: UndoLatch::new(undo)?,
+            mdl,
+            undo,
             undo_append_shards,
             undo_resident_admission,
             undo_append_next_shard: AtomicU64::new(0),
