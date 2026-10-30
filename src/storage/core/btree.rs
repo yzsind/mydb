@@ -4404,22 +4404,33 @@ impl IndexFile {
     fn apply_batch_with_lsn(
         &self,
         txn_id: u64,
-        mut entries: Vec<IndexBatchEntry>,
+        entries: Vec<IndexBatchEntry>,
         lsn: Option<u64>,
     ) -> Result<(), QueryError> {
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(lsn);
-        // A single logged DELETE needs no batch topology reservation. Share
-        // the point-delete path and retain its terminal pin/native image.
-        if lsn.is_some() && entries.len() == 1 && entries[0].kind == WalIndexOpKind::Delete {
-            let entry = entries.pop().expect("single delete");
-            let result = self.delete_entry_concurrent(
-                txn_id,
-                IndexEntry {
-                    key: entry.key,
-                    row_id: entry.row_id,
-                },
-            );
+        // Logged deletions share the point-delete oracle: fitting leaves need
+        // only their leaf latch and a shared topology guard. Underflow still
+        // takes the exclusive structural fallback for that entry. Keep the
+        // batch mutation epoch open across entries for range-cursor repair.
+        if lsn.is_some()
+            && entries
+                .iter()
+                .all(|entry| entry.kind == WalIndexOpKind::Delete)
+        {
+            let result = (|| {
+                let _mutation = (entries.len() > 1).then(|| self.begin_mutation());
+                for entry in entries {
+                    self.delete_entry_concurrent(
+                        txn_id,
+                        IndexEntry {
+                            key: entry.key,
+                            row_id: entry.row_id,
+                        },
+                    )?;
+                }
+                Ok(())
+            })();
             btree_logical_wal::set(previous_lsn);
             return result;
         }
@@ -18476,6 +18487,139 @@ enum ReverseLeafSpan {
     /// `stop`; `terminal` means the low bound cuts inside this leaf
     /// and the scan finishes there.
     Span { stop: usize, terminal: bool },
+}
+
+#[cfg(test)]
+mod logged_delete_batch_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Arc<IndexFile>) {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            crate::wal::LogManager::open(&dir.path().join("wal")).unwrap(),
+        ));
+        let pool = BufferPool::new(
+            256,
+            log.clone(),
+            DurabilityMode::Strict,
+            Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+        );
+        let file = Arc::new(
+            IndexFile::open_with_durability(
+                dir.path().join("delete.idx"),
+                log,
+                DurabilityMode::Strict,
+                pool,
+            )
+            .unwrap(),
+        );
+        (dir, file)
+    }
+
+    #[test]
+    fn logged_delete_batch_can_share_unchanged_topology() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..100u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(i64::from(n))]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let deletes = [10usize, 70].map(|n| IndexBatchEntry {
+            kind: WalIndexOpKind::Delete,
+            key: entries[n].key.clone(),
+            row_id: entries[n].row_id,
+        });
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &deletes)
+            .unwrap()
+            .unwrap();
+        let topology = file.structure_lock.read();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_file = Arc::clone(&file);
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_file.apply_batch_with_lsn(7, deletes.into(), Some(lsn)))
+                .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_millis(200));
+        drop(topology);
+        worker.join().unwrap();
+        result
+            .expect("leaf-only deletion must not wait for a topology reader")
+            .unwrap();
+        for (n, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                file.get_unique_one(&entry.key).unwrap(),
+                (![10, 70].contains(&n)).then_some(entry.row_id)
+            );
+        }
+    }
+
+    #[test]
+    fn logged_delete_batch_preserves_composite_keys_through_merges_and_root_collapse() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..1000u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![
+                    KeyPart::Int(i64::from(n)),
+                    KeyPart::Null,
+                    KeyPart::Bytes(vec![n as u8; 20 + usize::from(n % 130)]),
+                ]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        assert_ne!(
+            file.root_page.load(Ordering::Acquire),
+            file.leftmost_leaf().unwrap()
+        );
+        let delete = |entry: &IndexEntry| IndexBatchEntry {
+            kind: WalIndexOpKind::Delete,
+            key: entry.key.clone(),
+            row_id: entry.row_id,
+        };
+        let mut deletes: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| n % 137 != 0)
+            .map(|(_, entry)| delete(entry))
+            .collect();
+        // Reapplying an already-deleted entry must remain idempotent after
+        // neighboring leaves have merged and their old route has disappeared.
+        deletes.push(delete(&entries[1]));
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &deletes)
+            .unwrap()
+            .unwrap();
+        file.apply_batch_with_lsn(7, deletes, Some(lsn)).unwrap();
+        let survivors: Vec<_> = entries.iter().step_by(137).collect();
+        assert_eq!(
+            file.range(None, None, false).unwrap(),
+            survivors
+                .iter()
+                .map(|entry| entry.row_id)
+                .collect::<Vec<_>>()
+        );
+        let deletes: Vec<_> = survivors.into_iter().map(delete).collect();
+        let lsn = file
+            .append_mixed_index_batch_wal(8, &deletes)
+            .unwrap()
+            .unwrap();
+        file.apply_batch_with_lsn(8, deletes, Some(lsn)).unwrap();
+        assert!(file.range(None, None, false).unwrap().is_empty());
+        assert_eq!(file.active_mutations.load(Ordering::Acquire), 0);
+        assert_eq!(btree_logical_wal::current(), None);
+    }
 }
 
 #[cfg(test)]
