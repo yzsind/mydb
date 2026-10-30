@@ -586,6 +586,7 @@ impl BufferPool {
                     .min(100),
             ),
             used_pages: CachePadded::new(AtomicU64::new(0)),
+            deferred_wal_pages: CachePadded::new(AtomicU64::new(0)),
             evictions: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
             write_requests: AtomicU64::new(0),

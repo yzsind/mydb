@@ -4716,6 +4716,52 @@ impl HeapFile {
             }
         }
         let retained_fallback = !inserts.is_empty();
+        // Resident ordinary inserts need neither an immediate WAL latch nor
+        // direct file writes. Pin every target before queueing redo, and keep
+        // the transaction-buffer latch through the image stores so a parallel
+        // transaction worker cannot finalize their pins before publication.
+        // Fresh/direct reduced-redo extents retain their data-before-commit
+        // path; a missing resident frame retains the eager append oracle.
+        if self.durability() != DurabilityMode::Memory
+            && retained_fallback
+            && !direct_fresh_append
+            && fresh_extent.is_none()
+            && txn_wal_buffering_active(&self.log, txn_id)
+        {
+            let keys = pages.keys().map(|id| self.page_key(*id)).collect();
+            let payload = WalPayload::HeapInsertBatch {
+                path: self.relative_path(),
+                inserts,
+            };
+            let write = |lsn| -> Result<(), QueryError> {
+                for (page_id, mut page) in pages {
+                    if lsn != 0 {
+                        page.set_lsn(lsn);
+                    }
+                    self.buffer_pool.store_page_cold(
+                        self.page_key(page_id),
+                        page.encode_into_owned(),
+                        lsn,
+                    )?;
+                }
+                Ok(())
+            };
+            return match try_buffer_txn_page_write(
+                &self.log,
+                &self.buffer_pool,
+                txn_id,
+                payload,
+                keys,
+                write,
+            ) {
+                Ok(result) => result,
+                Err((payload, write)) => {
+                    let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
+                    let lsn = self.log.lock().append_pre_encoded(pre)?;
+                    write(lsn)
+                }
+            };
+        }
         let logged_lsn = if self.durability() == DurabilityMode::Memory {
             0
         } else if inserts.is_empty() {
@@ -4923,31 +4969,43 @@ impl HeapFile {
         };
         let mut scratch = (plan == HeapUpdatePlan::Compact).then(|| vec![0_u8; PAGE_SIZE]);
         self.maybe_emit_heap_fpi(row_id.page_id)?;
-        let lsn = if self.durability() == DurabilityMode::Memory {
-            0
-        } else {
-            let pre = crate::wal::LogManager::pre_encode_record(
-                txn_id,
-                WalPayload::HeapUpdate {
-                    path: self.relative_path(),
-                    page_id: row_id.page_id,
-                    slot_id: row_id.slot_id,
-                    before,
-                    after: payload.clone(),
-                    undo_lsn,
-                },
-            )?;
-            self.log.lock().append_pre_encoded(pre)?
+        let mut write = |lsn| {
+            self.buffer_pool
+                .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
+                    HeapPageMut::new(bytes)?.update(
+                        row_id.slot_id,
+                        &payload,
+                        plan,
+                        scratch.as_deref_mut(),
+                    )
+                })
         };
-        self.buffer_pool
-            .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
-                HeapPageMut::new(bytes)?.update(
-                    row_id.slot_id,
-                    &payload,
-                    plan,
-                    scratch.as_deref_mut(),
-                )
-            })
+        if self.durability() == DurabilityMode::Memory {
+            return write(0);
+        }
+        let redo = WalPayload::HeapUpdate {
+            path: self.relative_path(),
+            page_id: row_id.page_id,
+            slot_id: row_id.slot_id,
+            before,
+            after: payload.clone(),
+            undo_lsn,
+        };
+        match try_buffer_txn_page_write(
+            &self.log,
+            &self.buffer_pool,
+            txn_id,
+            redo,
+            vec![self.page_key(row_id.page_id as u64)],
+            write,
+        ) {
+            Ok(result) => result,
+            Err((redo, mut write)) => {
+                let pre = crate::wal::LogManager::pre_encode_record(txn_id, redo)?;
+                let lsn = self.log.lock().append_pre_encoded(pre)?;
+                write(lsn)
+            }
+        }
     }
 
     fn write_heap_delete_logged(
@@ -4993,28 +5051,37 @@ impl HeapFile {
         undo_lsn: Option<u64>,
     ) -> Result<(), QueryError> {
         self.maybe_emit_heap_fpi(row_id.page_id)?;
-        let lsn = if self.durability() == DurabilityMode::Memory {
-            0
-        } else {
-            let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
-            log.append_reserved(
-                lsn,
-                txn_id,
-                WalPayload::HeapDelete {
-                    path: self.relative_path(),
-                    page_id: row_id.page_id,
-                    slot_id: row_id.slot_id,
-                    before,
-                    undo_lsn,
-                },
-            )?;
-            lsn
+        let write = |lsn| {
+            self.buffer_pool
+                .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
+                    HeapPageMut::new(bytes)?.delete(row_id.slot_id)
+                })
         };
-        self.buffer_pool
-            .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
-                HeapPageMut::new(bytes)?.delete(row_id.slot_id)
-            })
+        if self.durability() == DurabilityMode::Memory {
+            return write(0);
+        }
+        let redo = WalPayload::HeapDelete {
+            path: self.relative_path(),
+            page_id: row_id.page_id,
+            slot_id: row_id.slot_id,
+            before,
+            undo_lsn,
+        };
+        match try_buffer_txn_page_write(
+            &self.log,
+            &self.buffer_pool,
+            txn_id,
+            redo,
+            vec![self.page_key(row_id.page_id as u64)],
+            write,
+        ) {
+            Ok(result) => result,
+            Err((redo, write)) => {
+                let pre = crate::wal::LogManager::pre_encode_record(txn_id, redo)?;
+                let lsn = self.log.lock().append_pre_encoded(pre)?;
+                write(lsn)
+            }
+        }
     }
 
     /// rowid-6bytes M2: flip an MVCC-tombstoned slot to `ROW_FLAG_FREE`

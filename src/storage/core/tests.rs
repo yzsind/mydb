@@ -28301,3 +28301,188 @@ fn release_format_column_and_layout_limits_preserve_existing_identity() {
     assert_eq!(table.active_layout_id, u32::MAX);
     assert_eq!(table.row_layouts.len(), 1);
 }
+
+#[test]
+fn buffered_resident_heap_and_index_inserts_recover_and_rollback_together() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+        db.create_table(
+            "buffered_insert",
+            vec![
+                concurrent_index_test_column("id", true),
+                concurrent_index_test_column("v", false),
+            ],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let seed = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            seed,
+            "test.buffered_insert",
+            vec![vec![Value::Int(1), Value::Int(10)]],
+        )
+        .unwrap();
+        db.commit_txn(seed.txn_id).unwrap();
+        let committed = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            committed,
+            "test.buffered_insert",
+            vec![
+                vec![Value::Int(2), Value::Int(20)],
+                vec![Value::Int(3), Value::Int(30)],
+            ],
+        )
+        .unwrap();
+        {
+            let key = txn_wal_buffer_key(&db.log, committed.txn_id);
+            let shard = txn_wal_buffer_shard(key).lock();
+            let buffer = shard.get(&key).unwrap();
+            assert!(
+                buffer
+                    .entries
+                    .iter()
+                    .any(|(record, _)| matches!(record, WalPayload::HeapInsertBatch { .. })),
+                "resident heap insert must participate in the same deferred durability barrier"
+            );
+            assert!(
+                buffer
+                    .entries
+                    .iter()
+                    .any(|(record, _)| matches!(record, WalPayload::IndexBatch { .. })),
+                "fitting leaf inserts must retain their WAL-before-data pins until append"
+            );
+        }
+        db.commit_txn(committed.txn_id).unwrap();
+        let aborted = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            aborted,
+            "test.buffered_insert",
+            vec![vec![Value::Int(4), Value::Int(40)]],
+        )
+        .unwrap();
+        db.rollback_txn(aborted.txn_id).unwrap();
+        db.check_consistency().unwrap();
+        db.buffer_pool.shutdown_flusher();
+        // Plain Database drop simulates a crash rather than a checkpoint.
+    }
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let mut rows = db
+        .scan_rows(
+            "test.buffered_insert",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    rows.sort_by_key(|row| match row.values[0] {
+        Value::Int(id) => id,
+        _ => unreachable!(),
+    });
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+        ]
+    );
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn buffered_page_publication_fences_a_concurrent_wal_drain() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    db.create_table(
+        "publish_fence",
+        vec![concurrent_index_test_column("id", true)],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(seed, "test.publish_fence", vec![vec![Value::Int(1)]])
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let table = db.table("test.publish_fence").unwrap();
+    let (key, path) = {
+        let handle = db.heap_handle(table.id).unwrap();
+        let heap = handle.read();
+        (
+            heap.page_key(u64::from(ids[0].page_id)),
+            heap.relative_path(),
+        )
+    };
+    let txn = db.begin_dml_txn().unwrap();
+    let (entered, enter_wait) = std::sync::mpsc::channel();
+    let (resume, resume_wait) = std::sync::mpsc::channel();
+    let published = Arc::new(AtomicBool::new(false));
+    let writer_db = Arc::clone(&db);
+    let writer_published = Arc::clone(&published);
+    let writer = std::thread::spawn(move || {
+        let image_key = key.clone();
+        let result = try_buffer_txn_page_write(
+            &writer_db.log,
+            &writer_db.buffer_pool,
+            txn.txn_id,
+            WalPayload::HeapUpdateLogical {
+                path,
+                page_id: ids[0].page_id,
+                slot_id: ids[0].slot_id,
+                patches: Vec::new(),
+                undo_lsn: None,
+            },
+            vec![key],
+            |lsn| {
+                entered.send(()).unwrap();
+                resume_wait.recv().unwrap();
+                writer_db
+                    .buffer_pool
+                    .with_raw_page_mut(image_key, lsn, |_| Ok(()))?;
+                writer_published.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Ok(Ok(()))));
+    });
+    enter_wait.recv().unwrap();
+    let buffer_key = txn_wal_buffer_key(&db.log, txn.txn_id);
+    let fenced = txn_wal_buffer_shard(buffer_key).try_lock().is_none();
+    let drainer_db = Arc::clone(&db);
+    let drainer = std::thread::spawn(move || {
+        drainer_db.flush_txn_wal_buffer(txn.txn_id, None).unwrap();
+        assert!(
+            published.load(Ordering::Acquire),
+            "WAL drain finalized a page before publication"
+        );
+    });
+    resume.send(()).unwrap();
+    writer.join().unwrap();
+    drainer.join().unwrap();
+    assert!(
+        fenced,
+        "parallel WAL drain was not fenced during page publication"
+    );
+    assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 0);
+    db.commit_txn(txn.txn_id).unwrap();
+}
+
+#[test]
+fn deferred_wal_page_budget_releases_headroom_for_eager_progress() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let limit = db.buffer_pool.capacity_pages() / 8;
+    let reservation = db
+        .buffer_pool
+        .reserve_deferred_wal_pages(limit as usize)
+        .unwrap();
+    assert!(db.buffer_pool.reserve_deferred_wal_pages(1).is_none());
+    drop(reservation);
+    let replacement = db.buffer_pool.reserve_deferred_wal_pages(1).unwrap();
+    assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 1);
+    drop(replacement);
+    assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 0);
+}

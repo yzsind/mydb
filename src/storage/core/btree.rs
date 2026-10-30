@@ -3720,16 +3720,19 @@ impl IndexFile {
             );
         }
         let entry = IndexEntry { key, row_id };
-        // Always log via the compact logical `IndexBatch` record (one
-        // op, ~24 bytes) and set `logical_wal_lsn` so the downstream
-        // `write_page` calls skip emitting full 32 KB before/after page
-        // images. Recovery already replays IndexBatch via
-        // `redo_index_batch` (which calls `insert_internal` again),
-        // so durability is identical to the old Strict physical path
-        // — only the WAL bytes shrink by ~1000× per index op.
-        self.apply_single_index_op_logged(txn_id, WalIndexOpKind::Insert, entry, |index, entry| {
-            index.insert_entry_concurrent(txn_id, entry)
-        })
+        match self.try_insert_entries_buffered(txn_id, std::slice::from_ref(&entry))? {
+            Some(None) => Ok(()),
+            Some(Some(lsn)) => {
+                let _logical = btree_logical_wal::LsnScope::new(Some(lsn));
+                self.insert_entry_concurrent(txn_id, entry)
+            }
+            None => self.apply_single_index_op_logged(
+                txn_id,
+                WalIndexOpKind::Insert,
+                entry,
+                |index, entry| index.insert_entry_concurrent(txn_id, entry),
+            ),
+        }
     }
 
     /// Insert a batch of `(key, row_id)` entries.
@@ -4478,8 +4481,134 @@ impl IndexFile {
             }
             return self.bulk_load_sorted(txn_id, entries);
         }
+        if let Some(outcome) = self.try_insert_entries_buffered(txn_id, &entries)? {
+            return match outcome {
+                None => Ok(()),
+                Some(lsn) => self.insert_entries_with_lsn(txn_id, entries, Some(lsn)),
+            };
+        }
         let lsn = self.append_index_batch_wal(txn_id, WalIndexOpKind::Insert, &entries)?;
         self.insert_entries_with_lsn(txn_id, entries, lsn)
+    }
+
+    /// Buffer bounded leaf-only insert runs. An overflow/structural decline
+    /// appends the complete logical batch before entering the structural
+    /// oracle. Already applied entries replay idempotently, just as when an
+    /// eager batch append precedes a partially completed insert operation.
+    /// None means ineligible, Some(None) completed, Some(Some(lsn)) needs the
+    /// ordinary insertion oracle using the already appended batch.
+    fn try_insert_entries_buffered(
+        &self,
+        txn_id: u64,
+        entries: &[IndexEntry],
+    ) -> Result<Option<Option<u64>>, QueryError> {
+        if self.durability == DurabilityMode::Memory
+            || !txn_wal_buffer_index_enabled()
+            || !txn_wal_buffering_active(&self.log, txn_id)
+            || btree_logical_wal::is_deferred()
+            || physical_wal_apply_active()
+        {
+            return Ok(None);
+        }
+        let path = self.relative_path();
+        let mut payload_bytes = 8usize.saturating_add(path.len());
+        let mut ops = Vec::new();
+        for entry in entries {
+            let key_len = encoded_index_key_len(&entry.key)?;
+            payload_bytes = payload_bytes.saturating_add(11).saturating_add(key_len);
+            if payload_bytes > INDEX_BATCH_WAL_TARGET_BYTES {
+                return Ok(None);
+            }
+            let mut key = Vec::with_capacity(key_len);
+            encode_index_key_into(&entry.key, &mut key)?;
+            ops.push(WalIndexOp {
+                kind: WalIndexOpKind::Insert,
+                key,
+                row_id: WalRowId {
+                    page_id: entry.row_id.page_id,
+                    slot_id: entry.row_id.slot_id,
+                },
+            });
+        }
+        let Some(reservation) = self.buffer_pool.reserve_deferred_wal_pages(entries.len()) else {
+            return Ok(None);
+        };
+        let payload = WalPayload::IndexBatch { path, ops };
+        let _logical = btree_logical_wal::LsnScope::new(None);
+        btree_logical_wal::begin_deferred();
+        let applied = (|| -> Result<bool, QueryError> {
+            let mut position = 0;
+            let mut route = smallvec::SmallVec::<[InsertRouteFrame; 4]>::new();
+            while position < entries.len() {
+                let run = SortedIndexEntryRun::prefix(&entries[position..]);
+                let _structure = self.structure_lock.read();
+                let single;
+                let (pinned, end) = if entries.len() == 1 {
+                    single = self
+                        .find_leaf_for_entry_with_candidate(&entries[0], &entries[0])?
+                        .0;
+                    (&single, 1)
+                } else {
+                    self.find_leaf_for_insert_run(
+                        entries,
+                        position,
+                        position + run.0.len(),
+                        &mut route,
+                    )?
+                };
+                let leaf = pinned.frame.key.page_id;
+                let (_latch, _same) = self.lock_leaf_latches(leaf, leaf)?;
+                let _mutation = self.begin_mutation();
+                let run = RoutedIndexEntryRun(SortedIndexEntryRun(&entries[position..end]));
+                let consumed = if entries.len() == 1 {
+                    self.try_insert_leaf_run_in_place::<false>(txn_id, pinned, run)?
+                } else {
+                    self.try_insert_leaf_run_in_place::<true>(txn_id, pinned, run)?
+                };
+                match consumed {
+                    Some(n) if n > 0 => {
+                        position += n;
+                        self.dirty.store(true, Ordering::Release);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            Ok(true)
+        })();
+        let keys = btree_logical_wal::take_deferred();
+        let (payload, keys, _reservation) = if matches!(applied, Ok(true)) {
+            match push_reserved_txn_wal_record(&self.log, txn_id, payload, keys, Some(reservation))
+            {
+                Ok(()) => return Ok(Some(None)),
+                Err(owned) => owned,
+            }
+        } else {
+            (payload, keys, Some(reservation))
+        };
+        // Drop deferred collection before appending or entering an oracle.
+        // No leaf or topology guard is held while touching the WAL mutex.
+        let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+            .and_then(|pre| self.log.lock().append_pre_encoded(pre));
+        let lsn = match appended {
+            Ok(lsn) => {
+                for key in &keys {
+                    self.buffer_pool.finalize_deferred(key, lsn);
+                }
+                lsn
+            }
+            Err(err) => {
+                // Never make an unlogged dirty image flushable at LSN zero.
+                for key in &keys {
+                    let _ = self.buffer_pool.discard_page(key);
+                }
+                return Err(err);
+            }
+        };
+        match applied {
+            Ok(true) => Ok(Some(None)),
+            Ok(false) => Ok(Some(Some(lsn))),
+            Err(err) => Err(err),
+        }
     }
 
     fn insert_entries_with_lsn(

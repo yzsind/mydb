@@ -3508,6 +3508,8 @@ struct BufferPool {
     /// no longer ping-pongs the line back and forth against the
     /// neighbouring `evictions`/`flushes`/`dirty_pages` counters.
     used_pages: CachePadded<AtomicU64>,
+    /// Bounded additional unflushable pages admitted by generic WAL batching.
+    deferred_wal_pages: CachePadded<AtomicU64>,
     evictions: AtomicU64,
     flushes: AtomicU64,
     /// Logical writes applied to resident page images. Unlike `flushes`, this
