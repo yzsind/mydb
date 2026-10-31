@@ -33,6 +33,81 @@ fn is_null(v: &Value) -> bool {
 }
 
 #[test]
+fn row_projection_preserves_nulls_for_narrow_and_wide_arities() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE row_buffers(id INT PRIMARY KEY,n BIGINT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO row_buffers VALUES(1,7),(2,NULL)")
+        .unwrap();
+    for arity in [2, 4, 5, 8] {
+        let items = (0..arity).map(|_| "n").collect::<Vec<_>>().join(",");
+        for (expr, expected) in [
+            (
+                format!("({items})=({items})"),
+                vec![Value::Int(1), Value::Null],
+            ),
+            (
+                format!("({items})<=>({items})"),
+                vec![Value::Int(1), Value::Int(1)],
+            ),
+            (
+                format!("({items}) IN (({items}))"),
+                vec![Value::Int(1), Value::Null],
+            ),
+            (
+                format!("({items}) NOT IN (({items}))"),
+                vec![Value::Int(0), Value::Null],
+            ),
+        ] {
+            let response = engine
+                .execute(&format!("SELECT {expr} FROM row_buffers ORDER BY id"))
+                .unwrap();
+            let QueryResponse::ResultSet(result) = response else {
+                panic!("rows")
+            };
+            assert_eq!(
+                result
+                    .rows
+                    .into_iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{expr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn row_projection_preserves_eager_arguments_and_in_list_short_circuit() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::system_default();
+    let mut scalar = |sql: &str| {
+        let response = engine
+            .execute_with_session(&mut session, sql)
+            .and_then(QueryResponse::materialize)
+            .unwrap();
+        match response {
+            QueryResponse::ResultSet(result) => Some(result.rows[0][0].clone()),
+            _ => None,
+        }
+    };
+    scalar("SET @row_buffer=0");
+    assert_eq!(
+        scalar("SELECT ROW((@row_buffer:=@row_buffer+1),(@row_buffer:=@row_buffer+1))=ROW(9,9)"),
+        Some(Value::Int(0))
+    );
+    assert_eq!(scalar("SELECT @row_buffer"), Some(Value::Int(2)));
+    scalar("SET @row_buffer=0");
+    assert_eq!(scalar("SELECT ROW((@row_buffer:=@row_buffer+1),0) IN (ROW(1,0),ROW((@row_buffer:=@row_buffer+1),0))"), Some(Value::Int(1)));
+    assert_eq!(scalar("SELECT @row_buffer"), Some(Value::Int(1)));
+}
+
+#[test]
 fn row_eq_basic() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_test_engine(tmp.path());

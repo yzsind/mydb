@@ -43,6 +43,8 @@ pub(crate) mod query_shape;
 mod rewrite;
 pub(crate) mod rrf;
 mod source;
+mod token_output;
+pub(crate) use token_output::parse_with_token_output;
 pub(crate) mod visit;
 
 pub use ast::*;

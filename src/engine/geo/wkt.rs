@@ -90,18 +90,26 @@ impl<'a> WktParser<'a> {
     fn parse_number(&mut self) -> Result<f64, QueryError> {
         self.skip_ws();
         let start = self.pos;
+        let negative = self.peek() == Some(b'-');
         if matches!(self.peek(), Some(b'+') | Some(b'-')) {
             self.pos += 1;
         }
         let mut saw_digit = false;
+        let mut integer = Some(0u64);
         while let Some(c) = self.peek() {
             match c {
                 b'0'..=b'9' => {
                     saw_digit = true;
+                    integer = integer
+                        .and_then(|value| value.checked_mul(10)?.checked_add(u64::from(c - b'0')));
                     self.pos += 1;
                 }
-                b'.' => self.pos += 1,
+                b'.' => {
+                    integer = None;
+                    self.pos += 1;
+                }
                 b'e' | b'E' => {
+                    integer = None;
                     self.pos += 1;
                     if matches!(self.peek(), Some(b'+') | Some(b'-')) {
                         self.pos += 1;
@@ -112,6 +120,12 @@ impl<'a> WktParser<'a> {
         }
         if !saw_digit {
             return Err(invalid_wkt("expected number"));
+        }
+        if let Some(integer) = integer.filter(|value| *value <= 1u64 << 53) {
+            // Every integer in this range is exactly representable. Preserve
+            // signed zero; decimal/exponent/large inputs use the full parser.
+            let value = integer as f64;
+            return Ok(if negative { -value } else { value });
         }
         std::str::from_utf8(&self.s[start..self.pos])
             .ok()
@@ -303,6 +317,10 @@ fn push_num(out: &mut String, v: f64) {
     if v == 0.0 {
         // Avoid "-0".
         out.push('0');
+    } else if v.abs() <= (1u64 << 53) as f64 && v.trunc() == v {
+        // Integer coordinates have the same Display spelling. Avoid the
+        // floating-point shortest-decimal converter for this exact domain.
+        out.push_str(itoa::Buffer::new().format(v as i64));
     } else {
         let _ = write!(out, "{v}");
     }
@@ -411,6 +429,90 @@ fn write_into(out: &mut String, geom: &Geom) {
                 }
                 out.push(')');
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod formatting_tests {
+    use super::{parse_wkt, push_num, WktParser};
+
+    #[test]
+    fn integer_coordinate_parser_keeps_float_rounding_and_signed_zero() {
+        let mut inputs = vec![
+            "0".to_owned(),
+            "-0".to_owned(),
+            "+0000000000000000000001".to_owned(),
+            "9007199254740992".to_owned(),
+            "9007199254740993".to_owned(),
+            "9007199254740994".to_owned(),
+            "18446744073709551615".to_owned(),
+            "18446744073709551616".to_owned(),
+            "1000000000000000128".to_owned(),
+            "1.5".to_owned(),
+            "-.0".to_owned(),
+            "1e100".to_owned(),
+            "1e-320".to_owned(),
+        ];
+        for integer in -1000..1000 {
+            inputs.push(integer.to_string());
+            inputs.push(format!("{integer}.125"));
+            inputs.push(format!("{integer}e-3"));
+        }
+        for text in inputs {
+            let expected = text.parse::<f64>().unwrap();
+            let mut parser = WktParser {
+                s: text.as_bytes(),
+                pos: 0,
+            };
+            let actual = parser.parse_number().unwrap();
+            assert_eq!(parser.pos, text.len());
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{text}");
+        }
+        for text in [
+            "POINT(1.2.3 0)",
+            "POINT(1e+ 0)",
+            "POINT(1e999 0)",
+            "POINT(+ 0)",
+        ] {
+            assert_eq!(parse_wkt(text).unwrap_err().code(), 3037, "{text}");
+        }
+    }
+
+    #[test]
+    fn coordinate_formatting_keeps_the_original_shortest_decimal_spelling() {
+        let mut numbers = vec![
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            (1u64 << 53) as f64,
+            ((1u64 << 53) + 2) as f64,
+            1_000_000_000_000_000_128.0,
+            i64::MAX as f64,
+            i64::MIN as f64,
+        ];
+        for integer in -10000..10000 {
+            numbers.push(integer as f64);
+        }
+        let mut seed = 73u64;
+        for _ in 0..50000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            numbers.push(f64::from_bits(seed));
+        }
+        for value in numbers {
+            let expected = if value == 0.0 {
+                "0".into()
+            } else {
+                value.to_string()
+            };
+            let mut actual = String::new();
+            push_num(&mut actual, value);
+            assert_eq!(actual, expected, "{:016x}", value.to_bits());
         }
     }
 }

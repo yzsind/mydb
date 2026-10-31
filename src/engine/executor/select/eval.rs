@@ -813,7 +813,32 @@ fn eval_plan_structural_expr(
 
 #[inline]
 pub(super) fn eval_plan_expr_legacy(expr: &Expr, row: &PlanRow) -> Result<Value, QueryError> {
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+        let _depth = crate::engine::expr::ExpressionDepthGuard::enter()?;
+        return eval_plan_column_reference(expr, row);
+    }
     crate::engine::expr::eval_scalar_context(expr, || eval_plan_expr_legacy_inner(expr, row))
+}
+
+/// Column lookup cannot recurse. Keep its depth/error contract while avoiding
+/// the large recursive evaluator frame and its stack-segment admission.
+#[inline]
+fn eval_plan_column_reference(expr: &Expr, row: &PlanRow) -> Result<Value, QueryError> {
+    let (qualifier, column) = match expr {
+        Expr::Identifier(name) => (None, name.as_str()),
+        Expr::CompoundIdentifier(parts) => {
+            let column = parts.last().ok_or_else(|| {
+                error(crate::error::catalog::ER_BAD_FIELD_ERROR, "unknown column")
+            })?;
+            (
+                parts.iter().rev().nth(1).map(String::as_str),
+                column.as_str(),
+            )
+        }
+        _ => unreachable!("column reference"),
+    };
+    let resolved = resolve_plan_field(row, qualifier, column).map(|field| field.value.clone());
+    hidden_group_cache_value(expr, row, resolved)
 }
 
 /// Common PlanRow scalar-function binding. The caller owns recursion (plain
@@ -1621,6 +1646,12 @@ pub(super) fn eval_plan_expr_with_db(
     row: &PlanRow,
     eval_ctx: &mut EvalQueryContext,
 ) -> Result<Value, QueryError> {
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+        // Preserve both recursion scopes of the existing with-db -> legacy
+        // dispatch, but enter neither of its large recursive frames.
+        let _depth = crate::engine::expr::ExpressionDepthGuard::enter()?;
+        return eval_plan_expr_legacy(expr, row);
+    }
     crate::engine::expr::eval_scalar_context(expr, || {
         eval_plan_expr_with_db_inner(db, txn, expr, row, eval_ctx)
     })
@@ -6081,6 +6112,40 @@ mod compiled_plan_expr_tests {
 
     fn field(name: &str, value: Value) -> PlanField {
         PlanField::new("t", None, name, ColumnType::VarString, value)
+    }
+
+    #[test]
+    fn column_leaf_lookup_keeps_qualification_errors_and_depth_on_small_stack() {
+        let row = PlanRow::from_fields(vec![field("s", Value::String("数据库".into()))]);
+        let present = ["SELECT s", "SELECT t.s", "SELECT db.t.s"].map(first_projection_expr);
+        let missing = ["SELECT missing", "SELECT other.s"].map(first_projection_expr);
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                for expr in present {
+                    assert_eq!(
+                        eval_plan_expr_legacy(&expr, &row).unwrap(),
+                        Value::String("数据库".into())
+                    );
+                }
+                for expr in missing {
+                    assert_eq!(eval_plan_expr_legacy(&expr, &row).unwrap_err().code(), 1054);
+                }
+                let guards = (0..crate::engine::expr_program::MAX_EXPRESSION_DEPTH)
+                    .map(|_| crate::engine::expr::ExpressionDepthGuard::enter().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(eval_plan_expr_legacy(&Expr::Identifier("s".into()), &row)
+                    .unwrap_err()
+                    .is(crate::error::catalog::ER_STACK_OVERRUN_NEED_MORE));
+                drop(guards);
+                assert_eq!(
+                    eval_plan_expr_legacy(&Expr::Identifier("s".into()), &row).unwrap(),
+                    Value::String("数据库".into())
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

@@ -1,5 +1,8 @@
+mod compression;
 pub(crate) mod date_format;
 pub(crate) mod digest;
+#[cfg(test)]
+mod formatting_tests;
 pub(crate) mod math;
 pub(crate) mod network;
 crate::engine::builtin_catalog::declare_retains_ast!();
@@ -24,7 +27,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fs::File,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     ptr::NonNull,
     time::Duration,
@@ -7159,7 +7162,10 @@ where
                     if let Value::Time(t) = v {
                         return Ok(*t);
                     }
-                    let s = string_value(v);
+                    if matches!(v, Value::Date(_) | Value::DateTime(_)) {
+                        return parse_datetime(v).map(|dt| dt.and_utc().timestamp_micros());
+                    }
+                    let s = str_value(v);
                     let bytes = s.as_bytes();
                     let looks_datetime = bytes.contains(&b' ')
                         || bytes.contains(&b'T')
@@ -7367,8 +7373,7 @@ where
                 } else {
                     fsp
                 };
-                let (neg2, h2, m2, s2, us2) = match parse_time_components(&string_value(&values[1]))
-                {
+                let (neg2, h2, m2, s2, us2) = match parse_time_components(&str_value(&values[1])) {
                     Ok(parts) => parts,
                     Err(err) if !strict_dml_expression() => {
                         return Ok(warn_invalid_temporal_function("time", &values[1], err));
@@ -9184,12 +9189,13 @@ where
             let value = eval_one(name, args, eval_arg)?;
             null_or(value, |value| {
                 let sql = digest_input_string(&value)?;
-                validate_digest_sql(&sql)?;
+                let charset =
+                    (upper == "STATEMENT_DIGEST").then(|| digest_argument_charset(&args[0]));
+                let digest = validated_statement_digest(&sql, charset)?;
                 if upper == "STATEMENT_DIGEST" {
-                    let source_charset = digest_argument_charset(&args[0]);
-                    Ok(Value::String(statement_digest_hash(&sql, &source_charset)))
+                    Ok(Value::String(digest))
                 } else {
-                    Ok(statement_digest_text_result(statement_digest_text(&sql)))
+                    Ok(statement_digest_text_result(digest))
                 }
             })
         }
@@ -14422,6 +14428,17 @@ impl NumberStyle {
 }
 
 fn format_datetime_fsp(dt: NaiveDateTime, fsp: usize) -> String {
+    if (0..=9999).contains(&dt.year()) && dt.nanosecond() < 1_000_000_000 && fsp <= 6 {
+        let mut buffer = [0; 32];
+        let bytes = crate::types::write_datetime_canonical_with_fsp(
+            dt.and_utc().timestamp_micros(),
+            Some(fsp as u8),
+            &mut buffer,
+        );
+        return std::str::from_utf8(bytes)
+            .expect("canonical datetime is ASCII")
+            .to_owned();
+    }
     let mut out = String::with_capacity(26);
     use std::fmt::Write;
     let _ = write!(
@@ -14464,7 +14481,18 @@ fn write_frac_into(out: &mut String, micros: u32, fsp: usize) {
 /// MySQL temporal functions echo this declared precision in their
 /// result — `TIMESTAMP('… .500','… .250')` prints `.750`, not `.75`.
 fn text_fsp(value: &Value) -> usize {
-    let text = string_value(value);
+    let mut buffer = [0; 32];
+    // TIMESTAMP retains session-aware conversion and its diagnostic behavior.
+    let text = if !matches!(value, Value::Timestamp(_)) {
+        value
+            .canonical_cmp_bytes(&mut buffer)
+            .map(|bytes| {
+                std::borrow::Cow::Borrowed(std::str::from_utf8(bytes).expect("canonical UTF-8"))
+            })
+            .unwrap_or_else(|| str_value(value))
+    } else {
+        str_value(value)
+    };
     match text.rsplit_once('.') {
         Some((_, frac)) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
             frac.len().min(6)
@@ -16874,22 +16902,11 @@ where
 {
     let value = eval_one(name, args, eval_arg)?;
     null_or(value, |value| {
-        let input = value_bytes(&value);
+        let input = value_bytes_ref(&value);
         if input.is_empty() {
             return Ok(Value::Bytes(Vec::new()));
         }
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder
-            .write_all(&input)
-            .map_err(|e| error(crate::error::catalog::ER_GET_ERRNO, e.to_string()))?;
-        let mut out = (input.len() as u32).to_le_bytes().to_vec();
-        out.extend(
-            encoder
-                .finish()
-                .map_err(|e| error(crate::error::catalog::ER_GET_ERRNO, e.to_string()))?,
-        );
-        Ok(Value::Bytes(out))
+        compression::compress(&input).map(Value::Bytes)
     })
 }
 
@@ -16899,7 +16916,7 @@ where
 {
     let value = eval_one(name, args, eval_arg)?;
     null_or(value, |value| {
-        let bytes = value_bytes(&value);
+        let bytes = value_bytes_ref(&value);
         if bytes.is_empty() {
             return Ok(Value::Bytes(Vec::new()));
         }
@@ -16920,11 +16937,9 @@ where
             );
             return Ok(Value::Null);
         }
-        let mut decoder = flate2::read::ZlibDecoder::new(&bytes[4..]);
-        let mut out = Vec::with_capacity(expected.min(1024 * 1024));
-        match decoder.read_to_end(&mut out) {
-            Ok(_) if out.len() == expected => Ok(Value::Bytes(out)),
-            Ok(_) | Err(_) => {
+        match compression::uncompress(&bytes[4..], expected)? {
+            Some(out) => Ok(Value::Bytes(out)),
+            None => {
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
                     crate::error::catalog::ER_ZLIB_Z_DATA_ERROR,
@@ -16946,7 +16961,7 @@ where
 {
     let value = eval_one(name, args, eval_arg)?;
     null_or(value, |value| {
-        let bytes = value_bytes(&value);
+        let bytes = value_bytes_ref(&value);
         if bytes.is_empty() {
             Ok(Value::UInt(0))
         } else if bytes.len() <= 4 {
@@ -26963,20 +26978,24 @@ pub(crate) fn parse_time_components(s: &str) -> Result<(bool, u32, u32, u32, u32
         .strip_prefix('-')
         .map_or((false, trimmed), |rest| (true, rest));
     let (main, fraction) = rest.split_once('.').unwrap_or((rest, ""));
-    let micros = crate::util::temporal::parse_time_fraction(fraction).map_err(invalid)?;
-    // A DATETIME also contains `:`. Recognise the full date shape before the
-    // generic HH:MM:SS lane so TIMESTAMP(date, datetime_expression) can use
-    // the expression's time fields instead of trying to parse
-    // `"YYYY-MM-DD HH"` as an hour.
-    if matches!(main, "0000-00-00" | "0000-00-00 00:00:00") {
-        return Ok((neg, 0, 0, 0, micros));
-    }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(main, "%Y-%m-%d %H:%M:%S") {
-        use chrono::Timelike;
-        return Ok((neg, dt.hour(), dt.minute(), dt.second(), micros));
-    }
-    if chrono::NaiveDate::parse_from_str(main, "%Y-%m-%d").is_ok() {
-        return Ok((neg, 0, 0, 0, micros));
+    // Both calendar formats require a literal date separator. Duration text
+    // without one cannot match either format; parse it only once below.
+    if main.as_bytes().contains(&b'-') {
+        let micros = crate::util::temporal::parse_time_fraction(fraction).map_err(invalid)?;
+        // A DATETIME also contains `:`. Recognise the full date shape before the
+        // generic HH:MM:SS lane so TIMESTAMP(date, datetime_expression) can use
+        // the expression's time fields instead of trying to parse
+        // `"YYYY-MM-DD HH"` as an hour.
+        if matches!(main, "0000-00-00" | "0000-00-00 00:00:00") {
+            return Ok((neg, 0, 0, 0, micros));
+        }
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(main, "%Y-%m-%d %H:%M:%S") {
+            use chrono::Timelike;
+            return Ok((neg, dt.hour(), dt.minute(), dt.second(), micros));
+        }
+        if chrono::NaiveDate::parse_from_str(main, "%Y-%m-%d").is_ok() {
+            return Ok((neg, 0, 0, 0, micros));
+        }
     }
 
     let parts = crate::util::temporal::parse_time_duration(s).map_err(invalid)?;
@@ -27090,7 +27109,7 @@ fn parse_time_value_components_inner(
             format!("incorrect TIME value: '{}'", string_value(value)),
         ));
     }
-    let text = string_value(value);
+    let text = str_value(value);
     if matches!(
         value,
         Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
@@ -27124,7 +27143,12 @@ fn parse_time_value_components_inner(
             dt.nanosecond() / 1000,
         ));
     }
-    parse_time_components(&string_value(value))
+    if matches!(value, Value::Timestamp(_)) {
+        // Timestamp text conversion can emit session-timezone diagnostics.
+        parse_time_components(&string_value(value))
+    } else {
+        parse_time_components(&text)
+    }
 }
 
 /// TIME_FORMAT's core formatting logic. Numeric date fields use a zero date;
@@ -27449,10 +27473,21 @@ fn statement_digest_text_result(text: String) -> Value {
 /// latin1 `Å` and UTF-8 `Å` render equivalently but have the same token hash
 /// only when the explicit CONVERT source is respected.
 fn statement_digest_hash(sql: &str, source_charset: &str) -> String {
+    use sqlparser::{dialect::MySqlDialect, tokenizer::Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return String::new();
+    };
+    statement_digest_hash_tokens(tokens.iter(), sql.len(), source_charset)
+}
+
+fn statement_digest_hash_tokens<'a>(
+    tokens: impl IntoIterator<Item = &'a sqlparser::tokenizer::Token>,
+    source_len: usize,
+    source_charset: &str,
+) -> String {
     use sha2::Digest;
-    use sqlparser::dialect::MySqlDialect;
     use sqlparser::keywords::Keyword;
-    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    use sqlparser::tokenizer::{Token, Whitespace};
 
     const TOK_GENERIC_VALUE: u16 = 1100;
     const TOK_IDENT: u16 = 1106;
@@ -27538,9 +27573,6 @@ fn statement_digest_hash(sql: &str, source_charset: &str) -> String {
         token
     }
 
-    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
-        return String::new();
-    };
     let mut pieces: Vec<(String, Vec<u8>)> = Vec::new();
     for token in tokens {
         let piece = match token {
@@ -27631,7 +27663,7 @@ fn statement_digest_hash(sql: &str, source_charset: &str) -> String {
     }
 
     let limit = STATEMENT_DIGEST_TOKEN_LIMIT.with(Cell::get).unwrap_or(1024);
-    let mut token_buffer = Vec::with_capacity(limit.min(sql.len()));
+    let mut token_buffer = Vec::with_capacity(limit.min(source_len));
     for (_, piece) in pieces {
         if token_buffer.len().saturating_add(piece.len()) > limit {
             break;
@@ -27844,9 +27876,21 @@ fn statement_digest_text_tokenized(
     max_bytes: usize,
     max_digest_length: Option<usize>,
 ) -> (String, bool) {
-    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::{dialect::MySqlDialect, tokenizer::Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return (String::new(), false);
+    };
+    statement_digest_text_tokens(tokens.iter(), sql.len(), max_bytes, max_digest_length)
+}
+
+fn statement_digest_text_tokens<'a>(
+    tokens: impl IntoIterator<Item = &'a sqlparser::tokenizer::Token>,
+    source_len: usize,
+    max_bytes: usize,
+    max_digest_length: Option<usize>,
+) -> (String, bool) {
     use sqlparser::keywords::Keyword;
-    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    use sqlparser::tokenizer::{Token, Whitespace};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DigestTokenKind {
@@ -27858,10 +27902,8 @@ fn statement_digest_text_tokenized(
         Other,
     }
 
-    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
-        return (String::new(), false);
-    };
-    let mut normalized: Vec<(String, DigestTokenKind)> = Vec::with_capacity(tokens.len());
+    let tokens = tokens.into_iter();
+    let mut normalized: Vec<(String, DigestTokenKind)> = Vec::with_capacity(tokens.size_hint().0);
     let mut spaced_parens = Vec::new();
     for token in tokens {
         let item = match token {
@@ -27978,7 +28020,7 @@ fn statement_digest_text_tokenized(
         }
     }
 
-    let mut out = String::with_capacity(sql.len().min(max_bytes));
+    let mut out = String::with_capacity(source_len.min(max_bytes));
     let mut previous_kind = None;
     let mut saturated = false;
     // MySQL's `max_digest_length` buffer also stores the terminating token;
@@ -28025,20 +28067,55 @@ fn digest_input_string(value: &Value) -> Result<String, QueryError> {
     }
 }
 
-fn validate_digest_sql(sql: &str) -> Result<(), QueryError> {
+fn validated_statement_digest(
+    sql: &str,
+    source_charset: Option<String>,
+) -> Result<String, QueryError> {
+    let invalid = || {
+        error(
+            crate::error::catalog::ER_PARSE_ERROR_IN_DIGEST_FN,
+            "Statement digest function received invalid SQL text.",
+        )
+    };
     if sql.trim().is_empty() || sql.contains('\0') || sql.contains('?') {
-        return Err(error(
-            crate::error::catalog::ER_PARSE_ERROR_IN_DIGEST_FN,
-            "Statement digest function received invalid SQL text.",
-        ));
+        return Err(invalid());
     }
-    match crate::parser::parse_statements(sql) {
-        Ok(statements) if statements.len() == 1 => Ok(()),
-        _ => Err(error(
-            crate::error::catalog::ER_PARSE_ERROR_IN_DIGEST_FN,
-            "Statement digest function received invalid SQL text.",
-        )),
+    let hash = source_charset.is_some();
+    let renderer = if hash {
+        |tokens: &[sqlparser::tokenizer::TokenWithSpan], source: &str, charset: &str| {
+            statement_digest_hash_tokens(
+                tokens.iter().map(|token| &token.token),
+                source.len(),
+                charset,
+            )
+        }
+    } else {
+        |tokens: &[sqlparser::tokenizer::TokenWithSpan], source: &str, _: &str| {
+            let limit = STATEMENT_DIGEST_TOKEN_LIMIT.with(Cell::get);
+            statement_digest_text_tokens(
+                tokens.iter().map(|token| &token.token),
+                source.len(),
+                1024,
+                limit,
+            )
+            .0
+        }
+    };
+    let (statements, captured, charset) =
+        crate::parser::parse_with_token_output(sql, source_charset.unwrap_or_default(), renderer)
+            .map_err(|_| invalid())?;
+    let valid = statements.len() == 1;
+    drop(statements);
+    if !valid {
+        return Err(invalid());
     }
+    Ok(captured.unwrap_or_else(|| {
+        if hash {
+            statement_digest_hash(sql, &charset)
+        } else {
+            statement_digest_text(sql)
+        }
+    }))
 }
 
 fn digest_expr_failure_must_be_undisclosed(expr: &Expr) -> bool {
