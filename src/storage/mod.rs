@@ -22,6 +22,8 @@ pub(crate) mod schema;
 pub(crate) mod sequence;
 pub(crate) mod snapshot;
 mod stats;
+mod stats_codec;
+mod stats_store;
 pub(crate) mod temp_quota;
 mod temporal;
 pub mod vector_config;

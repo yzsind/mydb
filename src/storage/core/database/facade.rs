@@ -1066,6 +1066,9 @@ impl Database {
         }
         db.recover_sequence_values(sequence_recovery)?;
         db.initialize_sequence_sync()?;
+        if physical_replica {
+            db.recover_replica_statistics()?;
+        }
         // Reconcile any partition-reorg journals left by a crash mid
         // build-then-swap (§2.1). Must run after the catalog is loaded and
         // WAL redo/undo have settled, so commit state is derivable from the

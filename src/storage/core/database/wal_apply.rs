@@ -1291,23 +1291,24 @@ impl Database {
                     let Some(previous) = old_tables.iter().find(|old| old.id == table.id) else {
                         continue;
                     };
-                    if previous.stats.analyzed_at_unix_ms != table.stats.analyzed_at_unix_ms {
+                    if table.stats.analyze_revision < previous.stats.analyze_revision
+                        || (table.active_generation != previous.active_generation
+                            && table.stats.row_count == 0
+                            && table.stats.columns.is_empty())
+                    {
+                        self.drop_table_modification_delta(table.id);
+                        continue;
+                    }
+                    if previous.stats.analyze_revision != table.stats.analyze_revision {
                         // The DD row includes the baselines folded by the
                         // source ANALYZE. Replay only those subtractions;
                         // DML committed after its snapshot stays visible.
                         if let Some(counter) = self.table_live_row_deltas.read().get(&table.id) {
-                            let baseline = table.stats.last_analyze_live_baseline;
-                            let _ = counter.fetch_update(
+                            // The revision transition proves this source baseline has not
+                            // been folded before. Later DELETEs may have reversed the sign.
+                            counter.fetch_sub(
+                                table.stats.last_analyze_live_baseline,
                                 Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| {
-                                    let aligned = if baseline >= 0 {
-                                        baseline.min(current.max(0))
-                                    } else {
-                                        baseline.max(current.min(0))
-                                    };
-                                    Some(current.saturating_sub(aligned))
-                                },
                             );
                         }
                         if let Some(counter) = self.table_modification_deltas.read().get(&table.id)

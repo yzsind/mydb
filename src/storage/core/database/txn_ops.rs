@@ -2419,7 +2419,9 @@ impl Database {
     /// `mydb_undo_buffer_bytes`). Lives in the UndoManager since it is
     /// applied to its `buffer_limit` field directly.
     pub fn undo_buffer_bytes(&self) -> u64 {
-        self.undo_append_shards.first().map_or(0, |shard| shard.lock().buffer_limit)
+        self.undo_append_shards
+            .first()
+            .map_or(0, |shard| shard.lock().buffer_limit)
     }
 
     /// P2/12 — disk-cap soft-fail warning toggle (sysvar
@@ -2976,6 +2978,16 @@ impl Database {
     /// `finish_deferred_commits`; dropping it would leave post-durable hooks
     /// unfinished.
     pub(crate) fn commit_txn_deferred(&self, txn_id: u64) -> Result<DeferredCommit, QueryError> {
+        self.commit_txn_deferred_with_vector_maintenance(txn_id, true)
+    }
+
+    /// A statistics DD transaction holds the catalog publication latch. Its
+    /// durability path must not re-enter that catalog through unrelated purges.
+    fn commit_txn_deferred_with_vector_maintenance(
+        &self,
+        txn_id: u64,
+        drain_vector_purges: bool,
+    ) -> Result<DeferredCommit, QueryError> {
         // Handler_commit: every commit — read-only, autocommit, explicit, or
         // fast-path — funnels through here, matching MySQL's internal commit
         // counter (which also counts read-only commits).
@@ -3249,7 +3261,9 @@ impl Database {
         frontier_guard.disarm();
         // Superseded vector versions queued by this (or an earlier) commit
         // become retirable once the frontier covers them.
-        self.drain_vector_purges();
+        if drain_vector_purges {
+            self.drain_vector_purges();
+        }
         if has_vector_pending && index_error.is_none() {
             index_error = self.ensure_operational().err();
         }
@@ -4544,11 +4558,27 @@ impl Database {
         })?;
         let applied_lsn = self.replica_applied_lsn_atomic.load(Ordering::Acquire);
         let wal_durable_lsn = self.log.lock().durable_lsn();
-        let persisted = crate::repl::replica::progress::load_progress(&self.data_dir)
-            .map_err(io_err)?
-            .map(|p| p.durable_applied_lsn)
-            .unwrap_or(0);
+        let progress =
+            crate::repl::replica::progress::load_progress(&self.data_dir).map_err(io_err)?;
+        let persisted = progress.as_ref().map_or(0, |p| p.durable_applied_lsn);
+        let statistics_floor = progress
+            .as_ref()
+            .and_then(|p| p.statistics.as_ref())
+            .map(|s| s.covered_lsn);
         let mut restart_lsn = applied_lsn.min(wal_durable_lsn).min(persisted);
+        if let Some(floor) = statistics_floor {
+            restart_lsn = restart_lsn.min(floor);
+        } else if !self.table_live_row_deltas.read().is_empty()
+            || !self.table_modification_deltas.read().is_empty()
+            || self
+                .pending_live_row_deltas
+                .iter()
+                .any(|s| !s.lock().is_empty())
+        {
+            // Until progress contains the first statistical after-state, retain
+            // the logical tail needed to reconstruct it after a crash.
+            restart_lsn = 0;
+        }
         // Keep every streamed in-flight BEGIN, including transactions whose
         // first write has not arrived yet. Data-file durability alone cannot
         // reconstruct their MVCC identity after restart.

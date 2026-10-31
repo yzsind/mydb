@@ -1760,6 +1760,7 @@ impl MydbReplManager {
             .database_for_replication()
             .set_physical_replica_mode(true)?;
         let progress = ReplicaProgress {
+            statistics: None,
             received_lsn: durable_lsn,
             durable_lsn,
             applied_lsn: durable_lsn,

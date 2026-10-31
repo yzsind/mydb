@@ -2527,7 +2527,7 @@ fn rows(
         ("information_schema", "role_table_grants") => Ok(role_table_grants_rows(db)),
         ("information_schema", "role_column_grants") => Ok(role_column_grants_rows(db)),
         ("information_schema", "role_routine_grants") => Ok(role_routine_grants_rows(db)),
-        ("information_schema", "column_statistics") => Ok(column_statistics_rows(db)),
+        ("information_schema", "column_statistics") => column_statistics_rows(db),
         ("information_schema", "keywords") => Ok(keywords_rows()),
         ("information_schema", "plugins") => {
             Ok(crate::engine::show::information_schema_plugin_rows())
@@ -5025,13 +5025,16 @@ fn role_routine_grants_rows(db: &Database) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn column_statistics_rows(db: &Database) -> Vec<Vec<Value>> {
+fn column_statistics_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     let visibility = Visibility::compute(db);
     let mut rows = Vec::new();
-    for table in db.catalog().tables.values() {
-        if !visibility.table_visible(&table.database, &table.name) {
+    for header in db.catalog().tables.values() {
+        if !visibility.table_visible(&header.database, &header.name) {
             continue;
         }
+        // Startup headers intentionally omit distributions. Resolve the bounded
+        // descriptor before reading user-requested histogram metadata.
+        let table = db.table(&header.qualified_name())?;
         for (column, histogram) in &table.stats.explicit_histograms {
             if !table
                 .iter_visible_columns()
@@ -5049,11 +5052,11 @@ fn column_statistics_rows(db: &Database) -> Vec<Vec<Value>> {
                 s(&table.database),
                 s(&table.name),
                 s(column),
-                Value::String(histogram.to_string()),
+                Value::String(histogram.to_json()),
             ]);
         }
     }
-    rows
+    Ok(rows)
 }
 
 fn sequence_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {

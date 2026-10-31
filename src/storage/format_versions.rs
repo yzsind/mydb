@@ -26,7 +26,8 @@
 /// v63 persists vector WITH configuration independently from index comments.
 /// v64: persistent vector manifests, snapshot identities and retirement ledger.
 /// v65: encrypted AI Secret, Connection and Model catalog metadata.
-pub const CATALOG_VERSION: u32 = 66;
+/// v67: object-scoped, typed binary optimizer statistics.
+pub const CATALOG_VERSION: u32 = 67;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.

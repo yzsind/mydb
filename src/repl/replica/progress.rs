@@ -18,6 +18,15 @@ use serde::{Deserialize, Serialize};
 
 pub const PROGRESS_FILE: &str = "system/replication/replica_progress.json";
 
+/// Counter after-state at exactly covered_lsn, including uncommitted populations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatisticsSnapshot {
+    pub covered_lsn: u64,
+    pub tables: Vec<(u64, i64, u64)>,
+    pub pending: Vec<(u64, Vec<(u64, i64)>)>,
+    pub folds: Vec<(u64, Vec<(u64, u64, i64, u64, bool)>)>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicaProgress {
     #[serde(default)]
@@ -51,6 +60,8 @@ pub struct ReplicaProgress {
     #[serde(default)]
     pub source_fence_token_hash: String,
     pub last_update_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<std::sync::Arc<StatisticsSnapshot>>,
 }
 
 /// Advance only to records the live engine actually applied and the WAL
@@ -167,6 +178,7 @@ mod tests {
     fn save_load_round_trip_preserves_fields() {
         let dir = TempDir::new().unwrap();
         let p = ReplicaProgress {
+            statistics: None,
             received_lsn: 12348,
             durable_lsn: 12347,
             applied_lsn: 12346,

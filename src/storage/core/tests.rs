@@ -4070,8 +4070,8 @@ fn analyze_table_stats_survive_reopen() {
 }
 
 #[test]
-fn wide_table_stats_above_12k_survive_reopen_via_dd_lob() {
-    use crate::storage::data_dictionary::{DD_STATS_JSON_CAP_BYTES, DD_TABLE_STATS};
+fn wide_table_stats_survive_reopen_as_independent_objects() {
+    use crate::storage::data_dictionary::DD_COLUMN_STATS;
 
     const COLUMN_COUNT: usize = 160;
     let dir = tempfile::tempdir().unwrap();
@@ -4112,20 +4112,19 @@ fn wide_table_stats_above_12k_survive_reopen_via_dd_lob() {
 
         let table_id = db.table("test.wide_stats").unwrap().id;
         let persisted = db
-            .scan_dd_table(DD_TABLE_STATS)
+            .scan_dd_table(DD_COLUMN_STATS)
             .unwrap()
             .into_iter()
             .find(|row| row.first() == Some(&Value::UInt(table_id)))
             .expect("wide table stats row should be present");
-        let Value::String(stats_json) = &persisted[2] else {
-            panic!("stats_json should decode from the externalized DD value");
+        let Value::Bytes(payload) = &persisted[7] else {
+            panic!("column stats should use typed binary payloads");
         };
-        assert!(
-            stats_json.len() > 12 * 1024,
-            "fixture must cross the former persistence limit; got {} bytes",
-            stats_json.len()
+        assert!(payload.starts_with(b"MST\x01"));
+        assert_eq!(
+            db.scan_dd_table(DD_COLUMN_STATS).unwrap().len(),
+            COLUMN_COUNT
         );
-        assert!(stats_json.len() <= DD_STATS_JSON_CAP_BYTES);
     }
 
     let db = open_relaxed_test_db(dir.path());
@@ -13852,7 +13851,7 @@ fn dd_object_shards_commit_independent_tables_concurrently() {
 }
 
 #[test]
-fn analyze_replaces_only_one_table_stats_row() {
+fn analyze_updates_only_its_table_revision_and_changed_statistics_objects() {
     use crate::storage::data_dictionary::{
         DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE, DD_TABLES, DD_TABLE_STATS,
     };
@@ -13882,17 +13881,24 @@ fn analyze_replaces_only_one_table_stats_row() {
         vec![],
     )
     .unwrap();
-    let structural_before = [DD_TABLES, DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE]
-        .map(|id| db.scan_dd_table(id).unwrap());
+    let mut table_rows = db.scan_dd_table(DD_TABLES).unwrap();
+    let structural_before =
+        [DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE].map(|id| db.scan_dd_table(id).unwrap());
     let mutations_before = db.catalog_store_stats().2;
     db.analyze_table("test.t").unwrap();
     let mutations = db.catalog_store_stats().2 - mutations_before;
     assert_eq!(
-        mutations, 2,
-        "one current stats row is deleted and inserted"
+        mutations, 6,
+        "table/root revisions are replaced and column/index objects inserted"
     );
     assert_eq!(db.scan_dd_table(DD_TABLE_STATS).unwrap().len(), 1);
-    for (id, before) in [DD_TABLES, DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE]
+    for row in &mut table_rows {
+        if let Value::UInt(version) = &mut row[10] {
+            *version += 1;
+        }
+    }
+    assert_eq!(db.scan_dd_table(DD_TABLES).unwrap(), table_rows);
+    for (id, before) in [DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE]
         .into_iter()
         .zip(structural_before)
     {
@@ -28908,3 +28914,5 @@ fn write_path_lazy_begin_shares_commit_batch_and_precedes_eager_fallback() {
         .is_empty());
     db.check_consistency().unwrap();
 }
+
+include!("object_stats_tests.rs");

@@ -933,6 +933,7 @@ pub(crate) async fn perform_base_backup_into_with_config(
     // state receiver resumes at backup_lsn + 1.
     let master_uuid = crate::repl::role::uuid_bytes_to_string(&ack.master_uuid);
     let progress = ReplicaProgress {
+        statistics: None,
         received_lsn: backup_lsn,
         durable_lsn: backup_lsn,
         applied_lsn: backup_lsn,

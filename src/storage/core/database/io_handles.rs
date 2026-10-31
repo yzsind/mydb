@@ -410,10 +410,11 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn diagnostic_catalog_snapshot_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_DD_PROPERTIES,
-            DD_EVENTS, DD_FOREIGN_KEYS, DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES,
-            DD_INDEXES, DD_INDEX_COLUMN_USAGE, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES,
-            DD_SCHEMATA, DD_SEQUENCES, DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
+            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
+            DD_COLUMN_STATS, DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
+            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
+            DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
+            DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
         };
         let load = |dd_id: u64| self.scan_dd_table(dd_id);
         catalog_from_dd_rows(&DdRowSet {
@@ -436,6 +437,10 @@ impl Database {
             sequences: load(DD_SEQUENCES)?,
             restrictions: load(DD_RESTRICTIONS)?,
             table_stats: load(DD_TABLE_STATS)?,
+            column_stats: load(DD_COLUMN_STATS)?,
+            index_stats: load(DD_INDEX_STATS)?,
+            extended_stats: load(DD_EXTENDED_STATS)?,
+            column_histograms: load(DD_COLUMN_HISTOGRAMS)?,
             innodb_dynamic_metadata: Vec::new(),
         })
     }

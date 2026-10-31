@@ -4496,6 +4496,7 @@ include!("core/database/mvcc.rs");
 include!("core/database/undo_publish.rs");
 include!("core/database/startup.rs");
 include!("core/database/stats_ops.rs");
+include!("core/database/stats_recovery.rs");
 include!("core/database/io_handles.rs");
 include!("core/database/sequences.rs");
 include!("core/database/sequence_persistence.rs");

@@ -1111,7 +1111,11 @@ impl TableSchema {
         let primary_key = match name {
             "schemata" => vec!["name"],
             "tables" => vec!["id"],
-            "table_stats" => vec!["table_id"],
+            "table_stats" => vec!["table_id", "scope_id"],
+            "column_stats" => vec!["table_id", "scope_id", "column_id"],
+            "index_stats" => vec!["table_id", "scope_id", "index_id"],
+            "extended_stats" => vec!["table_id", "scope_id", "kind", "ordinal"],
+            "column_histograms" => vec!["table_id", "column_id"],
             "innodb_dynamic_metadata" => vec!["table_id"],
             "mydb_ddl_retirements" => vec!["table_id", "generation", "index_id"],
             "columns" => vec!["table_id", "column_id"],
