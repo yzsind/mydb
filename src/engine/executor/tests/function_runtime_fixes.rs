@@ -93,25 +93,34 @@ fn deadline_interrupts_stateful_projection_and_session_recovers() {
             .execute_with_session(&mut session, "CREATE SEQUENCE cancel_seq")
             .unwrap();
         engine
+            .execute_with_session(&mut session, "SELECT SETVAL('cancel_seq',1)")
+            .unwrap();
+        engine
             .execute_with_session(&mut session, "SET max_execution_time=10")
             .unwrap();
-        let started = std::time::Instant::now();
         let error = engine
             .execute_with_session(
                 &mut session,
-                &format!("SELECT /*+ {hint} */ SETVAL('cancel_seq',id) FROM cr"),
+                &format!("SELECT /*+ {hint} */ SETVAL('cancel_seq',NEXTVAL('cancel_seq')) FROM cr"),
             )
             .and_then(QueryResponse::materialize)
             .unwrap_err();
         assert_eq!(error.code(), 3024, "{hint}");
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "{hint}: cancellation took {:?}",
-            started.elapsed()
-        );
         engine
             .execute_with_session(&mut session, "SET max_execution_time=0")
             .unwrap();
+        // Verify interrupted work instead of host scheduling latency. A
+        // completed projection would advance the sequence to 100001.
+        let QueryResponse::ResultSet(progress) = engine
+            .execute_with_session(&mut session, "SELECT CURRVAL('cancel_seq')")
+            .unwrap()
+        else {
+            panic!("expected sequence progress");
+        };
+        let Value::Int(progress) = progress.rows[0][0] else {
+            panic!("expected integer sequence progress");
+        };
+        assert!((1..100001).contains(&progress), "{hint}: {progress}");
         assert!(engine
             .execute_with_session(&mut session, "SELECT 1")
             .is_ok());

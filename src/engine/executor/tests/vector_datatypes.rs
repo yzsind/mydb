@@ -1474,7 +1474,12 @@ fn vector_checkpoint_publication_failures_preserve_wal_and_committed_results() {
                     .execute("UPDATE items SET v='[0,0,0,0]' WHERE id=20")
                     .unwrap();
                 let ends = |root: &std::path::Path| {
-                    crate::wal::LogManager::scan(root)
+                    // Recovery scans may truncate the active tail. Freeze and
+                    // flush the writer, then inspect without modifying its file.
+                    let log = engine.database().wal_log();
+                    let mut writer = log.lock();
+                    writer.flush().unwrap();
+                    crate::wal::LogManager::scan_with_mode(root, crate::wal::WalReadMode::Strict)
                         .unwrap()
                         .records
                         .iter()
