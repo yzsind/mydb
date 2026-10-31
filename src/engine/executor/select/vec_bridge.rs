@@ -64,6 +64,8 @@ mod aggregation;
 pub(super) use aggregation::*;
 mod compute;
 use compute::*;
+mod analyzed_workers;
+mod projection_parallel;
 
 mod compact_window;
 mod scan_batch;
@@ -1525,6 +1527,7 @@ pub(crate) struct VecResultBatchInput<'a> {
     pub row_major_projection: bool,
 }
 
+#[derive(Clone)]
 pub(crate) enum VecResultProjection {
     Column(usize),
     Expr(Arc<ExprProgram>),
@@ -1653,6 +1656,42 @@ fn preflight_aggregate_result_layout(
     Some((layout.output_template, output, row_major))
 }
 
+// Keep metadata-sensitive string/mixed extrema on their existing oracle.
+// Direct signed integer operands can use the composable value-only kernel.
+fn integer_extrema_projection_shape(expr: &Expr, template: &[PlanField]) -> bool {
+    let Expr::Function { args, .. } = expr else {
+        return false;
+    };
+    args.len() >= 2
+        && args.iter().all(|arg| {
+            if let Some(index) = expr_column_index_in_template(arg, template) {
+                let field = &template[index];
+                return matches!(
+                    field.column_type,
+                    ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                ) && field.source.flags
+                    & (crate::mysql::protocol::UNSIGNED_FLAG
+                        | crate::mysql::protocol::ENUM_FLAG
+                        | crate::mysql::protocol::SET_FLAG)
+                    == 0;
+            }
+            match arg {
+                Expr::Literal(crate::parser::Literal::Int(_) | crate::parser::Literal::Null)
+                | Expr::BoundValue(Value::Int(_) | Value::Null) => true,
+                Expr::Placeholder(index) => {
+                    crate::engine::params::with_current_param(*index, |value| {
+                        matches!(value, Some(Value::Int(_) | Value::Null))
+                    })
+                }
+                _ => false,
+            }
+        })
+}
+
 fn preflight_result_projection(
     plan: &PhysicalPlan,
     projection: &[SelectItem],
@@ -1716,18 +1755,17 @@ fn preflight_result_projection(
                     output.push(VecResultProjection::Column(index));
                     continue;
                 }
-                // GREATEST/LEAST must aggregate MySQL coercibility and
-                // character-set metadata across every operand. That metadata
-                // can originate at a derived/CTE boundary and is richer than
-                // the value-only function kernel. Evaluate the expression
-                // row-wise against the PlanField template inside this batch;
-                // the input is still consumed exactly once.
-                if matches!(
+                // String/mixed GREATEST/LEAST operands aggregate coercibility
+                // and character-set metadata across derived/CTE boundaries.
+                // Direct signed integers have a value-only proof; other
+                // shapes retain their PlanField-aware row evaluator.
+                let extrema = matches!(
                     expr,
                     Expr::Function { name, .. }
                         if name.eq_ignore_ascii_case("GREATEST")
                             || name.eq_ignore_ascii_case("LEAST")
-                ) {
+                );
+                if extrema && !integer_extrema_projection_shape(expr, &planned_template) {
                     expression_count += 1;
                     has_erroring_expression = true;
                     output.push(VecResultProjection::Scalar(expr.clone()));
@@ -1739,13 +1777,31 @@ fn preflight_result_projection(
                     output.push(VecResultProjection::Scalar(expr.clone()));
                     continue;
                 };
+                if extrema && !program.has_column_contract(&schema) {
+                    expression_count += 1;
+                    has_erroring_expression = true;
+                    output.push(VecResultProjection::Scalar(expr.clone()));
+                    continue;
+                }
                 let mut source_sensitive_string_coercion = false;
                 let mut source_sensitive_number_rendering = false;
+                let mut source_sensitive_value_provenance = false;
                 crate::planner::walk_expr_for_idents(expr, &mut |node| {
                     let Some(index) = expr_column_index_in_template(node, &planned_template) else {
                         return;
                     };
                     let field = &planned_template[index];
+                    source_sensitive_value_provenance |= field.source.flags
+                        & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+                        != 0
+                        || matches!(
+                            field.column_type,
+                            ColumnType::Date
+                                | ColumnType::DateTime
+                                | ColumnType::Timestamp
+                                | ColumnType::Time
+                                | ColumnType::Year
+                        );
                     source_sensitive_number_rendering |= matches!(
                         field.column_type,
                         ColumnType::Float | ColumnType::Double | ColumnType::Bit { .. }
@@ -1767,7 +1823,9 @@ fn preflight_result_projection(
                     };
                 });
                 let value_string_operations = !source_sensitive_number_rendering
-                    && program.has_only_value_string_operations();
+                    && (program.has_only_value_string_operations()
+                        || (!source_sensitive_value_provenance
+                            && program.has_value_only_spatial_root()));
                 // Numeric coercions retain the catalog-aware oracle (TEXT/BLOB
                 // conversions are silent while bounded strings publish 1292).
                 // Proven value-only string operations can use compiled kernels;
@@ -1776,8 +1834,13 @@ fn preflight_result_projection(
                 // This is a kernel choice in the same pipeline: input is not
                 // replayed and the projection remains batch-driven.
                 let typed_value_operations = program.has_column_contract(&schema);
+                let ordered_value_kernel = !source_sensitive_number_rendering
+                    && !source_sensitive_value_provenance
+                    && !source_sensitive_string_coercion
+                    && program.has_ordered_value_kernel_root();
                 if crate::engine::expr::strict_numeric_materialization_active()
                     || (!typed_value_operations
+                        && !ordered_value_kernel
                         && (((source_sensitive_string_coercion || program.capability().may_error)
                             && !value_string_operations)
                             || !program.capability().deterministic
@@ -2061,7 +2124,10 @@ pub(crate) fn try_native_result_batch_input<'a>(
         return Ok(None);
     };
 
-    let Some(VecBatchInput { stream, template }) = try_native_vec_input_stream(db, txn, plan)?
+    let Some(VecBatchInput {
+        mut stream,
+        mut template,
+    }) = try_native_vec_input_stream(db, txn, plan)?
     else {
         return Ok(None);
     };
@@ -2076,6 +2142,33 @@ pub(crate) fn try_native_result_batch_input<'a>(
         ));
     }
     NATIVE_RESULT_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut output = output;
+    let mut row_major_projection = row_major_projection;
+    if stream.is_native_parallel_scan()
+        && output
+            .iter()
+            .any(|item| matches!(item, VecResultProjection::Expr(_)))
+    {
+        if let Some(projected_template) = query_projection_template(projection, &template, &output)
+        {
+            if let Some(projected) = projection_parallel::try_parallel_projection(
+                db,
+                txn,
+                plan,
+                &mut stream,
+                &output,
+                &projected_template,
+            )? {
+                stream = projected;
+                template = projected_template;
+                output = (0..template.len())
+                    .map(VecResultProjection::Column)
+                    .collect();
+                row_major_projection = false;
+            }
+        }
+    }
+
     Ok(Some(VecResultBatchInput {
         stream,
         projection: output,
@@ -2335,6 +2428,27 @@ impl AnalyzedBatchOperator<'_> {
 }
 
 impl BatchOperator for AnalyzedBatchOperator<'_> {
+    fn is_native_parallel_scan(&self) -> bool {
+        self.inner.is_native_parallel_scan()
+    }
+
+    fn take_parallel_workers(
+        &mut self,
+        degree: usize,
+    ) -> Result<
+        Option<Vec<Box<dyn crate::engine::executor::vec::stream::ParallelBatchWorker>>>,
+        QueryError,
+    > {
+        let Some(workers) = self.inner.take_parallel_workers(degree)? else {
+            return Ok(None);
+        };
+        Ok(Some(analyzed_workers::wrap(
+            workers,
+            self.plan,
+            self.partition_visits.clone(),
+        )))
+    }
+
     fn prefer_key_locality(&mut self, columns: &[usize]) -> bool {
         self.inner.prefer_key_locality(columns)
     }
@@ -2690,7 +2804,12 @@ impl NativePlanBatchCursor {
             .unwrap_or(Ok(()));
         match self.budget.terminal_oom() {
             Some(error) => Err(error),
-            None => result,
+            None => {
+                result?;
+                // Cancellation can arrive while waiting for the final channel
+                // close or joining a producer, after the entry checkpoint.
+                self.check_cancelled()
+            }
         }
     }
 }
@@ -3081,7 +3200,10 @@ impl BatchOperator for QueryProjectionBatchOperator<'_> {
                             && precomputed.get(index).and_then(Option::as_ref).is_none()
                 });
             let mut row_values = Vec::with_capacity(batch.columns().len());
-            for row in visible {
+            for (ordinal, row) in visible.into_iter().enumerate() {
+                if ordinal & crate::engine::cancel::SCALAR_ROW_CANCEL_MASK == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
                 if needs_row {
                     row_values.clear();
                     row_values.extend(
@@ -3429,12 +3551,22 @@ fn try_build_query_output_batch<'a>(
     else {
         return Ok(None);
     };
-    let Some(input) = try_native_vec_input_stream(db, txn, plan)? else {
+    let Some(mut input) = try_native_vec_input_stream(db, txn, plan)? else {
         return Ok(None);
     };
     let Some(template) = query_projection_template(projection, &planned_template, &lowered) else {
         return Ok(None);
     };
+    if let Some(stream) = projection_parallel::try_parallel_projection(
+        db,
+        txn,
+        plan,
+        &mut input.stream,
+        &lowered,
+        &template,
+    )? {
+        return Ok(Some(VecBatchInput { stream, template }));
+    }
     let schema = template_to_batch_schema(&template);
     Ok(Some(VecBatchInput {
         stream: Box::new(QueryProjectionBatchOperator {

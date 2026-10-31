@@ -401,8 +401,13 @@ impl<'a> JsonbRef<'a> {
     /// The bytes of exactly this node (tag through end), copyable into a
     /// fresh `Value::Json`.
     pub(crate) fn to_owned_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+
+    /// Borrow exactly this node, excluding any following siblings.
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
         let len = Self::node_len(self.bytes).unwrap_or(self.bytes.len());
-        self.bytes[..len.min(self.bytes.len())].to_vec()
+        &self.bytes[..len.min(self.bytes.len())]
     }
 
     pub(crate) fn json_type(&self) -> JsonType {

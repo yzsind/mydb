@@ -10,9 +10,13 @@ impl Database {
         // its complete small record instead of replacing it on every clean CP.
         if self.vector_purge_queue.lock().is_empty() && path.try_exists().map_err(io_err)? {
             let file = fs::File::open(&path).map_err(io_err)?;
-            if file.metadata().map_err(io_err)?.len() <= 17 {
+            if file.metadata().map_err(io_err)?.len()
+                <= vector::persistence::EMPTY_COUNT_FILE_LEN as u64
+            {
                 let mut bytes = Vec::new();
-                file.take(18).read_to_end(&mut bytes).map_err(io_err)?;
+                file.take(vector::persistence::EMPTY_COUNT_FILE_LEN as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(io_err)?;
                 let validated = (|| -> Result<(), QueryError> {
                     let mut reader = vector::persistence::Reader::new(&bytes, 9)?;
                     if reader.count(52)? != 0 {
@@ -66,7 +70,7 @@ impl Database {
         out.flush().map_err(io_err)?;
         let file = out.into_inner().map_err(|err| io_err(err.into_error()))?;
         crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
-        fs::rename(&tmp, &path).map_err(io_err)?;
+        rename_owned_file(&tmp, &path).map_err(io_err)?;
         crate::platform::fs::sync_path(path.parent().expect("system directory")).map_err(io_err)
     }
 

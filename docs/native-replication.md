@@ -133,6 +133,10 @@ replacement replicas and guarantee conditions.
 
 ### Bootstrap and failure limits
 
+Physical replicas report `read_only=ON` and `super_read_only=ON`, reflecting the
+effective write policy. These variables cannot disable physical-replica write
+protection; promotion changes the role and removes that role-imposed policy.
+
 `MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS` defaults to 10 failed seed attempts. Exhaustion exits with the last error and preserves files for repair and restart; set it to 0 for indefinite retries. Each backup frame read has a 60-second timeout. A live seed slot retains WAL through transfers longer than `MYDB_REPL_SLOT_TIMEOUT_MS`, subject to the configured WAL byte cap. The seed lease ends at the first streaming ACK, rather than when bytes enter TCP buffers; after disconnect it allows at least 60 seconds for installation/recovery before the slot can expire. Snapshot file descriptors are opened one at a time during transfer; abandoned private snapshots are removed on startup under the data-directory lock.
 
 The handshake advertises the source heartbeat interval. The replica's idle watchdog uses six times the larger peer interval (at least five seconds). Configuration/format handshake rejections stop the receiver with a visible status instead of retrying indefinitely. Five repeated online apply failures without progress also stop the receiver; repair the cause and run `START MYDB REPLICATION`. Transient overlap-read I/O errors do not mark healthy WAL as a poison frame.

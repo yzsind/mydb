@@ -60,7 +60,10 @@ fn collect_prepared_metadata_source(
         let record = record?;
         match &record.payload {
             WalPayload::PrepareTxn {
-                prepare_scn, mdl_locks, binlog, ..
+                prepare_scn,
+                mdl_locks,
+                binlog,
+                ..
             } => {
                 prepared.prepare_scn.insert(record.txn_id, *prepare_scn);
                 if mdl_locks.is_empty() {
@@ -192,11 +195,25 @@ impl Database {
         Self::open_impl(data_dir.into(), config, RecoveryContext::default(), None)
     }
 
-    pub fn open_image(data_dir:impl Into<PathBuf>,runtime_directory:PathBuf)->Result<Self,QueryError>{
-        let data_dir=data_dir.into();
-        if !crate::storage::image::is_snapshot(&data_dir)?{return Err(error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"direct image open requires a completed read-only image"));}
-        let mut context=RecoveryContext::default();context.mode=DatabaseOpenMode::ReadOnlyImage;
-        Self::open_impl(data_dir,StorageConfig::from_env(),context,Some(runtime_directory))
+    pub fn open_image(
+        data_dir: impl Into<PathBuf>,
+        runtime_directory: PathBuf,
+    ) -> Result<Self, QueryError> {
+        let data_dir = data_dir.into();
+        if !crate::storage::image::is_snapshot(&data_dir)? {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                "direct image open requires a completed read-only image",
+            ));
+        }
+        let mut context = RecoveryContext::default();
+        context.mode = DatabaseOpenMode::ReadOnlyImage;
+        Self::open_impl(
+            data_dir,
+            StorageConfig::from_env(),
+            context,
+            Some(runtime_directory),
+        )
     }
 
     pub(crate) fn open_for_backup_preparation(
@@ -235,7 +252,7 @@ impl Database {
         mut data_dir: PathBuf,
         mut config: StorageConfig,
         context: RecoveryContext,
-        runtime_directory:Option<PathBuf>,
+        runtime_directory: Option<PathBuf>,
     ) -> Result<Self, QueryError> {
         let preparing = matches!(
             context.mode,
@@ -243,8 +260,12 @@ impl Database {
         );
         let startup_started = Instant::now();
         let native_snapshot = crate::storage::image::inspect(&data_dir)?;
-        if let Some(image)=&native_snapshot{
-            if image.state!=crate::storage::image::State::Writable||crate::startup_config::var("MYDB_UNDO_RETENTION_MS").is_err(){config.undo_retention=Duration::from_millis(image.manifest.history_retention_ms);}
+        if let Some(image) = &native_snapshot {
+            if image.state != crate::storage::image::State::Writable
+                || crate::startup_config::var("MYDB_UNDO_RETENTION_MS").is_err()
+            {
+                config.undo_retention = Duration::from_millis(image.manifest.history_retention_ms);
+            }
         }
         let native_clock = native_snapshot
             .as_ref()
@@ -262,14 +283,28 @@ impl Database {
             Some(snapshot) => snapshot.state == crate::storage::image::State::ReadOnly,
             None => false,
         };
-        if snapshot_read_only{data_dir=fs::canonicalize(&data_dir).map_err(io_err)?;}
-        let image_repository_lease=if snapshot_read_only {
-            if let Some(repository)=crate::storage::image_io::repository_ancestor(&data_dir){
-                if context.mode!=DatabaseOpenMode::ReadOnlyImage{return Err(error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"repository bases require --backup-repository, --base and an external --runtime-dir"));}
-                let file=std::fs::File::open(repository.join("gc.lock")).map_err(io_err)?;
-                file.try_lock_shared().map_err(|e|error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,format!("repository GC is busy: {e}")))?;Some(file)
-            }else{None}
-        }else{None};
+        if snapshot_read_only {
+            data_dir = fs::canonicalize(&data_dir).map_err(io_err)?;
+        }
+        let image_repository_lease = if snapshot_read_only {
+            if let Some(repository) = crate::storage::image_io::repository_ancestor(&data_dir) {
+                if context.mode != DatabaseOpenMode::ReadOnlyImage {
+                    return Err(error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"repository bases require --backup-repository, --base and an external --runtime-dir"));
+                }
+                let file = std::fs::File::open(repository.join("gc.lock")).map_err(io_err)?;
+                file.try_lock_shared().map_err(|e| {
+                    error(
+                        crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                        format!("repository GC is busy: {e}"),
+                    )
+                })?;
+                Some(file)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let snapshot_runtime = if snapshot_read_only {
             if config.durability == DurabilityMode::Memory {
                 return Err(error(
@@ -278,7 +313,11 @@ impl Database {
                 ));
             }
             data_dir = fs::canonicalize(&data_dir).map_err(io_err)?;
-            Some(if let Some(runtime)=runtime_directory.as_ref(){crate::storage::image_io::SnapshotRuntime::open_with_temp_dir(&data_dir,runtime)?}else{crate::storage::image_io::SnapshotRuntime::open(&data_dir)?})
+            Some(if let Some(runtime) = runtime_directory.as_ref() {
+                crate::storage::image_io::SnapshotRuntime::open_with_temp_dir(&data_dir, runtime)?
+            } else {
+                crate::storage::image_io::SnapshotRuntime::open(&data_dir)?
+            })
         } else {
             None
         };
@@ -317,6 +356,19 @@ impl Database {
             // `Database` drops (or the process exits / re-execs).
         }
         let dir_lock = crate::storage::dir_lock::DataDirLock::acquire(&data_dir)?;
+        if snapshot_read_only {
+            crate::storage::control::Control::load(&data_dir)?.ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "image storage control is missing",
+                )
+            })?;
+        } else {
+            crate::storage::control::Control::admit(&data_dir)?;
+        }
+        crate::binlog::validate_persisted_format(&data_dir)?;
+        crate::repl::role::load(&data_dir).map_err(io_err)?;
+        crate::repl::replica::progress::load_progress(&data_dir).map_err(io_err)?;
         if !snapshot_read_only {
             crate::storage::image::cleanup_abandoned_staging(&data_dir)?;
             crate::repl::base_backup::cleanup_abandoned_snapshots(&data_dir)?;
@@ -350,7 +402,11 @@ impl Database {
             // Clean up hash join spill temp directories left by an abnormally exited previous process.
             crate::engine::executor::select::grace::cleanup_orphan_tmp_dirs(&data_dir);
         }
-        if data_dir.join("system/index-maintenance.failed").try_exists().map_err(io_err)? {
+        if data_dir
+            .join("system/index-maintenance.failed")
+            .try_exists()
+            .map_err(io_err)?
+        {
             return Err(error(crate::error::catalog::ER_INDEX_CORRUPT,
                 "persistent vector maintenance failure requires explicit repair; recovery has preserved the failed files"));
         }
@@ -358,19 +414,42 @@ impl Database {
             validate_heap_file_lengths(&data_dir)?;
         }
         let capture = crate::storage::capture::CaptureState::open(&data_dir, snapshot_read_only)?;
-        if capture.floor().is_some()&&config.durability==DurabilityMode::Memory{return Err(error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"a WAL-protected source cannot open in memory durability mode"));}
-        if let Some(retention)=capture.protected_history_retention_ms()?{
-            if config.undo_retention!=Duration::from_millis(retention){log_message(format_args!("mydb: restoring protected temporal history retention {retention}ms before WAL recovery"));}
-            config.undo_retention=Duration::from_millis(retention);
+        if capture.floor().is_some() && config.durability == DurabilityMode::Memory {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                "a WAL-protected source cannot open in memory durability mode",
+            ));
+        }
+        if let Some(retention) = capture.protected_history_retention_ms()? {
+            if config.undo_retention != Duration::from_millis(retention) {
+                log_message(format_args!("mydb: restoring protected temporal history retention {retention}ms before WAL recovery"));
+            }
+            config.undo_retention = Duration::from_millis(retention);
         }
         let t = Instant::now();
         let recovery_result = if snapshot_read_only {
             let scan =
                 LogManager::scan_replay_with_mode(&data_dir, crate::wal::WalReadMode::ReadOnly)?;
             let source = crate::storage::snapshot::SourceVisibility::from_wal(&scan.records)?;
-            let image = crate::storage::image::inspect(&data_dir)?.ok_or_else(|| error(crate::error::catalog::MYDB_ER_BACKUP_FAILED, "missing image"))?;
-            if source != image.seal.as_ref().ok_or_else(|| error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"missing seal"))?.visibility_state {
-                return Err(error(crate::error::catalog::MYDB_ER_BACKUP_FAILED,"image transaction state mismatch"));
+            let image = crate::storage::image::inspect(&data_dir)?.ok_or_else(|| {
+                error(
+                    crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                    "missing image",
+                )
+            })?;
+            if source
+                != image
+                    .seal
+                    .as_ref()
+                    .ok_or_else(|| {
+                        error(crate::error::catalog::MYDB_ER_BACKUP_FAILED, "missing seal")
+                    })?
+                    .visibility_state
+            {
+                return Err(error(
+                    crate::error::catalog::MYDB_ER_BACKUP_FAILED,
+                    "image transaction state mismatch",
+                ));
             }
             RecoveryResult {
                 summary: RecoverySummary {
@@ -457,9 +536,13 @@ impl Database {
             .into_iter()
             .map(|(txn_id, _)| txn_id)
             .collect::<HashSet<_>>();
-        let retain_since_us = (if context.is_restore() { context.target_time_us.unwrap_or(native_clock) / 1_000 } else { current_unix_ms() })
-            .saturating_sub(config.undo_retention.as_millis().min(u128::from(u64::MAX)) as u64)
-            .saturating_mul(1_000);
+        let retain_since_us = (if context.is_restore() {
+            context.target_time_us.unwrap_or(native_clock) / 1_000
+        } else {
+            current_unix_ms()
+        })
+        .saturating_sub(config.undo_retention.as_millis().min(u128::from(u64::MAX)) as u64)
+        .saturating_mul(1_000);
         retained_undo_txns.extend(temporal_history.txn_ids_committed_since(retain_since_us));
         let runtime_config = RuntimeStorageConfig::from_storage_config(&config);
         // M3.1 - Use persistent undo journal when not running in Memory mode.
@@ -469,7 +552,9 @@ impl Database {
         } else if config.durability == DurabilityMode::Memory {
             UndoTablespace::from_wal(&scan.records)?
         } else {
-            if context.mode == DatabaseOpenMode::SealBaseline || (!context.is_restore() && capture.floor().is_some()) {
+            if context.mode == DatabaseOpenMode::SealBaseline
+                || (!context.is_restore() && capture.floor().is_some())
+            {
                 UndoTablespace::open_preserving_source(
                     &scan.records,
                     &data_dir,
@@ -525,27 +610,64 @@ impl Database {
             // coalesced write, still no fsync) at each commit barrier before
             // the client is acked. Memory mode never persists, so it stays off.
             log.set_write_buffer_enabled(config.durability != DurabilityMode::Memory)?;
-            if !context.is_restore()&&!snapshot_read_only {
-                if let Some(floor)=capture.leases().get("archive").map(|l|l.floor).or_else(||capture.floor()){
-                    let prefixes=log.pin_prefix_after(floor-1,None)?;let mut pending=0u64;
-                    for prefix in &prefixes {crate::wal::visit_pinned_range(prefix,prefix.first_lsn.max(floor)-1,u64::MAX,|_,_,_,_,raw|{pending=pending.saturating_add(raw.len() as u64);Ok(())})?;}
-                    capture.budget.pending.store(pending,Ordering::Release);
+            if !context.is_restore() && !snapshot_read_only {
+                if let Some(floor) = capture
+                    .leases()
+                    .get("archive")
+                    .map(|l| l.floor)
+                    .or_else(|| capture.floor())
+                {
+                    let prefixes = log.pin_prefix_after(floor - 1, None)?;
+                    let mut pending = 0u64;
+                    for prefix in &prefixes {
+                        crate::wal::visit_pinned_range(
+                            prefix,
+                            prefix.first_lsn.max(floor) - 1,
+                            u64::MAX,
+                            |_, _, _, _, raw| {
+                                pending = pending.saturating_add(raw.len() as u64);
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    capture.budget.pending.store(pending, Ordering::Release);
                 }
                 log.bind_wal_budget(Arc::clone(&capture.budget));
             }
             let atomics = log.state_atomics();
-            (Arc::new(parking_lot::Mutex::new(log)), atomics)
+            let log = Arc::new(parking_lot::Mutex::new(log));
+            atomics
+                .transaction_buffer_owner
+                .store(Arc::as_ptr(&log) as usize as u64, Ordering::Release);
+            (log, atomics)
         };
         // All transaction/undo/log consumers are finished. Only zone deltas
         // remain; release the general recovery directory before index builds.
-        let zone_replay = scan.select(&[ReplayType::ZoneMapMergeBatch, ReplayType::VectorIndexBatch, ReplayType::VectorIndexModel, ReplayType::VectorIndexComplete, ReplayType::VectorIndexImage,
-            ReplayType::CommitTxn, ReplayType::AbortTxn, ReplayType::EndTxn, ReplayType::RollbackTo])?;
+        let zone_replay = scan.select(&[
+            ReplayType::ZoneMapMergeBatch,
+            ReplayType::VectorIndexBatch,
+            ReplayType::VectorIndexModel,
+            ReplayType::VectorIndexComplete,
+            ReplayType::VectorIndexImage,
+            ReplayType::CommitTxn,
+            ReplayType::AbortTxn,
+            ReplayType::EndTxn,
+            ReplayType::RollbackTo,
+        ])?;
         crate::engine::executor::mem_budget::validate_controlled_memory_split(
             runtime_config.buffer_pool_pages,
         )?;
         crate::engine::executor::mem_budget::set_controlled_buffer_limit_pages(
             runtime_config.buffer_pool_pages,
         );
+        let undo_append_shards = undo.concurrent_persistent_append_shards();
+        let undo_resident_admission = undo.resident_admission();
+        let undo_concurrent_append_eligible =
+            undo.concurrent_persistent_append_eligibility_handle();
+        // Admit fixed metadata before starting background workers, so an OOM
+        // during startup cannot leave an unattached worker pool running.
+        let undo = UndoLatch::new(undo)?;
+        let mdl = MdlManager::try_new()?;
         let buffer_pool = BufferPool::new_with_options(
             runtime_config.buffer_pool_pages,
             log.clone(),
@@ -560,18 +682,16 @@ impl Database {
         let index_repair_state = Arc::clone(&txns.index_repairs);
         let index_repair_version = Arc::clone(&txns.index_repair_version);
         let index_repair_epochs = Arc::clone(&txns.index_repair_epochs);
-        let durability_worker =
-            if !snapshot_read_only && crate::storage::txn::durability_worker_enabled() {
-                DurabilityWorker::start(Arc::clone(&log))
-            } else {
-                DurabilityWorker::disabled()
-            };
-        let undo_append_shards = undo.concurrent_persistent_append_shards();
-        let undo_resident_admission = undo.resident_admission();
-        let undo_concurrent_append_eligible =
-            undo.concurrent_persistent_append_eligibility_handle();
-        let source_clock=log.lock().source_clock();
-        source_clock.fetch_max(commit_hlc_seed,Ordering::Release);
+        let durability_worker = if !snapshot_read_only
+            && config.durability != DurabilityMode::Memory
+            && crate::storage::txn::durability_worker_enabled()
+        {
+            DurabilityWorker::start(Arc::clone(&log))
+        } else {
+            DurabilityWorker::disabled()
+        };
+        let source_clock = log.lock().source_clock();
+        source_clock.fetch_max(commit_hlc_seed, Ordering::Release);
         let mut db = Self {
             _snapshot_runtime: snapshot_runtime,
             _image_repository_lease: image_repository_lease,
@@ -582,7 +702,11 @@ impl Database {
             } else {
                 context.mode
             },
-            recovery_context: if snapshot_read_only{context.at_source_time(native_clock)}else{context},
+            recovery_context: if snapshot_read_only {
+                context.at_source_time(native_clock)
+            } else {
+                context
+            },
             primary_definition_highwater: AtomicU64::new(0),
             read_definition_highwater: AtomicU64::new(0),
             visibility_cache_id: NEXT_VISIBILITY_CACHE_ID.fetch_add(1, Ordering::Relaxed),
@@ -605,12 +729,11 @@ impl Database {
             unique_reservations: lock_manager.unique_reservation_filter(),
             lock_log_presence: lock_manager.lock_log_presence(),
             lock_manager: parking_lot::RwLock::new(lock_manager),
-            mdl: MdlManager::default(),
-            undo: UndoLatch::new(undo),
+            mdl,
+            undo,
             undo_append_shards,
             undo_resident_admission,
             undo_append_next_shard: AtomicU64::new(0),
-            undo_publish: UndoPublishQueue::default(),
             undo_concurrent_append_eligible,
             active_snapshots: (0..ACTIVE_SNAPSHOT_SHARDS)
                 .map(|_| Mutex::new(Default::default()))
@@ -850,8 +973,9 @@ impl Database {
             } else if db.config.durability == DurabilityMode::Memory {
                 crate::util::env::var_os("MYDB_TEST_MEMORY_CATALOG")
             } else if clean_checkpoint_startup
-                && crate::util::env::var_os("MYDB_TEST_SEED_CATALOG_SOURCE")
-                    .is_some_and(|source| Some(source) == crate::util::env::var_os("MYDB_TEST_SEED_DIR"))
+                && crate::util::env::var_os("MYDB_TEST_SEED_CATALOG_SOURCE").is_some_and(|source| {
+                    Some(source) == crate::util::env::var_os("MYDB_TEST_SEED_DIR")
+                })
             {
                 crate::util::env::var_os("MYDB_TEST_SEED_CATALOG")
             } else {
@@ -872,8 +996,16 @@ impl Database {
         }
         #[cfg(not(test))]
         db.load_or_bootstrap_catalog()?;
-        if db.data_dir.join("system/index-maintenance.failed").try_exists().map_err(io_err)? {
-            return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "persistent vector maintenance worker failure requires explicit repair"));
+        if db
+            .data_dir
+            .join("system/index-maintenance.failed")
+            .try_exists()
+            .map_err(io_err)?
+        {
+            return Err(error(
+                crate::error::catalog::ER_INDEX_CORRUPT,
+                "persistent vector maintenance worker failure requires explicit repair",
+            ));
         }
 
         db.load_vector_purge_ledger()?;
@@ -934,6 +1066,9 @@ impl Database {
         }
         db.recover_sequence_values(sequence_recovery)?;
         db.initialize_sequence_sync()?;
+        if physical_replica {
+            db.recover_replica_statistics()?;
+        }
         // Reconcile any partition-reorg journals left by a crash mid
         // build-then-swap (§2.1). Must run after the catalog is loaded and
         // WAL redo/undo have settled, so commit state is derivable from the
@@ -965,7 +1100,9 @@ impl Database {
         // summary. Persisted globals have the highest startup priority.
         db.initialize_zone_map_enabled()?;
         let zone_replay_started = Instant::now();
-        if context.continuation_base.is_none(){db.replay_zone_map_wal(&zone_replay)?;}
+        if context.continuation_base.is_none() {
+            db.replay_zone_map_wal(&zone_replay)?;
+        }
         if startup_progress_logging_enabled() {
             log_message(format_args!(
                 "mydb recovery: zone summaries {} records in {}ms",
@@ -974,26 +1111,38 @@ impl Database {
             ));
         }
         db.replay_persistent_vector_wal(&zone_replay)?;
-        if !snapshot_read_only && !db.physical_replica_mode() && db.open_mode != DatabaseOpenMode::SealBaseline {
+        if !snapshot_read_only
+            && !db.physical_replica_mode()
+            && db.open_mode != DatabaseOpenMode::SealBaseline
+        {
             while db.vector_purges_pending.load(Ordering::Acquire) != 0 {
                 let completed = db.drain_vector_purges();
                 db.ensure_operational()?;
-                if completed == 0 { return Err(vector::persistence::corrupt()); }
+                if completed == 0 {
+                    return Err(vector::persistence::corrupt());
+                }
             }
         }
         db.restore_prepared_vector_mutations(&zone_replay)?;
         db.restore_replica_vector_completion(&zone_replay)?;
-        if db.open_mode == DatabaseOpenMode::ReadWrite && !db.physical_replica_mode() { db.resume_failed_vector_jobs()?; }
+        if db.open_mode == DatabaseOpenMode::ReadWrite && !db.physical_replica_mode() {
+            db.resume_failed_vector_jobs()?;
+        }
         drop(zone_replay);
         // Re-publish XA branches whose `PrepareTxn` records survived the
         // crash. `TransactionManager::from_wal` already marked the
         // matching slots as PREPARED and replayed their locks; this just
         // mirrors them into `Database.prepared_xa` so XA RECOVER / XA
         // COMMIT / XA ROLLBACK can find them.
-        db.rebuild_prepared_xa_from_slots(&prepared_metadata.binlog, &prepared_metadata.prepare_scn);
+        db.rebuild_prepared_xa_from_slots(
+            &prepared_metadata.binlog,
+            &prepared_metadata.prepare_scn,
+        );
         db.recover_binlog_intent_files()?;
         db.restore_inflight_index_repairs()?;
-        if !snapshot_read_only { db.recover_vector_completion_intents()?; }
+        if !snapshot_read_only {
+            db.recover_vector_completion_intents()?;
+        }
         db.rebuild_prepared_mdl_from_wal(&prepared_metadata.mdl);
         // P2 — table locks are now owned by the sharded `table_locks_sharded`
         // store, but crash recovery (`from_wal` → `install_prepared_locks`)
@@ -1133,6 +1282,11 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn stop_buffer_pool_io_for_test(&self) {
+        self.buffer_pool.shutdown_flusher();
+    }
+
+    #[cfg(test)]
     fn open_with_durability(
         data_dir: impl Into<PathBuf>,
         durability: DurabilityMode,
@@ -1159,7 +1313,10 @@ impl Database {
 }
 
 #[cfg(test)]
-fn seed_empty_test_data_dir(data_dir: &Path, durability: DurabilityMode) -> Result<bool, QueryError> {
+fn seed_empty_test_data_dir(
+    data_dir: &Path,
+    durability: DurabilityMode,
+) -> Result<bool, QueryError> {
     const OPT_OUT_MARKER: &str = ".mydb-test-fresh-data-dir";
 
     let seed = if durability == DurabilityMode::Memory {

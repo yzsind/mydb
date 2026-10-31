@@ -403,8 +403,7 @@ pub(super) fn reusable_memo(
     let valid = |memo: &PreparedSelectMemo, selectivity: &mut Option<String>| {
         semantics_match(&memo.semantics, &memo.optimizer_switch, session)
             && memo_catalog_is_valid(db, memo, current_epoch)
-            && *memo.parameter_plan_signature
-                == current_parameter_signature(db, memo, params, selectivity)
+            && current_parameter_signature_matches(db, memo, params, selectivity)
     };
     if valid(rp, &mut selectivity) {
         return Some(Arc::clone(rp));
@@ -421,20 +420,31 @@ pub(super) fn reusable_memo(
 
 /// The signature `memo` would record for `params`. The selectivity tier is
 /// computed at most once per EXECUTE and shared by every candidate memo.
-fn current_parameter_signature(
+fn current_parameter_signature_matches(
     db: &Database,
     memo: &PreparedSelectMemo,
     params: &[crate::types::Value],
     selectivity: &mut Option<String>,
-) -> String {
-    let mut signature =
-        crate::engine::auto_param::parameter_plan_signature(&memo.presentation_select, params);
-    if !has_parameter_independent_cardinality(&memo.compiled) {
-        signature.push_str(selectivity.get_or_insert_with(|| {
-            crate::planner::parameter_selectivity_signature(db, &memo.presentation_select, params)
-        }));
-    }
-    signature
+) -> bool {
+    let suffix = if has_parameter_independent_cardinality(&memo.compiled) {
+        ""
+    } else {
+        selectivity
+            .get_or_insert_with(|| {
+                crate::planner::parameter_selectivity_signature(
+                    db,
+                    &memo.presentation_select,
+                    params,
+                )
+            })
+            .as_str()
+    };
+    crate::engine::auto_param::parameter_plan_signature_matches(
+        &memo.presentation_select,
+        params,
+        &memo.parameter_plan_signature,
+        suffix,
+    )
 }
 
 /// The lowered operator already proved an exact, residual-free unique probe.

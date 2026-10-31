@@ -3,8 +3,8 @@ use super::*;
 use crate::engine::geo::Mbr;
 
 pub(super) const MAGIC: u32 = 0x52545031;
-const VERSION: u16 = 1;
-const HEADER: usize = 32;
+const VERSION: u16 = crate::storage::format_versions::SPATIAL_PAGE_VERSION;
+const HEADER: usize = 64;
 const CAPACITY: usize = (PAGE_SIZE - HEADER) / 40;
 const MIN_FILL: usize = CAPACITY * 2 / 5;
 const MAX_BATCH_PAGES: usize = 128;
@@ -112,11 +112,11 @@ struct Meta {
 impl Meta {
     fn encode(self) -> Vec<u8> {
         let mut bytes = page(0);
-        write_u64(&mut bytes, 32, self.root);
-        write_u64(&mut bytes, 40, self.next);
-        write_u64(&mut bytes, 48, self.free);
-        write_u64(&mut bytes, 56, self.index_id);
-        write_u16(&mut bytes, 64, self.height);
+        write_u64(&mut bytes, 64, self.root);
+        write_u64(&mut bytes, 72, self.next);
+        write_u64(&mut bytes, 80, self.free);
+        write_u64(&mut bytes, 88, self.index_id);
+        write_u16(&mut bytes, 96, self.height);
         refresh_page_checksum(&mut bytes);
         bytes
     }
@@ -126,11 +126,11 @@ impl Meta {
             return Err(corrupt("expected meta page"));
         }
         let m = Self {
-            root: read_u64(bytes, 32),
-            next: read_u64(bytes, 40),
-            free: read_u64(bytes, 48),
-            index_id: read_u64(bytes, 56),
-            height: read_u16(bytes, 64),
+            root: read_u64(bytes, 64),
+            next: read_u64(bytes, 72),
+            free: read_u64(bytes, 80),
+            index_id: read_u64(bytes, 88),
+            height: read_u16(bytes, 96),
         };
         if m.root == 0 || m.root >= m.next || m.free >= m.next || m.height == 0 || m.height > 65 {
             return Err(corrupt("invalid root or allocator"));
@@ -371,6 +371,10 @@ impl SpatialIndexFile {
         txn_id: u64,
         changes: &[(WalIndexOpKind, Item)],
     ) -> Result<(), QueryError> {
+        for (&id, image) in &mut pages {
+            stamp_page_owner(image, &self.file_key.owner, id);
+            refresh_page_checksum(image);
+        }
         if pages.len() > MAX_BATCH_PAGES {
             return Err(corrupt("structural batch exceeds page limit"));
         }
@@ -424,7 +428,7 @@ impl SpatialIndexFile {
             }
             log.append_pre_encoded(record)?
         };
-        let next = pages.get(&0).map(|p| read_u64(p, 40));
+        let next = pages.get(&0).map(|p| read_u64(p, 72));
         // The complete batch is in WAL before any page becomes evictable.
         #[cfg(test)]
         let inject_crash = !CRASH_STRUCTURAL_ONLY.with(|flag| flag.get())
@@ -1418,6 +1422,31 @@ impl SpatialIndexFile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_format_golden_spatial_pages() {
+        use crate::storage::format_golden::golden;
+        let mut meta = Meta {
+            root: 1,
+            next: 2,
+            free: 0,
+            index_id: 17,
+            height: 1,
+        }
+        .encode();
+        stamp_page_owner(&mut meta, &[0xa5; 16], 0);
+        set_page_lsn_if_formatted(&mut meta, 17);
+        golden!("spatial-meta", &meta);
+        let mut node = Node {
+            level: 0,
+            items: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        stamp_page_owner(&mut node, &[0xa5; 16], 1);
+        set_page_lsn_if_formatted(&mut node, 17);
+        golden!("spatial-page", &node);
+    }
+
     use super::*;
     fn directory() -> tempfile::TempDir {
         fs::create_dir_all("/tmp/mydb").unwrap();
@@ -1516,6 +1545,12 @@ mod tests {
         let last = tree.log.lock().last_lsn();
         LogManager::sync_durable_to(&tree.log, last).unwrap();
         let scan = LogManager::scan(source.path()).unwrap();
+        fs::create_dir_all(target.path().join("system")).unwrap();
+        fs::copy(
+            source.path().join(crate::storage::control::PATH),
+            target.path().join(crate::storage::control::PATH),
+        )
+        .unwrap();
         for record in &scan.records {
             if let WalPayload::SpatialPageBatch { path, bytes } = &record.payload {
                 redo(target.path(), path, bytes, record.lsn).unwrap();

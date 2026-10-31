@@ -1389,7 +1389,7 @@ fn temporary_audit_session_quota_counts_storage_and_releases_on_truncate_drop() 
     let mut owner = SessionContext::default();
     owner.temp_quota = Arc::new(crate::storage::temp_quota::SessionTempQuota::new(
         1,
-        16 * 1024,
+        32 * 1024,
         1024 * 1024,
     ));
     let mut other = SessionContext::default();
@@ -1411,7 +1411,7 @@ fn temporary_audit_session_quota_counts_storage_and_releases_on_truncate_drop() 
         .execute_with_session(&mut owner, "INSERT INTO capped VALUES(1,'small')")
         .unwrap();
     let before = owner.temp_quota.usage().1;
-    assert_eq!(before, 16 * 1024);
+    assert_eq!(before, 32 * 1024);
     assert_eq!(
         engine
             .execute_with_session(
@@ -1450,7 +1450,7 @@ fn temporary_audit_session_quota_counts_storage_and_releases_on_truncate_drop() 
     engine
         .execute_with_session(&mut owner, "TRUNCATE TABLE capped")
         .unwrap();
-    assert_eq!(owner.temp_quota.usage().1, 0);
+    assert_eq!(owner.temp_quota.usage().1, 16 * 1024);
     engine
         .execute_with_session(&mut owner, "INSERT INTO capped VALUES(3,'again')")
         .unwrap();
@@ -1525,7 +1525,7 @@ fn temporary_audit_session_index_quota_and_snapshot_rollback() {
     let mut session = SessionContext::default();
     session.temp_quota = Arc::new(crate::storage::temp_quota::SessionTempQuota::new(
         10,
-        32 * 1024,
+        64 * 1024,
         1024 * 1024,
     ));
     engine
@@ -1534,7 +1534,7 @@ fn temporary_audit_session_index_quota_and_snapshot_rollback() {
     engine
         .execute_with_session(&mut session, "INSERT INTO index_capped VALUES(1)")
         .unwrap();
-    // Snapshot (16KB) + backing heap (16KB) exhausts the budget before a new
+    // Snapshot (32KB) + backing heap (32KB) exhausts the budget before a new
     // B-tree can be built. The failed ALTER must restore the original schema.
     assert_eq!(
         engine
@@ -1543,7 +1543,7 @@ fn temporary_audit_session_index_quota_and_snapshot_rollback() {
             .code(),
         1114
     );
-    assert_eq!(session.temp_quota.usage().1, 16 * 1024);
+    assert_eq!(session.temp_quota.usage().1, 32 * 1024);
     engine
         .execute_with_session(&mut session, "INSERT INTO index_capped VALUES(1)")
         .unwrap();
@@ -1633,7 +1633,7 @@ fn temporary_audit_quota_during_index_growth_keeps_previous_commits() {
     let mut session = SessionContext::default();
     session.temp_quota = Arc::new(crate::storage::temp_quota::SessionTempQuota::new(
         10,
-        80 * 1024,
+        96 * 1024,
         4 * 1024 * 1024,
     ));
     engine
@@ -1676,7 +1676,7 @@ fn temporary_audit_quota_during_index_growth_keeps_previous_commits() {
         ),
         count
     );
-    assert!(session.temp_quota.usage().1 <= 80 * 1024);
+    assert!(session.temp_quota.usage().1 <= 96 * 1024);
     engine
         .execute_with_session(&mut session, "TRUNCATE TABLE growing")
         .unwrap();

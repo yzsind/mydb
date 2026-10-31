@@ -1203,6 +1203,42 @@ fn compile_update(
     })
 }
 
+/// Prove that a parameterized exact key predicate cannot invoke temporal
+/// validation. Temporal keys and every expression outside this small grammar
+/// retain the normal per-execute checks (including parameter diagnostics).
+fn point_predicate_has_no_temporal_conversion(
+    expr: &Expr,
+    table: &crate::storage::TableSchema,
+) -> bool {
+    match expr {
+        Expr::Placeholder(_) => true,
+        Expr::Identifier(name) => table.find_column_index(name).is_some_and(|index| {
+            !matches!(
+                table.columns[index].data_type,
+                crate::storage::DataTypeKind::Date
+                    | crate::storage::DataTypeKind::DateTime { .. }
+                    | crate::storage::DataTypeKind::Timestamp { .. }
+                    | crate::storage::DataTypeKind::Time { .. }
+            )
+        }),
+        Expr::CompoundIdentifier(parts) => parts.last().is_some_and(|name| {
+            point_predicate_has_no_temporal_conversion(&Expr::Identifier(name.clone()), table)
+        }),
+        Expr::Binary {
+            left,
+            op:
+                crate::parser::BinaryOp::Eq
+                | crate::parser::BinaryOp::NullSafeEq
+                | crate::parser::BinaryOp::And,
+            right,
+        } => {
+            point_predicate_has_no_temporal_conversion(left, table)
+                && point_predicate_has_no_temporal_conversion(right, table)
+        }
+        _ => false,
+    }
+}
+
 fn compile_point_write(
     table: &Arc<crate::storage::TableSchema>,
     statement: &Statement,
@@ -1239,6 +1275,7 @@ fn compile_point_write(
         return None;
     }
     Some(PreparedPointWrite {
+        needs_temporal_validation: !point_predicate_has_no_temporal_conversion(selection, table),
         table: Arc::clone(table),
         index: index.clone(),
         key,

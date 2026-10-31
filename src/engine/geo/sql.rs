@@ -218,6 +218,38 @@ pub(crate) fn result_type(upper: &str, arity: usize) -> Option<ColumnType> {
     })
 }
 
+pub(crate) fn is_geometry_collection_constructor(name: &str) -> bool {
+    [
+        "LINESTRING",
+        "POLYGON",
+        "MULTIPOINT",
+        "MULTILINESTRING",
+        "MULTIPOLYGON",
+        "GEOMETRYCOLLECTION",
+        "GEOMCOLLECTION",
+    ]
+    .iter()
+    .any(|constructor| name.eq_ignore_ascii_case(constructor))
+}
+
+/// SQL NULL retains its bind-time geometry type. Untyped NULL and strings
+/// remain invalid constructor arguments, even beside a typed geometry NULL.
+pub(crate) fn eval_geometry_constructor(
+    name: &str,
+    values: &[Value],
+    geometry_arguments: bool,
+) -> Result<Value, QueryError> {
+    let upper = name.to_ascii_uppercase();
+    let spec = function_spec(&upper).expect("bound geometry constructor");
+    if values.len() < usize::from(spec.min_args) || values.len() > usize::from(spec.max_args) {
+        return Err(wrong_count(name));
+    }
+    if geometry_arguments && values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    eval(&upper, name, values)
+}
+
 /// Evaluate a spatial function. `values` are the already-evaluated argument
 /// values. NULL in any argument yields SQL NULL for every spatial function.
 pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, QueryError> {

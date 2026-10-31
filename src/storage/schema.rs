@@ -178,6 +178,20 @@ pub struct Catalog {
     pub(crate) ai: Arc<crate::engine::ai::AiCatalog>,
 }
 
+impl Catalog {
+    pub(crate) fn allocate_table_id(&mut self) -> Result<u64, QueryError> {
+        let id = self.next_table_id;
+        if id == 0 || id >= crate::storage::data_dictionary::DD_TABLE_ID_BASE {
+            return Err(crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "table/storage identity space exhausted",
+            ));
+        }
+        self.next_table_id = id + 1;
+        Ok(id)
+    }
+}
+
 /// Rebuild every table's foreign-key runtime caches from the persisted
 /// `foreign_keys` of all tables: resolves each FK's `child_col_idx`, and
 /// denormalizes the reverse index (`fk_referenced_by`) onto each parent
@@ -1059,7 +1073,7 @@ pub enum RowLayoutState {
 pub struct RowLayoutColumnSchema {
     pub column_id: u32,
     pub physical_pos: u32,
-    pub codec_kind: String,
+    pub codec_kind: crate::storage::RowCodecSpec,
     #[serde(default)]
     pub fixed_offset: Option<u32>,
     #[serde(default)]
@@ -1097,7 +1111,11 @@ impl TableSchema {
         let primary_key = match name {
             "schemata" => vec!["name"],
             "tables" => vec!["id"],
-            "table_stats" => vec!["table_id"],
+            "table_stats" => vec!["table_id", "scope_id"],
+            "column_stats" => vec!["table_id", "scope_id", "column_id"],
+            "index_stats" => vec!["table_id", "scope_id", "index_id"],
+            "extended_stats" => vec!["table_id", "scope_id", "kind", "ordinal"],
+            "column_histograms" => vec!["table_id", "column_id"],
             "innodb_dynamic_metadata" => vec!["table_id"],
             "mydb_ddl_retirements" => vec!["table_id", "generation", "index_id"],
             "columns" => vec!["table_id", "column_id"],
@@ -1481,7 +1499,7 @@ impl TableSchema {
 
     /// Publish a heap-row decoder for subsequent writes, reusing an identical
     /// retained format when possible. Existing formats remain readable.
-    pub fn publish_new_row_layout(&mut self) {
+    pub fn publish_new_row_layout(&mut self) -> Result<(), QueryError> {
         let mut candidate = build_row_layout_schema(0, RowLayoutState::Active, &self.columns);
         // Physical NULL capacity may outlive logical nullability. Reserving
         // its existing bits keeps the same decoder usable for old snapshots,
@@ -1514,7 +1532,7 @@ impl TableSchema {
                     layout.state = RowLayoutState::Readable;
                 }
             }
-            return;
+            return Ok(());
         }
         // Reactivating an older ID must not allow the next allocation to
         // collide with a newer retained layout that has a different decoder.
@@ -1525,8 +1543,13 @@ impl TableSchema {
             .max()
             .unwrap_or(self.active_layout_id)
             .max(self.active_layout_id)
-            .saturating_add(1)
-            .max(default_row_layout_id());
+            .checked_add(1)
+            .ok_or_else(|| {
+                crate::storage::error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "row layout identity space exhausted",
+                )
+            })?;
         for layout in &mut self.row_layouts {
             if layout.state == RowLayoutState::Active {
                 layout.state = RowLayoutState::Readable;
@@ -1534,6 +1557,7 @@ impl TableSchema {
         }
         candidate.layout_id = self.active_layout_id;
         self.row_layouts.push(candidate);
+        Ok(())
     }
 
     /// Collapse `row_layouts` down to just the current Active layout,
@@ -1803,13 +1827,18 @@ impl TableSchema {
     /// Allocate a fresh [`ColumnSchema::column_id`]. Caller is responsible
     /// for ensuring `build_column_index` has been run at least once so
     /// `next_column_id` is non-zero.
-    pub fn allocate_column_id(&mut self) -> u32 {
+    pub fn allocate_column_id(&mut self) -> Result<u32, QueryError> {
         if self.next_column_id == 0 {
             self.next_column_id = 1;
         }
         let id = self.next_column_id;
-        self.next_column_id = self.next_column_id.saturating_add(1);
-        id
+        self.next_column_id = self.next_column_id.checked_add(1).ok_or_else(|| {
+            crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "column identity space exhausted",
+            )
+        })?;
+        Ok(id)
     }
 
     /// Next free physical slot for a newly added column. Equals
@@ -1817,12 +1846,19 @@ impl TableSchema {
     /// table is empty. New columns are appended at the tail of the row
     /// payload — never inserted in the middle — so existing rows keep
     /// their layout and `ADD COLUMN` stays INSTANT.
-    pub fn next_physical_pos(&self) -> u32 {
+    pub fn next_physical_pos(&self) -> Result<u32, QueryError> {
         self.columns
             .iter()
             .map(|c| c.physical_pos)
             .max()
-            .map_or(0, |m| m.saturating_add(1))
+            .map_or(Ok(0), |m| {
+                m.checked_add(1).ok_or_else(|| {
+                    crate::storage::error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "column physical position space exhausted",
+                    )
+                })
+            })
     }
 
     /// Bump `schema_version` by one. DDL that mutates this table's structure
@@ -1934,8 +1970,8 @@ fn build_row_layout_schema(
     }
 }
 
-fn row_layout_codec_kind(data_type: &DataTypeKind, unsigned: bool) -> String {
-    format!("{:?}:{}", data_type, if unsigned { "u" } else { "s" })
+fn row_layout_codec_kind(data_type: &DataTypeKind, unsigned: bool) -> crate::storage::RowCodecSpec {
+    super::core::row_codec_spec(data_type, unsigned)
 }
 
 fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
@@ -2801,16 +2837,24 @@ impl GeometrySubtype {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DataTypeKind {
+    #[serde(rename = "TinyInt")]
     TinyInt,
+    #[serde(rename = "SmallInt")]
     SmallInt,
+    #[serde(rename = "MediumInt")]
     MediumInt,
+    #[serde(rename = "Int")]
     Int,
+    #[serde(rename = "BigInt")]
     BigInt,
+    #[serde(rename = "Bool")]
     Bool,
     /// `FLOAT[(M[,D])]` — the optional `(precision, scale)` is the
     /// declared display width / decimals carried for SHOW COLUMNS and
     /// information_schema. Storage is still 4-byte IEEE-754 regardless.
+    #[serde(rename = "Float")]
     Float {
         #[serde(default)]
         precision: Option<u8>,
@@ -2818,61 +2862,58 @@ pub enum DataTypeKind {
         scale: Option<u8>,
     },
     /// `DOUBLE[(M[,D])]` — see [`DataTypeKind::Float`]. 8-byte storage.
+    #[serde(rename = "Double")]
     Double {
         #[serde(default)]
         precision: Option<u8>,
         #[serde(default)]
         scale: Option<u8>,
     },
+    #[serde(rename = "Decimal")]
     Decimal {
         precision: Option<u8>,
         scale: Option<u8>,
     },
-    Char {
-        len: Option<usize>,
-    },
-    VarChar {
-        len: Option<usize>,
-    },
-    Binary {
-        len: Option<usize>,
-    },
-    VarBinary {
-        len: Option<usize>,
-    },
+    #[serde(rename = "Char")]
+    Char { len: Option<usize> },
+    #[serde(rename = "VarChar")]
+    VarChar { len: Option<usize> },
+    #[serde(rename = "Binary")]
+    Binary { len: Option<usize> },
+    #[serde(rename = "VarBinary")]
+    VarBinary { len: Option<usize> },
     /// TEXT family (character). `max_len` is the byte cap per the
     /// declared size (TINYTEXT=255, TEXT=65535, MEDIUMTEXT=16M-1,
     /// LONGTEXT=4G-1).
-    Text {
-        max_len: u32,
-    },
+    #[serde(rename = "Text")]
+    Text { max_len: u32 },
     /// BLOB family (binary). `max_len` is the byte cap per the declared
     /// size (TINYBLOB=255 … LONGBLOB=4G-1).
-    Blob {
-        max_len: u32,
-    },
+    #[serde(rename = "Blob")]
+    Blob { max_len: u32 },
+    #[serde(rename = "Date")]
     Date,
     /// `TIME[(fsp)]` — `fsp` is the declared fractional-seconds precision
     /// (0..=6). Writers round the i64-microsecond payload half-away-from-zero
     /// to the corresponding multiple of `10^(6-fsp)` before storing (MySQL
     /// 5.6.4+ default; `TIME_TRUNCATE_FRACTIONAL` switches to truncation), so a
     /// `TIME(0)` column never round-trips a non-zero microsecond fragment.
-    Time {
-        fsp: u8,
-    },
+    #[serde(rename = "Time")]
+    Time { fsp: u8 },
     /// `DATETIME[(fsp)]` — see [`DataTypeKind::Time { .. }`].
-    DateTime {
-        fsp: u8,
-    },
+    #[serde(rename = "DateTime")]
+    DateTime { fsp: u8 },
     /// `TIMESTAMP[(fsp)]` — see [`DataTypeKind::Time { .. }`].
-    Timestamp {
-        fsp: u8,
-    },
+    #[serde(rename = "Timestamp")]
+    Timestamp { fsp: u8 },
+    #[serde(rename = "Year")]
     Year,
+    #[serde(rename = "Json")]
     Json,
     /// `GEOMETRY` / `POINT` / `POLYGON` / … — stored as internal `SRID + WKB`
     /// bytes (`ColumnKind::Geometry`). `srid` is the optional column SRID
     /// constraint (MySQL 8.0 `... SRID n`); `None` means unconstrained.
+    #[serde(rename = "Geometry")]
     Geometry {
         subtype: GeometrySubtype,
         srid: Option<u32>,
@@ -2881,19 +2922,17 @@ pub enum DataTypeKind {
     /// internal little-endian bytes (`ColumnKind::Vector`). `dim` is the
     /// declared dimension constraint; `None` means unconstrained (any
     /// dimension accepted).
+    #[serde(rename = "Vector")]
     Vector {
         dim: Option<u32>,
         datatype: crate::vector::VectorDataType,
     },
-    Enum {
-        values: Vec<String>,
-    },
-    Set {
-        values: Vec<String>,
-    },
-    Bit {
-        len: Option<usize>,
-    },
+    #[serde(rename = "Enum")]
+    Enum { values: Vec<String> },
+    #[serde(rename = "Set")]
+    Set { values: Vec<String> },
+    #[serde(rename = "Bit")]
+    Bit { len: Option<usize> },
 }
 
 /// Convert result-set metadata back into the in-memory type descriptor used by
@@ -3388,6 +3427,28 @@ fn cmp_uniform_numeric_key_parts(
 }
 
 impl IndexKey {
+    /// Owned payload retained by an execution-local key batch. Inline key
+    /// parts need no heap reservation; variable-width components do.
+    pub(crate) fn heap_capacity_bytes(&self) -> usize {
+        let parts = if self.0.spilled() {
+            self.0
+                .capacity()
+                .saturating_mul(std::mem::size_of::<KeyPart>())
+        } else {
+            0
+        };
+        self.0.iter().fold(parts, |bytes, part| {
+            bytes.saturating_add(match part {
+                KeyPart::Bytes(value) => value.capacity(),
+                KeyPart::String(value) | KeyPart::CollatedString { value, .. } => value.capacity(),
+                KeyPart::DecimalWide { value, .. } => {
+                    (value.bits().div_ceil(64) as usize).saturating_mul(16)
+                }
+                _ => 0,
+            })
+        })
+    }
+
     /// Ordering equality can hide a changed covering-index payload (case,
     /// accents or PAD SPACE). Maintenance must preserve the original text.
     #[inline]
@@ -6351,7 +6412,7 @@ mod tests {
         // Migration must seed next_column_id beyond the existing max id,
         // not reset to 1.
         assert!(table.next_column_id > 7);
-        let new_id = table.allocate_column_id();
+        let new_id = table.allocate_column_id().unwrap();
         assert_eq!(new_id, 8);
     }
 

@@ -238,6 +238,20 @@ impl Database {
                 .collect();
             crate::storage::naming::migrate_catalog(headers)
         } else {
+            if crate::storage::control::Control::load(&self.data_dir)?
+                .is_some_and(|control| control.initialized)
+            {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    format!(
+                        "initialized data dictionary is missing; refusing bootstrap; {}",
+                        self.catalog_property_scan_diagnostics()
+                            .unwrap_or_else(|err| {
+                                format!("property diagnostics failed: {}", err.message())
+                            })
+                    ),
+                ));
+            }
             // A fresh directory has no dictionary rows. Losing the version
             // property in an existing dictionary is corruption, not bootstrap.
             for table in crate::storage::data_dictionary::dd_tables() {
@@ -263,9 +277,15 @@ impl Database {
                 crate::storage::naming::migrate_catalog(super::catalog::empty_catalog());
             self.bootstrap_catalog_store(&bootstrap)?;
             self.catalog.replace_live(bootstrap)?;
+            if self.config.durability != DurabilityMode::Memory {
+                crate::storage::control::Control::finish_initialization(&self.data_dir)?;
+            }
             return Ok(());
         };
         self.catalog.replace_live(migrated)?;
+        if self.config.durability != DurabilityMode::Memory {
+            crate::storage::control::Control::finish_initialization(&self.data_dir)?;
+        }
         Ok(())
     }
 
@@ -300,7 +320,7 @@ impl Database {
         ];
         self.scan_dd_table_projected_batched(DD_TABLES, HEADER_COLUMNS, 24, 512, |rows| {
             for row in rows {
-                let table = crate::storage::data_dictionary::table_header_from_dd_row(&row);
+                let table = crate::storage::data_dictionary::table_header_from_dd_row(&row)?;
                 catalog.tables.insert(
                     crate::storage::naming::table_key(&table.database, &table.name),
                     table,
@@ -390,10 +410,11 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn diagnostic_catalog_snapshot_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_DD_PROPERTIES,
-            DD_EVENTS, DD_FOREIGN_KEYS, DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES,
-            DD_INDEXES, DD_INDEX_COLUMN_USAGE, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES,
-            DD_SCHEMATA, DD_SEQUENCES, DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
+            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
+            DD_COLUMN_STATS, DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
+            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
+            DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
+            DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
         };
         let load = |dd_id: u64| self.scan_dd_table(dd_id);
         catalog_from_dd_rows(&DdRowSet {
@@ -416,6 +437,10 @@ impl Database {
             sequences: load(DD_SEQUENCES)?,
             restrictions: load(DD_RESTRICTIONS)?,
             table_stats: load(DD_TABLE_STATS)?,
+            column_stats: load(DD_COLUMN_STATS)?,
+            index_stats: load(DD_INDEX_STATS)?,
+            extended_stats: load(DD_EXTENDED_STATS)?,
+            column_histograms: load(DD_COLUMN_HISTOGRAMS)?,
             innodb_dynamic_metadata: Vec::new(),
         })
     }
@@ -483,18 +508,16 @@ impl Database {
         let timed = matches!(payload, WalPayload::SequenceState { .. });
         if timed {
             let pre = crate::wal::LogManager::pre_encode_timed_record(txn_id, payload)?;
-            return self
-                .log
-                .lock()
-                .append_timed(
-                    pre,
-                    &self.commit_hlc_unix_us,
-                    Some(&self.temporal_hlc_rollback_total),
-                )
-                .map(|(lsn, _)| lsn);
+            return crate::wal::LogManager::append_timed_to(
+                &self.log,
+                pre,
+                &self.commit_hlc_unix_us,
+                Some(&self.temporal_hlc_rollback_total),
+            )
+            .map(|(lsn, _)| lsn);
         }
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-        self.log.lock().append_pre_encoded(pre)
+        crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
     }
 
     fn append_commit_wal(
@@ -507,7 +530,8 @@ impl Database {
             return Ok((0, self.next_commit_unix_us()));
         }
         let pre = crate::wal::LogManager::pre_encode_timed_record(txn_id, payload)?;
-        self.log.lock().append_timed(
+        crate::wal::LogManager::append_timed_to(
+            &self.log,
             pre,
             &self.commit_hlc_unix_us,
             Some(&self.temporal_hlc_rollback_total),
@@ -520,6 +544,7 @@ impl Database {
         path: PathBuf,
         bytes: Vec<u8>,
     ) -> Result<(), QueryError> {
+        let bytes = create_empty_heap_image(&path, bytes);
         self.append_wal(
             txn_id,
             WalPayload::FileCreate {
@@ -547,7 +572,13 @@ impl Database {
                 before,
             },
         )?;
-        let _ = fs::remove_file(path);
+        match fs::remove_file(&path) {
+            Ok(()) => retire_page_owner_proof(&path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                retire_page_owner_proof(&path)
+            }
+            Err(_) => {}
+        }
         Ok(())
     }
 
@@ -1062,7 +1093,9 @@ impl Database {
         let index = index.read();
         index.ensure_healthy()?;
         match f(&index) {
-            Err(err) if err.is(crate::error::catalog::ER_INDEX_CORRUPT) => Err(index.fence_persistent_corruption(err)),
+            Err(err) if err.is(crate::error::catalog::ER_INDEX_CORRUPT) => {
+                Err(index.fence_persistent_corruption(err))
+            }
             result => result,
         }
     }
@@ -1728,9 +1761,13 @@ impl Database {
         }
         let paths = match self.owned_vector_files(table, index, storage_id) {
             Ok(paths) => paths,
-            Err(err) => { self.quarantine_mvcc(format!("vector size accounting failed: {err:?}")); return 0; }
+            Err(err) => {
+                self.quarantine_mvcc(format!("vector size accounting failed: {err:?}"));
+                return 0;
+            }
         };
-        paths.iter()
+        paths
+            .iter()
             .filter_map(|path| fs::metadata(path).ok())
             .map(|meta| meta.len())
             .fold(0u64, u64::saturating_add)

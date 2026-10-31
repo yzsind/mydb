@@ -816,3 +816,73 @@ fn uncorrelated_in_with_nested_scalar_subquery_per_row_fast_path() {
     // facts with d in {3,4}: ids 3,4,6,7,9 -> 5 rows.
     assert_eq!(result, vec![vec![Value::Int(5)]]);
 }
+
+#[test]
+fn unique_in_subquery_batch_rebinds_null_prefix_and_collated_keys() {
+    use crate::engine::api::{PreparedSelectMemoState, QueryEngine};
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE batch_target (tenant INT,item VARCHAR(20) COLLATE utf8mb4_0900_ai_ci,qty INT,PRIMARY KEY(tenant,item))",
+        "CREATE TABLE batch_input (k VARCHAR(20) COLLATE utf8mb4_0900_ai_ci,bucket INT)",
+        "INSERT INTO batch_target VALUES (1,'alpha',10),(1,'beta',20),(2,'gamma',30)",
+        "INSERT INTO batch_input VALUES ('alpha',1),('ALPHA',1),('beta',1),(NULL,1),('missing',1),('gamma',2)",
+    ] { engine.execute(sql).unwrap(); }
+    let sql="SELECT qty FROM batch_target WHERE tenant=? AND item IN (SELECT k FROM batch_input WHERE bucket=?) ORDER BY qty";
+    let mut session = SessionContext::default();
+    let parsed = engine.prepare_cached(&mut session, sql, 2).unwrap();
+    let mut state = PreparedSelectMemoState::default();
+    for (tenant, bucket, expected) in [
+        (
+            Value::Int(1),
+            1,
+            vec![vec![Value::Int(10)], vec![Value::Int(20)]],
+        ),
+        (Value::Null, 1, vec![]),
+        (Value::Int(2), 2, vec![vec![Value::Int(30)]]),
+        (
+            Value::Int(1),
+            1,
+            vec![vec![Value::Int(10)], vec![Value::Int(20)]],
+        ),
+    ] {
+        let response = engine
+            .execute_prepared_select(
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[tenant, Value::Int(bucket)],
+            )
+            .unwrap()
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let QueryResponse::ResultSet(result) = response else {
+            panic!("rows")
+        };
+        assert_eq!(result.rows, expected);
+    }
+}
+
+#[test]
+fn unique_in_subquery_batch_handles_multiple_probe_windows() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE batch_numbers (tenant INT,id INT,v INT,PRIMARY KEY(tenant,id))")
+        .unwrap();
+    engine.execute("CREATE TABLE batch_keys (id INT)").unwrap();
+    insert_fixture_rows(
+        &engine,
+        "test.batch_numbers",
+        (0..2100).map(|id| vec![Value::Int(1), Value::Int(id), Value::Int(id * 2)]),
+    );
+    insert_fixture_rows(
+        &engine,
+        "test.batch_keys",
+        (0..2200).chain(0..2200).map(|id| vec![Value::Int(id)]),
+    );
+    let QueryResponse::ResultSet(result)=engine.execute("SELECT COUNT(*) FROM batch_numbers WHERE tenant=1 AND id IN (SELECT id FROM batch_keys)").unwrap() else {panic!("rows")};
+    assert_eq!(result.rows, vec![vec![Value::Int(2100)]]);
+}

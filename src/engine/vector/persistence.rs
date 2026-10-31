@@ -2,6 +2,9 @@
 use crate::{storage::RowId, types::QueryError, vector::VectorValue};
 use std::io::{self, Write};
 
+pub(crate) const HEADER_LEN: usize = 8 + 2 + 1;
+pub(crate) const EMPTY_COUNT_FILE_LEN: usize = HEADER_LEN + 4 + 4;
+
 pub(crate) fn corrupt() -> QueryError {
     crate::storage::error(
         crate::error::catalog::ER_INDEX_CORRUPT,
@@ -24,7 +27,8 @@ impl<W: Write> Writer<W> {
             out,
             crc: crc32fast::Hasher::new(),
         };
-        writer.put(b"MYDBVEC1")?;
+        writer.put(b"MYDBVEC2")?;
+        writer.put(&crate::storage::format_versions::VECTOR_STATE_VERSION.to_le_bytes())?;
         writer.u8(kind)?;
         Ok(writer)
     }
@@ -69,19 +73,21 @@ pub(crate) struct Reader<'a> {
 }
 impl<'a> Reader<'a> {
     pub(crate) fn new(bytes: &'a [u8], kind: u8) -> Result<Self, QueryError> {
-        if bytes.len() < 13 {
+        if bytes.len() < HEADER_LEN + 4 {
             return Err(corrupt());
         }
         let (data, crc) = bytes.split_at(bytes.len() - 4);
-        if &data[..8] != b"MYDBVEC1"
-            || data[8] != kind
+        if &data[..8] != b"MYDBVEC2"
+            || u16::from_le_bytes(data[8..10].try_into().map_err(|_| corrupt())?)
+                != crate::storage::format_versions::VECTOR_STATE_VERSION
+            || data[10] != kind
             || crc32fast::hash(data) != u32::from_le_bytes(crc.try_into().map_err(|_| corrupt())?)
         {
             return Err(corrupt());
         }
         Ok(Self {
             bytes: data,
-            offset: 9,
+            offset: HEADER_LEN,
         })
     }
     fn take(&mut self, len: usize) -> Result<&'a [u8], QueryError> {

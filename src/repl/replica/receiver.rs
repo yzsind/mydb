@@ -554,6 +554,7 @@ mod tests {
     #[test]
     fn durable_received_wal_is_not_an_applied_resume_point() {
         let known = ReplicaProgress {
+            statistics: None,
             received_lsn: 42,
             durable_lsn: 42,
             applied_lsn: 10,

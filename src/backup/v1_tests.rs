@@ -46,6 +46,47 @@ fn rows(db: &StorageQueryEngine, sql: &str) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn sealed_partition_indexes_use_leaf_heaps() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    for (table, partitioning) in [
+        ("parts", "PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN MAXVALUE)"),
+        ("subparts", "PARTITION BY RANGE(id) SUBPARTITION BY HASH(id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN MAXVALUE)"),
+    ] {
+        source.execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY,v INT,INDEX iv(v)) {partitioning}")).unwrap();
+        source.execute(&format!("INSERT INTO {table} VALUES(1,11),(2,12),(20,22),(21,23)")).unwrap();
+    }
+    let coordinator = Coordinator::get(source.db_handle()).unwrap();
+    let repository = root.path().join("repository");
+    let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+        .base_id
+        .unwrap();
+    let runtime = root.path().join("runtime");
+    let reader = super::open_base(&repository, &base, &runtime).unwrap();
+    let backup = StorageQueryEngine::open_backup_image(
+        reader.data_dir.clone(),
+        runtime,
+        Default::default(),
+        Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+        vec![],
+    )
+    .unwrap();
+    for table in ["parts", "subparts"] {
+        for sql in [
+            format!("SELECT id,v FROM {table} ORDER BY id"),
+            format!("SELECT id,v FROM {table} FORCE INDEX(PRIMARY) WHERE id>=2 ORDER BY id"),
+            format!(
+                "SELECT id,v FROM {table} FORCE INDEX(iv) WHERE v BETWEEN 12 AND 23 ORDER BY id"
+            ),
+        ] {
+            assert_eq!(rows(&backup, &sql), rows(&source, &sql), "{sql}");
+        }
+    }
+    backup.shutdown().unwrap();
+    discard_source(source, coordinator);
+}
+
+#[test]
 fn hybrid_rrf_immutable_backup_preserves_ranked_snapshot() {
     let root = root();
     let source = engine(&root.path().join("source"));

@@ -21,9 +21,9 @@
 //! databases, base tables, columns, indexes, checks, foreign keys, views,
 //! routines, triggers, events, auth, and sequences. A few
 //! structurally-complex fields — the full column type (with ENUM/SET
-//! members), DEFAULT values, partition definitions, routine parameters,
-//! and table statistics — are still carried as JSON text columns for now;
-//! later phases can split these into dedicated normalized tables (e.g.
+//! members), DEFAULT values, partition definitions and routine parameters —
+//! are still carried as JSON text columns. Optimizer statistics use
+//! object-scoped typed binary records. Later phases can split these into dedicated normalized tables (e.g.
 //! MySQL's `column_type_elements`, `table_partitions`) without changing the
 //! rule that DD heap rows are the catalog authority.
 //!
@@ -36,27 +36,18 @@ use crate::engine::auth::{account_id, AuthCatalog, GrantEntry, RoleEdge, UserAcc
 use crate::storage::partitioning::PartitionInfo;
 use crate::types::Value;
 
-use super::naming::{event_key, normalize_name, routine_key, table_key, trigger_key};
+use super::naming::{event_key, routine_key, table_key, trigger_key};
 use super::schema::EventOnCompletionSchema;
 use super::schema::{
     Catalog, CheckConstraintSchema, ColumnSchema, ColumnState, DataTypeKind, DatabaseSchema,
-    EventScheduleSchema, EventSchema, EventStatusSchema, ForeignKeySchema, IndexColumnDirection,
-    IndexExpression, IndexSchema, IndexState, ReferentialAction, RoutineKindSchema,
-    RoutineParamSchema, RoutineSchema, RoutineSecuritySchema, RoutineSqlDataAccessSchema,
-    TableSchema, TriggerEventSchema, TriggerSchema, TriggerTimingSchema, ViewColumnDef,
-    ViewDependency, ViewRoutineDependency, ViewSchema, CATALOG_VERSION,
+    EventSchema, EventStatusSchema, ForeignKeySchema, IndexColumnDirection, IndexExpression,
+    IndexSchema, IndexState, ReferentialAction, RoutineKindSchema, RoutineParamSchema,
+    RoutineSchema, RoutineSecuritySchema, RoutineSqlDataAccessSchema, TableSchema,
+    TriggerEventSchema, TriggerSchema, TriggerTimingSchema, ViewColumnDef, ViewDependency,
+    ViewRoutineDependency, ViewSchema, CATALOG_VERSION,
 };
 use super::sequence::{SeqType, SequenceSchema};
 use super::stats::TableStats;
-
-/// Persisted payload ceiling used by `mysql.table_stats.stats_json`.
-///
-/// Dictionary writes use the same governed LOB externalization path as user
-/// tables, so the payload is not constrained by the 16 KiB heap-page size.
-/// Keeping a finite ceiling still bounds catalog recovery and descriptor-cache
-/// materialization for pathologically wide schemas.
-pub(crate) const DD_STATS_JSON_CAP_BYTES: usize = 1024 * 1024;
-const DD_STATS_JSON_CAP_BYTES_U32: u32 = DD_STATS_JSON_CAP_BYTES as u32;
 
 #[cfg(test)]
 /// Database that owns the dictionary tables. MySQL keeps them in the
@@ -135,6 +126,17 @@ pub(crate) const DD_INNODB_DYNAMIC_METADATA: u64 = DD_TABLE_ID_BASE + 24;
 pub(crate) const DD_DDL_RETIREMENTS: u64 = DD_TABLE_ID_BASE + 25;
 pub(crate) const DD_SEQUENCE_VALUES: u64 = DD_TABLE_ID_BASE + 26;
 pub(crate) const DD_SEQUENCE_RETIREMENTS: u64 = DD_TABLE_ID_BASE + 27;
+pub(crate) const DD_COLUMN_STATS: u64 = DD_TABLE_ID_BASE + 28;
+pub(crate) const DD_INDEX_STATS: u64 = DD_TABLE_ID_BASE + 29;
+pub(crate) const DD_EXTENDED_STATS: u64 = DD_TABLE_ID_BASE + 30;
+pub(crate) const DD_COLUMN_HISTOGRAMS: u64 = DD_TABLE_ID_BASE + 31;
+pub(crate) const DD_STATS_TABLES: [u64; 5] = [
+    DD_TABLE_STATS,
+    DD_COLUMN_STATS,
+    DD_INDEX_STATS,
+    DD_EXTENDED_STATS,
+    DD_COLUMN_HISTOGRAMS,
+];
 
 /// `true` if `id` falls in the reserved dictionary-table id range.
 #[inline]
@@ -277,17 +279,62 @@ fn table_stats_table() -> TableSchema {
         "table_stats",
         vec![
             ucol("table_id", DataTypeKind::BigInt, false),
+            ucol("scope_id", DataTypeKind::BigInt, false),
             ucol("stats_version", DataTypeKind::BigInt, false),
+            ucol("row_count", DataTypeKind::BigInt, false),
+            ucol("heap_page_count", DataTypeKind::BigInt, false),
+            ucol("modified_rows", DataTypeKind::BigInt, false),
+            ucol("analyzed_ms", DataTypeKind::BigInt, true),
             col(
-                "stats_json",
-                DataTypeKind::Text {
-                    max_len: DD_STATS_JSON_CAP_BYTES_U32,
+                "sample_fraction",
+                DataTypeKind::Double {
+                    precision: None,
+                    scale: None,
                 },
-                false,
+                true,
             ),
-            ucol("updated_ms", DataTypeKind::BigInt, false),
+            col(
+                "confidence",
+                DataTypeKind::Double {
+                    precision: None,
+                    scale: None,
+                },
+                true,
+            ),
+            ucol("analyze_revision", DataTypeKind::BigInt, false),
+            col("live_baseline", DataTypeKind::BigInt, false),
+            ucol("modification_baseline", DataTypeKind::BigInt, false),
+            col("check_ok", DataTypeKind::Bool, true),
+            ucol("fold_txn_id", DataTypeKind::BigInt, false),
+            ucol("reset_txn_id", DataTypeKind::BigInt, false),
         ],
     )
+}
+
+fn stats_object_table(id: u64, name: &str, keys: &[&str]) -> TableSchema {
+    let mut columns: Vec<_> = keys
+        .iter()
+        .map(|key| ucol(key, DataTypeKind::BigInt, false))
+        .collect();
+    columns.push(ucol("stats_version", DataTypeKind::BigInt, false));
+    if name == "column_stats" {
+        columns.push(ucol("null_count", DataTypeKind::BigInt, false));
+        columns.push(ucol("distinct_count", DataTypeKind::BigInt, false));
+        columns.push(col(
+            "average_width",
+            DataTypeKind::Double {
+                precision: None,
+                scale: None,
+            },
+            true,
+        ));
+    }
+    columns.push(col(
+        "payload",
+        DataTypeKind::Blob { max_len: u32::MAX },
+        false,
+    ));
+    TableSchema::system_table(id, name, columns)
 }
 
 fn innodb_dynamic_metadata_table() -> TableSchema {
@@ -792,6 +839,26 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
         Arc::new(sequences_table()),
         Arc::new(restrictions_table()),
         Arc::new(table_stats_table()),
+        Arc::new(stats_object_table(
+            DD_COLUMN_STATS,
+            "column_stats",
+            &["table_id", "scope_id", "column_id"],
+        )),
+        Arc::new(stats_object_table(
+            DD_INDEX_STATS,
+            "index_stats",
+            &["table_id", "scope_id", "index_id"],
+        )),
+        Arc::new(stats_object_table(
+            DD_EXTENDED_STATS,
+            "extended_stats",
+            &["table_id", "scope_id", "kind", "ordinal"],
+        )),
+        Arc::new(stats_object_table(
+            DD_COLUMN_HISTOGRAMS,
+            "column_histograms",
+            &["table_id", "column_id"],
+        )),
         Arc::new(innodb_dynamic_metadata_table()),
         Arc::new(TableSchema::system_table(
             DD_DDL_RETIREMENTS,
@@ -839,7 +906,7 @@ pub(crate) fn dd_table_schema(id: u64) -> Option<Arc<TableSchema>> {
 //
 // The mirror covers every durable catalog family represented by `DdRowSet`.
 // Structurally-complex fields (full column type, DEFAULT value, partition
-// definition, table statistics, routine parameters, auth account payloads)
+// definition, routine parameters, auth account payloads)
 // are carried as JSON text and rebuilt on read by the relevant schema
 // constructors. `TableSchema::build_column_index` re-derives every
 // `#[serde(skip)]` runtime field (row codec, compiled expressions, partition
@@ -873,12 +940,16 @@ pub(crate) struct DdRowSet {
     pub sequences: Vec<Vec<Value>>,
     pub restrictions: Vec<Vec<Value>>,
     pub table_stats: Vec<Vec<Value>>,
+    pub column_stats: Vec<Vec<Value>>,
+    pub index_stats: Vec<Vec<Value>>,
+    pub extended_stats: Vec<Vec<Value>>,
+    pub column_histograms: Vec<Vec<Value>>,
     pub innodb_dynamic_metadata: Vec<Vec<Value>>,
 }
 
 impl DdRowSet {
     /// `(dictionary table id, rows)` pairs, for writing into heap files.
-    pub(crate) fn per_table(&self) -> [(u64, &Vec<Vec<Value>>); 20] {
+    pub(crate) fn per_table(&self) -> [(u64, &Vec<Vec<Value>>); 24] {
         [
             (DD_SCHEMATA, &self.schemata),
             (DD_TABLES, &self.tables),
@@ -899,6 +970,10 @@ impl DdRowSet {
             (DD_SEQUENCES, &self.sequences),
             (DD_RESTRICTIONS, &self.restrictions),
             (DD_TABLE_STATS, &self.table_stats),
+            (DD_COLUMN_STATS, &self.column_stats),
+            (DD_INDEX_STATS, &self.index_stats),
+            (DD_EXTENDED_STATS, &self.extended_stats),
+            (DD_COLUMN_HISTOGRAMS, &self.column_histograms),
             (DD_INNODB_DYNAMIC_METADATA, &self.innodb_dynamic_metadata),
         ]
     }
@@ -928,108 +1003,6 @@ fn opt_uv(v: Option<u64>) -> Value {
 /// Serialize a structurally-complex field to a JSON text column.
 fn jsonv<T: serde::Serialize>(v: &T) -> Value {
     Value::String(serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
-}
-
-/// Serialize table statistics for the `mysql.table_stats.stats_json` column
-/// while keeping the encoded text within the 1 MiB catalog payload limit.
-///
-/// A full [`TableStats`] for a wide table — per-column top-value sketches
-/// plus equi-depth histograms — can exceed the bounded catalog payload. When
-/// that happens we persist a progressively trimmed copy that keeps the cheap
-/// scalar estimates (row / distinct / null counts, min, max), drops the large
-/// sketches, and preserves compact conditional key-domain stats when possible.
-/// The value is externalized through the normal DD LOB path whenever it does
-/// not fit in a heap page. A final guard falls back to empty stats for
-/// pathologically wide tables. Statistics are advisory, so this
-/// lossy-on-overflow persistence is sound — correctness never depends on the
-/// sketches surviving a restart.
-fn stats_json_bounded(table: &TableSchema) -> Value {
-    let stats = &table.stats;
-    let full = serde_json::to_string(stats).unwrap_or_else(|_| "null".to_string());
-    if full.len() <= DD_STATS_JSON_CAP_BYTES {
-        return Value::String(full);
-    }
-    let mut trimmed = stats.clone();
-    for col in trimmed.columns.values_mut() {
-        col.top_values = Vec::new();
-        col.frequency = Default::default();
-        col.histogram = Vec::new();
-    }
-    let trimmed_json = serde_json::to_string(&trimmed).unwrap_or_else(|_| "null".to_string());
-    if trimmed_json.len() <= DD_STATS_JSON_CAP_BYTES {
-        return Value::String(trimmed_json);
-    }
-    trimmed.conditional_key_domains.retain(|domain| {
-        domain.filter_columns.len() == 1
-            && domain.key_columns.len() == 1
-            && domain.entries.len() <= 1024
-    });
-    trimmed
-        .conditional_key_domains
-        .sort_by_key(|domain| domain.entries.len());
-    let trimmed_json = serde_json::to_string(&trimmed).unwrap_or_else(|_| "null".to_string());
-    if trimmed_json.len() <= DD_STATS_JSON_CAP_BYTES {
-        return Value::String(trimmed_json);
-    }
-    let keep_columns = stats_priority_columns(table, &trimmed);
-    trimmed
-        .columns
-        .retain(|column, _| keep_columns.contains(&normalize_name(column)));
-    let trimmed_json = serde_json::to_string(&trimmed).unwrap_or_else(|_| "null".to_string());
-    if trimmed_json.len() <= DD_STATS_JSON_CAP_BYTES {
-        return Value::String(trimmed_json);
-    }
-    for entry_limit in [256_usize, 128, 64, 16, 4, 1] {
-        for domain in &mut trimmed.conditional_key_domains {
-            if domain.entries.len() > entry_limit {
-                domain
-                    .entries
-                    .sort_by_key(|entry| std::cmp::Reverse(entry.row_count));
-                domain.entries.truncate(entry_limit);
-            }
-        }
-        let trimmed_json = serde_json::to_string(&trimmed).unwrap_or_else(|_| "null".to_string());
-        if trimmed_json.len() <= DD_STATS_JSON_CAP_BYTES {
-            return Value::String(trimmed_json);
-        }
-    }
-    while !trimmed.conditional_key_domains.is_empty() {
-        trimmed.conditional_key_domains.pop();
-        let trimmed_json = serde_json::to_string(&trimmed).unwrap_or_else(|_| "null".to_string());
-        if trimmed_json.len() <= DD_STATS_JSON_CAP_BYTES {
-            return Value::String(trimmed_json);
-        }
-    }
-    let mut fallback = TableStats::empty();
-    // Advisory CBO sketches may be trimmed; explicitly requested SQL
-    // histograms are user-visible metadata and must survive a restart.
-    fallback.explicit_histograms = stats.explicit_histograms.clone();
-    jsonv(&fallback)
-}
-
-fn stats_priority_columns(
-    table: &TableSchema,
-    stats: &TableStats,
-) -> std::collections::BTreeSet<String> {
-    let mut keep = std::collections::BTreeSet::new();
-    for column in &table.primary_key {
-        keep.insert(normalize_name(column));
-    }
-    for index in &table.indexes {
-        for column in &index.columns {
-            keep.insert(normalize_name(column));
-        }
-    }
-    for domain in &stats.conditional_key_domains {
-        for column in domain
-            .filter_columns
-            .iter()
-            .chain(domain.key_columns.iter())
-        {
-            keep.insert(normalize_name(column));
-        }
-    }
-    keep
 }
 
 // ---- read helpers (column Value -> Catalog field) ----
@@ -1083,29 +1056,85 @@ fn r_opt_usize(row: &[Value], i: usize) -> Option<usize> {
         _ => None,
     }
 }
-/// Deserialize a JSON text column to a `Default`-able type.
-fn r_json<T: serde::de::DeserializeOwned + Default>(row: &[Value], i: usize) -> T {
-    match row.get(i) {
-        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_default(),
-        Some(Value::SmallString(b)) => {
-            serde_json::from_str(unsafe { std::str::from_utf8_unchecked(b) }).unwrap_or_default()
-        }
-        _ => T::default(),
-    }
+/// Decode authoritative JSON without inventing missing or unknown semantics.
+fn r_json<T: serde::de::DeserializeOwned>(
+    row: &[Value],
+    i: usize,
+) -> Result<T, crate::types::QueryError> {
+    let text = row
+        .get(i)
+        .and_then(crate::types::value_str)
+        .ok_or_else(|| {
+            super::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                format!("catalog field {i}: expected JSON text"),
+            )
+        })?;
+    serde_json::from_str(text).map_err(|err| {
+        super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("catalog field {i}: invalid persisted metadata: {err}"),
+        )
+    })
 }
-/// DataTypeKind has no `Default`; fall back to `Text` on parse failure
-/// (should never happen for rows we wrote).
-fn r_data_type(row: &[Value], i: usize) -> DataTypeKind {
-    match row.get(i) {
-        Some(Value::String(s)) => {
-            serde_json::from_str(s).unwrap_or(DataTypeKind::Text { max_len: 65_535 })
+fn r_data_type(row: &[Value], i: usize) -> Result<DataTypeKind, crate::types::QueryError> {
+    let kind: DataTypeKind = r_json(row, i)?;
+    let valid = match &kind {
+        DataTypeKind::Decimal { precision, scale } => {
+            precision.is_none_or(|p| (1..=65).contains(&p))
+                && scale.is_none_or(|s| s <= 30 && precision.is_none_or(|p| s <= p))
         }
-        Some(Value::SmallString(b)) => {
-            serde_json::from_str(unsafe { std::str::from_utf8_unchecked(b) })
-                .unwrap_or(DataTypeKind::Text { max_len: 65_535 })
+        DataTypeKind::Time { fsp }
+        | DataTypeKind::DateTime { fsp }
+        | DataTypeKind::Timestamp { fsp } => *fsp <= 6,
+        DataTypeKind::Vector { dim, datatype } => {
+            dim.is_none_or(|n| n > 0 && n <= datatype.max_dimension())
         }
-        _ => DataTypeKind::Text { max_len: 65_535 },
+        DataTypeKind::Enum { values } => !values.is_empty() && values.len() <= 65535,
+        DataTypeKind::Set { values } => !values.is_empty() && values.len() <= 64,
+        DataTypeKind::Bit { len } => len.is_none_or(|n| (1..=64).contains(&n)),
+        _ => true,
+    };
+    if !valid {
+        return Err(super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("invalid persisted SQL type parameters at catalog field {i}"),
+        ));
     }
+    Ok(kind)
+}
+
+fn require_tag(
+    row: &[Value],
+    field: usize,
+    name: &str,
+    supported: &[&str],
+) -> Result<(), crate::types::QueryError> {
+    let value = row
+        .get(field)
+        .and_then(crate::types::value_str)
+        .filter(|value| supported.contains(value));
+    if value.is_none() {
+        return Err(super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("unsupported or missing catalog {name} at field {field}"),
+        ));
+    }
+    Ok(())
+}
+
+fn r_u32(row: &[Value], field: usize) -> Result<u32, crate::types::QueryError> {
+    let value = match row.get(field) {
+        Some(Value::UInt(value)) => u32::try_from(*value).ok(),
+        Some(Value::Int(value)) => u32::try_from(*value).ok(),
+        _ => None,
+    };
+    value.ok_or_else(|| {
+        super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("invalid catalog unsigned 32-bit field {field}"),
+        )
+    })
 }
 
 fn col_state_str(s: ColumnState) -> &'static str {
@@ -1152,7 +1181,7 @@ fn dir_from(s: &str) -> IndexColumnDirection {
 /// Flatten the database + base-table portion of `catalog` into dictionary
 /// rows. (Views / routines / triggers / events / auth are mirrored in a
 /// later phase.)
-pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> DdRowSet {
+pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> Result<DdRowSet, crate::types::QueryError> {
     let mut set = DdRowSet::default();
     for db in catalog.databases.values() {
         set.schemata.push(vec![
@@ -1165,7 +1194,7 @@ pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> DdRowSet {
         ]);
     }
     for table in catalog.tables.values() {
-        push_table_rows(&mut set, table);
+        push_table_rows(&mut set, table)?;
     }
     for view in catalog.views.values() {
         set.views.push(view_row(view));
@@ -1235,10 +1264,13 @@ pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> DdRowSet {
         sv("next_sequence_id"),
         sv(catalog.next_sequence_id.to_string()),
     ]);
-    set
+    Ok(set)
 }
 
-fn push_table_rows(set: &mut DdRowSet, table: &TableSchema) {
+fn push_table_rows(
+    set: &mut DdRowSet,
+    table: &TableSchema,
+) -> Result<(), crate::types::QueryError> {
     let table_options = crate::storage::schema::TableOptions::from_schema(table);
     let table_options_json = if table_options.is_default() {
         Value::Null
@@ -1271,12 +1303,7 @@ fn push_table_rows(set: &mut DdRowSet, table: &TableSchema) {
         uv(table.next_index_id),
         uv(table.primary_publication_job_id),
     ]);
-    set.table_stats.push(vec![
-        uv(table.id),
-        uv(table.schema_version),
-        stats_json_bounded(table),
-        uv(table.updated_ms),
-    ]);
+    super::stats_store::append(set, table)?;
     for col in &table.columns {
         set.columns.push(vec![
             uv(table.id),
@@ -1402,40 +1429,33 @@ fn push_table_rows(set: &mut DdRowSet, table: &TableSchema) {
             ]);
         }
     }
+    Ok(())
 }
 
 /// Encode exactly one table and its owned child metadata. Incremental catalog
 /// transactions use this instead of walking the process-wide catalog.
-pub(crate) fn dd_rows_for_table(table: &TableSchema) -> DdRowSet {
+pub(crate) fn dd_rows_for_table(table: &TableSchema) -> Result<DdRowSet, crate::types::QueryError> {
     let mut set = DdRowSet::default();
-    push_table_rows(&mut set, table);
-    set
+    push_table_rows(&mut set, table)?;
+    Ok(set)
 }
 
-pub(crate) fn dd_row_for_table_stats(table: &TableSchema) -> Vec<Value> {
-    vec![
-        uv(table.id),
-        uv(table.schema_version),
-        stats_json_bounded(table),
-        uv(table.updated_ms),
-    ]
-}
-
-/// Decode only the startup-resident relation header. Large row-layout,
-/// primary-key and statistics JSON fields are intentionally skipped; they are
-/// decoded with the rest of the descriptor on first object access.
-pub(crate) fn table_header_from_dd_row(trow: &[Value]) -> Arc<TableSchema> {
-    let table_options: crate::storage::schema::TableOptions = match trow.get(18) {
-        Some(Value::String(s)) if !s.is_empty() => serde_json::from_str(s).unwrap_or_default(),
-        Some(Value::SmallString(b)) if !b.is_empty() => {
-            serde_json::from_str(unsafe { std::str::from_utf8_unchecked(b) }).unwrap_or_default()
-        }
-        _ => crate::storage::schema::TableOptions::default(),
-    };
-    Arc::new(TableSchema {
+/// Decode only the startup-resident relation header. Row-layout and primary-key
+/// JSON plus object-scoped statistics are loaded with the descriptor on access.
+pub(crate) fn table_header_from_dd_row(
+    trow: &[Value],
+) -> Result<Arc<TableSchema>, crate::types::QueryError> {
+    if r_u64(trow, 0) == 0 || r_u64(trow, 0) >= DD_TABLE_ID_BASE || r_u64(trow, 19) == 0 {
+        return Err(super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "zero catalog table or generation identity",
+        ));
+    }
+    let table_options: crate::storage::schema::TableOptions = r_json(trow, 18)?;
+    Ok(Arc::new(TableSchema {
         id: r_u64(trow, 0),
         object_id: r_u64(trow, 1),
-        active_generation: r_u64(trow, 19).max(1),
+        active_generation: r_u64(trow, 19),
         database: r_str(trow, 2),
         name: r_str(trow, 3),
         engine: r_str(trow, 4),
@@ -1456,21 +1476,21 @@ pub(crate) fn table_header_from_dd_row(trow: &[Value]) -> Arc<TableSchema> {
         schema_version: r_u64(trow, 10),
         system_time_epoch_us: table_options.system_time_epoch_us,
         row_generation_txn_id: table_options.row_generation_txn_id,
-        next_column_id: r_u64(trow, 11) as u32,
-        active_layout_id: r_u64(trow, 12) as u32,
+        next_column_id: r_u32(trow, 11)?,
+        active_layout_id: r_u32(trow, 12)?,
         row_layouts: Vec::new(),
-        pending_primary_key: r_json(trow, 20),
+        pending_primary_key: r_json(trow, 20)?,
         primary_definition_scn: r_u64(trow, 21),
         next_index_id: r_u64(trow, 22),
         primary_publication_job_id: r_u64(trow, 23),
-        partitioning: r_json::<Option<PartitionInfo>>(trow, 15),
+        partitioning: r_json::<Option<PartitionInfo>>(trow, 15)?,
         pctfree: table_options.pctfree,
         pctused: table_options.pctused,
         mysql_table_options: table_options.mysql_options,
         column_name_map: Default::default(),
         column_id_map: HashMap::new(),
         row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
-    })
+    }))
 }
 
 pub(crate) fn dd_row_for_schema(schema: &DatabaseSchema) -> Vec<Value> {
@@ -1507,18 +1527,18 @@ pub(crate) fn dd_row_for_sequence(sequence: &SequenceSchema) -> Vec<Value> {
 /// Auth mutations are independent of table count. Until the authorization
 /// layer moves to object-scoped CatalogTxn calls, replace only the bounded
 /// auth DD families rather than the whole database catalog.
-pub(crate) fn dd_rows_for_auth(auth: &AuthCatalog) -> DdRowSet {
+pub(crate) fn dd_rows_for_auth(auth: &AuthCatalog) -> Result<DdRowSet, crate::types::QueryError> {
     let mut catalog = super::catalog::empty_catalog();
     catalog.databases.clear();
     catalog.auth = std::sync::Arc::new(auth.clone());
-    let mut set = catalog_to_dd_rows(&catalog);
+    let mut set = catalog_to_dd_rows(&catalog)?;
     set.dd_properties.retain(|row| {
         matches!(
             row.first().and_then(crate::types::value_str),
             Some("auth_epoch" | "component_validate_password")
         )
     });
-    set
+    Ok(set)
 }
 
 pub(crate) fn auth_grant_key(grant: &GrantEntry) -> String {
@@ -1549,8 +1569,7 @@ pub(crate) fn auth_restriction_key(restriction: &crate::engine::auth::Restrictio
 }
 
 /// Parse a persisted `update_rule` / `delete_rule` string back into a
-/// [`ReferentialAction`]. Unknown values fall back to `NO ACTION` (the
-/// MySQL default and the safest enforcement).
+/// [`ReferentialAction`]. Callers validate the persisted tag before decoding.
 fn parse_referential_action(s: &str) -> ReferentialAction {
     match s.to_ascii_uppercase().as_str() {
         "CASCADE" => ReferentialAction::Cascade,
@@ -1564,7 +1583,7 @@ fn parse_referential_action(s: &str) -> ReferentialAction {
 /// dictionary rows. The reverse of [`catalog_to_dd_rows`]. Runtime-only
 /// fields are re-derived by `build_column_index`.
 pub(crate) fn catalog_from_dd_rows(set: &DdRowSet) -> Result<Catalog, crate::types::QueryError> {
-    catalog_from_dd_rows_with_auth(set, reconstruct_auth(set))
+    catalog_from_dd_rows_with_auth(set, reconstruct_auth(set)?)
 }
 
 /// Decode schema metadata for a temporary descriptor graph without creating
@@ -1579,6 +1598,69 @@ fn catalog_from_dd_rows_with_auth(
     set: &DdRowSet,
     auth: AuthCatalog,
 ) -> Result<Catalog, crate::types::QueryError> {
+    let check = |rows: &[Vec<Value>],
+                 column: usize,
+                 allowed: &[&str]|
+     -> Result<(), crate::types::QueryError> {
+        for row in rows {
+            let value = row
+                .get(column)
+                .and_then(crate::types::value_str)
+                .unwrap_or("");
+            if !allowed
+                .iter()
+                .any(|allowed| value.eq_ignore_ascii_case(allowed))
+            {
+                return Err(super::error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    format!("invalid catalog enum field {column}: {value}"),
+                ));
+            }
+        }
+        Ok(())
+    };
+    check(
+        &set.columns,
+        13,
+        &["PUBLIC", "WRITE_ONLY", "DELETE_ONLY", "DROPPED"],
+    )?;
+    check(&set.indexes, 7, &["PUBLIC", "BUILDING"])?;
+    check(
+        &set.indexes,
+        3,
+        &["BTREE", "FULLTEXT", "SPATIAL", "HNSW", "IVF", "VECTOR"],
+    )?;
+    check(&set.index_column_usage, 5, &["ASC", "DESC"])?;
+    check(
+        &set.foreign_keys,
+        4,
+        &["NO ACTION", "RESTRICT", "CASCADE", "SET NULL"],
+    )?;
+    check(
+        &set.foreign_keys,
+        5,
+        &["NO ACTION", "RESTRICT", "CASCADE", "SET NULL"],
+    )?;
+    check(&set.routines, 2, &["FUNCTION", "PROCEDURE"])?;
+    check(&set.routines, 5, &["DEFINER", "INVOKER"])?;
+    check(
+        &set.routines,
+        10,
+        &[
+            "CONTAINS SQL",
+            "NO SQL",
+            "READS SQL DATA",
+            "MODIFIES SQL DATA",
+        ],
+    )?;
+    check(&set.triggers, 4, &["BEFORE", "AFTER"])?;
+    check(&set.triggers, 5, &["INSERT", "UPDATE", "DELETE"])?;
+    check(&set.events, 5, &["PRESERVE", "NOT PRESERVE"])?;
+    check(
+        &set.events,
+        6,
+        &["ENABLED", "DISABLED", "SLAVESIDE_DISABLED"],
+    )?;
     // Partial descriptor snapshots omit properties. A persisted authority must
     // never be silently relabelled with the current binary's format version.
     for row in &set.dd_properties {
@@ -1590,6 +1672,7 @@ fn catalog_from_dd_rows_with_auth(
             }
         }
     }
+    super::stats_store::validate_rows(set)?;
     let mut databases = BTreeMap::new();
     for row in &set.schemata {
         let name = r_str(row, 0);
@@ -1621,11 +1704,6 @@ fn catalog_from_dd_rows_with_auth(
             .or_default()
             .push(row);
     }
-    let mut stats_by_table = set
-        .table_stats
-        .iter()
-        .map(|row| (r_u64(row, 0), row))
-        .collect::<HashMap<_, _>>();
     let mut chk_by_table: HashMap<u64, Vec<&Vec<Value>>> = HashMap::new();
     for row in &set.check_constraints {
         chk_by_table.entry(r_u64(row, 0)).or_default().push(row);
@@ -1650,7 +1728,10 @@ fn catalog_from_dd_rows_with_auth(
 
         let mut col_rows = cols_by_table.remove(&id).unwrap_or_default();
         col_rows.sort_by_key(|r| r_u64(r, 4)); // physical_pos
-        let columns: Vec<ColumnSchema> = col_rows.iter().map(|r| reconstruct_column(r)).collect();
+        let columns: Vec<ColumnSchema> = col_rows
+            .iter()
+            .map(|r| reconstruct_column(r))
+            .collect::<Result<_, _>>()?;
 
         let mut idx_rows = idx_by_table.remove(&id).unwrap_or_default();
         idx_rows.sort_by_key(|r| r_u64(r, 1)); // ordinal_position
@@ -1658,7 +1739,7 @@ fn catalog_from_dd_rows_with_auth(
             .iter()
             .map(|r| {
                 let parts = icu_by_index.remove(&(id, r_str(r, 2))).unwrap_or_default();
-                let mut index = reconstruct_index(r, parts);
+                let mut index = reconstruct_index(r, parts)?;
                 if index.is_vector() {
                     let raw = r.get(13).and_then(crate::types::value_str).ok_or_else(|| {
                         crate::storage::error(
@@ -1710,27 +1791,41 @@ fn catalog_from_dd_rows_with_auth(
         chk_rows.sort_by(|a, b| r_str(a, 1).cmp(&r_str(b, 1)));
         let check_constraints = chk_rows
             .iter()
-            .map(|r| CheckConstraintSchema {
-                name: r_str(r, 1),
-                expr: r_str(r, 2),
-                enforced: r_bool(r, 3),
-                column_names: r_json::<Vec<String>>(r, 4),
-                expr_ast: None,
-                program: None,
+            .map(|r| {
+                Ok(CheckConstraintSchema {
+                    name: r_str(r, 1),
+                    expr: r_str(r, 2),
+                    enforced: r_bool(r, 3),
+                    column_names: r_json::<Vec<String>>(r, 4)?,
+                    expr_ast: None,
+                    program: None,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::types::QueryError>>()?;
 
         let mut fk_rows = fk_by_table.remove(&id).unwrap_or_default();
         fk_rows.sort_by(|a, b| r_str(a, 1).cmp(&r_str(b, 1)));
         let foreign_keys = fk_rows
             .iter()
             .map(|r| {
+                require_tag(
+                    r,
+                    4,
+                    "foreign-key update rule",
+                    &["CASCADE", "SET NULL", "RESTRICT", "NO ACTION"],
+                )?;
+                require_tag(
+                    r,
+                    5,
+                    "foreign-key delete rule",
+                    &["CASCADE", "SET NULL", "RESTRICT", "NO ACTION"],
+                )?;
                 let fk_name = r_str(r, 1);
                 let mut parts = fkcu_by_fk
                     .remove(&(id, fk_name.clone()))
                     .unwrap_or_default();
                 parts.sort_by_key(|p| r_u64(p, 2)); // ordinal_position
-                ForeignKeySchema {
+                Ok(ForeignKeySchema {
                     name: fk_name,
                     columns: parts.iter().map(|p| r_str(p, 3)).collect(),
                     referenced_database: r_str(r, 2),
@@ -1741,34 +1836,23 @@ fn catalog_from_dd_rows_with_auth(
                     backing_index: r_str(r, 6),
                     backing_index_id: r_u64(r, 7),
                     child_col_idx: Vec::new(),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::types::QueryError>>()?;
 
         let database = r_str(trow, 2);
         let name = r_str(trow, 3);
-        let stats = match stats_by_table.remove(&id).and_then(|row| row.get(2)) {
-            Some(Value::String(s)) => {
-                serde_json::from_str(s).unwrap_or_else(|_| TableStats::empty())
-            }
-            Some(Value::SmallString(b)) => {
-                serde_json::from_str(unsafe { std::str::from_utf8_unchecked(b) })
-                    .unwrap_or_else(|_| TableStats::empty())
-            }
-            _ => TableStats::empty(),
-        };
-        let table_options: crate::storage::schema::TableOptions = match trow.get(18) {
-            Some(Value::String(s)) if !s.is_empty() => serde_json::from_str(s).unwrap_or_default(),
-            Some(Value::SmallString(b)) if !b.is_empty() => {
-                serde_json::from_str(unsafe { std::str::from_utf8_unchecked(b) })
-                    .unwrap_or_default()
-            }
-            _ => crate::storage::schema::TableOptions::default(),
-        };
+        if r_u64(trow, 0) == 0 || r_u64(trow, 0) >= DD_TABLE_ID_BASE || r_u64(trow, 19) == 0 {
+            return Err(super::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "zero catalog table or generation identity",
+            ));
+        }
+        let table_options: crate::storage::schema::TableOptions = r_json(trow, 18)?;
         let mut table = TableSchema {
             id,
             object_id: r_u64(trow, 1),
-            active_generation: r_u64(trow, 19).max(1),
+            active_generation: r_u64(trow, 19),
             database: database.clone(),
             name: name.clone(),
             engine: r_str(trow, 4),
@@ -1779,24 +1863,24 @@ fn catalog_from_dd_rows_with_auth(
             updated_ms: r_u64(trow, 17),
             table_type: r_str(trow, 8),
             columns,
-            primary_key: r_json::<Vec<String>>(trow, 14),
+            primary_key: r_json::<Vec<String>>(trow, 14)?,
             indexes,
             check_constraints,
             foreign_keys,
             fk_referenced_by: Vec::new(),
-            stats,
+            stats: TableStats::empty(),
             system: r_bool(trow, 9),
             schema_version: r_u64(trow, 10),
             system_time_epoch_us: table_options.system_time_epoch_us,
             row_generation_txn_id: table_options.row_generation_txn_id,
-            next_column_id: r_u64(trow, 11) as u32,
-            active_layout_id: r_u64(trow, 12) as u32,
-            row_layouts: r_json(trow, 13),
-            pending_primary_key: r_json(trow, 20),
+            next_column_id: r_u32(trow, 11)?,
+            active_layout_id: r_u32(trow, 12)?,
+            row_layouts: r_json(trow, 13)?,
+            pending_primary_key: r_json(trow, 20)?,
             primary_definition_scn: r_u64(trow, 21),
             next_index_id: r_u64(trow, 22),
             primary_publication_job_id: r_u64(trow, 23),
-            partitioning: r_json::<Option<PartitionInfo>>(trow, 15),
+            partitioning: r_json::<Option<PartitionInfo>>(trow, 15)?,
             pctfree: table_options.pctfree,
             pctused: table_options.pctused,
             mysql_table_options: table_options.mysql_options,
@@ -1804,7 +1888,9 @@ fn catalog_from_dd_rows_with_auth(
             column_id_map: HashMap::new(),
             row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
+        validate_persisted_layouts(&table)?;
         table.build_column_index();
+        table.stats = super::stats_store::load(set, &table)?;
         tables.insert(table_key(&database, &name), Arc::new(table));
     }
 
@@ -1815,7 +1901,7 @@ fn catalog_from_dd_rows_with_auth(
     }
     let mut routines = BTreeMap::new();
     for row in &set.routines {
-        let r = reconstruct_routine(row);
+        let r = reconstruct_routine(row)?;
         routines.insert(
             routine_key(&r.database, r.kind.lower(), &r.name),
             std::sync::Arc::new(r),
@@ -1823,12 +1909,12 @@ fn catalog_from_dd_rows_with_auth(
     }
     let mut triggers = BTreeMap::new();
     for row in &set.triggers {
-        let t = reconstruct_trigger(row);
+        let t = reconstruct_trigger(row)?;
         triggers.insert(trigger_key(&t.database, &t.name), t);
     }
     let mut events = BTreeMap::new();
     for row in &set.events {
-        let e = reconstruct_event(row);
+        let e = reconstruct_event(row)?;
         events.insert(event_key(&e.database, &e.name), e);
     }
     let mut sequences = BTreeMap::new();
@@ -1839,18 +1925,31 @@ fn catalog_from_dd_rows_with_auth(
         sequences.insert(table_key(&s.database, &s.name), Arc::new(s));
     }
 
-    let property_u64 = |name: &str| {
-        set.dd_properties.iter().find_map(|row| {
-            (r_str(row, 0) == name)
-                .then(|| r_str(row, 1).parse::<u64>().ok())
-                .flatten()
-        })
+    let property_u64 = |name: &str| -> Result<Option<u64>, crate::types::QueryError> {
+        let mut found = None;
+        for row in &set.dd_properties {
+            if r_str(row, 0) == name {
+                let value = r_str(row, 1).parse::<u64>().map_err(|_| {
+                    super::error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        format!("invalid catalog property {name}"),
+                    )
+                })?;
+                if value == 0 || found.replace(value).is_some() {
+                    return Err(super::error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        format!("duplicate or zero catalog property {name}, value={value}, previous={found:?}"),
+                    ));
+                }
+            }
+        }
+        Ok(found)
     };
 
     Ok(Catalog {
         version: CATALOG_VERSION,
-        next_table_id: property_u64("next_table_id").unwrap_or(max_id + 1),
-        next_sequence_id: property_u64("next_sequence_id").unwrap_or(max_seq_id + 1),
+        next_table_id: property_u64("next_table_id")?.unwrap_or(max_id.saturating_add(1)),
+        next_sequence_id: property_u64("next_sequence_id")?.unwrap_or(max_seq_id.saturating_add(1)),
         databases,
         tables,
         views,
@@ -1876,40 +1975,29 @@ fn catalog_from_dd_rows_with_auth(
     })
 }
 
-fn reconstruct_auth(set: &DdRowSet) -> AuthCatalog {
+fn reconstruct_auth(set: &DdRowSet) -> Result<AuthCatalog, crate::types::QueryError> {
     // A persisted authority is authoritative, including deleted bootstrap accounts.
     let mut auth = AuthCatalog::empty();
     for row in &set.users {
-        if let Some(s) = row.get(2).and_then(crate::types::value_str) {
-            if let Ok(account) = serde_json::from_str::<UserAccount>(s) {
-                auth.accounts.insert(account_id(&account.key), account);
-            }
-        }
+        let account: UserAccount = r_json(row, 2)?;
+        auth.accounts.insert(account_id(&account.key), account);
     }
     let mut grant_rows: Vec<(String, GrantEntry)> = set
         .grants
         .iter()
-        .filter_map(|row| {
-            let s = row.get(1).and_then(crate::types::value_str)?;
-            serde_json::from_str::<GrantEntry>(s)
-                .ok()
-                .map(|g| (r_str(row, 0), g))
-        })
-        .collect();
+        .map(|row| Ok((r_str(row, 0), r_json(row, 1)?)))
+        .collect::<Result<_, crate::types::QueryError>>()?;
     grant_rows.sort_by(|left, right| left.0.cmp(&right.0));
     auth.grants = grant_rows.into_iter().map(|(_, g)| g).collect();
 
     let mut edges: Vec<(String, RoleEdge)> = Vec::new();
     let mut defaults: Vec<(String, RoleEdge)> = Vec::new();
     for row in &set.role_edges {
-        if let Some(s) = row.get(2).and_then(crate::types::value_str) {
-            if let Ok(edge) = serde_json::from_str::<RoleEdge>(s) {
-                if r_bool(row, 1) {
-                    defaults.push((r_str(row, 0), edge));
-                } else {
-                    edges.push((r_str(row, 0), edge));
-                }
-            }
+        let edge: RoleEdge = r_json(row, 2)?;
+        if r_bool(row, 1) {
+            defaults.push((r_str(row, 0), edge));
+        } else {
+            edges.push((r_str(row, 0), edge));
         }
     }
     edges.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1920,13 +2008,13 @@ fn reconstruct_auth(set: &DdRowSet) -> AuthCatalog {
     let mut restrictions = set
         .restrictions
         .iter()
-        .filter_map(|row| {
-            let json = row.get(1).and_then(crate::types::value_str)?;
-            serde_json::from_str::<crate::engine::auth::RestrictionEntry>(json)
-                .ok()
-                .map(|restriction| (r_str(row, 0), restriction))
+        .map(|row| {
+            Ok((
+                r_str(row, 0),
+                r_json::<crate::engine::auth::RestrictionEntry>(row, 1)?,
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, crate::types::QueryError>>()?;
     restrictions.sort_by(|left, right| left.0.cmp(&right.0));
     auth.restrictions = restrictions
         .into_iter()
@@ -1935,44 +2023,158 @@ fn reconstruct_auth(set: &DdRowSet) -> AuthCatalog {
 
     for row in &set.dd_properties {
         if r_str(row, 0) == "auth_epoch" {
-            auth.epoch = r_str(row, 1).parse().unwrap_or(0);
+            auth.epoch = r_str(row, 1).parse().map_err(|_| {
+                super::error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "invalid catalog auth epoch",
+                )
+            })?;
         }
         if r_str(row, 0) == "component_validate_password" {
+            require_tag(row, 1, "password-validation component state", &["0", "1"])?;
             auth.password_validation_component = r_str(row, 1) == "1";
         }
     }
     auth.rebuild_runtime_indexes();
-    auth
+    Ok(auth)
 }
 
-fn reconstruct_column(r: &[Value]) -> ColumnSchema {
-    ColumnSchema {
+fn validate_persisted_layouts(table: &TableSchema) -> Result<(), crate::types::QueryError> {
+    let fail = || {
+        super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!(
+                "invalid persisted row layouts for {}.{}",
+                table.database, table.name
+            ),
+        )
+    };
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| c.column_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if columns.len() != table.columns.len() || columns.contains(&0) || table.active_generation == 0
+    {
+        return Err(fail());
+    }
+    let physical_positions = table
+        .columns
+        .iter()
+        .map(|column| column.physical_pos)
+        .collect::<std::collections::BTreeSet<_>>();
+    if physical_positions.len() != table.columns.len()
+        || table.next_column_id <= columns.iter().copied().max().unwrap_or(0)
+    {
+        return Err(fail());
+    }
+    let mut index_ids = std::collections::BTreeSet::new();
+    for index in &table.indexes {
+        if index.index_id == 0
+            || index.index_id >= table.next_index_id
+            || !index_ids.insert(index.index_id)
+        {
+            return Err(fail());
+        }
+        for (position, name) in index.columns.iter().enumerate() {
+            if index
+                .key_expressions
+                .get(position)
+                .and_then(Option::as_ref)
+                .is_none()
+                && !table
+                    .columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(name))
+            {
+                return Err(fail());
+            }
+        }
+        if index.included_columns.iter().any(|name| {
+            !table
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(name))
+        }) {
+            return Err(fail());
+        }
+    }
+    if table.foreign_keys.iter().any(|key| {
+        key.columns.len() != key.referenced_columns.len()
+            || key.columns.is_empty()
+            || key.columns.iter().any(|name| {
+                !table
+                    .columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(name))
+            })
+    }) {
+        return Err(fail());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for layout in &table.row_layouts {
+        if layout.layout_id == 0 || !ids.insert(layout.layout_id) {
+            return Err(fail());
+        }
+        let mut stored = std::collections::BTreeSet::new();
+        let mut positions = std::collections::BTreeSet::new();
+        for column in &layout.columns {
+            if !columns.contains(&column.column_id)
+                || !stored.insert(column.column_id)
+                || !positions.insert(column.physical_pos)
+            {
+                return Err(fail());
+            }
+        }
+    }
+    if !ids.contains(&table.active_layout_id) {
+        return Err(fail());
+    }
+    if table.primary_key.iter().any(|key| {
+        !table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(key))
+    }) {
+        return Err(fail());
+    }
+    Ok(())
+}
+
+fn reconstruct_column(r: &[Value]) -> Result<ColumnSchema, crate::types::QueryError> {
+    require_tag(
+        r,
+        13,
+        "column state",
+        &["PUBLIC", "WRITE_ONLY", "DELETE_ONLY", "DROPPED"],
+    )?;
+    Ok(ColumnSchema {
         not_null_from_scn: r_u64(r, 23),
         name: r_str(r, 2),
-        data_type: r_data_type(r, 6),
+        data_type: r_data_type(r, 6)?,
         nullable: r_bool(r, 7),
         unsigned: r_bool(r, 8),
         auto_increment: r_bool(r, 9),
-        default: r_json::<Option<Value>>(r, 10),
-        read_backfill_default: r_json::<Option<Value>>(r, 22),
+        default: r_json::<Option<Value>>(r, 10)?,
+        read_backfill_default: r_json::<Option<Value>>(r, 22)?,
         default_expr: r_opt_str(r, 11),
         on_update_expr: r_opt_str(r, 12),
-        column_id: r_u64(r, 1) as u32,
+        column_id: r_u32(r, 1)?,
         state: col_state_from(&r_str(r, 13)),
-        physical_pos: r_u64(r, 4) as u32,
-        logical_pos: r_u64(r, 5) as u32,
-        ordinal_position: r_u64(r, 3) as u32,
+        physical_pos: r_u32(r, 4)?,
+        logical_pos: r_u32(r, 5)?,
+        ordinal_position: r_u32(r, 3)?,
         charset: r_opt_str(r, 14),
         collation: r_opt_str(r, 15),
         comment: r_str(r, 16),
         generated_expr: r_opt_str(r, 17),
         generated_stored: r_bool(r, 18),
-        generated_column_names: r_json::<Vec<String>>(r, 19),
+        generated_column_names: r_json::<Vec<String>>(r, 19)?,
         zerofill: r_bool(r, 20),
         invisible: r_bool(r, 21),
         generated_expr_ast: None,
         generated_program: None,
-    }
+    })
 }
 
 /// Physical index identity for startup validation. Key definitions are only
@@ -1990,7 +2192,17 @@ pub(crate) fn index_storage_identity(row: &[Value]) -> Option<(u64, u64)> {
         .then(|| (r_u64(row, 0), r_u64(row, 10)))
 }
 
-fn reconstruct_index(irow: &[Value], mut parts: Vec<&Vec<Value>>) -> IndexSchema {
+fn reconstruct_index(
+    irow: &[Value],
+    mut parts: Vec<&Vec<Value>>,
+) -> Result<IndexSchema, crate::types::QueryError> {
+    require_tag(irow, 7, "index state", &["PUBLIC", "BUILDING"])?;
+    require_tag(
+        irow,
+        3,
+        "index type",
+        &["BTREE", "FULLTEXT", "SPATIAL", "HNSW", "IVF"],
+    )?;
     parts.sort_by_key(|r| r_u64(r, 2)); // ordinal_position
     let mut columns = Vec::new();
     let mut prefix_lengths = Vec::new();
@@ -1998,6 +2210,7 @@ fn reconstruct_index(irow: &[Value], mut parts: Vec<&Vec<Value>>) -> IndexSchema
     let mut key_expressions: Vec<Option<IndexExpression>> = Vec::new();
     let mut included_columns = Vec::new();
     for p in &parts {
+        require_tag(p, 5, "index direction", &["ASC", "DESC"])?;
         if r_bool(p, 6) {
             included_columns.push(r_str(p, 3));
             continue;
@@ -2009,9 +2222,9 @@ fn reconstruct_index(irow: &[Value], mut parts: Vec<&Vec<Value>>) -> IndexSchema
                 columns.push(expr_sql.clone());
                 key_expressions.push(Some(IndexExpression {
                     expr_sql,
-                    data_type: r_data_type(p, 8),
+                    data_type: r_data_type(p, 8)?,
                     nullable: r_bool(p, 9),
-                    referenced_columns: r_json::<Vec<String>>(p, 10),
+                    referenced_columns: r_json::<Vec<String>>(p, 10)?,
                     multi_valued: r_bool(p, 11),
                     ast: None,
                     program: None,
@@ -2039,8 +2252,8 @@ fn reconstruct_index(irow: &[Value], mut parts: Vec<&Vec<Value>>) -> IndexSchema
     let index_type = r_str(irow, 3);
     // Persist the complete per-index snapshot: process environment changes
     // must never change the tokenizer of an existing physical index.
-    let fulltext = r_json::<Option<crate::storage::schema::FulltextMeta>>(irow, 11);
-    IndexSchema {
+    let fulltext = r_json::<Option<crate::storage::schema::FulltextMeta>>(irow, 11)?;
+    Ok(IndexSchema {
         readable_from_scn: r_u64(irow, 12),
         index_id: r_u64(irow, 10),
         name: r_str(irow, 2),
@@ -2056,8 +2269,8 @@ fn reconstruct_index(irow: &[Value], mut parts: Vec<&Vec<Value>>) -> IndexSchema
         visible: r_bool(irow, 6),
         comment: r_str(irow, 8),
         fulltext,
-        vector: r_json(irow, 13),
-    }
+        vector: r_json(irow, 13)?,
+    })
 }
 
 // ---- views ----
@@ -2087,6 +2300,8 @@ fn view_row(v: &ViewSchema) -> Vec<Value> {
     ]
 }
 fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError> {
+    require_tag(r, 8, "view security", &["INVOKER", "DEFINER"])?;
+    require_tag(r, 5, "view algorithm", &["UNDEFINED", "MERGE", "TEMPTABLE"])?;
     let encoded = match r.get(17) {
         None | Some(Value::Null) => None,
         Some(value) => Some(crate::types::value_str(value).ok_or_else(|| {
@@ -2121,8 +2336,8 @@ fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError>
         database: r_str(r, 0),
         name: r_str(r, 1),
         sql: r_str(r, 2),
-        columns: r_json::<Vec<ViewColumnDef>>(r, 3),
-        dependencies: r_json::<Vec<ViewDependency>>(r, 4),
+        columns: r_json::<Vec<ViewColumnDef>>(r, 3)?,
+        dependencies: r_json::<Vec<ViewDependency>>(r, 4)?,
         algorithm: r_str_default(r, 5, "UNDEFINED"),
         definer_user: r_str_default(r, 6, "root"),
         definer_host: r_str_default(r, 7, "%"),
@@ -2130,7 +2345,7 @@ fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError>
             "INVOKER" => RoutineSecuritySchema::Invoker,
             _ => RoutineSecuritySchema::Definer,
         },
-        routine_dependencies: r_json::<Vec<ViewRoutineDependency>>(r, 9),
+        routine_dependencies: r_json::<Vec<ViewRoutineDependency>>(r, 9)?,
         check_option: r_opt_str(r, 10),
         is_updatable: r_bool(r, 11),
         character_set_client: r_str_default(r, 12, crate::charset::DEFAULT_CHARSET),
@@ -2241,25 +2456,39 @@ fn routine_row(r: &RoutineSchema) -> Vec<Value> {
         sv(&r.sql_mode),
     ]
 }
-fn reconstruct_routine(r: &[Value]) -> RoutineSchema {
-    RoutineSchema {
+fn reconstruct_routine(r: &[Value]) -> Result<RoutineSchema, crate::types::QueryError> {
+    require_tag(r, 2, "routine kind", &["FUNCTION", "PROCEDURE"])?;
+    require_tag(r, 5, "routine security", &["INVOKER", "DEFINER"])?;
+    require_tag(
+        r,
+        10,
+        "routine data access",
+        &[
+            "NO SQL",
+            "READS SQL DATA",
+            "MODIFIES SQL DATA",
+            "CONTAINS SQL",
+        ],
+    )?;
+    Ok(RoutineSchema {
         database: r_str(r, 0),
         name: r_str(r, 1),
         kind: routine_kind_from(&r_str(r, 2)),
         definer_user: r_str(r, 3),
         definer_host: r_str(r, 4),
         security_type: routine_security_from(&r_str(r, 5)),
-        return_type: r
-            .get(6)
-            .and_then(crate::types::value_str)
-            .and_then(|s| serde_json::from_str(s).ok()),
+        return_type: if matches!(r.get(6), Some(Value::Null)) {
+            None
+        } else {
+            Some(r_json(r, 6)?)
+        },
         return_type_sql: r_opt_str(r, 7),
         return_unsigned: r_bool(r, 8),
         deterministic: r_bool(r, 9),
         sql_data_access: routine_sda_from(&r_str(r, 10)),
         comment: r_str(r, 11),
         body_sql: r_str(r, 12),
-        params: r_json::<Vec<RoutineParamSchema>>(r, 13),
+        params: r_json::<Vec<RoutineParamSchema>>(r, 13)?,
         schema_version: r_u64(r, 14),
         created_ms: r_u64(r, 15),
         updated_ms: r_u64(r, 16),
@@ -2267,7 +2496,7 @@ fn reconstruct_routine(r: &[Value]) -> RoutineSchema {
         collation_connection: r_str_default(r, 18, crate::charset::DEFAULT_COLLATION),
         database_collation: r_str_default(r, 19, crate::charset::DEFAULT_COLLATION),
         sql_mode: r_str(r, 20),
-    }
+    })
 }
 fn routine_kind_from(s: &str) -> RoutineKindSchema {
     if s.eq_ignore_ascii_case("FUNCTION") {
@@ -2314,8 +2543,10 @@ fn trigger_row(t: &TriggerSchema) -> Vec<Value> {
         sv(&t.database_collation),
     ]
 }
-fn reconstruct_trigger(r: &[Value]) -> TriggerSchema {
-    TriggerSchema {
+fn reconstruct_trigger(r: &[Value]) -> Result<TriggerSchema, crate::types::QueryError> {
+    require_tag(r, 4, "trigger timing", &["BEFORE", "AFTER"])?;
+    require_tag(r, 5, "trigger event", &["INSERT", "UPDATE", "DELETE"])?;
+    Ok(TriggerSchema {
         database: r_str(r, 0),
         name: r_str(r, 1),
         table_database: r_str(r, 2),
@@ -2330,14 +2561,14 @@ fn reconstruct_trigger(r: &[Value]) -> TriggerSchema {
         definer_host: r_str(r, 7),
         body_sql: r_str(r, 8),
         create_sql: r_str(r, 9),
-        action_order: r_u64(r, 10) as u32,
+        action_order: r_u32(r, 10)?,
         schema_version: r_u64(r, 11),
         created_ms: r_u64(r, 12),
         sql_mode: r_str(r, 13),
         character_set_client: r_str(r, 14),
         collation_connection: r_str(r, 15),
         database_collation: r_str(r, 16),
-    }
+    })
 }
 fn trigger_event_from(s: &str) -> TriggerEventSchema {
     match s.to_ascii_uppercase().as_str() {
@@ -2371,17 +2602,20 @@ fn event_row(e: &EventSchema) -> Vec<Value> {
         sv(&e.database_collation),
     ]
 }
-fn reconstruct_event(r: &[Value]) -> EventSchema {
-    EventSchema {
+fn reconstruct_event(r: &[Value]) -> Result<EventSchema, crate::types::QueryError> {
+    require_tag(r, 5, "event completion", &["PRESERVE", "NOT PRESERVE"])?;
+    require_tag(
+        r,
+        6,
+        "event status",
+        &["ENABLED", "DISABLED", "SLAVESIDE_DISABLED"],
+    )?;
+    Ok(EventSchema {
         database: r_str(r, 0),
         name: r_str(r, 1),
         definer_user: r_str(r, 2),
         definer_host: r_str(r, 3),
-        schedule: r
-            .get(4)
-            .and_then(crate::types::value_str)
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(EventScheduleSchema::OneShot { execute_at_ms: 0 }),
+        schedule: r_json(r, 4)?,
         on_completion: if r_str(r, 5).eq_ignore_ascii_case("PRESERVE") {
             EventOnCompletionSchema::Preserve
         } else {
@@ -2407,7 +2641,7 @@ fn reconstruct_event(r: &[Value]) -> EventSchema {
         character_set_client: r_str(r, 16),
         collation_connection: r_str(r, 17),
         database_collation: r_str(r, 18),
-    }
+    })
 }
 fn event_status_from(s: &str) -> EventStatusSchema {
     match s.to_ascii_uppercase().as_str() {
@@ -2420,6 +2654,39 @@ fn event_status_from(s: &str) -> EventStatusSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statistics_above_one_mib_roundtrip_without_loss() {
+        let mut catalog = sample_catalog();
+        let table = Arc::make_mut(catalog.tables.get_mut("test.t").unwrap());
+        let name = table.columns[0].name.clone();
+        let mut column = crate::storage::stats::ColumnStats {
+            null_count: 0,
+            distinct_count: 1,
+            min: None,
+            max: None,
+            top_values: Vec::new(),
+            frequency: Default::default(),
+            average_width_bytes: Some(8192.0),
+            histogram: Vec::new(),
+        };
+        for i in 0..160 {
+            column
+                .top_values
+                .push(crate::storage::stats::ValueFrequency {
+                    value: Value::String(format!("{i:04}{}", "x".repeat(8192))),
+                    count: 1,
+                });
+        }
+        table.stats.columns.insert(name, column);
+        let expected = serde_json::to_value(&table.stats).unwrap();
+        let rows = catalog_to_dd_rows(&catalog).unwrap();
+        let decoded = catalog_from_dd_rows(&rows).unwrap();
+        assert_eq!(
+            serde_json::to_value(&decoded.tables["test.t"].stats).unwrap(),
+            expected
+        );
+    }
 
     #[test]
     fn vector_format_rejects_stale_persisted_catalog_version() {
@@ -2457,7 +2724,7 @@ mod tests {
             position_gap: Some(7),
         });
         let expected = serde_json::to_value(&idx.fulltext).unwrap();
-        let rebuilt = catalog_from_dd_rows(&catalog_to_dd_rows(&catalog)).unwrap();
+        let rebuilt = catalog_from_dd_rows(&catalog_to_dd_rows(&catalog).unwrap()).unwrap();
         assert_eq!(
             serde_json::to_value(&rebuilt.tables["test.t"].indexes[1].fulltext).unwrap(),
             expected
@@ -2651,7 +2918,7 @@ mod tests {
 
     #[test]
     fn dd_rows_match_column_counts() {
-        let set = catalog_to_dd_rows(&sample_catalog());
+        let set = catalog_to_dd_rows(&sample_catalog()).unwrap();
         for (id, rows) in set.per_table() {
             let ncols = dd_table_schema(id).unwrap().columns.len();
             for row in rows {
@@ -2668,7 +2935,7 @@ mod tests {
 
     #[test]
     fn schema_decode_preserves_metadata_without_bootstrap_auth() {
-        let set = catalog_to_dd_rows(&sample_catalog());
+        let set = catalog_to_dd_rows(&sample_catalog()).unwrap();
         let full = catalog_from_dd_rows(&set).unwrap();
         let schema = catalog_schema_from_dd_rows(&set).unwrap();
         assert!(!full.auth.accounts.is_empty());
@@ -2709,7 +2976,7 @@ mod tests {
     #[test]
     fn catalog_roundtrips_through_dd_rows() {
         let original = sample_catalog();
-        let set = catalog_to_dd_rows(&original);
+        let set = catalog_to_dd_rows(&original).unwrap();
         let rebuilt = catalog_from_dd_rows(&set).unwrap();
 
         let db = rebuilt.databases.get("test").expect("test db");
@@ -2751,205 +3018,6 @@ mod tests {
 
         // build_column_index re-derived the lookup maps / codec.
         assert_eq!(t.column_name_map.len(), 2);
-    }
-
-    #[test]
-    fn stats_json_bounded_preserves_payloads_between_128k_and_1m() {
-        use super::super::stats::{ColumnStats, HistogramBucket, ValueFrequency};
-
-        let mut table = (**sample_catalog()
-            .tables
-            .get(&table_key("test", "t"))
-            .unwrap())
-        .clone();
-        table.stats.row_count = 1_000;
-        table.stats.columns.insert(
-            "payload".to_string(),
-            ColumnStats {
-                null_count: 0,
-                distinct_count: 1_000,
-                min: Some(Value::String("a".to_string())),
-                max: Some(Value::String("z".to_string())),
-                top_values: Vec::new(),
-                average_width_bytes: Some(256.0),
-                histogram: Vec::new(),
-                frequency: Default::default(),
-            },
-        );
-
-        let col = table.stats.columns.get_mut("payload").unwrap();
-        for i in 0..20 {
-            let value = Value::String(format!("{i:02}-{}", "x".repeat(4096)));
-            col.top_values.push(ValueFrequency {
-                value: value.clone(),
-                count: i + 1,
-            });
-            col.histogram.push(HistogramBucket {
-                upper: value,
-                cumulative_count: (i + 1) * 50,
-            });
-        }
-
-        let full = serde_json::to_string(&table.stats).unwrap();
-        assert!(
-            full.len() > 128 * 1024,
-            "test payload should exceed the superseded 128 KiB stats budget; got {}",
-            full.len()
-        );
-        assert!(
-            full.len() <= DD_STATS_JSON_CAP_BYTES,
-            "test payload should fit the 1 MiB stats_json cap; got {}",
-            full.len()
-        );
-
-        let Value::String(encoded) = stats_json_bounded(&table) else {
-            panic!("stats_json_bounded should return JSON text");
-        };
-        assert_eq!(encoded, full);
-        let decoded: TableStats = serde_json::from_str(&encoded).unwrap();
-        let decoded_col = decoded.columns.get("payload").unwrap();
-        assert_eq!(decoded_col.top_values.len(), 20);
-        assert_eq!(decoded_col.histogram.len(), 20);
-    }
-
-    #[test]
-    fn stats_json_bounded_preserves_small_conditional_domains_when_trimming_sketches() {
-        use super::super::stats::{
-            ColumnStats, ConditionalKeyDomainEntry, ConditionalKeyDomainStats, HistogramBucket,
-            ValueFrequency,
-        };
-
-        let mut table = (**sample_catalog()
-            .tables
-            .get(&table_key("test", "t"))
-            .unwrap())
-        .clone();
-        table.primary_key = vec!["d_date_sk".to_string()];
-        table.indexes = vec![
-            IndexSchema {
-                readable_from_scn: 0,
-                index_id: 0,
-                name: "PRIMARY".to_string(),
-                columns: vec!["d_date_sk".to_string()],
-                column_prefix_lengths: Vec::new(),
-                column_directions: Vec::new(),
-                key_expressions: Vec::new(),
-                unique: true,
-                primary: true,
-                included_columns: Vec::new(),
-                state: IndexState::Public,
-                index_type: "BTREE".to_string(),
-                visible: true,
-                comment: String::new(),
-                vector: None,
-                fulltext: None,
-            },
-            IndexSchema {
-                readable_from_scn: 0,
-                index_id: 0,
-                name: "idx_year".to_string(),
-                columns: vec!["d_year".to_string()],
-                column_prefix_lengths: Vec::new(),
-                column_directions: Vec::new(),
-                key_expressions: Vec::new(),
-                unique: false,
-                primary: false,
-                included_columns: Vec::new(),
-                state: IndexState::Public,
-                index_type: "BTREE".to_string(),
-                visible: true,
-                comment: String::new(),
-                vector: None,
-                fulltext: None,
-            },
-        ];
-        table.stats = TableStats::empty();
-        table.stats.row_count = 100_000;
-        for col_idx in 0..80 {
-            let name = format!("payload_{col_idx}");
-            let mut col = ColumnStats {
-                null_count: 0,
-                distinct_count: 10_000,
-                min: Some(Value::String("a".to_string())),
-                max: Some(Value::String("z".to_string())),
-                top_values: Vec::new(),
-                average_width_bytes: Some(64.0),
-                histogram: Vec::new(),
-                frequency: Default::default(),
-            };
-            col.frequency.complete = true;
-            col.frequency.source = crate::storage::FrequencySource::Exact;
-            for bucket in 0..10 {
-                let value = Value::String(format!("{col_idx:02}-{bucket:02}-{}", "x".repeat(2048)));
-                col.top_values.push(ValueFrequency {
-                    value: value.clone(),
-                    count: bucket + 1,
-                });
-                col.histogram.push(HistogramBucket {
-                    upper: value,
-                    cumulative_count: (bucket + 1) * 100,
-                });
-            }
-            table.stats.columns.insert(name, col);
-        }
-        for name in ["d_date_sk", "d_year"] {
-            table.stats.columns.insert(
-                name.to_string(),
-                ColumnStats {
-                    null_count: 0,
-                    distinct_count: 1_000,
-                    min: Some(Value::Int(1)),
-                    max: Some(Value::Int(1_000)),
-                    top_values: Vec::new(),
-                    average_width_bytes: Some(8.0),
-                    histogram: Vec::new(),
-                    frequency: Default::default(),
-                },
-            );
-        }
-        table
-            .stats
-            .conditional_key_domains
-            .push(ConditionalKeyDomainStats {
-                filter_columns: vec!["d_year".to_string()],
-                key_columns: vec!["d_date_sk".to_string()],
-                entries: vec![ConditionalKeyDomainEntry {
-                    filter_values: vec![Value::Int(2000)],
-                    row_count: 366,
-                    key_distinct_count: 366,
-                    key_min: Some(Value::Int(2_451_545)),
-                    key_max: Some(Value::Int(2_451_910)),
-                }],
-            });
-
-        assert!(
-            serde_json::to_string(&table.stats).unwrap().len() > DD_STATS_JSON_CAP_BYTES,
-            "test payload should force stats_json trimming"
-        );
-
-        let Value::String(encoded) = stats_json_bounded(&table) else {
-            panic!("stats_json_bounded should return JSON text");
-        };
-        assert!(encoded.len() <= DD_STATS_JSON_CAP_BYTES);
-        let decoded: TableStats = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.conditional_key_domains.len(), 1);
-        assert_eq!(
-            decoded.conditional_key_domains[0].filter_columns,
-            ["d_year".to_string()]
-        );
-        assert!(decoded.columns.contains_key("d_date_sk"));
-        assert!(decoded.columns.contains_key("d_year"));
-        assert!(
-            decoded.columns.values().all(|col| col.top_values.is_empty()
-                && col.histogram.is_empty()
-                && !col.frequency.complete),
-            "large per-column sketches should be trimmed before conditional domains"
-        );
-        assert_eq!(
-            decoded.columns.len(),
-            82,
-            "dropping sketches should retain scalar statistics for every column"
-        );
     }
 
     #[test]
@@ -3066,7 +3134,7 @@ mod tests {
             },
         );
 
-        let rebuilt = catalog_from_dd_rows(&catalog_to_dd_rows(&catalog)).unwrap();
+        let rebuilt = catalog_from_dd_rows(&catalog_to_dd_rows(&catalog).unwrap()).unwrap();
 
         let v = rebuilt.views.get(&table_key("test", "v")).unwrap();
         assert_eq!(v.sql, "SELECT 1");
@@ -3114,6 +3182,8 @@ mod tests {
             let mut row = vec![Value::Null; 18];
             row[0] = Value::String("test".into());
             row[1] = Value::String("corrupt".into());
+            row[5] = sv("UNDEFINED");
+            row[8] = sv("DEFINER");
             row[17] = payload;
             let set = DdRowSet {
                 views: vec![row],
@@ -3127,6 +3197,53 @@ mod tests {
                 assert_eq!(error.code(), 1356);
                 assert!(error.message().contains("View 'test.corrupt'"));
             }
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode_dictionary(bytes: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let row = [Value::String(text.to_owned())];
+        let _ = r_data_type(&row, 0);
+        let _ = r_json::<Vec<crate::storage::schema::RowLayoutSchema>>(&row, 0);
+    }
+    if let Ok(row) = crate::storage::core::decode_row(bytes) {
+        let _ = table_header_from_dd_row(&row);
+        let _ = reconstruct_column(&row);
+    }
+}
+
+#[cfg(test)]
+mod release_format_dictionary_tests {
+    use super::*;
+    #[test]
+    fn release_format_dictionary_rejects_semantic_tags_and_id_overflow() {
+        let mut row = vec![Value::Null; 24];
+        row[1] = uv(1);
+        row[2] = sv("v");
+        row[3] = uv(1);
+        row[4] = uv(0);
+        row[5] = uv(0);
+        row[6] = sv("\"Int\"");
+        row[10] = sv("null");
+        row[13] = sv("PUBLIC");
+        row[19] = sv("[]");
+        row[22] = sv("null");
+        reconstruct_column(&row).unwrap();
+        for (field, bad) in [
+            (13, sv("FUTURE")),
+            (1, uv(u64::from(u32::MAX) + 1)),
+            (4, Value::Int(-1)),
+            (6, sv("{\"Time\":{\"fsp\":7}}")),
+            (6, sv("{\"Decimal\":{\"precision\":66,\"scale\":0}}")),
+        ] {
+            let mut corrupt = row.clone();
+            corrupt[field] = bad;
+            assert!(
+                reconstruct_column(&corrupt).is_err(),
+                "accepted field {field}"
+            );
         }
     }
 }

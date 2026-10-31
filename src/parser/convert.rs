@@ -4402,7 +4402,7 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             // there is a precedence artifact: re-thread the arrow down the
             // left spine of its right operand so it binds the path leaf.
             if matches!(cop, BinaryOp::Arrow | BinaryOp::LongArrow) {
-                return Ok(rethread_json_arrow(cleft, cop, cright));
+                return rethread_json_arrow(cleft, cop, cright);
             }
             Ok(Expr::Binary {
                 left: Box::new(cleft),
@@ -8209,22 +8209,25 @@ fn function_args_distinct(args: &FunctionArguments) -> bool {
 /// precedence mismatch between sqlparser and MySQL. Recurses down the left
 /// spine so chained shapes like `j -> '$.x' = 5 AND ...` rotate correctly at
 /// any depth.
-fn rethread_json_arrow(left: Expr, op: BinaryOp, right: Expr) -> Expr {
+fn rethread_json_arrow(left: Expr, op: BinaryOp, right: Expr) -> Result<Expr, ParseError> {
     match right {
         Expr::Binary {
             left: rl,
             op: rop,
             right: rr,
-        } => Expr::Binary {
-            left: Box::new(rethread_json_arrow(left, op, *rl)),
+        } => Ok(Expr::Binary {
+            left: Box::new(rethread_json_arrow(left, op, *rl)?),
             op: rop,
             right: rr,
-        },
-        leaf => Expr::Binary {
+        }),
+        leaf @ Expr::Literal(Literal::String(_)) => Ok(Expr::Binary {
             left: Box::new(left),
             op,
             right: Box::new(leaf),
-        },
+        }),
+        _ => Err(ParseError::at_zero(
+            "JSON arrow requires a string path literal",
+        )),
     }
 }
 

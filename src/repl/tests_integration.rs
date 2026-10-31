@@ -239,7 +239,11 @@ async fn replica_receives_master_wal_and_persists_progress() {
     let mut progress = ReplicaProgress::default();
     while std::time::Instant::now() < deadline {
         if let Ok(bytes) = std::fs::read(&progress_path) {
-            if let Ok(p) = serde_json::from_slice::<ReplicaProgress>(&bytes) {
+            if let Ok(p) = crate::storage::metadata::decode::<ReplicaProgress>(
+                crate::storage::metadata::PROGRESS,
+                crate::storage::format_versions::REPLICA_PROGRESS_VERSION,
+                &bytes,
+            ) {
                 progress = p;
                 if progress.durable_applied_lsn >= last_lsn {
                     break;
@@ -377,7 +381,9 @@ async fn replica_reconnect_resumes_from_persisted_progress() {
     master.log.lock().flush().unwrap();
 
     // Second connection: must resume from persisted progress and pick up only the new records.
-    let progress: ReplicaProgress = serde_json::from_slice(
+    let progress: ReplicaProgress = crate::storage::metadata::decode(
+        crate::storage::metadata::PROGRESS,
+        crate::storage::format_versions::REPLICA_PROGRESS_VERSION,
         &std::fs::read(crate::repl::replica::progress::progress_path(
             replica_dir.path(),
         ))

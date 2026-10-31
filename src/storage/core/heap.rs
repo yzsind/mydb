@@ -88,12 +88,20 @@ impl DirectScanScratch {
         self.buffer = Vec::new();
         self.charge = None;
         let charge = loop {
-            let category = crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch;
-            if let Some(charge) = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(category, pages * PAGE_SIZE) {
+            let category =
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch;
+            if let Some(charge) =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                    category,
+                    pages * PAGE_SIZE,
+                )
+            {
                 break charge;
             }
             if pages == 1 {
-                break crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(category, PAGE_SIZE)?;
+                break crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    category, PAGE_SIZE,
+                )?;
             }
             pages = (pages / 2).max(1);
         };
@@ -314,11 +322,10 @@ impl VerifiedDirectHeapChecksums {
         let bytes = values
             .capacity()
             .saturating_mul(std::mem::size_of::<std::sync::atomic::AtomicU64>());
-        let charge =
-            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
-                crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
-                bytes,
-            )?;
+        let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
+            bytes,
+        )?;
         values.resize_with(page_count, || std::sync::atomic::AtomicU64::new(0));
         Some(Self {
             values: values.into_boxed_slice(),
@@ -343,7 +350,10 @@ impl VerifiedDirectHeapChecksums {
             .ok()
             .and_then(|page_id| self.values.get(page_id))
         {
-            value.store(u64::from(checksum) + 1, std::sync::atomic::Ordering::Release);
+            value.store(
+                u64::from(checksum) + 1,
+                std::sync::atomic::Ordering::Release,
+            );
         }
     }
 }
@@ -359,7 +369,8 @@ macro_rules! projected_mvcc_reader {
             depth: usize,
         ) -> Result<Option<(RowHeader, Vec<Value>, usize)>, QueryError> {
             if depth > MAX_FORWARDING_DEPTH {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
                     &format!(
                         "heap row migration chain too deep at row \
                          table={} page={} slot={} (depth={}, max={})",
@@ -384,9 +395,7 @@ macro_rules! projected_mvcc_reader {
                     let stored_count = values.len();
                     Ok(Some((header, values, stored_count)))
                 }
-                Some(HeapPayload::Forward(target)) => {
-                    self.$name(target, $projection, depth + 1)
-                }
+                Some(HeapPayload::Forward(target)) => self.$name(target, $projection, depth + 1),
                 Some(HeapPayload::RowPieceColumns(header, values, stored_count)) if depth > 0 => {
                     Ok(Some((header, values, stored_count)))
                 }
@@ -394,7 +403,9 @@ macro_rules! projected_mvcc_reader {
                     let stored_count = values.len();
                     Ok(Some((header, values, stored_count)))
                 }
-                Some(HeapPayload::RowPiece(_, _) | HeapPayload::RowPieceColumns(..)) | None => Ok(None),
+                Some(HeapPayload::RowPiece(_, _) | HeapPayload::RowPieceColumns(..)) | None => {
+                    Ok(None)
+                }
             }
         }
     };
@@ -458,7 +469,66 @@ impl HeapFile {
         buffer_pool: Arc<BufferPool>,
         codec: Arc<RowCodec>,
     ) -> Result<Self, QueryError> {
-        let file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
+        let file = if crate::storage::naming::parse_relative_object_path(
+            &crate::storage::naming::wal_relative_object_path(&path),
+        )
+        .is_some()
+            && !crate::storage::data_dictionary::is_dd_table_id(table_id)
+            && !is_temp_table_id(table_id)
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(!crate::storage::image_io::immutable_path(&path))
+                .open(&path)
+                .map_err(|err| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        format!("open heap '{}': {err}", path.display()),
+                    )
+                })?
+        } else {
+            crate::storage::image_io::open_data_file(&path).map_err(io_err)?
+        };
+        if file.metadata().map_err(io_err)?.len() == 0 {
+            let relative = crate::storage::naming::wal_relative_object_path(&path);
+            let standalone =
+                crate::storage::naming::parse_relative_object_path(&relative).is_none();
+            let mut root = path.clone();
+            for _ in Path::new(&relative).components() {
+                root.pop();
+            }
+            let initializing_dd = crate::storage::data_dictionary::is_dd_table_id(table_id)
+                && crate::storage::control::Control::load(&root)?.is_some_and(|c| !c.initialized);
+            if !standalone && !initializing_dd && !is_temp_table_id(table_id) {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "existing heap allocation metadata is missing",
+                ));
+            }
+            let mut meta = encode_heap_meta(&path, 1);
+            let lsn = if durability == DurabilityMode::Memory {
+                0
+            } else {
+                log.lock().append(
+                    0,
+                    WalPayload::full_page_image(
+                        crate::storage::naming::wal_relative_object_path(&path),
+                        0,
+                        meta.clone(),
+                    ),
+                )?
+            };
+            set_page_lsn_if_formatted(&mut meta, lsn);
+            file.set_len(PAGE_SIZE as u64).map_err(io_err)?;
+            buffer_pool.store_page(
+                PageKey {
+                    file: Arc::new(BufferPool::heap_file_key(path.clone(), table_id)),
+                    page_id: 0,
+                },
+                meta,
+                lsn,
+            )?;
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -490,7 +560,18 @@ impl HeapFile {
         // share a cache line (see HeapFile::page_latches doc). Count is
         // `resolved_page_latch_count()` (env-overridable).
         let (page_latches, page_latch_mask) = new_heap_page_latch_array();
-        let page_count = len.div_ceil(PAGE_SIZE as u64);
+        let meta_bytes = buffer_pool.read_raw_page(PageKey {
+            file: file_key.clone(),
+            page_id: 0,
+        })?;
+        let meta_count = decode_heap_meta(&meta_bytes, &file_key.owner)?;
+        if file.metadata().map_err(io_err)?.len() / (PAGE_SIZE as u64) < meta_count {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "heap file is shorter than its allocated extent",
+            ));
+        }
+        let page_count = meta_count;
         let verified_direct_checksums = usize::try_from(page_count)
             .ok()
             .and_then(VerifiedDirectHeapChecksums::try_new);
@@ -528,22 +609,46 @@ impl HeapFile {
 
     fn validate(path: PathBuf, _table_id: u64, max_lsn: u64) -> Result<usize, QueryError> {
         if !path.exists() {
-            return Ok(0);
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "published heap file is missing",
+            ));
         }
+        let owner = page_owner(&path);
         let mut file = OpenOptions::new().read(true).open(path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
         if len % PAGE_SIZE as u64 != 0 {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap file length"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap file length",
+            ));
         }
-        let page_count = len / PAGE_SIZE as u64;
+        let mut meta = vec![0; PAGE_SIZE];
+        file.read_exact(&mut meta).map_err(io_err)?;
+        let page_count = decode_heap_meta(&meta, &owner)?;
+        if len / (PAGE_SIZE as u64) < page_count {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "heap allocated extent is truncated",
+            ));
+        }
+        file.seek(SeekFrom::Start(0)).map_err(io_err)?;
         let mut pages_per_read = 64usize;
         let _read_charge = loop {
-            let category = crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch;
-            if let Some(charge) = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
-                category, pages_per_read * PAGE_SIZE,
-            ) { break charge; }
+            let category =
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch;
+            if let Some(charge) =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                    category,
+                    pages_per_read * PAGE_SIZE,
+                )
+            {
+                break charge;
+            }
             if pages_per_read == 1 {
-                break crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(category, PAGE_SIZE)?;
+                break crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    category, PAGE_SIZE,
+                )?;
             }
             pages_per_read /= 2;
         };
@@ -551,11 +656,21 @@ impl HeapFile {
         let mut checked = 0usize;
         while (checked as u64) < page_count {
             let pages = (page_count - checked as u64).min(pages_per_read as u64) as usize;
-            file.read_exact(&mut buffer[..pages * PAGE_SIZE]).map_err(io_err)?;
+            file.read_exact(&mut buffer[..pages * PAGE_SIZE])
+                .map_err(io_err)?;
             for buf in buffer[..pages * PAGE_SIZE].chunks_exact(PAGE_SIZE) {
+                validate_page_owner(buf, &owner, checked as u64)?;
+                if checked > 0 && buf.iter().all(|b| *b == 0) {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "allocated heap page is zero",
+                    ));
+                }
                 if max_lsn > 0 && page_lsn(buf) > max_lsn {
-                    return Err(error(crate::error::catalog::ER_GET_ERRNO,
-                        "corrupt heap page: page LSN is ahead of WAL"));
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap page: page LSN is ahead of WAL",
+                    ));
                 }
                 if validate_heap_page_header(buf)? {
                     // Keep all checksum, slot-boundary and MVCC-header checks,
@@ -591,18 +706,18 @@ impl HeapFile {
     ) -> Result<RowId, QueryError> {
         let payload = encode_mvcc_row(header, values, &self.codec, &[])?;
         if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
-            return Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+            return Err(error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                 "row size is larger than one heap page",
             ));
         }
         loop {
             let page_count = self.page_count()?;
-            let start_page = page_count.saturating_sub(1);
+            let start_page = page_count.saturating_sub(1).max(1);
             for page_id in start_page..page_count {
-                let _page_guard = self
-                    .page_latch(page_id)
-                    .lock()
-                    .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+                let _page_guard = self.page_latch(page_id).lock().map_err(|_| {
+                    error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned")
+                })?;
                 let plan = self.with_page(page_id, |page| {
                     HeapPageMut::plan_insert(page.bytes, payload.len(), self.update_reserve_bytes)
                 })?;
@@ -635,12 +750,20 @@ impl HeapFile {
                 continue;
             }
             let new_page_id = cur_count;
-            let new_count = cur_count + 1;
+            let new_count = cur_count
+                .checked_add(1)
+                .filter(|n| *n <= u64::from(u32::MAX) + 1)
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "heap row-id address space exhausted",
+                    )
+                })?;
             crate::storage::temp_quota::reserve_extent(&self.path, new_count * PAGE_SIZE as u64)?;
             self.file
                 .set_len(new_count * PAGE_SIZE as u64)
                 .map_err(io_err)?;
-            self.set_page_count(new_count);
+            self.set_page_count(new_count)?;
             let _page_guard = self
                 .page_latch(new_page_id)
                 .lock()
@@ -832,13 +955,13 @@ impl HeapFile {
                 }
             }};
         }
-        if page_count > 0 {
+        if page_count > 1 {
             take_latch_for!(page_id);
         }
-        let mut append_only_page = page_count == 0;
+        let mut append_only_page = page_count <= 1;
         let mut page = if append_only_page {
-            page_id = 0;
-            page_count = 1;
+            page_id = 1;
+            page_count = 2;
             // Brand-new page: take its latch too.
             take_latch_for!(page_id);
             Page::new()
@@ -869,8 +992,17 @@ impl HeapFile {
                 Some(slot_id) => slot_id,
                 None => {
                     touched_pages.insert(page_id, page);
+                    let next_count = page_count
+                        .checked_add(1)
+                        .filter(|count| *count <= u64::from(u32::MAX) + 1)
+                        .ok_or_else(|| {
+                            error(
+                                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                                "heap row-id address space exhausted",
+                            )
+                        })?;
                     page_id = page_count;
-                    page_count += 1;
+                    page_count = next_count;
                     take_latch_for!(page_id);
                     page = Page::new();
                     append_only_page = true;
@@ -897,7 +1029,7 @@ impl HeapFile {
             self.file
                 .set_len(page_count * PAGE_SIZE as u64)
                 .map_err(io_err)?;
-            self.set_page_count(page_count);
+            self.set_page_count(page_count)?;
         }
         self.write_heap_insert_batch_logged(txn_id, wal_inserts, touched_pages, false, None)?;
         drop(latches);
@@ -1053,7 +1185,7 @@ impl HeapFile {
                 let tail_guard = self.page_latch(new_page_count - 1).lock().map_err(|_| {
                     error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned")
                 })?;
-                self.set_page_count(new_page_count);
+                self.set_page_count_with_extent(new_page_count, fresh_extent.map(|(_, lsn)| lsn))?;
                 (first_page_id, fresh_extent, tail_guard)
             };
 
@@ -1117,7 +1249,7 @@ impl HeapFile {
             new_len: new_page_count.saturating_mul(PAGE_SIZE as u64),
         };
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         note_reduced_redo_file(&self.log, txn_id, relative_path);
         Ok(Some(lsn))
     }
@@ -1137,9 +1269,7 @@ impl HeapFile {
     /// before publishing it.  Off-page values are intentionally not accepted;
     /// the ALTER COPY orchestrator routes LOB-capable schemas through the
     /// existing compatibility path until an overflow direct builder exists.
-    pub(crate) fn shadow_payload_batch_direct_scratch_capacity(
-        payloads: &[&[u8]],
-    ) -> usize {
+    pub(crate) fn shadow_payload_batch_direct_scratch_capacity(payloads: &[&[u8]]) -> usize {
         let estimated_page_bytes = payloads
             .iter()
             .map(|payload| payload.len().saturating_add(SLOT_SIZE))
@@ -1147,11 +1277,7 @@ impl HeapFile {
         let estimated_pages = estimated_page_bytes.div_ceil(PAGE_SIZE).saturating_add(1);
         estimated_pages
             .saturating_mul(PAGE_SIZE)
-            .saturating_add(
-                payloads
-                    .len()
-                    .saturating_mul(std::mem::size_of::<RowId>()),
-            )
+            .saturating_add(payloads.len().saturating_mul(std::mem::size_of::<RowId>()))
     }
 
     pub(crate) fn prepare_shadow_payload_batch_direct(
@@ -1174,9 +1300,7 @@ impl HeapFile {
         // Every completed page already owns a 16 KiB buffer. Reserve the
         // coalesced write vector once so extending it does not repeatedly
         // copy the earlier pages in this batch.
-        let mut encoded_pages = Vec::<u8>::with_capacity(
-            estimated_pages.saturating_mul(PAGE_SIZE),
-        );
+        let mut encoded_pages = Vec::<u8>::with_capacity(estimated_pages.saturating_mul(PAGE_SIZE));
         let mut row_ids = Vec::with_capacity(payloads.len());
 
         for &payload in payloads {
@@ -1231,22 +1355,28 @@ impl HeapFile {
     ) -> Result<u64, QueryError> {
         let written_pages = batch.encoded_pages.len() / PAGE_SIZE;
         let first_page_id = {
-            let _extend_guard = self.extend_mutex.lock().map_err(|_| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "extend mutex poisoned",
-                )
-            })?;
+            let _extend_guard = self
+                .extend_mutex
+                .lock()
+                .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "extend mutex poisoned"))?;
             let first_page_id = self.page_count()?;
-            let new_page_count = first_page_id.saturating_add(written_pages as u64);
+            let new_page_count = first_page_id
+                .checked_add(written_pages as u64)
+                .filter(|count| *count <= u64::from(u32::MAX) + 1)
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "shadow heap address space exhausted",
+                    )
+                })?;
             crate::storage::temp_quota::reserve_extent(
                 &self.path,
-                new_page_count.saturating_mul(PAGE_SIZE as u64),
+                new_page_count * PAGE_SIZE as u64,
             )?;
             self.file
-                .set_len(new_page_count.saturating_mul(PAGE_SIZE as u64))
+                .set_len(new_page_count * PAGE_SIZE as u64)
                 .map_err(io_err)?;
-            self.set_page_count(new_page_count);
+            self.page_count.store(new_page_count, Ordering::Release);
             first_page_id
         };
         let page_delta = u32::try_from(first_page_id).map_err(|_| {
@@ -1268,15 +1398,31 @@ impl HeapFile {
 
     pub(crate) fn write_reserved_shadow_batch_direct(
         &self,
-        batch: ShadowPreparedHeapBatch,
+        mut batch: ShadowPreparedHeapBatch,
         first_page_id: u64,
     ) -> Result<Vec<RowId>, QueryError> {
+        for (position, bytes) in batch.encoded_pages.chunks_exact_mut(PAGE_SIZE).enumerate() {
+            stamp_page_owner(bytes, &self.file_key.owner, first_page_id + position as u64);
+            refresh_page_checksum(bytes);
+        }
         write_all_at(
             &self.file,
             &batch.encoded_pages,
             first_page_id.saturating_mul(PAGE_SIZE as u64),
         )
         .map_err(io_err)?;
+        {
+            // Serialize allocation-frontier publication with reservations.
+            // The first page's LSN also proves this direct-built generation
+            // covers an older FileCreate during crash recovery.
+            let _extend_guard = self
+                .extend_mutex
+                .lock()
+                .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "extend mutex poisoned"))?;
+            let mut meta = encode_heap_meta(&self.path, self.page_count_relaxed());
+            set_page_lsn_if_formatted(&mut meta, page_lsn(&batch.encoded_pages[..PAGE_SIZE]));
+            write_all_at(&self.file, &meta, 0).map_err(io_err)?;
+        }
         if self.durability() != DurabilityMode::Memory {
             // Overlap private-generation writeback with construction; the
             // mandatory sync_shadow_direct barrier still precedes publication.
@@ -1327,13 +1473,46 @@ impl HeapFile {
         self.read_mvcc_following(row_id, 0)
     }
 
+    fn read_external_refs(&self, mut row_id: RowId) -> Result<Vec<(usize, LobRef)>, QueryError> {
+        if !codec_has_externalizable_columns(&self.codec) {
+            return Ok(Vec::new());
+        }
+        for depth in 0..=MAX_FORWARDING_DEPTH {
+            if row_id.page_id as u64 >= self.page_count()? {
+                return Ok(Vec::new());
+            }
+            let (target, refs) = self.with_page(row_id.page_id as u64, |page| {
+                let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                    return Ok((None, Vec::new()));
+                };
+                if let Some(target) = decode_heap_forwarding_stub(payload)? {
+                    return Ok((Some(target), Vec::new()));
+                }
+                let (header, _, _) = read_mvcc_header(payload)?;
+                if depth == 0 && header.flags & MVCC_FLAG_ROW_PIECE != 0 {
+                    return Ok((None, Vec::new()));
+                }
+                Ok((None, decode_mvcc_external_refs(payload, &self.codec)?))
+            })?;
+            match target {
+                Some(target) => row_id = target,
+                None => return Ok(refs),
+            }
+        }
+        Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "heap row migration chain too deep",
+        ))
+    }
+
     fn read_mvcc_following(
         &self,
         row_id: RowId,
         depth: usize,
     ) -> Result<Option<MvccStoredRow>, QueryError> {
         if depth > MAX_FORWARDING_DEPTH {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO,
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
                 &format!(
                     "heap row migration chain too deep at row \
                      table={} page={} slot={} (depth={}, max={})",
@@ -1406,18 +1585,18 @@ impl HeapFile {
                 &self.page_key(row_id.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
-                let Some(page) = page else {
-                    return Ok(CachedMvccHeaderRead::NotFound);
-                };
-                let Some(payload) = page.payload(row_id.slot_id as usize)? else {
-                    return Ok(CachedMvccHeaderRead::NotFound);
-                };
-                match decode_heap_payload_header(payload)? {
-                    HeapPayloadHeader::Row(header) => Ok(CachedMvccHeaderRead::Hit(header)),
-                    HeapPayloadHeader::Forward | HeapPayloadHeader::RowPiece => {
-                        Ok(CachedMvccHeaderRead::MissingPage)
+                    let Some(page) = page else {
+                        return Ok(CachedMvccHeaderRead::NotFound);
+                    };
+                    let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                        return Ok(CachedMvccHeaderRead::NotFound);
+                    };
+                    match decode_heap_payload_header(payload)? {
+                        HeapPayloadHeader::Row(header) => Ok(CachedMvccHeaderRead::Hit(header)),
+                        HeapPayloadHeader::Forward | HeapPayloadHeader::RowPiece => {
+                            Ok(CachedMvccHeaderRead::MissingPage)
+                        }
                     }
-                }
                 },
             )?
             .unwrap_or(CachedMvccHeaderRead::MissingPage))
@@ -1447,36 +1626,34 @@ impl HeapFile {
             }
             return Ok(());
         }
-        let cached =
-            self.buffer_pool
-                .with_cached_heap_view(
-                    &self.page_key(page_id as u64),
-                    self.verified_direct_checksums.as_ref(),
-                    |page| {
-                    out.reserve(row_ids.len());
-                    let Some(page) = page else {
-                        for _ in row_ids {
-                            out.push(CachedMvccHeaderRead::NotFound);
-                        }
-                        return Ok(());
+        let cached = self.buffer_pool.with_cached_heap_view(
+            &self.page_key(page_id as u64),
+            self.verified_direct_checksums.as_ref(),
+            |page| {
+                out.reserve(row_ids.len());
+                let Some(page) = page else {
+                    for _ in row_ids {
+                        out.push(CachedMvccHeaderRead::NotFound);
+                    }
+                    return Ok(());
+                };
+                for row_id in row_ids {
+                    let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                        out.push(CachedMvccHeaderRead::NotFound);
+                        continue;
                     };
-                    for row_id in row_ids {
-                        let Some(payload) = page.payload(row_id.slot_id as usize)? else {
-                            out.push(CachedMvccHeaderRead::NotFound);
-                            continue;
-                        };
-                        match decode_heap_payload_header(payload)? {
-                            HeapPayloadHeader::Row(header) => {
-                                out.push(CachedMvccHeaderRead::Hit(header));
-                            }
-                            HeapPayloadHeader::Forward | HeapPayloadHeader::RowPiece => {
-                                out.push(CachedMvccHeaderRead::MissingPage);
-                            }
+                    match decode_heap_payload_header(payload)? {
+                        HeapPayloadHeader::Row(header) => {
+                            out.push(CachedMvccHeaderRead::Hit(header));
+                        }
+                        HeapPayloadHeader::Forward | HeapPayloadHeader::RowPiece => {
+                            out.push(CachedMvccHeaderRead::MissingPage);
                         }
                     }
-                    Ok(())
-                    },
-                )?;
+                }
+                Ok(())
+            },
+        )?;
         if cached.is_none() {
             out.clear();
             out.reserve(row_ids.len());
@@ -1497,23 +1674,25 @@ impl HeapFile {
                 &self.page_key(row_id.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
-                let Some(page) = page else {
-                    return Ok(CachedMvccRead::NotFound);
-                };
-                let Some(payload) = page.payload(row_id.slot_id as usize)? else {
-                    return Ok(CachedMvccRead::NotFound);
-                };
-                match decode_heap_payload(payload, &self.codec)? {
-                    HeapPayload::Row(header, values) => Ok(CachedMvccRead::Hit(MvccStoredRow {
-                        row_id,
-                        header,
-                        values,
-                    })),
-                    HeapPayload::Forward(_) => Ok(CachedMvccRead::MissingPage),
-                    HeapPayload::RowPiece(_, _)
-                    | HeapPayload::RowPieceColumns(..)
-                    | HeapPayload::RowColumns(..) => Ok(CachedMvccRead::NotFound),
-                }
+                    let Some(page) = page else {
+                        return Ok(CachedMvccRead::NotFound);
+                    };
+                    let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                        return Ok(CachedMvccRead::NotFound);
+                    };
+                    match decode_heap_payload(payload, &self.codec)? {
+                        HeapPayload::Row(header, values) => {
+                            Ok(CachedMvccRead::Hit(MvccStoredRow {
+                                row_id,
+                                header,
+                                values,
+                            }))
+                        }
+                        HeapPayload::Forward(_) => Ok(CachedMvccRead::MissingPage),
+                        HeapPayload::RowPiece(_, _)
+                        | HeapPayload::RowPieceColumns(..)
+                        | HeapPayload::RowColumns(..) => Ok(CachedMvccRead::NotFound),
+                    }
                 },
             )?
             .unwrap_or(CachedMvccRead::MissingPage))
@@ -1562,25 +1741,25 @@ impl HeapFile {
                 &self.page_key(row_id.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
-                let Some(page) = page else {
-                    return Ok(CachedProjectedRead::NotFound);
-                };
-                let Some(payload) = page.payload(row_id.slot_id as usize)? else {
-                    return Ok(CachedProjectedRead::NotFound);
-                };
-                match decode_heap_payload_columns_with_plan(payload, plan, &self.codec)? {
-                    HeapPayload::RowColumns(header, values, stored_count) => {
-                        Ok(CachedProjectedRead::Hit(header, values, stored_count))
+                    let Some(page) = page else {
+                        return Ok(CachedProjectedRead::NotFound);
+                    };
+                    let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                        return Ok(CachedProjectedRead::NotFound);
+                    };
+                    match decode_heap_payload_columns_with_plan(payload, plan, &self.codec)? {
+                        HeapPayload::RowColumns(header, values, stored_count) => {
+                            Ok(CachedProjectedRead::Hit(header, values, stored_count))
+                        }
+                        HeapPayload::Row(header, values) => {
+                            let stored_count = values.len();
+                            Ok(CachedProjectedRead::Hit(header, values, stored_count))
+                        }
+                        HeapPayload::Forward(_) => Ok(CachedProjectedRead::MissingPage),
+                        HeapPayload::RowPiece(_, _) | HeapPayload::RowPieceColumns(..) => {
+                            Ok(CachedProjectedRead::NotFound)
+                        }
                     }
-                    HeapPayload::Row(header, values) => {
-                        let stored_count = values.len();
-                        Ok(CachedProjectedRead::Hit(header, values, stored_count))
-                    }
-                    HeapPayload::Forward(_) => Ok(CachedProjectedRead::MissingPage),
-                    HeapPayload::RowPiece(_, _) | HeapPayload::RowPieceColumns(..) => {
-                        Ok(CachedProjectedRead::NotFound)
-                    }
-                }
                 },
             )?
             .unwrap_or(CachedProjectedRead::MissingPage))
@@ -1601,7 +1780,8 @@ impl HeapFile {
         depth: usize,
     ) -> Result<Option<(RowHeader, Vec<Value>, usize)>, QueryError> {
         if depth > MAX_FORWARDING_DEPTH {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO,
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
                 &format!(
                     "heap row migration chain too deep at row \
                      table={} page={} slot={} (depth={}, max={})",
@@ -2164,8 +2344,7 @@ impl HeapFile {
                         let Some(payload) = page.payload(row_id.slot_id as usize)? else {
                             continue;
                         };
-                        if crate::storage::core::decode_heap_forwarding_stub_pub(payload)?
-                            .is_some()
+                        if crate::storage::core::decode_heap_forwarding_stub_pub(payload)?.is_some()
                         {
                             return Ok(false);
                         }
@@ -2204,6 +2383,83 @@ impl HeapFile {
         Ok(true)
     }
 
+    /// Preserve an inline row's body when installing its MVCC tombstone.
+    /// External chains retain the full rewrite path: undo takes ownership
+    /// of those chains, so a tombstone must not keep materializable refs.
+    fn try_write_mvcc_tombstone(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        header: RowHeader,
+    ) -> Result<bool, QueryError> {
+        if !header.is_deleted() || header.undo_ptr.is_none() || txn_id == 0 {
+            return Ok(false);
+        }
+        let _page_guard = self
+            .page_latch(row_id.page_id as u64)
+            .lock()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+        let before = self.with_page(row_id.page_id as u64, |page| {
+            let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                return Ok(None);
+            };
+            if payload.first().copied() != Some(MVCC_ROW_VERSION) {
+                return Ok(None);
+            }
+            let (old, width, external) = read_mvcc_header(payload)?;
+            if width != 18 || external || old.flags & MVCC_FLAG_ROW_PIECE != 0 {
+                return Ok(None);
+            }
+            Ok(Some(<[u8; 17]>::try_from(&payload[1..18]).unwrap()))
+        })?;
+        let Some(before) = before else {
+            return Ok(false);
+        };
+        let mut after = before;
+        after[0] |= MVCC_FLAG_DELETED;
+        after[1..9].copy_from_slice(&header.last_txn_id.to_le_bytes());
+        after[9..17].copy_from_slice(&header.undo_ptr.unwrap().to_le_bytes());
+        self.maybe_emit_heap_fpi(row_id.page_id)?;
+        let key = self.page_key(row_id.page_id as u64);
+        let write = |lsn| {
+            self.buffer_pool
+                .with_raw_page_mut(key.clone(), lsn, |bytes| {
+                    patch_heap_page_raw(bytes, row_id.slot_id, &[(1, after.as_slice())])
+                })
+        };
+        if self.durability() == DurabilityMode::Memory {
+            write(0)?;
+            return Ok(true);
+        }
+        let payload = WalPayload::HeapUpdateLogical {
+            path: self.relative_path(),
+            page_id: row_id.page_id,
+            slot_id: row_id.slot_id,
+            patches: vec![WalColumnPatch {
+                offset: 1,
+                before: before.to_vec(),
+                after: after.to_vec(),
+            }],
+            undo_lsn: header.undo_ptr,
+        };
+        match try_buffer_txn_page_write(
+            &self.log,
+            &self.buffer_pool,
+            txn_id,
+            payload,
+            vec![key.clone()],
+            write,
+        ) {
+            Ok(result) => result?,
+            Err((payload, write)) => {
+                let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                write(lsn)?;
+            }
+        }
+        Ok(true)
+    }
+
     fn write_mvcc(
         &self,
         txn_id: u64,
@@ -2224,7 +2480,8 @@ impl HeapFile {
     ) -> Result<(), QueryError> {
         let payload = encode_mvcc_row(header, values, &self.codec, external)?;
         if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
-            return Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+            return Err(error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                 "row size is larger than one heap page",
             ));
         }
@@ -2297,7 +2554,8 @@ impl HeapFile {
             HeapPageMut::plan_update(page.bytes, row_id.slot_id, forwarding_stub.len())
         })?;
         if stub_plan == HeapUpdatePlan::NoSpace {
-            return Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+            return Err(error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                 "forwarding stub does not fit in heap page",
             ));
         }
@@ -2356,121 +2614,132 @@ impl HeapFile {
         };
         let mut charge =
             ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, spill_bytes)?;
-        let Some((
-            old_last_txn_id_bytes,
-            old_undo_ptr_bytes,
-            mut col_patches,
-        )) = self.with_page(row_id.page_id as u64, |page| {
-            let slot_bytes = page
-                .payload(row_id.slot_id as usize)?
-                .ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"))?;
-            if decode_heap_forwarding_stub(slot_bytes)?.is_some()
-                || slot_bytes.first().copied() != Some(MVCC_ROW_VERSION)
-            {
-                UPDATE_DELTA_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(None);
-            }
-
-            let (header, header_len, _) = read_mvcc_header(slot_bytes)?;
-            if header_len != 18 || header.flags & MVCC_FLAG_ROW_PIECE != 0 {
-                UPDATE_DELTA_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(None);
-            }
-
-            let old_last_txn_id_bytes: [u8; 8] = slot_bytes
-                .get(2..10)
-                .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "corrupt row header"))?
-                .try_into()
-                .expect("eight-byte slice");
-            let old_undo_ptr_bytes: [u8; 8] = slot_bytes
-                .get(10..18)
-                .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "corrupt row header"))?
-                .try_into()
-                .expect("eight-byte slice");
-
-            let mut col_patches = HeapColumnPatches::with_capacity(changed_cols.len());
-            for &col_idx in changed_cols {
-                let new_is_null = matches!(new_values.get(col_idx), Some(Value::Null));
-                let Some((range, null_offset, null_mask)) =
-                    fixed_column_patch_range(slot_bytes, &self.codec, col_idx)?
-                else {
+        let Some((old_last_txn_id_bytes, old_undo_ptr_bytes, mut col_patches)) =
+            self.with_page(row_id.page_id as u64, |page| {
+                let slot_bytes = page.payload(row_id.slot_id as usize)?.ok_or_else(|| {
+                    error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found")
+                })?;
+                if decode_heap_forwarding_stub(slot_bytes)?.is_some()
+                    || slot_bytes.first().copied() != Some(MVCC_ROW_VERSION)
+                {
+                    UPDATE_DELTA_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(None);
-                };
-                let old_null_byte = slot_bytes[null_offset];
-                if (old_null_byte & null_mask != 0) != new_is_null {
-                    if let Some((_, _, after)) = col_patches
-                        .iter_mut()
-                        .find(|(offset, _, _)| *offset == null_offset)
+                }
+
+                let (header, header_len, _) = read_mvcc_header(slot_bytes)?;
+                if header_len != 18 || header.flags & MVCC_FLAG_ROW_PIECE != 0 {
+                    UPDATE_DELTA_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
+                }
+
+                let old_last_txn_id_bytes: [u8; 8] = slot_bytes
+                    .get(2..10)
+                    .ok_or_else(|| {
+                        error(crate::error::catalog::ER_GET_ERRNO, "corrupt row header")
+                    })?
+                    .try_into()
+                    .expect("eight-byte slice");
+                let old_undo_ptr_bytes: [u8; 8] = slot_bytes
+                    .get(10..18)
+                    .ok_or_else(|| {
+                        error(crate::error::catalog::ER_GET_ERRNO, "corrupt row header")
+                    })?
+                    .try_into()
+                    .expect("eight-byte slice");
+
+                let mut col_patches = HeapColumnPatches::with_capacity(changed_cols.len());
+                for &col_idx in changed_cols {
+                    let new_is_null = matches!(new_values.get(col_idx), Some(Value::Null));
+                    let Some((range, null_offset, null_mask)) =
+                        column_patch_range(slot_bytes, &self.codec, col_idx)?
+                    else {
+                        return Ok(None);
+                    };
+                    // A variable NULL has zero encoded width. Preserve the
+                    // canonical shrinking rewrite instead of retaining its
+                    // former payload as unused bytes in a sparse patch.
+                    if new_is_null && range.width != 0 && fixed_width_for_kind(range.kind).is_none()
                     {
-                        if new_is_null {
-                            after[0] |= null_mask;
+                        return Ok(None);
+                    }
+                    let old_null_byte = slot_bytes[null_offset];
+                    if (old_null_byte & null_mask != 0) != new_is_null {
+                        if let Some((_, _, after)) = col_patches
+                            .iter_mut()
+                            .find(|(offset, _, _)| *offset == null_offset)
+                        {
+                            if new_is_null {
+                                after[0] |= null_mask;
+                            } else {
+                                after[0] &= !null_mask;
+                            }
                         } else {
-                            after[0] &= !null_mask;
-                        }
-                    } else {
-                        let new_null_byte = if new_is_null {
-                            old_null_byte | null_mask
-                        } else {
-                            old_null_byte & !null_mask
-                        };
-                        if !push_heap_column_patch(
-                            &mut col_patches,
-                            &mut charge,
-                            (
-                                null_offset,
-                                HeapPatchBytes::from_slice(&[old_null_byte]),
-                                HeapPatchBytes::from_slice(&[new_null_byte]),
-                            ),
-                        ) {
-                            return Err(crate::error::catalog::ER_OUTOFMEMORY
-                                .error("heap patch scratch budget exhausted"));
+                            let new_null_byte = if new_is_null {
+                                old_null_byte | null_mask
+                            } else {
+                                old_null_byte & !null_mask
+                            };
+                            if !push_heap_column_patch(
+                                &mut col_patches,
+                                &mut charge,
+                                (
+                                    null_offset,
+                                    HeapPatchBytes::from_slice(&[old_null_byte]),
+                                    HeapPatchBytes::from_slice(&[new_null_byte]),
+                                ),
+                            ) {
+                                return Err(crate::error::catalog::ER_OUTOFMEMORY
+                                    .error("heap patch scratch budget exhausted"));
+                            }
                         }
                     }
-                }
-                if range.width > 16 {
-                    charge.try_grow(range.width.next_power_of_two().saturating_mul(2))?;
-                }
-                let mut after_bytes = HeapPatchBytes::from_elem(0u8, range.width);
-                if !new_is_null
-                    && encode_fixed_value_into(range.kind, &new_values[col_idx], &mut after_bytes)
-                        .is_err()
-                {
-                    return Ok(None);
-                }
-                let end = range
-                    .offset_in_payload
-                    .checked_add(range.width)
-                    .ok_or_else(|| {
-                        error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "corrupt heap patch range",
-                        )
-                    })?;
-                let before_bytes = HeapPatchBytes::from_slice(
-                    slot_bytes
-                        .get(range.offset_in_payload..end)
+                    if range.width > 16 {
+                        charge.try_grow(range.width.next_power_of_two().saturating_mul(2))?;
+                    }
+                    let mut after_bytes = HeapPatchBytes::from_elem(0u8, range.width);
+                    if !new_is_null
+                        && !encode_column_patch_into(
+                            range.kind,
+                            &new_values[col_idx],
+                            &mut after_bytes,
+                        )?
+                    {
+                        return Ok(None);
+                    }
+                    let end = range
+                        .offset_in_payload
+                        .checked_add(range.width)
                         .ok_or_else(|| {
                             error(
                                 crate::error::catalog::ER_GET_ERRNO,
                                 "corrupt heap patch range",
                             )
-                        })?,
-                );
-                if !push_heap_column_patch(
-                    &mut col_patches,
-                    &mut charge,
-                    (range.offset_in_payload, before_bytes, after_bytes),
-                ) {
-                    return Err(crate::error::catalog::ER_OUTOFMEMORY
-                        .error("heap patch scratch budget exhausted"));
+                        })?;
+                    let before_bytes = HeapPatchBytes::from_slice(
+                        slot_bytes
+                            .get(range.offset_in_payload..end)
+                            .ok_or_else(|| {
+                                error(
+                                    crate::error::catalog::ER_GET_ERRNO,
+                                    "corrupt heap patch range",
+                                )
+                            })?,
+                    );
+                    if !push_heap_column_patch(
+                        &mut col_patches,
+                        &mut charge,
+                        (range.offset_in_payload, before_bytes, after_bytes),
+                    ) {
+                        return Err(crate::error::catalog::ER_OUTOFMEMORY
+                            .error("heap patch scratch budget exhausted"));
+                    }
                 }
-            }
-            Ok(Some((
-                old_last_txn_id_bytes,
-                old_undo_ptr_bytes,
-                col_patches,
-            )))
-        })?
+                Ok(Some((
+                    old_last_txn_id_bytes,
+                    old_undo_ptr_bytes,
+                    col_patches,
+                )))
+            })?
         else {
             return Ok(None);
         };
@@ -2646,7 +2915,9 @@ impl HeapFile {
                     // WAL-before-data contract through an eager append and
                     // balance the pin on both success and failure.
                     let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
-                        .and_then(|pre| self.log.lock().append_pre_encoded(pre));
+                        .and_then(|pre| {
+                            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
+                        });
                     match appended {
                         Ok(lsn) => {
                             for key in &keys {
@@ -2664,7 +2935,7 @@ impl HeapFile {
             } else {
                 // Frame not resident — append eagerly with this record.
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                let lsn = self.log.lock().append_pre_encoded(pre)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                 self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
                     patch_heap_page_raw(bytes, row_id.slot_id, &apply_patches)
                 })?;
@@ -2721,7 +2992,12 @@ impl HeapFile {
         let mut page = self.read_page_for_modify(target.page_id as u64)?;
         let before = page
             .read(target.slot_id)
-            .ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "migrated row piece not found"))?
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_KEY_NOT_FOUND,
+                    "migrated row piece not found",
+                )
+            })?
             .to_vec();
         let migrated_payload = make_heap_row_piece_payload(&payload, &self.codec)?;
         if page
@@ -2771,7 +3047,12 @@ impl HeapFile {
         let mut original_page = self.read_page_for_modify(original_row_id.page_id as u64)?;
         let stub_before = original_page
             .read(original_row_id.slot_id)
-            .ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "forwarding stub not found"))?
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_KEY_NOT_FOUND,
+                    "forwarding stub not found",
+                )
+            })?
             .to_vec();
         original_page.update(original_row_id.slot_id, &new_stub)?;
         self.bump_row_migrations();
@@ -2808,12 +3089,11 @@ impl HeapFile {
         // `page_count` and retry.
         loop {
             let page_count = self.page_count()?;
-            let start_page = page_count.saturating_sub(1);
+            let start_page = page_count.saturating_sub(1).max(1);
             for page_id in start_page..page_count {
-                let _page_guard = self
-                    .page_latch(page_id)
-                    .lock()
-                    .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+                let _page_guard = self.page_latch(page_id).lock().map_err(|_| {
+                    error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned")
+                })?;
                 let mut page = self.read_page_for_modify(page_id)?;
                 if let Some(slot_id) = page.insert(&payload) {
                     let row_id = RowId {
@@ -2836,12 +3116,20 @@ impl HeapFile {
                 continue;
             }
             let new_page_id = cur_count;
-            let new_count = cur_count + 1;
+            let new_count = cur_count
+                .checked_add(1)
+                .filter(|n| *n <= u64::from(u32::MAX) + 1)
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "heap row-id address space exhausted",
+                    )
+                })?;
             crate::storage::temp_quota::reserve_extent(&self.path, new_count * PAGE_SIZE as u64)?;
             self.file
                 .set_len(new_count * PAGE_SIZE as u64)
                 .map_err(io_err)?;
-            self.set_page_count(new_count);
+            self.set_page_count(new_count)?;
             // Acquire the new page's latch before dropping the extend
             // mutex so a racing reader pinning the page goes through
             // the buffer pool's normal load path (it's empty on disk;
@@ -3200,12 +3488,7 @@ impl HeapFile {
     where
         F: FnMut(ProjectedMvccStoredRow<'_>) -> Result<bool, QueryError>,
     {
-        self.scan_mvcc_columns_direct_range_impl(
-            columns,
-            0,
-            self.page_count_relaxed(),
-            visit,
-        )
+        self.scan_mvcc_columns_direct_range_impl(columns, 0, self.page_count_relaxed(), visit)
     }
 
     /// Direct projected scan over one half-open physical page range.  This is
@@ -3254,6 +3537,13 @@ impl HeapFile {
         let mut value_buf: Vec<Value> = Vec::with_capacity(columns.len());
         let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
         let mut scan_page = |page_id: u64, bytes: &[u8]| -> Result<bool, QueryError> {
+            validate_page_owner(bytes, &self.file_key.owner, page_id)?;
+            if page_id > 0 && bytes.iter().all(|byte| *byte == 0) {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "allocated heap page is zero",
+                ));
+            }
             let Some(slots) = Page::decode_slots(bytes)? else {
                 return Ok(false);
             };
@@ -3666,7 +3956,14 @@ impl HeapFile {
     where
         F: FnMut(PayloadMvccStoredRow<'_>) -> Result<bool, QueryError>,
     {
-        self.scan_mvcc_payloads_range_with_charge_until(columns, page_lo, page_hi, batch_charge, false, visit)
+        self.scan_mvcc_payloads_range_with_charge_until(
+            columns,
+            page_lo,
+            page_hi,
+            batch_charge,
+            false,
+            visit,
+        )
     }
 
     fn scan_mvcc_payloads_range_with_charge_until<F>(
@@ -3678,12 +3975,20 @@ impl HeapFile {
         coherent: bool,
         visit: F,
     ) -> Result<(), QueryError>
-    where F: FnMut(PayloadMvccStoredRow<'_>) -> Result<bool, QueryError>,
+    where
+        F: FnMut(PayloadMvccStoredRow<'_>) -> Result<bool, QueryError>,
     {
         let batch_pages = (batch_charge.bytes() / PAGE_SIZE).min(1024);
         assert!(batch_pages > 0, "direct scan requires a prepaid page");
         let mut buffer = vec![std::mem::MaybeUninit::<u8>::uninit(); batch_pages * PAGE_SIZE];
-        self.scan_mvcc_payloads_direct_range_with_buffer_until(columns, page_lo, page_hi, &mut buffer, coherent, visit)
+        self.scan_mvcc_payloads_direct_range_with_buffer_until(
+            columns,
+            page_lo,
+            page_hi,
+            &mut buffer,
+            coherent,
+            visit,
+        )
     }
 
     pub(crate) fn scan_mvcc_payloads_direct_range_reusing_until<F>(
@@ -3699,7 +4004,14 @@ impl HeapFile {
     {
         let pages = usize::try_from(page_hi.saturating_sub(page_lo)).unwrap_or(usize::MAX);
         scratch.prepare(pages)?;
-        self.scan_mvcc_payloads_direct_range_with_buffer_until(columns, page_lo, page_hi, &mut scratch.buffer, false, visit)
+        self.scan_mvcc_payloads_direct_range_with_buffer_until(
+            columns,
+            page_lo,
+            page_hi,
+            &mut scratch.buffer,
+            false,
+            visit,
+        )
     }
 
     fn scan_mvcc_payloads_direct_range_with_buffer_until<F>(
@@ -3755,7 +4067,8 @@ impl HeapFile {
                     continue;
                 }
                 let mut layout_pos = body_offset;
-                let layout_id = crate::storage::core::read_varint_at(payload, &mut layout_pos)? as u32;
+                let layout_id =
+                    crate::storage::core::read_varint_at(payload, &mut layout_pos)? as u32;
                 if visit(PayloadMvccStoredRow {
                     row_id: RowId {
                         page_id: page_id as u32,
@@ -3789,16 +4102,20 @@ impl HeapFile {
                     // Online scans need a latched image even for a cold page:
                     // a concurrent flusher can otherwise race a direct pread.
                     let pinned = self.buffer_pool.pin_page(self.page_key(page_id))?;
-                    self.buffer_pool.with_finalized_frame_bytes(&pinned.frame, |bytes| {
-                        assert_eq!(bytes.len(), PAGE_SIZE);
-                        // SAFETY: a pinned full page and the prepaid scratch
-                        // allocation are disjoint and both cover PAGE_SIZE.
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(bytes.as_ptr(),
-                                batch.as_mut_ptr().add(offset).cast::<u8>(), PAGE_SIZE);
-                        }
-                        Ok(())
-                    })?;
+                    self.buffer_pool
+                        .with_finalized_frame_bytes(&pinned.frame, |bytes| {
+                            assert_eq!(bytes.len(), PAGE_SIZE);
+                            // SAFETY: a pinned full page and the prepaid scratch
+                            // allocation are disjoint and both cover PAGE_SIZE.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    batch.as_mut_ptr().add(offset).cast::<u8>(),
+                                    PAGE_SIZE,
+                                );
+                            }
+                            Ok(())
+                        })?;
                     *is_cached = true;
                     continue;
                 }
@@ -3842,7 +4159,8 @@ impl HeapFile {
             // SAFETY: cached pages were copied in full and every remaining
             // contiguous run completed read_exact_at_uninit. An EOF/error
             // returned above without exposing any uninitialized bytes.
-            let batch = unsafe { std::slice::from_raw_parts(batch.as_ptr().cast::<u8>(), batch.len()) };
+            let batch =
+                unsafe { std::slice::from_raw_parts(batch.as_ptr().cast::<u8>(), batch.len()) };
             for position in 0..count {
                 let offset = position * PAGE_SIZE;
                 if scan_page(
@@ -3866,12 +4184,7 @@ impl HeapFile {
         values: &mut Vec<Value>,
     ) -> Result<bool, QueryError> {
         Ok(matches!(
-            decode_heap_payload_columns_into_with_plan(
-                row.payload,
-                row.plan,
-                row.codec,
-                values,
-            )?,
+            decode_heap_payload_columns_into_with_plan(row.payload, row.plan, row.codec, values,)?,
             HeapPayloadOutcome::Row(..)
         ))
     }
@@ -3882,6 +4195,13 @@ impl HeapFile {
         page_id: u64,
         bytes: &[u8],
     ) -> Result<bool, QueryError> {
+        validate_page_owner(bytes, &self.file_key.owner, page_id)?;
+        if page_id > 0 && bytes.iter().all(|b| *b == 0) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "allocated heap page is zero",
+            ));
+        }
         if !validate_heap_page_structure(bytes)? {
             return Ok(false);
         }
@@ -4057,9 +4377,54 @@ impl HeapFile {
         self.page_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn set_page_count(&self, n: u64) {
-        self.page_count
-            .store(n, std::sync::atomic::Ordering::Release);
+    fn set_page_count(&self, n: u64) -> Result<(), QueryError> {
+        self.set_page_count_with_extent(n, None)
+    }
+
+    fn set_page_count_with_extent(
+        &self,
+        n: u64,
+        reduced_extent_lsn: Option<u64>,
+    ) -> Result<(), QueryError> {
+        if n == 0 || n > u64::from(u32::MAX) + 1 {
+            return Err(error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                "heap allocation exceeds row-id address space",
+            ));
+        }
+        let old = self.page_count.load(Ordering::Acquire);
+        // Initialize every advertised page. Recovery can repair these pages
+        // from their WAL baseline; zero pages below the frontier are corrupt.
+        for id in old..n {
+            let mut image = Page::new().encode_into_owned();
+            stamp_page_owner(&mut image, &self.file_key.owner, id);
+            refresh_page_checksum(&mut image);
+            let lsn = if let Some(lsn) = reduced_extent_lsn {
+                lsn
+            } else if self.durability() == DurabilityMode::Memory {
+                0
+            } else {
+                self.log.lock().append(
+                    0,
+                    WalPayload::full_page_image(self.relative_path(), id, image.clone()),
+                )?
+            };
+            set_page_lsn_if_formatted(&mut image, lsn);
+            self.buffer_pool
+                .store_page_cold(self.page_key(id), image, lsn)?;
+        }
+        update_heap_meta_with_key(
+            self.page_key(0),
+            &self.buffer_pool,
+            &self.log,
+            self.durability(),
+            |meta| {
+                write_u64(meta, 24, n);
+                Ok(())
+            },
+        )?;
+        self.page_count.store(n, Ordering::Release);
+        Ok(())
     }
 
     fn page_latch(&self, page_id: u64) -> &Mutex<()> {
@@ -4114,7 +4479,8 @@ impl HeapFile {
             .buffer_pool
             .pin_page_with_intent(self.page_key(page_id), AccessIntent::Normal)?;
         pinned.with_heap_raw_bytes_cached(self.verified_direct_checksums.as_ref(), |page| {
-            let page = page.ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"))?;
+            let page = page
+                .ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"))?;
             f(page)
         })
     }
@@ -4267,20 +4633,6 @@ impl HeapFile {
     ///   0`). Recovery from an empty WAL trivially reconstructs every
     ///   page from the redo records that built it; there is no
     ///   pre-existing on-disk image to be torn.
-    fn protect_new_heap_page(&self, page_id: u64, page: &Page) -> Result<bool, QueryError> {
-        if self.durability() != DurabilityMode::Strict || read_u32(&page.data, 0) != 0
-            || std::env::var_os("MYDB_DISABLE_HEAP_FPI").is_some()
-        {
-            return Ok(false);
-        }
-        // Complete logical redo needs a valid starting image if the first
-        // physical write of a newly allocated page is torn.
-        let pre = crate::wal::LogManager::pre_encode_record(
-            0, WalPayload::full_page_image(self.relative_path(), page_id, Page::new().encode()))?;
-        self.log.lock().append_pre_encoded(pre)?;
-        Ok(true)
-    }
-
     fn maybe_emit_heap_fpi(&self, page_id: u32) -> Result<(), QueryError> {
         if self.durability() != DurabilityMode::Strict {
             return Ok(());
@@ -4342,13 +4694,15 @@ impl HeapFile {
             0, // FPI is a system record, not part of the transaction chain
             WalPayload::full_page_image(self.relative_path(), page_id as u64, after),
         )?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
-        if reduced {
-            self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+        // Stamp FPI coverage before any deferred mutation. Otherwise another
+        // mutation can emit a system FPI containing an unlogged row version.
+        self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
+            if reduced {
                 write_u16(bytes, 6, 0);
-                Ok(())
-            })?;
-        }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -4363,14 +4717,12 @@ impl HeapFile {
         // FPI: emit a full-page image before the logical record so
         // recovery can recover from a torn on-disk page (see
         // `maybe_emit_heap_fpi` doc for the full predicate).
-        if !self.protect_new_heap_page(row_id.page_id as u64, &page)? {
-            self.maybe_emit_heap_fpi(row_id.page_id)?;
-        }
+        self.maybe_emit_heap_fpi(row_id.page_id)?;
         let lsn = if self.durability() == DurabilityMode::Memory {
             0
         } else {
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             log.append_reserved(
                 lsn,
                 txn_id,
@@ -4419,7 +4771,7 @@ impl HeapFile {
             0
         } else {
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             log.append_reserved(
                 lsn,
                 txn_id,
@@ -4449,7 +4801,9 @@ impl HeapFile {
     ) -> Result<(), QueryError> {
         #[cfg(test)]
         HEAP_BATCH_PUBLISH_TEST_HOOK.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() { hook(); }
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
         });
         if inserts.is_empty() {
             return Ok(());
@@ -4460,10 +4814,8 @@ impl HeapFile {
         // short-circuits via the "not in buffer pool → no torn risk"
         // branch, so the steady-state cost is near zero.
         let reduced_fresh_start = fresh_extent.map(|(start, _)| start);
-        for (page_id, page) in &pages {
-            let protected = !reduced_fresh_start.is_some_and(|start| *page_id >= start)
-                && self.protect_new_heap_page(*page_id, page)?;
-            if !protected {
+        for page_id in pages.keys() {
+            if !reduced_fresh_start.is_some_and(|start| *page_id >= start) {
                 self.maybe_emit_heap_fpi(*page_id as u32)?;
             }
         }
@@ -4483,6 +4835,52 @@ impl HeapFile {
             }
         }
         let retained_fallback = !inserts.is_empty();
+        // Resident ordinary inserts need neither an immediate WAL latch nor
+        // direct file writes. Pin every target before queueing redo, and keep
+        // the transaction-buffer latch through the image stores so a parallel
+        // transaction worker cannot finalize their pins before publication.
+        // Fresh/direct reduced-redo extents retain their data-before-commit
+        // path; a missing resident frame retains the eager append oracle.
+        if self.durability() != DurabilityMode::Memory
+            && retained_fallback
+            && !direct_fresh_append
+            && fresh_extent.is_none()
+            && txn_wal_buffering_active(&self.log, txn_id)
+        {
+            let keys = pages.keys().map(|id| self.page_key(*id)).collect();
+            let payload = WalPayload::HeapInsertBatch {
+                path: self.relative_path(),
+                inserts,
+            };
+            let write = |lsn| -> Result<(), QueryError> {
+                for (page_id, mut page) in pages {
+                    if lsn != 0 {
+                        page.set_lsn(lsn);
+                    }
+                    self.buffer_pool.store_page_cold(
+                        self.page_key(page_id),
+                        page.encode_into_owned(),
+                        lsn,
+                    )?;
+                }
+                Ok(())
+            };
+            return match try_buffer_txn_page_write(
+                &self.log,
+                &self.buffer_pool,
+                txn_id,
+                payload,
+                keys,
+                write,
+            ) {
+                Ok(result) => result,
+                Err((payload, write)) => {
+                    let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
+                    let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                    write(lsn)
+                }
+            };
+        }
         let logged_lsn = if self.durability() == DurabilityMode::Memory {
             0
         } else if inserts.is_empty() {
@@ -4501,7 +4899,7 @@ impl HeapFile {
                     inserts,
                 },
             )?;
-            self.log.lock().append_pre_encoded(pre)?
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         if txn_reduced_redo_active(&self.log, txn_id) && retained_fallback {
             REDUCED_REDO_FALLBACK_RECORDS.fetch_add(1, Ordering::Relaxed);
@@ -4532,6 +4930,13 @@ impl HeapFile {
             if direct_lsn != 0 {
                 crate::wal::LogManager::sync_durable_to(&self.log, direct_lsn)?;
             }
+            // Allocation baselines must not race a direct after-image write.
+            // discard_page waits for any old writeback before returning.
+            if let Some((first, last)) = bulk_page_range {
+                for id in first..=last {
+                    self.buffer_pool.discard_page(&self.page_key(id))?;
+                }
+            }
             const DIRECT_RUN_PAGES: usize = 128;
             let mut images = Vec::with_capacity(DIRECT_RUN_PAGES * PAGE_SIZE);
             let mut run_first = None;
@@ -4547,8 +4952,15 @@ impl HeapFile {
                     Some(page_id),
                     run_first.map(|first| first + run_pages as u64)
                 );
-                let flags = if fresh_extent.is_some() { HEAP_PAGE_REDUCED_REDO } else { 0 };
-                images.extend_from_slice(&page.encode_into_owned_with_flags(flags));
+                let flags = if fresh_extent.is_some() {
+                    HEAP_PAGE_REDUCED_REDO
+                } else {
+                    0
+                };
+                let mut image = page.encode_into_owned_with_flags(flags);
+                stamp_page_owner(&mut image, &self.file_key.owner, page_id);
+                refresh_page_checksum(&mut image);
+                images.extend_from_slice(&image);
                 run_pages += 1;
                 if run_pages == DIRECT_RUN_PAGES {
                     write_all_at(
@@ -4602,12 +5014,18 @@ impl HeapFile {
             } else {
                 0
             };
-            self.buffer_pool
-                .store_page_cold(self.page_key(page_id), page.encode_into_owned_with_flags(flags), page_lsn)?;
+            self.buffer_pool.store_page_cold(
+                self.page_key(page_id),
+                page.encode_into_owned_with_flags(flags),
+                page_lsn,
+            )?;
         }
         if let Some((first_page_id, last_page_id)) = bulk_page_range {
-            self.buffer_pool
-                .schedule_bulk_page_range(&self.file_key, first_page_id, last_page_id)?;
+            self.buffer_pool.schedule_bulk_page_range(
+                &self.file_key,
+                first_page_id,
+                last_page_id,
+            )?;
         }
         Ok(())
     }
@@ -4636,7 +5054,7 @@ impl HeapFile {
                     undo_lsn,
                 },
             )?;
-            self.log.lock().append_pre_encoded(pre)?
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         if lsn != 0 {
             page.set_lsn(lsn);
@@ -4670,31 +5088,43 @@ impl HeapFile {
         };
         let mut scratch = (plan == HeapUpdatePlan::Compact).then(|| vec![0_u8; PAGE_SIZE]);
         self.maybe_emit_heap_fpi(row_id.page_id)?;
-        let lsn = if self.durability() == DurabilityMode::Memory {
-            0
-        } else {
-            let pre = crate::wal::LogManager::pre_encode_record(
-                txn_id,
-                WalPayload::HeapUpdate {
-                    path: self.relative_path(),
-                    page_id: row_id.page_id,
-                    slot_id: row_id.slot_id,
-                    before,
-                    after: payload.clone(),
-                    undo_lsn,
-                },
-            )?;
-            self.log.lock().append_pre_encoded(pre)?
+        let mut write = |lsn| {
+            self.buffer_pool
+                .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
+                    HeapPageMut::new(bytes)?.update(
+                        row_id.slot_id,
+                        &payload,
+                        plan,
+                        scratch.as_deref_mut(),
+                    )
+                })
         };
-        self.buffer_pool
-            .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
-                HeapPageMut::new(bytes)?.update(
-                    row_id.slot_id,
-                    &payload,
-                    plan,
-                    scratch.as_deref_mut(),
-                )
-            })
+        if self.durability() == DurabilityMode::Memory {
+            return write(0);
+        }
+        let redo = WalPayload::HeapUpdate {
+            path: self.relative_path(),
+            page_id: row_id.page_id,
+            slot_id: row_id.slot_id,
+            before,
+            after: payload.clone(),
+            undo_lsn,
+        };
+        match try_buffer_txn_page_write(
+            &self.log,
+            &self.buffer_pool,
+            txn_id,
+            redo,
+            vec![self.page_key(row_id.page_id as u64)],
+            write,
+        ) {
+            Ok(result) => result,
+            Err((redo, mut write)) => {
+                let pre = crate::wal::LogManager::pre_encode_record(txn_id, redo)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                write(lsn)
+            }
+        }
     }
 
     fn write_heap_delete_logged(
@@ -4719,7 +5149,7 @@ impl HeapFile {
                     undo_lsn,
                 },
             )?;
-            self.log.lock().append_pre_encoded(pre)?
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         if lsn != 0 {
             page.set_lsn(lsn);
@@ -4740,28 +5170,37 @@ impl HeapFile {
         undo_lsn: Option<u64>,
     ) -> Result<(), QueryError> {
         self.maybe_emit_heap_fpi(row_id.page_id)?;
-        let lsn = if self.durability() == DurabilityMode::Memory {
-            0
-        } else {
-            let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
-            log.append_reserved(
-                lsn,
-                txn_id,
-                WalPayload::HeapDelete {
-                    path: self.relative_path(),
-                    page_id: row_id.page_id,
-                    slot_id: row_id.slot_id,
-                    before,
-                    undo_lsn,
-                },
-            )?;
-            lsn
+        let write = |lsn| {
+            self.buffer_pool
+                .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
+                    HeapPageMut::new(bytes)?.delete(row_id.slot_id)
+                })
         };
-        self.buffer_pool
-            .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
-                HeapPageMut::new(bytes)?.delete(row_id.slot_id)
-            })
+        if self.durability() == DurabilityMode::Memory {
+            return write(0);
+        }
+        let redo = WalPayload::HeapDelete {
+            path: self.relative_path(),
+            page_id: row_id.page_id,
+            slot_id: row_id.slot_id,
+            before,
+            undo_lsn,
+        };
+        match try_buffer_txn_page_write(
+            &self.log,
+            &self.buffer_pool,
+            txn_id,
+            redo,
+            vec![self.page_key(row_id.page_id as u64)],
+            write,
+        ) {
+            Ok(result) => result,
+            Err((redo, write)) => {
+                let pre = crate::wal::LogManager::pre_encode_record(txn_id, redo)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                write(lsn)
+            }
+        }
     }
 
     /// rowid-6bytes M2: flip an MVCC-tombstoned slot to `ROW_FLAG_FREE`
@@ -4848,7 +5287,6 @@ impl HeapFile {
         )?;
         Ok(())
     }
-
 
     /// Test-only: report a slot's flag bits (`ROW_FLAG_DELETED` /
     /// `ROW_FLAG_FREE`) so unit tests can assert the M2 reclaim state
@@ -4993,27 +5431,43 @@ fn patch_heap_page_raw(
     let slot_count = read_u16(bytes, 20) as usize;
     let idx = slot_id as usize;
     if idx >= slot_count {
-        return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+        return Err(error(
+            crate::error::catalog::ER_KEY_NOT_FOUND,
+            "row not found",
+        ));
     }
     let base = PAGE_HEADER_SIZE + idx * SLOT_SIZE;
     let offset = read_u16(bytes, base) as usize;
     let len = read_u16(bytes, base + 2) as usize;
     let flags = bytes[base + 4];
     if flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) != 0 || len == 0 {
-        return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+        return Err(error(
+            crate::error::catalog::ER_KEY_NOT_FOUND,
+            "row not found",
+        ));
     }
-    let slot_end = offset
-        .checked_add(len)
-        .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"))?;
+    let slot_end = offset.checked_add(len).ok_or_else(|| {
+        error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap slot bounds",
+        )
+    })?;
     if slot_end > PAGE_SIZE {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap slot bounds",
+        ));
     }
     for (patch_offset, patch) in patches {
-        let end = patch_offset
-            .checked_add(patch.len())
-            .ok_or_else(|| error(crate::error::catalog::ER_TOO_BIG_ROWSIZE, "heap patch offset overflow"))?;
+        let end = patch_offset.checked_add(patch.len()).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                "heap patch offset overflow",
+            )
+        })?;
         if end > len {
-            return Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+            return Err(error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                 "in-place column patch exceeds row payload",
             ));
         }
@@ -5046,7 +5500,10 @@ struct HeapPageMut<'a> {
 impl<'a> HeapPageMut<'a> {
     fn new(bytes: &'a mut [u8]) -> Result<Self, QueryError> {
         if !validate_heap_page_structure(bytes)? {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         Ok(Self { bytes })
     }
@@ -5055,7 +5512,10 @@ impl<'a> HeapPageMut<'a> {
         let idx = slot_id as usize;
         let slot_count = read_u16(self.bytes, 20) as usize;
         if idx >= slot_count {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         let base = PAGE_HEADER_SIZE + idx * SLOT_SIZE;
         let slot = Slot {
@@ -5064,11 +5524,17 @@ impl<'a> HeapPageMut<'a> {
             flags: self.bytes[base + 4],
         };
         if slot.flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) != 0 || slot.len == 0 {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         let end = slot.offset as usize + slot.len as usize;
         if end > PAGE_SIZE {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap slot bounds",
+            ));
         }
         Ok(slot)
     }
@@ -5085,7 +5551,10 @@ impl<'a> HeapPageMut<'a> {
         let idx = slot_id as usize;
         let count = read_u16(bytes, 20) as usize;
         if idx >= count {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         let base = PAGE_HEADER_SIZE + idx * SLOT_SIZE;
         let slot = Slot {
@@ -5094,7 +5563,10 @@ impl<'a> HeapPageMut<'a> {
             flags: bytes[base + 4],
         };
         if slot.flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) != 0 || slot.len == 0 {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         if new_len <= slot.len as usize {
             return Ok(HeapUpdatePlan::InPlace);
@@ -5115,11 +5587,17 @@ impl<'a> HeapPageMut<'a> {
             let flags = bytes[slot_base + 4];
             if flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) == 0 {
                 if offset.checked_add(len).is_none_or(|end| end > PAGE_SIZE) {
-                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap slot bounds",
+                    ));
                 }
-                live_other = live_other
-                    .checked_add(len)
-                    .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap live-byte count"))?;
+                live_other = live_other.checked_add(len).ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap live-byte count",
+                    )
+                })?;
             }
         }
         if free_start
@@ -5156,11 +5634,17 @@ impl<'a> HeapPageMut<'a> {
             }
             if flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) == 0 {
                 if offset.checked_add(len).is_none_or(|end| end > PAGE_SIZE) {
-                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap slot bounds",
+                    ));
                 }
-                live_bytes = live_bytes
-                    .checked_add(len)
-                    .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap live-byte count"))?;
+                live_bytes = live_bytes.checked_add(len).ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap live-byte count",
+                    )
+                })?;
             }
         }
         let needs_slot = reusable.is_none();
@@ -5196,19 +5680,30 @@ impl<'a> HeapPageMut<'a> {
         let count = read_u16(self.bytes, 20) as usize;
         let appending = plan.slot_id as usize == count;
         if plan.slot_id as usize > count {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "heap insert slot preflight diverged"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "heap insert slot preflight diverged",
+            ));
         }
         if !appending {
             let base = PAGE_HEADER_SIZE + plan.slot_id as usize * SLOT_SIZE;
             if self.bytes[base + 4] & ROW_FLAG_FREE == 0 {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO, "heap insert slot preflight diverged"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "heap insert slot preflight diverged",
+                ));
             }
         }
         if plan.compact {
-            let scratch = scratch
-                .ok_or_else(|| error(crate::error::catalog::ER_OUTOFMEMORY, "heap compaction scratch unavailable"))?;
+            let scratch = scratch.ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "heap compaction scratch unavailable",
+                )
+            })?;
             if scratch.len() != PAGE_SIZE {
-                return Err(error(crate::error::catalog::ER_OUTOFMEMORY,
+                return Err(error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
                     "heap compaction scratch has invalid size",
                 ));
             }
@@ -5291,10 +5786,15 @@ impl<'a> HeapPageMut<'a> {
                 write_u16(self.bytes, 24, new_offset as u16);
             }
             HeapUpdatePlan::Compact => {
-                let scratch = scratch
-                    .ok_or_else(|| error(crate::error::catalog::ER_OUTOFMEMORY, "heap compaction scratch unavailable"))?;
+                let scratch = scratch.ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_OUTOFMEMORY,
+                        "heap compaction scratch unavailable",
+                    )
+                })?;
                 if scratch.len() != PAGE_SIZE {
-                    return Err(error(crate::error::catalog::ER_OUTOFMEMORY,
+                    return Err(error(
+                        crate::error::catalog::ER_OUTOFMEMORY,
                         "heap compaction scratch has invalid size",
                     ));
                 }
@@ -5327,7 +5827,8 @@ impl<'a> HeapPageMut<'a> {
                 self.bytes.copy_from_slice(scratch);
             }
             HeapUpdatePlan::NoSpace => {
-                return Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                return Err(error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                     "updated row does not fit in heap page",
                 ));
             }
@@ -5382,7 +5883,10 @@ fn validate_heap_page_header_with_cache(
     }
     let actual_checksum = page_checksum(buf, 16);
     if stored_checksum != actual_checksum {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page checksum"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap page checksum",
+        ));
     }
     if let Some(cache) = verified_checksums {
         cache.remember(page_id, stored_checksum);
@@ -5392,25 +5896,44 @@ fn validate_heap_page_header_with_cache(
 
 fn validate_heap_page_structure(buf: &[u8]) -> Result<bool, QueryError> {
     if buf.len() != PAGE_SIZE {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page: short page"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap page: short page",
+        ));
     }
     if buf.iter().all(|byte| *byte == 0) {
         return Ok(false);
     }
+    if read_u32(buf, 0) == HEAP_META_MAGIC {
+        decode_heap_meta(buf, &buf[40..56].try_into().unwrap())?;
+        return Ok(false);
+    }
     if read_u32(buf, 0) != HEAP_PAGE_MAGIC {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page: invalid magic"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap page: invalid magic",
+        ));
     }
     if read_u16(buf, 4) != HEAP_PAGE_VERSION {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "unsupported heap page version"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unsupported heap page version",
+        ));
     }
     let slot_count = read_u16(buf, 20) as usize;
     let free_start = read_u16(buf, 22);
     let free_end = read_u16(buf, 24);
     if free_start as usize > PAGE_SIZE || free_end as usize > PAGE_SIZE || free_start > free_end {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page header"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap page header",
+        ));
     }
     if PAGE_HEADER_SIZE + slot_count * SLOT_SIZE > free_start as usize {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot directory"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap slot directory",
+        ));
     }
     Ok(true)
 }
@@ -5432,7 +5955,10 @@ fn read_validated_page_payload(buf: &[u8], row_id: RowId) -> Result<Option<&[u8]
     }
     let end = slot.offset as usize + slot.len as usize;
     if end > PAGE_SIZE {
-        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "corrupt heap slot bounds",
+        ));
     }
     Ok(Some(&buf[slot.offset as usize..end]))
 }
@@ -5588,29 +6114,48 @@ impl Page {
     }
 
     fn decode_slots(buf: &[u8]) -> Result<Option<Vec<Slot>>, QueryError> {
+        if buf.len() == PAGE_SIZE && read_u32(buf, 0) == HEAP_META_MAGIC {
+            decode_heap_meta(buf, &buf[40..56].try_into().unwrap())?;
+            return Ok(None);
+        }
         if buf.iter().all(|byte| *byte == 0) {
             return Ok(None);
         }
         if read_u32(buf, 0) != HEAP_PAGE_MAGIC {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page: invalid magic"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap page: invalid magic",
+            ));
         }
         if read_u16(buf, 4) != HEAP_PAGE_VERSION {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "unsupported heap page version"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "unsupported heap page version",
+            ));
         }
         let stored_checksum = read_u32(buf, 16);
         let actual_checksum = page_checksum(buf, 16);
         if stored_checksum != actual_checksum {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page checksum"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap page checksum",
+            ));
         }
         let slot_count = read_u16(buf, 20) as usize;
         let free_start = read_u16(buf, 22);
         let free_end = read_u16(buf, 24);
         if free_start as usize > PAGE_SIZE || free_end as usize > PAGE_SIZE || free_start > free_end
         {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page header"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap page header",
+            ));
         }
         if PAGE_HEADER_SIZE + slot_count * SLOT_SIZE > free_start as usize {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot directory"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap slot directory",
+            ));
         }
         let mut slots = Vec::with_capacity(slot_count);
         for idx in 0..slot_count {
@@ -5623,7 +6168,10 @@ impl Page {
             if slot.flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) == 0 && slot.len > 0 {
                 let end = slot.offset as usize + slot.len as usize;
                 if end > PAGE_SIZE {
-                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap slot bounds",
+                    ));
                 }
             }
             slots.push(slot);
@@ -5636,25 +6184,40 @@ impl Page {
             return Ok(Self::new());
         }
         if read_u32(buf, 0) != HEAP_PAGE_MAGIC {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page: invalid magic"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap page: invalid magic",
+            ));
         }
         if read_u16(buf, 4) != HEAP_PAGE_VERSION {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "unsupported heap page version"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "unsupported heap page version",
+            ));
         }
         let stored_checksum = read_u32(buf, 16);
         let actual_checksum = page_checksum(buf, 16);
         if stored_checksum != actual_checksum {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page checksum"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap page checksum",
+            ));
         }
         let slot_count = read_u16(buf, 20) as usize;
         let free_start = read_u16(buf, 22);
         let free_end = read_u16(buf, 24);
         if free_start as usize > PAGE_SIZE || free_end as usize > PAGE_SIZE || free_start > free_end
         {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap page header"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap page header",
+            ));
         }
         if PAGE_HEADER_SIZE + slot_count * SLOT_SIZE > free_start as usize {
-            return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot directory"));
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt heap slot directory",
+            ));
         }
         let mut slots = Vec::new();
         let mut deleted_count: u16 = 0;
@@ -5668,7 +6231,10 @@ impl Page {
             if slot.flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) == 0 && slot.len > 0 {
                 let end = slot.offset as usize + slot.len as usize;
                 if end > PAGE_SIZE {
-                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt heap slot bounds"));
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap slot bounds",
+                    ));
                 }
             } else if slot.flags & ROW_FLAG_DELETED != 0 {
                 deleted_count = deleted_count.saturating_add(1);
@@ -5913,7 +6479,8 @@ impl Page {
         if self.try_update(slot_id, payload)?.is_some() {
             return Ok(());
         }
-        Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+        Err(error(
+            crate::error::catalog::ER_TOO_BIG_ROWSIZE,
             "updated row does not fit in heap page",
         ))
     }
@@ -5921,10 +6488,16 @@ impl Page {
     fn try_update(&mut self, slot_id: u16, payload: &[u8]) -> Result<Option<()>, QueryError> {
         let idx = slot_id as usize;
         let Some(slot) = self.slots.get(idx).copied() else {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         };
         if slot.flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) != 0 {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         if payload.len() <= slot.len as usize {
             self.data[slot.offset as usize..slot.offset as usize + payload.len()]
@@ -5969,10 +6542,16 @@ impl Page {
 
     fn delete(&mut self, slot_id: u16) -> Result<(), QueryError> {
         let Some(slot) = self.slots.get_mut(slot_id as usize) else {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         };
         if slot.flags & ROW_FLAG_FREE != 0 {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         if slot.flags & ROW_FLAG_DELETED == 0 {
             slot.flags |= ROW_FLAG_DELETED;
@@ -6040,7 +6619,10 @@ impl Page {
     /// snapshot, no secondary-index entry).
     fn mark_slot_free(&mut self, slot_id: u16) -> Result<(), QueryError> {
         let Some(slot) = self.slots.get_mut(slot_id as usize) else {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         };
         if slot.flags & ROW_FLAG_FREE != 0 {
             return Ok(());
@@ -6084,19 +6666,29 @@ impl Page {
     ) -> Result<Vec<Vec<u8>>, QueryError> {
         let idx = slot_id as usize;
         let Some(slot) = self.slots.get(idx).copied() else {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         };
         if slot.flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) != 0 {
-            return Err(error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"));
+            return Err(error(
+                crate::error::catalog::ER_KEY_NOT_FOUND,
+                "row not found",
+            ));
         }
         // Pre-validate every patch range; we want all-or-nothing
         // semantics so a half-applied patch can never corrupt a row.
         for (offset, bytes) in patches {
-            let end = offset
-                .checked_add(bytes.len())
-                .ok_or_else(|| error(crate::error::catalog::ER_TOO_BIG_ROWSIZE, "patch offset overflow"))?;
+            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                    "patch offset overflow",
+                )
+            })?;
             if end > slot.len as usize {
-                return Err(error(crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                return Err(error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                     "in-place column patch exceeds row payload",
                 ));
             }

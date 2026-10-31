@@ -844,6 +844,7 @@ mod tests {
         assert_eq!(&bytes[40..48], &5u64.to_le_bytes());
         assert_eq!(&bytes[56..64], &[1, 0, 84, 0, 253, 63, 0, 0]);
         set_page_lsn_if_formatted(&mut bytes, 991);
+        crate::storage::format_golden::golden!("zone-page", &bytes);
         assert_eq!(read_u64(&bytes, 8), 991);
         let view = View::open(&bytes, identity()).unwrap();
         assert_eq!(view.next(), 19);

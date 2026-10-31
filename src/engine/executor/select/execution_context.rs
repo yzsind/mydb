@@ -21,6 +21,7 @@ pub(in crate::engine::executor) struct ExecutionContext {
     params: Option<crate::engine::params::ParamContextSnapshot>,
     budget: Arc<MemBudget>,
     session_expr_info: Option<SessionExprInfo>,
+    statement_now_micros: i64,
     http_context: Option<crate::engine::http::Context>,
     // Owned per-context clone: SessionContext is Send but intentionally not
     // Sync (it contains connection-local RefCells). ExecutionContext clones
@@ -49,6 +50,58 @@ pub(in crate::engine::executor) struct ExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statement_clocks_follow_contexts_across_reused_workers_and_restore_nested_scopes() {
+        use crate::engine::{api, expr};
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+        let capture = |seconds: i64| {
+            api::clear_statement_now_freeze();
+            let mut session = api::SessionContext::default();
+            session.sysvars.timestamp_override = seconds as f64;
+            expr::with_session_expr_info(&session, || {
+                (
+                    ExecutionContext::capture(TxnView::read_only(
+                        0,
+                        crate::storage::IsolationLevel::ReadCommitted,
+                    )),
+                    expr::current_session_expr_info().unwrap(),
+                )
+            })
+        };
+        let (first, first_info) = capture(1_600_000_000);
+        let (second, second_info) = capture(1_700_000_000);
+        api::clear_statement_now_freeze();
+        std::thread::spawn(move || {
+            let micros = || expr::session_utc_now().and_utc().timestamp_micros();
+            assert_eq!(api::stmt_frozen_utc_now_micros(|| 123), 123);
+            for _ in 0..3 {
+                first.run(&db, || {
+                    assert_eq!(micros(), 1_600_000_000_000_000);
+                    second.run(&db, || assert_eq!(micros(), 1_700_000_000_000_000));
+                    assert_eq!(micros(), 1_600_000_000_000_000);
+                });
+                assert_eq!(micros(), 123);
+                expr::with_session_expr_info_snapshot(second_info.clone(), || {
+                    assert_eq!(micros(), 1_700_000_000_000_000);
+                    expr::with_session_expr_info_snapshot(first_info.clone(), || {
+                        assert_eq!(micros(), 1_600_000_000_000_000)
+                    });
+                    assert_eq!(micros(), 1_700_000_000_000_000);
+                });
+                assert_eq!(micros(), 123);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                first.run(&db, || panic!("unwind clock scope"))
+            }));
+            assert!(result.is_err());
+            assert_eq!(micros(), 123);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn zone_map_audit_worker_restores_optimizer_switch() {
@@ -200,6 +253,9 @@ impl ExecutionContext {
             params: crate::engine::params::snapshot_current_context(),
             budget,
             session_expr_info: crate::engine::expr::current_session_expr_info(),
+            statement_now_micros: crate::engine::expr::session_utc_now()
+                .and_utc()
+                .timestamp_micros(),
             http_context: crate::engine::http::capture(),
             session_context: crate::engine::expr::current_session_context_snapshot(),
             zone_map_optimizer_enabled: crate::storage::schema::zone_map_optimizer_enabled(),
@@ -321,6 +377,8 @@ impl ExecutionContext {
         f: impl FnOnce() -> R,
     ) -> R {
         let txn = self.txn;
+        let _statement_now =
+            crate::engine::api::StatementNowScope::enter(self.statement_now_micros);
         let _http_scope = crate::engine::http::enter_context(self.http_context.as_ref());
         let _http_serial = self
             .http_context

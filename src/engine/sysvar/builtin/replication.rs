@@ -44,6 +44,15 @@ pub(crate) fn log_bin_trust_function_creators() -> bool {
     LOG_BIN_TRUST_FUNCTION_CREATORS.load(Ordering::Relaxed)
 }
 
+fn forced_read_only_error(db: Option<&crate::storage::Database>) -> QueryError {
+    if db.is_some_and(|db| db.physical_replica_mode()) {
+        crate::error::catalog::ER_OPTION_PREVENTS_STATEMENT
+            .error("read-only mode cannot be disabled on a physical replica")
+    } else {
+        crate::storage::image_io::read_only_error()
+    }
+}
+
 pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
         SysVarDef::new("read_only", Scope::Global, DataType::Bool)
@@ -51,17 +60,21 @@ pub(crate) fn register(reg: &mut Registry) {
             .with_doc("Block writes from non-super users when ON."),
         |ctx| {
             SysVarValue::Bool(
-                ctx.db.is_some_and(|db| db.is_snapshot_read_only())
+                ctx.db
+                    .is_some_and(|db| db.is_snapshot_read_only() || db.physical_replica_mode())
                     || READ_ONLY.load(Ordering::Relaxed),
             )
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
             let on = v.as_bool().unwrap_or(false);
-            if ctx.db.is_some_and(|db| db.is_snapshot_read_only()) {
+            if ctx
+                .db
+                .is_some_and(|db| db.is_snapshot_read_only() || db.physical_replica_mode())
+            {
                 return if on {
                     Ok(())
                 } else {
-                    Err(crate::storage::image_io::read_only_error())
+                    Err(forced_read_only_error(ctx.db))
                 };
             }
             READ_ONLY.store(on, Ordering::Relaxed);
@@ -80,17 +93,21 @@ pub(crate) fn register(reg: &mut Registry) {
             .with_doc("Block writes from all users (including super) when ON."),
         |ctx| {
             SysVarValue::Bool(
-                ctx.db.is_some_and(|db| db.is_snapshot_read_only())
+                ctx.db
+                    .is_some_and(|db| db.is_snapshot_read_only() || db.physical_replica_mode())
                     || SUPER_READ_ONLY.load(Ordering::Relaxed),
             )
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
             let on = v.as_bool().unwrap_or(false);
-            if ctx.db.is_some_and(|db| db.is_snapshot_read_only()) {
+            if ctx
+                .db
+                .is_some_and(|db| db.is_snapshot_read_only() || db.physical_replica_mode())
+            {
                 return if on {
                     Ok(())
                 } else {
-                    Err(crate::storage::image_io::read_only_error())
+                    Err(forced_read_only_error(ctx.db))
                 };
             }
             SUPER_READ_ONLY.store(on, Ordering::Relaxed);

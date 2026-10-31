@@ -7,8 +7,8 @@
 /// `self.log.lock()` count. The pages they describe are held un-flushable in
 /// the buffer pool via `deferred_pins` until that commit-time append assigns
 /// their real LSNs (see `Frame::deferred_pins`). A crash before commit appends
-/// none of these buffered data records and flushes none of their pages; the
-/// eager BeginTxn record is harmless and recovery sees an empty loser.
+/// none of these buffered data records and flushes none of their pages.
+/// BeginTxn joins the first batch or an eager fallback's first WAL append.
 ///
 /// Each entry is `(pre-encoded record, frames it dirtied)`. The frames are
 /// `finalize_deferred`'d (real LSN published, pin released) right after their
@@ -22,7 +22,6 @@ pub(crate) enum LockingReadLockWatermark {
     Sharded(usize),
     Legacy(usize),
 }
-
 
 /// Undo records one purge lock round plans and removes. Rounds keep each
 /// undo-lock hold in the tens of microseconds, so DML undo publication never
@@ -162,11 +161,64 @@ thread_local! {
 type TxnWalBufferKey = (usize, u64);
 #[derive(Default)]
 struct TxnWalBuffer {
+    write_enabled: bool,
+    begin: Option<WalPayload>,
+    reusable_boundary: Option<Arc<crate::storage::txn::WalSavepointBoundary>>,
     entries: Vec<TxnWalEntry>,
+    page_reservation: Option<DeferredWalPageReservation>,
     boundaries: Vec<(
         usize,
         std::sync::Weak<crate::storage::txn::WalSavepointBoundary>,
     )>,
+}
+
+/// Holds additional batching headroom until the corresponding pins have real
+/// WAL LSNs. Admission reserves only a fraction of the existing pool; it does
+/// not grow the pool or alter transaction/worker concurrency.
+struct DeferredWalPageReservation {
+    pool: Arc<BufferPool>,
+    pages: u64,
+}
+
+impl Drop for DeferredWalPageReservation {
+    fn drop(&mut self) {
+        self.pool
+            .deferred_wal_pages
+            .fetch_sub(self.pages, Ordering::Release);
+    }
+}
+
+impl TxnWalBuffer {
+    fn hold_page_reservation(&mut self, mut reservation: Option<DeferredWalPageReservation>) {
+        match (&mut self.page_reservation, &mut reservation) {
+            (Some(current), Some(additional)) => {
+                assert!(Arc::ptr_eq(&current.pool, &additional.pool));
+                current.pages += additional.pages;
+                additional.pages = 0;
+            }
+            (None, _) => self.page_reservation = reservation,
+            _ => {}
+        }
+    }
+}
+
+impl BufferPool {
+    fn reserve_deferred_wal_pages(
+        self: &Arc<Self>,
+        pages: usize,
+    ) -> Option<DeferredWalPageReservation> {
+        let pages = u64::try_from(pages).ok()?;
+        let limit = self.capacity_pages() / 8;
+        self.deferred_wal_pages
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                current.checked_add(pages).filter(|total| *total <= limit)
+            })
+            .ok()?;
+        Some(DeferredWalPageReservation {
+            pool: Arc::clone(self),
+            pages,
+        })
+    }
 }
 type TxnWalBufferShard = parking_lot::Mutex<HashMap<TxnWalBufferKey, TxnWalBuffer>>;
 
@@ -310,18 +362,41 @@ pub(crate) fn row_lock_direct_wake_enabled() -> bool {
 
 fn txn_wal_buffering_active(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> bool {
     let key = txn_wal_buffer_key(log, txn_id);
-    txn_wal_buffer_shard(key).lock().contains_key(&key)
+    txn_wal_buffer_shard(key)
+        .lock()
+        .get(&key)
+        .is_some_and(|buffer| buffer.write_enabled)
 }
 
-fn begin_txn_wal_buffering(log: &Arc<crate::wal::LogMutex>, txn_id: u64) {
+fn begin_txn_wal_buffering(
+    log: &Arc<crate::wal::LogMutex>,
+    txn_id: u64,
+    start_scn: u64,
+    write_enabled: bool,
+) {
     let key = txn_wal_buffer_key(log, txn_id);
-    let previous = txn_wal_buffer_shard(key)
-        .lock()
-        .insert(key, TxnWalBuffer::default());
+    let previous = txn_wal_buffer_shard(key).lock().insert(
+        key,
+        TxnWalBuffer {
+            write_enabled,
+            begin: Some(WalPayload::BeginTxn { start_scn }),
+            ..Default::default()
+        },
+    );
     debug_assert!(
         previous.is_none(),
         "transaction WAL buffer must not be armed twice"
     );
+}
+
+/// Eager fallbacks publish the lazy BEGIN under the same WAL guard as
+/// their first record. Reserved-LSN callers must use reserve_txn_lsn.
+pub(crate) fn take_buffered_txn_begin(log_owner: u64, txn_id: u64) -> Option<WalPayload> {
+    if log_owner == 0 || txn_id == 0 {
+        return None;
+    }
+    let key = (log_owner as usize, txn_id);
+    txn_wal_buffer_shard(key).lock().get_mut(&key)?.begin.take()
 }
 
 /// Park a logical record + the frames it dirtied. Encoding is deferred until
@@ -335,13 +410,76 @@ fn push_txn_wal_record(
     payload: WalPayload,
     keys: Vec<PageKey>,
 ) -> Result<(), (WalPayload, Vec<PageKey>)> {
+    push_reserved_txn_wal_record(log, txn_id, payload, keys, None)
+        .map_err(|(payload, keys, _)| (payload, keys))
+}
+
+fn push_reserved_txn_wal_record(
+    log: &Arc<crate::wal::LogMutex>,
+    txn_id: u64,
+    payload: WalPayload,
+    keys: Vec<PageKey>,
+    reservation: Option<DeferredWalPageReservation>,
+) -> Result<(), (WalPayload, Vec<PageKey>, Option<DeferredWalPageReservation>)> {
     let key = txn_wal_buffer_key(log, txn_id);
     let mut shard = txn_wal_buffer_shard(key).lock();
     let Some(buf) = shard.get_mut(&key) else {
-        return Err((payload, keys));
+        return Err((payload, keys, reservation));
     };
+    if !buf.write_enabled {
+        return Err((payload, keys, reservation));
+    }
+    buf.hold_page_reservation(reservation);
     buf.entries.push((payload, keys));
     Ok(())
+}
+
+/// Queue redo before publishing resident page images, atomically with respect
+/// to a concurrent buffer drain. The callback may only update the pinned
+/// buffer images: it must not navigate trees, acquire heap/row latches, perform
+/// file I/O, or append WAL. Callers acquire their mutation latches first.
+/// A failed callback retains its redo/pins for statement rollback, exactly as
+/// an eager append preceding a failed page update does.
+fn try_buffer_txn_page_write<T, F>(
+    log: &Arc<crate::wal::LogMutex>,
+    pool: &Arc<BufferPool>,
+    txn_id: u64,
+    payload: WalPayload,
+    keys: Vec<PageKey>,
+    write: F,
+) -> Result<Result<T, QueryError>, (WalPayload, F)>
+where
+    F: FnOnce(u64) -> Result<T, QueryError>,
+{
+    if keys.len() > TXN_WAL_BUFFER_FLUSH_THRESHOLD || !txn_wal_buffering_active(log, txn_id) {
+        return Err((payload, write));
+    }
+    let Some(reservation) = pool.reserve_deferred_wal_pages(keys.len()) else {
+        return Err((payload, write));
+    };
+    let mut pinned = 0;
+    for key in &keys {
+        if !pool.add_deferred_pin(key) {
+            for key in &keys[..pinned] {
+                pool.finalize_deferred(key, 0);
+            }
+            return Err((payload, write));
+        }
+        pinned += 1;
+    }
+    let mut shard = txn_wal_buffer_shard(txn_wal_buffer_key(log, txn_id)).lock();
+    let Some(buffer) = shard.get_mut(&txn_wal_buffer_key(log, txn_id)) else {
+        drop(shard);
+        for key in &keys {
+            pool.finalize_deferred(key, 0);
+        }
+        return Err((payload, write));
+    };
+    buffer.hold_page_reservation(Some(reservation));
+    buffer.entries.push((payload, keys));
+    let result = write(0);
+    drop(shard);
+    Ok(result)
 }
 
 fn txn_wal_buffer_len(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> usize {
@@ -367,7 +505,14 @@ fn take_txn_wal_entries(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> TxnWalB
     txn_wal_buffer_shard(key)
         .lock()
         .get_mut(&key)
-        .map(std::mem::take)
+        .map(|buffer| {
+            let reusable_boundary = buffer.reusable_boundary.take();
+            let write_enabled = buffer.write_enabled;
+            let entries = std::mem::take(buffer);
+            buffer.reusable_boundary = reusable_boundary;
+            buffer.write_enabled = write_enabled;
+            entries
+        })
         .unwrap_or_default()
 }
 
@@ -582,8 +727,11 @@ impl Database {
             self.sequences.role_epoch.fetch_add(1, Ordering::AcqRel);
         }
         if enabled && role_changed {
-            let covered = self.log_state_atomics.next_lsn().saturating_sub(1)
-                .min(self.vector_pending_publication_floor().unwrap_or(u64::MAX).saturating_sub(1));
+            let covered = self.log_state_atomics.next_lsn().saturating_sub(1).min(
+                self.vector_pending_publication_floor()
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(1),
+            );
             self.vector_graph_persist_all_dirty(covered)?;
         }
         self.log.lock().set_physical_replica(enabled);
@@ -604,7 +752,9 @@ impl Database {
                 txns.close_registration_history();
             }
         }
-        if !enabled && role_changed { self.finish_promoted_vector_journal()?; }
+        if !enabled && role_changed {
+            self.finish_promoted_vector_journal()?;
+        }
         Ok(())
     }
 
@@ -872,12 +1022,7 @@ impl Database {
             .txns_write()?
             .begin_with_id(txn_id, start_scn, false, true, begin_lsn)?;
         self.slot_status_cache.insert_active(txn.txn_id);
-        if let Err(err) = self.append_wal(
-            txn.txn_id,
-            WalPayload::BeginTxn {
-                start_scn: txn.snapshot_scn,
-            },
-        ) {
+        if let Err(err) = self.begin_txn_wal(txn, false) {
             self.txns_write()?.discard_failed_begin(txn.txn_id);
             self.slot_status_cache.remove(txn.txn_id);
             return Err(err);
@@ -941,12 +1086,7 @@ impl Database {
             view
         };
         self.slot_status_cache.insert_active(txn.txn_id);
-        if let Err(err) = self.append_wal(
-            txn.txn_id,
-            WalPayload::BeginTxn {
-                start_scn: txn.snapshot_scn,
-            },
-        ) {
+        if let Err(err) = self.begin_txn_wal(txn, true) {
             let mut txns = self.txns_write()?;
             txns.discard_failed_begin(txn.txn_id);
             self.active_write_txns_atomic
@@ -956,11 +1096,23 @@ impl Database {
             return Err(err);
         }
         begin_txn_redo_policy(&self.log, txn.txn_id);
-        if txn_wal_buffer_feature_enabled() && self.config.durability != DurabilityMode::Memory {
-            begin_txn_wal_buffering(&self.log, txn.txn_id);
-        }
         self.cache_started_dml_txn(txn.txn_id, undo_head);
         Ok(txn)
+    }
+
+    fn begin_txn_wal(&self, txn: TxnView, write_enabled: bool) -> Result<(), QueryError> {
+        if txn_wal_buffer_feature_enabled() && self.config.durability != DurabilityMode::Memory {
+            begin_txn_wal_buffering(&self.log, txn.txn_id, txn.snapshot_scn, write_enabled);
+            Ok(())
+        } else {
+            self.append_wal(
+                txn.txn_id,
+                WalPayload::BeginTxn {
+                    start_scn: txn.snapshot_scn,
+                },
+            )
+            .map(|_| ())
+        }
     }
 
     /// A transaction which began with a read/savepoint can later write.
@@ -977,7 +1129,11 @@ impl Database {
         };
         if eligible {
             let key = txn_wal_buffer_key(&self.log, txn_id);
-            txn_wal_buffer_shard(key).lock().entry(key).or_default();
+            txn_wal_buffer_shard(key)
+                .lock()
+                .entry(key)
+                .or_default()
+                .write_enabled = true;
         }
         Ok(())
     }
@@ -1763,12 +1919,7 @@ impl Database {
             if self.try_row_lock_without_wait(txn_id, table_id, row_id, mode)? {
                 return Ok(());
             }
-            crate::storage::txn::record_nonblocking_row_wait_target(
-                txn_id,
-                table_id,
-                row_id,
-                mode,
-            );
+            crate::storage::txn::record_nonblocking_row_wait_target(txn_id, table_id, row_id, mode);
             return Err(crate::storage::txn::lock_would_block_error());
         }
         let started = Instant::now();
@@ -1863,7 +2014,10 @@ impl Database {
         index_name: &str,
         key: &IndexKey,
     ) -> Result<(), QueryError> {
-        if !self.unique_reservations.may_reserve_key(txn_id, table_id, index_name, key) {
+        if !self
+            .unique_reservations
+            .may_reserve_key(txn_id, table_id, index_name, key)
+        {
             return Ok(());
         }
         self.lock_manager().check_unique_key_lock(
@@ -1884,7 +2038,10 @@ impl Database {
     ) -> Result<bool, QueryError> {
         crate::engine::cancel::check_cancelled()?;
         // No reservation on the table: nothing to wait for, and no latch.
-        if !self.unique_reservations.may_reserve_key(txn_id, table_id, index_name, key) {
+        if !self
+            .unique_reservations
+            .may_reserve_key(txn_id, table_id, index_name, key)
+        {
             return Ok(false);
         }
         if self.lock_manager_read().unique_key_uncontended(
@@ -2262,19 +2419,15 @@ impl Database {
     /// `mydb_undo_buffer_bytes`). Lives in the UndoManager since it is
     /// applied to its `buffer_limit` field directly.
     pub fn undo_buffer_bytes(&self) -> u64 {
-        self.undo
-            .try_read()
-            .map(|undo| undo.buffer_limit())
-            .unwrap_or(0)
+        self.undo_append_shards
+            .first()
+            .map_or(0, |shard| shard.lock().buffer_limit)
     }
 
     /// P2/12 — disk-cap soft-fail warning toggle (sysvar
     /// `mydb_undo_disk_cap_softfail_warn`).
     pub fn undo_disk_cap_softfail_warn(&self) -> bool {
-        self.undo
-            .try_read()
-            .map(|undo| undo.disk_cap_softfail_warn())
-            .unwrap_or(false)
+        self.undo.disk_softfail_warn.load(Ordering::Acquire)
     }
 
     pub fn set_undo_disk_cap_softfail_warn(&self, enabled: bool) -> Result<(), QueryError> {
@@ -2296,10 +2449,7 @@ impl Database {
     /// `SHOW ENGINE MYDB STATUS` so operators can confirm
     /// `MYDB_UNDO_WRITE_SHARDS` took effect.
     pub fn undo_shard_count(&self) -> u64 {
-        self.undo
-            .try_read()
-            .map(|undo| undo.shard_count() as u64)
-            .unwrap_or(0)
+        self.undo_append_shards.len() as u64
     }
 
     /// P2/13 — surface the live undo mirror as a flat record list for
@@ -2828,6 +2978,16 @@ impl Database {
     /// `finish_deferred_commits`; dropping it would leave post-durable hooks
     /// unfinished.
     pub(crate) fn commit_txn_deferred(&self, txn_id: u64) -> Result<DeferredCommit, QueryError> {
+        self.commit_txn_deferred_with_vector_maintenance(txn_id, true)
+    }
+
+    /// A statistics DD transaction holds the catalog publication latch. Its
+    /// durability path must not re-enter that catalog through unrelated purges.
+    fn commit_txn_deferred_with_vector_maintenance(
+        &self,
+        txn_id: u64,
+        drain_vector_purges: bool,
+    ) -> Result<DeferredCommit, QueryError> {
         // Handler_commit: every commit — read-only, autocommit, explicit, or
         // fast-path — funnels through here, matching MySQL's internal commit
         // counter (which also counts read-only commits).
@@ -3042,7 +3202,9 @@ impl Database {
                 }
             })?;
         #[cfg(test)]
-        if has_vector_pending { self.test_vector_crash_point(1, commit_lsn)?; }
+        if has_vector_pending {
+            self.test_vector_crash_point(1, commit_lsn)?;
+        }
         // Publish and release row locks before the group durability barrier.
         // Strict durability guarantees COMMIT success only after WAL fsync;
         // a concurrent reader can observe an in-progress commit before that
@@ -3099,7 +3261,9 @@ impl Database {
         frontier_guard.disarm();
         // Superseded vector versions queued by this (or an earlier) commit
         // become retirable once the frontier covers them.
-        self.drain_vector_purges();
+        if drain_vector_purges {
+            self.drain_vector_purges();
+        }
         if has_vector_pending && index_error.is_none() {
             index_error = self.ensure_operational().err();
         }
@@ -3136,7 +3300,10 @@ impl Database {
         &self,
         commits: &mut [&mut DeferredCommit],
     ) -> Result<(), QueryError> {
-        let highest = commits.iter().filter_map(|commit| commit.durability_lsn).max();
+        let highest = commits
+            .iter()
+            .filter_map(|commit| commit.durability_lsn)
+            .max();
         if let Some(highest_lsn) = highest {
             let target = commits
                 .iter()
@@ -3243,9 +3410,10 @@ impl Database {
                 crate::binlog::semi_sync_wait_after_commit(file, end_pos);
             }
         }
-        if let Some((txn_id, err)) = commits.iter_mut().find_map(|commit| {
-            commit.index_error.take().map(|err| (commit.txn_id, err))
-        }) {
+        if let Some((txn_id, err)) = commits
+            .iter_mut()
+            .find_map(|commit| commit.index_error.take().map(|err| (commit.txn_id, err)))
+        {
             return Err(err.map_message(|message| format!(
                 "transaction {txn_id} has a committed WAL decision but index maintenance failed; database is fail-stopped: {message}"
             )));
@@ -3539,7 +3707,9 @@ impl Database {
 
     fn sync_commit_lsn_with_target(&self, lsn: u64, target: u64) -> Result<(), QueryError> {
         let (window, adaptive) = self.group_commit_window_and_adaptive();
-        if crate::storage::txn::durability_worker_enabled() {
+        if self.config.durability != DurabilityMode::Memory
+            && crate::storage::txn::durability_worker_enabled()
+        {
             return self.durability_worker.sync_lsn(lsn, window, target);
         }
         self.group_commit
@@ -3605,8 +3775,8 @@ impl Database {
     /// Append all parked transaction-local WAL records (and `final_record`, if
     /// given) in a SINGLE WAL-mutex acquisition, then publish each dirtied
     /// frame's real LSN and release its deferred pin. Returns the LSN assigned
-    /// to `final_record`. BeginTxn is appended eagerly when the transaction
-    /// starts, so WAL order is begin → parked records → final_record even when
+    /// to `final_record`. The lazy BeginTxn joins the first drain unless an
+    /// eager fallback already published it, so WAL order is preserved even when
     /// different statements run on different blocking-pool workers.
     fn flush_txn_wal_buffer(
         &self,
@@ -3614,9 +3784,19 @@ impl Database {
         final_record: Option<WalPayload>,
     ) -> Result<Option<(u64, u64)>, QueryError> {
         let TxnWalBuffer {
-            entries,
-            boundaries,
+            write_enabled: _,
+            begin,
+            reusable_boundary: _,
+            mut entries,
+            mut boundaries,
+            page_reservation: _page_reservation,
         } = take_txn_wal_entries(&self.log, txn_id);
+        if let Some(begin) = begin {
+            entries.insert(0, (begin, Vec::new()));
+            for (position, _) in &mut boundaries {
+                *position += 1;
+            }
+        }
         if entries.is_empty() && boundaries.is_empty() && final_record.is_none() {
             return Ok(None);
         }
@@ -4033,7 +4213,13 @@ impl Database {
         // reclaimed by the same slot/undo lifecycle as other transactional
         // heaps; checkpoint never serializes or garbage-collects logical
         // catalog generations.
-        let (begin_lsn, auto_increment_dirty, sequence_dirty, vector_redo_floor, vector_publish_floor) = {
+        let (
+            begin_lsn,
+            auto_increment_dirty,
+            sequence_dirty,
+            vector_redo_floor,
+            vector_publish_floor,
+        ) = {
             let _sequence_fence = self.sequence_checkpoint_fence.write();
             let _auto_increment_fence = self.auto_increment_checkpoint_fence.write();
             let begin_lsn = self.temporal_history.checkpoint_barrier(|| {
@@ -4052,7 +4238,13 @@ impl Database {
                 })?
                 .rotate();
             let sequences = self.sequence_dirty.lock().snapshot()?;
-            (begin_lsn, dirty, sequences, vector_redo_floor, vector_publish_floor)
+            (
+                begin_lsn,
+                dirty,
+                sequences,
+                vector_redo_floor,
+                vector_publish_floor,
+            )
         };
         if let Err(err) = self
             .persist_sequence_checkpoint(&sequence_dirty.entries)
@@ -4166,12 +4358,27 @@ impl Database {
         }
         // Complete every required vector publication before CheckpointEnd and
         // WAL reclamation. A failed index flush must fail this checkpoint.
-        let vector_covered_lsn = if matches!(self.open_mode, DatabaseOpenMode::SealBaseline | DatabaseOpenMode::RestoreWorkspace) {
-            self.recovery_context.source_end().ok_or_else(vector::persistence::corrupt)?
-        } else { begin_lsn };
-        let vector_covered_lsn = vector_covered_lsn.min(vector_publish_floor.unwrap_or(u64::MAX).saturating_sub(1));
+        let vector_covered_lsn = if matches!(
+            self.open_mode,
+            DatabaseOpenMode::SealBaseline | DatabaseOpenMode::RestoreWorkspace
+        ) {
+            self.recovery_context
+                .source_end()
+                .ok_or_else(vector::persistence::corrupt)?
+        } else {
+            begin_lsn
+        };
+        let vector_covered_lsn =
+            vector_covered_lsn.min(vector_publish_floor.unwrap_or(u64::MAX).saturating_sub(1));
         self.vector_graph_persist_all_dirty(vector_covered_lsn)?;
-        redo_floor = redo_floor.min(self.vector_pending_wal.lock().values().copied().min().unwrap_or(u64::MAX));
+        redo_floor = redo_floor.min(
+            self.vector_pending_wal
+                .lock()
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(u64::MAX),
+        );
         self.ensure_operational()?;
         // Re-read the watermarks immediately before appending so a
         // concurrent BeginTxn/CommitTxn that raced past the snapshot
@@ -4351,9 +4558,27 @@ impl Database {
         })?;
         let applied_lsn = self.replica_applied_lsn_atomic.load(Ordering::Acquire);
         let wal_durable_lsn = self.log.lock().durable_lsn();
-        let persisted = crate::repl::replica::progress::load_progress(&self.data_dir)
-            .map_err(io_err)?.map(|p| p.durable_applied_lsn).unwrap_or(0);
+        let progress =
+            crate::repl::replica::progress::load_progress(&self.data_dir).map_err(io_err)?;
+        let persisted = progress.as_ref().map_or(0, |p| p.durable_applied_lsn);
+        let statistics_floor = progress
+            .as_ref()
+            .and_then(|p| p.statistics.as_ref())
+            .map(|s| s.covered_lsn);
         let mut restart_lsn = applied_lsn.min(wal_durable_lsn).min(persisted);
+        if let Some(floor) = statistics_floor {
+            restart_lsn = restart_lsn.min(floor);
+        } else if !self.table_live_row_deltas.read().is_empty()
+            || !self.table_modification_deltas.read().is_empty()
+            || self
+                .pending_live_row_deltas
+                .iter()
+                .any(|s| !s.lock().is_empty())
+        {
+            // Until progress contains the first statistical after-state, retain
+            // the logical tail needed to reconstruct it after a crash.
+            restart_lsn = 0;
+        }
         // Keep every streamed in-flight BEGIN, including transactions whose
         // first write has not arrived yet. Data-file durability alone cannot
         // reconstruct their MVCC identity after restart.
@@ -4381,7 +4606,14 @@ impl Database {
         {
             restart_lsn = restart_lsn.min(floor);
         }
-        if let Some(floor) = self.replica_vector_state.lock().images.values().copied().min() {
+        if let Some(floor) = self
+            .replica_vector_state
+            .lock()
+            .images
+            .values()
+            .copied()
+            .min()
+        {
             restart_lsn = restart_lsn.min(floor);
         }
         if restart_lsn == 0 {
@@ -4396,9 +4628,16 @@ impl Database {
         if let Some(floor) = self.vector_pending_wal.lock().values().copied().min() {
             restart_lsn = restart_lsn.min(floor);
         }
-        let completing_floor = self.replica_vector_state.lock().transactions.values()
-            .filter(|txn| txn.completing).flat_map(|txn| txn.records.first().map(|record| record.lsn)).min();
-        let vector_covered = applied_lsn.min(completing_floor.unwrap_or(u64::MAX).saturating_sub(1));
+        let completing_floor = self
+            .replica_vector_state
+            .lock()
+            .transactions
+            .values()
+            .filter(|txn| txn.completing)
+            .flat_map(|txn| txn.records.first().map(|record| record.lsn))
+            .min();
+        let vector_covered =
+            applied_lsn.min(completing_floor.unwrap_or(u64::MAX).saturating_sub(1));
         self.vector_graph_persist_all_dirty(vector_covered)?;
         let phase_started = Instant::now();
         let (_, dirty_page_count) = self.buffer_pool.checkpoint_dirty_snapshot()?;
@@ -4754,16 +4993,12 @@ impl Database {
             .combined(self.flush_group_commit.stats());
         let durability_worker_enabled = crate::storage::txn::durability_worker_enabled();
         let durability_stats = self.durability_worker.stats();
-        let effective_batches = if durability_worker_enabled {
-            durability_stats.batches
-        } else {
-            group_commit_stats.batches
-        };
-        let effective_requests = if durability_worker_enabled {
-            durability_stats.requests
-        } else {
-            group_commit_stats.total_batch_size
-        };
+        let effective_batches = group_commit_stats
+            .batches
+            .saturating_add(durability_stats.batches);
+        let effective_requests = group_commit_stats
+            .total_batch_size
+            .saturating_add(durability_stats.requests);
         let avg_group_commit_size = if effective_batches == 0 {
             0
         } else {
@@ -6136,7 +6371,7 @@ impl Database {
             row_log_len,
             index_repair_log_len: head.index_repair_log_len(),
             binlog_len: crate::binlog::txn_len(txn_id),
-            live_row_deltas: HashMap::new(),
+            live_row_deltas: smallvec::SmallVec::new(),
         };
         savepoint.live_row_deltas = self.pending_live_row_deltas_snapshot(txn_id);
         Ok(savepoint)
@@ -6158,20 +6393,34 @@ impl Database {
                 // an empty skip interval, while resolving last_lsn to an actual
                 // record in this transaction's chain as before.
                 let eager_lsn = self.log_state_atomics.next_lsn().saturating_sub(1);
-                let cursor = Arc::new(crate::storage::txn::WalSavepointBoundary {
-                    eager_lsn,
-                    prefix_lsn: AtomicU64::new(eager_lsn),
-                    last_lsn: AtomicU64::new(u64::MAX),
-                });
-                // Finished statement boundaries are normally at the tail;
-                // discard them amortized O(1), without scanning named saves.
-                while buf
-                    .boundaries
-                    .last()
-                    .is_some_and(|(_, boundary)| boundary.strong_count() == 0)
-                {
+                // Keep one boundary allocation for serialized statements.
+                // Reuse only after every old weak reference has retired;
+                // an in-flight drain must never resolve a new statement's
+                // cursor through an older boundary identity.
+                while buf.boundaries.last().is_some_and(|(_, boundary)| {
+                    boundary.strong_count() == 0
+                        || buf.reusable_boundary.as_ref().is_some_and(|cursor| {
+                            Arc::strong_count(cursor) == 1
+                                && std::sync::Weak::ptr_eq(boundary, &Arc::downgrade(cursor))
+                        })
+                }) {
                     buf.boundaries.pop();
                 }
+                let cursor =
+                    if let Some(cursor) = buf.reusable_boundary.as_mut().and_then(Arc::get_mut) {
+                        cursor.eager_lsn = eager_lsn;
+                        cursor.prefix_lsn.store(eager_lsn, Ordering::Relaxed);
+                        cursor.last_lsn.store(u64::MAX, Ordering::Relaxed);
+                        Arc::clone(buf.reusable_boundary.as_ref().unwrap())
+                    } else {
+                        let cursor = Arc::new(crate::storage::txn::WalSavepointBoundary {
+                            eager_lsn,
+                            prefix_lsn: AtomicU64::new(eager_lsn),
+                            last_lsn: AtomicU64::new(u64::MAX),
+                        });
+                        buf.reusable_boundary = Some(Arc::clone(&cursor));
+                        cursor
+                    };
                 buf.boundaries
                     .push((buf.entries.len(), Arc::downgrade(&cursor)));
                 savepoint.wal_boundary = Some(cursor);
@@ -6985,7 +7234,11 @@ mod transaction_audit_tests {
         let db = Database::open_with_durability(dir.path(), DurabilityMode::Relaxed).unwrap();
         db.buffer_pool.shutdown_flusher();
         let txn = db.begin_txn().unwrap();
-        let lsn = db.log.lock().append(txn.txn_id, WalPayload::EndTxn).unwrap();
+        let lsn = db
+            .log
+            .lock()
+            .append(txn.txn_id, WalPayload::EndTxn)
+            .unwrap();
         db.flush_commit_lsn(lsn).unwrap();
         assert!(db.log.lock().durable_lsn() < lsn);
         db.sync_commit_lsn(lsn).unwrap();

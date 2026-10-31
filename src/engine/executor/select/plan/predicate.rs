@@ -154,6 +154,21 @@ pub(crate) enum DecodedTruth {
 
 #[derive(Clone)]
 pub(super) enum DecodedPredicateLeaf {
+    NumericCmp {
+        column: usize,
+        op: BinaryOp,
+        value: FastConst,
+        flipped: bool,
+    },
+    SubstringIn {
+        column: usize,
+        start: i64,
+        len: Option<i64>,
+        keys: std::collections::HashSet<crate::engine::expr::ValueKey>,
+        ascii_short: Option<Arc<AsciiShortStringSet>>,
+        has_null: bool,
+        negated: bool,
+    },
     StringCmp {
         column: usize,
         op: BinaryOp,
@@ -170,6 +185,59 @@ pub(super) enum DecodedPredicateLeaf {
         column: usize,
         negated: bool,
     },
+}
+
+/// Exact membership for every ASCII string of zero, one or two bytes.
+/// Entries are compiled with the scalar collation oracle, including control
+/// characters and PAD SPACE, rather than assuming bytewise equality.
+#[derive(Clone)]
+pub(super) struct AsciiShortStringSet {
+    empty: bool,
+    singles: [u64; 2],
+    pairs: [u64; 256],
+}
+
+impl AsciiShortStringSet {
+    fn compile(keys: &std::collections::HashSet<crate::engine::expr::ValueKey>) -> Self {
+        let contains = |bytes: &[u8]| {
+            // SAFETY: callers enumerate only ASCII bytes.
+            keys.contains(&crate::engine::expr::ValueKey::string_from_str(unsafe {
+                std::str::from_utf8_unchecked(bytes)
+            }))
+        };
+        let mut result = Self {
+            empty: contains(b""),
+            singles: [0; 2],
+            pairs: [0; 256],
+        };
+        for first in 0..128usize {
+            if contains(&[first as u8]) {
+                result.singles[first >> 6] |= 1u64 << (first & 63);
+            }
+            for second in 0..128usize {
+                let offset = first * 128 + second;
+                if contains(&[first as u8, second as u8]) {
+                    result.pairs[offset >> 6] |= 1u64 << (offset & 63);
+                }
+            }
+        }
+        result
+    }
+
+    #[inline]
+    fn contains(&self, bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            [] => Some(self.empty),
+            [first] if *first < 128 => {
+                Some(self.singles[usize::from(*first) >> 6] & (1u64 << (*first & 63)) != 0)
+            }
+            [first, second] if *first < 128 && *second < 128 => {
+                let offset = usize::from(*first) * 128 + usize::from(*second);
+                Some(self.pairs[offset >> 6] & (1u64 << (offset & 63)) != 0)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -344,7 +412,43 @@ impl DecodedPredicateProgram {
     pub(crate) fn compile(expr: &Expr, schema: &TableSchema) -> Option<Self> {
         let mut leaves = Vec::new();
         let root = compile_decoded_predicate_node(expr, schema, &mut leaves)?;
+        // Numeric-only predicates already have a compact typed evaluator.
+        // Borrowed decoding is useful when a text leaf shares that pass.
+        if leaves
+            .iter()
+            .any(|leaf| matches!(leaf, DecodedPredicateLeaf::NumericCmp { .. }))
+            && !leaves.iter().any(|leaf| {
+                matches!(
+                    leaf,
+                    DecodedPredicateLeaf::StringCmp { .. }
+                        | DecodedPredicateLeaf::StringLike { .. }
+                        | DecodedPredicateLeaf::SubstringIn { .. }
+                )
+            })
+        {
+            return None;
+        }
         Some(Self { root, leaves })
+    }
+
+    /// Amortize a bounded collation lookup table only on large scans. All
+    /// workers share the immutable table; short scans keep the hashed oracle.
+    pub(in crate::engine::executor::select) fn prepare_for_scan(&mut self, access_rows: f64) {
+        const ASCII_DOMAIN: usize = 1 + 128 + 128 * 128;
+        if access_rows < (ASCII_DOMAIN * 8) as f64 {
+            return;
+        }
+        for leaf in &mut self.leaves {
+            if let DecodedPredicateLeaf::SubstringIn {
+                keys,
+                ascii_short,
+                len: Some(1 | 2),
+                ..
+            } = leaf
+            {
+                *ascii_short = Some(Arc::new(AsciiShortStringSet::compile(keys)));
+            }
+        }
     }
 
     #[inline]
@@ -353,15 +457,18 @@ impl DecodedPredicateProgram {
     }
 
     /// Whether evaluating this program while the row payload is borrowed
-    /// avoids constructing an owned string for a LIKE pattern.  This is a
+    /// avoids constructing an owned string for a LIKE or substring predicate. This is a
     /// materially different cost shape from fixed-width/date comparisons:
     /// the latter are usually cheaper in the common batch filter when most
-    /// rows survive, while LIKE benefits from matching the borrowed bytes
+    /// rows survive, while text kernels benefit from matching the borrowed bytes
     /// even at a high selectivity.
-    pub(in crate::engine::executor::select) fn has_string_like(&self) -> bool {
-        self.leaves
-            .iter()
-            .any(|leaf| matches!(leaf, DecodedPredicateLeaf::StringLike { .. }))
+    pub(in crate::engine::executor::select) fn has_borrowed_string_predicate(&self) -> bool {
+        self.leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                DecodedPredicateLeaf::StringLike { .. } | DecodedPredicateLeaf::SubstringIn { .. }
+            )
+        })
     }
 
     /// Consume a UTF-8 value while the heap page is pinned. Every predicate
@@ -392,6 +499,30 @@ impl DecodedPredicateProgram {
         let mut consumed = false;
         for (index, leaf) in self.leaves.iter().enumerate() {
             let truth = match leaf {
+                DecodedPredicateLeaf::SubstringIn {
+                    column: leaf_column,
+                    start,
+                    len,
+                    keys,
+                    ascii_short,
+                    has_null,
+                    negated,
+                } if *leaf_column == column => {
+                    let value = crate::engine::expr::mysql_substring_slice(value, *start, *len);
+                    let found = ascii_short
+                        .as_ref()
+                        .and_then(|set| set.contains(value.as_bytes()))
+                        .unwrap_or_else(|| {
+                            keys.contains(&crate::engine::expr::ValueKey::string_from_str(value))
+                        });
+                    if found {
+                        DecodedTruth::from_bool(!*negated)
+                    } else if *has_null {
+                        DecodedTruth::Unknown
+                    } else {
+                        DecodedTruth::from_bool(*negated)
+                    }
+                }
                 DecodedPredicateLeaf::StringCmp {
                     column: leaf_column,
                     op,
@@ -461,6 +592,22 @@ impl DecodedPredicateProgram {
         let mut consumed = false;
         for (index, leaf) in self.leaves.iter().enumerate() {
             let truth = match leaf {
+                DecodedPredicateLeaf::NumericCmp {
+                    column: leaf_column,
+                    op,
+                    value,
+                    ..
+                } if *leaf_column == column => {
+                    if matches!(op, BinaryOp::NullSafeEq) {
+                        DecodedTruth::from_bool(matches!(value.value, Value::Null))
+                    } else {
+                        DecodedTruth::Unknown
+                    }
+                }
+                DecodedPredicateLeaf::SubstringIn {
+                    column: leaf_column,
+                    ..
+                } if *leaf_column == column => DecodedTruth::Unknown,
                 DecodedPredicateLeaf::StringCmp {
                     column: leaf_column,
                     op,
@@ -492,6 +639,51 @@ impl DecodedPredicateProgram {
     pub(crate) fn finish(&self, results: &[Option<DecodedTruth>]) -> Option<bool> {
         eval_decoded_predicate_node(&self.root, results)
             .map(|truth| matches!(truth, DecodedTruth::True))
+    }
+
+    pub(crate) fn put_numeric(
+        &self,
+        column: usize,
+        input: crate::engine::executor::vec::scan_bridge::PredicateValue,
+        results: &mut [Option<DecodedTruth>],
+    ) -> bool {
+        let mut consumed = false;
+        for (index, leaf) in self.leaves.iter().enumerate() {
+            let DecodedPredicateLeaf::NumericCmp {
+                column: leaf_column,
+                op,
+                value,
+                flipped,
+            } = leaf
+            else {
+                continue;
+            };
+            if *leaf_column != column {
+                continue;
+            }
+            let truth = if matches!(value.value, Value::Null) {
+                if matches!(op, BinaryOp::NullSafeEq) {
+                    DecodedTruth::False
+                } else {
+                    DecodedTruth::Unknown
+                }
+            } else {
+                let Ok(Some(ordering)) = fast_compare_typed_const(&input, value) else {
+                    return false;
+                };
+                DecodedTruth::from_bool(compare_ordering(
+                    *op,
+                    if *flipped {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    },
+                ))
+            };
+            results[index] = Some(truth);
+            consumed = true;
+        }
+        consumed
     }
 }
 
@@ -590,7 +782,27 @@ pub(super) fn compile_decoded_predicate_node(
             compile_decoded_predicate_node(expr, schema, leaves)?,
         ))),
         Expr::Binary { left, op, right } if crate::parser::boolean::is_comparison!(*op) => {
-            compile_decoded_string_comparison(left, *op, right, schema, leaves)
+            if let Some(node) = compile_decoded_string_comparison(left, *op, right, schema, leaves)
+            {
+                return Some(node);
+            }
+            let PredicateNode::Cmp {
+                col,
+                op,
+                value,
+                flipped,
+            } = compile_predicate_node(expr, schema)?
+            else {
+                return None;
+            };
+            let index = leaves.len();
+            leaves.push(DecodedPredicateLeaf::NumericCmp {
+                column: col,
+                op,
+                value,
+                flipped,
+            });
+            Some(DecodedPredicateNode::Leaf(index))
         }
         Expr::Between {
             expr,
@@ -609,16 +821,35 @@ pub(super) fn compile_decoded_predicate_node(
             })
         }
         Expr::InList {
-            expr,
+            expr: tested,
             list,
             negated,
         } => {
+            let input = InputSchema::from_table(schema);
+            if let Ok(program) = ExprCompiler::compile(expr, &input) {
+                if let Some((column, start, len, keys, has_null, negated)) =
+                    program.as_substring_column_string_in_const_set()
+                {
+                    simple_string_predicate_column(schema, column)?;
+                    let index = leaves.len();
+                    leaves.push(DecodedPredicateLeaf::SubstringIn {
+                        column,
+                        start,
+                        len,
+                        keys: keys.clone(),
+                        ascii_short: None,
+                        has_null,
+                        negated,
+                    });
+                    return Some(DecodedPredicateNode::Leaf(index));
+                }
+            }
             let mut items = Vec::with_capacity(list.len());
             for item in list {
                 items.push(if matches!(const_expr_value(item), Some(Value::Null)) {
                     DecodedPredicateNode::Const(DecodedTruth::Unknown)
                 } else {
-                    compile_decoded_string_comparison(expr, BinaryOp::Eq, item, schema, leaves)?
+                    compile_decoded_string_comparison(tested, BinaryOp::Eq, item, schema, leaves)?
                 });
             }
             // OR is associative under three-valued logic and both sides are
@@ -1872,4 +2103,42 @@ pub(in crate::engine::executor::select) fn should_use_predicate_first_projected_
     output_columns
         .iter()
         .any(|col| !predicate_columns.contains(col))
+}
+
+#[cfg(test)]
+mod ascii_short_tests {
+    use super::*;
+
+    #[test]
+    fn short_ascii_membership_exhaustively_matches_collation_oracle() {
+        for literals in [
+            vec![],
+            vec!["", "A", "13", "é"],
+            vec!["ab", "a ", "中", "\0"],
+        ] {
+            let keys = literals
+                .into_iter()
+                .map(crate::engine::expr::ValueKey::string_from_str)
+                .collect();
+            let set = AsciiShortStringSet::compile(&keys);
+            let check = |bytes: &[u8]| {
+                let value = std::str::from_utf8(bytes).unwrap();
+                assert_eq!(
+                    set.contains(bytes),
+                    Some(keys.contains(&crate::engine::expr::ValueKey::string_from_str(value))),
+                    "{bytes:?}"
+                );
+            };
+            check(b"");
+            for first in 0..128u8 {
+                check(&[first]);
+                for second in 0..128u8 {
+                    check(&[first, second]);
+                }
+            }
+            assert_eq!(set.contains("é".as_bytes()), None);
+            assert_eq!(set.contains(b"abc"), None);
+            assert_eq!(set.contains(&[255]), None);
+        }
+    }
 }

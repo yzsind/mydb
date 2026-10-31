@@ -32,6 +32,7 @@ use crate::engine::json::JsonPath;
 use crate::types::QueryError;
 
 pub(crate) const REGEX_CACHE_CAPACITY: usize = 128;
+pub(crate) const GTID_SET_CACHE_CAPACITY: usize = 128;
 pub(crate) const JSON_PATH_CACHE_CAPACITY: usize = 512;
 pub(crate) const JSON_SCHEMA_CACHE_CAPACITY: usize = 64;
 /// B9: `col LIKE ?` under prepared / auto-param patterns re-classifies
@@ -41,6 +42,8 @@ pub(crate) const JSON_SCHEMA_CACHE_CAPACITY: usize = 64;
 pub(crate) const LIKE_PLAN_CACHE_CAPACITY: usize = 128;
 
 static REGEX_HITS: AtomicU64 = AtomicU64::new(0);
+static GTID_SET_HITS: AtomicU64 = AtomicU64::new(0);
+static GTID_SET_MISSES: AtomicU64 = AtomicU64::new(0);
 static TZ_HITS: AtomicU64 = AtomicU64::new(0);
 static TZ_MISSES: AtomicU64 = AtomicU64::new(0);
 static REGEX_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -110,6 +113,8 @@ fn borrowed_hash(value: impl Hash) -> u64 {
 }
 
 thread_local! {
+    static GTID_SET_CACHE: RefCell<LruCache<String, Arc<Governed<crate::engine::expr::GtidSet>>, ahash::RandomState>> =
+        RefCell::new(LruCache::with_hasher(NonZeroUsize::new(GTID_SET_CACHE_CAPACITY).unwrap(),ahash::RandomState::new()));
     static REGEX_CACHE: RefCell<LruCache<u64, Vec<RegexCacheEntry>, ahash::RandomState>> =
         RefCell::new(LruCache::with_hasher(
             NonZeroUsize::new(REGEX_CACHE_CAPACITY).unwrap(),
@@ -136,6 +141,39 @@ thread_local! {
         NonZeroUsize::new(JSON_SCHEMA_CACHE_CAPACITY).unwrap(),
         ahash::RandomState::new(),
     ));
+}
+
+/// GTID set arithmetic is independent of replication/session state. Cache
+/// successful parses by exact source text, with bounded governed ownership.
+pub(crate) fn cached_gtid_set(
+    text: &str,
+) -> Result<Arc<Governed<crate::engine::expr::GtidSet>>, QueryError> {
+    GTID_SET_CACHE.with(|cache| {
+        if let Some(value) = cache.borrow_mut().get(text) {
+            GTID_SET_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::clone(value));
+        }
+        GTID_SET_MISSES.fetch_add(1, Ordering::Relaxed);
+        let parsed = crate::engine::expr::parse_gtid_set_uncached(text)?;
+        let bytes = parsed.iter().fold(
+            512usize.saturating_add(text.len()),
+            |bytes, (uuid, intervals)| {
+                bytes
+                    .saturating_add(1024)
+                    .saturating_add(uuid.capacity())
+                    .saturating_add(
+                        intervals
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(u64, u64)>()),
+                    )
+            },
+        );
+        let value = Arc::new(Governed::new(parsed, bytes));
+        if value.admitted() {
+            cache.borrow_mut().put(text.to_owned(), Arc::clone(&value));
+        }
+        Ok(value)
+    })
 }
 
 /// Compile (or fetch) a MySQL-flavoured regex. `match_type` is the raw
@@ -368,6 +406,10 @@ pub(crate) fn cached_json_schema(
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FuncCacheStats {
+    pub(crate) gtid_set_hits: u64,
+    pub(crate) gtid_set_misses: u64,
+    pub(crate) gtid_set_entries: u64,
+    pub(crate) gtid_set_bytes: u64,
     pub(crate) regex_hits: u64,
     pub(crate) regex_misses: u64,
     pub(crate) json_path_hits: u64,
@@ -401,6 +443,17 @@ pub(crate) fn note_tz_miss() {
 }
 
 pub(crate) fn stats() -> FuncCacheStats {
+    let (gtid_set_entries, gtid_set_bytes) = GTID_SET_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .fold((0u64, 0u64), |(entries, bytes), (_, value)| {
+                (
+                    entries + 1,
+                    bytes.saturating_add(value.charged_bytes() as u64),
+                )
+            })
+    });
     let (regex_entries, regex_bytes) = REGEX_CACHE.with(|cache| {
         cache
             .borrow()
@@ -450,6 +503,10 @@ pub(crate) fn stats() -> FuncCacheStats {
             })
     });
     FuncCacheStats {
+        gtid_set_hits: GTID_SET_HITS.load(Ordering::Relaxed),
+        gtid_set_misses: GTID_SET_MISSES.load(Ordering::Relaxed),
+        gtid_set_entries,
+        gtid_set_bytes,
         regex_hits: REGEX_HITS.load(Ordering::Relaxed),
         regex_misses: REGEX_MISSES.load(Ordering::Relaxed),
         json_path_hits: JSON_PATH_HITS.load(Ordering::Relaxed),
@@ -474,6 +531,29 @@ pub(crate) fn stats() -> FuncCacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gtid_parse_cache_keeps_validation_and_bounded_governed_entries() {
+        let text = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3:2-8";
+        let first = cached_gtid_set(text).unwrap();
+        let second = cached_gtid_set(text).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            &**first,
+            &crate::engine::expr::parse_gtid_set_uncached(text).unwrap()
+        );
+        for text in [
+            "invalid",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:3-1",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:0",
+        ] {
+            assert!(cached_gtid_set(text).is_err());
+        }
+        for end in 1..=GTID_SET_CACHE_CAPACITY * 2 {
+            cached_gtid_set(&format!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:1-{end}")).unwrap();
+        }
+        assert!(stats().gtid_set_entries <= GTID_SET_CACHE_CAPACITY as u64);
+    }
 
     #[test]
     fn cache_audit_hash_collisions_replace_instead_of_growing() {

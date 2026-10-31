@@ -28,7 +28,7 @@ mod path;
 mod tests;
 
 pub(crate) use compare::{compare, compare_nodes};
-pub(crate) use jsonb::{build_array, build_object, JsonType, JsonbRef};
+pub(crate) use jsonb::{build_array, build_object, ArrayIter, JsonType, JsonbRef, ObjectIter};
 pub(crate) use path::{ConcreteLeg, JsonPath};
 
 use crate::types::QueryError;
@@ -289,20 +289,24 @@ pub(crate) fn to_pretty(jsonb: &[u8]) -> String {
 /// coercion used when a JSON document flows into a character column or the
 /// `->>` operator.
 pub(crate) fn unquote_text(jsonb: &[u8]) -> String {
-    match JsonbRef::new(jsonb) {
-        Ok(r) if r.opaque_value().is_some() => {
-            let (ty, bytes) = r.opaque_value().expect("checked opaque value");
-            opaque_text(ty, bytes)
+    let mut out = String::new();
+    if let Ok(node) = JsonbRef::new(jsonb) {
+        if let Some((ty, bytes)) = node.opaque_value() {
+            return opaque_text(ty, bytes);
         }
-        Ok(r) => match r.as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                let mut out = String::new();
-                r.write_text(&mut out);
-                out
-            }
-        },
-        Err(_) => String::new(),
+        append_unquoted(node, &mut out);
+    }
+    out
+}
+
+/// Append the same unquoted representation into an owning column buffer.
+pub(crate) fn append_unquoted(node: JsonbRef<'_>, out: &mut String) {
+    if let Some((ty, bytes)) = node.opaque_value() {
+        out.push_str(&opaque_text(ty, bytes));
+    } else if let Some(text) = node.as_str() {
+        out.push_str(text);
+    } else {
+        node.write_text(out);
     }
 }
 
@@ -496,4 +500,132 @@ pub(crate) fn opaque_text(ty: u8, bytes: &[u8]) -> String {
         text.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
     }
     text
+}
+
+/// Append a JSON string node without constructing a temporary DOM/value.
+pub(crate) fn append_string_node(text: &str, output: &mut Vec<u8>) {
+    jsonb::write_text_scalar(jsonb::T_STRING, text, output);
+}
+
+/// JSON_KEYS has depth at most two and borrows every key from the document.
+pub(crate) fn append_object_keys(node: JsonbRef<'_>, output: &mut Vec<u8>) -> Option<()> {
+    if !node.is_object() {
+        return None;
+    }
+    let (mut count, mut bytes) = (0usize, 0usize);
+    for (key, _) in node.object_iter() {
+        count = count.checked_add(1)?;
+        bytes = bytes
+            .checked_add(1 + uvarint_len(key.len() as u64))?
+            .checked_add(key.len())?;
+    }
+    let payload = bytes.checked_add(uvarint_len(count as u64))?;
+    output.push(jsonb::T_ARRAY);
+    write_uvarint(output, payload as u64);
+    write_uvarint(output, count as u64);
+    for (key, _) in node.object_iter() {
+        append_string_node(key, output);
+    }
+    Some(())
+}
+
+/// Scalar JSON producers can borrow primitive SQL columns. Booleans and
+/// source-sensitive binary/ENUM/SET/temporal conversions stay with the oracle.
+#[derive(Clone, Copy)]
+pub(crate) enum Primitive<'a> {
+    Null,
+    Int(i64),
+    UInt(u64),
+    Text(&'a str),
+}
+impl Primitive<'_> {
+    pub(crate) fn encoded_len(self) -> usize {
+        match self {
+            Self::Null => 1,
+            Self::Int(_) | Self::UInt(_) => 9,
+            Self::Text(s) => 1 + uvarint_len(s.len() as u64) + s.len(),
+        }
+    }
+    fn append(self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.push(jsonb::T_NULL),
+            Self::Int(n) => {
+                out.push(jsonb::T_I64);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::UInt(n) => {
+                out.push(if n <= i64::MAX as u64 {
+                    jsonb::T_I64
+                } else {
+                    jsonb::T_U64
+                });
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::Text(s) => append_string_node(s, out),
+        }
+    }
+}
+
+pub(crate) fn append_primitive_array(values: &[Primitive<'_>], out: &mut Vec<u8>) -> Option<()> {
+    let payload = values
+        .iter()
+        .try_fold(uvarint_len(values.len() as u64), |sum, value| {
+            sum.checked_add(value.encoded_len())
+        })?;
+    out.push(jsonb::T_ARRAY);
+    write_uvarint(out, payload as u64);
+    write_uvarint(out, values.len() as u64);
+    for value in values {
+        value.append(out);
+    }
+    Some(())
+}
+
+/// Keys are unique and in canonical `(len, bytes)` order at binding time.
+pub(crate) fn append_primitive_object(
+    values: &[(&str, Primitive<'_>)],
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let payload =
+        values
+            .iter()
+            .try_fold(uvarint_len(values.len() as u64), |sum, (key, value)| {
+                sum.checked_add(uvarint_len(key.len() as u64))?
+                    .checked_add(key.len())?
+                    .checked_add(value.encoded_len())
+            })?;
+    out.push(jsonb::T_OBJECT);
+    write_uvarint(out, payload as u64);
+    write_uvarint(out, values.len() as u64);
+    for (key, value) in values {
+        write_uvarint(out, key.len() as u64);
+        out.extend_from_slice(key.as_bytes());
+        value.append(out);
+    }
+    Some(())
+}
+
+/// Concatenate borrowed nodes without allocating an owned buffer per match.
+pub(crate) fn append_borrowed_array(
+    values: &[JsonbRef<'_>],
+    out: &mut Vec<u8>,
+) -> Result<(), QueryError> {
+    let payload = values
+        .iter()
+        .try_fold(uvarint_len(values.len() as u64), |n, v| {
+            n.checked_add(v.as_bytes().len())
+        })
+        .ok_or_else(|| {
+            json_err(
+                crate::error::catalog::ER_JSON_VALUE_TOO_BIG,
+                "JSON value is too large",
+            )
+        })?;
+    out.push(jsonb::T_ARRAY);
+    write_uvarint(out, payload as u64);
+    write_uvarint(out, values.len() as u64);
+    for value in values {
+        out.extend_from_slice(value.as_bytes());
+    }
+    Ok(())
 }

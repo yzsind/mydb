@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/masking-keyring.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/masking-keyring.json"
+));
 
 function_fixture_test!(keyring_key_fetch, "KEYRING_KEY_FETCH", FIXTURE);
 function_fixture_test!(keyring_key_generate, "KEYRING_KEY_GENERATE", FIXTURE);

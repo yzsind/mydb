@@ -587,7 +587,19 @@ impl PlanStreamCursor {
                                     ) && computed.get(index).and_then(Option::as_ref).is_none()
                                 });
                         let mut row_values = Vec::with_capacity(batch.columns().len());
+                        let mut projected_rows = 0usize;
+                        // Scalar evaluation may do unbounded work per row;
+                        // precomputed columns only copy a byte-bounded batch.
+                        let cancellation_mask = if input.row_major_projection {
+                            crate::engine::cancel::SCALAR_ROW_CANCEL_MASK
+                        } else {
+                            1023
+                        };
                         let mut emit = |row: usize| -> Result<bool, QueryError> {
+                            if projected_rows & cancellation_mask == 0 {
+                                crate::engine::cancel::check_cancelled()?;
+                            }
+                            projected_rows += 1;
                             let projected = if input.row_major_projection {
                                 if needs_row {
                                     row_values.clear();

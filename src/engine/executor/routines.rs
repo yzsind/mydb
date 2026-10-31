@@ -4441,6 +4441,13 @@ fn bind_expr_locals(expr: &mut Expr, locals: &HashMap<String, Value>) -> Result<
             if let Some(value) = locals.get(&key).cloned() {
                 check_trigger_column(&key, crate::engine::auth::Privilege::Select)?;
                 *expr = Expr::BoundValue(value);
+            } else if trigger_row_avail().is_some()
+                && (parts[0].eq_ignore_ascii_case("OLD") || parts[0].eq_ignore_ascii_case("NEW"))
+            {
+                return Err(error(
+                    crate::error::catalog::ER_BAD_FIELD_ERROR,
+                    format!("Unknown column '{}' in '{} row'", parts[1], parts[0]),
+                ));
             }
         }
         Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {

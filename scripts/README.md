@@ -29,6 +29,7 @@ optional dependencies.
 | Client tooling compatibility | `run_client_compat_matrix.sh`; see [client examples](../examples/README.md) |
 | MySQL 8.0 capture, diff, and generated catalogs | `capture_mysql80_*.py`, `mysql80_*_diff.*`, `generate_mysql80_*.py` |
 | Function and collation coverage | `check_function_test_coverage.py`, `generate_legacy_general_weights.py`, `generate_uca9_weights.py` |
+| Function/expression performance comparison | `function_expression_bench.py`, `function_expression_report.py`; see [design and execution notes](../docs-internal/function-expression-benchmark-design.md) |
 | Storage format documentation, MTR import, and TSAN | `render_storage_format_versions.sh`, `mtr_import.sh`, `run_tsan_btree.sh` |
 | SQL oracle inputs and result checks | `tpch/`, `tpcds/`, `clickbench/`, `*_check_results.py`, `clickbench_results.py` |
 
@@ -58,6 +59,7 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp/mydb python3 scripts/test_script_maintenan
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_linux_compat.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_elf_abi.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_function_expression_bench.py
 python3 scripts/check_function_test_coverage.py --check
 python3 scripts/generate_mysql80_information_schema_rust.py --check
 python3 scripts/generate_mysql80_performance_schema_rust.py --check

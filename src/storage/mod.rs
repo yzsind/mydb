@@ -1,14 +1,19 @@
 pub(crate) mod capture;
 pub(crate) mod catalog;
+pub(crate) mod control;
 mod core;
+pub(crate) use core::take_buffered_txn_begin;
 pub(crate) mod data_dictionary;
 pub(crate) mod dir_lock;
 pub(crate) mod file_generation;
+#[cfg(test)]
+pub(crate) mod format_golden;
 pub mod format_versions;
 pub(crate) mod fulltext;
 pub mod image;
 pub(crate) mod image_io;
 pub(crate) mod mdl;
+pub(crate) mod metadata;
 pub mod naming;
 pub mod partitioning;
 pub(crate) mod read_schema;
@@ -17,6 +22,8 @@ pub(crate) mod schema;
 pub(crate) mod sequence;
 pub(crate) mod snapshot;
 mod stats;
+mod stats_codec;
+mod stats_store;
 pub(crate) mod temp_quota;
 mod temporal;
 pub mod vector_config;
@@ -34,7 +41,6 @@ pub(crate) fn fuzz_decode_row(bytes: &[u8]) {
 }
 pub mod wait_events;
 
-pub(crate) use core::backup_page_valid;
 #[cfg(test)]
 pub(crate) use core::commit_visibility_test_hook;
 pub(crate) use core::default_buffer_pool_bytes;
@@ -52,6 +58,7 @@ pub(crate) use core::ExactIndexVisibility;
 pub(crate) use core::VECTOR_BUILD_BEFORE_PUBLISH_HOOK;
 #[cfg(test)]
 pub(crate) use core::VECTOR_CHECKPOINT_AFTER_CAPTURE_HOOK;
+pub(crate) use core::{backup_page_valid, heap_is_empty_allocation_file};
 pub(crate) use core::{
     canonicalize_loaded_timestamp_value, coerce_routine_typed_value, ignorable_update_error,
     with_enum_field_copy_coercion, LoadDataIndexBuilders, LoadDataIndexKeyBatch,
@@ -87,6 +94,7 @@ pub(crate) use core::{
 // ENUM/SET on-disk width helpers — single source of truth (see the
 // `set_storage_width` / `enum_storage_width` doc comments in row_codec).
 pub(crate) use core::CatalogTxnBatchGuard;
+pub use core::RowCodecSpec;
 pub(crate) use core::{enum_storage_width, set_storage_width};
 pub use core::{
     error, DataLockRow, DataLockWaitRow, Database, DurabilityMode, IndexBuildOptions,
@@ -168,3 +176,15 @@ pub use value::value_to_string;
 pub(crate) use txn::with_durability_sync_failure;
 
 pub(crate) use value::is_numeric_value;
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode_storage_formats(bytes: &[u8]) {
+    let _ = control::Control::decode(bytes);
+    let _ = undo::decode_undo_record(bytes);
+    let _ = undo::decode_undo_record_metadata(bytes);
+    undo::fuzz_decode_framing(bytes);
+    data_dictionary::fuzz_decode_dictionary(bytes);
+    let _ = serde_json::from_slice::<RowCodecSpec>(bytes);
+    let _ = metadata::decode::<serde_json::Value>(metadata::PROGRESS, 1, bytes);
+    core::fuzz_validate_storage_pages(bytes);
+}

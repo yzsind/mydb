@@ -483,6 +483,15 @@ impl Applier {
         if !force_persist && self.last_progress_persist_at.elapsed() < PROGRESS_PERSIST_INTERVAL {
             return Ok(());
         }
+        if let Some(db) = &self.db {
+            if self.applied_lsn > self.progress.durable_applied_lsn {
+                crate::wal::LogManager::sync_durable_to(&self.log, self.applied_lsn)?;
+                self.progress.durable_lsn = self.progress.durable_lsn.max(self.applied_lsn);
+                self.progress.durable_applied_lsn = self.applied_lsn;
+            }
+            self.progress.statistics =
+                Some(Arc::new(db.replica_statistics_snapshot(self.applied_lsn)?));
+        }
         save_progress(&self.data_dir, &self.progress).map_err(|err| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,

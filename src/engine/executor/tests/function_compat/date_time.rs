@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/date-time.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/date-time.json"
+));
 
 function_fixture_test!(adddate, "ADDDATE", FIXTURE);
 function_fixture_test!(addtime, "ADDTIME", FIXTURE);

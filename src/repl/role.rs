@@ -49,7 +49,6 @@ impl Role {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoleState {
-    #[serde(default = "metadata_version")]
     pub metadata_version: u32,
     pub role: Role,
     pub node_uuid: String,
@@ -81,10 +80,6 @@ pub struct WriteFence {
     pub token: String,
     pub fence_lsn: u64,
     pub created_at_ms: u64,
-}
-
-const fn metadata_version() -> u32 {
-    REPLICATION_METADATA_VERSION
 }
 
 impl RoleState {
@@ -144,7 +139,11 @@ pub fn load(data_dir: impl AsRef<Path>) -> IoResult<Option<RoleState>> {
         return Ok(None);
     }
     let bytes = fs::read(&path)?;
-    let state: RoleState = match serde_json::from_slice(&bytes) {
+    let state: RoleState = match crate::storage::metadata::decode(
+        crate::storage::metadata::ROLE,
+        REPLICATION_METADATA_VERSION as u16,
+        &bytes,
+    ) {
         Ok(state) => state,
         Err(err) => {
             if std::env::var("MYDB_REPAIR_ROLE").as_deref() != Ok("replica") {
@@ -172,6 +171,15 @@ pub fn load(data_dir: impl AsRef<Path>) -> IoResult<Option<RoleState>> {
             state
         }
     };
+    if state.metadata_version != REPLICATION_METADATA_VERSION {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "replication metadata version {} is incompatible with version {}",
+                state.metadata_version, REPLICATION_METADATA_VERSION
+            ),
+        ));
+    }
     Ok(Some(state))
 }
 
@@ -181,8 +189,12 @@ pub fn save(data_dir: impl AsRef<Path>, state: &RoleState) -> IoResult<()> {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("role.json: {e}")))?;
+    let bytes = crate::storage::metadata::encode(
+        crate::storage::metadata::ROLE,
+        REPLICATION_METADATA_VERSION as u16,
+        state,
+    )
+    .map_err(|e| Error::new(ErrorKind::Other, format!("role.json: {e}")))?;
     // Crash-safe: fsync tmp + parent dir so a promote/demote can't
     // silently roll back on power loss (half-promoted role).
     crate::repl::durable::atomic_write_sync(&path, &tmp, &bytes)?;

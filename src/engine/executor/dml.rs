@@ -1231,9 +1231,11 @@ pub(super) fn execute_prepared_point_update(
         return Err(crate::error::catalog::ER_UNKNOWN_ERROR
             .error("internal error: UPDATE received non-update prepared point plan"));
     };
-    if let Some(selection) = &stmt.selection {
-        crate::engine::expr::validate_expr_temporal_literals(selection, &point.table)?;
-        crate::engine::expr::validate_dml_temporal_functions(selection)?;
+    if point.needs_temporal_validation {
+        if let Some(selection) = &stmt.selection {
+            crate::engine::expr::validate_expr_temporal_literals(selection, &point.table)?;
+            crate::engine::expr::validate_dml_temporal_functions(selection)?;
+        }
     }
     let row_id = db.lookup_unique_index_for_write_one(
         txn,
@@ -1717,9 +1719,11 @@ pub(super) fn execute_prepared_point_delete(
         return Err(crate::error::catalog::ER_UNKNOWN_ERROR
             .error("internal error: DELETE received non-delete prepared point plan"));
     }
-    if let Some(selection) = &stmt.selection {
-        crate::engine::expr::validate_expr_temporal_literals(selection, &point.table)?;
-        crate::engine::expr::validate_dml_temporal_functions(selection)?;
+    if point.needs_temporal_validation {
+        if let Some(selection) = &stmt.selection {
+            crate::engine::expr::validate_expr_temporal_literals(selection, &point.table)?;
+            crate::engine::expr::validate_dml_temporal_functions(selection)?;
+        }
     }
     let resolved_key = point.key.resolve_params()?;
     // DELETE is not a useful cache consumer in the common OLTP shape: its

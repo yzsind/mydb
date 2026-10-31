@@ -596,6 +596,7 @@ fn decimal_fact_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         fk_referenced_by: Vec::new(),
         stats: TableStats {
+            analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count: 0,
             heap_page_count: 0,
@@ -658,6 +659,92 @@ fn decoded_predicate_resolves_collation_once_and_handles_boolean_tree() {
     results.fill(None);
     assert!(!predicate.put_string(0, b"\xff", &mut results));
     assert_eq!(predicate.finish(&results), None);
+}
+
+#[test]
+fn decoded_substring_in_mixed_decimal_matches_scalar_three_valued_oracle() {
+    use crate::engine::executor::vec::scan_bridge::PredicateValue;
+    let mut schema = decimal_fact_schema();
+    schema.columns = vec![
+        col("s", DataTypeKind::VarChar { len: Some(120) }, 0),
+        col(
+            "n",
+            DataTypeKind::Decimal {
+                precision: Some(18),
+                scale: Some(2),
+            },
+            1,
+        ),
+    ];
+    schema.build_column_index();
+    for call in [
+        "SUBSTRING(s,1,2)",
+        "SUBSTR(s,-2,2)",
+        "SUBSTRING(s,0,2)",
+        "SUBSTRING(s,1,0)",
+        "SUBSTRING(s,-99,4)",
+        "SUBSTRING(s,2)",
+    ] {
+        for negated in ["", "NOT"] {
+            for null in ["", ", NULL"] {
+                let member = format!("{call} {negated} IN ('13','a ','中🙂','x'{null})");
+                for sql in [
+                    format!("n > 0.00 AND {member}"),
+                    format!("NOT (n <= 0.00 OR {member})"),
+                ] {
+                    let Statement::Select(select) =
+                        crate::parser::parse_statement(&format!("SELECT * FROM fact WHERE {sql}"))
+                            .unwrap()
+                    else {
+                        panic!("SELECT expected")
+                    };
+                    let mut expr = select.selection.unwrap();
+                    crate::engine::expr::fold_constant_subexprs(&mut expr);
+                    let mut decoded = DecodedPredicateProgram::compile(&expr, &schema)
+                        .unwrap_or_else(|| panic!("mixed borrowed predicate: {sql}"));
+                    decoded.prepare_for_scan(1_000_000.0);
+                    let scalar = CompiledPredicate::compile(&expr, &schema).unwrap();
+                    for text in [
+                        None,
+                        Some(""),
+                        Some("13-x"),
+                        Some("A "),
+                        Some("a"),
+                        Some("中🙂尾"),
+                        Some("xx中🙂"),
+                        Some("e\u{301}"),
+                    ] {
+                        for number in [None, Some(-1), Some(0), Some(123)] {
+                            let mut results = vec![None; decoded.leaf_count()];
+                            let s = if let Some(text) = text {
+                                assert!(decoded.put_string(0, text.as_bytes(), &mut results));
+                                Value::String(text.into())
+                            } else {
+                                assert!(decoded.put_null(0, &mut results));
+                                Value::Null
+                            };
+                            let n = if let Some(number) = number {
+                                assert!(decoded.put_numeric(
+                                    1,
+                                    PredicateValue::Decimal(number, 2),
+                                    &mut results
+                                ));
+                                Value::DecimalCompact(number as i64, 2)
+                            } else {
+                                assert!(decoded.put_null(1, &mut results));
+                                Value::Null
+                            };
+                            assert_eq!(
+                                decoded.finish(&results),
+                                Some(scalar.eval(&[s, n]).unwrap()),
+                                "{sql}, text={text:?}, number={number:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1545,6 +1632,7 @@ fn compiled_predicate_handles_expression_in_const_set() {
         foreign_keys: Vec::new(),
         fk_referenced_by: Vec::new(),
         stats: TableStats {
+            analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count: 0,
             heap_page_count: 0,

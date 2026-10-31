@@ -51,7 +51,7 @@ struct OnDiskMeta {
     host: String,
 }
 
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = crate::storage::format_versions::PERSISTED_SYSVARS_VERSION;
 const FILE_NAME: &str = "mysqld-auto.cnf";
 
 #[derive(Debug, Clone)]

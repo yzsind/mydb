@@ -137,7 +137,7 @@ const WAL_MAGIC: &[u8; 8] = b"MYDBWAL1";
 // with exact base LSN/CRC and after-image CRC, anchored by retained FPIs.
 use crate::storage::format_versions::WAL_VERSION;
 const WAL_RECORD_MAGIC: u32 = 0x4d_57_41_4c;
-pub(crate) const WAL_HEADER_LEN: usize = 8 + 4 + 8 + 8 + 8 + 4;
+pub(crate) const WAL_HEADER_LEN: usize = 64;
 pub(crate) const WAL_FRAME_HEADER_LEN: usize = 48;
 
 #[cfg(test)]
@@ -948,6 +948,7 @@ impl ArchiveManager {
 /// path still re-checks under the WAL/checkpoint locks.
 #[derive(Debug, Default)]
 pub struct LogStateAtomics {
+    pub(crate) transaction_buffer_owner: AtomicU64,
     pub next_lsn: AtomicU64,
     durable_lsn: AtomicU64,
     physical_replica: std::sync::atomic::AtomicBool,
@@ -956,6 +957,10 @@ pub struct LogStateAtomics {
 }
 
 impl LogStateAtomics {
+    pub(crate) fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.load(Ordering::Acquire)
+    }
+
     pub(crate) fn physical_replica(&self) -> bool {
         self.physical_replica.load(Ordering::Acquire)
     }
@@ -1046,6 +1051,140 @@ fn wal_segment_prep_enabled() -> bool {
     )
 }
 
+#[derive(Debug, Default)]
+struct WalWriterWake {
+    thread: std::sync::OnceLock<std::thread::Thread>,
+    pending: std::sync::atomic::AtomicBool,
+    stopping: std::sync::atomic::AtomicBool,
+}
+
+impl WalWriterWake {
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            if let Some(thread) = self.thread.get() {
+                thread.unpark();
+            }
+        }
+    }
+}
+
+/// Position writes for the next durability cohort can overlap the current
+/// cohort's fsync. The append latch is held only to exchange governed buffers.
+#[derive(Debug)]
+pub(crate) struct WalWriter {
+    wake: Arc<WalWriterWake>,
+    log: std::sync::Weak<LogMutex>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WalWriter {
+    pub(crate) fn start(log: Arc<LogMutex>) -> Self {
+        let wake = Arc::new(WalWriterWake::default());
+        let worker_wake = Arc::clone(&wake);
+        let weak = Arc::downgrade(&log);
+        let worker_log = Arc::clone(&log);
+        let handle = std::thread::Builder::new()
+            .name("mydb-wal-write".into())
+            .spawn(move || {
+                let _ = worker_wake.thread.set(std::thread::current());
+                while !worker_wake.stopping.load(Ordering::Acquire) {
+                    worker_wake.pending.store(false, Ordering::Release);
+                    if let Err(err) = LogManager::write_pending_to(&worker_log) {
+                        let completion = Arc::clone(&worker_log.lock().write_completion);
+                        *completion.result.lock() = Some(Err(err));
+                        completion.ready.notify_all();
+                        break;
+                    }
+                    if !worker_wake.pending.load(Ordering::Acquire) {
+                        std::thread::park();
+                    }
+                }
+            })
+            .expect("failed to start WAL writer");
+        let _ = wake.thread.set(handle.thread().clone());
+        log.lock().writer_wake = Some(Arc::clone(&wake));
+        wake.notify();
+        Self {
+            wake,
+            log: weak,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for WalWriter {
+    fn drop(&mut self) {
+        self.wake.stopping.store(true, Ordering::Release);
+        // Always unpark on shutdown: pending may already be set after the
+        // writer consumed its token while exiting on an I/O error.
+        if let Some(thread) = self.wake.thread.get() {
+            thread.unpark();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(log) = self.log.upgrade() {
+            let mut log = log.lock();
+            if log
+                .writer_wake
+                .as_ref()
+                .is_some_and(|wake| Arc::ptr_eq(wake, &self.wake))
+            {
+                log.writer_wake = None;
+            }
+        }
+    }
+}
+
+/// Completion is independent of the append latch. Legacy synchronous drains
+/// can wait while holding that latch: the writer signals before reacquiring
+/// it to recycle buffers or publish a durability watermark.
+#[derive(Debug)]
+struct WalWriteCompletion {
+    result: parking_lot::Mutex<Option<Result<(), QueryError>>>,
+    ready: parking_lot::Condvar,
+}
+
+impl Default for WalWriteCompletion {
+    fn default() -> Self {
+        Self {
+            result: parking_lot::Mutex::new(Some(Ok(()))),
+            ready: parking_lot::Condvar::new(),
+        }
+    }
+}
+
+struct DetachedWalWrite {
+    file: Arc<File>,
+    offset: u64,
+    bytes: Vec<u8>,
+    charge: ControlledMemoryCharge,
+    completion: Arc<WalWriteCompletion>,
+    finished: bool,
+}
+
+impl DetachedWalWrite {
+    fn write(&mut self) -> Result<(), QueryError> {
+        let result = write_all_at(&self.file, &self.bytes, self.offset);
+        *self.completion.result.lock() = Some(result.clone());
+        self.finished = true;
+        self.completion.ready.notify_all();
+        result
+    }
+}
+
+impl Drop for DetachedWalWrite {
+    fn drop(&mut self) {
+        if !self.finished {
+            *self.completion.result.lock() = Some(Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL write interrupted before completion",
+            )));
+            self.completion.ready.notify_all();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LogManager {
     read_only: bool,
@@ -1080,6 +1219,8 @@ pub struct LogManager {
     /// and segment rotation continue; followers re-check the durable
     /// high-water after acquiring the gate and normally return immediately.
     sync_gate: Arc<parking_lot::Mutex<()>>,
+    write_gate: Arc<parking_lot::Mutex<()>>,
+    writer_wake: Option<Arc<WalWriterWake>>,
     sync_count: u64,
     stats: WalStats,
     /// `txn_id -> last LSN this txn appended`, used to fill each record's
@@ -1136,6 +1277,8 @@ pub struct LogManager {
     pending_write_offset: u64,
     pending_write_bytes: Vec<u8>,
     pending_write_charge: ControlledMemoryCharge,
+    spare_write_buffer: Option<(Vec<u8>, ControlledMemoryCharge)>,
+    write_completion: Arc<WalWriteCompletion>,
     write_buffer_enabled: bool,
     write_buffer_bytes: usize,
     /// A next segment file the background preparer created ahead of the
@@ -1178,6 +1321,19 @@ pub const MAX_WAL_WRITE_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 const WAL_ENCODE_SCRATCH_REUSE_MIN_BYTES: usize = 256 * 1024;
 const WAL_ENCODE_SCRATCH_IDLE_BYTES: usize = 8 * 1024;
 const WAL_ENCODE_SCRATCH_RETAIN_LIMIT: usize = 64 * 1024;
+
+fn optional_wal_buffer(capacity: usize) -> Option<(Vec<u8>, ControlledMemoryCharge)> {
+    let mut charge = ControlledMemoryCharge::try_new_optional(
+        ControlledMemoryCategory::StorageScratch,
+        capacity,
+    )?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).ok()?;
+    if bytes.capacity() > capacity && !charge.try_grow_optional(bytes.capacity() - capacity) {
+        return None;
+    }
+    Some((bytes, charge))
+}
 
 fn controlled_wal_buffer(capacity: usize) -> Result<(Vec<u8>, ControlledMemoryCharge), QueryError> {
     let mut charge =
@@ -1414,6 +1570,7 @@ pub struct WalScan {
 
 impl LogManager {
     pub fn open(data_dir: &Path) -> Result<Self, QueryError> {
+        crate::storage::control::Control::admit(data_dir)?;
         let scan = Self::scan_replay(data_dir)?;
         Self::open_from_replay(data_dir, &scan)
     }
@@ -1540,6 +1697,8 @@ impl LogManager {
                 next_lsn: FIRST_LSN,
                 durable_lsn: 0,
                 sync_gate: Arc::new(parking_lot::Mutex::new(())),
+                write_gate: Arc::new(parking_lot::Mutex::new(())),
+                writer_wake: None,
                 sync_count: 0,
                 stats: WalStats::default(),
                 txn_last_lsn: hashbrown::HashMap::default(),
@@ -1554,6 +1713,8 @@ impl LogManager {
                 pending_write_offset: size_bytes,
                 pending_write_bytes,
                 pending_write_charge,
+                spare_write_buffer: None,
+                write_completion: Arc::new(WalWriteCompletion::default()),
                 write_buffer_enabled: false,
                 write_buffer_bytes,
                 next_segment: None,
@@ -1721,6 +1882,8 @@ impl LogManager {
             next_lsn,
             durable_lsn: active_last_lsn,
             sync_gate: Arc::new(parking_lot::Mutex::new(())),
+            write_gate: Arc::new(parking_lot::Mutex::new(())),
+            writer_wake: None,
             sync_count: 0,
             stats,
             txn_last_lsn,
@@ -1735,6 +1898,8 @@ impl LogManager {
             pending_write_offset: size_bytes,
             pending_write_bytes,
             pending_write_charge,
+            spare_write_buffer: None,
+            write_completion: Arc::new(WalWriteCompletion::default()),
             write_buffer_enabled: false,
             write_buffer_bytes,
             next_segment: None,
@@ -2008,7 +2173,12 @@ impl LogManager {
         // immediate truncate is not required for correctness.
         self.flush_pending_writes()?;
         self.active_file.flush().map_err(io_err)?;
-        let next_id = self.active_info.segment_id.saturating_add(1);
+        let next_id = self.active_info.segment_id.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL segment identity space exhausted",
+            )
+        })?;
         let path = segment_path(&self.dir, next_id).with_extension("log.pending");
         // Fast path: the background preparer (`ensure_next_segment`) already
         // created + header-wrote + fsynced this segment under a temp name off
@@ -2121,7 +2291,7 @@ impl LogManager {
         if self.active_info.size_bytes < threshold {
             return None;
         }
-        let next_id = self.active_info.segment_id.saturating_add(1);
+        let next_id = self.active_info.segment_id.checked_add(1)?;
         let tmp_path = self.dir.join(WAL_PREP_TMP_NAME);
         self.next_segment_prep_in_flight = true;
         Some((next_id, tmp_path, self.max_segment_bytes, fill))
@@ -2197,7 +2367,7 @@ impl LogManager {
     ) -> Result<(), QueryError> {
         self.next_segment_prep_in_flight = false;
         if self.next_segment.is_none()
-            && segment_id == self.active_info.segment_id.saturating_add(1)
+            && self.active_info.segment_id.checked_add(1) == Some(segment_id)
         {
             self.next_segment = Some(PreparedSegment {
                 segment_id,
@@ -2372,6 +2542,10 @@ impl LogManager {
             },
         );
         encode_payload_into(&payload, &mut bytes)?;
+        if matches!(payload, WalPayload::TxnBatch { .. }) && txn_batch_compression_enabled() {
+            compress_txn_batch_frame(&mut bytes, txn_id);
+        }
+        let payload_len = bytes.len() - WAL_FRAME_HEADER_LEN;
         // CRC combination costs more than hashing a tiny OLTP frame. Hash
         // those frames once after finalizing the header; keep wide payload
         // work outside the mutex and combine it without rescanning.
@@ -2484,6 +2658,7 @@ impl LogManager {
         rec: &mut PreEncodedRecord,
         administrative: bool,
     ) -> Result<u64, QueryError> {
+        self.publish_buffered_begin(rec.txn_id)?;
         let _disk = if !administrative {
             self.check_wal_budget(&rec.payload, rec.bytes.len() as u64)?
         } else {
@@ -2503,8 +2678,14 @@ impl LogManager {
         rec.bytes[36..44].copy_from_slice(&source_time.to_le_bytes());
         self.last_frame_time = source_time;
         let lsn_span = rec.lsn_span.max(1);
-        let lsn = self.next_lsn.saturating_add(lsn_span - 1);
-        self.next_lsn = self.next_lsn.saturating_add(lsn_span);
+        let next_lsn = self.next_lsn.checked_add(lsn_span).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
+        let lsn = next_lsn - 1;
+        self.next_lsn = next_lsn;
         self.state_atomics
             .next_lsn
             .store(self.next_lsn, Ordering::Release);
@@ -2603,8 +2784,9 @@ impl LogManager {
     }
 
     fn reserve_pending_write(&mut self, additional: usize) -> Result<(), QueryError> {
-        if self.pending_write_bytes.len().saturating_add(additional)
-            > self.pending_write_bytes.capacity()
+        if !self.pending_write_bytes.is_empty()
+            && self.pending_write_bytes.len().saturating_add(additional)
+                > self.pending_write_bytes.capacity()
         {
             self.flush_pending_writes()?;
         }
@@ -2671,6 +2853,9 @@ impl LogManager {
         }
         self.reserve_pending_write(bytes.len())?;
         self.pending_write_bytes.extend_from_slice(bytes);
+        if let Some(wake) = &self.writer_wake {
+            wake.notify();
+        }
         self.active_info.size_bytes = self
             .active_info
             .size_bytes
@@ -2738,7 +2923,70 @@ impl LogManager {
         Ok(())
     }
 
+    fn recycle_detached_write(&mut self, mut write: DetachedWalWrite) {
+        if write
+            .completion
+            .result
+            .lock()
+            .as_ref()
+            .is_some_and(Result::is_ok)
+        {
+            self.record_physical_write(write.bytes.len());
+        }
+        write.bytes.clear();
+        let bytes = std::mem::take(&mut write.bytes);
+        let charge = write.charge.split(write.charge.bytes());
+        self.spare_write_buffer = Some((bytes, charge));
+    }
+
+    fn write_pending_to(log: &Arc<LogMutex>) -> Result<(), QueryError> {
+        let gate = Arc::clone(&log.lock().write_gate);
+        let _write_guard = gate.lock();
+        let write = log.lock().detach_pending_write()?;
+        if let Some(mut write) = write {
+            let result = write.write();
+            log.lock().recycle_detached_write(write);
+            result?;
+        }
+        Ok(())
+    }
+
+    fn wait_pending_write(&self) -> Result<(), QueryError> {
+        let mut result = self.write_completion.result.lock();
+        while result.is_none() {
+            self.write_completion.ready.wait(&mut result);
+        }
+        result.as_ref().unwrap().clone()
+    }
+
+    fn detach_pending_write(&mut self) -> Result<Option<DetachedWalWrite>, QueryError> {
+        self.wait_pending_write()?;
+        if self.pending_write_bytes.is_empty() {
+            return Ok(None);
+        }
+        let (replacement, replacement_charge) = match self.spare_write_buffer.take() {
+            Some(buffer) => buffer,
+            None => {
+                optional_wal_buffer(self.write_buffer_bytes).unwrap_or(controlled_wal_buffer(0)?)
+            }
+        };
+        let bytes = std::mem::replace(&mut self.pending_write_bytes, replacement);
+        let charge = std::mem::replace(&mut self.pending_write_charge, replacement_charge);
+        let offset = self.pending_write_offset;
+        self.pending_write_offset = self.active_info.size_bytes;
+        *self.write_completion.result.lock() = None;
+        Ok(Some(DetachedWalWrite {
+            file: Arc::clone(&self.active_file),
+            offset,
+            bytes,
+            charge,
+            completion: Arc::clone(&self.write_completion),
+            finished: false,
+        }))
+    }
+
     fn flush_pending_writes(&mut self) -> Result<(), QueryError> {
+        self.wait_pending_write()?;
         if self.pending_write_bytes.is_empty() {
             self.pending_write_offset = self.active_info.size_bytes;
             return Ok(());
@@ -2786,10 +3034,37 @@ impl LogManager {
         Ok(())
     }
 
+    fn publish_buffered_begin(&mut self, txn_id: u64) -> Result<(), QueryError> {
+        if let Some(begin) = crate::storage::take_buffered_txn_begin(
+            self.state_atomics
+                .transaction_buffer_owner
+                .load(Ordering::Acquire),
+            txn_id,
+        ) {
+            let mut pre = Self::pre_encode_record(txn_id, begin)?;
+            self.append_pre_encoded_core(&mut pre, false)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_txn_lsn(&mut self, txn_id: u64) -> Result<u64, QueryError> {
+        self.check_local_writer()?;
+        if self.read_only {
+            return Err(crate::storage::image_io::read_only_error());
+        }
+        self.publish_buffered_begin(txn_id)?;
+        self.reserve_lsn()
+    }
+
     pub fn reserve_lsn(&mut self) -> Result<u64, QueryError> {
         self.check_local_writer()?;
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
+        self.next_lsn = self.next_lsn.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
         // Mirror to the lock-free atomic so `Database::should_checkpoint`
         // can read it without locking us. Release ordering pairs with
         // the Acquire load on the reader side.
@@ -2803,7 +3078,7 @@ impl LogManager {
         if self.read_only {
             return Err(crate::storage::image_io::read_only_error());
         }
-        let lsn = self.reserve_lsn()?;
+        let lsn = self.reserve_txn_lsn(txn_id)?;
         self.append_reserved(lsn, txn_id, payload)
     }
 
@@ -2813,6 +3088,12 @@ impl LogManager {
         txn_id: u64,
         payload: WalPayload,
     ) -> Result<u64, QueryError> {
+        let next_lsn = lsn.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
         if lsn <= self.last_lsn() {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -2838,7 +3119,7 @@ impl LogManager {
         let _disk = match self.check_wal_budget(&payload, estimated_len as u64) {
             Ok(token) => token,
             Err(error) => {
-                if self.next_lsn == lsn + 1 && self.last_lsn() < lsn {
+                if self.next_lsn == next_lsn && self.last_lsn() < lsn {
                     self.next_lsn = lsn;
                     self.state_atomics.next_lsn.store(lsn, Ordering::Release);
                 }
@@ -2846,7 +3127,7 @@ impl LogManager {
             }
         };
         if lsn >= self.next_lsn {
-            self.next_lsn = lsn + 1;
+            self.next_lsn = next_lsn;
             self.state_atomics
                 .next_lsn
                 .store(self.next_lsn, Ordering::Release);
@@ -3040,15 +3321,32 @@ impl LogManager {
             Arc::clone(&log_guard.sync_gate)
         };
         let _sync_guard = sync_gate.lock();
-        let (sync_files, high_water) = {
+        let write_gate = Arc::clone(&log.lock().write_gate);
+        let write_guard = write_gate.lock();
+        let (mut pending_write, sync_files, high_water) = {
             let mut log_guard = log.lock();
-            match log_guard.prepare_sync_to(lsn)? {
-                Some(prepared) => prepared,
-                None => return Ok((log_guard.durable_lsn, false)),
+            if log_guard.directory_sync_pending {
+                let durable = log_guard.durable_lsn;
+                log_guard.publish_synced_prefix(durable)?;
             }
+            if lsn <= log_guard.durable_lsn {
+                return Ok((log_guard.durable_lsn, false));
+            }
+            let write = log_guard.detach_pending_write()?;
+            let (files, high_water) = log_guard.sync_files_and_high_water(lsn);
+            (write, files, high_water)
         };
+        let write_result = match pending_write.as_mut() {
+            Some(write) => write.write(),
+            None => Ok(()),
+        };
+        if let Some(write) = pending_write.take() {
+            log.lock().recycle_detached_write(write);
+        }
+        drop(write_guard);
         let started = Instant::now();
-        let fsync_result = sync_files.iter().try_for_each(|file| sync_wal_file(file));
+        let fsync_result =
+            write_result.and_then(|()| sync_files.iter().try_for_each(|file| sync_wal_file(file)));
         let elapsed_us = elapsed_us(started);
         let mut log_guard = log.lock();
         // Drop the cloned fd before we publish the durable LSN —
@@ -3087,6 +3385,10 @@ impl LogManager {
         }
         self.flush_pending_writes()?;
         self.active_file.flush().map_err(io_err)?;
+        Ok(Some(self.sync_files_and_high_water(lsn)))
+    }
+
+    fn sync_files_and_high_water(&self, lsn: u64) -> (Vec<Arc<File>>, u64) {
         // `last_lsn` is captured under the log mutex right after the flush, so
         // it is a conservative lower bound on what the fsync will persist:
         // records appended *after* this point are not guaranteed flushed and
@@ -3113,7 +3415,7 @@ impl LogManager {
         if self.active_info.first_lsn <= self.active_info.last_lsn {
             files.push(Arc::clone(&self.active_file));
         }
-        Ok(Some((files, high_water)))
+        (files, high_water)
     }
 
     /// Highest LSN whose bytes are in the WAL write buffer / file (not
@@ -3313,6 +3615,18 @@ impl LogManager {
         gc_safe_txn_frontier: u64,
         defer_cleanup: bool,
     ) -> Result<(), QueryError> {
+        let next_lsn = checkpoint_lsn.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL LSN space exhausted",
+            )
+        })?;
+        let new_id = self.active_info.segment_id.checked_add(1).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL segment identity space exhausted",
+            )
+        })?;
         // Build the new "first record after checkpoint" — a fresh
         // CheckpointEnd at `checkpoint_lsn` — in a REPLACEMENT segment
         // (id = active + 1), fsync it, rename it into place, and only
@@ -3343,7 +3657,6 @@ impl LogManager {
         };
         let encoded = encode_record(&record)?;
         let started = Instant::now();
-        let new_id = self.active_info.segment_id.saturating_add(1);
         let new_path = segment_path(&self.dir, new_id);
         let tmp_path = new_path.with_extension("log.tmp");
         let valid_bytes = (WAL_HEADER_LEN + encoded.len()) as u64;
@@ -3360,8 +3673,12 @@ impl LogManager {
             // sparse segment, which still works (just falls back to
             // metadata-journal fsyncs until the next rotation).
             let _ = preallocate_segment(&tmp, self.max_segment_bytes);
-            tmp.write_all(&segment_header_with_replacement(new_id, checkpoint_lsn))
-                .map_err(io_err)?;
+            tmp.write_all(&segment_header_with_replacement(
+                &tmp_path,
+                new_id,
+                checkpoint_lsn,
+            )?)
+            .map_err(io_err)?;
             tmp.write_all(&encoded).map_err(io_err)?;
             // Order both data and extent metadata before rename. The full
             // directory sync below makes the new segment durable before any
@@ -3403,7 +3720,7 @@ impl LogManager {
         self.active_file = replacement;
         self.active_fill = SegmentFill::Reserve;
 
-        self.next_lsn = checkpoint_lsn.saturating_add(1).max(FIRST_LSN);
+        self.next_lsn = next_lsn.max(FIRST_LSN);
         self.state_atomics
             .next_lsn
             .store(self.next_lsn, Ordering::Release);
@@ -3620,6 +3937,12 @@ fn write_frame_header(out: &mut Vec<u8>, payload_len: usize, header: WalRecordHe
 /// pure field decode in their original order.
 #[inline]
 fn read_record_header(bytes: &[u8]) -> Result<WalRecordHeader, QueryError> {
+    if read_u16(bytes, 34) != 0 {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unsupported WAL frame flags",
+        ));
+    }
     Ok(WalRecordHeader {
         source_time_us: read_u64(bytes, 36),
         lsn: read_u64(bytes, 8),
@@ -3685,7 +4008,7 @@ fn inspect_wal_frame(bytes: &[u8]) -> Result<(WalRecordHeader, usize), QueryErro
 // ============================================================
 
 /// Output of [`WalReader::next_chunk`]: a contiguous run of WAL frames
-/// (each frame is the on-disk binary form, with its own 40-byte header
+/// (each frame is the on-disk binary form, with its own 48-byte header
 /// and CRC32) starting at `start_lsn` and ending at `end_lsn` inclusive.
 #[derive(Debug, Clone)]
 pub struct WalReadChunk {
@@ -4099,9 +4422,168 @@ impl WalReader {
     }
 }
 
+const COMPRESSED_TXN_BATCH: u32 = 1 << 31;
+const MAX_COMPRESSED_TXN_BATCH_BYTES: usize = 64 * 1024;
+
+fn txn_batch_compression_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MYDB_WAL_TXN_COMPRESSION")
+            .map(|value| !matches!(value.trim(), "0" | "off" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
+
+/// Locate the decision time in an ordinary batch without decoding values.
+/// Compressed frames keep this one append-time field outside the LZ4 block.
+fn txn_batch_commit_time_offset(input: &[u8]) -> Result<Option<usize>, QueryError> {
+    let mut offset = 0;
+    let count = read_u32_checked(input, &mut offset)? as usize;
+    if count == 0 || count > MAX_TXN_BATCH_RECORDS {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid WAL batch count",
+        ));
+    }
+    let mut result = None;
+    for index in 0..count {
+        let ty = WalRecordType::from_u16(read_u16_checked(input, &mut offset)?)?;
+        let len = read_u32_checked(input, &mut offset)? as usize;
+        if index + 1 == count && ty == WalRecordType::CommitTxn {
+            if len < 16 {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "truncated batch commit time",
+                ));
+            }
+            result = Some(offset + 8);
+        }
+        offset = offset
+            .checked_add(len)
+            .filter(|end| *end <= input.len())
+            .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "truncated WAL batch"))?;
+    }
+    if offset != input.len() {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "trailing WAL batch bytes",
+        ));
+    }
+    Ok(result)
+}
+
+/// Compress only bounded transaction frames with material savings. The
+/// complete physical before-images remain available for crash/restore undo.
+/// Optional scratch admission must never turn a compressible write into OOM.
+fn compress_txn_batch_frame(bytes: &mut Vec<u8>, txn_id: u64) {
+    let raw_len = bytes.len() - WAL_FRAME_HEADER_LEN;
+    if !(512..=MAX_COMPRESSED_TXN_BATCH_BYTES).contains(&raw_len) {
+        return;
+    }
+    let capacity = lz4_flex::block::get_maximum_output_size(raw_len);
+    let pooled = WAL_RECORD_BUF_POOL
+        .try_with(|pool| {
+            let mut pool = pool.try_borrow_mut().ok()?;
+            while let Some(buffer) = pool.pop() {
+                if buffer.owner_txn.is_some_and(|owner| owner != txn_id) {
+                    continue;
+                }
+                if buffer.bytes.capacity() >= capacity {
+                    return Some(buffer);
+                }
+            }
+            None
+        })
+        .ok()
+        .flatten();
+    let scratch = pooled.or_else(|| {
+        let (bytes, charge) = optional_wal_buffer(capacity)?;
+        Some(WalRecordBuffer {
+            bytes,
+            charge,
+            owner_txn: None,
+        })
+    });
+    let Some(mut scratch) = scratch else {
+        return;
+    };
+    scratch.bytes.resize(capacity, 0);
+    if let Ok(size) =
+        lz4_flex::block::compress_into(&bytes[WAL_FRAME_HEADER_LEN..], &mut scratch.bytes)
+    {
+        if size + 16 <= raw_len * 7 / 8 {
+            let count = read_u32(bytes, WAL_FRAME_HEADER_LEN);
+            let time = txn_batch_commit_time_offset(&bytes[WAL_FRAME_HEADER_LEN..])
+                .ok()
+                .flatten()
+                .map_or(0, |offset| read_u64(bytes, WAL_FRAME_HEADER_LEN + offset));
+            bytes.truncate(WAL_FRAME_HEADER_LEN);
+            write_u32_vec(bytes, count | COMPRESSED_TXN_BATCH);
+            write_u32_vec(bytes, raw_len as u32);
+            write_u64_vec(bytes, time);
+            bytes.extend_from_slice(&scratch.bytes[..size]);
+            bytes[4..8].copy_from_slice(&((size + 16) as u32).to_le_bytes());
+        }
+    }
+    scratch.owner_txn = None;
+    wal_record_buf_return(scratch);
+}
+
+fn expand_compressed_txn_batch(input: &[u8]) -> Result<Option<WalRecordBuffer>, QueryError> {
+    if input.len() < 4 || read_u32(input, 0) & COMPRESSED_TXN_BATCH == 0 {
+        return Ok(None);
+    }
+    let count = read_u32(input, 0) & !COMPRESSED_TXN_BATCH;
+    if input.len() < 16 || count == 0 || count as usize > MAX_TXN_BATCH_RECORDS {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid compressed WAL batch count",
+        ));
+    }
+    let raw_len = read_u32(input, 4) as usize;
+    if !(4..=MAX_COMPRESSED_TXN_BATCH_BYTES).contains(&raw_len)
+        || input.len() > MAX_COMPRESSED_TXN_BATCH_BYTES + 16
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid compressed WAL batch size",
+        ));
+    }
+    let (mut bytes, charge) = controlled_wal_buffer(raw_len)?;
+    bytes.resize(raw_len, 0);
+    let size = lz4_flex::block::decompress_into(&input[16..], &mut bytes).map_err(|err| {
+        error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("corrupt compressed WAL batch: {err}"),
+        )
+    })?;
+    if size != raw_len || read_u32(&bytes, 0) != count {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "compressed WAL batch length/count mismatch",
+        ));
+    }
+    if let Some(offset) = txn_batch_commit_time_offset(&bytes)? {
+        bytes[offset..offset + 8].copy_from_slice(&input[8..16]);
+    } else if read_u64(input, 8) != 0 {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "system WAL batch carries a commit time",
+        ));
+    }
+    Ok(Some(WalRecordBuffer {
+        bytes,
+        charge,
+        owner_txn: None,
+    }))
+}
+
 fn frame_logical_start(ty: WalRecordType, lsn: u64, payload: &[u8]) -> Result<u64, QueryError> {
     if ty != WalRecordType::TxnBatch {
         return Ok(lsn);
+    }
+    if let Some(expanded) = expand_compressed_txn_batch(payload)? {
+        return frame_logical_start(ty, lsn, &expanded.bytes);
     }
     let mut offset = 0;
     let count = read_u32_checked(payload, &mut offset)? as usize;
@@ -4601,7 +5083,7 @@ fn initialize_segment(
     if preallocate_bytes > 0 {
         let _ = preallocate_segment(&file, preallocate_bytes);
     }
-    let header = segment_header(segment_id);
+    let header = segment_header(path, segment_id)?;
     file.write_all(&header).map_err(io_err)?;
     if fill == SegmentFill::Zero && preallocate_bytes > header.len() as u64 {
         zero_fill_segment(&file, header.len() as u64, preallocate_bytes)?;
@@ -4697,20 +5179,51 @@ fn zero_fill_segment(file: &File, from: u64, to: u64) -> Result<(), QueryError> 
     Ok(())
 }
 
-fn segment_header(segment_id: u64) -> Vec<u8> {
-    segment_header_with_replacement(segment_id, 0)
+fn segment_header(path: &Path, segment_id: u64) -> Result<Vec<u8>, QueryError> {
+    segment_header_with_replacement(path, segment_id, 0)
 }
 
-fn segment_header_with_replacement(segment_id: u64, replaces_through: u64) -> Vec<u8> {
+fn encode_segment_header(
+    segment_id: u64,
+    replaces_through: u64,
+    created_ms: u64,
+    uuid: [u8; 16],
+) -> Vec<u8> {
     let mut header = Vec::with_capacity(WAL_HEADER_LEN);
     header.extend_from_slice(WAL_MAGIC);
     header.extend_from_slice(&WAL_VERSION.to_le_bytes());
     header.extend_from_slice(&segment_id.to_le_bytes());
-    header.extend_from_slice(&current_unix_ms().to_le_bytes());
+    header.extend_from_slice(&created_ms.to_le_bytes());
     header.extend_from_slice(&replaces_through.to_le_bytes());
+    header.extend_from_slice(&uuid);
+    header.extend_from_slice(&(WAL_HEADER_LEN as u32).to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
     let checksum = wal_checksum(&header);
     header.extend_from_slice(&checksum.to_le_bytes());
     header
+}
+
+fn segment_header_with_replacement(
+    path: &Path,
+    segment_id: u64,
+    replaces_through: u64,
+) -> Result<Vec<u8>, QueryError> {
+    let uuid = crate::storage::control::uuid_for_system_file(path)?.unwrap_or([0; 16]);
+    Ok(encode_segment_header(
+        segment_id,
+        replaces_through,
+        current_unix_ms(),
+        uuid,
+    ))
+}
+
+fn segment_header_valid(header: &[u8]) -> bool {
+    header.len() == WAL_HEADER_LEN
+        && &header[..8] == WAL_MAGIC
+        && read_u32(header, 8) == WAL_VERSION
+        && read_u32(header, 52) == WAL_HEADER_LEN as u32
+        && read_u32(header, 56) == 0
+        && read_u32(header, 60) == wal_checksum(&header[..60])
 }
 
 fn ensure_segment_header(path: &Path, segment_id: u64) -> Result<(), QueryError> {
@@ -4739,8 +5252,8 @@ fn ensure_segment_header(path: &Path, segment_id: u64) -> Result<(), QueryError>
     }
     let version = read_u32(&header, 8);
     let stored_segment = read_u64(&header, 12);
-    let stored_crc = read_u32(&header, 36);
-    let actual_crc = wal_checksum(&header[..36]);
+    let stored_crc = read_u32(&header, 60);
+    let actual_crc = wal_checksum(&header[..60]);
     if version != WAL_VERSION {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
@@ -4749,7 +5262,13 @@ fn ensure_segment_header(path: &Path, segment_id: u64) -> Result<(), QueryError>
             ),
         ));
     }
-    if stored_segment != segment_id || stored_crc != actual_crc {
+    let expected_owner = crate::storage::control::uuid_for_system_file(path)?;
+    if stored_segment != segment_id
+        || stored_crc != actual_crc
+        || read_u32(&header, 52) != WAL_HEADER_LEN as u32
+        || read_u32(&header, 56) != 0
+        || expected_owner.is_some_and(|uuid| header[36..52] != uuid)
+    {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "corrupt WAL segment header",
@@ -4818,7 +5337,7 @@ fn scan_segment_inner_with_mode(
         segment_id,
         truncate_tail,
         mode,
-        |record, _, _| {
+        |record, _, _, _| {
             records.push(record);
             Ok(())
         },
@@ -4836,6 +5355,9 @@ fn wal_has_frame_after(path: &Path, offset: u64) -> Result<bool, QueryError> {
     let mut file = File::open(path).map_err(io_err)?;
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     let magic = WAL_RECORD_MAGIC.to_le_bytes();
+    // Normal preallocated tails can span hundreds of MiB. Use the optimized
+    // byte search rather than a debug-build comparison at every byte offset.
+    let finder = memchr::memmem::Finder::new(&magic);
     let mut buffer = [0u8; 64 * 1024 + 3];
     let mut carry = 0;
     loop {
@@ -4844,7 +5366,7 @@ fn wal_has_frame_after(path: &Path, offset: u64) -> Result<bool, QueryError> {
             return Ok(false);
         }
         let end = carry + n;
-        if buffer[..end].windows(4).any(|window| window == magic) {
+        if finder.find(&buffer[..end]).is_some() {
             return Ok(true);
         }
         carry = end.min(3);
@@ -4860,7 +5382,7 @@ fn visit_segment_records(
     truncate_tail: bool,
     mut visit: impl FnMut(WalRecord) -> Result<(), QueryError>,
 ) -> Result<(u64, u64), QueryError> {
-    visit_segment_records_located(path, segment_id, truncate_tail, |record, _, _| {
+    visit_segment_records_located(path, segment_id, truncate_tail, |record, _, _, _| {
         visit(record)
     })
 }
@@ -4871,7 +5393,7 @@ fn visit_segment_records_located(
     path: &Path,
     segment_id: u64,
     truncate_tail: bool,
-    visit: impl FnMut(WalRecord, u64, usize) -> Result<(), QueryError>,
+    visit: impl FnMut(WalRecord, u64, usize, bool) -> Result<(), QueryError>,
 ) -> Result<(u64, u64), QueryError> {
     visit_segment_records_located_with_mode(
         path,
@@ -4887,7 +5409,7 @@ fn visit_segment_records_located_with_mode(
     segment_id: u64,
     truncate_tail: bool,
     mode: WalReadMode,
-    visit: impl FnMut(WalRecord, u64, usize) -> Result<(), QueryError>,
+    visit: impl FnMut(WalRecord, u64, usize, bool) -> Result<(), QueryError>,
 ) -> Result<(u64, u64), QueryError> {
     visit_segment_records_located_from(
         path,
@@ -4907,7 +5429,7 @@ fn visit_segment_records_located_from(
     mode: WalReadMode,
     start_offset: u64,
     mut previous_lsn: u64,
-    mut visit: impl FnMut(WalRecord, u64, usize) -> Result<(), QueryError>,
+    mut visit: impl FnMut(WalRecord, u64, usize, bool) -> Result<(), QueryError>,
 ) -> Result<(u64, u64), QueryError> {
     if mode != WalReadMode::Recovery
         && fs::metadata(path).map_err(io_err)?.len() < WAL_HEADER_LEN as u64
@@ -5028,6 +5550,15 @@ fn visit_segment_records_located_from(
         // "corrupt record frame". A non-zero header that doesn't match
         // the magic is still a real corruption and bails out.
         if header.iter().all(|&b| b == 0) {
+            // A zeroed header inside committed history is not an unused tail.
+            // Inspect the suffix before any destructive repair, including for
+            // sealed/read-only segments whose internal holes must be rejected.
+            if wal_has_frame_after(path, offset + WAL_FRAME_HEADER_LEN as u64)? {
+                return Err(error(crate::error::catalog::ER_GET_ERRNO, format!(
+                    "corrupt WAL '{}' at offset {offset}: zero header precedes a later frame; refusing tail truncation",
+                    path.display()
+                )));
+            }
             if recover {
                 let file = reader.get_mut();
                 file.set_len(offset).map_err(io_err)?;
@@ -5059,14 +5590,18 @@ fn visit_segment_records_located_from(
         let record_header = match read_record_header(&header) {
             Ok(t) => t,
             Err(err) => {
-                recover_or_fail!("unknown record type");
+                if forced {
+                    recover_or_fail!("unknown record type");
+                }
                 return Err(err);
             }
         };
         let record_type = record_header.record_type;
         let reserved = read_u16(&header, 34);
         if reserved != 0 {
-            recover_or_fail!("unknown reserved bits");
+            if forced {
+                recover_or_fail!("unknown reserved bits");
+            }
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "corrupt WAL: unknown reserved bits",
@@ -5074,7 +5609,9 @@ fn visit_segment_records_located_from(
         }
         let lsn = record_header.lsn;
         if lsn == 0 || lsn <= previous_lsn {
-            recover_or_fail!("non-monotonic LSN");
+            if forced {
+                recover_or_fail!("non-monotonic LSN");
+            }
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "corrupt WAL: non-monotonic LSN",
@@ -5083,7 +5620,11 @@ fn visit_segment_records_located_from(
         let payload = match decode_payload(record_type, &payload_buf) {
             Ok(p) => p,
             Err(err) => {
-                recover_or_fail!("undecodable payload");
+                // A complete checksummed frame cannot be an incomplete append.
+                // Unsupported semantics must not silently erase durable history.
+                if forced {
+                    recover_or_fail!(format!("undecodable payload: {}", err.message()));
+                }
                 return Err(err);
             }
         };
@@ -5106,10 +5647,9 @@ fn visit_segment_records_located_from(
                         )
                     })?;
                 let mut logical_prev = prev_txn_lsn;
+                let compressed = read_u32(&payload_buf, 0) & COMPRESSED_TXN_BATCH != 0;
                 let mut payload_offset = 4usize;
                 for (idx, payload) in logical.into_iter().enumerate() {
-                    let payload_len = read_u32(&payload_buf, payload_offset + 2) as usize;
-                    payload_offset += 6;
                     let logical_lsn = first_logical_lsn + idx as u64;
                     let record = WalRecord {
                         source_time_us: record_header.source_time_us,
@@ -5119,12 +5659,27 @@ fn visit_segment_records_located_from(
                         payload,
                     };
                     logical_prev = logical_lsn;
-                    visit(
-                        record,
-                        offset + WAL_FRAME_HEADER_LEN as u64 + payload_offset as u64,
-                        payload_len,
-                    )?;
-                    payload_offset += payload_len;
+                    if compressed {
+                        // A logical child has no standalone byte range in an
+                        // LZ4 block. Retain its immutable physical frame; the
+                        // replay directory resolves the child from its LSN.
+                        visit(
+                            record,
+                            offset,
+                            WAL_FRAME_HEADER_LEN + payload_buf.len(),
+                            true,
+                        )?;
+                    } else {
+                        let payload_len = read_u32(&payload_buf, payload_offset + 2) as usize;
+                        payload_offset += 6;
+                        visit(
+                            record,
+                            offset + WAL_FRAME_HEADER_LEN as u64 + payload_offset as u64,
+                            payload_len,
+                            false,
+                        )?;
+                        payload_offset += payload_len;
+                    }
                 }
             }
             payload => visit(
@@ -5137,6 +5692,7 @@ fn visit_segment_records_located_from(
                 },
                 offset + WAL_FRAME_HEADER_LEN as u64,
                 stored_payload_len,
+                false,
             )?,
         }
         offset += frame_len;
@@ -6001,8 +6557,13 @@ fn bounded_wal_count(
 }
 
 fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload, QueryError> {
+    if record_type == WalRecordType::TxnBatch {
+        if let Some(expanded) = expand_compressed_txn_batch(input)? {
+            return decode_payload(record_type, &expanded.bytes);
+        }
+    }
     let mut offset = 0;
-    Ok(match record_type {
+    let payload = match record_type {
         WalRecordType::FileClr => {
             let path = read_string(input, &mut offset)?;
             let undo_next_lsn = read_u64_checked(input, &mut offset)?;
@@ -6125,6 +6686,7 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
                 ));
             }
             let compressed_after = input[offset..offset + len].to_vec();
+            offset += len;
             WalPayload::PageDelta {
                 path,
                 page_id,
@@ -6515,7 +7077,14 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
             }
             WalPayload::TxnBatch { records }
         }
-    })
+    };
+    if offset != input.len() {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "unexpected trailing WAL payload bytes",
+        ));
+    }
+    Ok(payload)
 }
 
 fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), QueryError> {
@@ -8188,6 +8757,144 @@ mod tests {
     }
 
     #[test]
+    fn release_format_rejects_foreign_wal_directory_identity_without_writes() {
+        let a = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let b = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let make = |root: &Path| {
+            let mut log = LogManager::open(root).unwrap();
+            log.append(7, WalPayload::BeginTxn { start_scn: 5 })
+                .unwrap();
+            log.flush().unwrap();
+            log.path().to_owned()
+        };
+        let target = make(a.path());
+        let foreign = fs::read(make(b.path())).unwrap();
+        fs::write(&target, &foreign).unwrap();
+        assert!(LogManager::scan(a.path()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), foreign);
+    }
+
+    #[test]
+    fn release_format_wal_capacity_rejection_never_reuses_identity() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = LogManager::open(root.path()).unwrap();
+        log.flush().unwrap();
+        let path = log.path().to_owned();
+        let before = fs::read(&path).unwrap();
+        log.next_lsn = u64::MAX;
+        assert!(log.reserve_lsn().is_err());
+        assert_eq!(log.next_lsn, u64::MAX);
+        assert!(log
+            .append_pre_encoded(
+                LogManager::pre_encode_record(7, WalPayload::BeginTxn { start_scn: 1 }).unwrap()
+            )
+            .is_err());
+        assert!(log
+            .append_reserved(u64::MAX, 7, WalPayload::BeginTxn { start_scn: 1 })
+            .is_err());
+        log.active_info.segment_id = u64::MAX;
+        assert!(log.rotate_active_internal().is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn release_format_golden_wal_frame() {
+        let bytes = encode_record(&WalRecord {
+            source_time_us: 17,
+            lsn: 11,
+            prev_txn_lsn: 0,
+            txn_id: 7,
+            payload: WalPayload::BeginTxn { start_scn: 5 },
+        })
+        .unwrap();
+        crate::storage::format_golden::golden!("wal-frame", &bytes);
+        crate::storage::format_golden::golden!(
+            "wal-segment",
+            &encode_segment_header(7, 0, 17, [0xa5; 16])
+        );
+    }
+
+    #[test]
+    fn release_format_intact_unsupported_wal_frames_are_never_tail_trimmed() {
+        for offset in [8usize, 32, 34, WAL_FRAME_HEADER_LEN] {
+            let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(root.path()).unwrap();
+            log.append(7, WalPayload::CheckpointBegin).unwrap();
+            log.flush().unwrap();
+            let path = log.path().to_owned();
+            drop(log);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.truncate(WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN);
+            if offset == WAL_FRAME_HEADER_LEN {
+                bytes.push(99);
+                bytes[WAL_HEADER_LEN + 4..WAL_HEADER_LEN + 8].copy_from_slice(&1u32.to_le_bytes());
+            } else if offset == 8 {
+                bytes[WAL_HEADER_LEN + 8..WAL_HEADER_LEN + 16].fill(0);
+            } else {
+                bytes[WAL_HEADER_LEN + offset..WAL_HEADER_LEN + offset + 2].fill(255);
+            }
+            let checksum = wal_frame_checksum(
+                &bytes[WAL_HEADER_LEN..],
+                &bytes[WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN..],
+            );
+            bytes[WAL_HEADER_LEN + 44..WAL_HEADER_LEN + 48]
+                .copy_from_slice(&checksum.to_le_bytes());
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                scan_segment(&path, true).is_err(),
+                "accepted field at {offset}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn release_format_rejects_zero_header_before_later_frames_without_truncation() {
+        for tail in [false, true] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(dir.path()).unwrap();
+            for id in 1..=3 {
+                log.append(id, WalPayload::BeginTxn { start_scn: id })
+                    .unwrap();
+            }
+            log.flush().unwrap();
+            let path = log.path().to_owned();
+            drop(log);
+            let mut bytes = fs::read(&path).unwrap();
+            let offset = WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN + 8;
+            bytes[offset..offset + WAL_FRAME_HEADER_LEN].fill(0);
+            fs::write(&path, &bytes).unwrap();
+            assert!(scan_segment(&path, tail)
+                .unwrap_err()
+                .message()
+                .contains("later frame"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn wal_tail_probe_preserves_markers_across_read_boundaries() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let path = dir.path().join("tail.log");
+        let magic = WAL_RECORD_MAGIC.to_le_bytes();
+        let mut bytes = vec![0; 3 * 64 * 1024];
+        for offset in [0, 1, 65535, 65536, 65537, 65538, 65539, 65540, 131075] {
+            bytes.fill(0);
+            bytes[offset..offset + magic.len()].copy_from_slice(&magic);
+            fs::write(&path, &bytes).unwrap();
+            assert!(wal_has_frame_after(&path, 0).unwrap(), "offset {offset}");
+            assert!(wal_has_frame_after(&path, offset as u64).unwrap());
+            assert!(!wal_has_frame_after(&path, offset as u64 + 1).unwrap());
+        }
+        for prefix in 0..magic.len() {
+            bytes.fill(0);
+            bytes.extend_from_slice(&magic[..prefix]);
+            fs::write(&path, &bytes).unwrap();
+            assert!(!wal_has_frame_after(&path, 0).unwrap());
+        }
+    }
+
+    #[test]
     fn fresh_audit_wal_crc_protects_transaction_header_fields() {
         for pre_encoded in [false, true] {
             for offset in [8, 16, 24, 32, 34] {
@@ -8482,6 +9189,205 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compressed_transaction_batches_preserve_frame_atomicity_and_lsn_links() {
+        std::env::set_var("MYDB_WAL_TXN_COMPRESSION", "1");
+        let records = vec![
+            WalPayload::BeginTxn { start_scn: 1 },
+            WalPayload::FileCreate {
+                path: "objects/batch-compression.marker".into(),
+                after: vec![0xa5; 2048],
+            },
+            WalPayload::CommitTxn {
+                commit_scn: 2,
+                commit_unix_us: 2,
+                binlog: None,
+            },
+        ];
+        let pre = LogManager::pre_encode_record(7, WalPayload::TxnBatch { records }).unwrap();
+        let payload = &pre.bytes[WAL_FRAME_HEADER_LEN..];
+        assert_ne!(read_u32(payload, 0) & COMPRESSED_TXN_BATCH, 0);
+        assert!(pre.bytes.len() < 512);
+        let expanded = expand_compressed_txn_batch(payload).unwrap().unwrap();
+        assert_eq!(read_u32(&expanded.bytes, 0), 3);
+        let mut corrupt = payload.to_vec();
+        corrupt[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_payload(WalRecordType::TxnBatch, &corrupt).is_err());
+        let mut corrupt = payload.to_vec();
+        corrupt[..4].copy_from_slice(&(COMPRESSED_TXN_BATCH | 2).to_le_bytes());
+        assert!(decode_payload(WalRecordType::TxnBatch, &corrupt).is_err());
+        assert!(frame_logical_start(WalRecordType::TxnBatch, 3, &corrupt).is_err());
+        assert!(decode_payload(WalRecordType::TxnBatch, &payload[..payload.len() - 1]).is_err());
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let end = LogManager::append_pre_encoded_to(&log, pre).unwrap();
+        let next = log
+            .lock()
+            .append(8, WalPayload::BeginTxn { start_scn: 2 })
+            .unwrap();
+        assert_eq!(next, end + 1);
+        LogManager::sync_durable_to(&log, next).unwrap();
+        drop(log);
+        let scan = LogManager::scan(dir.path()).unwrap();
+        let batch: Vec<_> = scan
+            .records
+            .iter()
+            .filter(|record| record.txn_id == 7)
+            .collect();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[2].lsn, end);
+        assert_eq!(batch[0].prev_txn_lsn, 0);
+        assert_eq!(batch[1].prev_txn_lsn, batch[0].lsn);
+        assert_eq!(batch[2].prev_txn_lsn, batch[1].lsn);
+        let replay = LogManager::scan_replay(dir.path()).unwrap();
+        assert_eq!(replay.records.len(), scan.records.len());
+        for index in 0..scan.records.len() {
+            let located = replay.records.record(index).unwrap();
+            assert_eq!(located.lsn, scan.records[index].lsn);
+            assert_eq!(located.prev_txn_lsn, scan.records[index].prev_txn_lsn);
+            assert_eq!(
+                located.payload.record_type(),
+                scan.records[index].payload.record_type()
+            );
+        }
+        assert_eq!(
+            replay.records.redo_path(1).unwrap().unwrap().as_ref(),
+            "objects/batch-compression.marker"
+        );
+    }
+
+    #[test]
+    fn batch_compression_keeps_incompressible_and_oversized_frames_plain() {
+        let mut seed = 0x123456789abcdef0u64;
+        let random: Vec<u8> = (0..8192)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        for after in [random, vec![0; MAX_COMPRESSED_TXN_BATCH_BYTES + 1]] {
+            let payload = WalPayload::TxnBatch {
+                records: vec![WalPayload::FileCreate {
+                    path: "objects/compression-plain.marker".into(),
+                    after,
+                }],
+            };
+            let mut bytes = vec![0; WAL_FRAME_HEADER_LEN];
+            encode_payload_into(&payload, &mut bytes).unwrap();
+            let before = bytes.clone();
+            compress_txn_batch_frame(&mut bytes, 0);
+            assert_eq!(bytes, before);
+        }
+    }
+
+    #[test]
+    fn persistent_wal_writer_drains_without_publishing_durability() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut manager = LogManager::open(dir.path()).unwrap();
+        manager.set_write_buffer_enabled(true).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(manager));
+        let writer = WalWriter::start(Arc::clone(&log));
+        let lsn = log
+            .lock()
+            .append(1, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let log = log.lock();
+            let drained = log.pending_write_bytes.is_empty()
+                && log
+                    .write_completion
+                    .result
+                    .lock()
+                    .as_ref()
+                    .is_some_and(Result::is_ok);
+            if drained {
+                break;
+            }
+            drop(log);
+            assert!(
+                Instant::now() < deadline,
+                "writer did not drain the pending cohort"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            log.lock().durable_lsn() < lsn,
+            "pwrite is not a durability barrier"
+        );
+        LogManager::sync_durable_to(&log, lsn).unwrap();
+        assert!(log.lock().durable_lsn() >= lsn);
+        drop(writer);
+        assert!(log.lock().writer_wake.is_none());
+        drop(log);
+        assert!(LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .iter()
+            .any(|record| record.lsn == lsn));
+    }
+
+    #[test]
+    fn detached_wal_write_allows_append_and_unblocks_an_eager_drain() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut manager = LogManager::open(dir.path()).unwrap();
+        manager.set_write_buffer_enabled(true).unwrap();
+        let first = manager
+            .append(1, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(manager));
+        let mut detached = log.lock().detach_pending_write().unwrap().unwrap();
+        let second = log
+            .lock()
+            .append(2, WalPayload::BeginTxn { start_scn: 2 })
+            .unwrap();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (finished, finished_rx) = std::sync::mpsc::channel();
+        let drainer_log = Arc::clone(&log);
+        let drainer = std::thread::spawn(move || {
+            let mut guard = drainer_log.lock();
+            entered.send(()).unwrap();
+            let result = guard.flush_pending_writes();
+            finished.send(result).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "a drain must wait for the detached prefix"
+        );
+        detached.write().unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        drainer.join().unwrap();
+        LogManager::sync_durable_to(&log, second).unwrap();
+        assert!(log.lock().durable_lsn() >= second);
+        drop(log);
+        let scan = LogManager::scan(dir.path()).unwrap();
+        assert!(scan.records.iter().any(|r| r.lsn == first));
+        assert!(scan.records.iter().any(|r| r.lsn == second));
+    }
+
+    #[test]
+    fn abandoned_detached_wal_write_never_publishes_durability() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut manager = LogManager::open(dir.path()).unwrap();
+        manager.set_write_buffer_enabled(true).unwrap();
+        let lsn = manager
+            .append(1, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(manager));
+        let detached = log.lock().detach_pending_write().unwrap().unwrap();
+        drop(detached);
+        let err = LogManager::sync_durable_to(&log, lsn).unwrap_err();
+        assert!(err.message().contains("interrupted"));
+        assert!(log.lock().durable_lsn() < lsn);
+    }
     #[test]
     fn large_frames_bypass_pending_buffer_and_reuse_scratch_until_commit() {
         let dir = tempfile::tempdir().unwrap();

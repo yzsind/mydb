@@ -653,6 +653,299 @@ pub(crate) fn execute_physical_select(
     execute()
 }
 
+fn execute_runtime_scalar_point(
+    db: &Arc<Database>,
+    txn: TxnView,
+    stmt: &Select,
+    parent: &crate::engine::cache::CompiledSelectPlan,
+) -> Result<Option<QueryResponse>, QueryError> {
+    fn inline_parameters(extra: usize) -> bool {
+        crate::engine::params::with_current_params(|params, _| {
+            params.is_none_or(|params| {
+                params.len().saturating_add(extra) <= 16
+                    && params.iter().all(|value| {
+                        matches!(
+                            value,
+                            Value::Null
+                                | Value::Int(_)
+                                | Value::UInt(_)
+                                | Value::Float(_)
+                                | Value::Double(_)
+                                | Value::DecimalCompact(..)
+                                | Value::Decimal128(..)
+                                | Value::Date(_)
+                                | Value::Time(_)
+                                | Value::DateTime(_)
+                                | Value::Timestamp(_)
+                        )
+                    })
+            })
+        })
+    }
+    // Text literals carry coercion provenance for all their placeholders.
+    // Appended scalar values are wire-style bindings; keep mixed-provenance
+    // text execution on Apply until parameter contexts can describe each slot.
+    if crate::engine::params::auto_parameterized_active() {
+        return Ok(None);
+    }
+    if parent
+        .runtime_scalar_point
+        .get()
+        .is_some_and(Option::is_none)
+    {
+        return Ok(None);
+    }
+    if let Some(Some(memo)) = parent.runtime_scalar_point.get() {
+        if memo.source.as_ref() != stmt
+            || !inline_parameters(memo.subqueries.len())
+            || !super::eval::subquery_plan_cache_enabled()
+            || memo.subqueries.iter().any(|sub| {
+                !super::plan_deps_match_catalog(db, &sub.deps)
+                    || super::super::cte::select_references_active_cte(&sub.select)
+                    || crate::engine::params::with_current_params(|params, _| {
+                        crate::planner::parameter_selectivity_signature(
+                            db,
+                            &sub.select,
+                            params.unwrap_or(&[]),
+                        )
+                        .as_str()
+                            != sub.selectivity.as_ref()
+                    })
+            })
+        {
+            return Ok(None);
+        }
+        let mut params = smallvec::SmallVec::<[Value; 16]>::new();
+        crate::engine::params::with_current_params(|current, _| {
+            if let Some(current) = current {
+                params.extend(current.iter().cloned());
+            }
+        });
+        if !crate::engine::auto_param::parameter_plan_signature_matches(
+            stmt,
+            &params,
+            &memo.source_signature,
+            "",
+        ) {
+            return Ok(None);
+        }
+        let marks = crate::engine::api::statement_warning_marks();
+        let diagnostics = crate::engine::api::StatementWarningSink::default();
+        let values = super::analyze_stats::without_operator_collector(|| {
+            crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                memo.subqueries
+                    .iter()
+                    .map(|sub| super::eval::execute_independent_scalar(db, txn, sub))
+                    .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
+            })
+        });
+        let silent = diagnostics.lock().total_len() == 0
+            && crate::engine::api::statement_warning_marks() == marks;
+        let values = match values {
+            Ok(values)
+                if silent
+                    && values.iter().all(|v| {
+                        (crate::storage::is_numeric_value(v) || matches!(v, Value::Null))
+                            && !matches!(v, Value::Float(n) if !n.is_finite())
+                            && !matches!(v, Value::Double(n) if !n.is_finite())
+                    }) =>
+            {
+                values
+            }
+            _ => {
+                crate::engine::api::truncate_statement_warnings(marks);
+                crate::engine::cancel::check_cancelled()?;
+                return Ok(None);
+            }
+        };
+        params.extend(values);
+        if !crate::engine::auto_param::parameter_plan_signature_matches(
+            &memo.select,
+            &params,
+            &memo.signature,
+            "",
+        ) {
+            return Ok(None);
+        }
+        return crate::engine::params::with_params_slice(&params, || {
+            execute_compiled_select(db, txn, &memo.select, &memo.compiled).map(Some)
+        });
+    }
+    let Some(mut bound) = super::eval::bind_scalar_access_constants(db, txn, stmt)? else {
+        let _ = parent.runtime_scalar_point.set(None);
+        return Ok(None);
+    };
+    // Keep the extra binding frame inline. Variable-width bindings use Apply
+    // rather than retaining a second ungoverned copy of a large wire payload.
+    if !inline_parameters(0) {
+        let _ = parent.runtime_scalar_point.set(None);
+        return Ok(None);
+    }
+    let mut params = smallvec::SmallVec::<[Value; 16]>::new();
+    crate::engine::params::with_current_params(|current, _| {
+        if let Some(current) = current {
+            params.extend(current.iter().cloned());
+        }
+    });
+    let source_signature = crate::engine::auto_param::parameter_plan_signature(stmt, &params);
+    let mut scalar_queries = Vec::new();
+    fn defer<'a>(
+        old: &'a Expr,
+        new: &mut Expr,
+        params: &mut smallvec::SmallVec<[Value; 16]>,
+        queries: &mut Vec<&'a Select>,
+    ) -> bool {
+        match (old, new) {
+            (Expr::Subquery(query), new @ Expr::BoundValue(_)) => {
+                if params.len() == 16 {
+                    return false;
+                }
+                queries.push(query);
+                let Expr::BoundValue(value) =
+                    std::mem::replace(new, Expr::Placeholder(params.len()))
+                else {
+                    unreachable!()
+                };
+                params.push(value);
+            }
+            (
+                Expr::Binary {
+                    left: old_left,
+                    right: old_right,
+                    ..
+                },
+                Expr::Binary { left, right, .. },
+            ) => {
+                return defer(old_left, left, params, queries)
+                    && defer(old_right, right, params, queries);
+            }
+            _ => {}
+        }
+        true
+    }
+    if !defer(
+        stmt.selection.as_ref().unwrap(),
+        bound.selection.as_mut().unwrap(),
+        &mut params,
+        &mut scalar_queries,
+    ) {
+        let _ = parent.runtime_scalar_point.set(None);
+        return Ok(None);
+    }
+    fn unique_point(plan: &PhysicalPlan) -> bool {
+        match plan {
+            PhysicalPlan::Projection { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Sort { input, .. } => unique_point(input),
+            PhysicalPlan::IndexLookup {
+                index,
+                exact: true,
+                key,
+                ..
+            } => index.unique && !key.contains_null(),
+            _ => false,
+        }
+    }
+    if parent.runtime_scalar_point.get().is_none() {
+        let physical = crate::engine::params::with_params_slice(&params, || {
+            crate::planner::with_planning_params(&params, || {
+                crate::planner::plan_prepared_physical_select(db, &bound)
+            })
+        })?;
+        if !unique_point(&physical) {
+            let _ = parent.runtime_scalar_point.set(None);
+            return Ok(None);
+        }
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        if serde_json::to_writer(&mut count, &(&bound, stmt)).is_err() {
+            return Ok(None);
+        }
+        let bytes = count
+            .0
+            .saturating_mul(8)
+            .saturating_add(
+                physical
+                    .node_count()
+                    .saturating_mul(std::mem::size_of::<PhysicalPlan>()),
+            )
+            .saturating_add(64 * 1024);
+        let Some(charge) = super::super::mem_budget::ControlledMemoryCharge::try_new_optional(
+            super::super::mem_budget::ControlledMemoryCategory::DerivedCache,
+            bytes,
+        ) else {
+            return Ok(None);
+        };
+        let Some(subqueries) = scalar_queries
+            .iter()
+            .map(|query| super::eval::compile_independent_scalar(db, query))
+            .collect::<Option<Vec<_>>>()
+        else {
+            let _ = parent.runtime_scalar_point.set(None);
+            return Ok(None);
+        };
+        let select = Arc::new(bound.clone());
+        let executable = crate::engine::params::with_params_slice(&params, || {
+            crate::engine::cache::CompiledSelectPlan::new(
+                Arc::clone(&select),
+                Arc::new(physical),
+                smallvec::SmallVec::new(),
+                smallvec::SmallVec::new(),
+                parent.epoch,
+            )
+        });
+        db.record_select_operator_compile();
+        let _ =
+            parent
+                .runtime_scalar_point
+                .set(Some(crate::engine::cache::RuntimeScalarPointPlan {
+                    source: if parent.semantic_select.as_ref() == stmt {
+                        Arc::clone(&parent.semantic_select)
+                    } else {
+                        Arc::new(stmt.clone())
+                    },
+                    source_signature: source_signature.into(),
+                    subqueries,
+                    signature: crate::engine::auto_param::parameter_plan_signature(
+                        &select, &params,
+                    )
+                    .into(),
+                    select,
+                    compiled: Arc::new(executable),
+                    _charge: charge,
+                }));
+    }
+    let Some(memo) = parent
+        .runtime_scalar_point
+        .get()
+        .and_then(Option::as_ref)
+        .filter(|memo| {
+            memo.select.as_ref() == &bound
+                && crate::engine::auto_param::parameter_plan_signature_matches(
+                    &bound,
+                    &params,
+                    &memo.signature,
+                    "",
+                )
+        })
+    else {
+        return Ok(None);
+    };
+    crate::engine::params::with_params_slice(&params, || {
+        execute_compiled_select(db, txn, &bound, &memo.compiled).map(Some)
+    })
+}
+
 /// Execute the immutable artifact produced by physical-plan compilation.
 /// The presentation-bearing `stmt` comes from the current SQL text while all
 /// access-path decisions come from `compiled`; this is what permits semantic
@@ -670,6 +963,16 @@ pub(crate) fn execute_compiled_select(
         return execute_physical_select(db, txn, stmt, &compiled.physical);
     }
     super::check_primary_definition_for_select(db, txn, stmt)?;
+    if compiled.runtime_scalar_candidate
+        && !compiled
+            .runtime_scalar_point
+            .get()
+            .is_some_and(Option::is_none)
+    {
+        if let Some(response) = execute_runtime_scalar_point(db, txn, stmt, compiled)? {
+            return Ok(response);
+        }
+    }
     use crate::engine::cache::CompiledOperator;
     let operator = compiled.executable.as_ref();
     super::analyze_stats::register_execution_plan(&compiled.physical)?;

@@ -705,7 +705,9 @@ impl PackedNumericLeaf {
             return Some(false);
         };
         let target_pos = insertion_pos - usize::from(old_pos < insertion_pos);
-        if (!is_root && (old_pos == 0 || target_pos == 0)) || !self.admits_layout(&new.key) {
+        if (!is_root && target_pos == 0 && (old_pos != 0 || new < old))
+            || !self.admits_layout(&new.key)
+        {
             return None;
         }
         let before_bytes =

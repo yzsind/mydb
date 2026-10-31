@@ -5266,6 +5266,12 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
                 ", \"expression_mode\": \"{}\", \"native_expression_rows\": {}, \"fallback_expression_rows\": {}",
                 mode, s.native_expression_rows, s.fallback_expression_rows
             ));
+            if s.expression_workers > 0 {
+                extra.push_str(&format!(
+                    ", \"expression_workers\": {}",
+                    s.expression_workers
+                ));
+            }
         }
         if let Some(mode) = s.aggregate_mode {
             extra.push_str(&format!(

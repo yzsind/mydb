@@ -56,6 +56,7 @@ pub(super) fn replay_decode_charge(bytes: usize) -> Result<ControlledMemoryCharg
 pub(crate) struct UndoWalRecord<'a> {
     pub undo_id: u64,
     pub bytes: Cow<'a, [u8]>,
+    _charge: Option<DecodeReservation>,
 }
 
 pub(crate) trait WalRecordSource {
@@ -85,6 +86,7 @@ pub(crate) trait WalRecordSource {
         Ok(Some(UndoWalRecord {
             undo_id: *undo_id,
             bytes: Cow::Owned(bytes.clone()),
+            _charge: None,
         }))
     }
     fn zone_delta(&self, index: usize) -> Result<Option<Cow<'_, [u8]>>, QueryError> {
@@ -306,6 +308,8 @@ fn corrupt_directory() -> QueryError {
     )
 }
 
+const COMPRESSED_LOCATION: u32 = 1 << 31;
+
 #[derive(Debug, Clone, Copy)]
 struct RecordLocation {
     source_time_us: u64,
@@ -419,7 +423,11 @@ impl WalRecordSource for ReplayRecords {
     fn record(&self, index: usize) -> Result<RecordLease<'_>, QueryError> {
         let loc = self.locations.get(index).ok_or_else(corrupt_directory)?;
         let header = loc.header()?;
-        let charge = self.reserve_decode(loc.len as usize)?;
+        let charge = self.reserve_decode(if loc.segment_and_type & COMPRESSED_LOCATION != 0 {
+            MAX_COMPRESSED_TXN_BATCH_BYTES
+        } else {
+            loc.len as usize
+        })?;
         let bytes = self.payload(loc)?;
         Ok(RecordLease {
             record: Cow::Owned(WalRecord {
@@ -437,6 +445,11 @@ impl WalRecordSource for ReplayRecords {
         if loc.header()?.record_type != WalRecordType::UndoRecord {
             return Ok(None);
         }
+        let charge = if loc.segment_and_type & COMPRESSED_LOCATION != 0 {
+            Some(self.reserve_decode(MAX_COMPRESSED_TXN_BATCH_BYTES)?)
+        } else {
+            None
+        };
         let bytes = self.payload(loc)?;
         if bytes.len() < 12 {
             return Err(corrupt_directory());
@@ -454,7 +467,11 @@ impl WalRecordSource for ReplayRecords {
                     .to_vec(),
             ),
         };
-        Ok(Some(UndoWalRecord { undo_id, bytes }))
+        Ok(Some(UndoWalRecord {
+            undo_id,
+            bytes,
+            _charge: charge,
+        }))
     }
     fn zone_delta(&self, index: usize) -> Result<Option<Cow<'_, [u8]>>, QueryError> {
         let loc = self.locations.get(index).ok_or_else(corrupt_directory)?;
@@ -550,8 +567,11 @@ impl ReplayRecords {
         })
     }
     fn payload(&self, loc: &RecordLocation) -> Result<Cow<'_, [u8]>, QueryError> {
-        let segment_index = (loc.segment_and_type >> 8) as usize;
-        let segment = &self.segments[segment_index];
+        let segment_index = ((loc.segment_and_type & !COMPRESSED_LOCATION) >> 8) as usize;
+        let segment = self
+            .segments
+            .get(segment_index)
+            .ok_or_else(corrupt_directory)?;
         loc.offset
             .checked_add(loc.len as u64)
             .filter(|end| *end <= segment.len as u64)
@@ -596,7 +616,48 @@ impl ReplayRecords {
                 mapped.windows.push_back((segment_index, window));
             }
         }
-        segment.bytes(loc.offset, loc.len as usize)
+        let bytes = segment.bytes(loc.offset, loc.len as usize)?;
+        if loc.segment_and_type & COMPRESSED_LOCATION == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() < WAL_FRAME_HEADER_LEN {
+            return Err(corrupt_directory());
+        }
+        let header = read_record_header(&bytes)?;
+        if header.record_type != WalRecordType::TxnBatch {
+            return Err(corrupt_directory());
+        }
+        let expanded = expand_compressed_txn_batch(&bytes[WAL_FRAME_HEADER_LEN..])?
+            .ok_or_else(corrupt_directory)?;
+        let raw = expanded.bytes.as_slice();
+        let count = read_u32(raw, 0) as u64;
+        let first = header
+            .lsn
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(count))
+            .ok_or_else(corrupt_directory)?;
+        let ordinal = loc
+            .lsn
+            .checked_sub(first)
+            .filter(|ordinal| *ordinal < count)
+            .ok_or_else(corrupt_directory)?;
+        let mut offset = 4;
+        for position in 0..count {
+            let ty = WalRecordType::from_u16(read_u16_checked(raw, &mut offset)?)?;
+            let len = read_u32_checked(raw, &mut offset)? as usize;
+            let end = offset
+                .checked_add(len)
+                .filter(|end| *end <= raw.len())
+                .ok_or_else(corrupt_directory)?;
+            if position == ordinal {
+                if ty != loc.header()?.record_type {
+                    return Err(corrupt_directory());
+                }
+                return Ok(Cow::Owned(raw[offset..end].to_vec()));
+            }
+            offset = end;
+        }
+        Err(corrupt_directory())
     }
     pub fn find_lsn(&self, lsn: u64) -> Result<Option<RecordLease<'_>>, QueryError> {
         match self.locations.find(lsn) {
@@ -690,7 +751,10 @@ fn scan_replay_segment(
         id,
         truncate_tail,
         mode,
-        |record, offset, len| {
+        |record, offset, len, compressed| {
+            if index >= (1 << 23) {
+                return Err(corrupt_directory());
+            }
             if record.lsn <= last_lsn {
                 return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
@@ -707,7 +771,9 @@ fn scan_replay_segment(
                     txn_id: record.txn_id,
                     offset,
                     len: len as u32,
-                    segment_and_type: ((index as u32) << 8) | record.payload.record_type() as u32,
+                    segment_and_type: ((index as u32) << 8)
+                        | record.payload.record_type() as u32
+                        | if compressed { COMPRESSED_LOCATION } else { 0 },
                 },
                 &mut charge,
             )?;
@@ -826,7 +892,10 @@ impl ReplayScan {
                 self.read_mode,
                 start,
                 last_lsn,
-                |record, offset, len| {
+                |record, offset, len, compressed| {
+                    if index >= (1 << 23) {
+                        return Err(corrupt_directory());
+                    }
                     if record.lsn <= last_lsn {
                         return Err(corrupt_directory());
                     }
@@ -845,7 +914,8 @@ impl ReplayScan {
                             offset,
                             len: len as u32,
                             segment_and_type: ((index as u32) << 8)
-                                | record.payload.record_type() as u32,
+                                | record.payload.record_type() as u32
+                                | if compressed { COMPRESSED_LOCATION } else { 0 },
                         },
                         &mut self.records._directory_charge,
                     )?;

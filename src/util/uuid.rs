@@ -22,6 +22,17 @@ pub(crate) fn format(bytes: &[u8; 16]) -> String {
     out
 }
 
+/// Append canonical ASCII directly to an owning SQL column buffer.
+pub(crate) fn append_ascii(bytes: &[u8; 16], out: &mut Vec<u8>) {
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push(b'-');
+        }
+        out.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+        out.push(b"0123456789abcdef"[(byte & 15) as usize]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,6 +53,9 @@ mod tests {
                     &hex[20..]
                 );
                 let actual = format(&bytes);
+                let mut appended = b"prefix".to_vec();
+                append_ascii(&bytes, &mut appended);
+                assert_eq!(&appended[6..], expected.as_bytes());
                 assert_eq!(actual, expected);
                 assert_eq!(parse(&actual), Some(bytes));
             }

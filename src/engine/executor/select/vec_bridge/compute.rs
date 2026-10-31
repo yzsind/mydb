@@ -827,7 +827,10 @@ pub(super) fn compute_columns_batch(
         } else {
             let mut values = vec![vec![Value::Null; batch.num_rows()]; programs.len()];
             let mut row_values = Vec::with_capacity(batch.columns().len());
-            for row in batch.visible_indices() {
+            for (ordinal, row) in batch.visible_indices().enumerate() {
+                if ordinal & crate::engine::cancel::SCALAR_ROW_CANCEL_MASK == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
                 row_values.clear();
                 row_values.extend(
                     batch

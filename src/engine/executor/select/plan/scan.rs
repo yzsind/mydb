@@ -4128,9 +4128,39 @@ pub(in crate::engine::executor::select) fn execute_index_in_lookup_ids(
     // silently returns zero rows. Fall back to a prefix scan so every row
     // whose leading columns equal the key is visited.
     let exact = key_prefix.0.len() + 1 >= index.columns.len();
+    let mut batched = exact && index.unique && !table.is_partitioned() && !txn.historical;
     let mut row_ids = Vec::new();
     let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    // Keep only one bounded probe window. Sorting/deduplicating encoded keys
+    // also collapses values that become equal after index collation/coercion.
+    let mut keys = Vec::new();
+    let mut keys_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    let workspace = keys_charge.remaining() / 4;
+    let batch_size = rows
+        .len()
+        .min(crate::engine::executor::vec::DEFAULT_BATCH_ROWS)
+        .min(workspace / (8 * std::mem::size_of::<IndexKey>()));
+    let key_bytes = batch_size.saturating_mul(std::mem::size_of::<IndexKey>());
+    // Reserve fixed-width keys and storage's temporary copies once per
+    // window; numeric probes must not perform memory-governor atomics per key.
+    let fixed_key_bytes = key_bytes.saturating_mul(5);
+    if batched
+        && (batch_size == 0
+            || !keys_charge.add_within(fixed_key_bytes, workspace)
+            || keys.try_reserve_exact(batch_size).is_err())
+    {
+        batched = false;
+        keys_charge.release_bytes(fixed_key_bytes);
+    }
+    let column = &table.columns[table.column_index(in_column)?];
+    let target = crate::storage::ParamTarget::for_column_with_collation(
+        &column.data_type,
+        column.unsigned,
+        column.collation.as_deref(),
+    );
     let mut seen_values = HashSet::new();
+    let mut payload_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    let mut payload_bytes = 0usize;
     for row in rows {
         let Some(value) = row.first() else {
             continue;
@@ -4139,23 +4169,49 @@ pub(in crate::engine::executor::select) fn execute_index_in_lookup_ids(
             continue;
         }
         let mut parts = key_prefix.0.clone();
-        let column = &table.columns[table.column_index(in_column)?];
-        let target = crate::storage::ParamTarget::for_column_with_collation(
-            &column.data_type,
-            column.unsigned,
-            column.collation.as_deref(),
-        );
         let Some(part) = key_part_for_lookup_target(target, value)? else {
             continue;
         };
         parts.push(part);
         let key = IndexKey::from(parts);
-        let ids = if exact {
-            db.lookup_index_visible(table, index, key, txn)?
-        } else {
-            db.prefix_index_visible(table, index, key, txn)?
-        };
-        crate::engine::cancel::check_cancelled()?;
+        if !batched {
+            let ids = if exact {
+                db.lookup_index_visible(table, index, key, txn)?
+            } else {
+                db.prefix_index_visible(table, index, key, txn)?
+            };
+            append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+            crate::engine::cancel::check_cancelled()?;
+            continue;
+        }
+        // Include the concrete-key and encoded-entry copies used by storage.
+        let retained = key.heap_capacity_bytes().saturating_mul(4);
+        if retained != 0 && !payload_charge.add_within(retained, workspace) {
+            if !keys.is_empty() {
+                let ids = db.lookup_index_candidates_many(table, index, &keys, txn)?;
+                append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+                keys.clear();
+            }
+            payload_charge.release_bytes(payload_bytes);
+            payload_bytes = 0;
+            batched = false;
+            let ids = db.lookup_index_visible(table, index, key, txn)?;
+            append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+            continue;
+        }
+        payload_bytes = payload_bytes.saturating_add(retained);
+        keys.push(key);
+        if keys.len() == batch_size {
+            let ids = db.lookup_index_candidates_many(table, index, &keys, txn)?;
+            append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+            keys.clear();
+            payload_charge.release_bytes(payload_bytes);
+            payload_bytes = 0;
+            crate::engine::cancel::check_cancelled()?;
+        }
+    }
+    if !keys.is_empty() {
+        let ids = db.lookup_index_candidates_many(table, index, &keys, txn)?;
         append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
     }
     // Different SQL values can encode to the same index key (collation,

@@ -168,6 +168,7 @@ impl CatalogManager {
             .saturating_add(table.check_constraints.capacity().saturating_mul(512))
             .saturating_add(table.foreign_keys.capacity().saturating_mul(768))
             .saturating_add(table.row_layouts.capacity().saturating_mul(256))
+            .saturating_add(table.stats.allocated_bytes())
     }
 
     fn catalog_header_bytes(catalog: &Catalog) -> usize {
@@ -308,13 +309,16 @@ impl CatalogManager {
             .cloned()
     }
 
-    fn publish_dd_object_rows(&self, updates: Vec<(u64, u64, Vec<RowId>)>) {
+    fn publish_dd_object_rows(&self, updates: Vec<(u64, u64, Option<Vec<RowId>>)>) {
         if let Ok(mut rows) = self.dd_rows_by_object.write() {
             for (dd_table_id, object_id, row_ids) in updates {
-                if row_ids.is_empty() {
-                    rows.remove(&(dd_table_id, object_id));
-                } else {
-                    rows.insert((dd_table_id, object_id), row_ids);
+                match row_ids {
+                    Some(ids) if !ids.is_empty() => {
+                        rows.insert((dd_table_id, object_id), ids);
+                    }
+                    _ => {
+                        rows.remove(&(dd_table_id, object_id));
+                    }
                 }
             }
         }
@@ -591,6 +595,10 @@ enum CatalogRowSelector {
 }
 
 impl CatalogRowSelector {
+    fn whole_object(&self) -> bool {
+        matches!(self, Self::PrimaryValues(v) | Self::PrefixValues(v) if v.len() == 1)
+    }
+
     fn object_id(&self) -> Option<u64> {
         let values = match self {
             Self::PrimaryValues(values) | Self::PrefixValues(values) => values,
@@ -624,6 +632,7 @@ struct CatalogTxn<'a> {
     replacements: Vec<CatalogRowReplacement>,
     delta_object_ids: Vec<u64>,
     delta_invalidate_all: bool,
+    defer_table_publication: bool,
     #[cfg(test)]
     auth_mutation: bool,
     #[cfg(test)]
@@ -650,6 +659,7 @@ impl<'a> CatalogTxn<'a> {
             replacements: Vec::new(),
             delta_object_ids: Vec::new(),
             delta_invalidate_all: false,
+            defer_table_publication: false,
             #[cfg(test)]
             auth_mutation: false,
             #[cfg(test)]
@@ -694,6 +704,10 @@ impl<'a> CatalogTxn<'a> {
     }
 
     fn commit_in(mut self, txn: TxnView, stage_ddl_binlog: bool) -> Result<(), QueryError> {
+        let _rollback = RollbackTxnGuard::<true> {
+            db: self.db,
+            txn_id: txn.txn_id,
+        };
         if stage_ddl_binlog {
             if let Some((key, value)) = crate::replication::current_ddl_receipt()? {
                 self.replace(
@@ -749,6 +763,70 @@ impl<'a> CatalogTxn<'a> {
                 )
             })?);
         }
+        // Bind a fold/reset to its actual source transaction. Subsequent
+        // histogram or DDL rewrites retain the marker and must not replay it.
+        let mut generation_changes = HashSet::new();
+        for replacement in &self.replacements {
+            if replacement.dd_table_id != crate::storage::data_dictionary::DD_TABLES {
+                continue;
+            }
+            for row in &replacement.rows {
+                let Some(Value::UInt(id)) = row.first() else {
+                    continue;
+                };
+                let old = self.db.catalog_rows_for_selector(
+                    replacement.dd_table_id,
+                    CatalogRowSelector::PrimaryValues(vec![Value::UInt(*id)]),
+                )?;
+                if old.first().is_some_and(|old| old.get(19) != row.get(19)) {
+                    generation_changes.insert(*id);
+                }
+            }
+        }
+        let statistics_with_columns: HashSet<_> = self
+            .replacements
+            .iter()
+            .filter(|r| r.dd_table_id == crate::storage::data_dictionary::DD_COLUMN_STATS)
+            .flat_map(|r| r.rows.iter())
+            .filter_map(|r| match r.first() {
+                Some(Value::UInt(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for replacement in &mut self.replacements {
+            if replacement.dd_table_id != crate::storage::data_dictionary::DD_TABLE_STATS {
+                continue;
+            }
+            for row in &mut replacement.rows {
+                if row.get(1) != Some(&Value::UInt(0)) {
+                    continue;
+                }
+                let Some(Value::UInt(id)) = row.first() else {
+                    return Err(crate::storage::stats_codec::corrupt());
+                };
+                let id = *id;
+                let old = self.db.catalog_rows_for_selector(
+                    replacement.dd_table_id,
+                    CatalogRowSelector::PrimaryValues(vec![Value::UInt(id), Value::UInt(0)]),
+                )?;
+                if let Some(old) = old.first() {
+                    row[13] = if row[9] != old[9] && row[9] != Value::UInt(0) {
+                        Value::UInt(txn.txn_id)
+                    } else {
+                        old[13].clone()
+                    };
+                    row[14] = if (row[9] == Value::UInt(0) && old[9] != row[9])
+                        || (generation_changes.contains(&id)
+                            && row[3] == Value::UInt(0)
+                            && !statistics_with_columns.contains(&id))
+                    {
+                        Value::UInt(txn.txn_id)
+                    } else {
+                        old[14].clone()
+                    };
+                }
+            }
+        }
         // DD row mutations are the physical implementation of the enclosing
         // DDL query. They must not appear as a second user binlog transaction;
         // statement replication already records the DDL itself.
@@ -760,8 +838,33 @@ impl<'a> CatalogTxn<'a> {
                 let (changed, inserted) =
                     self.db.apply_catalog_row_replacement(txn, replacement)?;
                 mutation_rows = mutation_rows.saturating_add(changed as u64);
+                #[cfg(test)]
+                if self.defer_table_publication && STATS_CRASH_POINT.with(|p| p.get()) == 1 {
+                    self.db.flush_txn_wal_buffer(txn.txn_id, None)?;
+                    self.db.flush_dirty_data()?;
+                    let lsn = self.db.log.lock().last_lsn();
+                    LogManager::sync_durable_to(&self.db.log, lsn)?;
+                    std::process::exit(0);
+                }
+                #[cfg(test)]
+                if self.defer_table_publication
+                    && STATS_FAIL_AFTER_DD_ROWS.with(|v| v.replace(false))
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "injected statistics DD row failure",
+                    ));
+                }
                 if let Some(object_id) = replacement.selector.object_id() {
-                    locator_updates.push((replacement.dd_table_id, object_id, inserted));
+                    locator_updates.push((
+                        replacement.dd_table_id,
+                        object_id,
+                        if replacement.selector.whole_object() {
+                            Some(inserted)
+                        } else {
+                            None
+                        },
+                    ));
                 }
             }
             #[cfg(test)]
@@ -782,7 +885,15 @@ impl<'a> CatalogTxn<'a> {
             if stage_ddl_binlog {
                 crate::binlog::stage_current_ddl_transaction(txn.txn_id)?;
             }
-            self.db.commit_txn(txn.txn_id).map(|_| ()).map_err(|err| {
+            let committed = if self.defer_table_publication {
+                let mut token = self
+                    .db
+                    .commit_txn_deferred_with_vector_maintenance(txn.txn_id, false)?;
+                self.db.finish_deferred_commits(&mut [&mut token])
+            } else {
+                self.db.commit_txn(txn.txn_id).map(|_| ())
+            };
+            committed.map_err(|err| {
                 log_message(&format!(
                     "CatalogTxn commit failed txn_id={} replacements={}: {err}",
                     txn.txn_id,
@@ -806,14 +917,23 @@ impl<'a> CatalogTxn<'a> {
         }
         self.sequence_changes.clear();
         self.db.catalog.publish_dd_object_rows(locator_updates);
-        self.db.catalog.publish_table_deltas(&self.delta_object_ids);
+        drop(_dd_commit_guards);
+        if !self.defer_table_publication {
+            self.db.catalog.publish_table_deltas(&self.delta_object_ids);
+        }
         Ok(())
     }
 }
 
 impl Database {
-    pub(crate) fn set_password_validation_component(&self, installed: bool) -> Result<(), QueryError> {
-        self.mutate_auth_catalog(|auth| { auth.password_validation_component = installed; Ok(()) })
+    pub(crate) fn set_password_validation_component(
+        &self,
+        installed: bool,
+    ) -> Result<(), QueryError> {
+        self.mutate_auth_catalog(|auth| {
+            auth.password_validation_component = installed;
+            Ok(())
+        })
     }
 
     fn delete_auto_increment_metadata(&self, table_id: u64) -> Result<(), QueryError> {
@@ -897,9 +1017,23 @@ impl Database {
         let mut txn = CatalogTxn::new(self);
         txn.set_delta(Vec::new(), true);
         if before.password_validation_component != after.password_validation_component {
-            txn.replace(DD_DD_PROPERTIES,
-                CatalogRowSelector::PrimaryValues(vec![Value::String("component_validate_password".into())]),
-                vec![vec![Value::String("component_validate_password".into()), Value::String(if after.password_validation_component { "1" } else { "0" }.into())]]);
+            txn.replace(
+                DD_DD_PROPERTIES,
+                CatalogRowSelector::PrimaryValues(vec![Value::String(
+                    "component_validate_password".into(),
+                )]),
+                vec![vec![
+                    Value::String("component_validate_password".into()),
+                    Value::String(
+                        if after.password_validation_component {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                        .into(),
+                    ),
+                ]],
+            );
         }
         #[cfg(test)]
         {
@@ -1201,10 +1335,6 @@ impl Database {
         self.note_catalog_mutation(CatalogMutation::Table(table_id));
     }
 
-    fn note_catalog_stats(&self, table_id: u64) {
-        self.note_catalog_mutation(CatalogMutation::Stats(table_id));
-    }
-
     fn note_catalog_table_key(&self, key: &str) -> Result<u64, QueryError> {
         let table = self
             .catalog_read()?
@@ -1283,11 +1413,12 @@ impl Database {
     fn build_catalog_txn_incremental(&self) -> Result<Option<CatalogTxn<'_>>, QueryError> {
         use crate::storage::data_dictionary::{
             dd_row_for_event, dd_row_for_routine, dd_row_for_schema, dd_row_for_sequence,
-            dd_row_for_table_stats, dd_row_for_trigger, dd_row_for_view, dd_rows_for_auth,
-            dd_rows_for_table, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_DD_PROPERTIES, DD_EVENTS,
-            DD_FOREIGN_KEYS, DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES,
-            DD_INDEX_COLUMN_USAGE, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA,
-            DD_SEQUENCES, DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
+            dd_row_for_trigger, dd_row_for_view, dd_rows_for_auth, dd_rows_for_table,
+            DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS, DD_COLUMN_STATS,
+            DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
+            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
+            DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
+            DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
         };
         let mut mutations = Self::take_catalog_mutations();
         if mutations.is_empty() {
@@ -1298,9 +1429,9 @@ impl Database {
         let delta_object_ids = mutations
             .iter()
             .filter_map(|mutation| match mutation {
-                CatalogMutation::Table(table_id)
-                | CatalogMutation::TableVersion(table_id, _)
-                | CatalogMutation::Stats(table_id) => Some(*table_id),
+                CatalogMutation::Table(table_id) | CatalogMutation::TableVersion(table_id, _) => {
+                    Some(*table_id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1309,7 +1440,6 @@ impl Database {
                 mutation,
                 CatalogMutation::Table(_)
                     | CatalogMutation::TableVersion(_, _)
-                    | CatalogMutation::Stats(_)
                     | CatalogMutation::SequenceValue(_, _)
                     | CatalogMutation::SequenceRetirement(_, _)
             )
@@ -1381,6 +1511,7 @@ impl Database {
                     }
                     let rows = table
                         .map(|table| dd_rows_for_table(table))
+                        .transpose()?
                         .unwrap_or_default();
                     txn.replace(
                         DD_TABLES,
@@ -1395,6 +1526,10 @@ impl Database {
                         (DD_FOREIGN_KEYS, rows.foreign_keys),
                         (DD_FOREIGN_KEY_COLUMN_USAGE, rows.foreign_key_column_usage),
                         (DD_TABLE_STATS, rows.table_stats),
+                        (DD_COLUMN_STATS, rows.column_stats),
+                        (DD_INDEX_STATS, rows.index_stats),
+                        (DD_EXTENDED_STATS, rows.extended_stats),
+                        (DD_COLUMN_HISTOGRAMS, rows.column_histograms),
                     ] {
                         txn.replace(
                             dd_table_id,
@@ -1404,21 +1539,6 @@ impl Database {
                     }
                 }
                 CatalogMutation::TableVersion(_, _) => {}
-                CatalogMutation::Stats(table_id) => {
-                    let rows = self
-                        .catalog
-                        .table_key_by_id(table_id)
-                        .and_then(|key| catalog.tables.get(&key))
-                        .filter(|table| table.id == table_id)
-                        .or_else(|| catalog.tables.values().find(|table| table.id == table_id))
-                        .map(|table| vec![dd_row_for_table_stats(table)])
-                        .unwrap_or_default();
-                    txn.replace(
-                        DD_TABLE_STATS,
-                        CatalogRowSelector::PrimaryValues(vec![Value::UInt(table_id)]),
-                        rows,
-                    );
-                }
                 CatalogMutation::View { schema, name } => {
                     let key = table_key(&schema, &name);
                     let rows = catalog
@@ -1522,7 +1642,7 @@ impl Database {
                     );
                 }
                 CatalogMutation::Auth => {
-                    let rows = dd_rows_for_auth(&catalog.auth);
+                    let rows = dd_rows_for_auth(&catalog.auth)?;
                     for (dd_table_id, family) in [
                         (DD_USERS, rows.users),
                         (DD_GLOBAL_PRIVILEGES, rows.grants),
@@ -1532,8 +1652,16 @@ impl Database {
                         txn.replace(dd_table_id, CatalogRowSelector::All, family);
                     }
                     for property in rows.dd_properties {
-                        let name = property.first().and_then(crate::types::value_str).unwrap_or_default().to_string();
-                        txn.replace(DD_DD_PROPERTIES, CatalogRowSelector::PrimaryValues(vec![Value::String(name)]), vec![property]);
+                        let name = property
+                            .first()
+                            .and_then(crate::types::value_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        txn.replace(
+                            DD_DD_PROPERTIES,
+                            CatalogRowSelector::PrimaryValues(vec![Value::String(name)]),
+                            vec![property],
+                        );
                     }
                 }
             }
@@ -1563,6 +1691,140 @@ impl Database {
         }
     }
 
+    /// Persist a complete candidate before changing any live statistics or folded counter.
+    /// The catalog publication guard also serializes the final DDL revision check.
+    fn publish_stats_candidate(
+        &self,
+        expected: &TableSchema,
+        candidate: TableSchema,
+    ) -> Result<(), QueryError> {
+        self.publish_stats_candidate_checked(expected, candidate, false)
+            .map(|_| ())
+    }
+
+    fn publish_stats_candidate_checked(
+        &self,
+        expected: &TableSchema,
+        mut candidate: TableSchema,
+        skip_online: bool,
+    ) -> Result<bool, QueryError> {
+        use crate::storage::data_dictionary::{dd_rows_for_table, DD_STATS_TABLES, DD_TABLES};
+        crate::engine::cancel::check_cancelled()?;
+        candidate.bump_schema_version_without_system_time_epoch();
+        let rows = dd_rows_for_table(&candidate)?;
+        let previous = dd_rows_for_table(expected)?;
+        let _candidate_charge = crate::engine::executor::mem_budget::force_charge_scoped(
+            CatalogManager::descriptor_bytes(&candidate),
+        )?;
+        let key = expected.qualified_name();
+        let mut catalog = self.catalog_write()?;
+        if skip_online && self.catalog.online_pinned_ids.read().contains(&expected.id) {
+            return Ok(false);
+        }
+        let current = catalog.tables.get(&key).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                "table disappeared during ANALYZE",
+            )
+        })?;
+        if current.id != expected.id || current.schema_version != expected.schema_version {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                "table changed during ANALYZE; retry",
+            ));
+        }
+        #[cfg(test)]
+        if DDL_CATALOG_COMMIT_FAILURE.with(|fail| fail.replace(false)) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "injected statistics commit failure",
+            ));
+        }
+        let mut txn = CatalogTxn::new(self);
+        txn.defer_table_publication = true;
+        txn.set_delta(vec![expected.id], false);
+        txn.replace(
+            DD_TABLES,
+            CatalogRowSelector::PrimaryValues(vec![Value::UInt(expected.id)]),
+            rows.tables.clone(),
+        );
+        for ((id, values), (_, old_values)) in
+            rows.per_table().into_iter().zip(previous.per_table())
+        {
+            if !DD_STATS_TABLES.contains(&id) {
+                continue;
+            }
+            let schema =
+                crate::storage::data_dictionary::dd_table_schema(id).expect("statistics schema");
+            let key_len = schema.primary_key.len();
+            let key = |row: &Vec<Value>| {
+                row[..key_len]
+                    .iter()
+                    .map(|v| match v {
+                        Value::UInt(n) => *n,
+                        _ => unreachable!("statistics key"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let old: BTreeMap<_, _> = old_values.iter().map(|row| (key(row), row)).collect();
+            let new: BTreeMap<_, _> = values.iter().map(|row| (key(row), row)).collect();
+            for (k, row) in &new {
+                let unchanged = old.get(k).is_some_and(|old| {
+                    // Each object carries its last-change revision, bounded by the
+                    // root revision. MVCC makes unchanged objects part of the snapshot.
+                    !(id == crate::storage::data_dictionary::DD_TABLE_STATS && k[1] == 0)
+                        && old
+                            .iter()
+                            .zip(row.iter())
+                            .enumerate()
+                            .all(|(i, (a, b))| i == key_len || a == b)
+                });
+                if !unchanged {
+                    txn.replace(
+                        id,
+                        CatalogRowSelector::PrimaryValues(row[..key_len].to_vec()),
+                        vec![(*row).clone()],
+                    );
+                }
+            }
+            for (k, row) in old {
+                if !new.contains_key(&k) {
+                    txn.replace(
+                        id,
+                        CatalogRowSelector::PrimaryValues(row[..key_len].to_vec()),
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+        txn.commit()?;
+        #[cfg(test)]
+        if STATS_CRASH_POINT.with(|p| p.get()) == 2 {
+            std::process::exit(0);
+        }
+        if candidate.stats.analyze_revision != expected.stats.analyze_revision {
+            if let Some(counter) = self.table_live_row_deltas.read().get(&expected.id) {
+                counter.fetch_sub(
+                    candidate.stats.last_analyze_live_baseline,
+                    Ordering::Relaxed,
+                );
+            }
+            if let Some(counter) = self.table_modification_deltas.read().get(&expected.id) {
+                counter.fetch_sub(
+                    candidate.stats.last_analyze_modification_baseline,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        catalog.tables.insert(key.clone(), Arc::new(candidate));
+        drop(catalog);
+        self.catalog.publish_table_deltas(&[expected.id]);
+        // Commit maintenance may resolve table descriptors, so run it only
+        // after releasing the statistics publication latch.
+        self.drain_vector_purges();
+        Ok(true)
+    }
+
     fn dd_primary_index(table: &TableSchema) -> Result<&IndexSchema, QueryError> {
         table
             .indexes
@@ -1584,9 +1846,11 @@ impl Database {
         table: &TableSchema,
         selector: &CatalogRowSelector,
     ) -> Result<Vec<RowId>, QueryError> {
-        if let Some(object_id) = selector.object_id() {
-            if let Some(row_ids) = self.catalog.dd_object_rows(table.id, object_id) {
-                return Ok(row_ids);
+        if selector.whole_object() {
+            if let Some(object_id) = selector.object_id() {
+                if let Some(row_ids) = self.catalog.dd_object_rows(table.id, object_id) {
+                    return Ok(row_ids);
+                }
             }
         }
         match selector {
@@ -1652,6 +1916,29 @@ impl Database {
         Ok(rows)
     }
 
+    fn catalog_rows_for_selector_at(
+        &self,
+        dd_table_id: u64,
+        selector: CatalogRowSelector,
+        txn: TxnView,
+    ) -> Result<Vec<Vec<Value>>, QueryError> {
+        let table =
+            crate::storage::data_dictionary::dd_table_schema(dd_table_id).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "unknown dictionary table",
+                )
+            })?;
+        let ids = self.catalog_selected_row_ids(&table, &selector)?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = self.read_row(&table, id, txn)? {
+                rows.push(row.values);
+            }
+        }
+        Ok(rows)
+    }
+
     /// Decode one table descriptor using bounded primary-index range probes.
     /// This is the CatalogManager miss path; it never scans unrelated tables.
     fn load_table_descriptor_from_dd(
@@ -1695,12 +1982,23 @@ impl Database {
     ) -> Result<Option<Arc<TableSchema>>, QueryError> {
         use crate::storage::data_dictionary::{
             catalog_schema_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS,
-            DD_FOREIGN_KEYS, DD_FOREIGN_KEY_COLUMN_USAGE, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
+            DD_COLUMN_HISTOGRAMS, DD_COLUMN_STATS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
+            DD_FOREIGN_KEY_COLUMN_USAGE, DD_INDEXES, DD_INDEX_COLUMN_USAGE, DD_INDEX_STATS,
             DD_TABLES, DD_TABLE_STATS,
         };
-        let tables = self.catalog_rows_for_selector(
+        let _dd_guard = CATALOG_DD_COMMIT_LOCKS[table_id as usize % CATALOG_DD_COMMIT_SHARDS]
+            .lock()
+            .map_err(|_| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "catalog DD shard lock poisoned",
+                )
+            })?;
+        let snapshot = StorageReadSnapshot::new(self);
+        let tables = self.catalog_rows_for_selector_at(
             DD_TABLES,
             CatalogRowSelector::PrimaryValues(vec![Value::UInt(table_id)]),
+            snapshot.txn,
         )?;
         if tables.is_empty() {
             return Ok(None);
@@ -1708,14 +2006,53 @@ impl Database {
         let prefix = || CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id)]);
         let set = DdRowSet {
             tables,
-            columns: self.catalog_rows_for_selector(DD_COLUMNS, prefix())?,
-            indexes: self.catalog_rows_for_selector(DD_INDEXES, prefix())?,
-            index_column_usage: self.catalog_rows_for_selector(DD_INDEX_COLUMN_USAGE, prefix())?,
-            check_constraints: self.catalog_rows_for_selector(DD_CHECK_CONSTRAINTS, prefix())?,
-            foreign_keys: self.catalog_rows_for_selector(DD_FOREIGN_KEYS, prefix())?,
-            foreign_key_column_usage: self
-                .catalog_rows_for_selector(DD_FOREIGN_KEY_COLUMN_USAGE, prefix())?,
-            table_stats: self.catalog_rows_for_selector(DD_TABLE_STATS, prefix())?,
+            columns: self.catalog_rows_for_selector_at(DD_COLUMNS, prefix(), snapshot.txn)?,
+            indexes: self.catalog_rows_for_selector_at(DD_INDEXES, prefix(), snapshot.txn)?,
+            index_column_usage: self.catalog_rows_for_selector_at(
+                DD_INDEX_COLUMN_USAGE,
+                prefix(),
+                snapshot.txn,
+            )?,
+            check_constraints: self.catalog_rows_for_selector_at(
+                DD_CHECK_CONSTRAINTS,
+                prefix(),
+                snapshot.txn,
+            )?,
+            foreign_keys: self.catalog_rows_for_selector_at(
+                DD_FOREIGN_KEYS,
+                prefix(),
+                snapshot.txn,
+            )?,
+            foreign_key_column_usage: self.catalog_rows_for_selector_at(
+                DD_FOREIGN_KEY_COLUMN_USAGE,
+                prefix(),
+                snapshot.txn,
+            )?,
+            table_stats: self.catalog_rows_for_selector_at(
+                DD_TABLE_STATS,
+                prefix(),
+                snapshot.txn,
+            )?,
+            column_stats: self.catalog_rows_for_selector_at(
+                DD_COLUMN_STATS,
+                prefix(),
+                snapshot.txn,
+            )?,
+            index_stats: self.catalog_rows_for_selector_at(
+                DD_INDEX_STATS,
+                prefix(),
+                snapshot.txn,
+            )?,
+            extended_stats: self.catalog_rows_for_selector_at(
+                DD_EXTENDED_STATS,
+                prefix(),
+                snapshot.txn,
+            )?,
+            column_histograms: self.catalog_rows_for_selector_at(
+                DD_COLUMN_HISTOGRAMS,
+                prefix(),
+                snapshot.txn,
+            )?,
             ..DdRowSet::default()
         };
         let mut decoded = catalog_schema_from_dd_rows(&set)?;
@@ -1877,7 +2214,7 @@ impl Database {
 
     fn bootstrap_catalog_store(&self, catalog: &Catalog) -> Result<(), QueryError> {
         use crate::storage::data_dictionary::catalog_to_dd_rows;
-        let rows = catalog_to_dd_rows(catalog);
+        let rows = catalog_to_dd_rows(catalog)?;
         let mut txn = CatalogTxn::new(self);
         for (dd_table_id, table_rows) in rows.per_table() {
             txn.replace(dd_table_id, CatalogRowSelector::All, table_rows.clone());
@@ -1943,7 +2280,6 @@ enum CatalogMutation {
     Schema(String),
     Table(u64),
     TableVersion(u64, u64),
-    Stats(u64),
     View {
         schema: String,
         name: String,
@@ -1978,6 +2314,10 @@ struct CatalogApplyDelta {
 
 thread_local! {
     static CATALOG_MUTATIONS: RefCell<HashSet<CatalogMutation>> = RefCell::new(HashSet::new());
+    #[cfg(test)]
+    static STATS_FAIL_AFTER_DD_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    static STATS_CRASH_POINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 static CATALOG_TXN_COMMITS: AtomicU64 = AtomicU64::new(0);
 static CATALOG_TXN_ROLLBACKS: AtomicU64 = AtomicU64::new(0);

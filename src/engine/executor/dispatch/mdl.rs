@@ -409,21 +409,28 @@ fn acquire_prepared_mdl_requests(
             }) {
                 return Ok(PreparedMdlGuard::None);
             }
+            // Existing transaction tickets remain valid. Passing the entire
+            // recipe on a partial memo hit needlessly reacquires GLOBAL/FK
+            // object shards every time a statement touches one new table.
+            // Do not memoize any new request until its whole missing batch
+            // succeeds; a failed upgrade must retain only the old grants.
+            let missing: smallvec::SmallVec<[_; 4]> = requests
+                .iter()
+                .filter(|request| {
+                    !granted
+                        .iter()
+                        .any(|g| g.lock_type == request.lock_type && g.key == request.key)
+                })
+                .cloned()
+                .collect();
             db.acquire_cached_mdl(
                 session.connection_id as u64,
                 Some(session.connection_id as u64),
                 duration,
-                requests,
+                &missing,
                 "sql/statement",
             )?;
-            for request in requests {
-                if !granted
-                    .iter()
-                    .any(|g| g.lock_type == request.lock_type && g.key == request.key)
-                {
-                    granted.push(request.clone());
-                }
-            }
+            granted.extend(missing);
             return Ok(PreparedMdlGuard::None);
         }
     }
@@ -1839,4 +1846,84 @@ pub(super) fn collect_expr_table_uses(
         |_| true,
         |subquery| collect_select_table_uses(subquery, false, cte_names, out),
     );
+}
+
+#[cfg(test)]
+mod transaction_memo_tests {
+    use super::*;
+
+    #[test]
+    fn partial_transaction_mdl_memo_preserves_old_grants_and_retries_missing_objects() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+        let mut session = SessionContext::default();
+        session.connection_id = 11;
+        session.explicit_txn = true;
+        session.mdl_txn_generation = 1;
+        let global = MdlRequest {
+            key: MdlObjectKey::global(),
+            lock_type: MdlLockType::SharedWrite,
+        };
+        let a = MdlRequest {
+            key: MdlObjectKey::table("test", "a"),
+            lock_type: MdlLockType::SharedRead,
+        };
+        let b = MdlRequest {
+            key: MdlObjectKey::table("test", "b"),
+            lock_type: MdlLockType::SharedRead,
+        };
+        acquire_prepared_mdl_requests(&db, &session, &[global.clone(), a.clone()], false).unwrap();
+        db.acquire_cached_mdl(
+            22,
+            Some(22),
+            MdlDuration::Transaction,
+            &[MdlRequest {
+                key: b.key.clone(),
+                lock_type: MdlLockType::Exclusive,
+            }],
+            "test",
+        )
+        .unwrap();
+        let recipe = [global, a.clone(), b.clone()];
+        let blocked = acquire_prepared_mdl_requests(&db, &session, &recipe, false)
+            .err()
+            .unwrap();
+        assert!(crate::storage::is_lock_wait_pending_error(&blocked));
+        assert!(!session
+            .mdl_txn_grants
+            .borrow()
+            .1
+            .iter()
+            .any(|held| held.key == b.key));
+        assert!(session
+            .mdl_txn_grants
+            .borrow()
+            .1
+            .iter()
+            .any(|held| held.key == a.key));
+        // The earlier table grant survives failure of the newly missing one.
+        let blocked_a = db
+            .acquire_cached_mdl(
+                33,
+                Some(33),
+                MdlDuration::Statement,
+                &[MdlRequest {
+                    key: a.key.clone(),
+                    lock_type: MdlLockType::Exclusive,
+                }],
+                "test",
+            )
+            .unwrap_err();
+        assert!(crate::storage::is_lock_wait_pending_error(&blocked_a));
+        db.release_mdl_owner(33);
+        db.release_mdl_owner(22);
+        acquire_prepared_mdl_requests(&db, &session, &recipe, false).unwrap();
+        assert!(session
+            .mdl_txn_grants
+            .borrow()
+            .1
+            .iter()
+            .any(|held| held.key == b.key));
+        db.release_mdl_owner(11);
+    }
 }

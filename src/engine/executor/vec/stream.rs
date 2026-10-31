@@ -101,7 +101,7 @@ pub trait BatchOperator {
     fn is_native_parallel_scan(&self) -> bool {
         false
     }
-    /// Transfer unopened native scan partitions to an adjacent aggregate.
+    /// Transfer unopened native scan partitions to an adjacent consumer.
     /// Rejection must not consume input. The requested degree must agree with
     /// the planned source topology; this only removes an intermediate exchange.
     fn take_parallel_workers(

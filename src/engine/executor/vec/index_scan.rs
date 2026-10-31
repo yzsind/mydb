@@ -2234,8 +2234,12 @@ impl IndexBatchStream {
         let mut accumulator = ColumnAccumulator::for_field(field, self.batch_rows);
         let mut count = 0usize;
         let mut leaf_values = Vec::new();
+        let mut runtime_rejections = vec![0u64; self.exact_runtime_filters.len()];
+        let mut leaf_rejections = vec![0u64; self.exact_runtime_filters.len()];
         let mut rewound = false;
         while count < self.batch_rows {
+            crate::engine::cancel::check_cancelled()?;
+            leaf_rejections.fill(0);
             let next = match &mut self.state {
                 ScanState::LeafRange {
                     leaf_ids,
@@ -2290,12 +2294,25 @@ impl IndexBatchStream {
                                     self.txn,
                                 )
                             })?;
-                        leaf_values.extend(
-                            entries
-                                .iter()
-                                .zip(visible)
-                                .filter_map(|((value, _), visible)| visible.then_some(*value)),
-                        );
+                        for ((value, _), visible) in entries.iter().zip(visible) {
+                            if !visible {
+                                continue;
+                            }
+                            let mut admitted = true;
+                            for (position, filter) in self.exact_runtime_filters.iter().enumerate()
+                            {
+                                if !value
+                                    .is_some_and(|value| filter.filter.contains(i128::from(value)))
+                                {
+                                    leaf_rejections[position] += 1;
+                                    admitted = false;
+                                    break;
+                                }
+                            }
+                            if admitted {
+                                leaf_values.push(*value);
+                            }
+                        }
                         Ok(())
                     },
                 )?;
@@ -2328,9 +2345,17 @@ impl IndexBatchStream {
                 rewound = true;
                 break;
             }
+            for (total, rejected) in runtime_rejections.iter_mut().zip(&leaf_rejections) {
+                *total += rejected;
+            }
             count += leaf_values.len();
             for value in leaf_values.drain(..) {
                 accumulator.push_lossless_i64(value);
+            }
+        }
+        for (filter, rejected) in self.exact_runtime_filters.iter().zip(runtime_rejections) {
+            if let Some(counter) = &filter.rejected {
+                counter.fetch_add(rejected, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if rewound && count == 0 {
@@ -2566,7 +2591,10 @@ impl BatchOperator for IndexBatchStream {
         self.initialize()?;
         if self.covering {
             if self.raw_i64_key_position.is_some()
-                && self.exact_runtime_filters.is_empty()
+                && self
+                    .exact_runtime_filters
+                    .iter()
+                    .all(|filter| Some(filter.key_position) == self.raw_i64_key_position)
                 && self.seen.is_none()
                 && matches!(self.state, ScanState::LeafRange { .. } | ScanState::Done)
                 && self.leaf_repairs.is_none()
@@ -2953,6 +2981,135 @@ mod tests {
     use crate::engine::api::QueryResponse;
     use crate::engine::executor::StorageQueryEngine;
     use crate::storage::{DurabilityMode, IsolationLevel, StorageConfig};
+
+    #[test]
+    fn parallel_raw_integer_runtime_filters_preserve_ranges_nulls_and_snapshots() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            StorageConfig {
+                durability: DurabilityMode::Memory,
+                ..StorageConfig::from_env()
+            },
+        )
+        .unwrap();
+        engine
+            .execute("CREATE TABLE integer_filter (id INT PRIMARY KEY, k BIGINT, INDEX ik(k))")
+            .unwrap();
+        engine.execute("INSERT INTO integer_filter SELECT n, CASE WHEN MOD(n,11)=0 THEN NULL ELSE MOD(n,301)-150 END FROM generate_series(1,12000) gs(n)").unwrap();
+        let db = engine.db_for_tests();
+        let snapshot = db.visible_scn();
+        let _snapshot = db.register_statement_snapshot(snapshot);
+        let txn = TxnView::read_only(snapshot, IsolationLevel::RepeatableRead);
+        let schema = db.snapshot_table_schema("test.integer_filter").unwrap();
+        let index = schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "ik")
+            .unwrap()
+            .clone();
+        let key_column = schema.column_index("k").unwrap();
+        let table = PlanTable::new(schema.id, schema, None);
+        let low = Some(IndexBound {
+            key: IndexKey::from(vec![KeyPart::Int(-100)]),
+            inclusive: false,
+        });
+        let high = Some(IndexBound {
+            key: IndexKey::from(vec![KeyPart::Int(100)]),
+            inclusive: true,
+        });
+        for mutate in [false, true] {
+            if mutate {
+                engine
+                    .execute("UPDATE integer_filter SET k=999 WHERE MOD(id,3)=0")
+                    .unwrap();
+                engine
+                    .execute("DELETE FROM integer_filter WHERE MOD(id,5)=0")
+                    .unwrap();
+            }
+            for keys in [vec![], vec![-100, -99, 0, 100, 101], vec![999]] {
+                let parallel = IndexBatchStream::parallel_range_workers(
+                    db,
+                    txn,
+                    &table,
+                    &index,
+                    low.clone(),
+                    high.clone(),
+                    true,
+                    Some(&[key_column]),
+                    4,
+                )
+                .unwrap();
+                let workers = if mutate {
+                    assert!(
+                        parallel.is_none(),
+                        "pending repairs must decline parallel construction"
+                    );
+                    vec![IndexBatchStream::new(
+                        db,
+                        txn,
+                        &table,
+                        &index,
+                        IndexBatchAccess::Range {
+                            low: low.clone(),
+                            high: high.clone(),
+                            reverse: false,
+                        },
+                        true,
+                        Some(&[key_column]),
+                    )
+                    .unwrap()
+                    .unwrap()]
+                } else {
+                    let workers = parallel.expect("fixture must span multiple leaves");
+                    assert!(workers.len() > 1);
+                    workers
+                };
+                let mut builder =
+                    crate::engine::executor::select::bloom::ExactIntKeySetBuilder::with_capacity(
+                        keys.len(),
+                    )
+                    .unwrap();
+                for key in &keys {
+                    builder.insert(i128::from(*key));
+                }
+                let filter = Arc::new(builder.finish().unwrap());
+                let mut actual = Vec::new();
+                for mut worker in workers {
+                    assert_eq!(worker.raw_i64_key_position, Some(0));
+                    assert!(worker.install_runtime_filter(
+                        crate::planner::RuntimeFilter::ExactIntKey {
+                            keys: vec![Expr::Identifier("k".into())],
+                            null_safe: vec![false],
+                            filter: Arc::clone(&filter),
+                            rejected: Arc::new(std::sync::OnceLock::new()),
+                        }
+                    ));
+                    // Keep the native lane below one leaf; the repair oracle
+                    // uses bounded batches rather than re-sorting its directory per row.
+                    worker.batch_rows = if mutate { 128 } else { 1 };
+                    while let Some(batch) = worker.next_batch().unwrap() {
+                        for row in batch.visible_indices() {
+                            let Value::Int(value) = batch.columns()[0].value_at(row) else {
+                                panic!("integer output required")
+                            };
+                            actual.push(value);
+                        }
+                    }
+                }
+                let mut expected: Vec<_> = (1..=12000)
+                    .filter_map(|id| {
+                        let key = id % 301 - 150;
+                        (id % 11 != 0 && key > -100 && key <= 100 && keys.contains(&key))
+                            .then_some(key)
+                    })
+                    .collect();
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(actual, expected, "keys={keys:?}, mutate={mutate}");
+            }
+        }
+    }
 
     #[test]
     fn row_fallback_null_masks_cover_rows_beyond_scan_target() {

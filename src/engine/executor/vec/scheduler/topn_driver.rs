@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use crate::engine::executor::vec::batch::{Batch, ColumnVector};
 use crate::engine::executor::vec::stream::BatchOperator;
 use crate::types::{QueryError, Value};
 
@@ -38,6 +39,41 @@ struct TopKSink {
     spill: Option<spill::WorkerSpill>,
 }
 
+impl TopKSink {
+    fn inline_key_column<'a>(&self, batch: &'a Batch) -> Option<&'a ColumnVector> {
+        let column = batch.columns().get(self.keys.first()?.column)?;
+        match column {
+            ColumnVector::Null { .. }
+            | ColumnVector::Bool { .. }
+            | ColumnVector::I64 { .. }
+            | ColumnVector::U64 { .. }
+            | ColumnVector::F64 { .. }
+            | ColumnVector::Date32 { .. }
+            | ColumnVector::Time64 { .. }
+            | ColumnVector::DateTime64 { .. }
+            | ColumnVector::Timestamp64 { .. }
+            | ColumnVector::Decimal32 { .. }
+            | ColumnVector::Decimal64 { .. }
+            | ColumnVector::Decimal128 { .. } => Some(column),
+            _ => None,
+        }
+    }
+
+    /// A strictly worse leading key is rejectable without owning keys or
+    /// reserving a payload. Equal prefixes retain suffix/payload/ordinal ties;
+    /// spilled input retains its complete external-sort candidate stream.
+    fn rejects_inline_key(&self, column: &ColumnVector, row: usize) -> bool {
+        if self.spill.is_some() {
+            return false;
+        }
+        let Some((worst, field)) = self.topk.worst_first_key() else {
+            return false;
+        };
+        let value = column.value_at(row);
+        crate::engine::executor::sort::compare_value_for_sort(&value, worst, field).is_gt()
+    }
+}
+
 impl Sink for TopKSink {
     fn consume(&mut self, morsel: Morsel) -> Result<(), QueryError> {
         let mut base_row = morsel.base_row;
@@ -46,10 +82,14 @@ impl Sink for TopKSink {
             crate::engine::executor::select::eval::record_order_by_key_rows_prepared(
                 batch.visible_rows(),
             );
+            let inline_key = self.inline_key_column(batch);
             for r in batch.visible_indices() {
                 let seq = base_row.checked_add(r as u64).ok_or_else(|| {
                     crate::error::catalog::ER_UNKNOWN_ERROR.error("parallel TopN ordinal overflow")
                 })?;
+                if inline_key.is_some_and(|column| self.rejects_inline_key(column, r)) {
+                    continue;
+                }
                 if let Some(data_dir) = &self.data_dir {
                     // Worker shares partition one candidate budget; neither
                     // K nor worker count can multiply the allowed footprint.
@@ -641,5 +681,242 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn inline_cutoff_preserves_fixed_width_domains_null_order_and_payload_ties() {
+        use crate::engine::executor::sort::{compare_payload_rows, compare_value_for_sort};
+        let families: Vec<(ColumnType, Vec<Value>)> = vec![
+            (
+                ColumnType::LongLong,
+                vec![
+                    Value::Int(i64::MIN),
+                    Value::Int(-1),
+                    Value::Int(0),
+                    Value::Int(1),
+                    Value::Int(i64::MAX),
+                ],
+            ),
+            (
+                ColumnType::LongLong,
+                vec![
+                    Value::UInt(0),
+                    Value::UInt(1),
+                    Value::UInt(i64::MAX as u64),
+                    Value::UInt(u64::MAX),
+                ],
+            ),
+            (
+                ColumnType::Double,
+                vec![
+                    Value::Double(-1e300),
+                    Value::Double(-0.0),
+                    Value::Double(0.0),
+                    Value::Double(1e-300),
+                    Value::Double(1e300),
+                ],
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 38,
+                    scale: 3,
+                },
+                vec![
+                    Value::DecimalCompact(-123, 3),
+                    Value::DecimalCompact(0, 3),
+                    Value::DecimalCompact(123, 3),
+                ],
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 38,
+                    scale: 3,
+                },
+                vec![
+                    Value::DecimalCompact(-(1 << 40), 3),
+                    Value::DecimalCompact(0, 3),
+                    Value::DecimalCompact(1 << 40, 3),
+                ],
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 38,
+                    scale: 3,
+                },
+                vec![
+                    Value::Decimal128(-(1i128 << 80), 3),
+                    Value::Decimal128(0, 3),
+                    Value::Decimal128(1i128 << 80, 3),
+                ],
+            ),
+            (
+                ColumnType::Date,
+                vec![
+                    Value::Date(-100),
+                    Value::Date(0),
+                    Value::Date(100),
+                    Value::Date(crate::types::ZERO_DATE),
+                ],
+            ),
+            (
+                ColumnType::Time,
+                vec![Value::Time(-1234567), Value::Time(0), Value::Time(1234567)],
+            ),
+            (
+                ColumnType::DateTime,
+                vec![
+                    Value::DateTime(0),
+                    Value::DateTime(1234567),
+                    Value::DateTime(123456789),
+                ],
+            ),
+            (
+                ColumnType::Timestamp,
+                vec![
+                    Value::Timestamp(0),
+                    Value::Timestamp(1234567),
+                    Value::Timestamp(123456789),
+                ],
+            ),
+            (
+                ColumnType::VarString,
+                vec![
+                    Value::String("é".into()),
+                    Value::String("E".into()),
+                    Value::String("中文".into()),
+                    Value::String("a\0b".into()),
+                    Value::String("long".repeat(100)),
+                ],
+            ),
+            (
+                ColumnType::Blob,
+                vec![
+                    Value::Bytes(vec![]),
+                    Value::Bytes(vec![0, 255]),
+                    Value::Bytes(vec![255, 0]),
+                ],
+            ),
+        ];
+        for (kind, values) in families {
+            let mut fields = schema_iv().fields().to_vec();
+            fields[1].column_type = kind;
+            if kind == ColumnType::VarString {
+                fields[1].source.collation_id = Some(255);
+            }
+            let schema = Arc::new(BatchSchema::new(fields));
+            let rows = (0..513)
+                .map(|n| {
+                    vec![
+                        Value::Int(n),
+                        if n % 17 == 0 {
+                            Value::Null
+                        } else {
+                            values[(n as usize * 37) % values.len()].clone()
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            for ascending in [false, true] {
+                for nulls_first in [false, true] {
+                    let field = SortField {
+                        ascending,
+                        nulls_first,
+                        collation_id: schema.fields()[1].source.collation_id,
+                    };
+                    let mut expected = rows.clone();
+                    expected.sort_by(|a, b| {
+                        compare_value_for_sort(&a[1], &b[1], field)
+                            .then_with(|| compare_payload_rows(a, b))
+                    });
+                    expected.truncate(19);
+                    for workers in [1, 2, 4] {
+                        let batches = rows
+                            .chunks(29)
+                            .map(|chunk| {
+                                Batch::new(
+                                    schema.clone(),
+                                    vec![
+                                        ColumnVector::from_values(
+                                            chunk.iter().map(|r| r[0].clone()).collect(),
+                                        ),
+                                        ColumnVector::from_values(
+                                            chunk.iter().map(|r| r[1].clone()).collect(),
+                                        ),
+                                    ],
+                                )
+                            })
+                            .collect();
+                        let mut stream = MaterializedBatchOperator::new(schema.clone(), batches);
+                        let actual = run_topn_parallel(
+                            &mut stream,
+                            vec![SortKey {
+                                column: 1,
+                                ascending,
+                                nulls_first,
+                                collation_id: field.collation_id,
+                            }],
+                            19,
+                            workers,
+                        )
+                        .unwrap();
+                        assert_eq!(actual,expected,"{kind:?}, asc={ascending}, nulls_first={nulls_first}, workers={workers}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_strictly_worse_payload_does_not_force_parallel_topn_to_spill() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut fields = schema_iv().fields().to_vec();
+        fields[1].column_type = ColumnType::VarString;
+        let schema = Arc::new(BatchSchema::new(fields));
+        let batches = vec![
+            Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(vec![Value::Int(1)]),
+                    ColumnVector::from_values(vec![Value::String("winner".into())]),
+                ],
+            ),
+            Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(vec![Value::Int(2)]),
+                    ColumnVector::from_values(vec![Value::String("loser".repeat(65536))]),
+                ],
+            ),
+        ];
+        let budget = Arc::new(MemBudget::new(8192));
+        with_query_budget(budget.clone(), || {
+            let mut stream = MaterializedBatchOperator::new(schema, batches);
+            let result = run_topn_parallel_spillable(
+                &mut stream,
+                vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }],
+                1,
+                1,
+                dir.path(),
+                0,
+            )
+            .unwrap();
+            let ParallelTopNOutput::Resident(rows, charge) = result else {
+                panic!("a rejected payload forced spill")
+            };
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int(1), Value::String("winner".into())]]
+            );
+            drop(rows);
+            drop(charge);
+            assert!(budget.terminal_oom().is_none());
+        });
+        assert_eq!(budget.used(), 0);
     }
 }

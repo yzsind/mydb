@@ -3304,7 +3304,15 @@ where
                 manager.semi_sync_mark_replica(server_id);
             }
         }
-        for ev in manager.dump_preamble(&file, position) {
+        let initial_checksum = self
+            .context
+            .user_variable("source_binlog_checksum")
+            .or_else(|| self.context.user_variable("master_binlog_checksum"))
+            .filter(|value| value.to_display_string().eq_ignore_ascii_case("CRC32"))
+            .map_or(crate::binlog::BinlogChecksum::None, |_| {
+                crate::binlog::BinlogChecksum::Crc32
+            });
+        for ev in manager.dump_preamble(&file, position, initial_checksum) {
             let mut packet = Vec::with_capacity(ev.len() + 3);
             frame_binlog_packet(&mut packet, &ev, semi_sync_capable, false);
             if self

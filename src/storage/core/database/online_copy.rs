@@ -178,7 +178,9 @@ impl Database {
         use crate::parser::AlterAction as A;
         if actions.is_empty()
             || !actions.iter().all(|a| match a {
-                A::AddColumn(column) => !column.auto_increment || lock == crate::parser::AlterLock::Shared,
+                A::AddColumn(column) => {
+                    !column.auto_increment || lock == crate::parser::AlterLock::Shared
+                }
                 A::ModifyColumn(_) | A::ChangeColumn { .. } => true,
                 A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE"),
                 A::Rebuild
@@ -352,7 +354,8 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values = self.prepare_alter_copy_values(shadow, row.values, strict, warnings, &defaults)?;
+            let values =
+                self.prepare_alter_copy_values(shadow, row.values, strict, warnings, &defaults)?;
             tail_bytes = tail_bytes.saturating_add(
                 crate::engine::executor::mem_budget::estimate_row_bytes(&values),
             );
@@ -510,7 +513,13 @@ impl Database {
                 })?;
             }
         }
-        self.log_private_copy_vector_mutation(target, txn.txn_id, location.storage_id, location.row_id, None)?;
+        self.log_private_copy_vector_mutation(
+            target,
+            txn.txn_id,
+            location.storage_id,
+            location.row_id,
+            None,
+        )?;
         for index in target.indexes.iter().filter(|index| index.is_vector()) {
             self.vector_graph_mark_deleted(target, index, location.row_id, location.storage_id)?;
         }
@@ -575,10 +584,21 @@ impl Database {
         }
         let mut journal_values = vec![Value::Null; target.columns.len()];
         for (name, value) in &vector_values {
-            let index = target.indexes.iter().find(|index| index.name == *name).ok_or_else(vector::persistence::corrupt)?;
-            journal_values[target.column_index(&index.columns[0])?] = value.clone().unwrap_or(Value::Null);
+            let index = target
+                .indexes
+                .iter()
+                .find(|index| index.name == *name)
+                .ok_or_else(vector::persistence::corrupt)?;
+            journal_values[target.column_index(&index.columns[0])?] =
+                value.clone().unwrap_or(Value::Null);
         }
-        self.log_private_copy_vector_mutation(target, txn.txn_id, storage_id, row_id, Some(&journal_values))?;
+        self.log_private_copy_vector_mutation(
+            target,
+            txn.txn_id,
+            storage_id,
+            row_id,
+            Some(&journal_values),
+        )?;
         for (name, value) in vector_values {
             if let Some(Value::Vector(bytes)) = value {
                 let graph = self
@@ -676,7 +696,8 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values = self.prepare_alter_copy_values(target, row.values, strict, warnings, &defaults)?;
+            let values =
+                self.prepare_alter_copy_values(target, row.values, strict, warnings, &defaults)?;
             tail_bytes = tail_bytes.saturating_add(
                 crate::engine::executor::mem_budget::estimate_row_bytes(&values),
             );
@@ -847,12 +868,8 @@ impl Database {
             let build_ids = {
                 let mut catalog = self.catalog_write()?;
                 (0..source_ids.len())
-                    .map(|_| {
-                        let id = catalog.next_table_id;
-                        catalog.next_table_id += 1;
-                        id
-                    })
-                    .collect::<Vec<_>>()
+                    .map(|_| catalog.allocate_table_id())
+                    .collect::<Result<Vec<_>, _>>()?
             };
             self.ensure_table_id_highwater(self.current_next_table_id()?)?;
             let remap = source_ids
@@ -1097,7 +1114,9 @@ impl Database {
                     #[cfg(test)]
                     if attempt == 0 {
                         let hook = self.online_copy_publish_test_hook.lock().unwrap().take();
-                        if let Some(hook) = hook { hook.pause(); }
+                        if let Some(hook) = hook {
+                            hook.pause();
+                        }
                     }
                     let started = Instant::now();
                     if let Some(layout) = &rewrite {
@@ -1381,7 +1400,11 @@ impl AlterCopyChangeLog {
         self.record_buffered(entry, 4096)
     }
 
-    fn record_buffered(&mut self, entry: (u64, u64, RowId), buffered_rows: usize) -> Result<(), QueryError> {
+    fn record_buffered(
+        &mut self,
+        entry: (u64, u64, RowId),
+        buffered_rows: usize,
+    ) -> Result<(), QueryError> {
         #[cfg(unix)]
         use std::os::unix::fs::FileExt;
         if self.len() >= 64 * 1024 * 1024 / 24 {

@@ -1,5 +1,99 @@
 use super::*;
 
+#[test]
+fn buffered_insert_fallback_resumes_after_applied_prefix() {
+    for kind in 0..5 {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool = BufferPool::new(
+            1024,
+            log.clone(),
+            DurabilityMode::Relaxed,
+            Duration::from_secs(2),
+        );
+        let index = IndexFile::open_with_durability(
+            crate::storage::naming::index_object_path_by_id(dir.path(), 1, 1, 1, "idx"),
+            log.clone(),
+            DurabilityMode::Relaxed,
+            pool.clone(),
+        )
+        .unwrap();
+        let make = |n: u32| {
+            entry(
+                match kind {
+                    0 => vec![KeyPart::Int(n as i64)],
+                    1 => vec![KeyPart::UInt((1 << 63) + n as u64)],
+                    2 => vec![KeyPart::String(format!("{n:08}{}", "x".repeat(300)))],
+                    3 => vec![KeyPart::Int(n as i64 / 7), KeyPart::Int(n as i64 % 7)],
+                    _ => vec![KeyPart::Null, KeyPart::Int(n as i64)],
+                },
+                n,
+            )
+        };
+        let mut seed = Vec::new();
+        loop {
+            seed.push(make(seed.len() as u32));
+            let leaf = IndexLeafPage::new_with_resolved_layout(seed.clone(), None);
+            if encoded_leaf_page_len(&leaf) > PAGE_SIZE {
+                seed.truncate(seed.len() - 5);
+                break;
+            }
+        }
+        index
+            .write_page(
+                0,
+                INDEX_EMPTY_ROOT,
+                IndexPage::Leaf(IndexLeafPage::new_with_resolved_layout(seed.clone(), None)),
+            )
+            .unwrap();
+        let start = seed.len() as u32;
+        let incoming: Vec<_> = (start..start + 64).map(make).collect();
+        let txn_id = 71;
+        begin_txn_wal_buffering(&log, txn_id, 0, true);
+        let outcome = index
+            .try_insert_entries_buffered(txn_id, &incoming)
+            .unwrap()
+            .expect("bounded batch must be eligible");
+        let BufferedIndexInsert::Remaining { consumed, lsn } = outcome else {
+            panic!("batch must fill the leaf before completing");
+        };
+        assert!(consumed > 0 && consumed < incoming.len(), "kind={kind}");
+        assert_eq!(index.entries().unwrap().len(), seed.len() + consumed);
+        assert_eq!(pool.deferred_wal_pages.load(Ordering::Acquire), 0);
+        log.lock().flush().unwrap();
+        let logged: usize = crate::wal::LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .into_iter()
+            .filter(|record| record.txn_id == txn_id)
+            .filter_map(|record| match record.payload {
+                WalPayload::IndexBatch { ops, .. } => Some(ops.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(logged, incoming.len(), "WAL must retain the entire batch");
+        index
+            .insert_entries_with_lsn(txn_id, incoming[consumed..].to_vec(), Some(lsn))
+            .unwrap();
+        let mut expected = seed;
+        expected.extend(incoming);
+        assert_eq!(
+            index.entries().unwrap(),
+            expected
+                .into_iter()
+                .map(|entry| (entry.key, entry.row_id))
+                .collect::<Vec<_>>()
+        );
+        let buffer = take_txn_wal_entries(&log, txn_id);
+        assert!(buffer.entries.is_empty());
+        end_txn_wal_buffering(&log, txn_id);
+        index.flush().unwrap();
+        IndexFile::validate(index.path.clone()).unwrap();
+    }
+}
+
 fn entry(key: Vec<KeyPart>, id: u32) -> IndexEntry {
     IndexEntry {
         key: IndexKey::from(key),

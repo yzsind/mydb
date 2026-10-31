@@ -1504,38 +1504,9 @@ impl Database {
                 crate::storage::stats::sql_histogram(values, column, buckets, seen),
             );
         }
-        let mut combined = table.stats.explicit_histograms.clone();
-        combined.extend(histograms);
-        // The DD statistics payload is bounded. Explicit SQL metadata must
-        // fail atomically instead of being silently trimmed on persistence.
-        if serde_json::to_vec(&combined).map_or(true, |json| {
-            json.len() > crate::storage::data_dictionary::DD_STATS_JSON_CAP_BYTES / 2
-        }) {
-            return Err(error(
-                crate::error::catalog::ER_OUT_OF_RESOURCES,
-                "Explicit histogram metadata exceeds the per-table catalog budget",
-            ));
-        }
-        {
-            let mut catalog = self.catalog_write()?;
-            let stored = catalog.tables.get_mut(&key).ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NO_SUCH_TABLE,
-                    format!("Table '{key}' doesn't exist"),
-                )
-            })?;
-            if stored.schema_version != table.schema_version {
-                return Err(error(
-                    crate::error::catalog::ER_NEED_REPREPARE,
-                    "Table changed while building histogram",
-                ));
-            }
-            let stored = Arc::make_mut(stored);
-            stored.stats.explicit_histograms = combined;
-            stored.bump_schema_version_without_system_time_epoch();
-            self.note_catalog_table(stored.id);
-        }
-        self.commit_catalog_txn()?;
+        let mut candidate = (*table).clone();
+        candidate.stats.explicit_histograms.extend(histograms);
+        self.publish_stats_candidate(&table, candidate)?;
         Ok(selected.iter().map(|(_, c)| c.name.clone()).collect())
     }
 
@@ -1560,33 +1531,27 @@ impl Database {
         let analyze_lock = self.analyze_lock(&key);
         let _table_analyze = analyze_lock.lock();
         self.validate_histogram_columns(&key, columns)?;
+        let table = self.table_by_key(&key).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_NO_SUCH_TABLE,
+                "histogram table disappeared",
+            )
+        })?;
+        let mut candidate = (*table).clone();
         let mut resolved = Vec::with_capacity(columns.len());
-        {
-            let mut catalog = self.catalog_write()?;
-            let table_arc = catalog.tables.get_mut(&key).ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NO_SUCH_TABLE,
-                    format!("Table '{key}' doesn't exist"),
-                )
-            })?;
-            let table = Arc::make_mut(table_arc);
-            for col in columns {
-                let norm = normalize_name(col);
-                resolved.push(
-                    table
-                        .columns
-                        .iter()
-                        .find(|column| normalize_name(&column.name) == norm)
-                        .expect("histogram column validated above")
-                        .name
-                        .clone(),
-                );
-                table.stats.explicit_histograms.remove(&norm);
-            }
-            table.bump_schema_version_without_system_time_epoch();
-            self.note_catalog_table(table_arc.id);
+        for name in columns {
+            let column = table
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+                .expect("validated histogram column");
+            resolved.push(column.name.clone());
+            candidate
+                .stats
+                .explicit_histograms
+                .remove(&normalize_name(name));
         }
-        self.commit_catalog_txn()?;
+        self.publish_stats_candidate(&table, candidate)?;
         Ok(resolved)
     }
 

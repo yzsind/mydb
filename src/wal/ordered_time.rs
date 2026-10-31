@@ -21,11 +21,15 @@ impl TimedRecord {
                         "timed batch must end with CommitTxn",
                     ));
                 }
-                let mut offset = WAL_FRAME_HEADER_LEN + 4;
-                for _ in 0..records.len() - 1 {
-                    offset += 6 + read_u32(&record.bytes, offset + 2) as usize;
+                if read_u32(&record.bytes, WAL_FRAME_HEADER_LEN) & COMPRESSED_TXN_BATCH != 0 {
+                    WAL_FRAME_HEADER_LEN + 8
+                } else {
+                    let mut offset = WAL_FRAME_HEADER_LEN + 4;
+                    for _ in 0..records.len() - 1 {
+                        offset += 6 + read_u32(&record.bytes, offset + 2) as usize;
+                    }
+                    offset + 6 + 8
                 }
-                offset + 6 + 8
             }
             _ => {
                 return Err(error(
@@ -100,6 +104,7 @@ fn advance_time(clock: &AtomicU64, rollbacks: Option<&AtomicU64>) -> u64 {
 }
 
 impl LogManager {
+    #[cfg(test)]
     #[inline]
     pub(crate) fn append_timed(
         &mut self,
@@ -130,6 +135,13 @@ impl LogManager {
         clock: &AtomicU64,
         rollbacks: Option<&AtomicU64>,
     ) -> Result<(u64, u64), QueryError> {
+        // An eager fallback may still owe its transaction's lazy BEGIN.
+        // Publish it before assigning the decision time, and fence that time
+        // above every preceding source frame even during a clock rollback.
+        self.publish_buffered_begin(timed.record.txn_id)?;
+        if !std::ptr::eq(&*self.source_clock, clock) {
+            clock.fetch_max(self.source_clock.load(Ordering::Acquire), Ordering::Release);
+        }
         let time = advance_time(clock, rollbacks);
         timed.record.bytes[timed.offset..timed.offset + 8].copy_from_slice(&time.to_le_bytes());
         timed.record.payload_checksum = timed.checksum.take().map(|(mut prefix, suffix, shift)| {
@@ -227,6 +239,31 @@ mod tests {
     }
 
     #[test]
+    fn decision_time_fences_a_later_nondecision_source_clock() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = LogManager::open(root.path()).unwrap();
+        let future = wall_time_unix_us() + 10_000_000;
+        log.source_clock.store(future, Ordering::Release);
+        let clock = AtomicU64::new(0);
+        let timed = LogManager::pre_encode_timed_record(
+            1,
+            WalPayload::CommitTxn {
+                commit_scn: 1,
+                commit_unix_us: 0,
+                binlog: None,
+            },
+        )
+        .unwrap();
+        let (_, decision) = log.append_timed(timed, &clock, None).unwrap();
+        assert_eq!(decision, future + 1);
+        log.flush().unwrap();
+        let records = LogManager::scan(root.path()).unwrap().records;
+        assert_eq!(records.last().unwrap().source_time_us, decision);
+        assert!(matches!(records.last().unwrap().payload,
+            WalPayload::CommitTxn { commit_unix_us, .. } if commit_unix_us == decision));
+    }
+
+    #[test]
     fn decision_times_follow_append_order_even_when_encoding_is_reversed() {
         let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         let mut log = LogManager::open(root.path()).unwrap();
@@ -243,6 +280,19 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // Keep this payload above the incremental-CRC threshold even when
+        // transaction compression is enabled, while still compressing its
+        // zero suffix. The tiny compressed checksum path is covered above.
+        let mut random_state = 0x123456789abcdef0u64;
+        let mut mixed_payload: Vec<u8> = (0..4096)
+            .map(|_| {
+                random_state ^= random_state << 13;
+                random_state ^= random_state >> 7;
+                random_state ^= random_state << 17;
+                random_state as u8
+            })
+            .collect();
+        mixed_payload.extend_from_slice(&vec![0; 2048]);
         let b = TimedRecord::new(
             LogManager::pre_encode_record(
                 2,
@@ -251,7 +301,7 @@ mod tests {
                         WalPayload::BeginTxn { start_scn: 0 },
                         WalPayload::FileCreate {
                             path: "objects/tables/1/1.heap".into(),
-                            after: vec![7; 4096],
+                            after: mixed_payload,
                         },
                         WalPayload::CommitTxn {
                             commit_scn: 2,

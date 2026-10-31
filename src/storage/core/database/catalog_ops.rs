@@ -433,12 +433,44 @@ impl Database {
 
     pub fn table(&self, name: &str) -> Result<Arc<TableSchema>, QueryError> {
         let key = normalize_table_key(DEFAULT_DATABASE, name);
-        self.table_by_key(&key).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{name}' doesn't exist"),
-            )
-        })
+        if let Some(table) = self
+            .temp_tables
+            .read()
+            .map_err(|_| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "temporary catalog lock poisoned",
+                )
+            })?
+            .get(&key)
+        {
+            return Ok(Arc::clone(table));
+        }
+        let header = self
+            .catalog_read()?
+            .tables
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_NO_SUCH_TABLE,
+                    format!("Table '{name}' doesn't exist"),
+                )
+            })?;
+        let table = if !header.columns.is_empty() || header.system {
+            header
+        } else {
+            self.table_by_id_checked(header.id)?.ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "catalog table descriptor missing",
+                )
+            })?
+        };
+        Ok(crate::storage::read_schema::for_read(
+            table,
+            self.read_definition_highwater.load(Ordering::Acquire),
+        ))
     }
 
     /// Whether a table-like catalog object already owns this qualified name.

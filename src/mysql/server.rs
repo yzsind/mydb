@@ -174,6 +174,9 @@ where
             // *active* write blocked by a wedged peer also fails fast.
             tune_socket_keepalive(&stream);
 
+            // SET GLOBAL may change the cap while accept is parked. Admission
+            // must use the current limit, not the pre-accept diagnostic value.
+            let cap = effective_max_connections();
             let Some(slot) = ConnectionSlot::acquire_with_admin_reserve(cap) else {
                 spawn_reject(
                     stream,
@@ -889,6 +892,54 @@ fn load_private_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
 #[cfg(all(unix, test))]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blackbox_connection_cap_reduction_applies_to_waiting_accept() {
+        use crate::engine::StorageQueryEngine;
+        use crate::mysql::packet::read_packet;
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine.execute("SET GLOBAL max_connections=1000").unwrap();
+        let first = ConnectionSlot::acquire(1000).unwrap();
+        let second = ConnectionSlot::acquire(1000).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server =
+            MysqlServer::with_tls(addr, engine.clone(), None, Arc::new(SessionRegistry::new()));
+        let task = tokio::spawn(async move { server.run().await });
+        let mut ready = loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        let greeting = read_packet(&mut ready).await.unwrap().unwrap();
+        assert_eq!(greeting.payload[0], 10);
+        drop(ready);
+        // The listener is waiting with the old cap. Keep two occupied slots so
+        // the new cap permits neither ordinary nor reserved admission.
+        engine.execute("SET GLOBAL max_connections=1").unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), read_packet(&mut client))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        engine.execute("SET GLOBAL max_connections=1000").unwrap();
+        drop(client);
+        drop((first, second));
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            response.payload[0], 0xff,
+            "unexpected handshake after cap reduction"
+        );
+        assert_eq!(
+            u16::from_le_bytes(response.payload[1..3].try_into().unwrap()),
+            1040
+        );
+    }
     use std::os::unix::io::AsRawFd;
     use tokio::net::TcpListener;
 

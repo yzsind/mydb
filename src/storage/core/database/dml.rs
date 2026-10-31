@@ -501,13 +501,19 @@ impl Database {
                 *slot = Value::Null;
             }
         }
+        let header_only = before_external.is_empty()
+            && self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?;
         let undo_id = self.push_undo_ext(
             txn_id,
-            UndoKind::Delete,
+            if header_only {
+                UndoKind::DeleteHeader
+            } else {
+                UndoKind::Delete
+            },
             storage_id,
             row_id,
             Some(old_header),
-            Some(tombstone.clone()),
+            (!header_only).then(|| tombstone.clone()),
             before_external,
         )?;
         Ok((undo_id, tombstone))
@@ -2416,28 +2422,35 @@ impl Database {
                 *slot = Value::Null;
             }
         }
+        let header_only = before_external.is_empty()
+            && self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?;
         let undo_id = self.push_undo_ext(
             txn.txn_id,
-            UndoKind::Delete,
+            if header_only {
+                UndoKind::DeleteHeader
+            } else {
+                UndoKind::Delete
+            },
             storage_id,
             row_id,
             Some(current.header),
-            Some(stored_values.clone()),
+            (!header_only).then(|| stored_values.clone()),
             before_external,
         )?;
-        self.publish_wal_before_eager_heap_write(txn.txn_id)?;
-        self.with_heap_mut(storage_id, |heap| {
-            heap.write_mvcc(
-                txn.txn_id,
-                row_id,
-                RowHeader {
-                    flags: MVCC_FLAG_DELETED,
-                    last_txn_id: txn.txn_id,
-                    undo_ptr: Some(undo_id),
-                },
-                &stored_values,
-            )
+        let header = RowHeader {
+            flags: MVCC_FLAG_DELETED,
+            last_txn_id: txn.txn_id,
+            undo_ptr: Some(undo_id),
+        };
+        let patched = self.with_heap_mut(storage_id, |heap| {
+            heap.try_write_mvcc_tombstone(txn.txn_id, row_id, header)
         })?;
+        if !patched {
+            self.publish_wal_before_eager_heap_write(txn.txn_id)?;
+            self.with_heap_mut(storage_id, |heap| {
+                heap.write_mvcc(txn.txn_id, row_id, header, &stored_values)
+            })?;
+        }
         self.note_zone_map_deletes(txn.txn_id, storage_id, &[row_id])?;
         self.delete_indexes_deferred_at(txn.txn_id, storage_id, table, index_values, row_id)?;
         self.defer_vector_delete(txn.txn_id, undo_id, table, index_values, row_id, storage_id)?;
@@ -3828,14 +3841,31 @@ impl Database {
                     | ColumnKind::Geometry
                     | ColumnKind::Vector { .. }
                     | ColumnKind::Decimal { .. }
+                    | ColumnKind::DecimalWide { .. }
             ) {
-                return true;
+                // Unknown values during prepared-plan eligibility are checked
+                // against the persisted slot by prepare_mvcc_patch. Actual
+                // external references always decline there before mutation.
+                for value in [old_values.get(col), new_values.get(col)]
+                    .into_iter()
+                    .flatten()
+                {
+                    let bytes = match value {
+                        Value::String(s) | Value::Decimal(s) => s.len(),
+                        Value::SmallString(s) => s.as_slice().len(),
+                        Value::Bytes(b) | Value::Json(b) | Value::Geometry(b) => b.len(),
+                        Value::Vector(b) => b.len(),
+                        _ => 0,
+                    };
+                    if bytes > lob_inline_max() {
+                        return true;
+                    }
+                }
             }
             // FixedBytes / VectorFixed can be patched, but only if
             // the value bytes don't change length. The fixed-column
             // byte-range helper already verifies width, so we don't
             // need to second-guess it here.
-            let _ = (old_values, new_values);
         }
         false
     }
