@@ -453,6 +453,12 @@ thread_local! {
 }
 
 #[derive(Debug)]
+enum BufferedIndexInsert {
+    Complete,
+    Remaining { consumed: usize, lsn: u64 },
+}
+
+#[derive(Debug)]
 struct PreparedIndexInsert {
     pins: Vec<PinnedFrame>,
     route_epochs: Vec<u64>,
@@ -3721,10 +3727,13 @@ impl IndexFile {
         }
         let entry = IndexEntry { key, row_id };
         match self.try_insert_entries_buffered(txn_id, std::slice::from_ref(&entry))? {
-            Some(None) => Ok(()),
-            Some(Some(lsn)) => {
+            Some(BufferedIndexInsert::Complete) => Ok(()),
+            Some(BufferedIndexInsert::Remaining { consumed: 0, lsn }) => {
                 let _logical = btree_logical_wal::LsnScope::new(Some(lsn));
                 self.insert_entry_concurrent(txn_id, entry)
+            }
+            Some(BufferedIndexInsert::Remaining { .. }) => {
+                unreachable!("a consumed single entry completes the buffered insert")
             }
             None => self.apply_single_index_op_logged(
                 txn_id,
@@ -4500,8 +4509,12 @@ impl IndexFile {
         }
         if let Some(outcome) = self.try_insert_entries_buffered(txn_id, &entries)? {
             return match outcome {
-                None => Ok(()),
-                Some(lsn) => self.insert_entries_with_lsn(txn_id, entries, Some(lsn)),
+                BufferedIndexInsert::Complete => Ok(()),
+                BufferedIndexInsert::Remaining { consumed, lsn } => {
+                    let mut entries = entries;
+                    entries.drain(..consumed);
+                    self.insert_entries_with_lsn(txn_id, entries, Some(lsn))
+                }
             };
         }
         let lsn = self.append_index_batch_wal(txn_id, WalIndexOpKind::Insert, &entries)?;
@@ -4510,15 +4523,18 @@ impl IndexFile {
 
     /// Buffer bounded leaf-only insert runs. An overflow/structural decline
     /// appends the complete logical batch before entering the structural
-    /// oracle. Already applied entries replay idempotently, just as when an
-    /// eager batch append precedes a partially completed insert operation.
-    /// None means ineligible, Some(None) completed, Some(Some(lsn)) needs the
-    /// ordinary insertion oracle using the already appended batch.
+    /// oracle. Return the applied prefix length so the oracle handles only
+    /// the remaining suffix. Replaying a full leaf's already-applied prefix
+    /// would repeatedly decode that leaf just to rediscover duplicates and
+    /// would prevent a sorted suffix from using the right-edge append path.
+    /// The complete batch remains in WAL for crash recovery and replication.
+    /// None means ineligible; an eligible batch completes or returns its
+    /// remaining position and the LSN covering the complete batch.
     fn try_insert_entries_buffered(
         &self,
         txn_id: u64,
         entries: &[IndexEntry],
-    ) -> Result<Option<Option<u64>>, QueryError> {
+    ) -> Result<Option<BufferedIndexInsert>, QueryError> {
         if self.durability == DurabilityMode::Memory
             || !txn_wal_buffer_index_enabled()
             || !txn_wal_buffering_active(&self.log, txn_id)
@@ -4553,8 +4569,8 @@ impl IndexFile {
         let payload = WalPayload::IndexBatch { path, ops };
         let _logical = btree_logical_wal::LsnScope::new(None);
         btree_logical_wal::begin_deferred();
+        let mut position = 0;
         let applied = (|| -> Result<bool, QueryError> {
-            let mut position = 0;
             let mut route = smallvec::SmallVec::<[InsertRouteFrame; 4]>::new();
             while position < entries.len() {
                 let run = SortedIndexEntryRun::prefix(&entries[position..]);
@@ -4596,7 +4612,7 @@ impl IndexFile {
         let (payload, keys, _reservation) = if matches!(applied, Ok(true)) {
             match push_reserved_txn_wal_record(&self.log, txn_id, payload, keys, Some(reservation))
             {
-                Ok(()) => return Ok(Some(None)),
+                Ok(()) => return Ok(Some(BufferedIndexInsert::Complete)),
                 Err(owned) => owned,
             }
         } else {
@@ -4622,8 +4638,11 @@ impl IndexFile {
             }
         };
         match applied {
-            Ok(true) => Ok(Some(None)),
-            Ok(false) => Ok(Some(Some(lsn))),
+            Ok(true) => Ok(Some(BufferedIndexInsert::Complete)),
+            Ok(false) => Ok(Some(BufferedIndexInsert::Remaining {
+                consumed: position,
+                lsn,
+            })),
             Err(err) => Err(err),
         }
     }

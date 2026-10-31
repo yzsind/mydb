@@ -28303,6 +28303,77 @@ fn release_format_column_and_layout_limits_preserve_existing_identity() {
 }
 
 #[test]
+fn buffered_partial_index_insert_recovers_and_rolls_back_across_leaf_boundaries() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+        db.create_table(
+            "partial_insert",
+            vec![
+                concurrent_index_test_column("id", true),
+                concurrent_index_test_column("v", false),
+            ],
+            vec!["id".into()],
+            vec![crate::parser::IndexDef {
+                name: Some("v_idx".into()),
+                columns: vec!["v".into()],
+                column_prefix_lengths: Vec::new(),
+                column_descending: Vec::new(),
+                key_expressions: Vec::new(),
+                key_expression_multi_valued: Vec::new(),
+                unique: false,
+                included_columns: Vec::new(),
+                index_type: "BTREE".into(),
+                visible: true,
+                comment: String::new(),
+                fulltext_parser: String::new(),
+                vector_options: None,
+            }],
+        )
+        .unwrap();
+        for batch in 0..3 {
+            let txn = db.begin_dml_txn().unwrap();
+            db.insert_rows(
+                txn,
+                "test.partial_insert",
+                (batch * 1000..(batch + 1) * 1000)
+                    .map(|id| vec![Value::Int(id), Value::Int(id % 17)])
+                    .collect(),
+            )
+            .unwrap();
+            if batch == 2 {
+                db.rollback_txn(txn.txn_id).unwrap();
+            } else {
+                db.commit_txn(txn.txn_id).unwrap();
+            }
+        }
+        db.check_consistency().unwrap();
+        db.buffer_pool.shutdown_flusher();
+    }
+    // Reopen without a checkpoint so the full logical batch must replay,
+    // including the prefix already applied before the structural fallback.
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let rows = db
+        .scan_rows(
+            "test.partial_insert",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    let mut actual: Vec<_> = rows.into_iter().map(|row| row.values).collect();
+    actual.sort_by_key(|row| match row[0] {
+        Value::Int(id) => id,
+        _ => unreachable!(),
+    });
+    assert_eq!(
+        actual,
+        (0..2000)
+            .map(|id| vec![Value::Int(id), Value::Int(id % 17)])
+            .collect::<Vec<_>>()
+    );
+    db.check_consistency().unwrap();
+}
+
+#[test]
 fn buffered_resident_heap_and_index_inserts_recover_and_rollback_together() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     {
