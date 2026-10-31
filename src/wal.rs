@@ -5355,6 +5355,9 @@ fn wal_has_frame_after(path: &Path, offset: u64) -> Result<bool, QueryError> {
     let mut file = File::open(path).map_err(io_err)?;
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     let magic = WAL_RECORD_MAGIC.to_le_bytes();
+    // Normal preallocated tails can span hundreds of MiB. Use the optimized
+    // byte search rather than a debug-build comparison at every byte offset.
+    let finder = memchr::memmem::Finder::new(&magic);
     let mut buffer = [0u8; 64 * 1024 + 3];
     let mut carry = 0;
     loop {
@@ -5363,7 +5366,7 @@ fn wal_has_frame_after(path: &Path, offset: u64) -> Result<bool, QueryError> {
             return Ok(false);
         }
         let end = carry + n;
-        if buffer[..end].windows(4).any(|window| window == magic) {
+        if finder.find(&buffer[..end]).is_some() {
             return Ok(true);
         }
         carry = end.min(3);
@@ -8866,6 +8869,28 @@ mod tests {
                 .message()
                 .contains("later frame"));
             assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn wal_tail_probe_preserves_markers_across_read_boundaries() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let path = dir.path().join("tail.log");
+        let magic = WAL_RECORD_MAGIC.to_le_bytes();
+        let mut bytes = vec![0; 3 * 64 * 1024];
+        for offset in [0, 1, 65535, 65536, 65537, 65538, 65539, 65540, 131075] {
+            bytes.fill(0);
+            bytes[offset..offset + magic.len()].copy_from_slice(&magic);
+            fs::write(&path, &bytes).unwrap();
+            assert!(wal_has_frame_after(&path, 0).unwrap(), "offset {offset}");
+            assert!(wal_has_frame_after(&path, offset as u64).unwrap());
+            assert!(!wal_has_frame_after(&path, offset as u64 + 1).unwrap());
+        }
+        for prefix in 0..magic.len() {
+            bytes.fill(0);
+            bytes.extend_from_slice(&magic[..prefix]);
+            fs::write(&path, &bytes).unwrap();
+            assert!(!wal_has_frame_after(&path, 0).unwrap());
         }
     }
 
