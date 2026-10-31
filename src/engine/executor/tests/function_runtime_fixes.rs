@@ -167,7 +167,7 @@ fn parallel_projection_matches_serial_and_releases_workers_on_close() {
     crate::engine::executor::vec::config::with_vec_mode(
         crate::engine::executor::vec::config::VecMode::On,
         || {
-            let expressions="id,id AS duplicate_id,MD5(s),SHA1(b),SHA2(REVERSE(s),512),CHAR_LENGTH(UPPER(s)),YEAR(d)*100+MONTH(d)";
+            let expressions="id,id AS duplicate_id,MD5(s),SHA1(b),SHA2(REVERSE(s),512),CHAR_LENGTH(UPPER(s)),YEAR(d)*100+MONTH(d),ASCII(s),ORD(s),BIT_LENGTH(s),OCTET_LENGTH(s),ASCII(b),ORD(b),BIT_LENGTH(b),OCTET_LENGTH(b)";
             let mut serial = rows(
                 &engine,
                 &format!("SELECT /*+ NO_PARALLEL FULL_SCAN(pp) */ {expressions} FROM pp"),
@@ -457,5 +457,53 @@ fn json_column_prepared_paths_keep_parallel_parameters_and_scalar_errors() {
             .unwrap_err()
             .code(),
         3141
+    );
+}
+
+#[test]
+fn computed_stream_chunks_share_charged_result_metadata() {
+    use crate::engine::api::ResultChunk;
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE meta_chunks(id BIGINT PRIMARY KEY,s VARCHAR(16))")
+        .unwrap();
+    let count = crate::engine::executor::vec::batch::DEFAULT_BATCH_ROWS * 2 + 1;
+    engine.execute(&format!("INSERT INTO meta_chunks SELECT n,CAST(n AS CHAR) FROM generate_series(1,{count}) AS s(n)")).unwrap();
+    crate::engine::executor::vec::config::with_vec_mode(
+        crate::engine::executor::vec::config::VecMode::On,
+        || {
+            let alias = "a".repeat(48);
+            let response = engine.execute_streaming_for_test(&format!(
+                "SELECT /*+ NO_PARALLEL FULL_SCAN(meta_chunks) */ LENGTH(s) AS `{alias}`,id FROM meta_chunks"
+            )).unwrap();
+            let QueryResponse::StreamingResultSet(mut stream) = response else {
+                panic!("stream");
+            };
+            let mut schema = None;
+            let mut chunks = 0;
+            let mut rows = 0;
+            while let Some(chunk) = stream.cursor.next_chunk().unwrap() {
+                let ResultChunk::Columnar(result) = chunk else {
+                    panic!("columnar projection");
+                };
+                let current = result.batch.schema().clone();
+                assert_eq!(current.fields()[0].name, alias);
+                assert_eq!(current.fields()[1].source.org_name, "id");
+                assert!(current.heap_capacity_bytes() > 128);
+                if let Some(previous) = &schema {
+                    assert!(
+                        std::sync::Arc::ptr_eq(previous, &current),
+                        "computed chunks duplicated their result schema"
+                    );
+                }
+                schema = Some(current);
+                chunks += 1;
+                rows += result.batch.visible_rows();
+            }
+            assert!(chunks > 1);
+            assert_eq!(rows, count);
+        },
     );
 }

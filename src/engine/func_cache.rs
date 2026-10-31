@@ -160,7 +160,7 @@ pub(crate) fn cached_gtid_set(
             |bytes, (uuid, intervals)| {
                 bytes
                     .saturating_add(1024)
-                    .saturating_add(uuid.capacity())
+                    .saturating_add(uuid.len())
                     .saturating_add(
                         intervals
                             .capacity()

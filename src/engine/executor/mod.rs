@@ -2526,6 +2526,26 @@ impl ResultCursor for ObservedStreamCursor {
             .map_or(1, |inner| inner.external_batch_rows())
     }
 
+    fn next_chunk(&mut self) -> Result<Option<crate::engine::api::ResultChunk>, QueryError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        match inner.next_chunk() {
+            Ok(Some(chunk)) => {
+                self.rows_sent = self.rows_sent.saturating_add(chunk.rows() as u64);
+                Ok(Some(chunk))
+            }
+            Ok(None) => {
+                self.finish(None);
+                Ok(None)
+            }
+            Err(error) => {
+                self.finish(Some(error.clone()));
+                Err(error)
+            }
+        }
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(None);

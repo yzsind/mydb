@@ -330,8 +330,8 @@ impl<'a> JsonbRef<'a> {
     /// Validate untrusted persisted/exported documents before recursive reads.
     /// Scalar payloads are borrowed and containers are bounded before descent.
     pub(crate) fn validate(&self) -> Result<(), QueryError> {
-        fn check(bytes: &[u8], containers: usize) -> Result<(), QueryError> {
-            let node = JsonbRef::new(bytes)?;
+        fn check(node: JsonbRef<'_>, containers: usize) -> Result<(), QueryError> {
+            let bytes = node.bytes;
             let malformed = || {
                 json_err(
                     crate::error::catalog::ER_INVALID_JSON_TEXT,
@@ -358,7 +358,14 @@ impl<'a> JsonbRef<'a> {
                     }
                     let remaining = bytes.get(pos..).ok_or_else(malformed)?;
                     let len = JsonbRef::node_len(remaining)?;
-                    check(&remaining[..len], containers + 1)?;
+                    // The checked length already establishes this child's
+                    // exact boundary; do not decode it again on recursion.
+                    check(
+                        JsonbRef {
+                            bytes: &remaining[..len],
+                        },
+                        containers + 1,
+                    )?;
                     pos += len;
                 }
                 if pos != bytes.len() {
@@ -373,7 +380,7 @@ impl<'a> JsonbRef<'a> {
             }
             Ok(())
         }
-        check(self.bytes, 0)
+        check(JsonbRef::new(self.bytes)?, 0)
     }
 
     #[inline]
@@ -817,56 +824,85 @@ impl<'a> JsonbRef<'a> {
 
     /// Append MySQL `JSON_PRETTY` indented text (two spaces per level).
     pub(crate) fn write_pretty(&self, out: &mut String, indent: usize) {
-        if let Err(err) = self.validate() {
+        let start = out.len();
+        if let Err(err) = self.write_pretty_checked(out, indent, 0) {
+            out.truncate(start);
             crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Error, &err);
             out.push_str("null");
-            return;
         }
-        self.write_pretty_inner(out, indent);
     }
 
-    fn write_pretty_inner(&self, out: &mut String, indent: usize) {
-        match self.tag() {
-            T_ARRAY => {
-                if self.container_len() == Some(0) {
-                    out.push_str("[]");
-                    return;
-                }
-                out.push_str("[\n");
-                let inner = indent + 1;
-                for (i, elem) in self.array_iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(",\n");
-                    }
-                    push_indent(out, inner);
-                    elem.write_pretty_inner(out, inner);
-                }
-                out.push('\n');
-                push_indent(out, indent);
-                out.push(']');
+    // Validate and render in the same traversal. Counted containers must end
+    // exactly at their declared boundary; tolerant public iterators cannot
+    // provide this proof for malformed persisted documents.
+    fn write_pretty_checked(
+        &self,
+        out: &mut String,
+        indent: usize,
+        containers: usize,
+    ) -> Result<(), QueryError> {
+        let malformed = || {
+            json_err(
+                crate::error::catalog::ER_INVALID_JSON_TEXT,
+                "malformed JSONB container or UTF-8 payload",
+            )
+        };
+        if !self.is_array() && !self.is_object() {
+            if matches!(
+                self.tag(),
+                T_STRING | T_DECIMAL | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP
+            ) && self.text_payload().is_none()
+            {
+                return Err(malformed());
             }
-            T_OBJECT => {
-                if self.container_len() == Some(0) {
-                    out.push_str("{}");
-                    return;
-                }
-                out.push_str("{\n");
-                let inner = indent + 1;
-                for (i, (k, v)) in self.object_iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(",\n");
-                    }
-                    push_indent(out, inner);
-                    write_json_string(k, out);
-                    out.push_str(": ");
-                    v.write_pretty_inner(out, inner);
-                }
-                out.push('\n');
-                push_indent(out, indent);
-                out.push('}');
-            }
-            _ => self.write_text_inner(out),
+            self.write_text_inner(out);
+            return Ok(());
         }
+        if containers >= super::MAX_JSON_DEPTH - 1 {
+            return Err(super::json_too_deep());
+        }
+        let object = self.is_object();
+        let mut pos = 1;
+        read_uvarint(self.bytes, &mut pos)?;
+        let count = read_uvarint(self.bytes, &mut pos)?;
+        out.push(if object { '{' } else { '[' });
+        if count != 0 {
+            out.push('\n');
+        }
+        for i in 0..count {
+            if i > 0 {
+                out.push_str(",\n");
+            }
+            push_indent(out, indent + 1);
+            if object {
+                let len = usize::try_from(read_uvarint(self.bytes, &mut pos)?)
+                    .map_err(|_| malformed())?;
+                let end = pos
+                    .checked_add(len)
+                    .filter(|end| *end <= self.bytes.len())
+                    .ok_or_else(malformed)?;
+                let key = std::str::from_utf8(&self.bytes[pos..end]).map_err(|_| malformed())?;
+                pos = end;
+                write_json_string(key, out);
+                out.push_str(": ");
+            }
+            let remaining = self.bytes.get(pos..).ok_or_else(malformed)?;
+            let len = Self::node_len(remaining)?;
+            Self {
+                bytes: &remaining[..len],
+            }
+            .write_pretty_checked(out, indent + 1, containers + 1)?;
+            pos += len;
+        }
+        if pos != self.bytes.len() {
+            return Err(malformed());
+        }
+        if count != 0 {
+            out.push('\n');
+            push_indent(out, indent);
+        }
+        out.push(if object { '}' } else { ']' });
+        Ok(())
     }
 
     /// Storage size in bytes of this node, matching `JSON_STORAGE_SIZE`
@@ -1052,5 +1088,54 @@ pub(super) fn write_json_string(s: &str, out: &mut String) {
 fn push_indent(out: &mut String, level: usize) {
     for _ in 0..level {
         out.push_str("  ");
+    }
+}
+
+#[cfg(test)]
+mod pretty_validation_tests {
+    use super::*;
+
+    #[test]
+    fn fused_pretty_validation_matches_full_validation() {
+        let docs = [
+            "null",
+            "true",
+            "123",
+            "-2.5",
+            "\"数据库\"",
+            r#"{"a":[null,true,1,"x"],"b":{"z":[]}}"#,
+            r#"{"空\u0000":["\u0000\n\"\\",-9223372036854775808,18446744073709551615],"a":{}}"#,
+        ];
+        for text in docs {
+            let bytes = super::super::parse_text(text, 1, "test").unwrap();
+            // Mutate every byte, including lengths, counts, tags and UTF-8.
+            for index in 0..bytes.len() {
+                for byte in [0, 1, 8, 127, 128, 255] {
+                    let mut altered = bytes.clone();
+                    altered[index] = byte;
+                    let Ok(node) = JsonbRef::new(&altered) else {
+                        continue;
+                    };
+                    let expected = node.write_pretty_checked(&mut String::new(), 0, 0);
+                    let actual = node.validate();
+                    assert_eq!(expected.is_ok(), actual.is_ok(), "{altered:?}");
+                    if let (Err(expected), Err(actual)) = (expected, actual) {
+                        assert_eq!(expected.code(), actual.code());
+                        assert_eq!(expected.to_string(), actual.to_string());
+                    }
+                }
+            }
+        }
+        for depth in [99, 100, 101, 102] {
+            let text = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            // Build with the codec directly, bypassing the text depth guard.
+            let dom: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let bytes = super::super::from_serde(&dom);
+            let node = JsonbRef::new(&bytes).unwrap();
+            assert_eq!(
+                node.validate().is_ok(),
+                node.write_pretty_checked(&mut String::new(), 0, 0).is_ok()
+            );
+        }
     }
 }

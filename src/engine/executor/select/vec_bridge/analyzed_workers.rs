@@ -57,6 +57,18 @@ struct Worker {
     observation: Arc<Observation>,
 }
 impl ParallelBatchWorker for Worker {
+    fn take_coordinator_pull(&mut self, abort: Arc<AtomicBool>) -> Option<Box<dyn BatchOperator>> {
+        Some(Box::new(CoordinatorObservation {
+            inner: self.inner.take_coordinator_pull(abort)?,
+            observation: self.observation.clone(),
+            active: 0,
+            rows: 0,
+            batches: 0,
+            first: None,
+            started: false,
+        }))
+    }
+
     fn run(
         self: Box<Self>,
         consume: &mut dyn FnMut(Batch) -> Result<(), QueryError>,
@@ -96,6 +108,56 @@ impl ParallelBatchWorker for Worker {
         result
     }
 }
+
+struct CoordinatorObservation {
+    inner: Box<dyn BatchOperator>,
+    observation: Arc<Observation>,
+    active: u128,
+    rows: u64,
+    batches: u64,
+    first: Option<u128>,
+    started: bool,
+}
+
+impl BatchOperator for CoordinatorObservation {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        self.inner.schema()
+    }
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        self.started = true;
+        let started = std::time::Instant::now();
+        let result =
+            crate::storage::with_shared_operator_buffer_stats(self.observation.io.clone(), || {
+                self.inner.next_batch()
+            });
+        self.active += started.elapsed().as_nanos();
+        if let Ok(Some(batch)) = &result {
+            let rows = batch.visible_rows();
+            if rows != 0 {
+                self.first.get_or_insert(self.active);
+                self.rows += rows as u64;
+                self.batches += 1;
+            }
+        }
+        result
+    }
+}
+
+impl Drop for CoordinatorObservation {
+    fn drop(&mut self) {
+        if !self.started {
+            return;
+        }
+        let mut total = self.observation.totals.lock();
+        if let Some(first) = self.first {
+            total.first = Some(total.first.map_or(first, |previous| previous.min(first)));
+        }
+        total.active = total.active.max(self.active);
+        total.rows += self.rows;
+        total.batches += self.batches;
+        total.workers += 1;
+    }
+}
 pub(super) fn wrap(
     workers: Vec<Box<dyn ParallelBatchWorker>>,
     plan: &PhysicalPlan,
@@ -118,4 +180,45 @@ pub(super) fn wrap(
             }) as Box<dyn ParallelBatchWorker>
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinator_observation_counts_one_worker_and_selected_rows_on_drop() {
+        let observation = Arc::new(Observation {
+            key: None,
+            collector: None,
+            io: Arc::new(Default::default()),
+            totals: Default::default(),
+            visits: None,
+            mode: crate::engine::executor::vec::config::VecMode::On,
+        });
+        let schema = Arc::new(BatchSchema::new(vec![]));
+        let batches = vec![
+            Batch::with_row_count(schema.clone(), vec![], 0),
+            Batch::with_row_count(schema.clone(), vec![], 4)
+                .with_selection(Selection::Indices(vec![2, 0, 2])),
+        ];
+        let mut input = CoordinatorObservation {
+            inner: Box::new(MaterializedBatchOperator::new(schema, batches)),
+            observation: observation.clone(),
+            active: 0,
+            rows: 0,
+            batches: 0,
+            first: None,
+            started: false,
+        };
+        assert_eq!(input.next_batch().unwrap().unwrap().visible_rows(), 0);
+        assert_eq!(input.next_batch().unwrap().unwrap().visible_rows(), 3);
+        assert!(input.next_batch().unwrap().is_none());
+        assert!(input.next_batch().unwrap().is_none());
+        drop(input);
+        let total = observation.totals.lock();
+        assert_eq!((total.rows, total.batches, total.workers), (3, 1, 1));
+        assert!(total.first.is_some());
+        assert!(total.active >= total.first.unwrap());
+    }
 }

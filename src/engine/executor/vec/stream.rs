@@ -71,6 +71,15 @@ impl BatchProperties {
 /// An owned partition of a native scan. The source establishes its captured
 /// execution context around both decoding and the adjacent consumer.
 pub trait ParallelBatchWorker: Send {
+    /// Transfer an unopened partition to the pull coordinator. Refusal leaves
+    /// this worker intact so consumers can retain their threaded execution.
+    fn take_coordinator_pull(
+        &mut self,
+        _abort: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Box<dyn BatchOperator>> {
+        None
+    }
+
     fn run(
         self: Box<Self>,
         consume: &mut dyn FnMut(Batch) -> Result<(), QueryError>,

@@ -123,14 +123,19 @@ impl SearchBuffer {
         self.weights.clear();
         self.boundaries.clear();
         self.boundaries.push(0);
+        let early_ascii = needle.is_ascii() && needle.len() <= 8;
+        let mut ascii_prefix = true;
         for ch in haystack.chars() {
+            ascii_prefix &= ch.is_ascii();
             self.append_character(ch);
             self.boundaries.push(self.weights.len());
             // A complete prefix match is globally earliest: every earlier
             // start has an earlier weight offset and cannot require a later
             // end than this match. Ignorable and expanded weights retain the
             // original boundary test. A miss continues the same linear build.
-            if self.boundaries.len() == 17 {
+            if self.boundaries.len() == 17
+                || early_ascii && ascii_prefix && self.boundaries.len() == 9
+            {
                 let found = super::match_collation_search_keys(
                     &self.weights,
                     &self.boundaries,

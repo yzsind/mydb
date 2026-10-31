@@ -3,6 +3,8 @@ pub(crate) mod date_format;
 pub(crate) mod digest;
 #[cfg(test)]
 mod formatting_tests;
+#[cfg(test)]
+mod gtid_tests;
 pub(crate) mod math;
 pub(crate) mod network;
 crate::engine::builtin_catalog::declare_retains_ast!();
@@ -7016,7 +7018,14 @@ where
                     );
                     return Ok(Value::Null);
                 }
-                Ok(Value::String(date.format("%Y-%m-%d").to_string()))
+                Ok(Value::String({
+                    let mut buffer = [0; 32];
+                    let days = date.num_days_from_ce() - 719_163;
+                    String::from_utf8(
+                        crate::types::write_date_canonical(days, &mut buffer).to_vec(),
+                    )
+                    .expect("canonical calendar date is ASCII")
+                }))
             })
         }
         "TIME" => {
@@ -7073,7 +7082,14 @@ where
                         &Value::String(format!("{year}, {day}")),
                     ));
                 };
-                Ok(Value::String(date.format("%Y-%m-%d").to_string()))
+                Ok(Value::String({
+                    let mut buffer = [0; 32];
+                    let days = date.num_days_from_ce() - 719_163;
+                    String::from_utf8(
+                        crate::types::write_date_canonical(days, &mut buffer).to_vec(),
+                    )
+                    .expect("canonical calendar date is ASCII")
+                }))
             })
         }
         "MAKETIME" => {
@@ -8405,10 +8421,9 @@ where
             expect_arg_count(name, args, 3)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let (Ok(dt), Ok(from), Ok(to)) = (
+                let (Ok(dt), Ok(zones)) = (
                     parse_datetime(&values[0]),
-                    resolve_tz_spec(&string_value(&values[1])),
-                    resolve_tz_spec(&string_value(&values[2])),
+                    TimeZonePair::resolve(&string_value(&values[1]), &string_value(&values[2])),
                 ) else {
                     return Ok(Value::Null);
                 };
@@ -8416,7 +8431,7 @@ where
                 // untouched (zone offsets are whole minutes).
                 let micros = dt.and_utc().timestamp_subsec_micros();
                 let local_epoch = dt.and_utc().timestamp();
-                let utc_epoch = from.utc_from_local(local_epoch);
+                let utc_epoch = zones.utc_from_local(local_epoch);
                 // Preserve pre-epoch behavior, but extend future conversion
                 // through mydb's full TIMESTAMP domain.
                 if utc_epoch < 0 {
@@ -8425,7 +8440,7 @@ where
                 if utc_epoch > crate::types::MAX_TIMESTAMP_SECONDS {
                     return Ok(Value::Null);
                 }
-                let out_epoch = utc_epoch + to.offset_at_utc(utc_epoch) as i64;
+                let out_epoch = zones.target_from_utc(utc_epoch);
                 let out = chrono::DateTime::from_timestamp(out_epoch, micros * 1_000)
                     .ok_or_else(|| {
                         error(
@@ -13187,7 +13202,7 @@ pub(crate) fn mysql_date_format(dt: &NaiveDateTime, format: &str) -> String {
     out
 }
 
-fn interval_unit_from_arg(expr: &Expr) -> String {
+pub(crate) fn interval_unit_from_arg(expr: &Expr) -> String {
     let unit = match expr {
         Expr::Identifier(name) => name.to_ascii_uppercase(),
         Expr::Literal(Literal::String(s)) => s.to_ascii_uppercase(),
@@ -14480,7 +14495,7 @@ fn write_frac_into(out: &mut String, micros: u32, fsp: usize) {
 /// textual form (`'12:00:00.250'` → 3, `'.5'` → 1, none → 0, cap 6).
 /// MySQL temporal functions echo this declared precision in their
 /// result — `TIMESTAMP('… .500','… .250')` prints `.750`, not `.75`.
-fn text_fsp(value: &Value) -> usize {
+pub(crate) fn text_fsp(value: &Value) -> usize {
     let mut buffer = [0; 32];
     // TIMESTAMP retains session-aware conversion and its diagnostic behavior.
     let text = if !matches!(value, Value::Timestamp(_)) {
@@ -14606,7 +14621,7 @@ fn generate_uuid_v1() -> String {
     crate::util::uuid::format(&bytes)
 }
 
-fn checked_period_to_ym(period: i64, function: &str) -> Result<(i32, u32), QueryError> {
+pub(crate) fn checked_period_to_ym(period: i64, function: &str) -> Result<(i32, u32), QueryError> {
     if period == 0 {
         return Ok((0, 1));
     }
@@ -15380,6 +15395,34 @@ enum TzSpec {
     Fixed(i32),
     Named(std::sync::Arc<crate::engine::tz::TimeZoneData>),
     System,
+}
+
+/// Bound source/target zones shared by scalar and columnar CONVERT_TZ.
+/// Offsets are still resolved for each instant, including named-zone DST.
+pub(crate) struct TimeZonePair {
+    from: TzSpec,
+    to: TzSpec,
+}
+impl TimeZonePair {
+    pub(crate) fn resolve(from: &str, to: &str) -> Result<Self, QueryError> {
+        let (from, to) = (resolve_tz_spec(from), resolve_tz_spec(to));
+        Ok(Self {
+            from: from?,
+            to: to?,
+        })
+    }
+    pub(crate) fn session_to_utc() -> Result<Self, QueryError> {
+        Ok(Self {
+            from: session_tz_spec()?,
+            to: TzSpec::Fixed(0),
+        })
+    }
+    pub(crate) fn utc_from_local(&self, local_epoch: i64) -> i64 {
+        self.from.utc_from_local(local_epoch)
+    }
+    pub(crate) fn target_from_utc(&self, utc_epoch: i64) -> i64 {
+        utc_epoch + i64::from(self.to.offset_at_utc(utc_epoch))
+    }
 }
 
 /// Query/worker-local TIMESTAMP-to-DATE numeric converter. Resolving the
@@ -17508,7 +17551,8 @@ where
 /// Parsed GTID set: lowercase server-uuid → sorted, merged, non-empty
 /// interval list (1-based inclusive bounds). Pure string/set arithmetic
 /// for `GTID_SUBSET` / `GTID_SUBTRACT` — no replication state involved.
-pub(crate) type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+pub(crate) type GtidIntervals = smallvec::SmallVec<[(u64, u64); 2]>;
+pub(crate) type GtidSet = std::collections::BTreeMap<[u8; 36], GtidIntervals>;
 
 enum GtidArgument {
     Plain(GtidSet),
@@ -17524,7 +17568,12 @@ impl std::ops::Deref for GtidArgument {
     }
 }
 fn parsed_gtid_argument(expr: &Expr, value: &Value) -> Result<GtidArgument, QueryError> {
-    let text = string_value(value);
+    let text = match value {
+        Value::String(text) | Value::Decimal(text) => std::borrow::Cow::Borrowed(text.as_str()),
+        Value::SmallString(bytes) => String::from_utf8_lossy(bytes),
+        Value::Bytes(bytes) => String::from_utf8_lossy(bytes),
+        _ => std::borrow::Cow::Owned(string_value(value)),
+    };
     // Variable/high-cardinality expressions keep the original no-cache path.
     // Literal and bound-parameter operands are stable within one execution.
     if matches!(expr, Expr::Literal(_) | Expr::Placeholder(_)) {
@@ -17550,10 +17599,15 @@ pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError>
     for uuid_set in trimmed.split(',') {
         let uuid_set = uuid_set.trim();
         let mut parts = uuid_set.split(':');
-        let uuid = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-        if !is_valid_gtid_uuid(&uuid) {
+        let uuid = parts.next().unwrap_or("").trim();
+        if !is_valid_gtid_uuid(uuid) {
             return Err(malformed_gtid_set(text));
         }
+        let uuid: [u8; 36] = uuid
+            .as_bytes()
+            .try_into()
+            .expect("validated GTID UUID length");
+        let uuid = uuid.map(|byte| byte.to_ascii_lowercase());
         let intervals = set.entry(uuid).or_default();
         let mut saw_interval = false;
         for interval in parts {
@@ -17579,15 +17633,21 @@ pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError>
     }
     // Normalise: sort and merge overlapping / adjacent intervals.
     for intervals in set.values_mut() {
+        if intervals.len() <= 1 {
+            continue;
+        }
         intervals.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
-        for &(s, e) in intervals.iter() {
-            match merged.last_mut() {
-                Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
+        let mut written = 0;
+        for read in 0..intervals.len() {
+            let (s, e) = intervals[read];
+            if written > 0 && s <= intervals[written - 1].1.saturating_add(1) {
+                intervals[written - 1].1 = intervals[written - 1].1.max(e);
+            } else {
+                intervals[written] = (s, e);
+                written += 1;
             }
         }
-        *intervals = merged;
+        intervals.truncate(written);
     }
     Ok(set)
 }
@@ -17619,10 +17679,10 @@ fn gtid_set_is_subset(sub: &GtidSet, sup: &GtidSet) -> bool {
 fn gtid_set_subtract(base: &GtidSet, minus: &GtidSet) -> GtidSet {
     let mut out = GtidSet::new();
     for (uuid, intervals) in base {
-        let mut remaining: Vec<(u64, u64)> = intervals.clone();
+        let mut remaining = intervals.clone();
         if let Some(minus_intervals) = minus.get(uuid) {
             for &(ms, me) in minus_intervals {
-                let mut next: Vec<(u64, u64)> = Vec::with_capacity(remaining.len() + 1);
+                let mut next = GtidIntervals::new();
                 for &(s, e) in &remaining {
                     if me < s || ms > e {
                         next.push((s, e));
@@ -17639,27 +17699,36 @@ fn gtid_set_subtract(base: &GtidSet, minus: &GtidSet) -> GtidSet {
             }
         }
         if !remaining.is_empty() {
-            out.insert(uuid.clone(), remaining);
+            out.insert(*uuid, remaining);
         }
     }
     out
 }
 
 fn format_gtid_set(set: &GtidSet) -> String {
-    let mut out = String::new();
+    if set.is_empty() {
+        return String::new();
+    }
+    let capacity = set
+        .values()
+        .fold(set.len().saturating_mul(38), |bytes, intervals| {
+            bytes.saturating_add(intervals.len().saturating_mul(42))
+        });
+    let mut out = String::with_capacity(capacity);
+    let mut integer = itoa::Buffer::new();
     for (uuid, intervals) in set {
         if !out.is_empty() {
             // MySQL renders multi-uuid GTID sets with ",\n" between
             // uuid-sets (matches GTID_SUBTRACT output byte-for-byte).
             out.push_str(",\n");
         }
-        out.push_str(uuid);
+        out.push_str(std::str::from_utf8(uuid).expect("validated ASCII GTID UUID"));
         for &(s, e) in intervals {
             out.push(':');
-            if s == e {
-                out.push_str(&s.to_string());
-            } else {
-                out.push_str(&format!("{s}-{e}"));
+            out.push_str(integer.format(s));
+            if s != e {
+                out.push('-');
+                out.push_str(integer.format(e));
             }
         }
     }

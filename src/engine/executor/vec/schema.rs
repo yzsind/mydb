@@ -40,6 +40,7 @@ pub struct BatchSchema {
     /// schema and follows every executing `Arc<BatchSchema>` after cache
     /// eviction, so resident derived memory is never refunded early.
     cached_input: Option<Arc<InputSchema>>,
+    retained_charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
     cache_charge: Option<Arc<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
     // These lookup tables and the fingerprint back the schema unit-test API;
     // production vector operators address columns by their compiled ordinal
@@ -59,6 +60,7 @@ impl BatchSchema {
         let schema = Self {
             fields,
             cached_input: None,
+            retained_charge: None,
             cache_charge: None,
             #[cfg(test)]
             by_name: HashMap::new(),
@@ -80,6 +82,13 @@ impl BatchSchema {
 
     pub fn fields(&self) -> &[BatchField] {
         &self.fields
+    }
+
+    pub(crate) fn retain_charge(
+        &mut self,
+        charge: crate::engine::executor::mem_budget::ScopedCharge,
+    ) {
+        self.retained_charge = Some(charge);
     }
 
     pub(crate) fn install_cached_input(

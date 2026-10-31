@@ -32,6 +32,45 @@ fn malformed_fixed_width_scalar_is_rejected_without_panicking() {
 }
 
 #[test]
+fn varint_boundaries_and_error_positions() {
+    let mut values = vec![0, 1, 126, 127, 128, 129, u64::MAX];
+    for bits in (7..64).step_by(7) {
+        values.extend([(1u64 << bits) - 1, 1u64 << bits, (1u64 << bits) + 1]);
+    }
+    for value in values {
+        let mut bytes = vec![0xff, 0xff];
+        write_uvarint(&mut bytes, value);
+        let end = bytes.len();
+        bytes.extend_from_slice(&[7, 8]);
+        let mut pos = 2;
+        assert_eq!(read_uvarint(&bytes, &mut pos).unwrap(), value);
+        assert_eq!(pos, end);
+        for cut in 2..end {
+            let mut pos = 2;
+            let error = read_uvarint(&bytes[..cut], &mut pos).unwrap_err();
+            assert_eq!(error.code(), 3140);
+            assert!(error.to_string().contains("truncated jsonb varint"));
+            assert_eq!(pos, cut);
+        }
+    }
+    for byte in 0..128 {
+        let mut pos = 1;
+        assert_eq!(
+            read_uvarint(&[255, byte], &mut pos).unwrap(),
+            u64::from(byte)
+        );
+        assert_eq!(pos, 2);
+    }
+    let mut pos = 0;
+    let error = read_uvarint(&[0x80; 11], &mut pos).unwrap_err();
+    assert!(error.to_string().contains("overlong jsonb varint"));
+    assert_eq!(pos, 10);
+    let mut pos = usize::MAX;
+    assert!(read_uvarint(&[], &mut pos).is_err());
+    assert_eq!(pos, usize::MAX);
+}
+
+#[test]
 fn double_keeps_decimal_point() {
     // MySQL renders a JSON double with a decimal point: 1.0 stays 1.0.
     assert_eq!(canon("1.0"), "1.0");

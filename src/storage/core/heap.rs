@@ -5938,6 +5938,7 @@ fn validate_heap_page_structure(buf: &[u8]) -> Result<bool, QueryError> {
     Ok(true)
 }
 
+#[inline]
 fn read_validated_page_payload(buf: &[u8], row_id: RowId) -> Result<Option<&[u8]>, QueryError> {
     let slot_count = read_u16(buf, 20) as usize;
     let slot_id = row_id.slot_id as usize;

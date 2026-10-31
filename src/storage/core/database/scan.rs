@@ -472,7 +472,7 @@ impl Database {
     /// Storage-id aware payload scan used by range-task consumers. It keeps
     /// the raw-payload fast path for partition heaps and resolves deferred
     /// MVCC rows against the same physical heap.
-    pub(crate) fn scan_rows_payloads_storage_streaming_range(
+    pub(crate) fn scan_rows_payloads_storage_streaming_range<F>(
         &self,
         table_schema: &TableSchema,
         storage_id: u64,
@@ -481,8 +481,11 @@ impl Database {
         page_lo: u64,
         page_hi: u64,
         scratch: &mut DirectScanScratch,
-        on_payload: &mut dyn for<'a> FnMut(PayloadStreamHit<'a>) -> Result<(), QueryError>,
-    ) -> Result<(), QueryError> {
+        on_payload: &mut F,
+    ) -> Result<(), QueryError>
+    where
+        F: for<'a> FnMut(PayloadStreamHit<'a>) -> Result<(), QueryError> + ?Sized,
+    {
         let scan_policy = self.scan_cache_policy_for_table(table_schema)?;
         let examined = crate::engine::perf_events::RowsExaminedBatch::new();
         let mut deferred: Vec<RowId> = Vec::new();

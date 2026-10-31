@@ -1135,7 +1135,18 @@ pub(crate) fn peek_statement_info() -> String {
 #[derive(Debug)]
 pub enum ResultChunk {
     Row(Vec<Value>),
+    Rows(Vec<Vec<Value>>),
     Columnar(ResultBatch),
+}
+
+impl ResultChunk {
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            Self::Row(_) => 1,
+            Self::Rows(rows) => rows.len(),
+            Self::Columnar(owned) => owned.batch.visible_rows(),
+        }
+    }
 }
 
 pub struct ResultBatch {
@@ -1213,6 +1224,79 @@ impl ResultCursor for TimestampLocalizingCursor {
     }
     fn external_batch_rows(&self) -> usize {
         self.inner.external_batch_rows()
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<ResultChunk>, QueryError> {
+        let Some(chunk) = self.inner.next_chunk()? else {
+            return Ok(None);
+        };
+        Ok(Some(match chunk {
+            ResultChunk::Row(mut row) => {
+                localize_timestamp_row(&mut row, &self.time_zone)?;
+                ResultChunk::Row(row)
+            }
+            ResultChunk::Rows(mut rows) => {
+                for row in &mut rows {
+                    localize_timestamp_row(row, &self.time_zone)?;
+                }
+                ResultChunk::Rows(rows)
+            }
+            ResultChunk::Columnar(mut owned) => {
+                use crate::engine::executor::vec::batch::ColumnVector;
+                if owned.batch.columns().iter().any(|column| {
+                    matches!(
+                        column,
+                        ColumnVector::Timestamp64 { .. } | ColumnVector::Generic { .. }
+                    )
+                }) {
+                    // Convert only visible cells. Deduplicate physical indices
+                    // before mutating a timestamp lane in place, since a
+                    // selection may repeat the same instant several times.
+                    let mut workspace = owned.batch.memory_charge();
+                    workspace.add_force(
+                        owned.batch.num_rows().saturating_add(
+                            owned
+                                .batch
+                                .visible_rows()
+                                .saturating_mul(std::mem::size_of::<usize>()),
+                        ),
+                    )?;
+                    let mut seen = vec![false; owned.batch.num_rows()];
+                    let indices = owned
+                        .batch
+                        .visible_indices()
+                        .filter(|&index| !std::mem::replace(&mut seen[index], true))
+                        .collect::<Vec<_>>();
+                    for column in owned.batch.try_columns_mut()? {
+                        match column {
+                            ColumnVector::Timestamp64 { data, nulls } => {
+                                for &index in &indices {
+                                    if nulls.as_ref().is_none_or(|mask| mask.get(index)) {
+                                        data[index] = crate::engine::expr::utc_timestamp_to_local_datetime_micros_in_tz(
+                                            data[index], &self.time_zone,
+                                        )?;
+                                    }
+                                }
+                                *column = ColumnVector::DateTime64 {
+                                    data: std::mem::take(data),
+                                    nulls: nulls.take(),
+                                };
+                            }
+                            ColumnVector::Generic { values } => {
+                                for &index in &indices {
+                                    localize_timestamp_row(
+                                        std::slice::from_mut(&mut values[index]),
+                                        &self.time_zone,
+                                    )?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ResultChunk::Columnar(owned)
+            }
+        }))
     }
 
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
@@ -3801,5 +3885,75 @@ mod warning_sink_reuse_tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod result_chunk_tests {
+    use super::*;
+    use crate::engine::executor::vec::{
+        batch::{Batch, ColumnVector, Selection},
+        schema::{BatchField, BatchSchema},
+    };
+
+    #[derive(Debug)]
+    struct ChunkCursor(Option<ResultChunk>);
+    impl ResultCursor for ChunkCursor {
+        fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+            panic!("batch consumer must preserve chunks");
+        }
+        fn next_chunk(&mut self) -> Result<Option<ResultChunk>, QueryError> {
+            Ok(self.0.take())
+        }
+    }
+
+    #[test]
+    fn timestamp_chunks_localize_duplicate_visible_rows_once_and_skip_hidden_invalids() {
+        let schema = std::sync::Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "ts".into(),
+            column_type: crate::types::ColumnType::Timestamp,
+            source: Default::default(),
+        }]));
+        for generic in [false, true] {
+            let input = [0, i64::MAX, 1_000_000];
+            let column = if generic {
+                ColumnVector::Generic {
+                    values: input.into_iter().map(Value::Timestamp).collect(),
+                }
+            } else {
+                ColumnVector::Timestamp64 {
+                    data: input.to_vec(),
+                    nulls: None,
+                }
+            };
+            let batch = Batch::new(schema.clone(), vec![column])
+                .with_selection(Selection::Indices(vec![2, 2, 0]));
+            let mut cursor = TimestampLocalizingCursor {
+                inner: Box::new(ChunkCursor(Some(ResultChunk::Columnar(ResultBatch {
+                    batch,
+                    charge: None,
+                })))),
+                time_zone: "+08:00".into(),
+            };
+            let Some(ResultChunk::Columnar(owned)) = cursor.next_chunk().unwrap() else {
+                panic!("columnar output");
+            };
+            let actual: Vec<_> = owned
+                .batch
+                .visible_indices()
+                .map(|index| owned.batch.row(index))
+                .collect();
+            assert_eq!(
+                actual,
+                vec![
+                    vec![Value::DateTime(28_801_000_000)],
+                    vec![Value::DateTime(28_801_000_000)],
+                    vec![Value::DateTime(28_800_000_000)]
+                ]
+            );
+            assert!(cursor.next_chunk().unwrap().is_none());
+        }
     }
 }

@@ -737,6 +737,7 @@ where
     writer: &'a mut W,
     buffer: Vec<u8>,
     flush_threshold: usize,
+    steady_flush_threshold: Option<usize>,
     buffer_cap: usize,
     memory_charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
     /// `None` → plaintext path: `flush_buffer` writes the raw frame
@@ -770,11 +771,25 @@ where
             // rationale (avoids one alloc + one free per SELECT).
             buffer,
             flush_threshold: DEFAULT_BATCH_FLUSH_BYTES,
+            steady_flush_threshold: None,
             buffer_cap: batch_buffer_max_bytes(),
             memory_charge,
             compression,
             status,
             pending_status_bytes: 0,
+        }
+    }
+
+    /// Publish the first row block promptly, then amortize steady-state writes.
+    /// Metadata has already been flushed by the streaming caller.
+    pub(crate) fn begin_streaming_rows(&mut self) {
+        self.steady_flush_threshold = Some(self.flush_threshold);
+        self.flush_threshold = self.flush_threshold.min(16 * 1024);
+    }
+
+    fn restore_steady_flush_threshold(&mut self) {
+        if let Some(threshold) = self.steady_flush_threshold.take() {
+            self.flush_threshold = threshold;
         }
     }
 
@@ -784,10 +799,37 @@ where
             .map(|_| ())
     }
 
+    /// Stage a complete frame when no allocation, flush or socket wait is
+    /// needed. Callers only install an async cancellation waiter for real I/O.
+    #[inline]
+    pub(crate) fn try_buffer_packet_seq(&mut self, sequence_id: u8, payload: &[u8]) -> Option<u8> {
+        if payload.len() >= MAX_PAYLOAD_LEN {
+            return None;
+        }
+        let frame_len = payload.len().checked_add(4)?;
+        let required = self.buffer.len().checked_add(frame_len)?;
+        if required >= self.flush_threshold
+            || required > self.buffer_cap
+            || required > self.buffer.capacity()
+        {
+            return None;
+        }
+        let mut header = [0u8; 4];
+        encode_payload_len(payload.len(), &mut header);
+        header[3] = sequence_id;
+        self.buffer.extend_from_slice(&header);
+        self.buffer.extend_from_slice(payload);
+        self.pending_status_bytes = self.pending_status_bytes.saturating_add(frame_len as u64);
+        Some(sequence_id.wrapping_add(1))
+    }
+
     /// Like `write_packet` but returns the next sequence id (advanced by
     /// the number of frames written). Row loops use this so a row that
     /// spans multiple frames keeps the sequence counter in step.
     pub async fn write_packet_seq(&mut self, sequence_id: u8, payload: &[u8]) -> io::Result<u8> {
+        if let Some(next) = self.try_buffer_packet_seq(sequence_id, payload) {
+            return Ok(next);
+        }
         // Flush proactively if appending this frame would exceed the
         // hard buffer cap, so per-connection memory cannot grow without
         // bound under a slow client.
@@ -805,6 +847,7 @@ where
                     frame_len as u64,
                 );
             }
+            self.restore_steady_flush_threshold();
             return Ok(next);
         }
         let required = self.buffer.len().saturating_add(frame_len);
@@ -876,6 +919,7 @@ where
             }
             self.pending_status_bytes = 0;
             self.buffer.clear();
+            self.restore_steady_flush_threshold();
         }
         // Release excess capacity acquired by an oversized packet so
         // long-lived sessions don't permanently retain MAX_PAYLOAD_LEN
@@ -1781,6 +1825,68 @@ mod tests {
         // doesn't depend on the global env-driven default.
         let res = tokio::time::timeout(Duration::from_millis(50), writer.write_all(b"abc")).await;
         assert!(res.is_err(), "stalling writer must time out");
+    }
+
+    #[tokio::test]
+    async fn streaming_first_block_flush_restores_steady_threshold_with_both_codecs() {
+        for compressed in [false, true] {
+            let mut wire = Vec::new();
+            let mut codec = PacketCodec::plain();
+            if compressed {
+                codec.enable_zlib_compression();
+            }
+            let payload = vec![b'x'; 20 * 1024];
+            {
+                let mut batch = codec.batch_writer(&mut wire);
+                batch.begin_streaming_rows();
+                assert_eq!(batch.flush_threshold, 16 * 1024);
+                assert!(batch.try_buffer_packet_seq(1, &payload).is_none());
+                assert_eq!(batch.write_packet_seq(1, &payload).await.unwrap(), 2);
+                assert!(!batch.writer.is_empty());
+                assert_eq!(batch.flush_threshold, DEFAULT_BATCH_FLUSH_BYTES);
+                assert_eq!(batch.try_buffer_packet_seq(2, b"next"), Some(3));
+                batch.finish().await.unwrap();
+            }
+            let mut reader = wire.as_slice();
+            let mut codec = PacketCodec::plain();
+            if compressed {
+                codec.enable_zlib_compression();
+            }
+            let first = codec.read_packet(&mut reader).await.unwrap().unwrap();
+            let second = codec.read_packet(&mut reader).await.unwrap().unwrap();
+            assert_eq!(first.sequence_id, 1);
+            assert_eq!(first.payload, payload);
+            assert_eq!(second.sequence_id, 2);
+            assert_eq!(second.payload, b"next");
+            assert!(codec.read_packet(&mut reader).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_packet_staging_preserves_flush_boundaries_and_sequence_wrap() {
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        let mut sequence = 250u8;
+        let mut batch = PacketBatchWriter::new(&mut actual);
+        batch.flush_threshold = 128;
+        batch.buffer_cap = 256;
+        let mut fast = 0;
+        for width in [0, 1, 3, 27, 29, 63, 128, 2048, 1, 0, 4] {
+            let bytes = vec![width as u8; width];
+            let next = write_packet_frame_into(sequence, &bytes, &mut expected).unwrap();
+            let actual_next = match batch.try_buffer_packet_seq(sequence, &bytes) {
+                Some(next) => {
+                    fast += 1;
+                    next
+                }
+                None => batch.write_packet_seq(sequence, &bytes).await.unwrap(),
+            };
+            assert_eq!(actual_next, next);
+            sequence = next;
+        }
+        assert!(fast > 0);
+        batch.finish().await.unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

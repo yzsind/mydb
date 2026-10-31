@@ -220,6 +220,14 @@ impl Bitmap {
         }
     }
 
+    pub(crate) fn into_iter_true(self) -> OwnedBitmapTrueIter {
+        OwnedBitmapTrueIter {
+            words: self.words.into_iter(),
+            base: 0,
+            word: 0,
+        }
+    }
+
     /// Reset to `len` bits, all `false`, reusing the backing word buffer
     /// (no reallocation when capacity already suffices). For hot loops
     /// that need a fresh all-invalid mask per iteration — e.g. the
@@ -288,8 +296,52 @@ impl<'a> Iterator for BitmapTrueIter<'a> {
     }
 }
 
+/// Own an existing selection mask while skipping zero words. No expanded
+/// vector of physical indices is needed at an asynchronous stream boundary.
+pub(crate) struct OwnedBitmapTrueIter {
+    words: std::vec::IntoIter<u64>,
+    base: usize,
+    word: u64,
+}
+impl Iterator for OwnedBitmapTrueIter {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if self.word != 0 {
+                let bit = self.word.trailing_zeros() as usize;
+                self.word &= self.word - 1;
+                return Some(self.base - 64 + bit);
+            }
+            self.word = self.words.next()?;
+            self.base += 64;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_true_iterator_preserves_empty_sparse_dense_and_tail_masks() {
+        for len in [0, 1, 63, 64, 65, 129, 4097] {
+            for dense in [false, true] {
+                let mut mask = if dense {
+                    Bitmap::new_all_valid(len)
+                } else {
+                    Bitmap::new_all_invalid(len)
+                };
+                if !dense {
+                    for index in 0..len {
+                        if index % 67 == 0 {
+                            mask.set(index, true);
+                        }
+                    }
+                }
+                let expected = mask.iter_true().collect::<Vec<_>>();
+                assert_eq!(mask.into_iter_true().collect::<Vec<_>>(), expected);
+            }
+        }
+    }
+
     use super::*;
 
     fn assert_bits(bitmap: &Bitmap, expected: &[bool]) {

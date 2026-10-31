@@ -123,6 +123,17 @@ impl ResultCursor for Cursor {
             .map_or(1, |inner| inner.external_batch_rows())
     }
 
+    fn next_chunk(&mut self) -> Result<Option<crate::engine::api::ResultChunk>, QueryError> {
+        let result = match self.inner.as_mut() {
+            Some(inner) => inner.next_chunk(),
+            None => Ok(None),
+        };
+        if !matches!(result, Ok(Some(_))) {
+            self.close();
+        }
+        result
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let result = match self.inner.as_mut() {
             Some(inner) => inner.next_row(),

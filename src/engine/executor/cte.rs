@@ -454,6 +454,11 @@ impl CteSpillBuilder {
             crate::engine::cancel::check_cancelled()?;
             match chunk {
                 ResultChunk::Row(row) => self.push(row)?,
+                ResultChunk::Rows(rows) => {
+                    for row in rows {
+                        self.push(row)?;
+                    }
+                }
                 ResultChunk::Columnar(owned) => {
                     let batch = &owned.batch;
                     if batch.columns().len() != self.ncols {

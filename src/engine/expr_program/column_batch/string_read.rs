@@ -88,6 +88,7 @@ pub(super) enum StringRead<'a> {
         input: &'a ExprNode,
         binary: bool,
         ordinal: bool,
+        parallel: bool,
     },
     ParseDate {
         input: &'a ExprNode,
@@ -100,6 +101,7 @@ pub(super) enum StringRead<'a> {
     ByteLength {
         input: &'a ExprNode,
         multiplier: usize,
+        parallel: bool,
     },
     Strcmp {
         column: usize,
@@ -138,7 +140,7 @@ pub(super) enum StringRead<'a> {
         args: &'a [ExprNode],
     },
 }
-fn input_domain(node: &ExprNode, schema: &BatchSchema) -> Option<Domain> {
+fn input_contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
     if let ExprNode::Column(i) = node {
         let field = schema.fields().get(*i)?;
         if field.source.flags
@@ -153,8 +155,11 @@ fn input_domain(node: &ExprNode, schema: &BatchSchema) -> Option<Domain> {
             return None;
         }
     }
-    let domain = super::contract(node, schema)?.domain;
-    matches!(domain, Domain::Text | Domain::Binary | Domain::Null).then_some(domain)
+    let proof = super::contract(node, schema)?;
+    matches!(proof.domain, Domain::Text | Domain::Binary | Domain::Null).then_some(proof)
+}
+fn input_domain(node: &ExprNode, schema: &BatchSchema) -> Option<Domain> {
+    Some(input_contract(node, schema)?.domain)
 }
 impl<'a> StringRead<'a> {
     pub(super) fn bind(node: &'a ExprNode, schema: &BatchSchema) -> Option<Self> {
@@ -347,11 +352,12 @@ impl<'a> StringRead<'a> {
             return None;
         };
         if matches!(kernel, FunctionKernel::Ascii | FunctionKernel::Ord) && args.len() == 1 {
-            let domain = input_domain(&args[0], schema)?;
+            let child = input_contract(&args[0], schema)?;
             return Some(Self::ByteNumber {
                 input: &args[0],
-                binary: matches!(domain, Domain::Binary),
+                binary: matches!(child.domain, Domain::Binary),
                 ordinal: matches!(kernel, FunctionKernel::Ord),
+                parallel: child.parallel,
             });
         }
         if matches!(kernel, FunctionKernel::LegacyDeterministic("STR_TO_DATE"))
@@ -377,8 +383,8 @@ impl<'a> StringRead<'a> {
             FunctionKernel::LegacyDeterministic("BIT_LENGTH" | "OCTET_LENGTH")
         ) && args.len() == 1
         {
-            let domain = input_domain(&args[0], schema)?;
-            if matches!(domain, Domain::Text) {
+            let child = input_contract(&args[0], schema)?;
+            if matches!(child.domain, Domain::Text) {
                 let ExprNode::Column(i) = &args[0] else {
                     return None;
                 };
@@ -395,6 +401,7 @@ impl<'a> StringRead<'a> {
             }
             return Some(Self::ByteLength {
                 input: &args[0],
+                parallel: child.parallel,
                 multiplier: if matches!(kernel, FunctionKernel::LegacyDeterministic("BIT_LENGTH")) {
                     8
                 } else {
@@ -571,6 +578,9 @@ impl<'a> StringRead<'a> {
             },
             parallel: matches!(
                 self,
+                Self::ByteNumber { parallel: true, .. } | Self::ByteLength { parallel: true, .. }
+            ) || matches!(
+                self,
                 Self::Search { .. }
                     | Self::Strcmp { .. }
                     | Self::Column { .. }
@@ -721,6 +731,7 @@ impl<'a> StringRead<'a> {
                 input,
                 binary,
                 ordinal,
+                ..
             } => {
                 let column = operand(input, batch)?;
                 if !matches!(
@@ -774,7 +785,9 @@ impl<'a> StringRead<'a> {
                 }
                 Some(ColumnVector::from_values(values))
             }),
-            Self::ByteLength { input, multiplier } => {
+            Self::ByteLength {
+                input, multiplier, ..
+            } => {
                 let column = operand(input, batch)?;
                 let mut data = Vec::with_capacity(batch.num_rows());
                 for row in 0..batch.num_rows() {

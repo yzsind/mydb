@@ -18,7 +18,7 @@ fn compile(sql: &str, kind: ColumnType) -> (ExprProgram, Arc<BatchSchema>) {
         &ast,
         &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
     )
-    .unwrap();
+    .unwrap_or_else(|error| panic!("compile {sql}: {error:?}"));
     (program, schema)
 }
 fn oracle(program: &ExprProgram, batch: &Batch) -> Result<Vec<Value>, QueryError> {
@@ -38,9 +38,13 @@ fn parity(sql: &str, kind: ColumnType, values: Vec<Value>) {
     let (program, schema) = compile(sql, kind);
     let batch = Batch::new(schema, vec![ColumnVector::from_values(values)]);
     let expected = oracle(&program, &batch).unwrap();
-    let column = program
-        .try_eval_column(&batch)
-        .unwrap_or_else(|| panic!("kernel declined {sql}"));
+    let column = program.try_eval_column(&batch).unwrap_or_else(|| {
+        panic!(
+            "kernel declined {sql}; kind={kind:?}; root={:?}; expected={expected:?}; bound={:?}",
+            program.root,
+            program.column_output_bound(&batch)
+        )
+    });
     let actual: Vec<_> = (0..batch.num_rows()).map(|r| column.value_at(r)).collect();
     assert_eq!(actual, expected, "{sql}");
 }
@@ -2695,6 +2699,81 @@ fn boolean_byte_and_bulk_crypto_columns_match_scalar_truth_and_payloads() {
 }
 
 #[test]
+fn byte_reads_inherit_only_proven_parallel_text_and_binary_operands() {
+    for binary in [false, true] {
+        let (_, base) = compile(
+            "x",
+            if binary {
+                ColumnType::Blob
+            } else {
+                ColumnType::VarString
+            },
+        );
+        let mut field = base.fields()[0].clone();
+        field.source.collation_id = Some(if binary {
+            crate::charset::BINARY_COLLATION_ID
+        } else {
+            crate::charset::UTF8MB4_0900_AI_CI_ID
+        });
+        if binary {
+            field.source.flags |= crate::mysql::protocol::BINARY_FLAG;
+        }
+        let schema = Arc::new(BatchSchema::new(vec![field]));
+        let values = if binary {
+            vec![
+                Value::Null,
+                Value::Bytes(vec![]),
+                Value::Bytes(vec![255, 0, 128]),
+                Value::Bytes("文🙂".as_bytes().to_vec()),
+                Value::Bytes(vec![0; 20000]),
+            ]
+        } else {
+            vec![
+                Value::Null,
+                Value::String("".into()),
+                Value::String("a\0b".into()),
+                Value::String("文🙂é".into()),
+                Value::String("🙂".repeat(10000)),
+            ]
+        };
+        for sql in ["ASCII(x)", "ORD(x)", "OCTET_LENGTH(x)", "BIT_LENGTH(x)"] {
+            let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+            let program = ExprCompiler::compile(
+                &ast,
+                &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+            )
+            .unwrap();
+            assert!(program.column_parallel_safe(&schema), "{sql}/{binary}");
+            checked_legacy_column(
+                sql,
+                schema.clone(),
+                vec![if binary {
+                    typed_binary_values(values.clone())
+                } else {
+                    ColumnVector::from_values(values.clone())
+                }],
+            );
+            let mut enum_field = schema.fields()[0].clone();
+            enum_field.source.flags |= crate::mysql::protocol::ENUM_FLAG;
+            assert_eq!(
+                program.column_parallel_safe(&BatchSchema::new(vec![enum_field])),
+                sql == "OCTET_LENGTH(x)",
+                "{sql}/enum"
+            );
+        }
+    }
+    for sql in [
+        "ASCII(CURRENT_USER())",
+        "ORD(CURRENT_USER())",
+        "OCTET_LENGTH(CURRENT_USER())",
+        "ASCII(CAST(x AS SIGNED))",
+    ] {
+        let (program, schema) = compile(sql, ColumnType::VarString);
+        assert!(!program.column_parallel_safe(&schema), "{sql}");
+    }
+}
+
+#[test]
 fn regexp_columns_keep_collation_flags_unicode_offsets_occurrences_and_nulls() {
     let (_, schema) = compile("x", ColumnType::VarString);
     for collation in [
@@ -3182,4 +3261,665 @@ fn fixed_temporal_shifts_keep_typed_lanes_zones_precision_and_overflow_fallback(
     let _ = oracle(&program, &batch);
     assert!(crate::engine::api::statement_warning_count() > 0);
     crate::engine::api::clear_statement_warnings();
+}
+
+#[test]
+fn temporal_value_batches_match_scalar_values_nulls_and_selection() {
+    let dt = Value::DateTime(1_704_067_200_123_456);
+    for (kind, value, expressions) in [
+        (
+            ColumnType::DateTime,
+            dt,
+            vec![
+                "ADDTIME(x,'01:30:00.001')",
+                "SUBTIME(x,'-03:00:00')",
+                "TIMESTAMPADD(DAY,2,x)",
+                "TIMESTAMPDIFF(MICROSECOND,x,x)",
+                "TIMEDIFF(x,x)",
+                "CONVERT_TZ(x,'+00:00','+08:00')",
+                "TIME_FORMAT(x,'%H:%i:%s.%f')",
+            ],
+        ),
+        (
+            ColumnType::Time,
+            Value::Time(-90_061_123_456),
+            vec![
+                "ADDTIME(x,'01:30:00')",
+                "SUBTIME(x,'-03:00:00')",
+                "TIMEDIFF(x,x)",
+                "TIME_FORMAT(x,'%H:%i:%s.%f')",
+            ],
+        ),
+        (
+            ColumnType::LongLong,
+            Value::Int(12),
+            vec![
+                "MAKEDATE(2024,x)",
+                "MAKETIME(x,1,2.125)",
+                "PERIOD_ADD(202401,x)",
+                "PERIOD_DIFF(202401,202201+x%12)",
+                "FORMAT_BYTES(x)",
+                "FORMAT_PICO_TIME(x)",
+                "FROM_UNIXTIME(x)",
+            ],
+        ),
+    ] {
+        for sql in expressions {
+            let (program, schema) = compile(sql, kind);
+            let batch = Batch::new(
+                schema,
+                vec![ColumnVector::from_values(vec![
+                    value.clone(),
+                    Value::Null,
+                    value.clone(),
+                ])],
+            );
+            let expected = oracle(&program, &batch).unwrap();
+            let output = program
+                .try_eval_column(&batch)
+                .unwrap_or_else(|| panic!("declined {sql}"));
+            assert_eq!(
+                (0..3).map(|row| output.value_at(row)).collect::<Vec<_>>(),
+                expected,
+                "{sql}"
+            );
+            let selected = batch.with_selection(
+                crate::engine::executor::vec::batch::Selection::Indices(vec![2, 0, 2]),
+            );
+            let output = program.try_eval_column(&selected).unwrap();
+            for index in [2, 0] {
+                assert_eq!(output.value_at(index), expected[index], "{sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn temporal_value_batch_declines_diagnostics_without_publishing_or_consuming_them() {
+    for sql in [
+        "ADDTIME(x,'bad')",
+        "TIMESTAMPADD(DAY,1,x)",
+        "TIME_FORMAT(x,'%H:%i')",
+        "TIMEDIFF(x,x)",
+    ] {
+        let (program, schema) = compile(sql, ColumnType::VarString);
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![Value::String(
+                "invalid date".into(),
+            )])],
+        );
+        let warnings = crate::engine::api::StatementWarningSink::default();
+        crate::engine::api::with_statement_warning_sink(warnings.clone(), || {
+            assert!(program.try_eval_column(&batch).is_none(), "{sql}");
+            assert!(
+                warnings.lock().is_empty(),
+                "speculative diagnostics leaked: {sql}"
+            );
+            let _ = oracle(&program, &batch);
+            assert!(
+                !warnings.lock().is_empty(),
+                "ordered diagnostics were consumed: {sql}"
+            );
+        });
+    }
+}
+
+#[test]
+fn temporal_value_retained_bounds_admit_full_integer_batches() {
+    for sql in [
+        "PERIOD_ADD(202401,x%12)",
+        "PERIOD_DIFF(202401,202201+x%12)",
+        "MAKEDATE(2024,x%365+1)",
+        "MAKETIME(x%24,x%60,x%60)",
+        "FORMAT_BYTES(x)",
+        "FORMAT_PICO_TIME(x)",
+        "FROM_DAYS(x%10000)",
+        "SEC_TO_TIME(x%10000)",
+    ] {
+        let (program, schema) = compile(sql, ColumnType::LongLong);
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::I64 {
+                data: (0..32768).collect(),
+                nulls: None,
+            }],
+        );
+        assert!(
+            program.column_output_bound(&batch).is_some(),
+            "retained output bound rejected {sql}"
+        );
+        let column = program
+            .try_eval_column(&batch)
+            .unwrap_or_else(|| panic!("declined {sql}"));
+        assert_eq!(column.len(), 32768);
+        let expected = oracle(&program, &batch).unwrap();
+        for index in [0, 1, 100, 32767] {
+            assert_eq!(column.value_at(index), expected[index], "{sql}");
+        }
+    }
+}
+
+#[test]
+fn statement_identity_columns_rebind_database_and_login_per_execution() {
+    let mut session = SessionContext::default();
+    let programs = [
+        "DATABASE()",
+        "SCHEMA()",
+        "USER()",
+        "CURRENT_USER()",
+        "CONNECTION_ID()",
+        "VERSION()",
+    ]
+    .into_iter()
+    .map(|sql| (sql, compile(sql, ColumnType::LongLong)))
+    .collect::<Vec<_>>();
+    for database in ["first", "数据库🙂", ""] {
+        session.current_database = database.into();
+        session.user = format!("user_{database}");
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for (sql, (program, schema)) in &programs {
+                let batch = Batch::new(
+                    schema.clone(),
+                    vec![ColumnVector::I64 {
+                        data: vec![1, 2, 3],
+                        nulls: None,
+                    }],
+                );
+                let expected = oracle(program, &batch).unwrap();
+                let output = program
+                    .try_eval_column(&batch)
+                    .unwrap_or_else(|| panic!("declined {sql}"));
+                assert_eq!(
+                    (0..3)
+                        .map(|index| output.value_at(index))
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{sql}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn fixed_temporal_value_kernels_preserve_fractional_precision_and_dst() {
+    let mut session = SessionContext::default();
+    for zone in ["+00:00", "+08:00", "America/New_York"] {
+        session.sysvars.time_zone = zone.into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for kind in [ColumnType::DateTime, ColumnType::Timestamp] {
+                let values: Vec<_> = [
+                    0,
+                    -1,
+                    1_704_067_200_000_000,
+                    1_704_067_200_100_000,
+                    1_704_067_200_123_400,
+                    1_710_053_999_999_999,
+                    1_730_613_599_999_999,
+                ]
+                .into_iter()
+                .map(|value| {
+                    if kind == ColumnType::Timestamp {
+                        Value::Timestamp(value)
+                    } else {
+                        Value::DateTime(value)
+                    }
+                })
+                .chain([Value::Null])
+                .collect();
+                for sql in [
+                    "ADDTIME(x,'01:00:00.00100')",
+                    "ADDTIME(x,'0000-00-00')",
+                    "SUBTIME(x,'0000-00-00 00:00:00')",
+                    "SUBTIME(x,'-01:00:00.000001')",
+                    "CONVERT_TZ(x,'+08:00','-05:00')",
+                    "CONVERT_TZ(x,'America/New_York','Europe/Berlin')",
+                ] {
+                    parity(sql, kind, values.clone());
+                }
+            }
+            parity(
+                "DATEDIFF(x,DATE '2020-01-01')",
+                ColumnType::DateTime,
+                vec![Value::DateTime(1_704_067_200_123_400), Value::Null],
+            );
+        });
+    }
+}
+
+#[test]
+fn native_time_format_plan_matches_scalar_tokens_and_extended_hours() {
+    let values = vec![
+        Value::Null,
+        Value::Time(0),
+        Value::Time(1),
+        Value::Time(-1),
+        Value::Time(12 * 3_600_000_000 + 59_123_456),
+        Value::Time(36 * 3_600_000_000),
+        Value::Time(-3_020_399_999_999),
+        Value::Time(3_020_399_999_999),
+    ];
+    for format in [
+        "%H:%i:%s.%f",
+        "%r|%T|%p|%k|%h|%I|%l",
+        "%Y %y %m %c %d %e %% %q 🙂 %",
+        "",
+        "%D",
+        "%j",
+        "%W",
+        "%X",
+        "%w",
+    ] {
+        parity(
+            &format!("TIME_FORMAT(x,'{format}')"),
+            ColumnType::Time,
+            values.clone(),
+        );
+    }
+}
+
+#[test]
+fn integer_temporal_lanes_match_scalar_boundaries_and_unsigned_coercions() {
+    for sql in [
+        "SEC_TO_TIME(x)",
+        "MAKETIME(x,59,59)",
+        "MAKETIME(1,x,59)",
+        "MAKETIME(1,59,x)",
+        "MAKEDATE(x,1)",
+        "FROM_DAYS(x)",
+    ] {
+        parity(
+            sql,
+            ColumnType::LongLong,
+            vec![
+                Value::Null,
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(59),
+                Value::Int(60),
+                Value::Int(69),
+                Value::Int(70),
+                Value::Int(99),
+                Value::Int(100),
+                Value::Int(9999),
+                Value::Int(10000),
+                Value::Int(i64::MAX),
+            ],
+        );
+        parity(
+            sql,
+            ColumnType::LongLong,
+            vec![
+                Value::Null,
+                Value::UInt(0),
+                Value::UInt(1),
+                Value::UInt(i64::MAX as u64 + 1),
+                Value::UInt(u64::MAX),
+            ],
+        );
+    }
+    for sql in [
+        "PERIOD_ADD(x,1)",
+        "PERIOD_ADD(x,-10000)",
+        "PERIOD_DIFF(x,202401)",
+    ] {
+        parity(
+            sql,
+            ColumnType::LongLong,
+            vec![
+                Value::Null,
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(6912),
+                Value::Int(7001),
+                Value::Int(999912),
+                Value::Int(202401),
+            ],
+        );
+    }
+}
+
+#[test]
+fn fixed_calendar_arithmetic_matches_scalar_units_timezones_and_fsp() {
+    let mut session = SessionContext::default();
+    for zone in ["+00:00", "+08:00", "America/New_York"] {
+        session.sysvars.time_zone = zone.into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for kind in [ColumnType::DateTime, ColumnType::Timestamp] {
+                let values: Vec<_> = [
+                    0,
+                    -1,
+                    1_704_067_200_000_000,
+                    1_704_067_200_123_400,
+                    1_710_053_999_999_999,
+                    1_730_613_599_999_999,
+                ]
+                .into_iter()
+                .map(|v| {
+                    if kind == ColumnType::Timestamp {
+                        Value::Timestamp(v)
+                    } else {
+                        Value::DateTime(v)
+                    }
+                })
+                .chain([Value::Null])
+                .collect();
+                for sql in [
+                    "DATEDIFF(x,'2020-01-01')",
+                    "TIMEDIFF(x,x)",
+                    "TIMEDIFF(x,DATE(x))",
+                    "TIME_FORMAT(x,'%H:%i:%s.%f|%r|%p')",
+                ] {
+                    parity(sql, kind, values.clone());
+                }
+                parity(
+                    "UNIX_TIMESTAMP(x)",
+                    kind,
+                    vec![
+                        Value::Null,
+                        if kind == ColumnType::Timestamp {
+                            Value::Timestamp(1_704_067_200_000_000)
+                        } else {
+                            Value::DateTime(1_704_067_200_000_000)
+                        },
+                    ],
+                );
+                for unit in [
+                    "MICROSECOND",
+                    "SECOND",
+                    "MINUTE",
+                    "HOUR",
+                    "DAY",
+                    "DAYS",
+                    "WEEK",
+                    "SQL_TSI_DAY",
+                ] {
+                    for sql in [
+                        format!("TIMESTAMPADD({unit},-7,x)"),
+                        format!("TIMESTAMPDIFF({unit},x,'2020-01-01 12:34:56.123400')"),
+                    ] {
+                        parity(&sql, kind, values.clone());
+                    }
+                }
+            }
+            for sql in ["FROM_UNIXTIME(x)", "FROM_UNIXTIME(x+1)"] {
+                parity(
+                    sql,
+                    ColumnType::LongLong,
+                    vec![
+                        Value::Null,
+                        Value::Int(-1),
+                        Value::Int(0),
+                        Value::Int(1),
+                        Value::Int(2_147_483_648),
+                        Value::Int(253_402_300_799),
+                        Value::Int(i64::MAX - 1),
+                    ],
+                );
+            }
+        });
+    }
+    for sql in [
+        "TIMESTAMPADD(DAY,x,'2020-01-01')",
+        "TIMESTAMPADD(DAYS,x,'2020-01-01')",
+        "TIMESTAMPADD(SECOND,x,'2020-01-01 12:34:56.123400')",
+        "TIMESTAMPADD(MICROSECOND,x,'2020-01-01')",
+    ] {
+        parity(
+            sql,
+            ColumnType::LongLong,
+            vec![Value::Int(-1), Value::Int(0), Value::Int(1), Value::Null],
+        );
+    }
+}
+
+#[test]
+fn epoch_kernel_preserves_child_overflow_and_fractional_source_metadata() {
+    let (program, schema) = compile("FROM_UNIXTIME(x+1)", ColumnType::LongLong);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::I64 {
+            data: vec![i64::MAX],
+            nulls: None,
+        }],
+    );
+    assert!(program.try_eval_column(&batch).is_none());
+    assert_eq!(oracle(&program, &batch).unwrap_err().code(), 1690);
+    let (program, schema) = compile("UNIX_TIMESTAMP(x)", ColumnType::DateTime);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::DateTime64 {
+            data: vec![1_704_067_200_123_400],
+            nulls: None,
+        }],
+    );
+    let column = program.try_eval_column(&batch).unwrap();
+    assert_eq!(column.value_at(0), oracle(&program, &batch).unwrap()[0]);
+    let mut field = batch.schema().fields()[0].clone();
+    field.source.decimals = Some(6);
+    let schema = BatchSchema::new(vec![field]);
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+    let ast = crate::parser::parse_expr_fragment("UNIX_TIMESTAMP(x)").unwrap();
+    assert!(ExprCompiler::compile(&ast, &input).is_ok());
+    let nested = crate::parser::parse_expr_fragment("COALESCE(UNIX_TIMESTAMP(x),0)").unwrap();
+    assert!(matches!(
+        ExprCompiler::compile(&nested, &input),
+        Err(CompileError::Unsupported)
+    ));
+    let (_, text_schema) = compile("x", ColumnType::VarString);
+    let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&text_schema);
+    assert!(matches!(
+        ExprCompiler::compile(&ast, &input),
+        Err(CompileError::Unsupported)
+    ));
+}
+
+#[test]
+fn integer_lookup_domains_match_scalar_nulls_extremes_and_mixed_boundaries() {
+    let values = vec![
+        Value::Null,
+        Value::Int(i64::MIN),
+        Value::Int(-1),
+        Value::Int(0),
+        Value::Int(1),
+        Value::Int(2),
+        Value::Int(3),
+        Value::Int(9_007_199_254_740_993),
+        Value::Int(i64::MAX),
+    ];
+    for sql in [
+        "FIELD(x,1,2,3)",
+        "FIELD(x,NULL,1,1,9223372036854775807)",
+        "INTERVAL(x,NULL,0,10,100)",
+        "INTERVAL(x,100,10,NULL,0)",
+        "ELT(x,'a','数据库🙂',NULL)",
+        "ELT(x,X'00FF',X'0061',NULL)",
+        "ELT(x,1,2,NULL)",
+    ] {
+        parity(sql, ColumnType::LongLong, values.clone());
+    }
+    for sql in [
+        "FIELD(x,1,18446744073709551615)",
+        "INTERVAL(x,0,9007199254740992,18446744073709551615)",
+        "ELT(x,'a','b')",
+    ] {
+        parity(
+            sql,
+            ColumnType::LongLong,
+            vec![
+                Value::Null,
+                Value::UInt(0),
+                Value::UInt(1),
+                Value::UInt(u64::MAX),
+            ],
+        );
+    }
+}
+
+#[test]
+fn prepared_column_proof_declines_a_changed_parameter_binding() {
+    let (program, schema) = compile("CONCAT(x,?)", ColumnType::VarString);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![Value::String(
+            "base".into(),
+        )])],
+    );
+    crate::engine::params::with_params(vec![Value::String("short".into())], || {
+        let prepared = program.prepare_column(&batch).unwrap();
+        assert!(prepared.output_bound().is_some());
+        crate::engine::params::with_params(vec![Value::String("z".repeat(4000))], || {
+            assert!(prepared.evaluate().is_none());
+            let column = program.try_eval_column(&batch).unwrap();
+            assert_eq!(
+                column.value_at(0),
+                Value::String("base".to_string() + &"z".repeat(4000))
+            );
+        });
+    });
+}
+
+#[test]
+fn escaped_lazy_time_arguments_retain_their_scalar_evaluation_boundary() {
+    let (program, schema) = compile(
+        "MAKETIME(NULL,REPEAT('x',10000000),0)",
+        ColumnType::LongLong,
+    );
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::I64 {
+            data: vec![1],
+            nulls: None,
+        }],
+    );
+    let warnings = crate::engine::api::StatementWarningSink::default();
+    crate::engine::api::with_statement_warning_sink(warnings.clone(), || {
+        assert!(program.try_eval_column(&batch).is_none());
+        assert_eq!(oracle(&program, &batch).unwrap(), vec![Value::Null]);
+        assert!(warnings.lock().is_empty());
+    });
+}
+
+#[test]
+fn substring_byte_ranges_match_scalar_for_unicode_positions_and_extreme_extents() {
+    let values = vec![
+        Value::Null,
+        Value::String(String::new()),
+        Value::String("a".into()),
+        Value::String("abc\0def".into()),
+        Value::String("中🙂e\u{301}ß界".into()),
+        Value::String("x".repeat(10000)),
+    ];
+    for start in [i64::MIN, -20, -3, -1, 0, 1, 2, 4, 20, i64::MAX] {
+        for len in [
+            None,
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(8),
+            Some(i64::MAX),
+        ] {
+            let sql = match len {
+                Some(len) => format!("SUBSTRING(x,{start},{len})"),
+                None => format!("SUBSTRING(x,{start})"),
+            };
+            parity(&sql, ColumnType::VarString, values.clone());
+        }
+    }
+}
+
+#[test]
+fn projection_evaluation_reuses_a_prepared_workspace_proof() {
+    let (program, schema) = compile("SUBSTRING(x,2,3)", ColumnType::VarString);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![
+            Value::String("a中🙂e\u{301}界".into()),
+            Value::Null,
+            Value::String("x".repeat(10000)),
+        ])],
+    );
+    CONTRACT_BIND_VISITS.with(|visits| visits.set(0));
+    let proof = program.prepare_column(&batch).unwrap();
+    let retained = proof.retained_bound().unwrap();
+    let visits = CONTRACT_BIND_VISITS.with(std::cell::Cell::get);
+    let output = crate::engine::executor::vec::expr_batch::eval_to_column_prepared(
+        &program,
+        &batch,
+        Some(proof),
+    )
+    .unwrap();
+    assert_eq!(CONTRACT_BIND_VISITS.with(std::cell::Cell::get), visits);
+    assert!(output.memory_bytes() <= retained);
+    assert_eq!(
+        (0..batch.num_rows())
+            .map(|row| output.value_at(row))
+            .collect::<Vec<_>>(),
+        oracle(&program, &batch).unwrap()
+    );
+}
+
+#[test]
+fn borrowed_geometry_constructor_arguments_are_eager_and_evaluated_once() {
+    struct CountingRow {
+        values: Vec<Value>,
+        reads: RefCell<Vec<usize>>,
+    }
+    impl RowSource for CountingRow {
+        fn value_ref(&self, index: usize) -> Option<&Value> {
+            self.reads.borrow_mut().push(index);
+            self.values.get(index)
+        }
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+    }
+    let (_, schema) = compile("x", ColumnType::Geometry);
+    let mut second = schema.fields()[0].clone();
+    second.name = "y".into();
+    let schema = BatchSchema::new(vec![schema.fields()[0].clone(), second]);
+    let ast = crate::parser::parse_expr_fragment("GEOMETRYCOLLECTION(x,y)").unwrap();
+    let program = ExprCompiler::compile(
+        &ast,
+        &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+    )
+    .unwrap();
+    let geometry = crate::engine::geo::write_geometry(&crate::engine::geo::types::Geometry {
+        srid: 0,
+        geom: crate::engine::geo::parse_wkt("LINESTRING(0 0,1 1,2 3)").unwrap(),
+    });
+    for values in [
+        vec![
+            Value::Geometry(geometry.clone()),
+            Value::Geometry(geometry.clone()),
+        ],
+        vec![Value::Null, Value::Geometry(vec![255])],
+    ] {
+        let null = matches!(values[0], Value::Null);
+        let row = CountingRow {
+            values,
+            reads: RefCell::new(Vec::new()),
+        };
+        let result = with_eval_scratch(|scratch| program.eval_source(&row, scratch)).unwrap();
+        assert_eq!(*row.reads.borrow(), vec![0, 1]);
+        if null {
+            assert_eq!(result, Value::Null);
+        } else {
+            let Value::Geometry(bytes) = result else {
+                panic!("geometry");
+            };
+            assert_eq!(
+                crate::engine::geo::read_geometry(&bytes)
+                    .unwrap()
+                    .geom
+                    .num_geometries(),
+                2
+            );
+            assert_eq!(row.values[0], Value::Geometry(geometry.clone()));
+        }
+    }
 }

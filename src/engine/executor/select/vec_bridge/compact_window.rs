@@ -2,6 +2,8 @@
 //! one partition at a time uses the canonical SQL window evaluator. A failed
 //! optional reservation replays the consumed prefix into the spill pipeline.
 
+mod direct;
+
 use super::*;
 use crate::engine::executor::dispatch::{
     cancellable_window_sort, evaluate_window_prefix_values, evaluate_window_with_partitions,
@@ -97,10 +99,13 @@ fn fixed_result_scatter_safe(
     {
         return true;
     }
-    if !matches!(name.as_str(), "SUM" | "MIN" | "MAX" | "COUNT") {
+    if !matches!(
+        name.as_str(),
+        "SUM" | "MIN" | "MAX" | "COUNT" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+    ) {
         return false;
     }
-    let [argument] = window.args.as_slice() else {
+    let Some(argument) = window.args.first() else {
         return false;
     };
     let Some(column) = expr_column_index_in_template(argument, template) else {
@@ -343,9 +348,7 @@ fn fixed_output_width(
     let ColumnType::Decimal { precision, .. } = window.output_type else {
         return fixed_width(window.output_type);
     };
-    let [argument] = window.args.as_slice() else {
-        return None;
-    };
+    let argument = window.args.first()?;
     let column = expr_column_index_in_template(argument, template)?;
     if window.name.eq_ignore_ascii_case("MIN") || window.name.eq_ignore_ascii_case("MAX") {
         return Some(
@@ -968,9 +971,12 @@ pub(super) fn prepare_with_limit<'a>(
                 .args
                 .first()
                 .and_then(|arg| expr_column_index_in_template(arg, template));
+            let direct = direct::Plan::bind(window, template);
             for partition in &partitions {
                 crate::engine::cancel::check_cancelled()?;
-                let values = if prefix {
+                let values = if let Some(direct) = direct {
+                    direct.evaluate(partition, &batches, &order_positions, &sort_fields)?
+                } else if prefix {
                     evaluate_window_prefix_values(
                         &name,
                         count_star,

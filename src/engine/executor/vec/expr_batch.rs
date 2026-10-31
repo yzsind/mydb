@@ -2695,6 +2695,14 @@ pub fn batch_schema_to_input(schema: &BatchSchema) -> InputSchema {
 /// single `ColumnVector`. Picks a typed lane when all results agree on a
 /// kind, otherwise emits `Generic`.
 pub fn eval_to_column(program: &ExprProgram, batch: &Batch) -> Result<ColumnVector, QueryError> {
+    eval_to_column_prepared(program, batch, None)
+}
+
+pub(crate) fn eval_to_column_prepared<'a>(
+    program: &'a ExprProgram,
+    batch: &'a Batch,
+    prepared: Option<crate::engine::expr_program::ColumnEvaluation<'a>>,
+) -> Result<ColumnVector, QueryError> {
     if batch.selection().is_some()
         && !matches!(
             crate::engine::executor::vec::config::effective_mode(),
@@ -2860,9 +2868,13 @@ pub fn eval_to_column(program: &ExprProgram, batch: &Batch) -> Result<ColumnVect
         }
     }
     // Preserve established direct-column kernels before lowering composition.
-    // This expression-major boundary owns the complete evaluation order.
+    // Reuse a caller's workspace proof only at the composed-column boundary.
     if !matches!(super::config::effective_mode(), super::config::VecMode::Off) {
-        if let Some(column) = program.try_eval_column(batch) {
+        let column = match prepared {
+            Some(prepared) => prepared.evaluate(),
+            None => program.try_eval_column(batch),
+        };
+        if let Some(column) = column {
             return Ok(column);
         }
     }

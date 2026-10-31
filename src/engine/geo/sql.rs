@@ -239,15 +239,41 @@ pub(crate) fn eval_geometry_constructor(
     values: &[Value],
     geometry_arguments: bool,
 ) -> Result<Value, QueryError> {
-    let upper = name.to_ascii_uppercase();
+    eval_geometry_constructor_refs(name, values.iter(), geometry_arguments)
+}
+
+/// Constructor arguments may borrow immutable row/constant payloads. The
+/// iterator still represents every argument, evaluated once in source order.
+pub(crate) fn eval_geometry_constructor_refs<'a, I>(
+    name: &str,
+    values: I,
+    geometry_arguments: bool,
+) -> Result<Value, QueryError>
+where
+    I: ExactSizeIterator<Item = &'a Value> + Clone,
+{
+    let upper = if name.bytes().any(|b| b.is_ascii_lowercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_uppercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    };
     let spec = function_spec(&upper).expect("bound geometry constructor");
     if values.len() < usize::from(spec.min_args) || values.len() > usize::from(spec.max_args) {
         return Err(wrong_count(name));
     }
-    if geometry_arguments && values.iter().any(|value| matches!(value, Value::Null)) {
+    if geometry_arguments && values.clone().any(|value| matches!(value, Value::Null)) {
         return Ok(Value::Null);
     }
-    eval(&upper, name, values)
+    let target = match spec.canonical_id {
+        "LINESTRING" => WKB_LINESTRING,
+        "POLYGON" => WKB_POLYGON,
+        "MULTIPOINT" => WKB_MULTIPOINT,
+        "MULTILINESTRING" => WKB_MULTILINESTRING,
+        "MULTIPOLYGON" => WKB_MULTIPOLYGON,
+        "GEOMCOLLECTION" => WKB_GEOMETRYCOLLECTION,
+        _ => return eval(&upper, name, &values.cloned().collect::<Vec<_>>()),
+    };
+    typed_collection_ctor_refs(name, values, target)
 }
 
 /// Evaluate a spatial function. `values` are the already-evaluated argument
@@ -894,6 +920,17 @@ fn typed_collection_ctor(
     values: &[Value],
     target_type: u32,
 ) -> Result<Value, QueryError> {
+    typed_collection_ctor_refs(name, values.iter(), target_type)
+}
+
+fn typed_collection_ctor_refs<'a, I>(
+    name: &str,
+    values: I,
+    target_type: u32,
+) -> Result<Value, QueryError>
+where
+    I: ExactSizeIterator<Item = &'a Value>,
+{
     let mut srid = None;
     let mut parts = Vec::with_capacity(values.len());
     for value in values {

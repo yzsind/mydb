@@ -1918,6 +1918,21 @@ impl crate::engine::api::ResultCursor for WindowProjectionCursor {
                     })
                     .collect(),
             ),
+            ResultChunk::Rows(rows) => ResultChunk::Rows(
+                rows.into_iter()
+                    .map(|row| {
+                        self.projections
+                            .iter()
+                            .map(|projection| {
+                                let WindowFinalCol::Index(index) = projection else {
+                                    unreachable!("index-only projection")
+                                };
+                                row.get(*index).cloned().unwrap_or(Value::Null)
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            ),
             ResultChunk::Columnar(owned) => {
                 let rows = owned.batch.num_rows();
                 let selection = owned.batch.selection().cloned();

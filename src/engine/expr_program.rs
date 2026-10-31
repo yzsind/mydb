@@ -2,6 +2,7 @@ mod column_batch;
 use crate::engine::expr::expect_arg_count as expect_len;
 use crate::engine::expr::{null_or, ComparisonProvenance};
 use crate::parser::boolean::flip_cmp as flip;
+pub(crate) use column_batch::ColumnEvaluation;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -2323,8 +2324,8 @@ fn borrowed_aes_shape(expr: &Expr, schema: &InputSchema, depth: usize) -> bool {
         })
 }
 
-fn contains_source_sensitive_function(expr: &Expr, schema: &InputSchema) -> bool {
-    crate::parser::visit::try_inspect_value_expr(expr, |expr| {
+fn contains_source_sensitive_function(root: &Expr, schema: &InputSchema) -> bool {
+    crate::parser::visit::try_inspect_value_expr(root, |expr| {
         if let Expr::Function { name, args, .. } = expr {
             let is_json_cast = name.eq_ignore_ascii_case("CAST")
                 && matches!(
@@ -2339,7 +2340,25 @@ fn contains_source_sensitive_function(expr: &Expr, schema: &InputSchema) -> bool
             let consumes_source_octets = (name.eq_ignore_ascii_case("AES_ENCRYPT")
                 || name.eq_ignore_ascii_case("AES_DECRYPT"))
                 && !borrowed_aes_shape(expr, schema, 0);
-            let needs_source_type = name.eq_ignore_ascii_case("UNIX_TIMESTAMP");
+            // Standalone temporal columns retain their source kind and FSP in
+            // the bound schema. Nested conditional coercions, text and no-argument
+            // form still need the schema-aware legacy evaluation surface.
+            let bound_temporal = args.len() == 1
+                && input_expr_column_index(&args[0], schema)
+                    .and_then(|index| schema.bound_types.get(index))
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind.kind,
+                            crate::engine::expr_type::ExprTypeKind::Temporal {
+                                kind: crate::engine::expr_type::TemporalKind::Date
+                                    | crate::engine::expr_type::TemporalKind::DateTime
+                                    | crate::engine::expr_type::TemporalKind::Timestamp,
+                                ..
+                            }
+                        )
+                    });
+            let needs_source_type = name.eq_ignore_ascii_case("UNIX_TIMESTAMP")
+                && (!bound_temporal || !std::ptr::eq(expr, root));
             if is_json_cast || consumes_source_octets || needs_source_type {
                 return Err(());
             }
@@ -7259,6 +7278,14 @@ impl FunctionKernel {
                 )))
             }
             FunctionKernel::Spatial(spec) => {
+                if let [argument] = args {
+                    let value = argument.eval_ref(row, scratch)?;
+                    return crate::engine::geo::sql::eval(
+                        spec.canonical_id,
+                        spec.sql_name,
+                        std::slice::from_ref(value.as_value()),
+                    );
+                }
                 let values = args
                     .iter()
                     .map(|arg| arg.eval(row, scratch))
@@ -7679,11 +7706,11 @@ impl FunctionKernel {
             FunctionKernel::GeometryConstructor(name, geometry_arguments) => {
                 let values = args
                     .iter()
-                    .map(|arg| arg.eval(row, scratch))
-                    .collect::<Result<Vec<_>, _>>()?;
-                crate::engine::geo::sql::eval_geometry_constructor(
+                    .map(|arg| arg.eval_ref(row, scratch))
+                    .collect::<Result<smallvec::SmallVec<[ValueRef<'_>; 3]>, _>>()?;
+                crate::engine::geo::sql::eval_geometry_constructor_refs(
                     name,
-                    &values,
+                    values.iter().map(ValueRef::as_value),
                     geometry_arguments,
                 )
             }

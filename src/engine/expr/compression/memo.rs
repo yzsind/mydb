@@ -1,4 +1,4 @@
-//! Exact, byte-bounded reuse for repeated compression inputs.
+//! Exact, byte-bounded reuse for repeated byte transforms.
 
 use std::num::NonZeroUsize;
 
@@ -26,6 +26,7 @@ struct Entry {
     input: Vec<u8>,
     output: Vec<u8>,
     reused: bool,
+    expected: Option<usize>,
 }
 
 impl Memo {
@@ -54,9 +55,19 @@ impl Memo {
         })
     }
 
+    #[cfg(test)]
     fn get_hashed(&mut self, input: &[u8], hash: u64) -> Option<Vec<u8>> {
+        self.get_hashed_with_len(input, hash, None)
+    }
+
+    fn get_hashed_with_len(
+        &mut self,
+        input: &[u8],
+        hash: u64,
+        expected: Option<usize>,
+    ) -> Option<Vec<u8>> {
         self.entries.get_mut(&hash).and_then(|entry| {
-            if entry.input != input {
+            if entry.input != input || entry.expected != expected {
                 return None;
             }
             entry.reused = true;
@@ -65,14 +76,33 @@ impl Memo {
     }
 
     pub(super) fn lookup(&mut self, input: &[u8]) -> (Option<Vec<u8>>, Option<u64>) {
+        self.lookup_with_len(input, None)
+    }
+
+    pub(super) fn lookup_exact_len(
+        &mut self,
+        input: &[u8],
+        expected: usize,
+    ) -> (Option<Vec<u8>>, Option<u64>) {
+        self.lookup_with_len(input, Some(expected))
+    }
+
+    fn lookup_with_len(
+        &mut self,
+        input: &[u8],
+        expected: Option<usize>,
+    ) -> (Option<Vec<u8>>, Option<u64>) {
         if self.cooldown > 0 {
             self.cooldown -= 1;
             return (None, None);
         }
-        // Hash the input once. Both LRU operations and the admission filter
-        // reuse this fingerprint; complete bytes still prove every hit.
-        let hash = self.hasher.hash_one(input);
-        if let Some(output) = self.get_hashed(input, hash) {
+        // The advertised length is part of decoder identity. Even malformed
+        // streams cannot reuse an output from a differently bounded decode.
+        let hash = match expected {
+            None => self.hasher.hash_one(input),
+            Some(length) => self.hasher.hash_one((length, input)),
+        };
+        if let Some(output) = self.get_hashed_with_len(input, hash, expected) {
             return (Some(output), None);
         }
         (None, self.admit_hash(hash).then_some(hash))
@@ -99,6 +129,22 @@ impl Memo {
     }
 
     pub(super) fn insert(&mut self, input: &[u8], output: &[u8], hash: u64) {
+        self.insert_with_len(input, output, hash, None)
+    }
+
+    pub(super) fn insert_exact_len(
+        &mut self,
+        input: &[u8],
+        output: &[u8],
+        hash: u64,
+        expected: usize,
+    ) {
+        if output.len() == expected {
+            self.insert_with_len(input, output, hash, Some(expected));
+        }
+    }
+
+    fn insert_with_len(&mut self, input: &[u8], output: &[u8], hash: u64, expected: Option<usize>) {
         let cost = Self::cost(input, output);
         if cost > (BUDGET - FIXED_BYTES) / 16 {
             return;
@@ -131,6 +177,7 @@ impl Memo {
                 input: input.to_vec(),
                 output: output.to_vec(),
                 reused: false,
+                expected,
             },
         );
         self.bytes += cost;
@@ -195,6 +242,8 @@ mod tests {
     fn fingerprint_collisions_never_return_another_inputs_bytes() {
         let mut memo = Memo::try_new().unwrap();
         memo.insert(b"left", b"left encoded", 42);
+        assert!(memo.get_hashed_with_len(b"left", 42, Some(0)).is_none());
+        assert!(memo.get_hashed_with_len(b"right", 42, Some(0)).is_none());
         assert!(memo.get_hashed(b"right", 42).is_none());
         memo.insert(b"right", b"right encoded", 42);
         assert!(memo.get_hashed(b"left", 42).is_none());
@@ -206,5 +255,19 @@ mod tests {
             memo.bytes,
             FIXED_BYTES + Memo::cost(b"right", b"right encoded")
         );
+    }
+    #[test]
+    fn advertised_length_is_part_of_decoder_cache_identity() {
+        let mut memo = Memo::try_new().unwrap();
+        assert!(memo.lookup_exact_len(b"stream", 7).0.is_none());
+        let hash = memo.lookup_exact_len(b"stream", 7).1.unwrap();
+        memo.insert_exact_len(b"stream", b"decoded", hash, 7);
+        assert_eq!(
+            memo.lookup_exact_len(b"stream", 7).0,
+            Some(b"decoded".to_vec())
+        );
+        assert!(memo.lookup_exact_len(b"stream", 6).0.is_none());
+        assert!(memo.get_hashed_with_len(b"stream", hash, Some(6)).is_none());
+        assert!(memo.get_hashed(b"stream", hash).is_none());
     }
 }
