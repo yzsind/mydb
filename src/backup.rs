@@ -1846,11 +1846,16 @@ pub fn cli_main(args: Vec<String>) -> Result<(), QueryError> {
 pub struct BackupStartupGuard {
     _lock: crate::storage::dir_lock::DataDirLock,
 }
-pub fn prepare_archive_retention(root: &Path) -> Result<BackupStartupGuard, QueryError> {
-    // A first server boot reaches this guard before storage creates its tree.
+pub fn lock_data_directory(root: &Path) -> Result<BackupStartupGuard, QueryError> {
     fs::create_dir_all(crate::storage::naming::system_dir(root))
         .map_err(|e| io_err("create startup lock directory", e))?;
-    let lock = crate::storage::dir_lock::DataDirLock::acquire(root)?;
+    Ok(BackupStartupGuard {
+        _lock: crate::storage::dir_lock::DataDirLock::acquire(root)?,
+    })
+}
+
+pub fn prepare_archive_retention(root: &Path) -> Result<BackupStartupGuard, QueryError> {
+    let guard = lock_data_directory(root)?;
     DirectoryOperation::cleanup(
         &root.join("system/backup-generation-pins"),
         "generation-pins",
@@ -1893,7 +1898,7 @@ pub fn prepare_archive_retention(root: &Path) -> Result<BackupStartupGuard, Quer
     {
         capture.set_lease("archive", None)?;
     }
-    Ok(BackupStartupGuard { _lock: lock })
+    Ok(guard)
 }
 pub fn init_background_archiver(db: Arc<Database>) -> Result<(), QueryError> {
     coordinator::Coordinator::get(&db).map(|_| ())

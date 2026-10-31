@@ -362,7 +362,7 @@ fn resolve_range(first: IdxSpec, last: IdxSpec, len: usize) -> Option<(usize, us
     };
     let resolve_end = |spec| match spec {
         IdxSpec::FromStart(idx) => Some(idx.min(len - 1)),
-        IdxSpec::FromLast(off) => Some(len.saturating_sub(1).saturating_sub(off)),
+        IdxSpec::FromLast(off) => (len - 1).checked_sub(off),
     };
     let start = resolve_start(first)?;
     let end = resolve_end(last)?;

@@ -535,6 +535,18 @@ fn native_scalar_sql(
             render(&args[0])
         ));
     }
+    if name.eq_ignore_ascii_case("CONVERT_USING") && args.len() == 3 {
+        if let Expr::Literal(Literal::String(charset)) = &args[1] {
+            if matches!(&args[2], Expr::Literal(Literal::Bool(true))) {
+                return Some(format!("_{} {}", charset, render(&args[0])));
+            }
+            return Some(format!(
+                "CONVERT({} USING {})",
+                render(&args[0]),
+                quote_ident(charset)
+            ));
+        }
+    }
     if args.len() == 2 {
         if let Expr::Literal(Literal::String(value)) = &args[1] {
             if name.eq_ignore_ascii_case("COLLATE") {

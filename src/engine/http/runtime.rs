@@ -1056,3 +1056,32 @@ mod tests {
         assert_eq!(g.users.remove(&principal).unwrap().inflight, 0);
     }
 }
+
+#[cfg(test)]
+mod audit1031_shutdown_tests {
+    use super::*;
+    #[test]
+    fn audit1031_shutdown_finishes_checkpoint_after_http_drain_error() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut config = crate::storage::StorageConfig::from_env();
+        config.durability = crate::storage::DurabilityMode::Memory;
+        config.buffer_pool_pages = 512;
+        let engine =
+            crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(),
+                config,
+            )
+            .unwrap();
+        engine
+            .execute("CREATE TABLE shutdown_probe (a INT)")
+            .unwrap();
+        let c = control(engine.db_handle()).unwrap();
+        c.pending.store(1, Ordering::Release);
+        let checkpoints = engine.db_handle().storage_status().checkpoints_total;
+        assert!(engine.shutdown().is_err());
+        // Shutdown must report the drain failure, but still join workers and
+        // establish a durable checkpoint for already completed database work.
+        assert!(engine.db_handle().storage_status().checkpoints_total > checkpoints);
+        c.pending.store(0, Ordering::Release);
+    }
+}

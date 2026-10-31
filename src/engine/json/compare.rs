@@ -325,3 +325,58 @@ fn compare_objects(a: JsonbRef<'_>, b: JsonbRef<'_>) -> Ordering {
         }
     }
 }
+
+/// Hash equality must use exactly the same numeric and temporal domains as
+/// compare_nodes, including scalar leaves nested inside arrays and objects.
+pub(crate) fn equality_key(bytes: &[u8]) -> Vec<u8> {
+    fn field(out: &mut Vec<u8>, value: &[u8]) {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value);
+    }
+    fn append(node: JsonbRef<'_>, out: &mut Vec<u8>) {
+        out.push(node.json_type().sort_rank());
+        if node.is_number() {
+            let parts = parse_decimal_parts(&node.number_text().unwrap_or_default());
+            out.push(u8::from(parts.neg));
+            field(out, &parts.int_digits);
+            field(out, &parts.frac_digits);
+        } else if node.is_array() {
+            out.extend_from_slice(&(node.container_len().unwrap_or(0) as u64).to_le_bytes());
+            for child in node.array_iter() {
+                append(child, out);
+            }
+        } else if node.is_object() {
+            out.extend_from_slice(&(node.container_len().unwrap_or(0) as u64).to_le_bytes());
+            for (key, child) in node.object_iter() {
+                field(out, key.as_bytes());
+                append(child, out);
+            }
+        } else if let Some((ty, bytes)) = node.opaque_value() {
+            out.push(ty);
+            field(out, bytes);
+        } else if let Some(text) = node.as_str() {
+            let temporal = match node.json_type() {
+                JsonType::Date => crate::storage::parse_date_to_days_bytes(text.as_bytes())
+                    .ok()
+                    .map(i64::from),
+                JsonType::Time => crate::storage::parse_time_to_micros(text).ok(),
+                JsonType::Datetime | JsonType::Timestamp => {
+                    crate::storage::parse_datetime_to_micros(text).ok()
+                }
+                _ => None,
+            };
+            if let Some(value) = temporal {
+                field(out, &value.to_le_bytes());
+            } else {
+                field(out, text.as_bytes());
+            }
+        } else if let Some(value) = node.as_bool() {
+            out.push(u8::from(value));
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    if let Ok(node) = JsonbRef::new(bytes) {
+        append(node, &mut out);
+    }
+    out
+}

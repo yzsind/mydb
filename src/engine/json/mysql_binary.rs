@@ -36,7 +36,9 @@ struct EncodedValue {
 /// Convert mydb's canonical JSON representation to the byte format carried
 /// by a MySQL `MYSQL_TYPE_JSON` row event.
 pub(crate) fn encode(bytes: &[u8]) -> Result<Vec<u8>, QueryError> {
-    let value = encode_node(JsonbRef::new(bytes)?)?;
+    let node = JsonbRef::new(bytes)?;
+    node.validate()?;
+    let value = encode_node(node)?;
     let mut out = Vec::with_capacity(1 + value.payload.len());
     out.push(value.ty);
     out.extend_from_slice(&value.payload);

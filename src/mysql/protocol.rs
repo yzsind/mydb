@@ -1413,7 +1413,7 @@ pub fn binary_row_packet_into_with_charset(
                 payload.extend_from_slice(&year_u16.to_le_bytes());
             }
             // JSON: length-encoded canonical text, like VARCHAR.
-            Value::Json(b) => write_lenenc_json_text(payload, b),
+            Value::Json(b) => write_json_result(payload, b, charset),
             // GEOMETRY: length-encoded internal `SRID + WKB` bytes (clients
             // parse them or call ST_AsText), like a BLOB.
             Value::Geometry(b) => write_lenenc_string(payload, b),
@@ -1426,6 +1426,18 @@ pub fn binary_row_packet_into_with_charset(
 /// String storage representation must not affect the wire type advertised in
 /// column metadata. Borrow both heap and inline strings before dispatching.
 #[inline]
+fn write_json_result(
+    payload: &mut Vec<u8>,
+    json: &[u8],
+    charset: Option<&'static crate::charset::CharsetInfo>,
+) {
+    if charset.is_none_or(|cs| matches!(cs.name, "utf8mb4" | "binary")) {
+        write_lenenc_json_text(payload, json);
+    } else {
+        write_text_string(payload, &crate::engine::json::to_text(json), charset);
+    }
+}
+
 fn result_charset_for_column(
     charset: Option<&'static crate::charset::CharsetInfo>,
     column: Option<&Column>,
@@ -2596,7 +2608,7 @@ fn write_text_value_inner(
         }
         // JSON is sent to the client as canonical text (MySQL serialises the
         // binary form before transmitting).
-        Value::Json(b) => write_lenenc_json_text(payload, b),
+        Value::Json(b) => write_json_result(payload, b, charset),
         // GEOMETRY is sent as its raw internal `SRID + WKB` bytes (MySQL does
         // the same; clients render via ST_AsText / ST_AsWKB).
         Value::Geometry(b) => write_lenenc_string(payload, b),
@@ -4657,3 +4669,19 @@ mod temporal_encoding_tests;
 #[cfg(test)]
 #[path = "protocol/string_encoding_tests.rs"]
 mod string_encoding_tests;
+
+#[cfg(test)]
+mod audit1031_json_charset_tests {
+    use super::*;
+    #[test]
+    fn audit1031_json_result_obeys_utf8mb3_repertoire() {
+        let json = crate::engine::json::parse_text(r#"{"a":"🙂"}"#, 1, "test").unwrap();
+        let mut wire = Vec::new();
+        write_json_result(
+            &mut wire,
+            &json,
+            Some(crate::charset::resolve_charset("utf8mb3").unwrap()),
+        );
+        assert_eq!(&wire[1..], br#"{"a": "?"}"#);
+    }
+}

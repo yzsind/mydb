@@ -2173,6 +2173,9 @@ pub struct SessionContext {
     /// Unlike the SQL SYSTEM_USER dynamic privilege this cannot be granted by
     /// SQL and is the sole blanket authorization bypass.
     pub internal_system_session: bool,
+    /// Disconnect cleanup can retry after an error or panic without releasing
+    /// another live connection's account charge.
+    pub(crate) connection_quota_released: bool,
     pub connection_id: u32,
     /// Per-connection MySQL status counters. Protocol sessions install a
     /// governed shared object before the handshake; embedded callers leave it
@@ -3069,6 +3072,7 @@ impl SessionContext {
             account_limits: ResourceLimits::default(),
             current_user_is_system: false,
             internal_system_session: false,
+            connection_quota_released: false,
             connection_id: 1,
             status: None,
             ssl_cipher: None,

@@ -1853,7 +1853,11 @@ fn radix_sort_short_ascii_index_entries(entries: &mut [IndexEntry]) -> bool {
             }
         }
     }
-    true
+    // ASCII folding is only a candidate ordering: UCA punctuation weights
+    // and contractions can differ. Validate against the authoritative key
+    // comparator before bulk loading; the caller falls back to comparison
+    // sort when the candidate order is incompatible with this collation.
+    entries.windows(2).all(|pair| pair[0] <= pair[1])
 }
 
 #[test]

@@ -1288,6 +1288,32 @@ struct BinlogGlobal {
 }
 
 static GLOBAL: OnceLock<RwLock<BinlogGlobal>> = OnceLock::new();
+static RETENTION_WORKER: parking_lot::Mutex<Option<RetentionWorker>> =
+    parking_lot::Mutex::new(None);
+
+struct RetentionWorker {
+    stop: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RetentionWorker {
+    fn drop(&mut self) {
+        *self.stop.0.lock() = true;
+        self.stop.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                crate::util::logging::log_message(
+                    "binlog retention worker panicked during shutdown",
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn shutdown_retention() {
+    let worker = RETENTION_WORKER.lock().take();
+    drop(worker);
+}
 static FALLBACK_CONFIG: OnceLock<BinlogConfig> = OnceLock::new();
 static COMMIT_GATE: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
 static GLOBAL_READ_LOCK: AtomicBool = AtomicBool::new(false);
@@ -1343,6 +1369,8 @@ pub fn config_from_env_defaults() -> BinlogConfig {
 }
 
 pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryError> {
+    shutdown_retention();
+    let mut retention_worker = None;
     let mut config = config.normalize();
     let manager = if config.enabled {
         Some(Arc::new(BinlogSourceManager::open(
@@ -1358,10 +1386,21 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
         config = manager.config.clone();
         if manager.config.retention_hours.is_some() || manager.config.retention_bytes.is_some() {
             let weak = Arc::downgrade(manager);
-            std::thread::Builder::new()
+            let stop = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+            let thread_stop = Arc::clone(&stop);
+            let thread = std::thread::Builder::new()
                 .name("binlog-retention".into())
                 .spawn(move || loop {
-                    std::thread::sleep(Duration::from_secs(60));
+                    let mut stopped = thread_stop.0.lock();
+                    if !*stopped {
+                        thread_stop
+                            .1
+                            .wait_for(&mut stopped, Duration::from_secs(60));
+                    }
+                    if *stopped {
+                        break;
+                    }
+                    drop(stopped);
                     let Some(manager) = weak.upgrade() else {
                         break;
                     };
@@ -1379,6 +1418,10 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
                         format!("start binlog retention: {err}"),
                     )
                 })?;
+            retention_worker = Some(RetentionWorker {
+                stop,
+                thread: Some(thread),
+            });
         }
     }
     let global = GLOBAL.get_or_init(|| {
@@ -1394,6 +1437,8 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
         )
     })?;
     *guard = BinlogGlobal { config, manager };
+    drop(guard);
+    *RETENTION_WORKER.lock() = retention_worker;
     Ok(())
 }
 

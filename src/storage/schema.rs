@@ -1634,6 +1634,7 @@ impl TableSchema {
                 Option<Expr>,
                 Option<crate::engine::expr_program::CompiledTableExpr>,
                 Vec<String>,
+                Option<u16>,
             )>,
         > = self
             .indexes
@@ -1659,17 +1660,25 @@ impl TableSchema {
                             } else {
                                 expr_part.referenced_columns.clone()
                             };
-                            (ast, program, refs)
+                            let collation = expr_part.collation_id.or_else(|| {
+                                ast.as_ref()
+                                    .and_then(|ast| crate::engine::expr::expr_collation(ast, self))
+                                    .map(|c| c.collation_id)
+                            });
+                            (ast, program, refs, collation)
                         }
-                        None => (None, None, Vec::new()),
+                        None => (None, None, Vec::new(), None),
                     })
                     .collect()
             })
             .collect();
         for (index, slots) in self.indexes.iter_mut().zip(runtime) {
-            for (slot, (ast, program, refs)) in index.key_expressions.iter_mut().zip(slots) {
+            for (slot, (ast, program, refs, collation_id)) in
+                index.key_expressions.iter_mut().zip(slots)
+            {
                 if let Some(expr_part) = slot.as_mut() {
                     expr_part.ast = ast;
+                    expr_part.collation_id = collation_id;
                     expr_part.program = program;
                     if expr_part.referenced_columns.is_empty() {
                         expr_part.referenced_columns = refs;
@@ -1712,8 +1721,13 @@ impl TableSchema {
             .iter()
             .map(|(cols, slots)| compile_index_key_expressions(self, cols, slots))
             .collect::<Result<Vec<_>, _>>()?;
-        for (index, new_slots) in self.indexes.iter_mut().zip(compiled) {
+        for (index, mut new_slots) in self.indexes.iter_mut().zip(compiled) {
             if !new_slots.is_empty() {
+                for (old, new) in index.key_expressions.iter().zip(&mut new_slots) {
+                    if let (Some(old), Some(new)) = (old, new) {
+                        new.collation_id = old.collation_id.or(new.collation_id);
+                    }
+                }
                 index.key_expressions = new_slots;
             }
             index.validate_multi_valued_definition()?;
@@ -2305,6 +2319,9 @@ pub struct IndexExpression {
     /// disk because Expr is not stable across releases.
     #[serde(skip)]
     pub(crate) ast: Option<Expr>,
+    /// Result collation fixed at DDL time, shared by writes and probes.
+    #[serde(default)]
+    pub(crate) collation_id: Option<u16>,
     /// Compiled program over the table row, rebuilt alongside `ast`.
     #[serde(skip)]
     pub(crate) program: Option<crate::engine::expr_program::CompiledTableExpr>,
@@ -2346,7 +2363,16 @@ pub(crate) fn index_expression_param_target(expr: &IndexExpression) -> ParamTarg
             }
         }
     }
-    ParamTarget::for_column(&expr.data_type, false)
+    match (
+        ParamTarget::for_column(&expr.data_type, false),
+        expr.collation_id,
+    ) {
+        (ParamTarget::String, Some(collation_id)) => ParamTarget::CollatedString { collation_id },
+        (ParamTarget::CharString, Some(collation_id)) => {
+            ParamTarget::CollatedCharString { collation_id }
+        }
+        (target, _) => target,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4313,6 +4339,13 @@ impl TableSchema {
         let include_invisible = invisible_indexes_enabled();
         self.indexes.iter().filter(move |idx| {
             idx.state == IndexState::Public && (idx.visible || include_invisible)
+                // A writer-session TIMESTAMP conversion cannot provide a
+                // reader-session predicate or ordering. Retain the index for
+                // maintenance but never let a hint bypass this safety guard.
+                && !idx.key_expressions.iter().flatten().any(|part|
+                    part.referenced_columns.iter().any(|name|
+                        self.column_index(name).ok().is_some_and(|i|
+                            matches!(self.columns[i].data_type, DataTypeKind::Timestamp { .. }))))
         })
     }
 
@@ -4671,7 +4704,15 @@ impl TableSchema {
                 "multi-valued index requires an ARRAY expression key part",
             ));
         };
-        let elements = self.eval_multi_valued_index_expression(expr_part, values)?;
+        let elements = self
+            .eval_multi_valued_index_expression(expr_part, values)
+            .map_err(|err| {
+                if matches!(err.code(), 3903 | 3904) {
+                    err.map_message(|message| format!("{message} '{}'", index.name))
+                } else {
+                    err
+                }
+            })?;
         let mut keys = Vec::new();
         for element in elements {
             let mut parts = SmallVec::<[KeyPart; 4]>::new();
@@ -4886,11 +4927,25 @@ impl TableSchema {
         expr: &IndexExpression,
         values: &[Value],
     ) -> Result<Value, QueryError> {
-        if let Some(program) = expr.program.as_ref() {
-            return program.eval(self, values);
-        }
-        if let Some(ast) = expr.ast.as_ref() {
-            return crate::engine::expr::eval_expr_legacy(ast, self, values);
+        let _dml = crate::engine::expr::DmlExpressionGuard::new();
+        let result = if let Some(program) = expr.program.as_ref() {
+            Some(program.eval(self, values))
+        } else {
+            expr.ast
+                .as_ref()
+                .map(|ast| crate::engine::expr::eval_expr_legacy(ast, self, values))
+        };
+        if let Some(result) = result {
+            return result.map_err(|err| {
+                if err.code() == 1292 || err.code() == 1366 {
+                    crate::error::catalog::ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX.error(format!(
+                        "Data truncated for functional index expression '{}'",
+                        expr.expr_sql
+                    ))
+                } else {
+                    err
+                }
+            });
         }
         Err(error(
             crate::error::catalog::ER_UNKNOWN_ERROR,
@@ -5386,40 +5441,30 @@ fn multi_valued_index_elements(value: &Value) -> Result<Vec<Value>, QueryError> 
     if matches!(value, Value::Null) {
         return Ok(Vec::new());
     }
-    let dom = match value {
-        Value::Json(bytes) => crate::engine::json::to_serde(bytes)?,
+    let bytes = match value {
+        Value::Json(bytes) => bytes.clone(),
         other => {
-            serde_json::from_str::<serde_json::Value>(&other.to_display_string()).map_err(|_| {
-                error(
-                    crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
-                    "multi-valued index expression did not return JSON",
-                )
-            })?
+            crate::engine::json::parse_text(&other.to_display_string(), 1, "multi-valued index")?
         }
     };
-    match dom {
-        serde_json::Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                if item.is_null() {
-                    continue;
-                }
-                out.push(Value::Json(crate::engine::json::from_serde(&item)));
-            }
-            Ok(out)
-        }
-        // M2/P2-11: a scalar `MEMBER OF (j->'$.tag')` treats `j->'$.tag'` as
-        // a single-element array (matches MySQL 8.0 top-level MEMBER OF
-        // semantics: `SELECT 42 MEMBER OF ('42' -> '$')` is TRUE). The
-        // previous silent `Ok(Vec::new())` made every MEMBER OF on a
-        // scalar-valued path return no rows without any warning.
-        serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::Object(_) => Err(error(
+    let root = crate::engine::json::JsonbRef::new(&bytes)?;
+    if root.is_array() {
+        return Ok(root
+            .array_iter()
+            .filter(|node| !node.is_null())
+            .map(|node| Value::Json(node.to_owned_bytes()))
+            .collect());
+    }
+    if root.is_null() {
+        return Ok(Vec::new());
+    }
+    if root.is_object() {
+        return Err(error(
             crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
             "multi-valued index expression did not return a JSON array or scalar",
-        )),
-        scalar => Ok(vec![Value::Json(crate::engine::json::from_serde(&scalar))]),
+        ));
     }
+    Ok(vec![Value::Json(bytes)])
 }
 
 fn cast_multi_valued_index_element(value: Value, target: &str) -> Result<Value, QueryError> {
@@ -5516,14 +5561,14 @@ fn cast_mvi_int(value: &Value, unsigned: bool) -> Result<Value, QueryError> {
             let Some(txt) = r.number_text() else {
                 return Err(mvi_cast_error(target));
             };
-            return parse_mvi_int(&txt, unsigned).ok_or_else(|| mvi_cast_error(target));
+            return parse_mvi_int(&txt, unsigned).ok_or_else(|| mvi_integer_error(&txt, target));
         }
         if let Some(b) = r.as_bool() {
             let i = i64::from(b);
             return int_to_mvi(i, unsigned).ok_or_else(|| mvi_cast_error(target));
         }
         if let Some(s) = r.as_str() {
-            return parse_mvi_int(s, unsigned).ok_or_else(|| mvi_cast_error(target));
+            return parse_mvi_int(s, unsigned).ok_or_else(|| mvi_integer_error(s, target));
         }
         // Arrays / objects / null reach here — no numeric interpretation.
         return Err(mvi_cast_error(target));
@@ -5558,35 +5603,18 @@ fn int_to_mvi(v: i64, unsigned: bool) -> Option<Value> {
 }
 
 fn parse_mvi_int(s: &str, unsigned: bool) -> Option<Value> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if unsigned {
-        // A leading `-` is legal in `SIGNED` but never in `UNSIGNED`.
-        if let Ok(u) = s.parse::<u64>() {
-            return Some(Value::UInt(u));
-        }
-        // Accept `"1.0"` / `"1E0"` style whole-value decimals if the caller
-        // gave us canonical number text (the JSON path routes through
-        // `number_text`, which can produce e.g. `9.223e18`).
-        let d = crate::util::decimal::parse_exact_decimal_str(s)?;
-        let (mag, scale) = d;
-        if scale == 0 && mag >= 0 && mag <= i128::from(u64::MAX) {
-            Some(Value::UInt(mag as u64))
-        } else {
-            None
-        }
+    crate::util::decimal::checked_integer_text(s, unsigned)
+}
+
+fn mvi_integer_error(text: &str, target: &str) -> QueryError {
+    if crate::util::decimal::parse_exact_decimal_big(text).is_some()
+        || text.trim().parse::<f64>().is_ok()
+    {
+        crate::error::catalog::ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX.error(format!(
+            "JSON value is out of range for CAST to {target} for functional index"
+        ))
     } else {
-        if let Ok(i) = s.parse::<i64>() {
-            return Some(Value::Int(i));
-        }
-        let (mag, scale) = crate::util::decimal::parse_exact_decimal_str(s)?;
-        if scale == 0 && i64::try_from(mag).is_ok() {
-            Some(Value::Int(mag as i64))
-        } else {
-            None
-        }
+        mvi_cast_error(target)
     }
 }
 
@@ -5769,13 +5797,8 @@ pub fn compile_index_key_expressions(
             validate_multi_valued_index_expression(&ast, expr_sql)?;
         }
         let program = crate::engine::expr_program::CompiledTableExpr::compile_once(&ast, table);
-        // Best-effort static type inference (LOWER → VarChar,
-        // YEAR → Int, `c + 1` → BigInt, etc.). Falls back to
-        // VarChar { len: None } when unknown — that's a safe key-
-        // encoding placeholder because `KeyPart::from_column_value`
-        // only special-cases `Char`; everything else dispatches on the
-        // runtime Value variant. The benefit of the more precise type
-        // is purely cost-model accuracy / index_key_len estimates.
+        // This descriptor controls persisted keys as well as planner bounds.
+        // Numeric precision and scale must match the expression evaluator.
         let data_type = if *multi_valued {
             multi_valued_index_target_type(&ast)
         } else {
@@ -5803,6 +5826,7 @@ pub fn compile_index_key_expressions(
             nullable,
             referenced_columns,
             multi_valued: *multi_valued,
+            collation_id: crate::engine::expr::expr_collation(&ast, table).map(|c| c.collation_id),
             ast: Some(ast),
             program: Some(program),
         }));
@@ -5860,10 +5884,13 @@ fn multi_valued_index_target_type(expr: &Expr) -> DataTypeKind {
         "DATE" => DataTypeKind::Date,
         "DATETIME" => DataTypeKind::DateTime { fsp: 0 },
         "TIME" => DataTypeKind::Time { fsp: 0 },
-        "DECIMAL" => DataTypeKind::Decimal {
-            precision: None,
-            scale: Some(0),
-        },
+        "DECIMAL" => {
+            let params = decimal_target_params(&cast_target_with_params(&target, &args[2..]));
+            DataTypeKind::Decimal {
+                precision: Some(params.first().copied().unwrap_or(65)),
+                scale: Some(params.get(1).copied().unwrap_or(0)),
+            }
+        }
         _ => DataTypeKind::VarChar { len: None },
     }
 }
@@ -6014,18 +6041,31 @@ fn infer_index_expression_type(expr: &Expr, table: &TableSchema) -> DataTypeKind
             | crate::parser::BinaryOp::Sub
             | crate::parser::BinaryOp::Mul
             | crate::parser::BinaryOp::Mod => {
-                // Coarse coercion: if either side is floating-point,
-                // result is Double; otherwise BigInt. Close enough to
-                // MySQL's numeric op semantics for cost-model use.
+                // Arithmetic over DECIMAL must keep its fractional key;
+                // character operands enter the approximate numeric domain.
                 let lt = infer_index_expression_type(left, table);
                 let rt = infer_index_expression_type(right, table);
-                if matches!(lt, DataTypeKind::Double { .. } | DataTypeKind::Float { .. })
-                    || matches!(rt, DataTypeKind::Double { .. } | DataTypeKind::Float { .. })
+                if !lt.is_integer() && !matches!(lt, DataTypeKind::Decimal { .. })
+                    || !rt.is_integer() && !matches!(rt, DataTypeKind::Decimal { .. })
                 {
                     DataTypeKind::Double {
                         precision: None,
                         scale: None,
                     }
+                } else if matches!(lt, DataTypeKind::Decimal { .. })
+                    || matches!(rt, DataTypeKind::Decimal { .. })
+                {
+                    let column_type =
+                        crate::engine::expr_type::column_type::schema_expr_result_type(
+                            expr,
+                            &mut |operand| {
+                                infer_index_expression_type(operand, table).column_type()
+                            },
+                        );
+                    data_type_kind_for_column_type(
+                        column_type,
+                        &crate::types::ColumnSource::default(),
+                    )
                 } else {
                     DataTypeKind::BigInt
                 }

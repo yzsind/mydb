@@ -2403,6 +2403,16 @@ pub(crate) fn expr_semantically_eq(left: &Expr, right: &Expr) -> bool {
 }
 
 pub(crate) fn expr_fingerprint(expr: &Expr) -> u64 {
+    expr_fingerprint_mode::<false>(expr)
+}
+
+/// Compare single-source functional expressions independently of identifier
+/// qualification, without cloning or recursively dropping a temporary AST.
+pub(crate) fn unqualified_expr_fingerprint(expr: &Expr) -> u64 {
+    expr_fingerprint_mode::<true>(expr)
+}
+
+fn expr_fingerprint_mode<const UNQUALIFIED: bool>(expr: &Expr) -> u64 {
     // Fixed-seed ahash for the same reasons as `compute_fingerprint`:
     // callers (planner.rs) use the u64 output as a HashMap key across
     // calls in the same process, so the seeds must be process-stable.
@@ -2418,7 +2428,7 @@ pub(crate) fn expr_fingerprint(expr: &Expr) -> u64 {
         )
     });
     let mut hasher = rs.build_hasher();
-    hash_expr(expr, &mut hasher);
+    hash_expr_mode::<UNQUALIFIED>(expr, &mut hasher);
     hasher.finish()
 }
 
@@ -2562,7 +2572,11 @@ fn expression_depth_exceeds(root: &Expr, maximum: usize) -> bool {
 // Shared by the `Arrow` (`->`) fast path and the outer wrapper of the
 // `LongArrow` (`->>`) fast path so all three writing styles collapse to a
 // single fingerprint.
-fn hash_json_extract_call(left: &Expr, right: &Expr, state: &mut impl Hasher) {
+fn hash_json_extract_call<const UNQUALIFIED: bool>(
+    left: &Expr,
+    right: &Expr,
+    state: &mut impl Hasher,
+) {
     // Mirror the Function arm's discriminator layout so a synthetic
     // JSON_EXTRACT call hashes byte-for-byte identically to an explicitly
     // written one.
@@ -2570,8 +2584,8 @@ fn hash_json_extract_call(left: &Expr, right: &Expr, state: &mut impl Hasher) {
     "JSON_EXTRACT".hash(state);
     false.hash(state);
     2_usize.hash(state);
-    hash_expr(left, state);
-    hash_expr(right, state);
+    hash_expr_mode::<UNQUALIFIED>(left, state);
+    hash_expr_mode::<UNQUALIFIED>(right, state);
 }
 
 // SQL function/column names are ASCII case-insensitive. Keep the byte stream
@@ -2648,11 +2662,19 @@ fn hash_window_frame(frame: &crate::parser::WindowFrame, state: &mut impl Hasher
 }
 
 fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
+    hash_expr_mode::<false>(expr, state);
+}
+
+fn hash_expr_mode<const UNQUALIFIED: bool>(expr: &Expr, state: &mut impl Hasher) {
     match expr {
         Expr::Wildcard => 0_u8.hash(state),
         Expr::Identifier(name) => {
             1_u8.hash(state);
             hash_case_insensitive_name(name, state);
+        }
+        Expr::CompoundIdentifier(parts) if UNQUALIFIED && !parts.is_empty() => {
+            1_u8.hash(state);
+            hash_case_insensitive_name(parts.last().unwrap(), state);
         }
         Expr::CompoundIdentifier(parts) => {
             2_u8.hash(state);
@@ -2696,13 +2718,13 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             24_u8.hash(state);
             items.len().hash(state);
             for item in items {
-                hash_expr(item, state);
+                hash_expr_mode::<UNQUALIFIED>(item, state);
             }
         }
         Expr::Unary { op, expr } => {
             6_u8.hash(state);
             (*op as u8).hash(state);
-            hash_expr(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
         }
         Expr::Binary { left, op, right } => {
             // M2/B6: normalize `->` and `->>` to the JSON_EXTRACT /
@@ -2713,7 +2735,7 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             // corresponding function-form index expression.
             match op {
                 BinaryOp::Arrow => {
-                    hash_json_extract_call(left, right, state);
+                    hash_json_extract_call::<UNQUALIFIED>(left, right, state);
                     return;
                 }
                 BinaryOp::LongArrow => {
@@ -2722,23 +2744,23 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
                     "JSON_UNQUOTE".hash(state);
                     false.hash(state);
                     1_usize.hash(state);
-                    hash_json_extract_call(left, right, state);
+                    hash_json_extract_call::<UNQUALIFIED>(left, right, state);
                     return;
                 }
                 _ => {}
             }
             7_u8.hash(state);
             (*op as u8).hash(state);
-            hash_expr(left, state);
-            hash_expr(right, state);
+            hash_expr_mode::<UNQUALIFIED>(left, state);
+            hash_expr_mode::<UNQUALIFIED>(right, state);
         }
         Expr::IsNull(expr) => {
             8_u8.hash(state);
-            hash_expr(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
         }
         Expr::IsNotNull(expr) => {
             9_u8.hash(state);
-            hash_expr(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
         }
         Expr::InList {
             expr,
@@ -2747,10 +2769,10 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
         } => {
             10_u8.hash(state);
             negated.hash(state);
-            hash_expr(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
             list.len().hash(state);
             for item in list {
-                hash_expr(item, state);
+                hash_expr_mode::<UNQUALIFIED>(item, state);
             }
         }
         Expr::InSubquery {
@@ -2760,7 +2782,7 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
         } => {
             11_u8.hash(state);
             negated.hash(state);
-            hash_expr(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
             hash_select(subquery, state);
         }
         Expr::QuantifiedComparison {
@@ -2772,7 +2794,7 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             25_u8.hash(state);
             (*op as u8).hash(state);
             (*quantifier as u8).hash(state);
-            hash_expr(left, state);
+            hash_expr_mode::<UNQUALIFIED>(left, state);
             match right {
                 QuantifiedComparisonRight::Subquery(subquery) => {
                     0_u8.hash(state);
@@ -2782,7 +2804,7 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
                     1_u8.hash(state);
                     list.len().hash(state);
                     for item in list {
-                        hash_expr(item, state);
+                        hash_expr_mode::<UNQUALIFIED>(item, state);
                     }
                 }
             }
@@ -2804,9 +2826,9 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
         } => {
             14_u8.hash(state);
             negated.hash(state);
-            hash_expr(expr, state);
-            hash_expr(low, state);
-            hash_expr(high, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(low, state);
+            hash_expr_mode::<UNQUALIFIED>(high, state);
         }
         Expr::Like {
             expr,
@@ -2817,8 +2839,8 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             15_u8.hash(state);
             negated.hash(state);
             escape_char.hash(state);
-            hash_expr(expr, state);
-            hash_expr(pattern, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(pattern, state);
         }
         Expr::Case {
             operand,
@@ -2829,21 +2851,21 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             16_u8.hash(state);
             operand.is_some().hash(state);
             if let Some(operand) = operand {
-                hash_expr(operand, state);
+                hash_expr_mode::<UNQUALIFIED>(operand, state);
             }
             conditions.len().hash(state);
             for condition in conditions {
-                hash_expr(condition, state);
+                hash_expr_mode::<UNQUALIFIED>(condition, state);
             }
             17_u8.hash(state);
             results.len().hash(state);
             for result in results {
-                hash_expr(result, state);
+                hash_expr_mode::<UNQUALIFIED>(result, state);
             }
             18_u8.hash(state);
             else_result.is_some().hash(state);
             if let Some(else_result) = else_result {
-                hash_expr(else_result, state);
+                hash_expr_mode::<UNQUALIFIED>(else_result, state);
             }
         }
         Expr::Function {
@@ -2862,13 +2884,13 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             distinct.hash(state);
             args.len().hash(state);
             for arg in args {
-                hash_expr(arg, state);
+                hash_expr_mode::<UNQUALIFIED>(arg, state);
             }
         }
         Expr::GroupKeyRef { index, expr } => {
             26_u8.hash(state);
             index.hash(state);
-            hash_expr(expr, state);
+            hash_expr_mode::<UNQUALIFIED>(expr, state);
         }
         Expr::Grouping(indices) => {
             27_u8.hash(state);
@@ -2888,19 +2910,19 @@ fn hash_expr(expr: &Expr, state: &mut impl Hasher) {
             hash_optional_name(inherits.as_deref(), state);
             args.len().hash(state);
             for arg in args {
-                hash_expr(arg, state);
+                hash_expr_mode::<UNQUALIFIED>(arg, state);
             }
             21_u8.hash(state);
             partition_by.len().hash(state);
             for expr in partition_by {
-                hash_expr(expr, state);
+                hash_expr_mode::<UNQUALIFIED>(expr, state);
             }
             22_u8.hash(state);
             order_by.len().hash(state);
             for item in order_by {
                 item.asc.hash(state);
                 item.nulls_first.hash(state);
-                hash_expr(&item.expr, state);
+                hash_expr_mode::<UNQUALIFIED>(&item.expr, state);
             }
             match frame {
                 Some(frame) => {

@@ -7,12 +7,10 @@ pub(super) fn matches_part(index: &IndexSchema, pos: usize, expr: &Expr) -> bool
         Some(crate::storage::IndexKeyPart::Column(name)) => {
             expr_column_name(expr).is_some_and(|column| column.eq_ignore_ascii_case(name))
         }
-        Some(crate::storage::IndexKeyPart::Expression(part)) => {
-            part.ast.as_ref().is_some_and(|ast| {
-                crate::engine::expr_program::expr_fingerprint(ast)
-                    == crate::engine::expr_program::expr_fingerprint(expr)
-            })
-        }
+        Some(crate::storage::IndexKeyPart::Expression(part)) => part
+            .ast
+            .as_ref()
+            .is_some_and(|ast| expression_fingerprint(ast) == expression_fingerprint(expr)),
         _ => false,
     }
 }
@@ -391,4 +389,10 @@ pub(super) fn candidates(
         out.extend(ranges);
     }
     out
+}
+
+/// Single-source predicates have already been resolved to this table before
+/// index matching. Their spelling (column vs alias.column) is not semantic.
+pub(super) fn expression_fingerprint(expr: &Expr) -> u64 {
+    crate::engine::expr_program::unqualified_expr_fingerprint(expr)
 }

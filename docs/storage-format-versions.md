@@ -5,7 +5,7 @@ The current development format is incompatible with earlier versions. If version
 
 | Format | Version |
 | --- | --- |
-| catalog / WAL | 65 / 37 |
+| catalog / WAL | 66 / 37 |
 | heap page / MVCC row | 14 / 8 |
 | B-tree index file / page | 24 / 15 |
 | undo binary / tablespace | 14 / 1 |

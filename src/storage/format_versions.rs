@@ -26,7 +26,8 @@
 /// v63 persists vector WITH configuration independently from index comments.
 /// v64: persistent vector manifests, snapshot identities and retirement ledger.
 /// v65: encrypted AI Secret, Connection and Model catalog metadata.
-pub const CATALOG_VERSION: u32 = 65;
+/// v66: functional-index result collations and corrected numeric key domains.
+pub const CATALOG_VERSION: u32 = 66;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.
@@ -46,7 +47,7 @@ pub const INDEX_VERSION: u32 = 24;
 pub const INDEX_PAGE_VERSION: u16 = 15;
 /// Derived primary keys and Zone Map weights are part of physical replication
 /// compatibility. Development directories using older keys must be rebuilt.
-pub const COLLATION_KEY_VERSION: u32 = 2;
+pub const COLLATION_KEY_VERSION: u32 = 3;
 pub const UNDO_BINARY_VERSION: u8 = 14;
 pub const UNDO_TABLESPACE_VERSION: u32 = 1;
 pub const OVERFLOW_VERSION: u16 = 3;

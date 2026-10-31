@@ -525,3 +525,5 @@ mod release_audit_1024;
 mod release_audit_1025;
 
 mod expression_functions_1028;
+
+mod lifecycle_json_index_audit_1031;

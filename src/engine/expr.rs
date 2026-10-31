@@ -3500,10 +3500,11 @@ impl From<&Value> for ValueKey {
                 crate::charset::with_default_string_key(s, |bytes| buf.extend_from_slice(bytes));
                 ValueKey::String(buf)
             }
-            // Two equal JSON documents have byte-identical canonical jsonb,
-            // so hashing on the raw bytes keeps GROUP BY / DISTINCT / join
-            // probes on a JSON column correct.
-            Value::Json(v) => ValueKey::Bytes(KeyBytes::from_slice(v)),
+            // JSON numeric tags differ even for equal values (1 and 1.0).
+            // Normalize recursively in the JSON comparison domain.
+            Value::Json(v) => {
+                ValueKey::Bytes(KeyBytes::from_slice(&crate::engine::json::equality_key(v)))
+            }
             // Two equal geometries have byte-identical internal form, so
             // hashing on the raw bytes keeps GROUP BY / DISTINCT correct.
             Value::Geometry(v) => ValueKey::Bytes(KeyBytes::from_slice(v)),
@@ -3690,7 +3691,7 @@ pub(crate) fn write_value_inline_key(value: &Value, out: &mut InlineKeyBuf) {
             let s = unsafe { std::str::from_utf8_unchecked(b) };
             push_string(out, s);
         }
-        Value::Json(v) => push_bytes(out, v),
+        Value::Json(v) => push_bytes(out, &crate::engine::json::equality_key(v)),
         Value::Geometry(v) => push_bytes(out, v),
         Value::Vector(v) => push_bytes(out, &v.encode()),
         Value::DecimalCompact(mag, scale) => {
@@ -5864,10 +5865,9 @@ where
                     Value::String(s) => {
                         crate::engine::json::parse_text(&s, 1, "cast").map(Value::Json)
                     }
-                    Value::Bytes(b) => {
-                        crate::engine::json::parse_text(&String::from_utf8_lossy(&b), 1, "cast")
-                            .map(Value::Json)
-                    }
+                    Value::Bytes(b) => Ok(Value::Json(crate::engine::json::scalar_from_value(
+                        &Value::Bytes(b),
+                    ))),
                     // A DECIMAL *value* (`CAST(3.14 AS JSON)`) and temporal
                     // values keep their type/precision via the tagged scalar
                     // encoder (→ JSON DECIMAL/DATE/TIME/DATETIME).
@@ -7945,26 +7945,26 @@ where
             if matches!(doc_val, Value::Null) || matches!(candidate_val, Value::Null) {
                 return Ok(Value::Null);
             }
-            let doc = json_doc_arg(&doc_val, 1, "json_contains")?;
-            let candidate = json_doc_arg(&candidate_val, 2, "json_contains")?;
+            let doc = json_doc_bytes(&doc_val, 1, "json_contains")?;
+            let candidate = json_doc_bytes(&candidate_val, 2, "json_contains")?;
+            let root = crate::engine::json::JsonbRef::new(&doc)?;
+            let candidate = crate::engine::json::JsonbRef::new(&candidate)?;
             let target = if args.len() == 3 {
                 let path_val = eval_arg(&args[2])?;
                 if matches!(path_val, Value::Null) {
                     return Ok(Value::Null);
                 }
-                // A wildcard path raises 3149 here (MySQL: JSON_CONTAINS
-                // requires a path that addresses a single value).
-                json_path_extract_raw(&doc, &string_value(&path_val))?
+                let path = crate::engine::func_cache::cached_json_path(&string_value(&path_val))?;
+                if path.has_wildcard {
+                    return Err(crate::error::catalog::ER_INVALID_JSON_PATH_WILDCARD.error("In this situation, path expressions may not contain the * and ** tokens or an array range."));
+                }
+                path.eval(root).first().copied()
             } else {
-                Some(doc)
+                Some(root)
             };
             match target {
                 None => Ok(Value::Null),
-                Some(target) => Ok(Value::Int(if json_contains(&target, &candidate) {
-                    1
-                } else {
-                    0
-                })),
+                Some(target) => Ok(Value::Int(i64::from(json_contains(target, candidate)))),
             }
         }
         "__MEMBER_OF" => eval_json_member_of(name, args, eval_arg),
@@ -15633,10 +15633,8 @@ fn json_value_from_dom(dom: &serde_json::Value) -> Value {
 }
 
 pub(crate) fn checked_json_value(bytes: Vec<u8>) -> Result<Value, QueryError> {
-    let depth = crate::engine::json::JsonbRef::new(&bytes)?.depth();
-    if depth > crate::engine::json::MAX_JSON_DEPTH {
-        return Err(crate::engine::json::json_too_deep());
-    }
+    let root = crate::engine::json::JsonbRef::new(&bytes)?;
+    root.validate()?;
     Ok(Value::Json(bytes))
 }
 
@@ -16031,33 +16029,32 @@ where
     expect_arg_count(name, args, 2)?;
     let values = eval_args(args, eval_arg)?;
     null_if_any(values, |values| {
-        Ok(Value::Int(json_overlaps(
-            &json_doc_arg(&values[0], 1, name)?,
-            &json_doc_arg(&values[1], 2, name)?,
-        ) as i64))
+        let left = json_doc_bytes(&values[0], 1, name)?;
+        let right = json_doc_bytes(&values[1], 2, name)?;
+        Ok(Value::Int(i64::from(json_overlaps(
+            crate::engine::json::JsonbRef::new(&left)?,
+            crate::engine::json::JsonbRef::new(&right)?,
+        ))))
     })
 }
 
-fn json_overlaps(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    use serde_json::Value as J;
-    // Equality here must respect MySQL's cross-subtype numeric rules
-    // (`1 == 1.0`); see `json_dom_equiv` for why raw `==` on serde values
-    // isn't safe.
-    match (left, right) {
-        // Two arrays overlap iff they share at least one *equal* element
-        // (element comparison is equality, not a recursive overlap — the old
-        // recursion made `[[1,2]]` wrongly overlap `[[2,3]]` via the shared 2).
-        (J::Array(l), J::Array(r)) => l.iter().any(|lv| r.iter().any(|rv| json_dom_equiv(lv, rv))),
-        // Array vs non-array: the scalar/object must equal some element
-        // (MySQL treats the non-array as a candidate element). The old `_`
-        // arm made this branch always false.
-        (J::Array(a), other) | (other, J::Array(a)) => a.iter().any(|v| json_dom_equiv(v, other)),
-        // Two objects overlap iff they share a key with an equal value.
-        (J::Object(l), J::Object(r)) => l
-            .iter()
-            .any(|(k, lv)| r.get(k).is_some_and(|rv| json_dom_equiv(lv, rv))),
-        // Two scalars: equal (numeric-subtype aware).
-        (l, r) => json_dom_equiv(l, r),
+fn json_overlaps(
+    left: crate::engine::json::JsonbRef<'_>,
+    right: crate::engine::json::JsonbRef<'_>,
+) -> bool {
+    let equal = |a, b| crate::engine::json::compare_nodes(a, b) == std::cmp::Ordering::Equal;
+    if left.is_array() && right.is_array() {
+        left.array_iter()
+            .any(|a| right.array_iter().any(|b| equal(a, b)))
+    } else if left.is_array() {
+        left.array_iter().any(|a| equal(a, right))
+    } else if right.is_array() {
+        right.array_iter().any(|b| equal(left, b))
+    } else if left.is_object() && right.is_object() {
+        left.object_iter()
+            .any(|(key, value)| right.get(key).is_some_and(|other| equal(value, other)))
+    } else {
+        equal(left, right)
     }
 }
 
@@ -16276,7 +16273,13 @@ where
     }
     match json_value_convert_jsonb(&value, &returning) {
         Ok(value) => Ok(value),
-        Err(_) => json_value_response(&on_error, error_default, false),
+        Err(err) => {
+            crate::engine::api::push_statement_condition(
+                crate::error::ConditionLevel::Warning,
+                &err,
+            );
+            json_value_response(&on_error, error_default, false)
+        }
     }
 }
 
@@ -16334,6 +16337,12 @@ fn json_value_convert_jsonb(jsonb: &[u8], returning: &str) -> Result<Value, Quer
     if target.eq_ignore_ascii_case("JSON") {
         return Ok(Value::Json(jsonb.to_vec()));
     }
+    if node.is_number() && target.eq_ignore_ascii_case("DECIMAL") {
+        return json_value_cast(
+            Value::String(node.number_text().unwrap_or_default()),
+            returning,
+        );
+    }
     let value = match node.json_type() {
         JsonType::Boolean if target.eq_ignore_ascii_case("CHAR") => {
             Value::String(node.as_bool().unwrap_or(false).to_string())
@@ -16388,10 +16397,8 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
             }
             Ok(Value::String(value))
         }
-        "SIGNED" | "SIGNED INTEGER" | "INTEGER" => {
-            cast_to_integer(&json_value_numeric_input(value)?, false)
-        }
-        "UNSIGNED" | "UNSIGNED INTEGER" => cast_to_integer(&json_value_numeric_input(value)?, true),
+        "SIGNED" | "SIGNED INTEGER" | "INTEGER" => json_value_integer(value, false),
+        "UNSIGNED" | "UNSIGNED INTEGER" => json_value_integer(value, true),
         "FLOAT" => Ok(Value::Float(numeric(&value)? as f32)),
         "DOUBLE" | "REAL" => Ok(Value::Double(numeric(&value)?)),
         "DECIMAL" => json_value_require_conversion(cast_to_decimal(
@@ -16428,6 +16435,18 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
     }
 }
 
+fn json_value_integer(value: Value, unsigned: bool) -> Result<Value, QueryError> {
+    // JSON_VALUE uses ON ERROR for overflow; scalar CAST's wrap/clamp policy
+    // is deliberately different. Round before checking the destination range.
+    let value = json_value_numeric_input(value)?;
+    crate::util::decimal::checked_integer_text(&value.to_display_string(), unsigned).ok_or_else(
+        || {
+            crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST
+                .error("JSON_VALUE integer conversion is out of range")
+        },
+    )
+}
+
 fn json_value_require_conversion(result: Result<Value, QueryError>) -> Result<Value, QueryError> {
     match result? {
         Value::Null => Err(error(
@@ -16454,7 +16473,7 @@ fn json_value_numeric_input(value: Value) -> Result<Value, QueryError> {
         ));
     };
     let text = text.trim();
-    if crate::util::decimal::parse_exact_decimal_str(text).is_some() {
+    if crate::util::decimal::parse_exact_decimal_big(text).is_some() {
         return Ok(Value::Decimal(text.to_string()));
     }
     if let Ok(value) = text.parse::<f64>() {
@@ -22160,6 +22179,19 @@ fn round_fsp_fraction(nanos: u32, fsp: u8) -> (String, bool) {
 }
 
 pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, QueryError> {
+    if strict_numeric_conversion_is_error()
+        && matches!(
+            value,
+            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+        )
+    {
+        let text = string_value(value);
+        let parsed = crate::util::decimal::parse_lenient_int(&text);
+        if !parsed.clean || text.trim().is_empty() {
+            return Err(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE
+                .error(format!("Truncated incorrect INTEGER value: '{text}'")));
+        }
+    }
     if let Value::UInt(value) = value {
         return Ok(if unsigned {
             Value::UInt(*value)
@@ -22384,6 +22416,14 @@ pub(crate) fn cast_to_decimal(
     scale: u8,
 ) -> Result<Value, QueryError> {
     use crate::util::decimal as dk;
+    // JSON numbers use the same decimal text domain as JSON comparison.
+    // Never stage them in f64 -> i128: Rust saturates that conversion.
+    if let Value::Json(bytes) = value {
+        let node = crate::engine::json::JsonbRef::new(bytes)?;
+        if let Some(text) = node.number_text() {
+            return cast_to_decimal(&Value::String(text), precision, scale);
+        }
+    }
     // Runtime exact lanes, including Decimal128/DecimalWide and legacy
     // textual Decimal, must remain exact across CAST. In particular a
     // DECIMAL(65) coefficient cannot be staged in i128 or f64.
@@ -22395,22 +22435,19 @@ pub(crate) fn cast_to_decimal(
         );
     }
     // A character source is a conversion boundary, but syntactically clean
-    // fixed-point text can still be parsed and rounded without loss. Dirty
-    // and exponent-form coercions retain the existing approximate/warning
-    // rules below.
+    // fixed-point and exponent text can be parsed and rounded without loss.
+    // Dirty coercions retain the approximate/warning rules below.
     if let Value::String(text) = value {
-        if !text.contains(['e', 'E']) {
-            if let Some((magnitude, source_scale)) = dk::parse_exact_decimal_big(text) {
-                return finish_cast_to_decimal_exact(
-                    dk::rescale_exact(
-                        dk::ExactDecimal::from_big(magnitude, source_scale),
-                        scale,
-                        true,
-                    ),
-                    precision,
+        if let Some((magnitude, source_scale)) = dk::parse_exact_decimal_big(text) {
+            return finish_cast_to_decimal_exact(
+                dk::rescale_exact(
+                    dk::ExactDecimal::from_big(magnitude, source_scale),
                     scale,
-                );
-            }
+                    true,
+                ),
+                precision,
+                scale,
+            );
         }
     }
     if let Value::Decimal(text) | Value::String(text) = value {
@@ -22499,8 +22536,34 @@ pub(crate) fn cast_to_decimal(
             if scaled.is_finite() && scaled.abs() < 1.7e38 {
                 Some(scaled as i128)
             } else {
-                // Non-finite / astronomically large double: saturate.
-                Some(if n < 0.0 { i128::MIN + 1 } else { i128::MAX })
+                if n.is_finite() {
+                    if let Some((magnitude, source_scale)) =
+                        dk::parse_exact_decimal_big(&n.to_string())
+                    {
+                        return finish_cast_to_decimal_exact(
+                            dk::rescale_exact(
+                                dk::ExactDecimal::from_big(magnitude, source_scale),
+                                scale,
+                                true,
+                            ),
+                            precision,
+                            scale,
+                        );
+                    }
+                }
+                let magnitude = num_bigint::BigInt::from(10u8).pow(u32::from(precision));
+                return finish_cast_to_decimal_exact(
+                    dk::ExactDecimal::from_big(
+                        if n.is_sign_negative() {
+                            -magnitude
+                        } else {
+                            magnitude
+                        },
+                        scale,
+                    ),
+                    precision,
+                    scale,
+                );
             }
         }
     };
@@ -26266,44 +26329,6 @@ fn resolve_dom_index(seg: &JsonPathSegment, len: usize) -> Option<usize> {
     }
 }
 
-fn json_path_extract_raw(
-    doc: &serde_json::Value,
-    path: &str,
-) -> Result<Option<serde_json::Value>, QueryError> {
-    let segments = parse_json_path(path)?;
-    let mut current = doc;
-    for segment in &segments {
-        match segment {
-            JsonPathSegment::Key(key) => {
-                let Some(next) = current.get(key.as_str()) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-            _ => {
-                let Some(next) = json_array_get(current, segment) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-        }
-    }
-    Ok(Some(current.clone()))
-}
-
-fn json_array_get<'a>(
-    value: &'a serde_json::Value,
-    seg: &JsonPathSegment,
-) -> Option<&'a serde_json::Value> {
-    if let Some(arr) = value.as_array() {
-        let resolved = resolve_dom_index(seg, arr.len())?;
-        return arr.get(resolved);
-    }
-    // MySQL autowraps a scalar/object as a one-element array for an index
-    // leg. Only index 0 / [last] addresses the wrapped value.
-    (resolve_dom_index(seg, 1) == Some(0)).then_some(value)
-}
-
 fn json_owned_array_get_mut<'a>(
     value: &'a mut OwnedJsonb,
     seg: &JsonPathSegment,
@@ -26449,40 +26474,29 @@ pub(crate) fn value_to_json(val: &Value) -> serde_json::Value {
     }
 }
 
-fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> bool {
-    match (target, candidate) {
-        (serde_json::Value::Array(arr), candidate) => {
-            if let serde_json::Value::Array(cand_arr) = candidate {
-                cand_arr
-                    .iter()
-                    .all(|c| arr.iter().any(|t| json_contains(t, c)))
-            } else {
-                arr.iter().any(|t| json_contains(t, candidate))
-            }
+fn json_contains(
+    target: crate::engine::json::JsonbRef<'_>,
+    candidate: crate::engine::json::JsonbRef<'_>,
+) -> bool {
+    if target.is_array() {
+        if candidate.is_array() {
+            candidate
+                .array_iter()
+                .all(|value| target.array_iter().any(|item| json_contains(item, value)))
+        } else {
+            target
+                .array_iter()
+                .any(|item| json_contains(item, candidate))
         }
-        (serde_json::Value::Object(obj), serde_json::Value::Object(cand)) => cand
-            .iter()
-            .all(|(k, v)| obj.get(k).is_some_and(|tv| json_contains(tv, v))),
-        // Leaf equality: serde_json's Value::PartialEq treats Number(1) and
-        // Number(1.0) as distinct because its Number enum keeps int / float
-        // subtypes apart, so `[1.0]` fails to contain `1` under raw ==.
-        // MySQL's semantics are exact-decimal equality across all numeric
-        // subtypes — delegate to the jsonb compare kernel that already gets
-        // that right (integer / decimal / double all normalised through the
-        // canonical-decimal total order).
-        _ => json_dom_equiv(target, candidate),
+    } else if target.is_object() && candidate.is_object() {
+        candidate.object_iter().all(|(key, value)| {
+            target
+                .get(key)
+                .is_some_and(|item| json_contains(item, value))
+        })
+    } else {
+        crate::engine::json::compare_nodes(target, candidate) == std::cmp::Ordering::Equal
     }
-}
-
-/// Value equality that honours MySQL's cross-subtype numeric rules
-/// (`1 == 1.0 == 1E0 == 1.00`). Uses the jsonb `compare_nodes` kernel so
-/// the semantics stay in one place; the alternative — walking two serde
-/// DOMs and threading a custom Number comparator through every branch — is
-/// error-prone and slower for anything past a scalar.
-fn json_dom_equiv(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    let a_bytes = crate::engine::json::from_serde(a);
-    let b_bytes = crate::engine::json::from_serde(b);
-    crate::engine::json::compare(&a_bytes, &b_bytes) == std::cmp::Ordering::Equal
 }
 
 fn eval_json_member_of<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<Value, QueryError>
