@@ -847,6 +847,7 @@ impl Database {
                                 UndoApply::UpdateDelta(before_cols.clone())
                             }
                             UndoKind::Update | UndoKind::Delete => UndoApply::FullRow,
+                            UndoKind::DeleteHeader => UndoApply::UpdateDelta(Vec::new()),
                         };
                         (apply, rec.before_header, rec.before_values)
                     }

@@ -7,8 +7,8 @@
 /// `self.log.lock()` count. The pages they describe are held un-flushable in
 /// the buffer pool via `deferred_pins` until that commit-time append assigns
 /// their real LSNs (see `Frame::deferred_pins`). A crash before commit appends
-/// none of these buffered data records and flushes none of their pages; the
-/// eager BeginTxn record is harmless and recovery sees an empty loser.
+/// none of these buffered data records and flushes none of their pages.
+/// BeginTxn joins the first batch or an eager fallback's first WAL append.
 ///
 /// Each entry is `(pre-encoded record, frames it dirtied)`. The frames are
 /// `finalize_deferred`'d (real LSN published, pin released) right after their
@@ -161,6 +161,9 @@ thread_local! {
 type TxnWalBufferKey = (usize, u64);
 #[derive(Default)]
 struct TxnWalBuffer {
+    write_enabled: bool,
+    begin: Option<WalPayload>,
+    reusable_boundary: Option<Arc<crate::storage::txn::WalSavepointBoundary>>,
     entries: Vec<TxnWalEntry>,
     page_reservation: Option<DeferredWalPageReservation>,
     boundaries: Vec<(
@@ -359,18 +362,41 @@ pub(crate) fn row_lock_direct_wake_enabled() -> bool {
 
 fn txn_wal_buffering_active(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> bool {
     let key = txn_wal_buffer_key(log, txn_id);
-    txn_wal_buffer_shard(key).lock().contains_key(&key)
+    txn_wal_buffer_shard(key)
+        .lock()
+        .get(&key)
+        .is_some_and(|buffer| buffer.write_enabled)
 }
 
-fn begin_txn_wal_buffering(log: &Arc<crate::wal::LogMutex>, txn_id: u64) {
+fn begin_txn_wal_buffering(
+    log: &Arc<crate::wal::LogMutex>,
+    txn_id: u64,
+    start_scn: u64,
+    write_enabled: bool,
+) {
     let key = txn_wal_buffer_key(log, txn_id);
-    let previous = txn_wal_buffer_shard(key)
-        .lock()
-        .insert(key, TxnWalBuffer::default());
+    let previous = txn_wal_buffer_shard(key).lock().insert(
+        key,
+        TxnWalBuffer {
+            write_enabled,
+            begin: Some(WalPayload::BeginTxn { start_scn }),
+            ..Default::default()
+        },
+    );
     debug_assert!(
         previous.is_none(),
         "transaction WAL buffer must not be armed twice"
     );
+}
+
+/// Eager fallbacks publish the lazy BEGIN under the same WAL guard as
+/// their first record. Reserved-LSN callers must use reserve_txn_lsn.
+pub(crate) fn take_buffered_txn_begin(log_owner: u64, txn_id: u64) -> Option<WalPayload> {
+    if log_owner == 0 || txn_id == 0 {
+        return None;
+    }
+    let key = (log_owner as usize, txn_id);
+    txn_wal_buffer_shard(key).lock().get_mut(&key)?.begin.take()
 }
 
 /// Park a logical record + the frames it dirtied. Encoding is deferred until
@@ -400,6 +426,9 @@ fn push_reserved_txn_wal_record(
     let Some(buf) = shard.get_mut(&key) else {
         return Err((payload, keys, reservation));
     };
+    if !buf.write_enabled {
+        return Err((payload, keys, reservation));
+    }
     buf.hold_page_reservation(reservation);
     buf.entries.push((payload, keys));
     Ok(())
@@ -476,7 +505,14 @@ fn take_txn_wal_entries(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> TxnWalB
     txn_wal_buffer_shard(key)
         .lock()
         .get_mut(&key)
-        .map(std::mem::take)
+        .map(|buffer| {
+            let reusable_boundary = buffer.reusable_boundary.take();
+            let write_enabled = buffer.write_enabled;
+            let entries = std::mem::take(buffer);
+            buffer.reusable_boundary = reusable_boundary;
+            buffer.write_enabled = write_enabled;
+            entries
+        })
         .unwrap_or_default()
 }
 
@@ -986,12 +1022,7 @@ impl Database {
             .txns_write()?
             .begin_with_id(txn_id, start_scn, false, true, begin_lsn)?;
         self.slot_status_cache.insert_active(txn.txn_id);
-        if let Err(err) = self.append_wal(
-            txn.txn_id,
-            WalPayload::BeginTxn {
-                start_scn: txn.snapshot_scn,
-            },
-        ) {
+        if let Err(err) = self.begin_txn_wal(txn, false) {
             self.txns_write()?.discard_failed_begin(txn.txn_id);
             self.slot_status_cache.remove(txn.txn_id);
             return Err(err);
@@ -1055,12 +1086,7 @@ impl Database {
             view
         };
         self.slot_status_cache.insert_active(txn.txn_id);
-        if let Err(err) = self.append_wal(
-            txn.txn_id,
-            WalPayload::BeginTxn {
-                start_scn: txn.snapshot_scn,
-            },
-        ) {
+        if let Err(err) = self.begin_txn_wal(txn, true) {
             let mut txns = self.txns_write()?;
             txns.discard_failed_begin(txn.txn_id);
             self.active_write_txns_atomic
@@ -1070,11 +1096,23 @@ impl Database {
             return Err(err);
         }
         begin_txn_redo_policy(&self.log, txn.txn_id);
-        if txn_wal_buffer_feature_enabled() && self.config.durability != DurabilityMode::Memory {
-            begin_txn_wal_buffering(&self.log, txn.txn_id);
-        }
         self.cache_started_dml_txn(txn.txn_id, undo_head);
         Ok(txn)
+    }
+
+    fn begin_txn_wal(&self, txn: TxnView, write_enabled: bool) -> Result<(), QueryError> {
+        if txn_wal_buffer_feature_enabled() && self.config.durability != DurabilityMode::Memory {
+            begin_txn_wal_buffering(&self.log, txn.txn_id, txn.snapshot_scn, write_enabled);
+            Ok(())
+        } else {
+            self.append_wal(
+                txn.txn_id,
+                WalPayload::BeginTxn {
+                    start_scn: txn.snapshot_scn,
+                },
+            )
+            .map(|_| ())
+        }
     }
 
     /// A transaction which began with a read/savepoint can later write.
@@ -1091,7 +1129,11 @@ impl Database {
         };
         if eligible {
             let key = txn_wal_buffer_key(&self.log, txn_id);
-            txn_wal_buffer_shard(key).lock().entry(key).or_default();
+            txn_wal_buffer_shard(key)
+                .lock()
+                .entry(key)
+                .or_default()
+                .write_enabled = true;
         }
         Ok(())
     }
@@ -3651,7 +3693,9 @@ impl Database {
 
     fn sync_commit_lsn_with_target(&self, lsn: u64, target: u64) -> Result<(), QueryError> {
         let (window, adaptive) = self.group_commit_window_and_adaptive();
-        if crate::storage::txn::durability_worker_enabled() {
+        if self.config.durability != DurabilityMode::Memory
+            && crate::storage::txn::durability_worker_enabled()
+        {
             return self.durability_worker.sync_lsn(lsn, window, target);
         }
         self.group_commit
@@ -3717,8 +3761,8 @@ impl Database {
     /// Append all parked transaction-local WAL records (and `final_record`, if
     /// given) in a SINGLE WAL-mutex acquisition, then publish each dirtied
     /// frame's real LSN and release its deferred pin. Returns the LSN assigned
-    /// to `final_record`. BeginTxn is appended eagerly when the transaction
-    /// starts, so WAL order is begin → parked records → final_record even when
+    /// to `final_record`. The lazy BeginTxn joins the first drain unless an
+    /// eager fallback already published it, so WAL order is preserved even when
     /// different statements run on different blocking-pool workers.
     fn flush_txn_wal_buffer(
         &self,
@@ -3726,10 +3770,19 @@ impl Database {
         final_record: Option<WalPayload>,
     ) -> Result<Option<(u64, u64)>, QueryError> {
         let TxnWalBuffer {
-            entries,
-            boundaries,
+            write_enabled: _,
+            begin,
+            reusable_boundary: _,
+            mut entries,
+            mut boundaries,
             page_reservation: _page_reservation,
         } = take_txn_wal_entries(&self.log, txn_id);
+        if let Some(begin) = begin {
+            entries.insert(0, (begin, Vec::new()));
+            for (position, _) in &mut boundaries {
+                *position += 1;
+            }
+        }
         if entries.is_empty() && boundaries.is_empty() && final_record.is_none() {
             return Ok(None);
         }
@@ -4910,16 +4963,12 @@ impl Database {
             .combined(self.flush_group_commit.stats());
         let durability_worker_enabled = crate::storage::txn::durability_worker_enabled();
         let durability_stats = self.durability_worker.stats();
-        let effective_batches = if durability_worker_enabled {
-            durability_stats.batches
-        } else {
-            group_commit_stats.batches
-        };
-        let effective_requests = if durability_worker_enabled {
-            durability_stats.requests
-        } else {
-            group_commit_stats.total_batch_size
-        };
+        let effective_batches = group_commit_stats
+            .batches
+            .saturating_add(durability_stats.batches);
+        let effective_requests = group_commit_stats
+            .total_batch_size
+            .saturating_add(durability_stats.requests);
         let avg_group_commit_size = if effective_batches == 0 {
             0
         } else {
@@ -6292,7 +6341,7 @@ impl Database {
             row_log_len,
             index_repair_log_len: head.index_repair_log_len(),
             binlog_len: crate::binlog::txn_len(txn_id),
-            live_row_deltas: HashMap::new(),
+            live_row_deltas: smallvec::SmallVec::new(),
         };
         savepoint.live_row_deltas = self.pending_live_row_deltas_snapshot(txn_id);
         Ok(savepoint)
@@ -6314,20 +6363,34 @@ impl Database {
                 // an empty skip interval, while resolving last_lsn to an actual
                 // record in this transaction's chain as before.
                 let eager_lsn = self.log_state_atomics.next_lsn().saturating_sub(1);
-                let cursor = Arc::new(crate::storage::txn::WalSavepointBoundary {
-                    eager_lsn,
-                    prefix_lsn: AtomicU64::new(eager_lsn),
-                    last_lsn: AtomicU64::new(u64::MAX),
-                });
-                // Finished statement boundaries are normally at the tail;
-                // discard them amortized O(1), without scanning named saves.
-                while buf
-                    .boundaries
-                    .last()
-                    .is_some_and(|(_, boundary)| boundary.strong_count() == 0)
-                {
+                // Keep one boundary allocation for serialized statements.
+                // Reuse only after every old weak reference has retired;
+                // an in-flight drain must never resolve a new statement's
+                // cursor through an older boundary identity.
+                while buf.boundaries.last().is_some_and(|(_, boundary)| {
+                    boundary.strong_count() == 0
+                        || buf.reusable_boundary.as_ref().is_some_and(|cursor| {
+                            Arc::strong_count(cursor) == 1
+                                && std::sync::Weak::ptr_eq(boundary, &Arc::downgrade(cursor))
+                        })
+                }) {
                     buf.boundaries.pop();
                 }
+                let cursor =
+                    if let Some(cursor) = buf.reusable_boundary.as_mut().and_then(Arc::get_mut) {
+                        cursor.eager_lsn = eager_lsn;
+                        cursor.prefix_lsn.store(eager_lsn, Ordering::Relaxed);
+                        cursor.last_lsn.store(u64::MAX, Ordering::Relaxed);
+                        Arc::clone(buf.reusable_boundary.as_ref().unwrap())
+                    } else {
+                        let cursor = Arc::new(crate::storage::txn::WalSavepointBoundary {
+                            eager_lsn,
+                            prefix_lsn: AtomicU64::new(eager_lsn),
+                            last_lsn: AtomicU64::new(u64::MAX),
+                        });
+                        buf.reusable_boundary = Some(Arc::clone(&cursor));
+                        cursor
+                    };
                 buf.boundaries
                     .push((buf.entries.len(), Arc::downgrade(&cursor)));
                 savepoint.wal_boundary = Some(cursor);

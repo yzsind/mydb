@@ -353,7 +353,7 @@ No directory scan result may override the Data Dictionary's object identity and 
 
 WAL is a variable-length frame stream under `system/wal/`, with a default
 256 MiB segment rotation threshold. It does not use fixed 16 KiB framing.
-The current WAL v39 segment header is 64 bytes, little-endian:
+The current WAL v40 segment header is 64 bytes, little-endian:
 
 | Offset | Bytes | Field |
 | ---: | ---: | --- |
@@ -522,3 +522,28 @@ registered fixed-width integer fields. Allocation rejects exhaustion before
 publishing a reused or wrapped identity. Filesystem, operating-system and
 resource limits may impose smaller practical bounds. Widening these fields
 requires a new explicit format epoch rather than a native integer cast.
+
+### Compressed transaction batches
+
+WAL v40 permits bounded LZ4 compression inside a `TxnBatch` payload. A high bit
+in its first u32 marks compression; the remaining bits preserve the logical
+record count. The next u32 stores the uncompressed payload length, followed by an append-time
+u64 commit timestamp and an LZ4 block containing the ordinary batch payload.
+The decoder installs that timestamp into the final commit record; system-only
+file batches carry zero. This keeps decision-time assignment outside compression. Decoders reject
+length/count mismatches and expansion beyond 64 KiB. The enclosing frame CRC,
+transaction links, source time, commit boundary and physical before-images
+retain their ordinary meaning. Uncompressed batches remain valid. Writers
+use compression only when a bounded frame saves at least one eighth of its
+payload; larger and incompressible frames retain their ordinary encoding.
+
+### Header-only delete undo
+
+Undo binary v15 adds `DeleteHeader` for inline heap rows whose tombstones retain
+the exact original payload and layout. Its undo record carries the previous
+MVCC header and no copied values or external references. Snapshot traversal
+keeps the retained payload, rollback restores the header and index entries,
+and purge reclaims the tombstone only after all older snapshots release it.
+Rows with external references or unsupported layouts retain full delete undo.
+Physiological WAL still retains the before-bytes needed for catalog-free crash
+undo and point-in-time recovery.

@@ -531,7 +531,19 @@ impl Database {
                 self.note_dd_touch_if_needed(path, txn_id);
                 self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
-                self.note_replicated_table_mutation(txn_id, path, 1, 0);
+                let live_delta = patches
+                    .iter()
+                    .find_map(|patch| {
+                        let offset = 1usize.checked_sub(patch.offset as usize)?;
+                        let before = *patch.before.get(offset)?;
+                        let after = *patch.after.get(offset)?;
+                        Some(
+                            i64::from(after & MVCC_FLAG_DELETED == 0)
+                                - i64::from(before & MVCC_FLAG_DELETED == 0),
+                        )
+                    })
+                    .unwrap_or(0);
+                self.note_replicated_table_mutation(txn_id, path, 1, live_delta);
             }
             WalPayload::HeapDelete {
                 path,

@@ -7,10 +7,10 @@ The current development format is incompatible with earlier versions. If version
 | --- | --- |
 | storage control / owner-transfer proof | 1 / 1 |
 | row codec specification | 1 |
-| catalog / WAL | 66 / 39 |
+| catalog / WAL | 66 / 40 |
 | heap page / MVCC row | 15 / 9 |
 | B-tree index file / page | 25 / 16 |
-| undo binary / tablespace | 14 / 3 |
+| undo binary / tablespace | 15 / 3 |
 | overflow | 4 |
 | paged vector container (HNSW / IVF) index / page | 7 / 4 |
 | Zone Map file / page | 6 / 3 |

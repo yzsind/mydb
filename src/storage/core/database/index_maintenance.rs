@@ -2564,21 +2564,43 @@ impl Database {
         if writes.is_empty() {
             return Ok(());
         }
-        // Whole-row WAL is eager. Publish older deferred logical patches and
-        // their undo twins first, preserving mutation order for crash undo.
-        self.publish_wal_before_eager_heap_write(txn_id)?;
-        self.with_heap_mut(table_id, |heap| {
-            for write in writes {
+        if writes.iter().all(|write| !write.header.is_deleted()) {
+            // Preserve one prefix publication and one heap-handle lookup for
+            // an ordinary UPDATE batch, including resizing/LOB rewrites.
+            self.publish_wal_before_eager_heap_write(txn_id)?;
+            return self.with_heap_mut(table_id, |heap| {
+                for write in writes {
+                    heap.write_mvcc_ext(
+                        txn_id,
+                        write.row_id,
+                        write.header,
+                        &write.values,
+                        &write.external,
+                    )?;
+                }
+                Ok(())
+            });
+        }
+        for write in writes {
+            if write.header.is_deleted()
+                && self.with_heap_mut(table_id, |heap| {
+                    heap.try_write_mvcc_tombstone(txn_id, write.row_id, write.header)
+                })?
+            {
+                continue;
+            }
+            self.publish_wal_before_eager_heap_write(txn_id)?;
+            self.with_heap_mut(table_id, |heap| {
                 heap.write_mvcc_ext(
                     txn_id,
                     write.row_id,
                     write.header,
                     &write.values,
                     &write.external,
-                )?;
-            }
-            Ok(())
-        })
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn insert_index_batches_deferred(

@@ -1280,10 +1280,7 @@ impl Database {
     ) -> Result<Vec<(usize, LobRef)>, QueryError> {
         let heap = self.heap_handle(table_id)?;
         let heap_read = heap.read();
-        let collector = std::sync::Arc::new(LobRefCollector::new());
-        let installed: std::sync::Arc<dyn LobMaterializer> = collector.clone();
-        with_lob_materializer(Some(installed), || heap_read.read_mvcc(row_id))?;
-        Ok(collector.take())
+        heap_read.read_external_refs(row_id)
     }
 
     /// M2 (partial materialization) — fetch the externalized chain descriptor of a

@@ -30,7 +30,7 @@ fn log_vector_index_page_image(
     after: &mut Vec<u8>,
 ) -> Result<u64, QueryError> {
     let mut log = log.lock();
-    let lsn = log.reserve_lsn()?;
+    let lsn = log.reserve_txn_lsn(txn_id)?;
     set_page_lsn_if_formatted(after, lsn);
     let after = after.clone();
     let payload = match before {

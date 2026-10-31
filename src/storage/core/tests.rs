@@ -28544,3 +28544,296 @@ fn buffered_heap_update_recovery_preserves_whole_row_fences_under_pin_pressure()
     assert_eq!(rows[0].values[1], Value::String("z".repeat(508)));
     recovered.check_consistency().unwrap();
 }
+
+#[test]
+fn write_path_inline_string_update_uses_sparse_buffered_redo() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    db.create_table(
+        "inline_patch",
+        vec![
+            lob_col("id", DataType::Int, true),
+            lob_col("v", DataType::Text(65535), false),
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            seed,
+            "test.inline_patch",
+            vec![vec![Value::Int(1), Value::String("a".repeat(120))]],
+        )
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let reader = db.begin_txn().unwrap();
+    let writer = db.begin_dml_txn().unwrap();
+    db.update_row_by_id_with_changed_columns(
+        writer,
+        &db.table("test.inline_patch").unwrap(),
+        ids[0],
+        Some(&[1]),
+        |old| Ok(vec![old[0].clone(), Value::String("b".repeat(120))]),
+    )
+    .unwrap();
+    let key = txn_wal_buffer_key(&db.log, writer.txn_id);
+    let sparse = txn_wal_buffer_shard(key).lock().get(&key).unwrap().entries.iter().any(|(p, _)| matches!(p, WalPayload::HeapUpdateLogical { patches, .. } if patches.iter().any(|p| p.after.len() == 120)));
+    assert!(
+        sparse,
+        "an inline same-width string must use column redo instead of a full row"
+    );
+    assert_eq!(
+        db.scan_rows("test.inline_patch", reader).unwrap()[0].values[1],
+        Value::String("a".repeat(120))
+    );
+    db.rollback_txn(writer.txn_id).unwrap();
+    db.rollback_txn(reader.txn_id).unwrap();
+    assert_eq!(
+        db.scan_rows(
+            "test.inline_patch",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+        )
+        .unwrap()[0]
+            .values[1],
+        Value::String("a".repeat(120))
+    );
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn write_path_delete_buffers_header_and_index_redo() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    db.create_table(
+        "delete_patch",
+        vec![
+            lob_col("id", DataType::Int, true),
+            lob_col("v", DataType::Text(65535), false),
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            seed,
+            "test.delete_patch",
+            (1..=16)
+                .map(|id| vec![Value::Int(id), Value::String("a".repeat(120))])
+                .collect(),
+        )
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let reader = db.begin_txn().unwrap();
+    let writer = db.begin_dml_txn().unwrap();
+    db.delete_row_by_id(writer, &db.table("test.delete_patch").unwrap(), ids[4])
+        .unwrap();
+    let undo_id = db.txns.read().undo_head(writer.txn_id).unwrap().unwrap();
+    let undo = db.load_undo_owned(undo_id).unwrap().unwrap();
+    assert!(matches!(undo.kind, UndoKind::DeleteHeader));
+    assert!(undo.before_values.is_none());
+    assert!(undo.before_external.is_empty());
+    let key = txn_wal_buffer_key(&db.log, writer.txn_id);
+    {
+        let shard = txn_wal_buffer_shard(key).lock();
+        let entries = &shard.get(&key).unwrap().entries;
+        assert!(entries.iter().any(|(p, _)| matches!(p, WalPayload::HeapUpdateLogical { patches, .. } if patches.iter().all(|p| p.after.len() <= 18))), "a tombstone must retain its payload and log only its header");
+        assert!(entries.iter().any(|(p, _)| matches!(p, WalPayload::IndexBatch { ops, .. } if ops.iter().all(|o| matches!(o.kind, WalIndexOpKind::Delete)))), "a fitting leaf deletion must share the transaction WAL buffer");
+    }
+    assert_eq!(db.scan_rows("test.delete_patch", reader).unwrap().len(), 16);
+    db.rollback_txn(writer.txn_id).unwrap();
+    db.rollback_txn(reader.txn_id).unwrap();
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn write_path_inline_patch_types_null_resize_and_recovery() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let cases = vec![
+        (
+            DataType::Char(Some(120)),
+            Value::String("a".repeat(120)),
+            Value::String("b".repeat(120)),
+        ),
+        (
+            DataType::VarChar(Some(8192)),
+            Value::String("你好".repeat(20)),
+            Value::String("世界".repeat(20)),
+        ),
+        (
+            DataType::Binary(Some(120)),
+            Value::Bytes(vec![0; 120]),
+            Value::Bytes(vec![255; 120]),
+        ),
+        (
+            DataType::VarBinary(Some(8192)),
+            Value::Bytes(vec![0; 120]),
+            Value::Bytes(vec![255; 120]),
+        ),
+        (
+            DataType::Decimal(None),
+            Value::Decimal("123".into()),
+            Value::Decimal("124".into()),
+        ),
+        (
+            DataType::Decimal(Some((65, 10))),
+            Value::Decimal("123456789012345678901234567890.12".into()),
+            Value::Decimal("223456789012345678901234567890.12".into()),
+        ),
+        (
+            DataType::Json,
+            Value::Json(br#"{"a":1}"#.to_vec()),
+            Value::Json(br#"{"a":2}"#.to_vec()),
+        ),
+    ];
+    for (case, (kind, old_value, new_value)) in cases.into_iter().enumerate() {
+        let path = root.path().join(case.to_string());
+        let db = Database::open_with_durability(&path, DurabilityMode::Strict).unwrap();
+        db.create_table(
+            "t",
+            vec![
+                lob_col("id", DataType::Int, true),
+                lob_col("v", kind, false),
+            ],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let table = db.table("test.t").unwrap();
+        let seed = db.begin_dml_txn().unwrap();
+        let ids = db
+            .insert_rows(seed, "test.t", vec![vec![Value::Int(1), old_value]])
+            .unwrap();
+        db.commit_txn(seed.txn_id).unwrap();
+        let old = db
+            .scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+            )
+            .unwrap()[0]
+            .values
+            .clone();
+        let writer = db.begin_dml_txn().unwrap();
+        db.update_row_by_id_with_changed_columns(writer, &table, ids[0], Some(&[1]), |r| {
+            Ok(vec![r[0].clone(), new_value.clone()])
+        })
+        .unwrap();
+        let key = txn_wal_buffer_key(&db.log, writer.txn_id);
+        assert!(
+            txn_wal_buffer_shard(key)
+                .lock()
+                .get(&key)
+                .unwrap()
+                .entries
+                .iter()
+                .any(|(p, _)| matches!(p, WalPayload::HeapUpdateLogical { .. })),
+            "case {case} must use sparse redo"
+        );
+        let updated = db.scan_rows("test.t", writer).unwrap()[0].values.clone();
+        db.commit_txn(writer.txn_id).unwrap();
+        if matches!(case, 1 | 3) {
+            let reader = db.begin_txn().unwrap();
+            let resized = db.begin_dml_txn().unwrap();
+            let grown = if case == 1 {
+                Value::String("g".repeat(240))
+            } else {
+                Value::Bytes(vec![0xa5; 240])
+            };
+            db.update_row_by_id_with_changed_columns(resized, &table, ids[0], Some(&[1]), |r| {
+                Ok(vec![r[0].clone(), grown.clone()])
+            })
+            .unwrap();
+            assert_eq!(db.scan_rows("test.t", reader).unwrap()[0].values, updated);
+            assert_eq!(db.scan_rows("test.t", resized).unwrap()[0].values[1], grown);
+            db.rollback_txn(resized.txn_id).unwrap();
+            db.rollback_txn(reader.txn_id).unwrap();
+        }
+        let writer = db.begin_dml_txn().unwrap();
+        db.update_row_by_id_with_changed_columns(writer, &table, ids[0], Some(&[1]), |r| {
+            Ok(vec![r[0].clone(), Value::Null])
+        })
+        .unwrap();
+        assert_eq!(
+            db.scan_rows("test.t", writer).unwrap()[0].values[1],
+            Value::Null
+        );
+        db.rollback_txn(writer.txn_id).unwrap();
+        assert_ne!(old, updated);
+        db.buffer_pool.shutdown_flusher();
+        drop(db);
+        let db = Database::open_with_durability(&path, DurabilityMode::Strict).unwrap();
+        assert_eq!(
+            db.scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+            )
+            .unwrap()[0]
+                .values,
+            updated,
+            "case {case}"
+        );
+        db.check_consistency().unwrap();
+    }
+}
+
+#[test]
+fn write_path_lazy_begin_shares_commit_batch_and_precedes_eager_fallback() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    create_checkpoint_test_table(&db);
+    let table = db.table("test.t").unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(seed, "test.t", vec![vec![Value::Int(1)]])
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    for eager in [false, true] {
+        let txn = db.begin_txn().unwrap();
+        assert_eq!(
+            db.log.lock().last_txn_lsn(txn.txn_id),
+            0,
+            "BEGIN must not acquire the append latch"
+        );
+        if eager {
+            // Reserved-LSN writers must publish the deferred BEGIN before
+            // reserving their own row/page record, including structural DML.
+            let mut log = db.log.lock();
+            let reserved = log.reserve_txn_lsn(txn.txn_id).unwrap();
+            assert!(log.last_txn_lsn(txn.txn_id) < reserved);
+            assert_ne!(log.last_txn_lsn(txn.txn_id), 0);
+        }
+        db.delete_row_by_id(txn, &table, ids[0]).unwrap();
+        db.rollback_txn(txn.txn_id).unwrap();
+    }
+    let committed = db.begin_dml_txn().unwrap();
+    db.delete_row_by_id(committed, &table, ids[0]).unwrap();
+    db.commit_txn(committed.txn_id).unwrap();
+    db.buffer_pool.shutdown_flusher();
+    drop(db);
+    let scan = crate::wal::LogManager::scan(dir.path()).unwrap();
+    let records: Vec<_> = scan
+        .records
+        .iter()
+        .filter(|r| r.txn_id == committed.txn_id)
+        .collect();
+    assert!(matches!(
+        records.first().unwrap().payload,
+        WalPayload::BeginTxn { .. }
+    ));
+    assert!(matches!(
+        records.last().unwrap().payload,
+        WalPayload::CommitTxn { .. }
+    ));
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    assert!(db
+        .scan_rows(
+            "test.t",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+        )
+        .unwrap()
+        .is_empty());
+    db.check_consistency().unwrap();
+}

@@ -7113,6 +7113,63 @@ impl IndexFile {
             );
         }
         let entry = IndexEntry { key, row_id };
+        if self.durability != DurabilityMode::Memory
+            && txn_wal_buffer_index_enabled()
+            && txn_wal_buffering_active(&self.log, txn_id)
+            && !btree_logical_wal::is_deferred()
+            && !physical_wal_apply_active()
+            && self.online_build_log.is_none()
+        {
+            if let Some(reservation) = self.buffer_pool.reserve_deferred_wal_pages(1) {
+                let payload = WalPayload::IndexBatch {
+                    path: self.relative_path(),
+                    ops: vec![Self::encode_wal_index_op(WalIndexOpKind::Delete, &entry)?],
+                };
+                let _logical = btree_logical_wal::LsnScope::new(None);
+                btree_logical_wal::begin_deferred();
+                let applied = self.try_delete_entry_concurrent(txn_id, &entry);
+                let keys = btree_logical_wal::take_deferred();
+                let (payload, keys, _reservation) = if matches!(applied, Ok(true)) {
+                    match push_reserved_txn_wal_record(
+                        &self.log,
+                        txn_id,
+                        payload,
+                        keys,
+                        Some(reservation),
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(owned) => owned,
+                    }
+                } else {
+                    (payload, keys, Some(reservation))
+                };
+                // Release topology/leaf latches before WAL publication. A
+                // structural decline has not changed the leaf; a successful
+                // deferred mutation keeps its pin until the eager fallback
+                // has assigned a real LSN.
+                let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+                    .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre));
+                let lsn = match appended {
+                    Ok(lsn) => {
+                        for key in &keys {
+                            self.buffer_pool.finalize_deferred(key, lsn);
+                        }
+                        lsn
+                    }
+                    Err(err) => {
+                        for key in &keys {
+                            let _ = self.buffer_pool.discard_page(key);
+                        }
+                        return Err(err);
+                    }
+                };
+                if applied? {
+                    return Ok(());
+                }
+                let _logical = btree_logical_wal::LsnScope::new(Some(lsn));
+                return self.delete_entry_concurrent(txn_id, entry);
+            }
+        }
         // Symmetric with `insert_deferred`: always log via `IndexBatch`
         // so we don't emit a 32 KB per-page before/after image for a
         // single B-tree leaf modification. Recovery replays via
@@ -7129,15 +7186,28 @@ impl IndexFile {
     /// removal alone leaves a safe lower-bound separator until a structural
     /// rebuild refreshes it.
     fn delete_entry_concurrent(&self, txn_id: u64, entry: IndexEntry) -> Result<(), QueryError> {
+        if self.try_delete_entry_concurrent(txn_id, &entry)? {
+            return Ok(());
+        }
+        let _structure = self.structure_lock.write();
+        let _mutation = self.begin_mutation();
+        self.delete_internal_unlocked(txn_id, entry.key, entry.row_id, false)
+    }
+
+    fn try_delete_entry_concurrent(
+        &self,
+        txn_id: u64,
+        entry: &IndexEntry,
+    ) -> Result<bool, QueryError> {
         let completed_without_structure_change = {
             let _structure = self.structure_lock.read();
-            let pinned = self.find_leaf_for_entry_with_candidate(&entry, &entry)?.0;
+            let pinned = self.find_leaf_for_entry_with_candidate(entry, entry)?.0;
             let leaf_id = pinned.frame.key.page_id;
             let (leaf_latch, same_bucket) = self.lock_leaf_latches(leaf_id, leaf_id)?;
             let _mutation = self.begin_mutation();
             let root_page = self.root_page.load(Ordering::Acquire);
             let result =
-                self.try_delete_leaf_nonstructural_in_place(txn_id, &pinned, &entry, root_page)?;
+                self.try_delete_leaf_nonstructural_in_place(txn_id, &pinned, entry, root_page)?;
             drop(same_bucket);
             drop(leaf_latch);
             match result {
@@ -7149,12 +7219,7 @@ impl IndexFile {
                 None => false,
             }
         };
-        if completed_without_structure_change {
-            return Ok(());
-        }
-        let _structure = self.structure_lock.write();
-        let _mutation = self.begin_mutation();
-        self.delete_internal_unlocked(txn_id, entry.key, entry.row_id, false)
+        Ok(completed_without_structure_change)
     }
 
     #[cfg(test)]
@@ -11116,7 +11181,7 @@ impl IndexFile {
         } else {
             let before = self.read_raw_page_image(page_id)?;
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             set_page_lsn_if_formatted(&mut after, lsn);
             let path = self.relative_path();
             let reduced = txn_reduced_redo_active(&self.log, txn_id)
@@ -11219,7 +11284,7 @@ impl IndexFile {
         } else {
             let before = state.meta_image.clone();
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             set_page_lsn_if_formatted(&mut after, lsn);
             let path = self.relative_path();
             let reduced = txn_reduced_redo_active(&self.log, txn_id)

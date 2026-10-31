@@ -248,6 +248,9 @@ pub(crate) enum UndoKind {
     },
     Update,
     Delete,
+    /// Inline tombstone retaining its exact original payload. Only the
+    /// before_header is needed to recover the preceding logical version.
+    DeleteHeader,
     /// Column-level UPDATE delta — produced by the Phase 2 in-place
     /// patch path when every changed column is fixed-width and the
     /// row's NULL bitmap is unchanged. `before_cols` carries the
@@ -480,6 +483,7 @@ pub(crate) fn encode_undo_record(record: &UndoRecord) -> Result<Vec<u8>, QueryEr
         }
         UndoKind::Update => out.push(2),
         UndoKind::Delete => out.push(3),
+        UndoKind::DeleteHeader => out.push(5),
         UndoKind::UpdateDelta { before_cols } => {
             out.push(4);
             out.extend_from_slice(&(before_cols.len() as u32).to_le_bytes());
@@ -644,6 +648,7 @@ pub(crate) fn decode_undo_record(input: &[u8]) -> Result<UndoRecord, QueryError>
         }
         2 => UndoKind::Update,
         3 => UndoKind::Delete,
+        5 => UndoKind::DeleteHeader,
         4 => {
             let count = undo_read_u32(input, &mut pos)? as usize;
             if count > input.len().saturating_sub(pos) / 2 {
@@ -746,6 +751,7 @@ pub(crate) fn decode_undo_record_metadata(input: &[u8]) -> Result<UndoRecord, Qu
         }
         2 => (UndoKind::Update, 0),
         3 => (UndoKind::Delete, 0),
+        5 => (UndoKind::DeleteHeader, 0),
         4 => {
             let count = undo_read_u32(input, &mut pos)? as usize;
             skip(
@@ -1648,7 +1654,7 @@ pub(crate) fn estimate_undo_resident_bytes(record: &UndoRecord) -> u64 {
         UndoKind::UpdateDelta { before_cols } => {
             (before_cols.capacity() * std::mem::size_of::<u16>()) as u64
         }
-        UndoKind::Insert | UndoKind::Update | UndoKind::Delete => 0,
+        UndoKind::Insert | UndoKind::Update | UndoKind::Delete | UndoKind::DeleteHeader => 0,
     });
     if let Some(values) = &record.before_values {
         size = size.saturating_add((values.capacity() * std::mem::size_of::<Value>()) as u64);
@@ -1703,7 +1709,7 @@ pub(crate) fn estimate_undo_record_bytes(record: &UndoRecord) -> u64 {
         // (table_id 8 + ... + chain_depth 4) lives in the surrounding
         // record so we charge ~18 B per row, not 20.
         UndoKind::InsertBatch { row_ids } => 1 + (row_ids.len() as u64) * 18,
-        UndoKind::Update | UndoKind::Delete => 1,
+        UndoKind::Update | UndoKind::Delete | UndoKind::DeleteHeader => 1,
         UndoKind::UpdateDelta { before_cols } => 1 + 4 + (before_cols.len() as u64) * 2,
     };
     // table_id (8) + RowId (6) + before_header (~6) = 20-ish per
@@ -2079,9 +2085,10 @@ fn decode_segment_file_filtered(
                 // path: external LOB descriptors and/or a DELETE tombstone
                 // target. The heavy before-image stays on disk.
                 let needs_cleanup =
-                    matches!(record.kind, UndoKind::Delete) || !record.before_external.is_empty();
+                    matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader)
+                        || !record.before_external.is_empty();
                 if needs_cleanup {
-                    if !matches!(record.kind, UndoKind::Delete) {
+                    if !matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader) {
                         // Column lists are irrelevant to LOB cleanup.
                         record.kind = UndoKind::Update;
                     }
@@ -2607,12 +2614,13 @@ impl UndoManager {
                         ) {
                             continue;
                         }
-                        let needs_cleanup = matches!(metadata.kind, UndoKind::Delete)
-                            || !metadata.before_external.is_empty();
+                        let needs_cleanup =
+                            matches!(metadata.kind, UndoKind::Delete | UndoKind::DeleteHeader)
+                                || !metadata.before_external.is_empty();
                         if !needs_cleanup {
                             continue;
                         }
-                        if !matches!(metadata.kind, UndoKind::Delete) {
+                        if !matches!(metadata.kind, UndoKind::Delete | UndoKind::DeleteHeader) {
                             metadata.kind = UndoKind::Update;
                         }
                         metadata.prev_undo_ptr = None;
@@ -4309,7 +4317,10 @@ impl UndoManager {
                     match &mut rec.kind {
                         UndoKind::InsertBatch { row_ids } => *row_ids = Vec::new(),
                         UndoKind::UpdateDelta { before_cols } => *before_cols = Vec::new(),
-                        UndoKind::Insert | UndoKind::Update | UndoKind::Delete => {}
+                        UndoKind::Insert
+                        | UndoKind::Update
+                        | UndoKind::Delete
+                        | UndoKind::DeleteHeader => {}
                     }
                     let old_resident = resident_size(rec);
                     rec.resident_size =
@@ -4891,7 +4902,9 @@ impl UndoManager {
             // re-checks `is_slot_mvcc_tombstone`, so a rolled-back restore
             // would be a safe no-op — but we skip it outright to avoid
             // churning the reclaim quarantine on a live slot.
-            if matches!(removed.kind, UndoKind::Delete) && !creator_rolled_back {
+            if matches!(removed.kind, UndoKind::Delete | UndoKind::DeleteHeader)
+                && !creator_rolled_back
+            {
                 reclaim_targets.push((removed.table_id, removed.row_id));
             }
             if !creator_rolled_back && !removed.before_external.is_empty() {
@@ -7158,6 +7171,20 @@ mod update_delta_codec_tests {
             resident: true,
             encoded_len: 0,
         }
+    }
+
+    #[test]
+    fn header_delete_codec_and_metadata_preserve_purge_ownership() {
+        let record = record_with_kind(UndoKind::DeleteHeader, None);
+        let bytes = encode_undo_record(&record).unwrap();
+        let decoded = decode_undo_record(&bytes).unwrap();
+        let metadata = decode_undo_record_metadata(&bytes).unwrap();
+        assert!(matches!(decoded.kind, UndoKind::DeleteHeader));
+        assert!(matches!(metadata.kind, UndoKind::DeleteHeader));
+        assert_eq!(decoded.before_header, record.before_header);
+        assert!(decoded.before_values.is_none() && decoded.before_external.is_empty());
+        let full = record_with_kind(UndoKind::Delete, Some(vec![Value::String("x".repeat(120))]));
+        assert!(bytes.len() < encode_undo_record(&full).unwrap().len());
     }
 
     #[test]

@@ -2861,22 +2861,77 @@ pub(crate) fn fixed_column_byte_range_in_payload(
     )
 }
 
+/// Read only off-page descriptors. Inline rows stop at the header, and
+/// external rows visit the variable directory without decoding other values.
+pub(crate) fn decode_mvcc_external_refs(
+    payload: &[u8],
+    codec: &RowCodec,
+) -> Result<Vec<(usize, LobRef)>, QueryError> {
+    let (_, mut offset, has_external) = read_mvcc_header(payload)?;
+    if !has_external {
+        return Ok(Vec::new());
+    }
+    let layout_id = read_varint(payload, &mut offset)? as u32;
+    let row_layout = codec.layout_for_id(layout_id)?;
+    let count = read_varint(payload, &mut offset)? as usize;
+    if count > row_layout.columns.len() {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "row payload has more columns than its layout",
+        ));
+    }
+    let columns = &row_layout.columns[..count];
+    let layout = value_section_layout_for_prefix(row_layout, columns);
+    let section = row_value_section!(
+        payload,
+        offset,
+        count,
+        layout.fixed_len,
+        layout.var_count,
+        true
+    );
+    let mut refs = Vec::new();
+    for (ordinal, column) in columns.iter().enumerate() {
+        let Some(var_ord) = layout.var_ords[ordinal] else {
+            continue;
+        };
+        if column_is_null(payload, section.null_bitmap_start, ordinal)
+            || !external_bit(section.ext_bitmap, var_ord)
+        {
+            continue;
+        }
+        let (start, len) =
+            read_dir_entry(payload, section.dir_start, section.payload_start, var_ord)?;
+        refs.push((
+            column.column_index,
+            LobRef::read_from(checked_payload_slice(
+                payload,
+                section.payload_start,
+                start,
+                len,
+            )?)?,
+        ));
+    }
+    Ok(refs)
+}
+
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FixedColumnPatchRange<'a> {
+pub(crate) struct ColumnPatchRange<'a> {
     pub offset_in_payload: usize,
     pub width: usize,
     pub kind: &'a ColumnKind,
 }
 
-/// Locate a fixed slot even when NULL. Fixed slots always occupy their full
-/// width; changing nullness therefore needs a bitmap patch, not a row rewrite.
+/// Locate an inline column slot, including variable values and NULL slots.
+/// A variable slot can be patched only when the replacement has the same
+/// encoded width. External references must retain the ownership-aware path.
 /// Offsets are row-relative and cover the persisted layout, including old
 /// layouts retained by INSTANT DDL.
-pub(crate) fn fixed_column_patch_range<'a>(
+pub(crate) fn column_patch_range<'a>(
     payload: &[u8],
     codec: &'a RowCodec,
     column_index: usize,
-) -> Result<Option<(FixedColumnPatchRange<'a>, usize, u8)>, QueryError> {
+) -> Result<Option<(ColumnPatchRange<'a>, usize, u8)>, QueryError> {
     if payload.first().copied() != Some(MVCC_ROW_VERSION) {
         return Ok(None);
     }
@@ -2911,13 +2966,28 @@ pub(crate) fn fixed_column_patch_range<'a>(
             "corrupt row payload",
         ));
     }
-    let Some(fixed_offset) = layout.fixed_offsets[ordinal] else {
-        return Ok(None);
+    let (column_start, width) = if let Some(fixed_offset) = layout.fixed_offsets[ordinal] {
+        (
+            fixed_start + fixed_offset,
+            fixed_width_for_kind(&columns[ordinal].kind).expect("fixed slot has a width"),
+        )
+    } else {
+        let var_ord = layout.var_ords[ordinal].expect("variable column has an ordinal");
+        if has_external {
+            let ext_start = offset + count.div_ceil(8);
+            if external_bit(&payload[ext_start..fixed_start], var_ord) {
+                return Ok(None);
+            }
+        }
+        let dir_start = fixed_start + layout.fixed_len;
+        let payload_start = dir_start + layout.var_count * 2;
+        let (start, width) = read_dir_entry(payload, dir_start, payload_start, var_ord)?;
+        checked_payload_slice(payload, payload_start, start, width)?;
+        (payload_start + start as usize, width as usize)
     };
-    let width = fixed_width_for_kind(&columns[ordinal].kind).expect("fixed slot has a width");
     Ok(Some((
-        FixedColumnPatchRange {
-            offset_in_payload: fixed_start + fixed_offset,
+        ColumnPatchRange {
+            offset_in_payload: column_start,
             width,
             kind: &columns[ordinal].kind,
         },
@@ -3003,12 +3073,49 @@ pub(crate) fn fixed_column_byte_range_in_body(
 /// `encode_fixed_for_kind` so the in-place UPDATE path can write a
 /// new value into a heap page slot without going through
 /// `encode_mvcc_row` (which would rebuild the entire row).
+#[cfg(test)]
 pub(crate) fn encode_fixed_value_into(
     kind: &ColumnKind,
     value: &Value,
     out: &mut [u8],
 ) -> Result<(), QueryError> {
     encode_fixed_for_kind(kind, value, out)
+}
+
+/// Encode directly into an existing column slot. Return false before
+/// mutation when a variable value needs a different directory/row size.
+pub(crate) fn encode_column_patch_into(
+    kind: &ColumnKind,
+    value: &Value,
+    out: &mut [u8],
+) -> Result<bool, QueryError> {
+    if fixed_width_for_kind(kind).is_some() {
+        return Ok(encode_fixed_for_kind(kind, value, out).is_ok());
+    }
+    let borrowed = match (kind, value) {
+        (ColumnKind::VarString | ColumnKind::VarBytes, Value::String(s)) => Some(s.as_bytes()),
+        (ColumnKind::VarString | ColumnKind::VarBytes, Value::SmallString(s)) => Some(s.as_slice()),
+        (ColumnKind::VarString | ColumnKind::VarBytes, Value::Bytes(b)) => Some(b.as_slice()),
+        _ => None,
+    };
+    if let Some(bytes) = borrowed {
+        if bytes.len() != out.len() {
+            return Ok(false);
+        }
+        out.copy_from_slice(bytes);
+        return Ok(true);
+    }
+    let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+        out.len(),
+    )?;
+    let mut encoded = Vec::with_capacity(out.len());
+    encode_var_for_kind(kind, value, &mut encoded)?;
+    if encoded.len() != out.len() {
+        return Ok(false);
+    }
+    out.copy_from_slice(&encoded);
+    Ok(true)
 }
 
 /// Decode a fixed-width column body. Used by the in-place patch path's
@@ -8620,6 +8727,48 @@ mod inline_string_decode_tests {
             let before = cell.clone();
             assert!(decode_var_for_kind_into(&ColumnKind::VarString, &[0xff], &mut cell).is_err());
             assert_eq!(cell, before);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn variable_patch_encoding_preserves_validation_and_vector_dimensions() {
+    let kind = ColumnKind::Vector {
+        dim: None,
+        datatype: crate::vector::VectorDataType::Float32,
+    };
+    for dimension in [2, 3] {
+        let value = Value::Vector(crate::vector::VectorValue::new(
+            crate::vector::VectorDataType::Float32,
+            dimension,
+            (0..dimension)
+                .flat_map(|n| (n as f32).to_le_bytes())
+                .collect(),
+        ));
+        let mut expected = Vec::new();
+        encode_var_for_kind(&kind, &value, &mut expected).unwrap();
+        let mut actual = vec![0; expected.len()];
+        assert!(encode_column_patch_into(&kind, &value, &mut actual).unwrap());
+        assert_eq!(actual, expected);
+        let mut shorter = vec![0xa5; expected.len() - 4];
+        assert!(!encode_column_patch_into(&kind, &value, &mut shorter).unwrap());
+        assert!(shorter.iter().all(|&b| b == 0xa5));
+    }
+    for (kind, value) in [
+        (ColumnKind::Json, Value::Json(b"invalid".to_vec())),
+        (ColumnKind::Geometry, Value::Geometry(vec![0; 8])),
+    ] {
+        let mut expected = Vec::new();
+        let oracle = encode_var_for_kind(&kind, &value, &mut expected);
+        let mut actual = vec![0; expected.len()];
+        let patched = encode_column_patch_into(&kind, &value, &mut actual);
+        match oracle {
+            Ok(()) => {
+                assert!(patched.unwrap());
+                assert_eq!(actual, expected);
+            }
+            Err(err) => assert_eq!(patched.unwrap_err().code(), err.code()),
         }
     }
 }

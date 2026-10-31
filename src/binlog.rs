@@ -1288,6 +1288,9 @@ struct BinlogGlobal {
 }
 
 static GLOBAL: OnceLock<RwLock<BinlogGlobal>> = OnceLock::new();
+// Published while holding GLOBAL's write guard. Disabled recording and
+// savepoints need no shared global latch on the statement hot path.
+static MANAGER_ENABLED: AtomicBool = AtomicBool::new(false);
 static FALLBACK_CONFIG: OnceLock<BinlogConfig> = OnceLock::new();
 static COMMIT_GATE: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
 static GLOBAL_READ_LOCK: AtomicBool = AtomicBool::new(false);
@@ -1394,6 +1397,7 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
         )
     })?;
     *guard = BinlogGlobal { config, manager };
+    MANAGER_ENABLED.store(guard.manager.is_some(), Ordering::Release);
     Ok(())
 }
 
@@ -1626,7 +1630,7 @@ pub fn validate_binlog_transaction_compression(value: &str) -> Result<(), QueryE
 }
 
 pub fn enabled() -> bool {
-    manager().is_some()
+    MANAGER_ENABLED.load(Ordering::Acquire)
 }
 
 pub fn should_record_table_rows(table: &TableSchema) -> bool {
@@ -1634,6 +1638,9 @@ pub fn should_record_table_rows(table: &TableSchema) -> bool {
 }
 
 pub fn manager() -> Option<Arc<BinlogSourceManager>> {
+    if !enabled() {
+        return None;
+    }
     GLOBAL
         .get()
         .and_then(|lock| lock.read().ok().and_then(|guard| guard.manager.clone()))

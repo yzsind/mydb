@@ -9,8 +9,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 /// attacker-chosen strings hashed across a trust boundary.
 pub(crate) type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -515,7 +514,7 @@ pub struct StatementSavepoint {
     /// Transaction-local signed row-count deltas at this savepoint. Owned by
     /// `Database` but carried here so statement and named-savepoint rollback
     /// restore CBO population tracking together with the undo chain.
-    pub(crate) live_row_deltas: HashMap<u64, i64>,
+    pub(crate) live_row_deltas: SmallVec<[(u64, i64); 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1819,40 +1818,41 @@ pub(crate) struct GroupCommitCoordinator {
 }
 
 #[derive(Debug)]
-enum DurabilityMessage {
-    Sync {
-        lsn: u64,
-        window: Duration,
-        target: u64,
-        complete: Arc<DurabilityCompletion>,
-    },
-    Shutdown,
+struct DurabilityWaiter {
+    lsn: u64,
+    signal: Arc<CommitWaitSignal>,
 }
 
 #[derive(Debug, Default)]
-struct DurabilityCompletion {
-    result: Mutex<Option<Result<(), QueryError>>>,
-    ready: Condvar,
+struct DurabilityState {
+    pending: SmallVec<[DurabilityWaiter; 32]>,
+    stopping: bool,
+    failure: Option<QueryError>,
+    window: Duration,
+    target: u64,
 }
 
-/// Optional single-owner WAL durability executor. Committers enqueue their
-/// target LSN and park on a private one-shot channel; the worker drains all
-/// targets that arrived together and performs one fsync to their high-water
-/// mark. The direct [`GroupCommitCoordinator`] path is the default: its
-/// lock-free durable-watermark fast path avoids the per-commit channel,
-/// completion mutex/condvar and completion-pool mutex round trips. The worker
-/// remains available through `MYDB_DURABILITY_WORKER=1` for differential
-/// testing and workloads where caller election is unusually contentious.
+#[derive(Debug, Default)]
+struct DurabilityShared {
+    state: parking_lot::Mutex<DurabilityState>,
+    ready: parking_lot::Condvar,
+    durable_lsn: AtomicU64,
+    queue_depth: AtomicU64,
+    queue_depth_peak: AtomicU64,
+    batches: AtomicU64,
+    requests: AtomicU64,
+    batch_max: AtomicU64,
+}
+
+/// Persistent durability owner. Each executor reuses its private park token;
+/// requests arriving during fsync join the next barrier without handing
+/// leadership back to a client thread or allocating a completion object.
 #[derive(Debug)]
 pub(crate) struct DurabilityWorker {
-    sender: mpsc::Sender<DurabilityMessage>,
+    log_state: Option<Arc<crate::wal::LogStateAtomics>>,
+    writer: Option<crate::wal::WalWriter>,
+    shared: Arc<DurabilityShared>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
-    queue_depth: Arc<AtomicU64>,
-    queue_depth_peak: Arc<AtomicU64>,
-    batches: Arc<AtomicU64>,
-    requests: Arc<AtomicU64>,
-    batch_max: Arc<AtomicU64>,
-    completion_pool: Mutex<Vec<Arc<DurabilityCompletion>>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1866,133 +1866,94 @@ pub(crate) struct DurabilityWorkerStats {
 
 impl DurabilityWorker {
     pub(crate) fn disabled() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        drop(receiver);
+        let shared = Arc::new(DurabilityShared::default());
+        shared.state.lock().stopping = true;
         Self {
-            sender,
+            log_state: None,
+            writer: None,
+            shared,
             handle: Mutex::new(None),
-            queue_depth: Arc::new(AtomicU64::new(0)),
-            queue_depth_peak: Arc::new(AtomicU64::new(0)),
-            batches: Arc::new(AtomicU64::new(0)),
-            requests: Arc::new(AtomicU64::new(0)),
-            batch_max: Arc::new(AtomicU64::new(0)),
-            completion_pool: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn start(log: Arc<crate::wal::LogMutex>) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let queue_depth = Arc::new(AtomicU64::new(0));
-        let queue_depth_peak = Arc::new(AtomicU64::new(0));
-        let batches = Arc::new(AtomicU64::new(0));
-        let requests = Arc::new(AtomicU64::new(0));
-        let batch_max = Arc::new(AtomicU64::new(0));
-        let worker_depth = Arc::clone(&queue_depth);
-        let worker_batches = Arc::clone(&batches);
-        let worker_requests = Arc::clone(&requests);
-        let worker_batch_max = Arc::clone(&batch_max);
+        let shared = Arc::new(DurabilityShared::default());
+        shared
+            .durable_lsn
+            .store(log.lock().durable_lsn(), Ordering::Release);
+        let writer = std::env::var("MYDB_WAL_WRITER")
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+            .then(|| crate::wal::WalWriter::start(Arc::clone(&log)));
+        let worker = Arc::clone(&shared);
+        let log_state = log.lock().state_atomics();
         let handle = thread::Builder::new()
             .name("mydb-wal-durable".to_string())
-            .spawn(move || {
-                let mut shutting_down = false;
-                while !shutting_down {
-                    let first = match receiver.recv() {
-                        Ok(DurabilityMessage::Sync {
-                            lsn,
-                            window,
-                            target,
-                            complete,
-                        }) => (lsn, window, target.max(1), complete),
-                        Ok(DurabilityMessage::Shutdown) | Err(_) => break,
-                    };
-                    worker_depth.fetch_sub(1, Ordering::AcqRel);
-                    let mut target_lsn = first.0;
-                    let batch_target = first.2;
-                    // The normal target is capped at eight. Keep the whole
-                    // batch inline so a strict OLTP workload does not perform
-                    // one allocator round trip per fsync batch (well over
-                    // 100k allocations/minute at 20 concurrent committers).
-                    // Larger operator-configured targets spill through
-                    // SmallVec's ordinary, correctness-equivalent fallback.
-                    let mut completions: smallvec::SmallVec<[Arc<DurabilityCompletion>; 8]> =
-                        smallvec::smallvec![first.3];
-                    let deadline = Instant::now() + first.1;
-                    loop {
-                        if completions.len() as u64 >= batch_target {
-                            break;
-                        }
-                        let next = match receiver.try_recv() {
-                            Ok(message) => Some(message),
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                shutting_down = true;
-                                None
-                            }
-                            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                                match receiver.recv_timeout(
-                                    deadline.saturating_duration_since(Instant::now()),
-                                ) {
-                                    Ok(message) => Some(message),
-                                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                        shutting_down = true;
-                                        None
-                                    }
-                                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                                }
-                            }
-                            Err(mpsc::TryRecvError::Empty) => None,
-                        };
-                        match next {
-                            Some(DurabilityMessage::Sync { lsn, complete, .. }) => {
-                                worker_depth.fetch_sub(1, Ordering::AcqRel);
-                                target_lsn = target_lsn.max(lsn);
-                                completions.push(complete);
-                            }
-                            Some(DurabilityMessage::Shutdown) => {
-                                shutting_down = true;
-                                break;
-                            }
-                            None => break,
-                        }
+            .spawn(move || loop {
+                let mut state = worker.state.lock();
+                while state.pending.is_empty() && !state.stopping {
+                    worker.ready.wait(&mut state);
+                }
+                if state.pending.is_empty() {
+                    break;
+                }
+                let deadline = Instant::now() + state.window;
+                while !state.stopping && state.pending.len() < state.target as usize {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
                     }
-                    let batch_size = completions.len() as u64;
-                    worker_batches.fetch_add(1, Ordering::Relaxed);
-                    worker_requests.fetch_add(batch_size, Ordering::Relaxed);
-                    worker_batch_max.fetch_max(batch_size, Ordering::Relaxed);
-                    let result = crate::wal::LogManager::sync_durable_to(&log, target_lsn);
-                    for complete in completions {
-                        if let Ok(mut slot) = complete.result.lock() {
-                            *slot = Some(result.clone());
-                            complete.ready.notify_one();
-                        }
+                    if worker.ready.wait_for(&mut state, remaining).timed_out() {
+                        break;
                     }
                 }
-
-                // Shutdown is graceful: requests already queued before the
-                // shutdown marker are drained in batches. If every sender was
-                // dropped unexpectedly, fail any remaining waiters explicitly.
-                while let Ok(message) = receiver.try_recv() {
-                    if let DurabilityMessage::Sync { complete, .. } = message {
-                        worker_depth.fetch_sub(1, Ordering::AcqRel);
-                        if let Ok(mut slot) = complete.result.lock() {
-                            *slot = Some(Err(error(
-                                crate::error::catalog::ER_GET_ERRNO,
-                                "durability worker stopped before WAL sync",
-                            )));
-                            complete.ready.notify_one();
+                let mut batch = std::mem::take(&mut state.pending);
+                let target_lsn = batch.iter().map(|waiter| waiter.lsn).max().unwrap();
+                drop(state);
+                let result = crate::wal::LogManager::sync_durable_high_water_to(&log, target_lsn);
+                let mut state = worker.state.lock();
+                let (failed, performed_io) = match result {
+                    Ok((high_water, performed_io)) => {
+                        worker.durable_lsn.fetch_max(high_water, Ordering::Release);
+                        // A request can enqueue after the batch snapshot even
+                        // though its bytes were included in the same fsync.
+                        // Release it now rather than scheduling a no-op batch.
+                        let mut i = 0;
+                        while i < state.pending.len() {
+                            if state.pending[i].lsn <= high_water {
+                                batch.push(state.pending.swap_remove(i));
+                            } else {
+                                i += 1;
+                            }
                         }
+                        (false, performed_io)
                     }
+                    Err(err) => {
+                        state.failure = Some(err);
+                        state.stopping = true;
+                        batch.extend(state.pending.drain(..));
+                        (true, false)
+                    }
+                };
+                let count = batch.len() as u64;
+                worker.queue_depth.fetch_sub(count, Ordering::AcqRel);
+                if performed_io {
+                    worker.batches.fetch_add(1, Ordering::Relaxed);
+                    worker.batch_max.fetch_max(count, Ordering::Relaxed);
+                }
+                drop(state);
+                for waiter in batch {
+                    waiter.signal.notify();
+                }
+                if failed {
+                    break;
                 }
             })
             .expect("failed to start WAL durability worker");
         Self {
-            sender,
+            log_state: Some(log_state),
+            writer,
+            shared,
             handle: Mutex::new(Some(handle)),
-            queue_depth,
-            queue_depth_peak,
-            batches,
-            requests,
-            batch_max,
-            completion_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -2003,75 +1964,79 @@ impl DurabilityWorker {
         window: Duration,
         target: u64,
     ) -> Result<(), QueryError> {
-        let complete = self
-            .completion_pool
-            .lock()
-            .ok()
-            .and_then(|mut pool| pool.pop())
-            .unwrap_or_else(|| Arc::new(DurabilityCompletion::default()));
-        if let Ok(mut slot) = complete.result.lock() {
-            *slot = None;
+        let durable = || {
+            self.shared.durable_lsn.load(Ordering::Acquire).max(
+                self.log_state
+                    .as_ref()
+                    .map_or(0, |state| state.durable_lsn()),
+            )
+        };
+        if lsn <= durable() {
+            return Ok(());
         }
-        let depth = self.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        self.queue_depth_peak.fetch_max(depth, Ordering::Relaxed);
-        if self
-            .sender
-            .send(DurabilityMessage::Sync {
-                lsn,
-                window,
-                target: target.max(1),
-                complete: Arc::clone(&complete),
-            })
-            .is_err()
-        {
-            self.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        let signal = COMMIT_WAIT_SIGNAL.with(Arc::clone);
+        let mut state = self.shared.state.lock();
+        if let Some(err) = &state.failure {
+            return Err(err.clone());
+        }
+        if state.stopping {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "WAL durability worker is stopped",
             ));
         }
-        let result = {
-            let mut slot = complete.result.lock().map_err(|_| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "durability completion lock poisoned",
-                )
-            })?;
-            while slot.is_none() {
-                slot = complete.ready.wait(slot).map_err(|_| {
-                    error(
-                        crate::error::catalog::ER_GET_ERRNO,
-                        "durability completion lock poisoned",
-                    )
-                })?;
-            }
-            slot.take().unwrap()
-        };
-        if let Ok(mut pool) = self.completion_pool.lock() {
-            pool.push(complete);
+        if lsn <= durable() {
+            return Ok(());
         }
-        result
+        self.shared.requests.fetch_add(1, Ordering::Relaxed);
+        if state.pending.is_empty() {
+            state.window = window;
+            state.target = target.max(1);
+        }
+        signal.ready.store(false, Ordering::Release);
+        state.pending.push(DurabilityWaiter {
+            lsn,
+            signal: Arc::clone(&signal),
+        });
+        let depth = self.shared.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared
+            .queue_depth_peak
+            .fetch_max(depth, Ordering::Relaxed);
+        drop(state);
+        self.shared.ready.notify_one();
+        signal.wait();
+        if lsn <= self.shared.durable_lsn.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(self.shared.state.lock().failure.clone().unwrap_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL durability worker stopped before WAL sync",
+            )
+        }))
     }
 
     pub(crate) fn stats(&self) -> DurabilityWorkerStats {
         DurabilityWorkerStats {
-            queue_depth: self.queue_depth.load(Ordering::Relaxed),
-            queue_depth_peak: self.queue_depth_peak.load(Ordering::Relaxed),
-            batches: self.batches.load(Ordering::Relaxed),
-            requests: self.requests.load(Ordering::Relaxed),
-            batch_max: self.batch_max.load(Ordering::Relaxed),
+            queue_depth: self.shared.queue_depth.load(Ordering::Relaxed),
+            queue_depth_peak: self.shared.queue_depth_peak.load(Ordering::Relaxed),
+            batches: self.shared.batches.load(Ordering::Relaxed),
+            requests: self.shared.requests.load(Ordering::Relaxed),
+            batch_max: self.shared.batch_max.load(Ordering::Relaxed),
         }
     }
 }
 
 impl Drop for DurabilityWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(DurabilityMessage::Shutdown);
+        self.shared.state.lock().stopping = true;
+        self.shared.ready.notify_one();
         if let Ok(handle) = self.handle.get_mut() {
             if let Some(handle) = handle.take() {
                 let _ = handle.join();
             }
         }
+        self.writer.take();
     }
 }
 
@@ -2080,7 +2045,7 @@ pub(crate) fn durability_worker_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("MYDB_DURABILITY_WORKER")
             .map(|value| !matches!(value.trim(), "0" | "off" | "false" | "no"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -3932,7 +3897,7 @@ impl TransactionManager {
             row_log_len,
             index_repair_log_len: self.active_slot(txn_id)?.undo_head.index_repair_log_len(),
             binlog_len: crate::binlog::txn_len(txn_id),
-            live_row_deltas: HashMap::new(),
+            live_row_deltas: SmallVec::new(),
         })
     }
 

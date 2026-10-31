@@ -635,7 +635,11 @@ impl Database {
                 log.bind_wal_budget(Arc::clone(&capture.budget));
             }
             let atomics = log.state_atomics();
-            (Arc::new(parking_lot::Mutex::new(log)), atomics)
+            let log = Arc::new(parking_lot::Mutex::new(log));
+            atomics
+                .transaction_buffer_owner
+                .store(Arc::as_ptr(&log) as usize as u64, Ordering::Release);
+            (log, atomics)
         };
         // All transaction/undo/log consumers are finished. Only zone deltas
         // remain; release the general recovery directory before index builds.
@@ -678,12 +682,14 @@ impl Database {
         let index_repair_state = Arc::clone(&txns.index_repairs);
         let index_repair_version = Arc::clone(&txns.index_repair_version);
         let index_repair_epochs = Arc::clone(&txns.index_repair_epochs);
-        let durability_worker =
-            if !snapshot_read_only && crate::storage::txn::durability_worker_enabled() {
-                DurabilityWorker::start(Arc::clone(&log))
-            } else {
-                DurabilityWorker::disabled()
-            };
+        let durability_worker = if !snapshot_read_only
+            && config.durability != DurabilityMode::Memory
+            && crate::storage::txn::durability_worker_enabled()
+        {
+            DurabilityWorker::start(Arc::clone(&log))
+        } else {
+            DurabilityWorker::disabled()
+        };
         let source_clock = log.lock().source_clock();
         source_clock.fetch_max(commit_hlc_seed, Ordering::Release);
         let mut db = Self {

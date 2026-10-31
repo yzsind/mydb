@@ -457,6 +457,29 @@ fn ensure_statement_txn_kind(
     session: &mut SessionContext,
     dml: bool,
 ) -> Result<TxnView, QueryError> {
+    let (txn_id, isolation) = ensure_statement_txn_slot(db, session, dml)?;
+    let mut view =
+        db.session_statement_view(txn_id, isolation, session_read_only_snapshot(session));
+    view.isolation = isolation;
+    // B1 — propagate the session's connection id so commit/rollback
+    // can donate any unused AUTO_INCREMENT tail to this connection's
+    // idle pool instead of abandoning it.
+    view.connection_id = session.connection_id;
+    // READ COMMITTED advances the read view each statement. This path is a
+    // current read (DML / locking read) which always observes the latest
+    // committed version, so under REPEATABLE READ it must NOT advance the
+    // transaction's fixed read view (pinned by the first consistent SELECT).
+    if !isolation.uses_repeatable_snapshot() {
+        session.txn_snapshot_scn = Some(view.snapshot_scn);
+    }
+    Ok(view)
+}
+
+fn ensure_statement_txn_slot(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    dml: bool,
+) -> Result<(u64, IsolationLevel), QueryError> {
     if session
         .xa_branch
         .as_ref()
@@ -502,21 +525,7 @@ fn ensure_statement_txn_kind(
             .wal_buffer_ready
             .store(true, AtomicOrdering::Release);
     }
-    let mut view =
-        db.session_statement_view(txn_id, isolation, session_read_only_snapshot(session));
-    view.isolation = isolation;
-    // B1 — propagate the session's connection id so commit/rollback
-    // can donate any unused AUTO_INCREMENT tail to this connection's
-    // idle pool instead of abandoning it.
-    view.connection_id = session.connection_id;
-    // READ COMMITTED advances the read view each statement. This path is a
-    // current read (DML / locking read) which always observes the latest
-    // committed version, so under REPEATABLE READ it must NOT advance the
-    // transaction's fixed read view (pinned by the first consistent SELECT).
-    if !isolation.uses_repeatable_snapshot() {
-        session.txn_snapshot_scn = Some(view.snapshot_scn);
-    }
-    Ok(view)
+    Ok((txn_id, isolation))
 }
 
 pub(super) fn ensure_temp_statement_txn(
@@ -706,16 +715,29 @@ pub(super) fn finish_statement_txn<T>(
 fn execute_statement_transaction<F>(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    txn: TxnView,
+    txn_id: u64,
+    isolation: IsolationLevel,
+    read_only: bool,
     execute: F,
 ) -> Result<QueryResponse, QueryError>
 where
     F: FnOnce(&Arc<Database>, &mut SessionContext, TxnView) -> Result<QueryResponse, QueryError>,
 {
-    let txn_runtime = session.ensure_txn_runtime(txn.txn_id)?;
+    let txn_runtime = session.ensure_txn_runtime(txn_id)?;
     let _statement_guard =
         (Arc::strong_count(&txn_runtime) > 2).then(|| txn_runtime.enter_statement());
-    let (txn, _snapshot_guard) = atomically_guard_statement_view(db, session, txn);
+    let pinned = session_read_only_snapshot(session);
+    let (mut txn, _snapshot_guard) = db.session_statement_view_with_guard(
+        txn_id,
+        isolation,
+        pinned,
+        read_only || pinned.is_some() || session.read_only_txn,
+    );
+    txn.connection_id = session.connection_id;
+    txn.dirty_read = isolation == IsolationLevel::ReadUncommitted;
+    if !isolation.uses_repeatable_snapshot() {
+        session.txn_snapshot_scn = Some(txn.snapshot_scn);
+    }
     let temp_savepoint = session.temp_table_journal.len();
     let savepoint = (!session.autocommit || session.explicit_txn)
         .then(|| db.statement_savepoint(txn.txn_id))
@@ -749,7 +771,14 @@ where
     F: FnOnce(&Arc<Database>, &mut SessionContext, TxnView) -> Result<QueryResponse, QueryError>,
 {
     let txn = ensure_statement_txn(db, session)?;
-    execute_statement_transaction(db, session, txn, execute)
+    execute_statement_transaction(
+        db,
+        session,
+        txn.txn_id,
+        txn.isolation,
+        txn.read_only,
+        execute,
+    )
 }
 
 pub(super) fn execute_temp_in_transaction_with_session<F>(
@@ -762,7 +791,14 @@ where
 {
     session.note_write_intent();
     let txn = ensure_temp_statement_txn(db, session)?;
-    execute_statement_transaction(db, session, txn, execute)
+    execute_statement_transaction(
+        db,
+        session,
+        txn.txn_id,
+        txn.isolation,
+        txn.read_only,
+        execute,
+    )
 }
 
 /// DML-flavoured `execute_in_transaction_with_session`. Identical to
@@ -782,8 +818,8 @@ where
 {
     // Failed writes still classify the session as a read-write workload.
     session.note_write_intent();
-    let txn = ensure_statement_dml_txn(db, session)?;
-    execute_statement_transaction(db, session, txn, execute)
+    let (txn_id, isolation) = ensure_statement_txn_slot(db, session, true)?;
+    execute_statement_transaction(db, session, txn_id, isolation, false, execute)
 }
 
 /// Transaction wrapper for a compiled exact locking point read attempted as

@@ -996,26 +996,30 @@ impl Database {
             .remove(&txn_id);
     }
 
-    pub(crate) fn pending_live_row_deltas_snapshot(&self, txn_id: u64) -> HashMap<u64, i64> {
+    pub(crate) fn pending_live_row_deltas_snapshot(
+        &self,
+        txn_id: u64,
+    ) -> smallvec::SmallVec<[(u64, i64); 4]> {
         self.pending_live_row_deltas[txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock()
             .get(&txn_id)
-            .cloned()
+            .map(|tables| {
+                tables
+                    .iter()
+                    .map(|(&table, &delta)| (table, delta))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    pub(crate) fn restore_pending_live_row_deltas(
-        &self,
-        txn_id: u64,
-        snapshot: &HashMap<u64, i64>,
-    ) {
+    pub(crate) fn restore_pending_live_row_deltas(&self, txn_id: u64, snapshot: &[(u64, i64)]) {
         let mut pending = self.pending_live_row_deltas
             [txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock();
         if snapshot.is_empty() {
             pending.remove(&txn_id);
         } else {
-            pending.insert(txn_id, snapshot.clone());
+            pending.insert(txn_id, snapshot.iter().copied().collect());
         }
     }
     pub(crate) fn table_live_row_delta(&self, table_id: u64) -> i64 {

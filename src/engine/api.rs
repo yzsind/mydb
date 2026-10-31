@@ -1541,6 +1541,7 @@ pub(crate) struct PreparedLockingPointRead {
 /// parameters by the normal index lookup path.
 #[derive(Debug)]
 pub(crate) struct PreparedPointWrite {
+    pub(crate) needs_temporal_validation: bool,
     pub(crate) table: Arc<TableSchema>,
     pub(crate) index: IndexSchema,
     pub(crate) key: IndexKey,

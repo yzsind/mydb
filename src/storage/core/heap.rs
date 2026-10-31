@@ -1473,6 +1473,38 @@ impl HeapFile {
         self.read_mvcc_following(row_id, 0)
     }
 
+    fn read_external_refs(&self, mut row_id: RowId) -> Result<Vec<(usize, LobRef)>, QueryError> {
+        if !codec_has_externalizable_columns(&self.codec) {
+            return Ok(Vec::new());
+        }
+        for depth in 0..=MAX_FORWARDING_DEPTH {
+            if row_id.page_id as u64 >= self.page_count()? {
+                return Ok(Vec::new());
+            }
+            let (target, refs) = self.with_page(row_id.page_id as u64, |page| {
+                let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                    return Ok((None, Vec::new()));
+                };
+                if let Some(target) = decode_heap_forwarding_stub(payload)? {
+                    return Ok((Some(target), Vec::new()));
+                }
+                let (header, _, _) = read_mvcc_header(payload)?;
+                if depth == 0 && header.flags & MVCC_FLAG_ROW_PIECE != 0 {
+                    return Ok((None, Vec::new()));
+                }
+                Ok((None, decode_mvcc_external_refs(payload, &self.codec)?))
+            })?;
+            match target {
+                Some(target) => row_id = target,
+                None => return Ok(refs),
+            }
+        }
+        Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "heap row migration chain too deep",
+        ))
+    }
+
     fn read_mvcc_following(
         &self,
         row_id: RowId,
@@ -2351,6 +2383,83 @@ impl HeapFile {
         Ok(true)
     }
 
+    /// Preserve an inline row's body when installing its MVCC tombstone.
+    /// External chains retain the full rewrite path: undo takes ownership
+    /// of those chains, so a tombstone must not keep materializable refs.
+    fn try_write_mvcc_tombstone(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        header: RowHeader,
+    ) -> Result<bool, QueryError> {
+        if !header.is_deleted() || header.undo_ptr.is_none() || txn_id == 0 {
+            return Ok(false);
+        }
+        let _page_guard = self
+            .page_latch(row_id.page_id as u64)
+            .lock()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+        let before = self.with_page(row_id.page_id as u64, |page| {
+            let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                return Ok(None);
+            };
+            if payload.first().copied() != Some(MVCC_ROW_VERSION) {
+                return Ok(None);
+            }
+            let (old, width, external) = read_mvcc_header(payload)?;
+            if width != 18 || external || old.flags & MVCC_FLAG_ROW_PIECE != 0 {
+                return Ok(None);
+            }
+            Ok(Some(<[u8; 17]>::try_from(&payload[1..18]).unwrap()))
+        })?;
+        let Some(before) = before else {
+            return Ok(false);
+        };
+        let mut after = before;
+        after[0] |= MVCC_FLAG_DELETED;
+        after[1..9].copy_from_slice(&header.last_txn_id.to_le_bytes());
+        after[9..17].copy_from_slice(&header.undo_ptr.unwrap().to_le_bytes());
+        self.maybe_emit_heap_fpi(row_id.page_id)?;
+        let key = self.page_key(row_id.page_id as u64);
+        let write = |lsn| {
+            self.buffer_pool
+                .with_raw_page_mut(key.clone(), lsn, |bytes| {
+                    patch_heap_page_raw(bytes, row_id.slot_id, &[(1, after.as_slice())])
+                })
+        };
+        if self.durability() == DurabilityMode::Memory {
+            write(0)?;
+            return Ok(true);
+        }
+        let payload = WalPayload::HeapUpdateLogical {
+            path: self.relative_path(),
+            page_id: row_id.page_id,
+            slot_id: row_id.slot_id,
+            patches: vec![WalColumnPatch {
+                offset: 1,
+                before: before.to_vec(),
+                after: after.to_vec(),
+            }],
+            undo_lsn: header.undo_ptr,
+        };
+        match try_buffer_txn_page_write(
+            &self.log,
+            &self.buffer_pool,
+            txn_id,
+            payload,
+            vec![key.clone()],
+            write,
+        ) {
+            Ok(result) => result?,
+            Err((payload, write)) => {
+                let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
+                let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                write(lsn)?;
+            }
+        }
+        Ok(true)
+    }
+
     fn write_mvcc(
         &self,
         txn_id: u64,
@@ -2542,10 +2651,17 @@ impl HeapFile {
                 for &col_idx in changed_cols {
                     let new_is_null = matches!(new_values.get(col_idx), Some(Value::Null));
                     let Some((range, null_offset, null_mask)) =
-                        fixed_column_patch_range(slot_bytes, &self.codec, col_idx)?
+                        column_patch_range(slot_bytes, &self.codec, col_idx)?
                     else {
                         return Ok(None);
                     };
+                    // A variable NULL has zero encoded width. Preserve the
+                    // canonical shrinking rewrite instead of retaining its
+                    // former payload as unused bytes in a sparse patch.
+                    if new_is_null && range.width != 0 && fixed_width_for_kind(range.kind).is_none()
+                    {
+                        return Ok(None);
+                    }
                     let old_null_byte = slot_bytes[null_offset];
                     if (old_null_byte & null_mask != 0) != new_is_null {
                         if let Some((_, _, after)) = col_patches
@@ -2582,12 +2698,11 @@ impl HeapFile {
                     }
                     let mut after_bytes = HeapPatchBytes::from_elem(0u8, range.width);
                     if !new_is_null
-                        && encode_fixed_value_into(
+                        && !encode_column_patch_into(
                             range.kind,
                             &new_values[col_idx],
                             &mut after_bytes,
-                        )
-                        .is_err()
+                        )?
                     {
                         return Ok(None);
                     }
@@ -4580,12 +4695,14 @@ impl HeapFile {
             WalPayload::full_page_image(self.relative_path(), page_id as u64, after),
         )?;
         let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
-        if reduced {
-            self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
+        // Stamp FPI coverage before any deferred mutation. Otherwise another
+        // mutation can emit a system FPI containing an unlogged row version.
+        self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
+            if reduced {
                 write_u16(bytes, 6, 0);
-                Ok(())
-            })?;
-        }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -4605,7 +4722,7 @@ impl HeapFile {
             0
         } else {
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             log.append_reserved(
                 lsn,
                 txn_id,
@@ -4654,7 +4771,7 @@ impl HeapFile {
             0
         } else {
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             log.append_reserved(
                 lsn,
                 txn_id,

@@ -38,7 +38,8 @@ pub const CATALOG_VERSION: u32 = 66;
 /// v35: transactional vector-index recovery batches.
 /// v36: persistent spatial R-tree page batches.
 /// v37: transaction-linked spatial undo and compensation cursors.
-pub const WAL_VERSION: u32 = 39;
+/// v40: bounded lossless LZ4 transaction-batch frames.
+pub const WAL_VERSION: u32 = 40;
 /// v14: reduced-redo pages require an FPI before later physiological writes.
 pub const HEAP_PAGE_VERSION: u16 = 15;
 pub const MVCC_ROW_VERSION: u8 = 9;
@@ -47,7 +48,8 @@ pub const INDEX_PAGE_VERSION: u16 = 16;
 /// Derived primary keys and Zone Map weights are part of physical replication
 /// compatibility. Development directories using older keys must be rebuilt.
 pub const COLLATION_KEY_VERSION: u32 = 2;
-pub const UNDO_BINARY_VERSION: u8 = 14;
+/// v15: header-only inline delete undo.
+pub const UNDO_BINARY_VERSION: u8 = 15;
 pub const UNDO_TABLESPACE_VERSION: u32 = 3;
 pub const OVERFLOW_VERSION: u16 = 4;
 /// v4 records the committed heap coverage frontier.

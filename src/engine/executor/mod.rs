@@ -4386,6 +4386,9 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        if !matches!(parsed.as_ref(), Statement::Select(_)) {
+            return None;
+        }
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);

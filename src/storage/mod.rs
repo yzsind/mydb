@@ -2,6 +2,7 @@ pub(crate) mod capture;
 pub(crate) mod catalog;
 pub(crate) mod control;
 mod core;
+pub(crate) use core::take_buffered_txn_begin;
 pub(crate) mod data_dictionary;
 pub(crate) mod dir_lock;
 pub(crate) mod file_generation;
