@@ -8949,16 +8949,36 @@ mod tests {
         assert!(gate.try_write_arc().is_some());
     }
 
+    fn isolated_strict_applier_engine(path: &Path) -> Arc<StorageQueryEngine> {
+        let config = crate::storage::StorageConfig {
+            durability: crate::storage::DurabilityMode::Strict,
+            buffer_pool_pages: 4096,
+            buffer_pool_io_threads: 1,
+            buffer_pool_prefetch_pages: 0,
+            ..crate::storage::StorageConfig::from_env()
+        };
+        let engine = Arc::new(
+            StorageQueryEngine::open_with_storage_config_without_background_workers(path, config)
+                .unwrap(),
+        );
+        // A cleaner can legitimately persist the commit high-water before
+        // the applier requests it, leaving no group-commit batch to count.
+        engine
+            .database_for_replication()
+            .stop_buffer_pool_io_for_test();
+        engine
+    }
+
     #[test]
     fn sql_applier_batches_independent_source_commits_under_one_durability_barrier() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let engine = isolated_strict_applier_engine(dir.path());
         engine
             .execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20))")
             .unwrap();
         let (_runtime, runner) = make_split_runner(dir.path(), Arc::clone(&engine));
         let db = engine.database_for_replication();
-        let before = db.storage_status().group_commit_batches;
+        let before = db.storage_status();
 
         for (id, pos) in [(1_i64, 180_u64), (2, 240)] {
             let gtid = Some(format!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:{id}"));
@@ -8980,12 +9000,14 @@ mod tests {
 
         let durable = runner.runtime.relay_gate.lock().unwrap().durable_offset;
         runner.sql_apply_available(durable).unwrap();
-        let after = db.storage_status().group_commit_batches;
+        let after = db.storage_status();
         assert_eq!(
-            after - before,
+            after.group_commit_batches - before.group_commit_batches,
             1,
             "two source commits should share one local WAL durability barrier"
         );
+        assert_eq!(after.wal_syncs - before.wal_syncs, 1);
+        assert!(after.durable_lsn >= after.current_lsn - 1);
         let result = engine
             .execute("SELECT id, v FROM t ORDER BY id")
             .unwrap()
@@ -9001,6 +9023,78 @@ mod tests {
                 vec![Value::Int(2), Value::String("v2".to_string())],
             ]
         );
+    }
+
+    #[test]
+    fn sql_applier_batch_finishes_already_durable_commits_without_another_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = isolated_strict_applier_engine(dir.path());
+        engine
+            .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+            .unwrap();
+        let (runtime, runner) = make_split_runner(dir.path(), Arc::clone(&engine));
+        let db = engine.database_for_replication();
+        let path = relay_log_path(dir.path(), DEFAULT_CHANNEL);
+        let mut pending = Vec::new();
+        for id in 1..=2 {
+            let gtid = format!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:{id}");
+            let commit = runner
+                .prepare_row_records(
+                    vec![RelayOp::WriteRows {
+                        database: "test".into(),
+                        table: "t".into(),
+                        rows: vec![vec![Value::Int(id)]],
+                    }],
+                    Some(&gtid),
+                )
+                .unwrap()
+                .unwrap();
+            pending.push(PendingRelayCommit {
+                commit: Some(commit),
+                relay_offset: id as u64 * 100,
+                source_file: "bin.000001".into(),
+                source_pos: id as u64 * 60 + 120,
+                gtid: Some(gtid),
+                event_count: 1,
+                commit_ts: 0,
+            });
+        }
+        let log = db.wal_log();
+        let high_water = log.lock().last_lsn();
+        assert!(log.lock().durable_lsn() < high_water);
+        // Reproduce a page cleaner's WAL-before-data barrier deterministically.
+        crate::wal::LogManager::sync_durable_to(&log, high_water).unwrap();
+        let before = db.storage_status();
+        let mut pending_bytes = 200;
+        runner
+            .flush_pending_relay_commits(&path, &mut pending, &mut pending_bytes)
+            .unwrap();
+        let after = db.storage_status();
+        // Coordinator variants account for already-covered requests differently;
+        // neither may issue another physical WAL durability barrier.
+        assert_eq!(after.wal_syncs, before.wal_syncs);
+        assert!(after.durable_lsn >= high_water);
+        assert!(pending.is_empty());
+        assert_eq!(pending_bytes, 0);
+        let status = runtime.status.lock().unwrap().clone();
+        assert_eq!(status.applied_transactions, 2);
+        assert_eq!(status.relay_log_pos, 200);
+        assert_eq!(status.exec_source_log_pos, 240);
+        for id in 1..=2 {
+            assert!(gtid_set_contains(
+                &status.executed_gtid_set,
+                &format!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:{id}")
+            ));
+        }
+        let QueryResponse::ResultSet(result) = engine
+            .execute("SELECT id FROM t ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("expected result set");
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
     }
 
     #[test]

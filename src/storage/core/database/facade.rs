@@ -1282,6 +1282,11 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn stop_buffer_pool_io_for_test(&self) {
+        self.buffer_pool.shutdown_flusher();
+    }
+
+    #[cfg(test)]
     fn open_with_durability(
         data_dir: impl Into<PathBuf>,
         durability: DurabilityMode,
