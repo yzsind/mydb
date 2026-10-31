@@ -780,8 +780,14 @@ impl Database {
 
     pub(crate) fn load_data_index_builders(
         &self,
+        txn: TxnView,
         table: &TableSchema,
     ) -> Result<LoadDataIndexBuilders, QueryError> {
+        self.check_dml_allowed(txn)?;
+        // Index discovery/open is part of this writer's physical access,
+        // not a harmless planning probe. Preserve concurrent appenders (IX
+        // is compatible with IX) while excluding a generation publisher.
+        self.acquire_table_write_binding(txn.txn_id, table)?;
         self.load_data_index_builders_for(table, true)
     }
 

@@ -203,7 +203,17 @@ impl Database {
         }
     }
 
-    pub(crate) fn table_is_physically_empty_for_shadow_load(
+    pub(crate) fn table_may_be_empty_for_shadow_load(
+        &self,
+        table: &TableSchema,
+    ) -> Result<bool, QueryError> {
+        // This is only a routing hint, before the statement owns a table
+        // lock. A peer may be replacing index files in this physical
+        // generation; never open or fault an index during that window.
+        Ok(self.heap_page_count(table.id) <= 1)
+    }
+
+    fn table_is_physically_empty_for_shadow_load(
         &self,
         table: &TableSchema,
     ) -> Result<bool, QueryError> {
@@ -218,17 +228,17 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) fn begin_shadow_generation(
+    pub(crate) fn try_begin_shadow_generation(
         self: &Arc<Self>,
         txn_id: u64,
         table: Arc<TableSchema>,
-    ) -> Result<ShadowGenerationBuilder, QueryError> {
+    ) -> Result<Option<ShadowGenerationBuilder>, QueryError> {
         self.acquire_table_exclusive(txn_id, table.id)?;
         if !self.table_is_physically_empty_for_shadow_load(&table)? {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "shadow generation requires a physically empty table",
-            ));
+            // No private id, file, row or WAL mutation has happened. The
+            // caller can append normally under the retained X lock instead
+            // of exposing a stale optimization decision as a SQL error.
+            return Ok(None);
         }
 
         let shadow_id = {
@@ -276,7 +286,7 @@ impl Database {
                 return Err(err);
             }
         };
-        Ok(ShadowGenerationBuilder {
+        Ok(Some(ShadowGenerationBuilder {
             db: Arc::clone(self),
             live_table: table,
             shadow_table,
@@ -285,7 +295,7 @@ impl Database {
             total_rows: 0,
             index_builders: Some(index_builders),
             published: false,
-        })
+        }))
     }
 
     fn persist_bulk_load_intent(

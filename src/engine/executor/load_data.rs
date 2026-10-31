@@ -108,6 +108,11 @@ const READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 // costs for wide bulk inputs.
 const PARALLEL_CHUNK_SIZE: usize = 500_000;
 const PARALLEL_MIN_ROWS: usize = 2_048;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SHADOW_OPEN_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 const PARALLEL_CHUNK_TARGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// D2 — RAII guard for the in-flight LOAD DATA counter. Bumps
@@ -632,7 +637,7 @@ fn load_data_exclusive_insert_shape_eligible(
     {
         return Ok(false);
     }
-    db.table_is_physically_empty_for_shadow_load(table)
+    db.table_may_be_empty_for_shadow_load(table)
 }
 
 /// Whether the declared input charset requires transcoding to the
@@ -1785,7 +1790,7 @@ fn execute_load_data_fast(
         let mut buf = Vec::with_capacity(READ_BUF_SIZE);
         let prepared_indexes = prepare_load_indexes(table)?;
 
-        let mut index_builders = db.load_data_index_builders(table)?;
+        let mut index_builders = db.load_data_index_builders(txn, table)?;
 
         loop {
             crate::engine::cancel::check_cancelled()?;
@@ -2214,8 +2219,6 @@ fn execute_load_data_fast_parallel(
     // authoritative coordinator route.
     let workers = degree;
     let auto_increment_idx = table.auto_increment_column_index();
-    let writer_encode =
-        crate::binlog::enabled() || (auto_increment_idx.is_some() && !use_shadow_generation);
     let no_auto_value_on_zero = crate::engine::expr::session_temporal_sql_mode_bits()
         & crate::engine::api::SQL_MODE_NO_AUTO_VALUE_ON_ZERO
         != 0;
@@ -2234,10 +2237,23 @@ fn execute_load_data_fast_parallel(
     // workers start. Eligibility is revalidated under that lock by storage,
     // closing the empty-table race with a concurrent writer.
     let shadow_builder = if use_shadow_generation {
-        Some(db.begin_shadow_generation(txn_id, Arc::new(table.clone()))?)
+        #[cfg(test)]
+        BEFORE_SHADOW_OPEN_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let builder = db.try_begin_shadow_generation(txn_id, Arc::new(table.clone()))?;
+        if builder.is_none() {
+            db.record_load_shadow_fallback();
+        }
+        builder
     } else {
         None
     };
+    let use_shadow_generation = shadow_builder.is_some();
+    let writer_encode =
+        crate::binlog::enabled() || (auto_increment_idx.is_some() && !use_shadow_generation);
     let shadow_heap_appender = shadow_builder
         .as_ref()
         .map(crate::storage::ShadowGenerationBuilder::heap_appender);
@@ -2973,7 +2989,7 @@ fn execute_prepared_load_data_fast(
 ) -> Result<QueryResponse, QueryError> {
     let mut total_rows: u64 = 0;
     let txn = ensure_statement_txn(db, session)?;
-    let mut index_builders = db.load_data_index_builders(table)?;
+    let mut index_builders = db.load_data_index_builders(txn, table)?;
 
     for batch in prepared_batches {
         if batch.rows.is_empty() {
@@ -3044,7 +3060,7 @@ impl<'a> LoadDataPreparedWriter<'a> {
         let index_builders = if shadow_builder.is_some() {
             None
         } else {
-            Some(db.load_data_index_builders(table)?)
+            Some(db.load_data_index_builders(txn, table)?)
         };
         Ok(Self {
             db,
@@ -7713,6 +7729,127 @@ mod tests {
             )
             .unwrap();
         (response, session.warnings, session.pending_statement_info)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parallel_load_rechecks_empty_candidate_and_keeps_identity_assignment() {
+        for identities in [false, true] {
+            let (engine, tmp) = setup_strict_load_engine();
+            let engine = Arc::new(engine);
+            engine
+                .execute(&format!(
+                    "CREATE TABLE ingest (id INT PRIMARY KEY {}, v VARCHAR(40) UNIQUE)",
+                    if identities { "AUTO_INCREMENT" } else { "" }
+                ))
+                .unwrap();
+            let input = (2..=5001)
+                .map(|id| {
+                    format!(
+                        "{}\tpayload-{id}\n",
+                        if identities {
+                            "\\N".to_owned()
+                        } else {
+                            id.to_string()
+                        }
+                    )
+                })
+                .collect::<String>();
+            let path = tmp.path().join("racing-import.tsv");
+            std::fs::write(&path, input).unwrap();
+            let competing = engine.clone();
+            BEFORE_SHADOW_OPEN_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    competing
+                        .execute("INSERT INTO ingest VALUES(1,'already-committed')")
+                        .unwrap();
+                }));
+            });
+            let hits = engine.db.load_shadow_perf_snapshot()[0];
+            assert_eq!(
+                engine
+                    .execute(&format!(
+                        "LOAD DATA /*+ PARALLEL(4) */ INFILE '{}' INTO TABLE ingest",
+                        crate::util::file::sql_path(&path)
+                    ))
+                    .unwrap(),
+                QueryResponse::OkAffected {
+                    affected_rows: 5000
+                }
+            );
+            assert_eq!(engine.db.load_shadow_perf_snapshot()[0], hits);
+            let QueryResponse::ResultSet(result) = engine
+                .execute("SELECT COUNT(*),MIN(id),MAX(id),CAST(SUM(id) AS SIGNED) FROM ingest")
+                .unwrap()
+            else {
+                panic!("expected result");
+            };
+            assert_eq!(
+                result.rows[0],
+                vec![
+                    Value::Int(5001),
+                    Value::Int(1),
+                    Value::Int(5001),
+                    Value::Int(12507501)
+                ]
+            );
+            let QueryResponse::ResultSet(committed) =
+                engine.execute("SELECT v FROM ingest WHERE id=1").unwrap()
+            else {
+                panic!("expected result");
+            };
+            assert_eq!(
+                committed.rows,
+                vec![vec![Value::String("already-committed".to_owned())]]
+            );
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parallel_local_empty_candidate_race_replays_duplicates_atomically() {
+        let (engine, _tmp) = setup_strict_load_engine();
+        let engine = Arc::new(engine);
+        engine
+            .execute("CREATE TABLE ingest (id INT PRIMARY KEY, v VARCHAR(40) UNIQUE)")
+            .unwrap();
+        let mut input = (2..=5001)
+            .map(|id| format!("{id}|new-{id}\n"))
+            .collect::<String>();
+        input.push_str("1|must-not-replace\n");
+        let competing = engine.clone();
+        BEFORE_SHADOW_OPEN_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                competing
+                    .execute("INSERT INTO ingest VALUES(1,'already-committed')")
+                    .unwrap();
+            }));
+        });
+        let (response, warnings, _) = import_local_for_test(&engine, "ingest", 4, &input);
+        assert_eq!(
+            response,
+            QueryResponse::OkAffected {
+                affected_rows: 5000
+            }
+        );
+        assert_eq!(warnings.len(), 1);
+        let QueryResponse::ResultSet(count) =
+            engine.execute("SELECT COUNT(*) FROM ingest").unwrap()
+        else {
+            panic!("expected result");
+        };
+        assert_eq!(count.rows, vec![vec![Value::Int(5001)]]);
+        let QueryResponse::ResultSet(row) =
+            engine.execute("SELECT v FROM ingest WHERE id=1").unwrap()
+        else {
+            panic!("expected result");
+        };
+        assert_eq!(
+            row.rows,
+            vec![vec![Value::String("already-committed".into())]]
+        );
+        engine.shutdown().unwrap();
     }
 
     #[test]

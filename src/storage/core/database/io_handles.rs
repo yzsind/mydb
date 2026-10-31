@@ -12,6 +12,10 @@ thread_local! {
 thread_local! {
     static STORAGE_PATH_RESOLVED_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static IN_PLACE_FILE_LATCH_WAIT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static INDEX_HANDLE_READ_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -95,8 +99,22 @@ impl Drop for CatalogTxnBatchGuard {
     }
 }
 
+/// Cold opens share this fence with same-path physical publication. Cached
+/// operations continue to use their existing file latch without another lock.
+struct StorageHandleOpenEpoch {
+    epoch: AtomicU64,
+    publication: parking_lot::RwLock<()>,
+}
+
+impl std::ops::Deref for StorageHandleOpenEpoch {
+    type Target = AtomicU64;
+    fn deref(&self) -> &Self::Target {
+        &self.epoch
+    }
+}
+
 impl Database {
-    fn storage_handle_open_epoch(&self, table_id: u64) -> Arc<AtomicU64> {
+    fn storage_handle_open_epoch(&self, table_id: u64) -> Arc<StorageHandleOpenEpoch> {
         let mut epochs = self
             .storage_handle_open_epochs
             .lock()
@@ -109,7 +127,10 @@ impl Database {
         if epochs.len() >= 128 {
             epochs.retain(|_, epoch| epoch.strong_count() != 0);
         }
-        let epoch = Arc::new(AtomicU64::new(0));
+        let epoch = Arc::new(StorageHandleOpenEpoch {
+            epoch: AtomicU64::new(0),
+            publication: parking_lot::RwLock::new(()),
+        });
         epochs.insert(table_id, Arc::downgrade(&epoch));
         epoch
     }
@@ -781,15 +802,12 @@ impl Database {
             // Double-check, then construct outside the global cache lock. Codec
             // resolution and file open can miss in DD/buffer caches; serializing
             // those operations made many-table opens scale as workers × latency.
-            let (open_epoch, epoch) = {
-                let cache = self.heap_cache.write();
-                if let Some(heap) = cache.get(&table_id) {
-                    return Ok(heap.clone());
-                }
-                let open_epoch = self.storage_handle_open_epoch(table_id);
-                let epoch = open_epoch.load(Ordering::Acquire);
-                (open_epoch, epoch)
-            };
+            let open_epoch = self.storage_handle_open_epoch(table_id);
+            let _publication = open_epoch.publication.read_recursive();
+            let epoch = open_epoch.load(Ordering::Acquire);
+            if let Some(heap) = self.heap_cache.read().get(&table_id) {
+                return Ok(heap.clone());
+            }
             // Resolve the row codec from the table's catalog entry so the
             // newly-opened HeapFile encodes/decodes rows in the layout the
             // current schema dictates. DDL paths that change column types
@@ -975,6 +993,7 @@ impl Database {
                 return Ok(overflow.clone());
             }
             let open_epoch = self.storage_handle_open_epoch(table_id);
+            let _publication = open_epoch.publication.read_recursive();
             let epoch = open_epoch.load(Ordering::Acquire);
             let path = self.overflow_path(table_id);
             #[cfg(test)]
@@ -1090,6 +1109,12 @@ impl Database {
         f: impl FnOnce(&IndexFile) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
         let index = self.index_handle(table_id, index_name)?;
+        #[cfg(test)]
+        INDEX_HANDLE_READ_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let index = index.read();
         index.ensure_healthy()?;
         match f(&index) {
@@ -1157,6 +1182,7 @@ impl Database {
             // The fallback path may need a data-dictionary index; doing that
             // under the cache guard would recursively enter index_handle.
             let open_epoch = self.storage_handle_open_epoch(table_id);
+            let _publication = open_epoch.publication.read_recursive();
             let epoch = open_epoch.load(Ordering::Acquire);
             let path = self.index_path(table_id, index_name);
             #[cfg(test)]
@@ -1303,6 +1329,10 @@ impl Database {
     /// Per-storage-object zone-map sidecar. Partition storage ids therefore
     /// get independent maps even though they share one logical TableSchema.
     pub(crate) fn zone_map_file_path(&self, table_id: u64) -> PathBuf {
+        self.zone_map_file_path_at_generation(table_id, self.storage_generation(table_id))
+    }
+
+    fn zone_map_file_path_at_generation(&self, table_id: u64, generation: u64) -> PathBuf {
         if is_temp_table_id(table_id) {
             return crate::storage::naming::temp_tables_dir(&self.data_dir)
                 .join(format!("{table_id}.zm"));
@@ -1310,7 +1340,7 @@ impl Database {
         crate::storage::naming::table_object_generation_path(
             &self.data_dir,
             table_id,
-            self.storage_generation(table_id),
+            generation,
             "zm",
         )
     }

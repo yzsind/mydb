@@ -1127,7 +1127,7 @@ pub struct Database {
     heap_cache: parking_lot::RwLock<HeapCacheMap>,
     /// Weak per-storage fences cover only concurrent cold opens. Cache hits
     /// need no epoch lookup, and unrelated tables cannot invalidate an open.
-    storage_handle_open_epochs: Mutex<HashMap<u64, std::sync::Weak<AtomicU64>>>,
+    storage_handle_open_epochs: Mutex<HashMap<u64, std::sync::Weak<StorageHandleOpenEpoch>>>,
     index_cache: parking_lot::RwLock<IndexCacheMap>,
     /// Per-table overflow (LOB) file handles, opened lazily on first
     /// externalization. Mirrors `heap_cache` / `index_cache`.
@@ -3388,6 +3388,8 @@ struct CachedFile {
     #[cfg(target_os = "linux")]
     direct_read_disabled: AtomicBool,
     len: AtomicU64,
+    #[cfg(target_os = "linux")]
+    kernel_cache_reclaim_cursor: AtomicU64,
     /// P1 - set to true after any pwrite through this handle; consumed
     /// (swap-to-false) by `sync_cached_file_handle` so an fsync skips
     /// files that nothing has written to since the last successful sync.
@@ -3425,6 +3427,8 @@ impl CachedFile {
             #[cfg(target_os = "linux")]
             direct_read_disabled: AtomicBool::new(false),
             len: AtomicU64::new(len),
+            #[cfg(target_os = "linux")]
+            kernel_cache_reclaim_cursor: AtomicU64::new(0),
             needs_sync: AtomicBool::new(true),
             sync_lock: parking_lot::Mutex::new(()),
             recently_used: AtomicBool::new(true),

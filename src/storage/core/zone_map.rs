@@ -10,6 +10,11 @@
 #[cfg(test)]
 const ZONE_MAP_DELTA_MAGIC: &[u8; 4] = b"ZMD1";
 #[cfg(test)]
+thread_local! {
+    static ZONE_INVALIDATION_DESCRIPTOR_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+#[cfg(test)]
 const ZONE_MAP_DELTA_V2_MAGIC: &[u8; 4] = b"ZMD2";
 #[cfg(test)]
 const ZONE_MAP_DELTA_V3_MAGIC: &[u8; 4] = b"ZMD3";
@@ -7553,20 +7558,38 @@ impl Database {
         }
         let load_latch =
             &self.zone_map_load_locks[storage_id as usize % self.zone_map_load_locks.len()];
-        // A failed speculative loader must not prevent durable revocation.
-        // A poisoned shard's cached result is never accepted.
-        let mut load = load_latch.lock().unwrap_or_else(|err| err.into_inner());
         // The caller holds zone_map_gate, so an OFF interval cannot end or
         // admit a local rebuild during this check. Remember only successful
         // revocations, with bounded storage and no per-row path/stat work.
         let disabled = !self.zone_map_enabled();
         let epoch = self.zone_map_retirement_epoch.load(Ordering::Acquire);
-        if disabled && !load_latch.is_poisoned() && *load == Some((storage_id, epoch)) {
-            return Ok(());
+        if disabled {
+            let load = load_latch.lock().unwrap_or_else(|err| err.into_inner());
+            if !load_latch.is_poisoned() && *load == Some((storage_id, epoch)) {
+                return Ok(());
+            }
         }
+        // Catalog publication can invalidate DD objects in this same loader
+        // shard. Resolve descriptors and physical paths before taking its
+        // latch, preserving catalog -> loader order without a lookup on the
+        // steady disabled/revoked fast path.
+        #[cfg(test)]
+        ZONE_INVALIDATION_DESCRIPTOR_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let Some(table) = self.table_by_id(storage_id) else {
             return Ok(());
         };
+        let generation = self.storage_generation(storage_id);
+        let path = self.zone_map_file_path_at_generation(storage_id, generation);
+        // A failed speculative loader must not prevent durable revocation.
+        // Recheck because another writer may have revoked while we resolved.
+        let mut load = load_latch.lock().unwrap_or_else(|err| err.into_inner());
+        if disabled && !load_latch.is_poisoned() && *load == Some((storage_id, epoch)) {
+            return Ok(());
+        }
         let cached = self
             .zone_maps
             .read()
@@ -7575,17 +7598,13 @@ impl Database {
         let map = if let Some(map) = cached {
             map
         } else {
-            if !self
-                .zone_map_file_path(storage_id)
-                .try_exists()
-                .map_err(io_err)?
-            {
+            if !path.try_exists().map_err(io_err)? {
                 if disabled {
                     *load = Some((storage_id, epoch));
                 }
                 return Ok(());
             }
-            self.open_paged_zone_map(storage_id, &table, false)?
+            self.open_paged_zone_map_at_generation(storage_id, &table, false, generation)?
         };
         let _data = map.data_gate.write().map_err(|_| {
             error(
@@ -7886,6 +7905,21 @@ impl Database {
         table: &TableSchema,
         known_empty: bool,
     ) -> Result<Arc<ZoneMap>, QueryError> {
+        self.open_paged_zone_map_at_generation(
+            storage_id,
+            table,
+            known_empty,
+            self.storage_generation(storage_id),
+        )
+    }
+
+    fn open_paged_zone_map_at_generation(
+        &self,
+        storage_id: u64,
+        table: &TableSchema,
+        known_empty: bool,
+        generation: u64,
+    ) -> Result<Arc<ZoneMap>, QueryError> {
         use zone_map_page::{mutable::Store, PageFile};
         #[cfg(test)]
         if zone_map_failpoint(7).is_err() {
@@ -7894,13 +7928,13 @@ impl Database {
                 "zone-map handle admission rejected",
             ));
         }
-        let path = self.zone_map_file_path(storage_id);
+        let path = self.zone_map_file_path_at_generation(storage_id, generation);
         let fingerprint = zone_schema_fingerprint(table);
         let file = || {
             PageFile::new(
                 path.clone(),
                 storage_id,
-                self.storage_generation(storage_id),
+                generation,
                 Arc::clone(&self.buffer_pool),
                 Arc::clone(&self.log),
                 self.config.durability,
@@ -7939,8 +7973,7 @@ impl Database {
             missing_empty,
         ));
         map.trusted_base.store(trusted, Ordering::Release);
-        map.file_generation
-            .store(self.storage_generation(storage_id), Ordering::Release);
+        map.file_generation.store(generation, Ordering::Release);
         *map.path.lock().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -7975,6 +8008,12 @@ impl Database {
                 return Some(map);
             }
         }
+        // Heap/path resolution may consult the catalog. Never do it under a
+        // loader latch shared with catalog-DD invalidation.
+        let generation = self.storage_generation(storage_id);
+        let empty = self
+            .with_heap_read(storage_id, |heap| Ok(heap.page_count_relaxed() == 0))
+            .unwrap_or(false);
         let _load = self.zone_map_load_locks[storage_id as usize % self.zone_map_load_locks.len()]
             .lock()
             .ok()?;
@@ -7993,10 +8032,9 @@ impl Database {
         }
         self.forget_zone_map(storage_id).ok()?;
         ZONE_MAP_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-        let empty = self
-            .with_heap_read(storage_id, |heap| Ok(heap.page_count_relaxed() == 0))
-            .unwrap_or(false);
-        let map = self.open_paged_zone_map(storage_id, table, empty).ok()?;
+        let map = self
+            .open_paged_zone_map_at_generation(storage_id, table, empty, generation)
+            .ok()?;
         self.zone_maps
             .write()
             .ok()?
@@ -14974,6 +15012,43 @@ mod zone_map_tests {
         assert_eq!(db.log.lock().last_lsn(), lsn);
         assert_eq!(fs::read(&path).unwrap(), before);
         db.set_physical_replica_mode(false).unwrap();
+    }
+
+    #[test]
+    fn zone_map_invalidation_resolves_catalog_without_loader_latch() {
+        let (_dir, engine) = switch_engine();
+        engine
+            .execute("CREATE TABLE zm (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let db = engine.db_for_tests();
+        let table = db.table("test.zm").unwrap();
+        db.set_zone_map_enabled(false).unwrap();
+        let latch = &db.zone_map_load_locks[table.id as usize % db.zone_map_load_locks.len()];
+        *latch.lock().unwrap() = None;
+        let (lookup_tx, lookup_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let catalog = db.catalog_write().unwrap();
+            let worker = scope.spawn(|| {
+                ZONE_INVALIDATION_DESCRIPTOR_TEST_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        lookup_tx.send(()).unwrap();
+                    }));
+                });
+                db.queue_zone_map_invalidation(0, table.id, false)
+            });
+            let reached_lookup = lookup_rx.recv_timeout(Duration::from_secs(5));
+            // A catalog publisher may invalidate a DD object in this same
+            // loader shard. Its write guard must never wait for this reader.
+            let loader_available = latch.try_lock().is_ok();
+            drop(catalog);
+            let result = worker.join().unwrap();
+            reached_lookup.unwrap();
+            result.unwrap();
+            assert!(
+                loader_available,
+                "descriptor lookup retained the loader latch"
+            );
+        });
     }
 
     #[test]

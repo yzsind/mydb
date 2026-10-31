@@ -5983,6 +5983,39 @@ impl BufferPool {
             .collect())
     }
 
+    pub(crate) fn reclaim_kernel_cache_headroom(&self, bytes: usize) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            if bytes == 0 {
+                return 0;
+            }
+            // Keep global file-cache latches out of potentially blocking VFS
+            // reclaim. Arc snapshots preserve descriptor/inode identity.
+            let Ok(cache) = self.file_cache.read() else {
+                return 0;
+            };
+            let mut files = cache.values().cloned().collect::<Vec<_>>();
+            drop(cache);
+            files.sort_by_key(|file| file.recently_used.load(Ordering::Relaxed));
+            let mut advised = 0usize;
+            for file in files {
+                advised = advised.saturating_add(advise_cached_file_headroom(
+                    &file,
+                    bytes.saturating_sub(advised),
+                ));
+                if advised >= bytes {
+                    break;
+                }
+            }
+            return advised;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = bytes;
+            0
+        }
+    }
+
     /// P0 - cheap pre-check for `flush_and_evict_all`. Probes each cached
     /// file's `needs_sync` flag without taking any per-file lock; bails
     /// out as soon as one is found. Uses Acquire to pair with the Release
@@ -7696,6 +7729,42 @@ fn read_exact_at_counted(file: &File, buf: &mut [u8], offset: u64) -> std::io::R
     crate::util::file::read_exact_at_counted(file, buf, offset, true, None)
 }
 
+/// Fallback for cgroups without a delegated reclaim interface. Advance the
+/// cursor so repeated requests do not keep advising an already-uncached prefix.
+#[cfg(target_os = "linux")]
+fn advise_cached_file_headroom(file: &CachedFile, requested: usize) -> usize {
+    use std::os::fd::AsRawFd;
+    let len = file.len();
+    if requested == 0 || len == 0 {
+        return 0;
+    }
+    let chunk = requested.min(64 * 1024 * 1024).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let offset = file
+        .kernel_cache_reclaim_cursor
+        .fetch_add(chunk as u64, Ordering::Relaxed)
+        % len;
+    let bytes = (chunk as u64).min(len - offset);
+    let (Ok(offset), Ok(bytes)) = (libc::off_t::try_from(offset), libc::off_t::try_from(bytes))
+    else {
+        return 0;
+    };
+    // SAFETY: the Arc owner retains this descriptor; only complete clean
+    // kernel pages can be discarded. Dirty/WAL ordering is unchanged.
+    let result = unsafe {
+        libc::posix_fadvise(
+            file.file.as_raw_fd(),
+            offset,
+            bytes,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+    if result == 0 {
+        bytes as usize
+    } else {
+        0
+    }
+}
+
 /// Fill scratch storage without first writing zeros that the read replaces.
 /// Success guarantees every byte is initialized; errors expose no byte slice.
 #[cfg(unix)]
@@ -7758,6 +7827,106 @@ fn read_exact_at_uninit(
     // retains its established implementation on non-Unix targets.
     let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len()) };
     read_exact_at_counted(file, bytes, offset).map(|_| ())
+}
+
+#[cfg(test)]
+#[test]
+#[cfg(target_os = "linux")]
+fn buffered_scan_cache_waits_for_bounded_physical_relief() {
+    use std::os::fd::AsRawFd;
+    struct Mapping(*mut libc::c_void, usize);
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            // SAFETY: this mapping is owned exclusively by the test.
+            unsafe {
+                libc::munmap(self.0, self.1);
+            }
+        }
+    }
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let bytes = vec![0x5a; PAGE_SIZE * 64];
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    for lane in 0..3 {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join(format!("scan-{lane}")))
+            .unwrap();
+        write_all_at(&file, &bytes, 0).unwrap();
+        file.sync_all().unwrap();
+        // PROT_NONE leaves PTEs absent: mincore observes the file cache
+        // without pinning pages against the advice being tested.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes.len(),
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let mapping = Mapping(address, bytes.len());
+        let resident = || {
+            let mut states = vec![0u8; bytes.len().div_ceil(page_size)];
+            assert_eq!(
+                unsafe { libc::mincore(mapping.0, mapping.1, states.as_mut_ptr()) },
+                0
+            );
+            states.into_iter().filter(|value| value & 1 != 0).count()
+        };
+        let before = resident();
+        assert!(before > 0);
+        match lane {
+            0 => {
+                let mut actual = vec![0; bytes.len()];
+                read_exact_at_counted(&file, &mut actual, 0).unwrap();
+                assert_eq!(actual, bytes);
+            }
+            1 => {
+                let mut actual = vec![std::mem::MaybeUninit::<u8>::uninit(); bytes.len()];
+                read_exact_at_uninit(&file, &mut actual, 0).unwrap();
+                let actual = unsafe {
+                    std::slice::from_raw_parts(actual.as_ptr().cast::<u8>(), actual.len())
+                };
+                assert_eq!(actual, bytes);
+            }
+            _ => {
+                let mut actual = vec![vec![0; PAGE_SIZE]; 64];
+                let mut pages: Vec<&mut [u8]> = actual.iter_mut().map(Vec::as_mut_slice).collect();
+                read_pages_batch_at(&file, &mut pages, 0).unwrap();
+                assert!(actual.iter().flatten().all(|byte| *byte == 0x5a));
+            }
+        }
+        assert_eq!(
+            resident(),
+            before,
+            "ordinary reads must preserve the useful kernel cache"
+        );
+        let cached = CachedFile::new(file, bytes.len() as u64);
+        assert_eq!(
+            advise_cached_file_headroom(&cached, bytes.len() / 2),
+            bytes.len() / 2
+        );
+        let after = resident();
+        assert!(after < before, "lane {lane} did not reclaim clean cache");
+        assert!(
+            after >= before / 2,
+            "lane {lane} discarded more than requested"
+        );
+        let cursor = cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed);
+        assert_eq!(advise_cached_file_headroom(&cached, 0), 0);
+        assert_eq!(
+            cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed),
+            cursor
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("scan-{lane}"))).unwrap(),
+            bytes
+        );
+    }
 }
 
 #[cfg(test)]

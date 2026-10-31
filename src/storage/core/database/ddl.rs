@@ -498,6 +498,7 @@ struct PreparedCreateTableSchema {
 
 /// Crash-safe file exchange shared by ALTER COPY and bulk shadow loads.
 struct ShadowGenerationFileSwap {
+    in_place_schema: Option<Arc<TableSchema>>,
     old_to_backup: Vec<(PathBuf, PathBuf)>,
     shadow_to_live: Vec<(PathBuf, PathBuf)>,
 }
@@ -8381,13 +8382,15 @@ impl Database {
             self.publish_copied_vector_owners(&candidate, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
                 .log_copied_generation(ddl_txn_id, &file_swap)
-                .and_then(|_| self.append_wal(
-                    ddl_txn_id,
-                    WalPayload::DdlCommit {
-                        job_id: job.job_id,
-                        retired_paths,
-                    },
-                ))
+                .and_then(|_| {
+                    self.append_wal(
+                        ddl_txn_id,
+                        WalPayload::DdlCommit {
+                            job_id: job.job_id,
+                            retired_paths,
+                        },
+                    )
+                })
                 .and_then(|_| self.commit_catalog_txn_existing(ddl_txn));
             if let Err(err) = publish {
                 if let Ok(mut catalog) = self.catalog_write() {
@@ -8918,6 +8921,132 @@ impl Database {
         .map_err(io_err)
     }
 
+    /// Rebind stable-schema public handles while excluding both existing
+    /// operations and cold opens. Retaining cache bindings is essential: an
+    /// Arc cloned before publication must observe the replacement, too.
+    fn with_in_place_generation_publication<T>(
+        &self,
+        table: &TableSchema,
+        publish: impl FnOnce() -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        // Resolve metadata and populate every handle before acquiring the
+        // publication fence. Nested heap/LOB readers can then finish through
+        // cache hits while publication waits for their file latches.
+        let heap = self.heap_handle(table.id)?;
+        let indexes = table
+            .indexes
+            .iter()
+            .map(|index| self.index_handle(table.id, &index.name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let overflow = if codec_has_externalizable_columns(&table.row_codec) {
+            Some(self.overflow_handle(table.id)?)
+        } else {
+            None
+        };
+        let heap_path = self.table_path(table.id);
+        let index_paths = table
+            .indexes
+            .iter()
+            .map(|index| self.index_path(table.id, &index.name))
+            .collect::<Vec<_>>();
+        let overflow_path = self.overflow_path(table.id);
+        let reserve = if table.pctfree > 0 {
+            ((PAGE_SIZE as u64 * u64::from(table.pctfree.min(50)) / 100) as usize)
+                .min(MAX_HEAP_UPDATE_RESERVE_BYTES)
+        } else {
+            self.config.heap_update_reserve_bytes
+        };
+        let epoch = self.storage_handle_open_epoch(table.id);
+        let _mode = self.zone_map_gate.read_recursive();
+        let _publication = epoch.publication.write();
+        // A reader may consult catalog metadata while retaining a file latch;
+        // catalog publishers can invalidate a DD map in this loader shard.
+        // Never wait for a file while retaining either another file or the
+        // loader latch. Retry retirement if a loader entered between attempts.
+        let (_loader, mut heap_file, mut index_files, mut overflow_file) = loop {
+            let loader = self.zone_map_load_locks
+                [table.id as usize % self.zone_map_load_locks.len()]
+            .lock()
+            .map_err(|_| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "zone map loader lock poisoned",
+                )
+            })?;
+            self.forget_zone_map(table.id)?;
+            let h = heap.try_write();
+            let i = indexes
+                .iter()
+                .map(|handle| handle.try_write())
+                .collect::<Option<Vec<_>>>();
+            let o = overflow.as_ref().map(|handle| handle.try_write());
+            if h.is_some() && i.is_some() && o.as_ref().is_none_or(Option::is_some) {
+                break (loader, h.unwrap(), i.unwrap(), o.flatten());
+            }
+            drop((h, i, o, loader));
+            #[cfg(test)]
+            IN_PLACE_FILE_LATCH_WAIT_TEST_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            crate::engine::cancel::check_cancelled()?;
+            std::thread::yield_now();
+        };
+        heap_file.discard_without_flush();
+        for index in &mut index_files {
+            index.discard_without_flush();
+            index.retain_buffered_pages_on_drop();
+        }
+        if let Some(overflow) = &mut overflow_file {
+            overflow.discard_without_flush();
+        }
+        let result = publish();
+        // Also refresh after a rolled-back partial exchange. The old inode and
+        // page-owner proof may both have changed even when publish returned Err.
+        let refresh = (|| {
+            if let Some(file) = &mut overflow_file {
+                **file = OverflowFile::open_with_buffer_pool(
+                    overflow_path,
+                    table.id,
+                    self.log.clone(),
+                    self.config.durability,
+                    self.buffer_pool.clone(),
+                )?;
+            }
+            let mut replacement = HeapFile::open_with_buffer_pool(
+                heap_path,
+                table.id,
+                self.log.clone(),
+                self.config.durability,
+                reserve,
+                self.buffer_pool.clone(),
+                table.row_codec.clone(),
+            )?;
+            if let Some(overflow) = &overflow {
+                replacement.lob_reader = Some(Arc::new(OverflowReader::new(overflow.clone())));
+            }
+            *heap_file = replacement;
+            for (file, path) in index_files.iter_mut().zip(index_paths) {
+                **file = IndexFile::open_with_durability(
+                    path,
+                    self.log.clone(),
+                    self.config.durability,
+                    self.buffer_pool.clone(),
+                )?;
+            }
+            Ok::<_, QueryError>(())
+        })();
+        if let Err(err) = refresh {
+            self.quarantine_mvcc(format!(
+                "physical publication requires recovery: {}",
+                err.message()
+            ));
+            return Err(err);
+        }
+        result
+    }
+
     fn swap_shadow_generation_files(
         &self,
         old_table: &TableSchema,
@@ -8925,24 +9054,59 @@ impl Database {
         shadow_id: u64,
         job_id: u64,
     ) -> Result<ShadowGenerationFileSwap, QueryError> {
+        self.flush_online_copy_shadow(old_table)?;
+        let in_place = old_table.active_generation == candidate.active_generation;
+        if in_place && old_table.schema_version != candidate.schema_version {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "in-place storage publication requires an unchanged schema",
+            ));
+        }
+        if in_place {
+            let mut swap = self.with_in_place_generation_publication(old_table, || {
+                self.swap_shadow_generation_files_inner(
+                    old_table, candidate, shadow_id, job_id, true,
+                )
+            })?;
+            swap.in_place_schema = Some(Arc::new(old_table.clone()));
+            Ok(swap)
+        } else {
+            self.swap_shadow_generation_files_inner(old_table, candidate, shadow_id, job_id, false)
+        }
+    }
+
+    fn swap_shadow_generation_files_inner(
+        &self,
+        old_table: &TableSchema,
+        candidate: &TableSchema,
+        shadow_id: u64,
+        job_id: u64,
+        in_place: bool,
+    ) -> Result<ShadowGenerationFileSwap, QueryError> {
         // Source LOB/vector tails must also survive a failed swap. Flush all
         // authoritative source files before dropping their cached pages.
-        self.flush_online_copy_shadow(old_table)?;
-        self.remove_heap_cache_entry(old_table.id)?;
+        if !in_place {
+            self.remove_heap_cache_entry(old_table.id)?;
+        }
         self.remove_heap_cache_entry(shadow_id)?;
-        for index in &old_table.indexes {
-            self.remove_index_cache_entry(old_table.id, &index.name)?;
+        if !in_place {
+            for index in &old_table.indexes {
+                self.remove_index_cache_entry(old_table.id, &index.name)?;
+            }
         }
         for index in &candidate.indexes {
             self.remove_index_cache_entry(shadow_id, &index.name)?;
         }
 
-        self.remove_overflow_cache_entry(old_table.id)?;
+        if !in_place {
+            self.remove_overflow_cache_entry(old_table.id)?;
+        }
         self.remove_overflow_cache_entry(shadow_id)?;
         let (old_to_backup, shadow_to_live) =
             self.shadow_generation_swap_paths(old_table, candidate, shadow_id, job_id);
 
         let mut performed = ShadowGenerationFileSwap {
+            in_place_schema: None,
             old_to_backup: Vec::new(),
             shadow_to_live: Vec::new(),
         };
@@ -8979,7 +9143,9 @@ impl Database {
             }
             // LOAD can replace an inode at the same physical generation.
             // Invalidate opens started after the initial cache drain as well.
-            self.invalidate_generation_handles(old_table)?;
+            if !in_place {
+                self.invalidate_generation_handles(old_table)?;
+            }
             self.sync_shadow_generation_directories(&performed)?;
             Ok::<_, QueryError>(())
         })();
@@ -8993,6 +9159,7 @@ impl Database {
             return Err(err);
         }
         Ok(ShadowGenerationFileSwap {
+            in_place_schema: None,
             old_to_backup,
             shadow_to_live,
         })
@@ -9022,41 +9189,70 @@ impl Database {
             let mut file = File::open(path).map_err(io_err)?;
             let total = file.metadata().map_err(io_err)?.len();
             if matches!(ext, "hvec" | "hnsw") {
-                let _vector_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
-                    crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
-                    2 * 1024 * 1024,
-                )?;
+                let _vector_charge =
+                    crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                        crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+                        2 * 1024 * 1024,
+                    )?;
                 let mut bytes = vec![0; 1024 * 1024];
                 let mut offset = 0;
                 while offset < total {
                     let count = (total - offset).min(bytes.len() as u64) as usize;
                     file.read_exact(&mut bytes[..count]).map_err(io_err)?;
-                    self.append_wal(txn_id, WalPayload::VectorIndexImage {
-                        path: relative.clone(), offset, total, bytes: bytes[..count].to_vec(),
-                    })?;
+                    self.append_wal(
+                        txn_id,
+                        WalPayload::VectorIndexImage {
+                            path: relative.clone(),
+                            offset,
+                            total,
+                            bytes: bytes[..count].to_vec(),
+                        },
+                    )?;
                     offset += count as u64;
                 }
                 continue;
             }
             if total == 0 || total % PAGE_SIZE as u64 != 0 {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,
-                    "copied generation has invalid page file length"));
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "copied generation has invalid page file length",
+                ));
             }
             let mut page = vec![0; PAGE_SIZE];
             file.read_exact(&mut page).map_err(io_err)?;
-            self.append_wal(txn_id, WalPayload::FileCreate {
-                path: relative.clone(), after: page.clone(),
-            })?;
+            self.append_wal(
+                txn_id,
+                WalPayload::FileCreate {
+                    path: relative.clone(),
+                    after: page.clone(),
+                },
+            )?;
             for page_id in 1..total / PAGE_SIZE as u64 {
                 crate::engine::cancel::check_cancelled()?;
                 file.read_exact(&mut page).map_err(io_err)?;
-                self.append_wal(txn_id, WalPayload::full_page_image(relative.clone(), page_id, page.clone()))?;
+                self.append_wal(
+                    txn_id,
+                    WalPayload::full_page_image(relative.clone(), page_id, page.clone()),
+                )?;
             }
         }
         Ok(())
     }
 
     fn rollback_shadow_generation_file_swap(
+        &self,
+        swap: &ShadowGenerationFileSwap,
+    ) -> Result<(), QueryError> {
+        if let Some(table) = &swap.in_place_schema {
+            self.with_in_place_generation_publication(table, || {
+                self.rollback_shadow_generation_file_swap_inner(swap)
+            })
+        } else {
+            self.rollback_shadow_generation_file_swap_inner(swap)
+        }
+    }
+
+    fn rollback_shadow_generation_file_swap_inner(
         &self,
         swap: &ShadowGenerationFileSwap,
     ) -> Result<(), QueryError> {

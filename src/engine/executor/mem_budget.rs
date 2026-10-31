@@ -854,6 +854,26 @@ fn reclaim_pending_clean_cache_headroom() {
     }
 }
 
+/// The kernel knows which clean pages are cold. If controller delegation is
+/// unavailable, bounded advice on cached database descriptors needs no cgroup
+/// write permission and leaves dirty bytes and durability ordering untouched.
+fn reclaim_kernel_cache_headroom(database: &Arc<crate::storage::Database>, requested: usize) {
+    let deficit = crate::engine::memory_reclaimer::kernel_cache_headroom_reclaim_bytes(requested);
+    if deficit == 0 {
+        return;
+    }
+    if crate::engine::memory_reclaimer::try_reclaim_kernel_cache(deficit) {
+        return;
+    }
+    for _ in 0..16 {
+        let deficit =
+            crate::engine::memory_reclaimer::kernel_cache_headroom_reclaim_bytes(requested);
+        if deficit == 0 || database.reclaim_kernel_cache_headroom(deficit) == 0 {
+            break;
+        }
+    }
+}
+
 /// Preserve a useful cache floor and all pinned/dirty state. Physical cache
 /// pressure is advisory: failure to find a clean victim cannot manufacture
 /// a 1037 while ordinary hard admission still has room.
@@ -908,10 +928,28 @@ pub(crate) fn spawn_memory_pressure_worker(
     database: Arc<crate::storage::Database>,
 ) -> crate::engine::background::BackgroundWorker {
     crate::engine::background::BackgroundWorker::spawn("mydb-memory-pressure", move |shutdown| {
-        while !shutdown.wait_timeout(std::time::Duration::from_millis(50)) {
+        let mut next_owned_reclaim = std::time::Instant::now();
+        let interval = if cfg!(target_os = "linux") { 10 } else { 50 };
+        while !shutdown.wait_timeout(std::time::Duration::from_millis(interval)) {
             if !crate::engine::memory_reclaimer::enabled() {
                 continue;
             }
+            // Kernel residency and governed cache ownership are distinct
+            // signals. Do not turn a kernel-cache hint into another CLOCK
+            // sweep of reusable engine frames. Preserve the existing cadence
+            // for logical/hard reclamation while covering I/O-free growth.
+            if crate::engine::memory_reclaimer::kernel_cache_headroom_reclaim_bytes(0) != 0
+                && crate::engine::memory_reclaimer::kernel_cache_pressure_observed()
+            {
+                // This single worker owns kernel relief; VFS reclaim does not
+                // need the engine cache-admission mutex. Holding it here would
+                // stall independent work-area/cache admission behind kernel IO.
+                reclaim_kernel_cache_headroom(&database, 0);
+            }
+            if std::time::Instant::now() < next_owned_reclaim {
+                continue;
+            }
+            next_owned_reclaim = std::time::Instant::now() + std::time::Duration::from_millis(50);
             let hard_deficit = crate::engine::memory_reclaimer::process_headroom_reclaim_bytes(
                 0,
                 operational_memory_limit_bytes(),

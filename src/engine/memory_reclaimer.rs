@@ -45,7 +45,6 @@ const LONG_STATEMENT_RECLAIM_THRESHOLD: Duration = Duration::from_millis(50);
 /// Re-sample OS pressure after at most this much newly admitted resident
 /// memory. This bounds drift from file-cache/runtime growth without putting a
 /// `/proc` read on every container push.
-#[cfg(not(test))]
 const MAX_PRESSURE_ALLOWANCE_BYTES: usize = 64 * 1024 * 1024;
 
 static ACTIVE_STATEMENTS: AtomicUsize = AtomicUsize::new(0);
@@ -75,6 +74,199 @@ static PHYSICAL_PRESSURE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(test))]
 static PRESSURE_SAMPLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CACHE_HEADROOM_REQUESTED: AtomicUsize = AtomicUsize::new(0);
+/// Physical cache headroom is advisory and independent of SQL ownership.
+/// Clean active pages are reclaimable, but reclaim/refault contention can
+/// exhaust a cgroup before its already-admitted anonymous pages fault.
+/// Request a small bounded reserve, never a full scan-range invalidation.
+pub(crate) fn kernel_cache_headroom_reclaim_bytes(requested: usize) -> usize {
+    #[cfg(target_os = "linux")]
+    if let (Some(current), Some(limit)) = crate::util::system_memory::linux_cgroup_memory() {
+        return kernel_cache_headroom_for_values(
+            current,
+            requested as u64,
+            limit,
+            crate::engine::executor::mem_budget::effective_memory_limit_bytes() as u64,
+        ) as usize;
+    }
+    let _ = requested;
+    0
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn kernel_cache_headroom_for_values(
+    current: u64,
+    incoming: u64,
+    reported: u64,
+    effective: u64,
+) -> u64 {
+    if reported == 0 || reported > effective {
+        return 0;
+    }
+    let reserve = (reported / 50)
+        .clamp(64 * 1024, 256 * 1024 * 1024)
+        .min(reported / 4);
+    let next = current.saturating_add(incoming);
+    if next <= reported.saturating_sub(reserve) {
+        return 0;
+    }
+    // One physical-admission sampling window is enough for one response;
+    // subsequent real pressure events can request another bounded batch.
+    next.saturating_sub(reported.saturating_sub(reserve + reserve / 2))
+        .min(reserve)
+        .min(MAX_PRESSURE_ALLOWANCE_BYTES as u64)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Default)]
+struct KernelCachePressureEvents {
+    previous: Option<u64>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl KernelCachePressureEvents {
+    fn observe(&mut self, current: Option<u64>) -> bool {
+        let Some(current) = current else {
+            return true;
+        };
+        let previous = self.previous.replace(current);
+        previous.map_or(current != 0, |previous| current > previous)
+    }
+}
+
+/// A full, healthy file cache is useful memory, not a reason to evict it.
+/// Only new controller limit-pressure events arm proactive relief. Counter
+/// resets are benign; older controllers retain conservative bounded relief.
+pub(crate) fn kernel_cache_pressure_observed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static HISTORY: Mutex<KernelCachePressureEvents> =
+            Mutex::new(KernelCachePressureEvents { previous: None });
+        // Serialize the observation itself, so an older concurrent read cannot
+        // be mistaken for a reset after a newer counter has been recorded.
+        let mut history = HISTORY.lock().unwrap_or_else(|error| error.into_inner());
+        let counter = current_linux_cgroup_v2_path()
+            .and_then(|path| {
+                let events = std::fs::read_to_string(path.join("memory.events")).ok()?;
+                events.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    (fields.next()? == "max")
+                        .then(|| fields.next()?.parse::<u64>().ok())
+                        .flatten()
+                })
+            })
+            .or_else(|| {
+                current_linux_cgroup_v1_path()
+                    .and_then(|path| read_cgroup_u64(&path.join("memory.failcnt")))
+            });
+        return history.observe(counter);
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(test)]
+#[test]
+fn kernel_cache_pressure_events_preserve_a_healthy_full_cache_and_handle_resets() {
+    let mut events = KernelCachePressureEvents::default();
+    assert!(!events.observe(Some(0)));
+    assert!(!events.observe(Some(0)));
+    assert!(events.observe(Some(1)));
+    assert!(!events.observe(Some(1)));
+    assert!(events.observe(Some(100)));
+    assert!(!events.observe(Some(0)));
+    assert!(!events.observe(Some(0)));
+    assert!(events.observe(Some(1)));
+    assert!(events.observe(None));
+}
+
+/// Let the controller choose its cold victims instead of discarding every
+/// recently consumed scan page. This is a one-shot reclaim, not a limit or
+/// configuration change. Unsupported/delegation-denied controllers fall back
+/// to bounded advice on this database's own buffered files.
+pub(crate) fn try_reclaim_kernel_cache(bytes: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    if bytes != 0 {
+        if let Some(path) = current_linux_cgroup_v2_path() {
+            return try_reclaim_kernel_cache_at(&path, bytes);
+        }
+    }
+    let _ = bytes;
+    false
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn try_reclaim_kernel_cache_at(path: &std::path::Path, bytes: usize) -> bool {
+    use std::io::Write;
+    if bytes == 0 {
+        return false;
+    }
+    // Older controllers lack the per-request swappiness option. A plain
+    // request is safe only when this cgroup already forbids swapping.
+    let no_swap = read_cgroup_u64(&path.join("memory.swap.max")) == Some(0);
+    let request = if no_swap {
+        format!("{bytes}\n")
+    } else {
+        format!("{bytes} swappiness=0\n")
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.join("memory.reclaim"))
+        .and_then(|mut file| file.write_all(request.as_bytes()))
+        .is_ok()
+}
+
+#[cfg(test)]
+#[test]
+fn kernel_cache_headroom_is_bounded_and_preserves_healthy_cache() {
+    let gib = 1024 * 1024 * 1024;
+    let limit = 10 * gib;
+    let reserve = limit / 50;
+    let batch = reserve.min(MAX_PRESSURE_ALLOWANCE_BYTES as u64);
+    assert_eq!(
+        kernel_cache_headroom_for_values(limit * 96 / 100, 1024 * 1024, limit, limit),
+        0
+    );
+    assert_eq!(
+        kernel_cache_headroom_for_values(limit - reserve, 0, limit, limit),
+        0
+    );
+    assert!(kernel_cache_headroom_for_values(limit - reserve, 1024 * 1024, limit, limit) > 0);
+    assert_eq!(
+        kernel_cache_headroom_for_values(limit, 0, limit, limit),
+        batch
+    );
+    assert_eq!(
+        kernel_cache_headroom_for_values(u64::MAX, u64::MAX, limit, limit),
+        batch
+    );
+    assert_eq!(kernel_cache_headroom_for_values(u64::MAX, 1, 0, limit), 0);
+    assert_eq!(
+        kernel_cache_headroom_for_values(limit, 1, 2 * limit, limit),
+        0
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn kernel_cache_reclaim_request_preserves_swap_policy_and_handles_missing_controller() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    assert!(!try_reclaim_kernel_cache_at(dir.path(), 4096));
+    std::fs::write(dir.path().join("memory.reclaim"), "").unwrap();
+    std::fs::write(dir.path().join("memory.swap.max"), "0\n").unwrap();
+    assert!(try_reclaim_kernel_cache_at(dir.path(), 4096));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("memory.reclaim")).unwrap(),
+        "4096\n"
+    );
+    std::fs::write(dir.path().join("memory.reclaim"), "").unwrap();
+    std::fs::write(dir.path().join("memory.swap.max"), "max\n").unwrap();
+    assert!(try_reclaim_kernel_cache_at(dir.path(), 8192));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("memory.reclaim")).unwrap(),
+        "8192 swappiness=0\n"
+    );
+    assert!(!try_reclaim_kernel_cache_at(dir.path(), 0));
+}
 
 struct WakeState {
     generation: u64,
@@ -1270,7 +1462,7 @@ fn current_linux_cgroup_v1_path() -> Option<std::path::PathBuf> {
     Some(std::path::Path::new("/sys/fs/cgroup/memory").join(relative.trim_start_matches('/')))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 fn read_cgroup_u64(path: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }

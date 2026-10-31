@@ -2601,6 +2601,10 @@ impl Database {
             .reclaim_clean_for_memory_target(target_bytes, Duration::from_millis(10))
     }
 
+    pub(crate) fn reclaim_kernel_cache_headroom(&self, bytes: usize) -> usize {
+        self.buffer_pool.reclaim_kernel_cache_headroom(bytes)
+    }
+
     pub fn set_checkpoint_wal_bytes(&self, bytes: u64) -> Result<(), QueryError> {
         if bytes == 0 {
             return Err(error(
