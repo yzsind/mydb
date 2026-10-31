@@ -1693,3 +1693,200 @@ fn low_frequency_prepared_memo_reuses_only_matching_selectivity_tier() {
     assert!(!std::sync::Arc::ptr_eq(&plans[0], &plans[1]));
     assert!(std::sync::Arc::ptr_eq(&plans[0], &plans[2]));
 }
+
+#[test]
+fn scalar_point_plan_reuses_operator_and_rebinds_scalar_results() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE scalar_point_rows (tenant INT,id INT,v INT,PRIMARY KEY(tenant,id))",
+        "CREATE TABLE scalar_point_limit (id INT PRIMARY KEY,n INT)",
+        "INSERT INTO scalar_point_rows VALUES (1,1,10),(1,2,20),(1,3,30)",
+        "INSERT INTO scalar_point_limit VALUES (1,1),(2,3)",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let sql="SELECT v FROM scalar_point_rows WHERE tenant=? AND id=(SELECT n FROM scalar_point_limit WHERE id=?)";
+    let mut session = SessionContext::default();
+    let parsed = engine.prepare_cached(&mut session, sql, 2).unwrap();
+    let mut state = PreparedSelectMemoState::default();
+    assert_eq!(
+        rows_of(
+            compiled(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(1), Value::Int(1)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        vec![vec![Value::Int(10)]]
+    );
+    let PreparedSelectMemoState::Ready(memo) = &state else {
+        panic!("memo")
+    };
+    let point = Arc::clone(
+        &memo
+            .compiled
+            .runtime_scalar_point
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .compiled,
+    );
+    engine
+        .execute("UPDATE scalar_point_limit SET n=2 WHERE id=1")
+        .unwrap();
+    assert_eq!(
+        rows_of(
+            compiled(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(1), Value::Int(1)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        vec![vec![Value::Int(20)]]
+    );
+    let PreparedSelectMemoState::Ready(memo) = &state else {
+        panic!("memo")
+    };
+    assert!(Arc::ptr_eq(
+        &point,
+        &memo
+            .compiled
+            .runtime_scalar_point
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .compiled
+    ));
+    engine
+        .execute("UPDATE scalar_point_limit SET n=NULL WHERE id=1")
+        .unwrap();
+    assert!(rows_of(
+        compiled(
+            &engine,
+            &mut session,
+            &mut state,
+            &parsed,
+            sql,
+            &[Value::Int(1), Value::Int(1)]
+        )
+        .unwrap()
+        .unwrap()
+    )
+    .is_empty());
+    assert_eq!(
+        rows_of(
+            compiled(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(1), Value::Int(2)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        vec![vec![Value::Int(30)]]
+    );
+    engine
+        .execute("ALTER TABLE scalar_point_rows ADD COLUMN extra INT DEFAULT 7")
+        .unwrap();
+    assert_eq!(
+        rows_of(
+            compiled(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(1), Value::Int(2)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        vec![vec![Value::Int(30)]]
+    );
+    engine
+        .execute("ALTER TABLE scalar_point_limit MODIFY COLUMN n BIGINT")
+        .unwrap();
+    assert_eq!(
+        rows_of(
+            compiled(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(1), Value::Int(2)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        vec![vec![Value::Int(30)]]
+    );
+}
+
+#[test]
+fn scalar_point_numeric_boundaries_match_apply_oracle() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE scalar_decimal_rows (tenant INT,id DECIMAL(20,2),PRIMARY KEY(tenant,id))",
+        "CREATE TABLE scalar_decimal_limit (id INT PRIMARY KEY,n DECIMAL(20,3))",
+        "INSERT INTO scalar_decimal_rows VALUES(1,1.00),(1,1.01)",
+        "INSERT INTO scalar_decimal_limit VALUES(1,1.004)",
+        "CREATE TABLE scalar_float_rows (tenant INT,id FLOAT,PRIMARY KEY(tenant,id))",
+        "CREATE TABLE scalar_float_limit (id INT PRIMARY KEY,n DOUBLE)",
+        "INSERT INTO scalar_float_rows VALUES(1,0.1),(1,1.0)",
+        "INSERT INTO scalar_float_limit VALUES(1,0.1)",
+        "CREATE TABLE scalar_wide_rows (tenant INT,id DECIMAL(20,0),PRIMARY KEY(tenant,id))",
+        "CREATE TABLE scalar_wide_limit (id INT PRIMARY KEY,n DOUBLE)",
+        "INSERT INTO scalar_wide_rows VALUES(1,9007199254740992),(1,9007199254740993)",
+        "INSERT INTO scalar_wide_limit VALUES(1,9007199254740992)",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    for kind in ["decimal", "float", "wide"] {
+        let sql=format!("SELECT id FROM scalar_{kind}_rows WHERE tenant=? AND id=(SELECT n FROM scalar_{kind}_limit WHERE id=?)");
+        let oracle=format!("SELECT id FROM scalar_{kind}_rows WHERE tenant=1 AND id=(SELECT n FROM scalar_{kind}_limit WHERE id=1)");
+        let mut session = SessionContext::default();
+        let parsed = engine.prepare_cached(&mut session, &sql, 2).unwrap();
+        let mut state = PreparedSelectMemoState::default();
+        for value in ["1.004", "1.000", "1.006"] {
+            if kind == "decimal" {
+                engine
+                    .execute(&format!(
+                        "UPDATE scalar_decimal_limit SET n={value} WHERE id=1"
+                    ))
+                    .unwrap();
+            }
+            let expected = rows_of(engine.execute(&oracle).unwrap());
+            let actual = rows_of(
+                compiled(
+                    &engine,
+                    &mut session,
+                    &mut state,
+                    &parsed,
+                    &sql,
+                    &[Value::Int(1), Value::Int(1)],
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            assert_eq!(actual, expected, "{kind}, {value}");
+        }
+    }
+}

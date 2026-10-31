@@ -999,6 +999,25 @@ impl CompiledOperator {
 /// Cache lookups validate every dependency against the live catalog; a single
 /// mismatch evicts the entry lazily.
 #[derive(Debug)]
+pub(crate) struct RuntimeScalarSubqueryPlan {
+    pub(crate) select: Arc<Select>,
+    pub(crate) compiled: Arc<CompiledSelectPlan>,
+    pub(crate) deps: SmallVec<[PlanDep; 4]>,
+    pub(crate) selectivity: Arc<str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeScalarPointPlan {
+    pub(crate) source: Arc<Select>,
+    pub(crate) source_signature: Arc<str>,
+    pub(crate) subqueries: Vec<RuntimeScalarSubqueryPlan>,
+    pub(crate) select: Arc<Select>,
+    pub(crate) compiled: Arc<CompiledSelectPlan>,
+    pub(crate) signature: Arc<str>,
+    pub(crate) _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+#[derive(Debug)]
 pub struct CompiledSelectPlan {
     pub semantic_select: Arc<Select>,
     pub physical: Arc<PhysicalPlan>,
@@ -1020,6 +1039,11 @@ pub struct CompiledSelectPlan {
     /// Reuse the no-I/O output-capability proof as well as the route decision.
     /// Errors are deliberately not cached: execution retains canonical error timing.
     pub(crate) native_output_supported: Option<bool>,
+    /// An independent scalar result becomes an execution parameter, never a
+    /// cached value. Only a proven unique point access can reuse this plan
+    /// without a value-dependent cardinality tier.
+    pub(crate) runtime_scalar_point: OnceLock<Option<RuntimeScalarPointPlan>>,
+    pub(crate) runtime_scalar_candidate: bool,
     /// Immutable execution-envelope recipes. They are initialized by the
     /// first runner that has session/catalog binding context (normally the
     /// compiling prepared handle) and then shared by every handle reusing the
@@ -1044,6 +1068,11 @@ impl CompiledSelectPlan {
             &physical,
             &semantic_select.projection,
         );
+        let runtime_scalar_candidate = semantic_select.selection.as_ref().is_some_and(|expr| {
+            crate::parser::visit::any_expr(expr, |node| {
+                matches!(node, crate::parser::Expr::Subquery(_))
+            })
+        });
         Self {
             execution_class: SelectExecutionClass::from_select(&semantic_select),
             batch_route,
@@ -1062,6 +1091,8 @@ impl CompiledSelectPlan {
             deps,
             object_deps,
             epoch,
+            runtime_scalar_point: OnceLock::new(),
+            runtime_scalar_candidate,
             cbo_epoch: crate::engine::cbo::cbo_epoch(),
             required_privileges: OnceLock::new(),
             mdl_requests: OnceLock::new(),

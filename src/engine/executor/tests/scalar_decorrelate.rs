@@ -715,3 +715,72 @@ fn scalar_apply_inside_semi_join_with_sibling_hash_join() {
         "pushed scan filter"
     );
 }
+
+#[test]
+fn scalar_access_constants_are_execution_local_and_keep_lazy_fallbacks() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE scalar_access (tenant INT,id BIGINT,grp INT,PRIMARY KEY(tenant,id))",
+        "INSERT INTO scalar_access VALUES (1,1,7),(1,2,7),(1,3,8),(2,9,7)",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let sql = "SELECT id FROM scalar_access WHERE tenant=1 AND id=(SELECT MAX(id) FROM scalar_access WHERE tenant=1 AND grp=7)";
+    let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+        panic!("select")
+    };
+    let txn = engine
+        .db
+        .read_only_statement_view(crate::storage::IsolationLevel::ReadCommitted, None);
+    let bound = crate::engine::executor::select::eval::bind_scalar_access_constants(
+        &engine.db, txn, &select,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!crate::parser::visit::any_expr(
+        bound.selection.as_ref().unwrap(),
+        |e| matches!(e, Expr::Subquery(_))
+    ));
+    let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap() else {
+        panic!("rows")
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int(2)]]);
+    engine
+        .execute("INSERT INTO scalar_access VALUES (1,4,7)")
+        .unwrap();
+    let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap() else {
+        panic!("rows")
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int(4)]]);
+    for sql in [
+        "SELECT id FROM scalar_access o WHERE id=(SELECT MAX(i.id) FROM scalar_access i WHERE i.grp=o.grp)",
+        "SELECT id FROM scalar_access WHERE tenant=99 AND id=(SELECT id FROM scalar_access)",
+        "SELECT id FROM scalar_access WHERE id=(SELECT RAND())",
+        "SELECT id FROM scalar_access WHERE id=(SELECT '4')",
+    ] {
+        let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else { panic!("select") };
+        assert!(crate::engine::executor::select::eval::bind_scalar_access_constants(&engine.db,txn,&select).unwrap().is_none(),"{sql}");
+    }
+    // Failed folding leaves the authoritative evaluator's cardinality error.
+    assert_eq!(
+        engine
+            .execute("SELECT id FROM scalar_access WHERE id=(SELECT id FROM scalar_access)")
+            .unwrap_err()
+            .code(),
+        1242
+    );
+    let QueryResponse::ResultSet(result) = engine.execute("SELECT id FROM scalar_access WHERE id=(SELECT MAX(id) FROM scalar_access WHERE tenant=99)").unwrap() else { panic!("rows") };
+    assert!(result.rows.is_empty());
+    let QueryResponse::ResultSet(plan) = engine
+        .execute(&format!("EXPLAIN ANALYZE FORMAT=TREE {sql}"))
+        .unwrap()
+    else {
+        panic!("plan")
+    };
+    let text = format!("{:?}", plan.rows);
+    assert!(text.contains("scalar_access"), "{text}");
+    // Text auto-parameters retain literal provenance and use Apply; the
+    // prepared point memo has its own rebind/reuse regression coverage.
+    assert!(text.contains("Apply"), "{text}");
+}

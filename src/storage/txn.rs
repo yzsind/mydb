@@ -657,8 +657,9 @@ type IndexRepairRowMap = HashMap<(u64, String, RowId), smallvec::SmallVec<[(u64,
 /// retired keys consults this registry, so it is partitioned instead of
 /// guarded by one latch: retired keys live in `entry_shards` chosen by key
 /// hash, and each writer's ordered registration log lives in `log_shards`
-/// chosen by transaction id. Exact-key readers touch one entry shard; range
-/// readers visit every shard under short read leases and merge.
+/// chosen by transaction id. Index identities select a group of entry shards;
+/// keys distribute writes within that group. Range readers only visit that
+/// index's group under short read leases and merge.
 ///
 /// Lock order: transaction directory -> log shard -> entry shard. Readers
 /// never take a log shard, and no path holds two entry shards at once.
@@ -698,12 +699,24 @@ impl Default for IndexRepairState {
 }
 
 impl IndexRepairState {
+    const SHARDS_PER_INDEX: usize = 4;
+
+    fn index_shard_start(table_id: u64, index_name: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = ahash::AHasher::default();
+        table_id.hash(&mut hasher);
+        index_name.hash(&mut hasher);
+        (hasher.finish() as usize & (INDEX_REPAIR_ENTRY_SHARDS / Self::SHARDS_PER_INDEX - 1))
+            * Self::SHARDS_PER_INDEX
+    }
+
     fn entry_shard_of(key: &IndexRepairKey) -> usize {
         use std::hash::{BuildHasher, Hash, Hasher};
         static HASHER: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
         let mut hasher = HASHER.get_or_init(ahash::RandomState::new).build_hasher();
         key.hash(&mut hasher);
-        hasher.finish() as usize & (INDEX_REPAIR_ENTRY_SHARDS - 1)
+        Self::index_shard_start(key.table_id, &key.index_name)
+            + (hasher.finish() as usize & (Self::SHARDS_PER_INDEX - 1))
     }
 
     fn entry_shard(&self, key: &IndexRepairKey) -> &parking_lot::RwLock<IndexRepairEntryMap> {
@@ -767,17 +780,20 @@ impl IndexRepairState {
             index_name: normalize_name(index_name),
             key: IndexKey::from(Vec::new()),
         };
-        self.entry_shards.iter().any(|shard| {
-            shard
-                .read()
-                .range(&start..)
-                .next()
-                .is_some_and(|(key, entries)| {
-                    key.table_id == table_id
-                        && key.index_name == start.index_name
-                        && !entries.is_empty()
-                })
-        })
+        let first = Self::index_shard_start(table_id, &start.index_name);
+        self.entry_shards[first..first + Self::SHARDS_PER_INDEX]
+            .iter()
+            .any(|shard| {
+                shard
+                    .read()
+                    .range(&start..)
+                    .next()
+                    .is_some_and(|(key, entries)| {
+                        key.table_id == table_id
+                            && key.index_name == start.index_name
+                            && !entries.is_empty()
+                    })
+            })
     }
 
     /// The third tuple field identifies single-key indexes. For FULLTEXT/MVI,
@@ -955,7 +971,8 @@ impl IndexRepairState {
             key: low.map_or_else(|| IndexKey::from(Vec::new()), |bound| bound.key.clone()),
         };
         let mut out = Vec::new();
-        for shard in self.entry_shards.iter() {
+        let first = Self::index_shard_start(table_id, &start.index_name);
+        for shard in &self.entry_shards[first..first + Self::SHARDS_PER_INDEX] {
             let shard = shard.read();
             for (key, entries) in shard.range(&start..).take_while(|(key, _)| {
                 key.table_id == table_id
@@ -978,6 +995,31 @@ impl IndexRepairState {
             out.sort_by(|a, b| a.key.cmp(&b.key));
         }
         out
+    }
+
+    /// Collect suspect rows without copying retired index keys or sorting
+    /// candidates whose key/writer metadata the visibility shortcut never uses.
+    pub(crate) fn suspect_rows(
+        &self,
+        table_id: u64,
+        index_name: &str,
+    ) -> std::collections::HashSet<RowId> {
+        let start = IndexRepairKey {
+            table_id,
+            index_name: normalize_name(index_name),
+            key: IndexKey::from(Vec::new()),
+        };
+        let first = Self::index_shard_start(table_id, &start.index_name);
+        let mut rows = std::collections::HashSet::new();
+        for shard in &self.entry_shards[first..first + Self::SHARDS_PER_INDEX] {
+            let shard = shard.read();
+            for (_, entries) in shard.range(&start..).take_while(|(key, _)| {
+                key.table_id == table_id && key.index_name == start.index_name
+            }) {
+                rows.extend(entries.iter().map(|entry| entry.row_id));
+            }
+        }
+        rows
     }
 
     /// Retired entries for one exact logical index key.
@@ -5915,6 +5957,49 @@ mod group_commit_tests {
             epoch(),
             "purge of a committed writer is not a rollback"
         );
+    }
+
+    #[test]
+    fn index_repair_grouped_ranges_and_suspect_rows_match_exact_entries() {
+        let mut txns = TransactionManager::default();
+        txns.begin_with_id(1, 0, false, true, 1).unwrap();
+        for table_id in 1..=32 {
+            for index in ["primary", "secondary"] {
+                for number in 0..4 {
+                    let key = IndexRepairKey {
+                        table_id,
+                        index_name: index.into(),
+                        key: IndexKey::from(vec![crate::storage::KeyPart::Int(number)]),
+                    };
+                    txns.register_index_repairs(
+                        1,
+                        [key],
+                        RowId::new(table_id as u32, number as u16),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for table_id in 1..=32 {
+            for index in ["PRIMARY", "secondary"] {
+                let range = txns
+                    .index_repairs
+                    .candidates(table_id, index, None, None, |_| true);
+                assert_eq!(range.len(), 4);
+                let expected: std::collections::HashSet<_> =
+                    range.iter().map(|entry| entry.row_id).collect();
+                assert_eq!(txns.index_repairs.suspect_rows(table_id, index), expected);
+                for entry in range {
+                    let exact = txns
+                        .index_repairs
+                        .exact_candidates(table_id, index, &entry.key);
+                    assert_eq!(exact.len(), 1);
+                    assert_eq!(exact[0].row_id, entry.row_id);
+                }
+            }
+        }
+        txns.clear_index_repairs(1);
+        assert!(txns.index_repairs.suspect_rows(1, "primary").is_empty());
     }
 
     #[test]

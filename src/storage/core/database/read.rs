@@ -301,8 +301,13 @@ impl Database {
                 let mut out_local = Vec::with_capacity(fallback.len());
                 heap_read.with_lob(|| -> Result<(), QueryError> {
                     if heap_read.try_read_mvcc_columns_sparse_probe(
-                        &fallback, columns, decode_plan, &mut out_local,
-                    )? { return Ok(()); }
+                        &fallback,
+                        columns,
+                        decode_plan,
+                        &mut out_local,
+                    )? {
+                        return Ok(());
+                    }
                     if heap_read.try_read_mvcc_columns_dense_probe(
                         &fallback,
                         columns,
@@ -924,12 +929,7 @@ impl Database {
         if !self.has_pending_index_repairs_for(table.id, &index.name) {
             return None;
         }
-        let rows: HashSet<RowId> = self
-            .index_repair_state
-            .candidates(table.id, &index.name, None, None, |_| true)
-            .into_iter()
-            .map(|candidate| candidate.row_id)
-            .collect();
+        let rows = self.index_repair_state.suspect_rows(table.id, &index.name);
         (!rows.is_empty()).then_some(IndexEntrySuspects::Rows(rows))
     }
 

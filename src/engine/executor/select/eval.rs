@@ -3849,6 +3849,222 @@ fn prepare_subquery_call(
 /// aggregate is still a statement constant. Keeping the folded template in
 /// `EvalQueryContext::legacy_subquery_templates` makes that distinction
 /// explicit instead of inheriting the volatile parent's per-row execution.
+/// Bind independent numeric scalar predicates before choosing an access path.
+/// Values live only in this execution's AST: no result is put in the shared
+/// physical-plan cache. Failed/diagnostic/volatile probes retain Apply's
+/// original lazy evaluation and error timing.
+pub(in crate::engine::executor) fn bind_scalar_access_constants(
+    db: &Arc<Database>,
+    txn: TxnView,
+    select: &Select,
+) -> Result<Option<Select>, QueryError> {
+    fn candidate(expr: &Expr) -> bool {
+        match expr {
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => candidate(left) || candidate(right),
+            Expr::Binary { left, op, right } if crate::parser::boolean::is_comparison!(*op) => {
+                matches!(
+                    (&**left, &**right),
+                    (
+                        Expr::Identifier(_) | Expr::CompoundIdentifier(_),
+                        Expr::Subquery(_)
+                    ) | (
+                        Expr::Subquery(_),
+                        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+                    )
+                )
+            }
+            _ => false,
+        }
+    }
+    if !select.joins.is_empty()
+        || select.from.len() != 1
+        || select.derived.is_some()
+        || select.for_update
+        || select.lock_clause.is_some()
+        || !select.selection.as_ref().is_some_and(candidate)
+    {
+        return Ok(None);
+    }
+    let Some(name) = select.table.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(table) = db.table(name) else {
+        return Ok(None);
+    };
+    let outer = crate::planner_decorrelate::select_scope(db, select);
+    let mut selection = select.selection.clone().unwrap();
+    let mut changed = false;
+    fn bind(
+        db: &Arc<Database>,
+        txn: TxnView,
+        table: &TableSchema,
+        outer: &crate::planner_decorrelate::sublink::Scope,
+        constraints: &Expr,
+        expr: &mut Expr,
+        changed: &mut bool,
+    ) -> Result<(), QueryError> {
+        let Expr::Binary { left, op, right } = expr else {
+            return Ok(());
+        };
+        if *op == BinaryOp::And {
+            bind(db, txn, table, outer, constraints, left, changed)?;
+            return bind(db, txn, table, outer, constraints, right, changed);
+        }
+        if !crate::parser::boolean::is_comparison!(*op) {
+            return Ok(());
+        }
+        let (column, scalar) = match (&mut **left, &mut **right) {
+            (
+                column @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)),
+                scalar @ Expr::Subquery(_),
+            )
+            | (
+                scalar @ Expr::Subquery(_),
+                column @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)),
+            ) => (column, scalar),
+            _ => return Ok(()),
+        };
+        let Some(position) = expr_column_index(column, table) else {
+            return Ok(());
+        };
+        fn fixed(expr: &Expr, table: &TableSchema, position: usize) -> bool {
+            match expr {
+                Expr::Binary {
+                    left,
+                    op: BinaryOp::And,
+                    right,
+                } => fixed(left, table, position) || fixed(right, table, position),
+                Expr::Binary {
+                    left,
+                    op: BinaryOp::Eq,
+                    right,
+                } => {
+                    let constant = |expr: &Expr| {
+                        matches!(
+                            expr,
+                            Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
+                        )
+                    };
+                    (expr_column_index(left, table) == Some(position) && constant(right))
+                        || (expr_column_index(right, table) == Some(position) && constant(left))
+                }
+                _ => false,
+            }
+        }
+        // Binding before planning is useful only when this column can extend
+        // an index's fixed prefix. Unindexed predicates keep the existing
+        // reusable Apply/batch program instead of paying for a new plan.
+        if !table.iter_queryable_indexes().any(|index| {
+            index.columns.iter().enumerate().any(|(slot, name)| {
+                table.column_index(name).ok() == Some(position)
+                    && index.columns[..slot].iter().all(|prior| {
+                        table
+                            .column_index(prior)
+                            .is_ok_and(|p| fixed(constraints, table, p))
+                    })
+            })
+        }) {
+            return Ok(());
+        }
+        // String/temporal subquery operands carry coercibility provenance.
+        // Keep their original evaluator until that metadata can travel with
+        // a bound value as well; numeric domains have no collation to lose.
+        if !matches!(
+            table.columns[position].data_type,
+            DataTypeKind::TinyInt
+                | DataTypeKind::SmallInt
+                | DataTypeKind::MediumInt
+                | DataTypeKind::Int
+                | DataTypeKind::BigInt
+                | DataTypeKind::Bool
+                | DataTypeKind::Float { .. }
+                | DataTypeKind::Double { .. }
+                | DataTypeKind::Decimal { .. }
+        ) {
+            return Ok(());
+        }
+        let Expr::Subquery(subquery) = scalar else {
+            unreachable!()
+        };
+        if super::explain::select_is_uncacheable(subquery)
+            || crate::parser::visit::collect_select_function_names(subquery)
+                .iter()
+                .any(|name| !crate::planner::is_aggregate_function(name))
+            || crate::planner::collect_aggregate_calls(subquery)
+                .iter()
+                .any(|expr| matches!(expr, Expr::Function { distinct: true, .. }))
+        {
+            return Ok(());
+        }
+        let inner = crate::planner_decorrelate::select_scope(db, subquery);
+        if !crate::planner_decorrelate::sublink::classify_sublink(scalar, outer, &inner)
+            .is_some_and(|info| {
+                info.shape == crate::planner_decorrelate::sublink::CorrelationShape::Uncorrelated
+            })
+        {
+            return Ok(());
+        }
+        let marks = crate::engine::api::statement_warning_marks();
+        let diagnostics = crate::engine::api::StatementWarningSink::default();
+        let mut bound = scalar.clone();
+        let result = super::analyze_stats::without_operator_collector(|| {
+            crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                fold_legacy_nested_scalar_constants_expr(
+                    db,
+                    txn,
+                    &mut bound,
+                    &mut EvalQueryContext::default(),
+                )
+            })
+        });
+        let silent = diagnostics.lock().total_len() == 0
+            && crate::engine::api::statement_warning_marks() == marks;
+        if result.is_err() || !silent {
+            crate::engine::api::truncate_statement_warnings(marks);
+            crate::engine::cancel::check_cancelled()?;
+            return Ok(());
+        }
+        if matches!(&bound, Expr::BoundValue(value) if crate::storage::is_numeric_value(value) || matches!(value, Value::Null))
+        {
+            let Expr::BoundValue(value) = &bound else {
+                unreachable!()
+            };
+            // A unique storage key is not a unique SQL equality result when
+            // comparison changes domains (notably DECIMAL versus DOUBLE).
+            // Keep Apply when several distinct keys can compare equal.
+            if !crate::planner::index_bounds::equality_fixes_order_value(
+                table,
+                &table.columns[position].name,
+                &crate::planner::index_bounds::ConstraintValue::Concrete(value.clone()),
+            ) {
+                return Ok(());
+            }
+            *scalar = bound;
+            *changed = true;
+        }
+        Ok(())
+    }
+    bind(
+        db,
+        txn,
+        &table,
+        &outer,
+        select.selection.as_ref().unwrap(),
+        &mut selection,
+        &mut changed,
+    )?;
+    if !changed {
+        return Ok(None);
+    }
+    let mut bound = select.clone();
+    bound.selection = Some(selection);
+    Ok(Some(bound))
+}
+
 fn fold_legacy_nested_scalar_constants(
     db: &Arc<Database>,
     txn: TxnView,
@@ -4634,7 +4850,7 @@ fn collect_outer_params(
 /// Per-statement plan cache for correlated/uncorrelated subqueries is
 /// on by default. Set `MYDB_SUBQUERY_PLAN_CACHE=off` (or `0`/`false`/`no`)
 /// to disable — useful for differential testing.
-fn subquery_plan_cache_enabled() -> bool {
+pub(in crate::engine::executor) fn subquery_plan_cache_enabled() -> bool {
     if !crate::engine::executor::plan_cache_enabled_from_env() {
         return false;
     }
@@ -4646,6 +4862,65 @@ fn subquery_plan_cache_enabled() -> bool {
         "off" | "0" | "false" | "no" => false,
         _ => true,
     }
+}
+
+pub(in crate::engine::executor) fn compile_independent_scalar(
+    db: &Arc<Database>,
+    select: &Select,
+) -> Option<crate::engine::cache::RuntimeScalarSubqueryPlan> {
+    if select.limit.is_some() || select.offset.is_some() || !select.named_windows.is_empty() {
+        return None;
+    }
+    let cached = try_build_cached_subquery_plan(db, select, &PlanRow::default())?;
+    cached
+        .bindings
+        .is_empty()
+        .then(|| crate::engine::cache::RuntimeScalarSubqueryPlan {
+            select: Arc::clone(&cached.parametric_stmt),
+            compiled: Arc::clone(&cached.compiled),
+            deps: super::collect_plan_deps(&cached.compiled.physical),
+            selectivity: crate::engine::params::with_current_params(|params, _| {
+                crate::planner::parameter_selectivity_signature(
+                    db,
+                    &cached.parametric_stmt,
+                    params.unwrap_or(&[]),
+                )
+                .into()
+            }),
+        })
+}
+
+pub(in crate::engine::executor) fn execute_independent_scalar(
+    db: &Arc<Database>,
+    txn: TxnView,
+    plan: &crate::engine::cache::RuntimeScalarSubqueryPlan,
+) -> Result<Value, QueryError> {
+    let response = super::plan::execute_compiled_select(db, txn, &plan.select, &plan.compiled)?
+        .materialize()?;
+    let (columns, rows) = match response {
+        QueryResponse::ResultSet(result) => (result.columns.len(), result.rows),
+        QueryResponse::SharedResultSet(result) => (result.columns.len(), result.rows),
+        _ => {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "scalar subquery must return rows",
+            ))
+        }
+    };
+    if columns != 1 {
+        return Err(crate::engine::expr::operand_columns_error(1));
+    }
+    if rows.len() > 1 {
+        return Err(error(
+            crate::error::catalog::ER_SUBQUERY_NO_1_ROW,
+            "Subquery returns more than 1 row",
+        ));
+    }
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next())
+        .unwrap_or(Value::Null))
 }
 
 /// Build a parametric plan if `subquery` is in a shape we know how to

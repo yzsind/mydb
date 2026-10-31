@@ -601,6 +601,14 @@ pub(crate) fn is_recording() -> bool {
     STATS_COLLECTOR.with(|cell| cell.borrow().is_some())
 }
 
+/// Initialization queries precede the outer access tree. Preserve the query's
+/// buffer accounting, but do not register an initialization plan as its root.
+pub(super) fn without_operator_collector<R>(f: impl FnOnce() -> R) -> R {
+    let previous = STATS_COLLECTOR.with(|cell| cell.borrow_mut().take());
+    let _restore = CollectorRestore(previous);
+    f()
+}
+
 pub(crate) fn current_collector_handle() -> Option<CollectorHandle> {
     STATS_COLLECTOR.with(|cell| {
         cell.borrow()

@@ -23472,3 +23472,72 @@ fn columnar_window_parallel_sort_large_partitions_release_query_charge() {
     };
     assert_eq!(run("on"), run("off"));
 }
+
+#[test]
+fn index_order_ignores_fixed_equality_columns_in_order_by() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE ordered_prefix (a INT, b INT, c INT, v VARCHAR(20), PRIMARY KEY(a,b,c))",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO ordered_prefix VALUES (1,2,5,'five'),(1,2,3,'three'),(1,3,1,'other')")
+        .unwrap();
+    for (suffix, expected) in [
+        ("a,b,c", vec![Value::Int(3), Value::Int(5)]),
+        ("a DESC,b DESC,c DESC", vec![Value::Int(5), Value::Int(3)]),
+        ("c,a,b", vec![Value::Int(3), Value::Int(5)]),
+    ] {
+        let sql = format!(
+            "SELECT c FROM ordered_prefix FORCE INDEX(PRIMARY) WHERE a=1 AND b=2 ORDER BY {suffix}"
+        );
+        let QueryResponse::ResultSet(plan) = engine.execute(&format!("EXPLAIN {sql}")).unwrap()
+        else {
+            panic!("expected explain")
+        };
+        assert!(
+            !plan
+                .rows
+                .iter()
+                .flatten()
+                .any(|v| matches!(v, Value::String(s) if s.contains("filesort"))),
+            "{sql}: {:?}",
+            plan.rows
+        );
+        let QueryResponse::ResultSet(result) = engine.execute(&sql).unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(
+            result.rows,
+            expected.into_iter().map(|v| vec![v]).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn index_order_keeps_sort_for_numeric_equality_on_character_columns() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE order_coercion (a VARCHAR(20),b INT,PRIMARY KEY(a,b))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO order_coercion VALUES ('01',100),('1',1),('1.0',50)")
+        .unwrap();
+    let QueryResponse::ResultSet(result) = engine
+        .execute("SELECT b FROM order_coercion FORCE INDEX(PRIMARY) WHERE a=1 ORDER BY b")
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(50)],
+            vec![Value::Int(100)]
+        ]
+    );
+}

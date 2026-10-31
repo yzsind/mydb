@@ -1389,3 +1389,35 @@ fn rename_index_keeps_fk_backing_index_and_cascade() {
         "CASCADE must delete the child row after the backing index was renamed"
     );
 }
+
+#[test]
+fn batch_fk_interleaved_parent_keys_keep_error_order_and_statement_atomicity() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE fk_batch_parent (id VARCHAR(20) COLLATE utf8mb4_0900_ai_ci PRIMARY KEY)",
+        "CREATE TABLE fk_batch_child (id INT PRIMARY KEY,p VARCHAR(20) COLLATE utf8mb4_0900_ai_ci,FOREIGN KEY(p) REFERENCES fk_batch_parent(id))",
+        "INSERT INTO fk_batch_parent VALUES ('alpha'),('beta'),('gamma')",
+        "INSERT INTO fk_batch_child VALUES (1,'alpha'),(2,'beta'),(3,'ALPHA'),(4,'gamma'),(5,'beta'),(6,NULL)",
+    ] {engine.execute(sql).unwrap();}
+    let err=engine.execute("INSERT INTO fk_batch_child VALUES (7,'alpha'),(8,'beta'),(9,'ALPHA'),(10,'missing'),(11,'gamma')").unwrap_err();
+    assert_eq!(err.code(), 1452);
+    assert_eq!(
+        rows(
+            engine
+                .execute("SELECT COUNT(*) FROM fk_batch_child")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(6)]]
+    );
+    engine
+        .execute("INSERT INTO fk_batch_child VALUES (7,'gamma'),(8,'beta'),(9,'gamma')")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute("DELETE FROM fk_batch_parent WHERE id='gamma'")
+            .unwrap_err()
+            .code(),
+        1451
+    );
+}

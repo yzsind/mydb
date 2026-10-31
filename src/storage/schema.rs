@@ -3427,6 +3427,28 @@ fn cmp_uniform_numeric_key_parts(
 }
 
 impl IndexKey {
+    /// Owned payload retained by an execution-local key batch. Inline key
+    /// parts need no heap reservation; variable-width components do.
+    pub(crate) fn heap_capacity_bytes(&self) -> usize {
+        let parts = if self.0.spilled() {
+            self.0
+                .capacity()
+                .saturating_mul(std::mem::size_of::<KeyPart>())
+        } else {
+            0
+        };
+        self.0.iter().fold(parts, |bytes, part| {
+            bytes.saturating_add(match part {
+                KeyPart::Bytes(value) => value.capacity(),
+                KeyPart::String(value) | KeyPart::CollatedString { value, .. } => value.capacity(),
+                KeyPart::DecimalWide { value, .. } => {
+                    (value.bits().div_ceil(64) as usize).saturating_mul(16)
+                }
+                _ => 0,
+            })
+        })
+    }
+
     /// Ordering equality can hide a changed covering-index payload (case,
     /// accents or PAD SPACE). Maintenance must preserve the original text.
     #[inline]

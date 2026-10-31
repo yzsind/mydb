@@ -184,14 +184,55 @@ fn param_type_tag(value: &Value) -> u8 {
 /// LIMIT/OFFSET magnitude bucket) recompiles instead of reusing a physical
 /// plan chosen for the previous domain.
 pub(crate) fn parameter_plan_signature(select: &Select, params: &[Value]) -> String {
-    use std::fmt::Write as _;
-
     let mut signature = String::with_capacity(params.len().saturating_add(24));
-    signature.push('t');
+    write_parameter_plan_signature(select, params, &mut signature)
+        .expect("writing a String cannot fail");
+    signature
+}
+
+/// Compare the exact signature stream without constructing a temporary String
+/// on every prepared execution. Formatting and matching share one encoder.
+pub(crate) fn parameter_plan_signature_matches(
+    select: &Select,
+    params: &[Value],
+    expected: &str,
+    suffix: &str,
+) -> bool {
+    use std::fmt::Write;
+    struct Match<'a> {
+        expected: &'a [u8],
+        offset: usize,
+    }
+    impl Write for Match<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let end = self.offset.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            if self.expected.get(self.offset..end) != Some(text.as_bytes()) {
+                return Err(std::fmt::Error);
+            }
+            self.offset = end;
+            Ok(())
+        }
+    }
+    let mut matcher = Match {
+        expected: expected.as_bytes(),
+        offset: 0,
+    };
+    write_parameter_plan_signature(select, params, &mut matcher)
+        .and_then(|_| matcher.write_str(suffix))
+        .is_ok()
+        && matcher.offset == matcher.expected.len()
+}
+
+fn write_parameter_plan_signature(
+    select: &Select,
+    params: &[Value],
+    signature: &mut impl std::fmt::Write,
+) -> std::fmt::Result {
+    signature.write_char('t')?;
     for value in params {
         // Tuple bounds require lossless per-component conversions. Keep the
         // domains distinct without keying plans by concrete parameter values.
-        signature.push(match value {
+        signature.write_char(match value {
             Value::Int(v) if *v < 0 => '-',
             Value::Int(_) => '+',
             Value::UInt(v) if *v > i64::MAX as u64 => 'U',
@@ -201,7 +242,7 @@ pub(crate) fn parameter_plan_signature(select: &Select, params: &[Value]) -> Str
             Value::DateTime(_) => 'Z',
             Value::Timestamp(_) => 'P',
             _ => param_type_tag(value) as char,
-        });
+        })?;
         let shape = match value {
             Value::Vector(v) => Some((3, v.dimension)),
             Value::String(s) => crate::vector::text_parameter_shape(s.as_bytes()),
@@ -210,7 +251,7 @@ pub(crate) fn parameter_plan_signature(select: &Select, params: &[Value]) -> Str
             _ => None,
         };
         if let Some((tag, number)) = shape {
-            let _ = write!(signature, ":v{tag}_{number};");
+            write!(signature, ":v{tag}_{number};")?;
         }
     }
     let runtime_bucket = |value: &Option<LimitValue>| -> Option<u64> {
@@ -227,12 +268,12 @@ pub(crate) fn parameter_plan_signature(select: &Select, params: &[Value]) -> Str
         Some(limit_magnitude_bucket(n))
     };
     if let Some(bucket) = runtime_bucket(&select.limit) {
-        let _ = write!(signature, ":l{bucket:x}");
+        write!(signature, ":l{bucket:x}")?;
     }
     if let Some(bucket) = runtime_bucket(&select.offset) {
-        let _ = write!(signature, ":o{bucket:x}");
+        write!(signature, ":o{bucket:x}")?;
     }
-    signature
+    Ok(())
 }
 
 /// Power-of-two magnitude bucket for LIMIT / OFFSET fingerprinting. Two
@@ -1624,5 +1665,51 @@ mod tests {
             40,
             "fingerprint length must be O(number of params), not AST size"
         );
+    }
+}
+
+#[cfg(test)]
+mod signature_stream_tests {
+    use super::*;
+
+    #[test]
+    fn signature_matcher_preserves_domains_shapes_limits_and_suffixes() {
+        let Statement::Select(select) =
+            crate::parser::parse_statement("SELECT id FROM t LIMIT ? OFFSET ?").unwrap()
+        else {
+            panic!("select")
+        };
+        for value in [
+            Value::Null,
+            Value::Int(-1),
+            Value::Int(1),
+            Value::UInt(u64::MAX),
+            Value::Float(1.25),
+            Value::Double(1.25),
+            Value::Decimal("1.250".into()),
+            Value::String("[1,2,3]".into()),
+            Value::Bytes(b"not a vector".to_vec()),
+            Value::Date(1),
+            Value::Time(2),
+            Value::DateTime(3),
+            Value::Timestamp(4),
+        ] {
+            let params = [Value::Int(20), Value::UInt(10), value];
+            let expected = parameter_plan_signature(&select, &params);
+            assert!(parameter_plan_signature_matches(
+                &select, &params, &expected, ""
+            ));
+            let extended = format!("{expected}:tier");
+            assert!(parameter_plan_signature_matches(
+                &select, &params, &extended, ":tier"
+            ));
+            assert!(!parameter_plan_signature_matches(
+                &select, &params, &extended, ""
+            ));
+            assert!(!parameter_plan_signature_matches(
+                &select, &params, &expected, ":tier"
+            ));
+            assert!(!parameter_plan_signature_matches(&select, &params, "x", ""));
+        }
     }
 }
