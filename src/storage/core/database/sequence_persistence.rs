@@ -131,8 +131,10 @@ impl CatalogTxn<'_> {
                     )?
                     .first()
                     .map(|row| {
-                        crate::storage::data_dictionary::table_header_from_dd_row(row).object_id
-                    }),
+                        crate::storage::data_dictionary::table_header_from_dd_row(row)
+                            .map(|table| table.object_id)
+                    })
+                    .transpose()?,
             };
             if let Some(id) = object {
                 objects.push(id);

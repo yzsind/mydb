@@ -225,7 +225,7 @@ fn cast_as_json_preserves_enum_set_bit_and_binary_source_types() {
             Value::String("STRING".into()),
             Value::String("STRING".into()),
             Value::String("UNSIGNED INTEGER".into()),
-            Value::String("STRING".into()),
+            Value::String("BLOB".into()),
         ]]
     );
 }

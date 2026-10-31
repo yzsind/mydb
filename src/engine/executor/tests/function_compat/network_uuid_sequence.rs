@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/network-uuid-sequence.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/network-uuid-sequence.json"
+));
 
 function_fixture_test!(bin_to_uuid, "BIN_TO_UUID", FIXTURE);
 function_fixture_test!(currval, "CURRVAL", FIXTURE);

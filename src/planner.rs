@@ -8139,6 +8139,8 @@ fn index_order_prefix_len(
     if let Some(filter) = filter {
         collect_index_constraints(table, filter, &mut eq_columns, &mut ranges);
     }
+    eq_columns
+        .retain(|column, value| index_bounds::equality_fixes_order_value(table, column, value));
     let mut index_pos = 0usize;
     while index_pos < index.columns.len()
         && eq_columns.contains_key(&normalize_expr_column(&index.columns[index_pos]))
@@ -8148,15 +8150,6 @@ fn index_order_prefix_len(
     let expected_asc = !is_reverse;
     let mut prefix = 0usize;
     for item in order_by {
-        if item.asc != expected_asc {
-            break;
-        }
-        // B-tree keys rank NULL lowest (`KeyPart::Null` is the first
-        // variant), so index order delivers NULLs in default position
-        // only; explicit NULLS FIRST/LAST that deviates needs a sort.
-        if item.has_custom_nulls() {
-            break;
-        }
         if let Expr::CompoundIdentifier(parts) = &item.expr {
             if parts.len() >= 2
                 && !matches_table(
@@ -8172,6 +8165,16 @@ fn index_order_prefix_len(
             break;
         };
         let column = normalize_expr_column(column);
+        // An equality-constrained column cannot reorder any surviving row,
+        // wherever it appears in ORDER BY and regardless of its direction.
+        if eq_columns.contains_key(&column) {
+            prefix += 1;
+            continue;
+        }
+        // Nonconstant keys must match the scan direction and NULL placement.
+        if item.asc != expected_asc || item.has_custom_nulls() {
+            break;
+        }
         let mut matched = false;
         while index_pos < index.columns.len() {
             let index_column = normalize_expr_column(&index.columns[index_pos]);
@@ -8474,6 +8477,8 @@ fn index_order_covers_order_by(
     if let Some(filter) = filter {
         collect_index_constraints(table, filter, &mut eq_columns, &mut ranges);
     }
+    eq_columns
+        .retain(|column, value| index_bounds::equality_fixes_order_value(table, column, value));
     let mut index_pos = 0usize;
     while index_pos < index.columns.len()
         && eq_columns.contains_key(&normalize_expr_column(&index.columns[index_pos]))
@@ -8485,6 +8490,9 @@ fn index_order_covers_order_by(
             return false;
         };
         let column = normalize_expr_column(column);
+        if eq_columns.contains_key(&column) {
+            continue;
+        }
         let mut matched = false;
         while index_pos < index.columns.len() {
             let index_column = normalize_expr_column(&index.columns[index_pos]);
@@ -11213,19 +11221,43 @@ fn choose_scan(
             let qual_cpu = qual_cpu * cost_access_rows;
             cost.total += qual_cpu;
             cost.cpu_units += qual_cpu;
-            PhysicalPlan::IndexLookup {
-                table: table.clone(),
-                index: choice.index,
-                key,
-                exact,
-                filter,
-                estimated_rows: cost_output_rows,
-                access_rows: cost_access_rows,
-                cost,
-                possible_keys,
-                covering: will_cover,
-                hint_note: None,
-                projected_columns: None,
+            if !exact && order_preserving && order_direction == Some(true) {
+                // Inclusive prefix bounds denote the same key domain as a
+                // prefix lookup, while a range node can expose reverse order.
+                let bound = IndexBound {
+                    key,
+                    inclusive: true,
+                };
+                PhysicalPlan::IndexRangeScan {
+                    table: table.clone(),
+                    index: choice.index,
+                    low: Some(bound.clone()),
+                    high: Some(bound),
+                    reverse: true,
+                    filter,
+                    estimated_rows: cost_output_rows,
+                    access_rows: cost_access_rows,
+                    cost,
+                    possible_keys,
+                    covering: will_cover,
+                    hint_note: None,
+                    projected_columns: None,
+                }
+            } else {
+                PhysicalPlan::IndexLookup {
+                    table: table.clone(),
+                    index: choice.index,
+                    key,
+                    exact,
+                    filter,
+                    estimated_rows: cost_output_rows,
+                    access_rows: cost_access_rows,
+                    cost,
+                    possible_keys,
+                    covering: will_cover,
+                    hint_note: None,
+                    projected_columns: None,
+                }
             }
         }
         IndexAccessKind::MultiLookup { keys, exact } => {
@@ -11911,8 +11943,8 @@ fn choose_orderby_index_scan(
                         matched = false;
                         break;
                     };
-                    if crate::engine::expr_program::expr_fingerprint(ast)
-                        != crate::engine::expr_program::expr_fingerprint(&item.expr)
+                    if tuple_access::expression_fingerprint(ast)
+                        != tuple_access::expression_fingerprint(&item.expr)
                     {
                         matched = false;
                         break;
@@ -12070,8 +12102,8 @@ fn choose_groupby_index_scan(
                     }
                     Some(crate::storage::IndexKeyPart::Expression(expr_part)) => {
                         expr_part.ast.as_ref().is_some_and(|ast| {
-                            crate::engine::expr_program::expr_fingerprint(ast)
-                                == crate::engine::expr_program::expr_fingerprint(group_expr)
+                            tuple_access::expression_fingerprint(ast)
+                                == tuple_access::expression_fingerprint(group_expr)
                         })
                     }
                     None => false,
@@ -15130,7 +15162,7 @@ fn collect_index_expression_constraints(
                 if plan_constraint_is_null_literal(&value) {
                     return None;
                 }
-                let fp = crate::engine::expr_program::expr_fingerprint(target);
+                let fp = tuple_access::expression_fingerprint(target);
                 eq_values.insert(fp, value);
                 Some(())
             };
@@ -15147,12 +15179,12 @@ fn collect_index_expression_constraints(
             // as the "target" expression, the literal side as the bound.
             if expr_column_name(left).is_none() {
                 if let Some(value) = expr_to_plan_constraint(right) {
-                    let fp = crate::engine::expr_program::expr_fingerprint(left);
+                    let fp = tuple_access::expression_fingerprint(left);
                     record_expression_range(ranges, fp, *op, value);
                 }
             } else if expr_column_name(right).is_none() {
                 if let Some(value) = expr_to_plan_constraint(left) {
-                    let fp = crate::engine::expr_program::expr_fingerprint(right);
+                    let fp = tuple_access::expression_fingerprint(right);
                     record_expression_range(ranges, fp, flip_cmp(*op), value);
                 }
             }
@@ -15167,7 +15199,7 @@ fn collect_index_expression_constraints(
                 if let (Some(low), Some(high)) =
                     (expr_to_plan_constraint(low), expr_to_plan_constraint(high))
                 {
-                    let fp = crate::engine::expr_program::expr_fingerprint(expr);
+                    let fp = tuple_access::expression_fingerprint(expr);
                     record_expression_range(ranges, fp, BinaryOp::GtEq, low);
                     record_expression_range(ranges, fp, BinaryOp::LtEq, high);
                 }
@@ -15213,7 +15245,7 @@ fn collect_index_expression_constraints(
             // B12: hand the escape to the extractor so LIKE-under-ESCAPE
             // still yields a prefix; the extractor drops the special
             // char in-place and pushes the following literal.
-            let fp = crate::engine::expr_program::expr_fingerprint(expr);
+            let fp = tuple_access::expression_fingerprint(expr);
             let Some(shape) =
                 crate::engine::expr::analyze_like_sargable_pattern(&folded_pattern, *escape_char)
             else {
@@ -15589,7 +15621,7 @@ fn collect_index_expression_in_constraints(
                 return;
             };
             if !values.is_empty() {
-                let fp = crate::engine::expr_program::expr_fingerprint(expr);
+                let fp = tuple_access::expression_fingerprint(expr);
                 in_values.insert(fp, values);
             }
         }
@@ -17908,9 +17940,9 @@ fn index_nlj_dependent_range_fraction(
                 )
             })
         }
-        Some(crate::storage::IndexKeyPart::Expression(expr)) => Some(
-            crate::storage::ParamTarget::for_column(&expr.data_type, false),
-        ),
+        Some(crate::storage::IndexKeyPart::Expression(expr)) => {
+            Some(crate::storage::schema::index_expression_param_target(expr))
+        }
         None => None,
     };
     for pos in 0..eq_prefix_len {

@@ -368,14 +368,33 @@ impl Database {
             }
         }
         for name in index_names {
-            let index_id = journal.index_ids.get(name).copied().or_else(|| table.as_ref().and_then(|table|
-                table.indexes.iter().find(|index| index.name.eq_ignore_ascii_case(name)).map(|index| index.index_id)))
+            let index_id = journal
+                .index_ids
+                .get(name)
+                .copied()
+                .or_else(|| {
+                    table.as_ref().and_then(|table| {
+                        table
+                            .indexes
+                            .iter()
+                            .find(|index| index.name.eq_ignore_ascii_case(name))
+                            .map(|index| index.index_id)
+                    })
+                })
                 .unwrap_or_else(|| stable_missing_index_id(name));
             paths.extend(self.owned_vector_files_parts(sid, generation, index_id)?);
         }
         if self.durability_mode() != DurabilityMode::Memory {
             let mut last = 0;
-            for path in &paths { last = self.append_wal(0, WalPayload::FileDelete { path: self.relative_path(path), before: Vec::new() })?; }
+            for path in &paths {
+                last = self.append_wal(
+                    0,
+                    WalPayload::FileDelete {
+                        path: self.relative_path(path),
+                        before: Vec::new(),
+                    },
+                )?;
+            }
             crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         }
         let mut directories = std::collections::BTreeSet::new();
@@ -1665,7 +1684,7 @@ impl Database {
                     if let Some(parent) = to_abs.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    let _ = std::fs::rename(&from_abs, &to_abs);
+                    let _ = rename_owned_file(&from_abs, &to_abs);
                 }
             }
             self.forget_zone_map(journal.swapped_sid)?;

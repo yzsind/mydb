@@ -18,6 +18,10 @@ pub const DEFAULT_CHARSET: &str = "utf8mb4";
 pub const DEFAULT_COLLATION: &str = "utf8mb4_0900_ai_ci";
 pub const BINARY_COLLATION_ID: u16 = 63;
 pub const UTF8MB4_0900_AI_CI_ID: u16 = 255;
+// Audited against every packed DUCET entry; Hangul decomposition and
+// implicit weights also remain within this UTF-8 byte expansion bound.
+#[cfg(test)]
+pub(crate) const UCA9_PRIMARY_MAX_EXPANSION: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharsetInfo {
@@ -2146,6 +2150,28 @@ pub fn weight_string(value: &str, collation: Option<&str>) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len());
     write_collation_key_unicode_or_ascii(info, value, &mut out);
     out
+}
+
+pub(crate) fn uca9_primary_weights_into(value: &str, out: &mut Vec<u8>) {
+    out.clear();
+    uca9::primary_into(value, out);
+}
+
+/// A tight byte bound for UCA 9 primary weights. Almost every DUCET entry
+/// expands by at most four bytes per UTF-8 byte; the four larger expansions
+/// are counted explicitly. Packed-table tests audit this complete bound.
+pub(crate) fn uca9_primary_byte_bound(value: &[u8]) -> Option<usize> {
+    let mut bytes = value.len().checked_mul(4)?;
+    if memchr::memchr2(0xe3, 0xef, value).is_none() {
+        return Some(bytes);
+    }
+    for (scalar, extra) in uca9::PRIMARY_EXPANSION_EXCEPTIONS {
+        let mut utf8 = [0; 4];
+        let count =
+            memchr::memmem::find_iter(value, scalar.encode_utf8(&mut utf8).as_bytes()).count();
+        bytes = bytes.checked_add(count.checked_mul(*extra)?)?;
+    }
+    Some(bytes)
 }
 
 /// Four-level Czech sort key used by MySQL's legacy Czech collations.

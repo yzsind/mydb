@@ -125,7 +125,7 @@ fn recover_generation_files(
             let shadow = resolve(shadow)?;
             let live = resolve(live)?;
             if !live.exists() && shadow.exists() {
-                fs::rename(shadow, live).map_err(io_err)?;
+                rename_owned_file(shadow, live).map_err(io_err)?;
             }
         }
         for (old_live, backup) in old_to_backup {
@@ -140,7 +140,7 @@ fn recover_generation_files(
             let backup = resolve(backup)?;
             if backup.exists() {
                 let _ = fs::remove_file(&live);
-                fs::rename(backup, live).map_err(io_err)?;
+                rename_owned_file(backup, live).map_err(io_err)?;
             }
         }
         for (shadow, live_relative) in shadow_to_live {
@@ -207,7 +207,7 @@ impl Database {
         &self,
         table: &TableSchema,
     ) -> Result<bool, QueryError> {
-        if self.heap_page_count(table.id) != 0 {
+        if self.heap_page_count(table.id) > 1 {
             return Ok(false);
         }
         for index in &table.indexes {
@@ -233,8 +233,7 @@ impl Database {
 
         let shadow_id = {
             let mut catalog = self.catalog_write()?;
-            let id = catalog.next_table_id;
-            catalog.next_table_id = catalog.next_table_id.saturating_add(1);
+            let id = catalog.allocate_table_id()?;
             id
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
@@ -261,6 +260,7 @@ impl Database {
             self.unregister_reorg_storage_locs(&[shadow_id]);
             return Err(err);
         }
+        fs::write(&heap_path, encode_heap_meta(&heap_path, 1)).map_err(io_err)?;
         self.remove_heap_cache_entry(shadow_id)?;
         self.set_cached_heap_codec(shadow_id, table.row_codec.clone())?;
         self.with_heap_read(shadow_id, |heap| {

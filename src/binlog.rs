@@ -1288,6 +1288,35 @@ struct BinlogGlobal {
 }
 
 static GLOBAL: OnceLock<RwLock<BinlogGlobal>> = OnceLock::new();
+// Published while holding GLOBAL's write guard. Disabled recording and
+// savepoints need no shared global latch on the statement hot path.
+static MANAGER_ENABLED: AtomicBool = AtomicBool::new(false);
+static RETENTION_WORKER: parking_lot::Mutex<Option<RetentionWorker>> =
+    parking_lot::Mutex::new(None);
+
+struct RetentionWorker {
+    stop: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RetentionWorker {
+    fn drop(&mut self) {
+        *self.stop.0.lock() = true;
+        self.stop.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                crate::util::logging::log_message(
+                    "binlog retention worker panicked during shutdown",
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn shutdown_retention() {
+    let worker = RETENTION_WORKER.lock().take();
+    drop(worker);
+}
 static FALLBACK_CONFIG: OnceLock<BinlogConfig> = OnceLock::new();
 static COMMIT_GATE: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
 static GLOBAL_READ_LOCK: AtomicBool = AtomicBool::new(false);
@@ -1343,6 +1372,8 @@ pub fn config_from_env_defaults() -> BinlogConfig {
 }
 
 pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryError> {
+    shutdown_retention();
+    let mut retention_worker = None;
     let mut config = config.normalize();
     let manager = if config.enabled {
         Some(Arc::new(BinlogSourceManager::open(
@@ -1358,10 +1389,21 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
         config = manager.config.clone();
         if manager.config.retention_hours.is_some() || manager.config.retention_bytes.is_some() {
             let weak = Arc::downgrade(manager);
-            std::thread::Builder::new()
+            let stop = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+            let thread_stop = Arc::clone(&stop);
+            let thread = std::thread::Builder::new()
                 .name("binlog-retention".into())
                 .spawn(move || loop {
-                    std::thread::sleep(Duration::from_secs(60));
+                    let mut stopped = thread_stop.0.lock();
+                    if !*stopped {
+                        thread_stop
+                            .1
+                            .wait_for(&mut stopped, Duration::from_secs(60));
+                    }
+                    if *stopped {
+                        break;
+                    }
+                    drop(stopped);
                     let Some(manager) = weak.upgrade() else {
                         break;
                     };
@@ -1379,6 +1421,10 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
                         format!("start binlog retention: {err}"),
                     )
                 })?;
+            retention_worker = Some(RetentionWorker {
+                stop,
+                thread: Some(thread),
+            });
         }
     }
     let global = GLOBAL.get_or_init(|| {
@@ -1394,6 +1440,9 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
         )
     })?;
     *guard = BinlogGlobal { config, manager };
+    MANAGER_ENABLED.store(guard.manager.is_some(), Ordering::Release);
+    drop(guard);
+    *RETENTION_WORKER.lock() = retention_worker;
     Ok(())
 }
 
@@ -1626,7 +1675,7 @@ pub fn validate_binlog_transaction_compression(value: &str) -> Result<(), QueryE
 }
 
 pub fn enabled() -> bool {
-    manager().is_some()
+    MANAGER_ENABLED.load(Ordering::Acquire)
 }
 
 pub fn should_record_table_rows(table: &TableSchema) -> bool {
@@ -1634,6 +1683,9 @@ pub fn should_record_table_rows(table: &TableSchema) -> bool {
 }
 
 pub fn manager() -> Option<Arc<BinlogSourceManager>> {
+    if !enabled() {
+        return None;
+    }
     GLOBAL
         .get()
         .and_then(|lock| lock.read().ok().and_then(|guard| guard.manager.clone()))
@@ -2635,6 +2687,11 @@ pub(crate) fn recover_before_checkpoint(data_dir: &Path) -> Result<(), QueryErro
     Ok(())
 }
 
+pub(crate) fn validate_persisted_format(data_dir: &Path) -> Result<(), QueryError> {
+    read_manifest_file(&data_dir.join("binlog/manifest.json"))?;
+    Ok(())
+}
+
 impl BinlogSourceManager {
     fn open(data_dir: PathBuf, mut config: BinlogConfig) -> Result<Self, QueryError> {
         let dir = data_dir.join("binlog");
@@ -3154,7 +3211,12 @@ impl BinlogSourceManager {
     ///    checksum-algorithm descriptor byte. Without this, the SQL
     ///    thread defaults to NONE-checksum and chokes on the CRC32
     ///    trailer attached to every subsequent event.
-    pub fn dump_preamble(&self, file: &str, start_position: u64) -> Vec<Vec<u8>> {
+    pub fn dump_preamble(
+        &self,
+        file: &str,
+        start_position: u64,
+        initial_checksum: BinlogChecksum,
+    ) -> Vec<Vec<u8>> {
         let state = self.state.lock();
         let target_file = if file.is_empty() {
             state.active_file.clone()
@@ -3176,9 +3238,20 @@ impl BinlogSourceManager {
         let mut rotate_payload = Vec::with_capacity(8 + target_file.len());
         rotate_payload.extend_from_slice(&start_position.max(4).to_le_bytes());
         rotate_payload.extend_from_slice(target_file.as_bytes());
-        let mut rotate =
-            encode_event_with_timestamp(&self.config, ROTATE_EVENT, 0, 0, &rotate_payload, false);
-        mark_dump_event_artificial(&mut rotate, self.config.checksum == BinlogChecksum::Crc32);
+        // Before the FDE, the client only knows its negotiated checksum.
+        // Appending the source's CRC unconditionally makes raw clients treat
+        // four checksum bytes as part of the artificial rotate's filename.
+        let mut initial_config = self.config.clone();
+        initial_config.checksum = initial_checksum;
+        let mut rotate = encode_event_with_timestamp(
+            &initial_config,
+            ROTATE_EVENT,
+            0,
+            0,
+            &rotate_payload,
+            false,
+        );
+        mark_dump_event_artificial(&mut rotate, initial_checksum == BinlogChecksum::Crc32);
         out.push(rotate);
         // At file start the real FDE is already the next event. Mid-file
         // requests need a synthetic FDE to negotiate the checksum first.
@@ -6801,6 +6874,7 @@ fn read_index_file(path: &Path) -> Result<Vec<String>, QueryError> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BinlogManifest {
     version: u32,
     active_file: String,
@@ -6821,7 +6895,7 @@ fn read_manifest_file(path: &Path) -> Result<Option<BinlogManifest>, QueryError>
         return Ok(None);
     }
     let bytes = fs::read(path).map_err(io_error)?;
-    let manifest = serde_json::from_slice(&bytes).map_err(|err| {
+    let manifest: BinlogManifest = serde_json::from_slice(&bytes).map_err(|err| {
         error(
             crate::error::catalog::ER_UNKNOWN_ERROR,
             format!(
@@ -6830,6 +6904,12 @@ fn read_manifest_file(path: &Path) -> Result<Option<BinlogManifest>, QueryError>
             ),
         )
     })?;
+    if manifest.version != crate::storage::format_versions::BINLOG_MANIFEST_VERSION {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            format!("unsupported binlog manifest version {}", manifest.version),
+        ));
+    }
     Ok(Some(manifest))
 }
 
@@ -6862,7 +6942,7 @@ fn write_manifest_file(
         config: &'a BinlogConfig,
     }
     let manifest = Manifest {
-        version: 2,
+        version: crate::storage::format_versions::BINLOG_MANIFEST_VERSION,
         active_file,
         active_position: active_pos,
         gtid_executed,
@@ -7063,6 +7143,30 @@ fn env_value_truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_format_binlog_rejects_future_manifest_without_rewriting() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let path = dir.path().join("manifest.json");
+        write_manifest_file(
+            &path,
+            &test_config(dir.path()),
+            "binlog.000001",
+            4,
+            "",
+            "",
+            1,
+            1,
+        )
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["version"] = 999.into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_manifest_file(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
     use super::*;
 
     #[test]
@@ -8547,7 +8651,7 @@ mod tests {
         let manager =
             BinlogSourceManager::open(dir.path().to_path_buf(), test_config(dir.path())).unwrap();
         let file = manager.current_position().unwrap().file;
-        let preamble = manager.dump_preamble(&file, 4);
+        let preamble = manager.dump_preamble(&file, 4, BinlogChecksum::Crc32);
         assert_eq!(preamble.len(), 1);
         let rotate = &preamble[0];
         assert_eq!(rotate[4], ROTATE_EVENT);
@@ -8556,7 +8660,7 @@ mod tests {
         assert_eq!(u64::from_le_bytes(rotate[19..27].try_into().unwrap()), 4);
         let events = manager.events_after(&file, 4).unwrap();
         assert_eq!(events[0].bytes[4], FORMAT_DESCRIPTION_EVENT);
-        let middle = manager.dump_preamble(&file, 1234);
+        let middle = manager.dump_preamble(&file, 1234, BinlogChecksum::Crc32);
         assert_eq!(middle.len(), 2);
         assert_eq!(middle[1][4], FORMAT_DESCRIPTION_EVENT);
         for event in &middle {

@@ -574,6 +574,7 @@ fn collect_files<'a>(
         "objects",
         "system/catalog",
         "system/undo",
+        "system/object-owners",
         "system/xa-binlog",
     ] {
         collect_tree(data_dir, &data_dir.join(root), &mut files)?;
@@ -581,6 +582,7 @@ fn collect_files<'a>(
     for relative in [
         "system/commit-ledger.v1",
         "system/commit-clock.v1",
+        "system/storage.control",
         "system/history-index.v1",
         "system/tablespaces.json",
         "system/zone-map-checkpoint.manifest",
@@ -1454,12 +1456,14 @@ fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
         || relative.starts_with("objects/")
         || relative.starts_with("system/catalog/")
         || relative.starts_with("system/undo/")
+        || relative.starts_with("system/object-owners/")
         || relative.starts_with("system/xa-binlog/")
         || relative.starts_with("system/wal/")
         || matches!(
             relative,
             "system/commit-ledger.v1"
                 | "system/commit-clock.v1"
+                | "system/storage.control"
                 | "system/history-index.v1"
                 | "system/tablespaces.json"
                 | "system/zone-map-checkpoint.manifest"
@@ -1846,11 +1850,16 @@ pub fn cli_main(args: Vec<String>) -> Result<(), QueryError> {
 pub struct BackupStartupGuard {
     _lock: crate::storage::dir_lock::DataDirLock,
 }
-pub fn prepare_archive_retention(root: &Path) -> Result<BackupStartupGuard, QueryError> {
-    // A first server boot reaches this guard before storage creates its tree.
+pub fn lock_data_directory(root: &Path) -> Result<BackupStartupGuard, QueryError> {
     fs::create_dir_all(crate::storage::naming::system_dir(root))
         .map_err(|e| io_err("create startup lock directory", e))?;
-    let lock = crate::storage::dir_lock::DataDirLock::acquire(root)?;
+    Ok(BackupStartupGuard {
+        _lock: crate::storage::dir_lock::DataDirLock::acquire(root)?,
+    })
+}
+
+pub fn prepare_archive_retention(root: &Path) -> Result<BackupStartupGuard, QueryError> {
+    let guard = lock_data_directory(root)?;
     DirectoryOperation::cleanup(
         &root.join("system/backup-generation-pins"),
         "generation-pins",
@@ -1893,7 +1902,7 @@ pub fn prepare_archive_retention(root: &Path) -> Result<BackupStartupGuard, Quer
     {
         capture.set_lease("archive", None)?;
     }
-    Ok(BackupStartupGuard { _lock: lock })
+    Ok(guard)
 }
 pub fn init_background_archiver(db: Arc<Database>) -> Result<(), QueryError> {
     coordinator::Coordinator::get(&db).map(|_| ())

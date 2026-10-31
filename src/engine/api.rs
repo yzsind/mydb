@@ -222,6 +222,9 @@ thread_local! {
     /// sink in every producer; the result cursor drains it at the batch
     /// boundary before returning rows to the connection thread.
     static STATEMENT_WARNING_SINK: std::cell::RefCell<Option<StatementWarningSink>> = const { std::cell::RefCell::new(None) };
+    /// One idle, exclusively-owned coordinator sink per executor thread.
+    /// Deferred cursors/workers keep their own Arc and cannot enter this slot.
+    static IDLE_STATEMENT_WARNING_SINK: std::cell::RefCell<Option<StatementWarningSink>> = const { std::cell::RefCell::new(None) };
     static STATEMENT_WARNING_BATCH: std::cell::RefCell<Option<SqlWarnings>> = const { std::cell::RefCell::new(None) };
     static STATEMENT_INSERT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STATEMENT_OK_INSERT_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -479,6 +482,20 @@ thread_local! {
 
 pub(crate) fn clear_statement_now_freeze() {
     STMT_NOW_MICROS.with(|c| c.set(None));
+}
+
+/// Install the invoking statement's clock on a reusable worker thread.
+/// Nested operators and unwinding restore the worker's preceding context.
+pub(crate) struct StatementNowScope(Option<i64>);
+impl StatementNowScope {
+    pub(crate) fn enter(micros: i64) -> Self {
+        Self(STMT_NOW_MICROS.with(|slot| slot.replace(Some(micros))))
+    }
+}
+impl Drop for StatementNowScope {
+    fn drop(&mut self) {
+        STMT_NOW_MICROS.with(|slot| slot.set(self.0));
+    }
 }
 
 /// Read the statement-frozen UTC now, computing and caching on first
@@ -756,7 +773,23 @@ pub(crate) struct StatementWarningSinkScope {
 
 impl StatementWarningSinkScope {
     pub(crate) fn enter() -> Self {
-        let sink = current_statement_warning_sink().unwrap_or_default();
+        let sink = current_statement_warning_sink().unwrap_or_else(|| {
+            let mut sink = IDLE_STATEMENT_WARNING_SINK
+                .with(|slot| slot.borrow_mut().take())
+                .unwrap_or_default();
+            let state = std::sync::Arc::get_mut(&mut sink.0)
+                .expect("idle warning sink is exclusively owned");
+            // Drop any diagnostic payload from an unwound statement, and
+            // bound the retained dedup allocation independently of its size.
+            *state.warnings.get_mut() = SqlWarnings::new();
+            let once = state.once.get_mut();
+            if once.capacity() > 64 {
+                *once = Default::default();
+            } else {
+                once.clear();
+            }
+            sink
+        });
         let previous = STATEMENT_WARNING_SINK.with(|slot| slot.borrow_mut().replace(sink.clone()));
         Self { previous, sink }
     }
@@ -780,9 +813,19 @@ impl StatementWarningSinkScope {
 
 impl Drop for StatementWarningSinkScope {
     fn drop(&mut self) {
-        STATEMENT_WARNING_SINK.with(|slot| {
-            *slot.borrow_mut() = self.previous.take();
-        });
+        let root = self.previous.is_none();
+        let installed = STATEMENT_WARNING_SINK
+            .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), self.previous.take()));
+        if let Some(installed) = installed {
+            // These two references are the installed sink and this guard.
+            // Any outstanding worker/cursor forbids recycling its diagnostics.
+            if root
+                && std::sync::Arc::strong_count(&installed.0) == 2
+                && std::sync::Arc::ptr_eq(&installed.0, &self.sink.0)
+            {
+                IDLE_STATEMENT_WARNING_SINK.with(|slot| *slot.borrow_mut() = Some(installed));
+            }
+        }
     }
 }
 
@@ -1527,6 +1570,7 @@ pub(crate) struct PreparedLockingPointRead {
 /// parameters by the normal index lookup path.
 #[derive(Debug)]
 pub(crate) struct PreparedPointWrite {
+    pub(crate) needs_temporal_validation: bool,
     pub(crate) table: Arc<TableSchema>,
     pub(crate) index: IndexSchema,
     pub(crate) key: IndexKey,
@@ -2173,6 +2217,9 @@ pub struct SessionContext {
     /// Unlike the SQL SYSTEM_USER dynamic privilege this cannot be granted by
     /// SQL and is the sole blanket authorization bypass.
     pub internal_system_session: bool,
+    /// Disconnect cleanup can retry after an error or panic without releasing
+    /// another live connection's account charge.
+    pub(crate) connection_quota_released: bool,
     pub connection_id: u32,
     /// Per-connection MySQL status counters. Protocol sessions install a
     /// governed shared object before the handshake; embedded callers leave it
@@ -3069,6 +3116,7 @@ impl SessionContext {
             account_limits: ResourceLimits::default(),
             current_user_is_system: false,
             internal_system_session: false,
+            connection_quota_released: false,
             connection_id: 1,
             status: None,
             ssl_cipher: None,
@@ -3710,4 +3758,48 @@ pub(crate) fn with_frozen_statement_time<R>(micros: i64, f: impl FnOnce() -> R) 
     }
     let _restore = Restore(STMT_NOW_MICROS.with(|c| c.replace(Some(micros))));
     f()
+}
+
+#[cfg(test)]
+mod warning_sink_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn idle_warning_sink_reuses_only_exclusive_root_and_clears_once_identity() {
+        std::thread::spawn(|| {
+            let address = {
+                let root = StatementWarningSinkScope::enter();
+                assert_eq!(
+                    shared_statement_warning_should_publish(1, 1265, "old"),
+                    Some(true)
+                );
+                let nested = StatementWarningSinkScope::enter();
+                assert!(Arc::ptr_eq(&root.sink.0, &nested.sink.0));
+                Arc::as_ptr(&root.sink.0)
+            };
+            let root = StatementWarningSinkScope::enter();
+            assert_eq!(Arc::as_ptr(&root.sink.0), address);
+            assert_eq!(
+                shared_statement_warning_should_publish(1, 1265, "old"),
+                Some(true)
+            );
+            let deferred = current_statement_warning_sink().unwrap();
+            drop(root);
+            let next = StatementWarningSinkScope::enter();
+            assert!(!Arc::ptr_eq(&next.sink.0, &deferred.0));
+            assert_eq!(
+                shared_statement_warning_should_publish(1, 1265, "old"),
+                Some(true)
+            );
+            drop(next);
+            with_statement_warning_sink(deferred, || {
+                assert_eq!(
+                    shared_statement_warning_should_publish(1, 1265, "old"),
+                    Some(false)
+                );
+            });
+        })
+        .join()
+        .unwrap();
+    }
 }

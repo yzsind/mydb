@@ -89,10 +89,15 @@ impl VectorInput for Vec<u8> {
 #[repr(u8)]
 pub enum VectorDataType {
     #[default]
+    #[serde(rename = "Float32")]
     Float32 = 0,
+    #[serde(rename = "Float16")]
     Float16 = 1,
+    #[serde(rename = "BFloat16")]
     BFloat16 = 2,
+    #[serde(rename = "Int8")]
     Int8 = 3,
+    #[serde(rename = "Binary")]
     Binary = 4,
 }
 
@@ -198,7 +203,12 @@ impl VectorValue {
     /// Standalone values carry type information; fixed heap lanes use only payload.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(12 + self.payload.len());
-        out.extend_from_slice(&[1, self.datatype as u8, 0, 0]);
+        out.extend_from_slice(&[
+            crate::storage::format_versions::NATIVE_VECTOR_VALUE_VERSION,
+            self.datatype as u8,
+            0,
+            0,
+        ]);
         out.extend_from_slice(&self.dimension.to_le_bytes());
         out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.payload);
@@ -206,7 +216,10 @@ impl VectorValue {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 12 || bytes[0] != 1 || bytes[2..4] != [0, 0] {
+        if bytes.len() < 12
+            || bytes[0] != crate::storage::format_versions::NATIVE_VECTOR_VALUE_VERSION
+            || bytes[2..4] != [0, 0]
+        {
             return None;
         }
         let datatype = VectorDataType::from_tag(bytes[1])?;

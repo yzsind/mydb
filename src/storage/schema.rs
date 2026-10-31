@@ -178,6 +178,20 @@ pub struct Catalog {
     pub(crate) ai: Arc<crate::engine::ai::AiCatalog>,
 }
 
+impl Catalog {
+    pub(crate) fn allocate_table_id(&mut self) -> Result<u64, QueryError> {
+        let id = self.next_table_id;
+        if id == 0 || id >= crate::storage::data_dictionary::DD_TABLE_ID_BASE {
+            return Err(crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "table/storage identity space exhausted",
+            ));
+        }
+        self.next_table_id = id + 1;
+        Ok(id)
+    }
+}
+
 /// Rebuild every table's foreign-key runtime caches from the persisted
 /// `foreign_keys` of all tables: resolves each FK's `child_col_idx`, and
 /// denormalizes the reverse index (`fk_referenced_by`) onto each parent
@@ -1059,7 +1073,7 @@ pub enum RowLayoutState {
 pub struct RowLayoutColumnSchema {
     pub column_id: u32,
     pub physical_pos: u32,
-    pub codec_kind: String,
+    pub codec_kind: crate::storage::RowCodecSpec,
     #[serde(default)]
     pub fixed_offset: Option<u32>,
     #[serde(default)]
@@ -1097,7 +1111,11 @@ impl TableSchema {
         let primary_key = match name {
             "schemata" => vec!["name"],
             "tables" => vec!["id"],
-            "table_stats" => vec!["table_id"],
+            "table_stats" => vec!["table_id", "scope_id"],
+            "column_stats" => vec!["table_id", "scope_id", "column_id"],
+            "index_stats" => vec!["table_id", "scope_id", "index_id"],
+            "extended_stats" => vec!["table_id", "scope_id", "kind", "ordinal"],
+            "column_histograms" => vec!["table_id", "column_id"],
             "innodb_dynamic_metadata" => vec!["table_id"],
             "mydb_ddl_retirements" => vec!["table_id", "generation", "index_id"],
             "columns" => vec!["table_id", "column_id"],
@@ -1481,7 +1499,7 @@ impl TableSchema {
 
     /// Publish a heap-row decoder for subsequent writes, reusing an identical
     /// retained format when possible. Existing formats remain readable.
-    pub fn publish_new_row_layout(&mut self) {
+    pub fn publish_new_row_layout(&mut self) -> Result<(), QueryError> {
         let mut candidate = build_row_layout_schema(0, RowLayoutState::Active, &self.columns);
         // Physical NULL capacity may outlive logical nullability. Reserving
         // its existing bits keeps the same decoder usable for old snapshots,
@@ -1514,7 +1532,7 @@ impl TableSchema {
                     layout.state = RowLayoutState::Readable;
                 }
             }
-            return;
+            return Ok(());
         }
         // Reactivating an older ID must not allow the next allocation to
         // collide with a newer retained layout that has a different decoder.
@@ -1525,8 +1543,13 @@ impl TableSchema {
             .max()
             .unwrap_or(self.active_layout_id)
             .max(self.active_layout_id)
-            .saturating_add(1)
-            .max(default_row_layout_id());
+            .checked_add(1)
+            .ok_or_else(|| {
+                crate::storage::error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "row layout identity space exhausted",
+                )
+            })?;
         for layout in &mut self.row_layouts {
             if layout.state == RowLayoutState::Active {
                 layout.state = RowLayoutState::Readable;
@@ -1534,6 +1557,7 @@ impl TableSchema {
         }
         candidate.layout_id = self.active_layout_id;
         self.row_layouts.push(candidate);
+        Ok(())
     }
 
     /// Collapse `row_layouts` down to just the current Active layout,
@@ -1634,6 +1658,7 @@ impl TableSchema {
                 Option<Expr>,
                 Option<crate::engine::expr_program::CompiledTableExpr>,
                 Vec<String>,
+                Option<u16>,
             )>,
         > = self
             .indexes
@@ -1659,17 +1684,25 @@ impl TableSchema {
                             } else {
                                 expr_part.referenced_columns.clone()
                             };
-                            (ast, program, refs)
+                            let collation = expr_part.collation_id.or_else(|| {
+                                ast.as_ref()
+                                    .and_then(|ast| crate::engine::expr::expr_collation(ast, self))
+                                    .map(|c| c.collation_id)
+                            });
+                            (ast, program, refs, collation)
                         }
-                        None => (None, None, Vec::new()),
+                        None => (None, None, Vec::new(), None),
                     })
                     .collect()
             })
             .collect();
         for (index, slots) in self.indexes.iter_mut().zip(runtime) {
-            for (slot, (ast, program, refs)) in index.key_expressions.iter_mut().zip(slots) {
+            for (slot, (ast, program, refs, collation_id)) in
+                index.key_expressions.iter_mut().zip(slots)
+            {
                 if let Some(expr_part) = slot.as_mut() {
                     expr_part.ast = ast;
+                    expr_part.collation_id = collation_id;
                     expr_part.program = program;
                     if expr_part.referenced_columns.is_empty() {
                         expr_part.referenced_columns = refs;
@@ -1712,8 +1745,13 @@ impl TableSchema {
             .iter()
             .map(|(cols, slots)| compile_index_key_expressions(self, cols, slots))
             .collect::<Result<Vec<_>, _>>()?;
-        for (index, new_slots) in self.indexes.iter_mut().zip(compiled) {
+        for (index, mut new_slots) in self.indexes.iter_mut().zip(compiled) {
             if !new_slots.is_empty() {
+                for (old, new) in index.key_expressions.iter().zip(&mut new_slots) {
+                    if let (Some(old), Some(new)) = (old, new) {
+                        new.collation_id = old.collation_id.or(new.collation_id);
+                    }
+                }
                 index.key_expressions = new_slots;
             }
             index.validate_multi_valued_definition()?;
@@ -1803,13 +1841,18 @@ impl TableSchema {
     /// Allocate a fresh [`ColumnSchema::column_id`]. Caller is responsible
     /// for ensuring `build_column_index` has been run at least once so
     /// `next_column_id` is non-zero.
-    pub fn allocate_column_id(&mut self) -> u32 {
+    pub fn allocate_column_id(&mut self) -> Result<u32, QueryError> {
         if self.next_column_id == 0 {
             self.next_column_id = 1;
         }
         let id = self.next_column_id;
-        self.next_column_id = self.next_column_id.saturating_add(1);
-        id
+        self.next_column_id = self.next_column_id.checked_add(1).ok_or_else(|| {
+            crate::storage::error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "column identity space exhausted",
+            )
+        })?;
+        Ok(id)
     }
 
     /// Next free physical slot for a newly added column. Equals
@@ -1817,12 +1860,19 @@ impl TableSchema {
     /// table is empty. New columns are appended at the tail of the row
     /// payload — never inserted in the middle — so existing rows keep
     /// their layout and `ADD COLUMN` stays INSTANT.
-    pub fn next_physical_pos(&self) -> u32 {
+    pub fn next_physical_pos(&self) -> Result<u32, QueryError> {
         self.columns
             .iter()
             .map(|c| c.physical_pos)
             .max()
-            .map_or(0, |m| m.saturating_add(1))
+            .map_or(Ok(0), |m| {
+                m.checked_add(1).ok_or_else(|| {
+                    crate::storage::error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "column physical position space exhausted",
+                    )
+                })
+            })
     }
 
     /// Bump `schema_version` by one. DDL that mutates this table's structure
@@ -1934,8 +1984,8 @@ fn build_row_layout_schema(
     }
 }
 
-fn row_layout_codec_kind(data_type: &DataTypeKind, unsigned: bool) -> String {
-    format!("{:?}:{}", data_type, if unsigned { "u" } else { "s" })
+fn row_layout_codec_kind(data_type: &DataTypeKind, unsigned: bool) -> crate::storage::RowCodecSpec {
+    super::core::row_codec_spec(data_type, unsigned)
 }
 
 fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
@@ -2305,6 +2355,9 @@ pub struct IndexExpression {
     /// disk because Expr is not stable across releases.
     #[serde(skip)]
     pub(crate) ast: Option<Expr>,
+    /// Result collation fixed at DDL time, shared by writes and probes.
+    #[serde(default)]
+    pub(crate) collation_id: Option<u16>,
     /// Compiled program over the table row, rebuilt alongside `ast`.
     #[serde(skip)]
     pub(crate) program: Option<crate::engine::expr_program::CompiledTableExpr>,
@@ -2346,7 +2399,16 @@ pub(crate) fn index_expression_param_target(expr: &IndexExpression) -> ParamTarg
             }
         }
     }
-    ParamTarget::for_column(&expr.data_type, false)
+    match (
+        ParamTarget::for_column(&expr.data_type, false),
+        expr.collation_id,
+    ) {
+        (ParamTarget::String, Some(collation_id)) => ParamTarget::CollatedString { collation_id },
+        (ParamTarget::CharString, Some(collation_id)) => {
+            ParamTarget::CollatedCharString { collation_id }
+        }
+        (target, _) => target,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2801,16 +2863,24 @@ impl GeometrySubtype {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DataTypeKind {
+    #[serde(rename = "TinyInt")]
     TinyInt,
+    #[serde(rename = "SmallInt")]
     SmallInt,
+    #[serde(rename = "MediumInt")]
     MediumInt,
+    #[serde(rename = "Int")]
     Int,
+    #[serde(rename = "BigInt")]
     BigInt,
+    #[serde(rename = "Bool")]
     Bool,
     /// `FLOAT[(M[,D])]` — the optional `(precision, scale)` is the
     /// declared display width / decimals carried for SHOW COLUMNS and
     /// information_schema. Storage is still 4-byte IEEE-754 regardless.
+    #[serde(rename = "Float")]
     Float {
         #[serde(default)]
         precision: Option<u8>,
@@ -2818,61 +2888,58 @@ pub enum DataTypeKind {
         scale: Option<u8>,
     },
     /// `DOUBLE[(M[,D])]` — see [`DataTypeKind::Float`]. 8-byte storage.
+    #[serde(rename = "Double")]
     Double {
         #[serde(default)]
         precision: Option<u8>,
         #[serde(default)]
         scale: Option<u8>,
     },
+    #[serde(rename = "Decimal")]
     Decimal {
         precision: Option<u8>,
         scale: Option<u8>,
     },
-    Char {
-        len: Option<usize>,
-    },
-    VarChar {
-        len: Option<usize>,
-    },
-    Binary {
-        len: Option<usize>,
-    },
-    VarBinary {
-        len: Option<usize>,
-    },
+    #[serde(rename = "Char")]
+    Char { len: Option<usize> },
+    #[serde(rename = "VarChar")]
+    VarChar { len: Option<usize> },
+    #[serde(rename = "Binary")]
+    Binary { len: Option<usize> },
+    #[serde(rename = "VarBinary")]
+    VarBinary { len: Option<usize> },
     /// TEXT family (character). `max_len` is the byte cap per the
     /// declared size (TINYTEXT=255, TEXT=65535, MEDIUMTEXT=16M-1,
     /// LONGTEXT=4G-1).
-    Text {
-        max_len: u32,
-    },
+    #[serde(rename = "Text")]
+    Text { max_len: u32 },
     /// BLOB family (binary). `max_len` is the byte cap per the declared
     /// size (TINYBLOB=255 … LONGBLOB=4G-1).
-    Blob {
-        max_len: u32,
-    },
+    #[serde(rename = "Blob")]
+    Blob { max_len: u32 },
+    #[serde(rename = "Date")]
     Date,
     /// `TIME[(fsp)]` — `fsp` is the declared fractional-seconds precision
     /// (0..=6). Writers round the i64-microsecond payload half-away-from-zero
     /// to the corresponding multiple of `10^(6-fsp)` before storing (MySQL
     /// 5.6.4+ default; `TIME_TRUNCATE_FRACTIONAL` switches to truncation), so a
     /// `TIME(0)` column never round-trips a non-zero microsecond fragment.
-    Time {
-        fsp: u8,
-    },
+    #[serde(rename = "Time")]
+    Time { fsp: u8 },
     /// `DATETIME[(fsp)]` — see [`DataTypeKind::Time { .. }`].
-    DateTime {
-        fsp: u8,
-    },
+    #[serde(rename = "DateTime")]
+    DateTime { fsp: u8 },
     /// `TIMESTAMP[(fsp)]` — see [`DataTypeKind::Time { .. }`].
-    Timestamp {
-        fsp: u8,
-    },
+    #[serde(rename = "Timestamp")]
+    Timestamp { fsp: u8 },
+    #[serde(rename = "Year")]
     Year,
+    #[serde(rename = "Json")]
     Json,
     /// `GEOMETRY` / `POINT` / `POLYGON` / … — stored as internal `SRID + WKB`
     /// bytes (`ColumnKind::Geometry`). `srid` is the optional column SRID
     /// constraint (MySQL 8.0 `... SRID n`); `None` means unconstrained.
+    #[serde(rename = "Geometry")]
     Geometry {
         subtype: GeometrySubtype,
         srid: Option<u32>,
@@ -2881,19 +2948,17 @@ pub enum DataTypeKind {
     /// internal little-endian bytes (`ColumnKind::Vector`). `dim` is the
     /// declared dimension constraint; `None` means unconstrained (any
     /// dimension accepted).
+    #[serde(rename = "Vector")]
     Vector {
         dim: Option<u32>,
         datatype: crate::vector::VectorDataType,
     },
-    Enum {
-        values: Vec<String>,
-    },
-    Set {
-        values: Vec<String>,
-    },
-    Bit {
-        len: Option<usize>,
-    },
+    #[serde(rename = "Enum")]
+    Enum { values: Vec<String> },
+    #[serde(rename = "Set")]
+    Set { values: Vec<String> },
+    #[serde(rename = "Bit")]
+    Bit { len: Option<usize> },
 }
 
 /// Convert result-set metadata back into the in-memory type descriptor used by
@@ -3388,6 +3453,28 @@ fn cmp_uniform_numeric_key_parts(
 }
 
 impl IndexKey {
+    /// Owned payload retained by an execution-local key batch. Inline key
+    /// parts need no heap reservation; variable-width components do.
+    pub(crate) fn heap_capacity_bytes(&self) -> usize {
+        let parts = if self.0.spilled() {
+            self.0
+                .capacity()
+                .saturating_mul(std::mem::size_of::<KeyPart>())
+        } else {
+            0
+        };
+        self.0.iter().fold(parts, |bytes, part| {
+            bytes.saturating_add(match part {
+                KeyPart::Bytes(value) => value.capacity(),
+                KeyPart::String(value) | KeyPart::CollatedString { value, .. } => value.capacity(),
+                KeyPart::DecimalWide { value, .. } => {
+                    (value.bits().div_ceil(64) as usize).saturating_mul(16)
+                }
+                _ => 0,
+            })
+        })
+    }
+
     /// Ordering equality can hide a changed covering-index payload (case,
     /// accents or PAD SPACE). Maintenance must preserve the original text.
     #[inline]
@@ -4313,6 +4400,13 @@ impl TableSchema {
         let include_invisible = invisible_indexes_enabled();
         self.indexes.iter().filter(move |idx| {
             idx.state == IndexState::Public && (idx.visible || include_invisible)
+                // A writer-session TIMESTAMP conversion cannot provide a
+                // reader-session predicate or ordering. Retain the index for
+                // maintenance but never let a hint bypass this safety guard.
+                && !idx.key_expressions.iter().flatten().any(|part|
+                    part.referenced_columns.iter().any(|name|
+                        self.column_index(name).ok().is_some_and(|i|
+                            matches!(self.columns[i].data_type, DataTypeKind::Timestamp { .. }))))
         })
     }
 
@@ -4671,7 +4765,18 @@ impl TableSchema {
                 "multi-valued index requires an ARRAY expression key part",
             ));
         };
-        let elements = self.eval_multi_valued_index_expression(expr_part, values)?;
+        let elements = self
+            .eval_multi_valued_index_expression(expr_part, values)
+            .map_err(|err| {
+                if err.is_any(&[
+                    crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_FUNC_INDEX,
+                    crate::error::catalog::ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX,
+                ]) {
+                    err.map_message(|message| format!("{message} '{}'", index.name))
+                } else {
+                    err
+                }
+            })?;
         let mut keys = Vec::new();
         for element in elements {
             let mut parts = SmallVec::<[KeyPart; 4]>::new();
@@ -4886,11 +4991,28 @@ impl TableSchema {
         expr: &IndexExpression,
         values: &[Value],
     ) -> Result<Value, QueryError> {
-        if let Some(program) = expr.program.as_ref() {
-            return program.eval(self, values);
-        }
-        if let Some(ast) = expr.ast.as_ref() {
-            return crate::engine::expr::eval_expr_legacy(ast, self, values);
+        let _dml = crate::engine::expr::DmlExpressionGuard::new();
+        let result = if let Some(program) = expr.program.as_ref() {
+            Some(program.eval(self, values))
+        } else {
+            expr.ast
+                .as_ref()
+                .map(|ast| crate::engine::expr::eval_expr_legacy(ast, self, values))
+        };
+        if let Some(result) = result {
+            return result.map_err(|err| {
+                if err.is_any(&[
+                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
+                ]) {
+                    crate::error::catalog::ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX.error(format!(
+                        "Data truncated for functional index expression '{}'",
+                        expr.expr_sql
+                    ))
+                } else {
+                    err
+                }
+            });
         }
         Err(error(
             crate::error::catalog::ER_UNKNOWN_ERROR,
@@ -5386,40 +5508,30 @@ fn multi_valued_index_elements(value: &Value) -> Result<Vec<Value>, QueryError> 
     if matches!(value, Value::Null) {
         return Ok(Vec::new());
     }
-    let dom = match value {
-        Value::Json(bytes) => crate::engine::json::to_serde(bytes)?,
+    let bytes = match value {
+        Value::Json(bytes) => bytes.clone(),
         other => {
-            serde_json::from_str::<serde_json::Value>(&other.to_display_string()).map_err(|_| {
-                error(
-                    crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
-                    "multi-valued index expression did not return JSON",
-                )
-            })?
+            crate::engine::json::parse_text(&other.to_display_string(), 1, "multi-valued index")?
         }
     };
-    match dom {
-        serde_json::Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                if item.is_null() {
-                    continue;
-                }
-                out.push(Value::Json(crate::engine::json::from_serde(&item)));
-            }
-            Ok(out)
-        }
-        // M2/P2-11: a scalar `MEMBER OF (j->'$.tag')` treats `j->'$.tag'` as
-        // a single-element array (matches MySQL 8.0 top-level MEMBER OF
-        // semantics: `SELECT 42 MEMBER OF ('42' -> '$')` is TRUE). The
-        // previous silent `Ok(Vec::new())` made every MEMBER OF on a
-        // scalar-valued path return no rows without any warning.
-        serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::Object(_) => Err(error(
+    let root = crate::engine::json::JsonbRef::new(&bytes)?;
+    if root.is_array() {
+        return Ok(root
+            .array_iter()
+            .filter(|node| !node.is_null())
+            .map(|node| Value::Json(node.to_owned_bytes()))
+            .collect());
+    }
+    if root.is_null() {
+        return Ok(Vec::new());
+    }
+    if root.is_object() {
+        return Err(error(
             crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
             "multi-valued index expression did not return a JSON array or scalar",
-        )),
-        scalar => Ok(vec![Value::Json(crate::engine::json::from_serde(&scalar))]),
+        ));
     }
+    Ok(vec![Value::Json(bytes)])
 }
 
 fn cast_multi_valued_index_element(value: Value, target: &str) -> Result<Value, QueryError> {
@@ -5516,14 +5628,14 @@ fn cast_mvi_int(value: &Value, unsigned: bool) -> Result<Value, QueryError> {
             let Some(txt) = r.number_text() else {
                 return Err(mvi_cast_error(target));
             };
-            return parse_mvi_int(&txt, unsigned).ok_or_else(|| mvi_cast_error(target));
+            return parse_mvi_int(&txt, unsigned).ok_or_else(|| mvi_integer_error(&txt, target));
         }
         if let Some(b) = r.as_bool() {
             let i = i64::from(b);
             return int_to_mvi(i, unsigned).ok_or_else(|| mvi_cast_error(target));
         }
         if let Some(s) = r.as_str() {
-            return parse_mvi_int(s, unsigned).ok_or_else(|| mvi_cast_error(target));
+            return parse_mvi_int(s, unsigned).ok_or_else(|| mvi_integer_error(s, target));
         }
         // Arrays / objects / null reach here — no numeric interpretation.
         return Err(mvi_cast_error(target));
@@ -5558,35 +5670,18 @@ fn int_to_mvi(v: i64, unsigned: bool) -> Option<Value> {
 }
 
 fn parse_mvi_int(s: &str, unsigned: bool) -> Option<Value> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if unsigned {
-        // A leading `-` is legal in `SIGNED` but never in `UNSIGNED`.
-        if let Ok(u) = s.parse::<u64>() {
-            return Some(Value::UInt(u));
-        }
-        // Accept `"1.0"` / `"1E0"` style whole-value decimals if the caller
-        // gave us canonical number text (the JSON path routes through
-        // `number_text`, which can produce e.g. `9.223e18`).
-        let d = crate::util::decimal::parse_exact_decimal_str(s)?;
-        let (mag, scale) = d;
-        if scale == 0 && mag >= 0 && mag <= i128::from(u64::MAX) {
-            Some(Value::UInt(mag as u64))
-        } else {
-            None
-        }
+    crate::util::decimal::checked_integer_text(s, unsigned)
+}
+
+fn mvi_integer_error(text: &str, target: &str) -> QueryError {
+    if crate::util::decimal::parse_exact_decimal_big(text).is_some()
+        || text.trim().parse::<f64>().is_ok()
+    {
+        crate::error::catalog::ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX.error(format!(
+            "JSON value is out of range for CAST to {target} for functional index"
+        ))
     } else {
-        if let Ok(i) = s.parse::<i64>() {
-            return Some(Value::Int(i));
-        }
-        let (mag, scale) = crate::util::decimal::parse_exact_decimal_str(s)?;
-        if scale == 0 && i64::try_from(mag).is_ok() {
-            Some(Value::Int(mag as i64))
-        } else {
-            None
-        }
+        mvi_cast_error(target)
     }
 }
 
@@ -5769,13 +5864,8 @@ pub fn compile_index_key_expressions(
             validate_multi_valued_index_expression(&ast, expr_sql)?;
         }
         let program = crate::engine::expr_program::CompiledTableExpr::compile_once(&ast, table);
-        // Best-effort static type inference (LOWER → VarChar,
-        // YEAR → Int, `c + 1` → BigInt, etc.). Falls back to
-        // VarChar { len: None } when unknown — that's a safe key-
-        // encoding placeholder because `KeyPart::from_column_value`
-        // only special-cases `Char`; everything else dispatches on the
-        // runtime Value variant. The benefit of the more precise type
-        // is purely cost-model accuracy / index_key_len estimates.
+        // This descriptor controls persisted keys as well as planner bounds.
+        // Numeric precision and scale must match the expression evaluator.
         let data_type = if *multi_valued {
             multi_valued_index_target_type(&ast)
         } else {
@@ -5803,6 +5893,7 @@ pub fn compile_index_key_expressions(
             nullable,
             referenced_columns,
             multi_valued: *multi_valued,
+            collation_id: crate::engine::expr::expr_collation(&ast, table).map(|c| c.collation_id),
             ast: Some(ast),
             program: Some(program),
         }));
@@ -5860,10 +5951,13 @@ fn multi_valued_index_target_type(expr: &Expr) -> DataTypeKind {
         "DATE" => DataTypeKind::Date,
         "DATETIME" => DataTypeKind::DateTime { fsp: 0 },
         "TIME" => DataTypeKind::Time { fsp: 0 },
-        "DECIMAL" => DataTypeKind::Decimal {
-            precision: None,
-            scale: Some(0),
-        },
+        "DECIMAL" => {
+            let params = decimal_target_params(&cast_target_with_params(&target, &args[2..]));
+            DataTypeKind::Decimal {
+                precision: Some(params.first().copied().unwrap_or(65)),
+                scale: Some(params.get(1).copied().unwrap_or(0)),
+            }
+        }
         _ => DataTypeKind::VarChar { len: None },
     }
 }
@@ -6014,18 +6108,31 @@ fn infer_index_expression_type(expr: &Expr, table: &TableSchema) -> DataTypeKind
             | crate::parser::BinaryOp::Sub
             | crate::parser::BinaryOp::Mul
             | crate::parser::BinaryOp::Mod => {
-                // Coarse coercion: if either side is floating-point,
-                // result is Double; otherwise BigInt. Close enough to
-                // MySQL's numeric op semantics for cost-model use.
+                // Arithmetic over DECIMAL must keep its fractional key;
+                // character operands enter the approximate numeric domain.
                 let lt = infer_index_expression_type(left, table);
                 let rt = infer_index_expression_type(right, table);
-                if matches!(lt, DataTypeKind::Double { .. } | DataTypeKind::Float { .. })
-                    || matches!(rt, DataTypeKind::Double { .. } | DataTypeKind::Float { .. })
+                if !lt.is_integer() && !matches!(lt, DataTypeKind::Decimal { .. })
+                    || !rt.is_integer() && !matches!(rt, DataTypeKind::Decimal { .. })
                 {
                     DataTypeKind::Double {
                         precision: None,
                         scale: None,
                     }
+                } else if matches!(lt, DataTypeKind::Decimal { .. })
+                    || matches!(rt, DataTypeKind::Decimal { .. })
+                {
+                    let column_type =
+                        crate::engine::expr_type::column_type::schema_expr_result_type(
+                            expr,
+                            &mut |operand| {
+                                infer_index_expression_type(operand, table).column_type()
+                            },
+                        );
+                    data_type_kind_for_column_type(
+                        column_type,
+                        &crate::types::ColumnSource::default(),
+                    )
                 } else {
                     DataTypeKind::BigInt
                 }
@@ -6351,7 +6458,7 @@ mod tests {
         // Migration must seed next_column_id beyond the existing max id,
         // not reset to 1.
         assert!(table.next_column_id > 7);
-        let new_id = table.allocate_column_id();
+        let new_id = table.allocate_column_id().unwrap();
         assert_eq!(new_id, 8);
     }
 

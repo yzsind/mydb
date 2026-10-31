@@ -25,8 +25,8 @@ use super::txn::IndexRepairKey;
 use super::{error, DurabilityMode, IndexBound, IndexKey, RowId, TxnView};
 
 const LEDGER_MAGIC: &[u8; 8] = b"MYDBCTL1";
-const LEDGER_VERSION: u32 = 1;
-const HEADER_LEN: usize = 16;
+const LEDGER_VERSION: u32 = crate::storage::format_versions::COMMIT_LEDGER_VERSION;
+const HEADER_LEN: usize = 64;
 const RECORD_LEN: usize = 32;
 /// `commit_unix_us` never reaches the high bit for representable SQL
 /// timestamps.  Use it to distinguish the single availability-baseline
@@ -34,8 +34,41 @@ const RECORD_LEN: usize = 32;
 /// ledger format.
 const BASELINE_TIME_MARKER: u64 = 1 << 63;
 const HISTORY_MAGIC: &[u8; 8] = b"MYDBHIX1";
-const HISTORY_VERSION: u32 = 1;
+const HISTORY_VERSION: u32 = crate::storage::format_versions::HISTORY_INDEX_VERSION;
 const HISTORY_FRAME_HEADER_LEN: usize = 16;
+
+fn temporal_header(
+    path: &Path,
+    magic: &[u8; 8],
+    version: u32,
+) -> Result<[u8; HEADER_LEN], QueryError> {
+    let mut bytes = [0; HEADER_LEN];
+    bytes[..8].copy_from_slice(magic);
+    bytes[8..12].copy_from_slice(&version.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+    bytes[16..32].copy_from_slice(&super::control::uuid_for_system_file(path)?.unwrap_or([0; 16]));
+    let crc = crc32fast::hash(&bytes[..60]);
+    bytes[60..64].copy_from_slice(&crc.to_le_bytes());
+    Ok(bytes)
+}
+
+fn temporal_header_valid(
+    path: &Path,
+    bytes: &[u8],
+    magic: &[u8; 8],
+    version: u32,
+) -> Result<bool, QueryError> {
+    if bytes.len() < HEADER_LEN {
+        return Ok(false);
+    }
+    let uuid = super::control::uuid_for_system_file(path)?;
+    Ok(&bytes[..8] == magic
+        && u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == version
+        && u32::from_le_bytes(bytes[12..16].try_into().unwrap()) == HEADER_LEN as u32
+        && uuid.is_none_or(|uuid| bytes[16..32] == uuid)
+        && bytes[32..60].iter().all(|b| *b == 0)
+        && u32::from_le_bytes(bytes[60..64].try_into().unwrap()) == crc32fast::hash(&bytes[..60]))
+}
 
 fn index_bounds_are_empty(low: Option<&IndexBound>, high: Option<&IndexBound>) -> bool {
     low.zip(high).is_some_and(|(low, high)| {
@@ -1402,11 +1435,7 @@ fn rewrite_ledger(
     let temp = path.with_extension("v1.tmp");
     let file = File::create(&temp).map_err(|err| ledger_io_error(&temp, err))?;
     let mut file = BufWriter::with_capacity(64 * 1024, file);
-    file.write_all(LEDGER_MAGIC)
-        .map_err(|err| ledger_io_error(&temp, err))?;
-    file.write_all(&LEDGER_VERSION.to_le_bytes())
-        .map_err(|err| ledger_io_error(&temp, err))?;
-    file.write_all(&0u32.to_le_bytes())
+    file.write_all(&temporal_header(path, LEDGER_MAGIC, LEDGER_VERSION)?)
         .map_err(|err| ledger_io_error(&temp, err))?;
     if let Some(baseline) = baseline {
         file.write_all(&encode_baseline_record(baseline))
@@ -1452,11 +1481,7 @@ fn rewrite_history_index(
     let temp = path.with_extension("v1.tmp");
     let file = File::create(&temp).map_err(|err| history_io_error(&temp, err))?;
     let mut file = BufWriter::with_capacity(64 * 1024, file);
-    file.write_all(HISTORY_MAGIC)
-        .map_err(|err| history_io_error(&temp, err))?;
-    file.write_all(&HISTORY_VERSION.to_le_bytes())
-        .map_err(|err| history_io_error(&temp, err))?;
-    file.write_all(&0u32.to_le_bytes())
+    file.write_all(&temporal_header(path, HISTORY_MAGIC, HISTORY_VERSION)?)
         .map_err(|err| history_io_error(&temp, err))?;
     let mut txn_ids = batches.keys().copied().collect::<Vec<_>>();
     txn_ids.sort_unstable();
@@ -1492,10 +1517,7 @@ fn load_history_index(path: &Path) -> Result<(HistoryIndexState, bool), QueryErr
         }
         Err(err) => return Err(history_io_error(path, err)),
     };
-    if bytes.len() < HEADER_LEN
-        || &bytes[..8] != HISTORY_MAGIC
-        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != HISTORY_VERSION
-    {
+    if !temporal_header_valid(path, &bytes, HISTORY_MAGIC, HISTORY_VERSION)? {
         return Err(history_error(path, "invalid history-index header"));
     }
     let mut state = HistoryIndexState::default();
@@ -1538,9 +1560,7 @@ fn load_ledger(path: &Path) -> Result<(TimelineState, bool), QueryError> {
         }
         Err(err) => return Err(ledger_io_error(path, err)),
     };
-    if bytes.len() < HEADER_LEN
-        || &bytes[..8] != LEDGER_MAGIC
-        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != LEDGER_VERSION
+    if !temporal_header_valid(path, &bytes, LEDGER_MAGIC, LEDGER_VERSION)?
         || (bytes.len() - HEADER_LEN) % RECORD_LEN != 0
     {
         return Err(ledger_error(

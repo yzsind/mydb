@@ -27,8 +27,8 @@ mod path;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use compare::{compare, compare_nodes};
-pub(crate) use jsonb::{build_array, build_object, JsonType, JsonbRef};
+pub(crate) use compare::{compare, compare_nodes, equality_key};
+pub(crate) use jsonb::{build_array, build_object, ArrayIter, JsonType, JsonbRef, ObjectIter};
 pub(crate) use path::{ConcreteLeg, JsonPath};
 
 use crate::types::QueryError;
@@ -48,15 +48,18 @@ pub(crate) fn invalid_json_text(arg_pos: usize, func: &str) -> QueryError {
     )
 }
 
-/// MySQL 8.0 caps JSON documents at 100 nesting levels; anything deeper
-/// raises ER_JSON_DOCUMENT_TOO_DEEP (3157).
-pub(crate) const MAX_JSON_DEPTH: usize = 100;
+/// A JSON document permits 100 container levels plus one scalar leaf level.
+/// Deeper containers raise ER_JSON_DOCUMENT_TOO_DEEP (3157).
+pub(crate) const MAX_JSON_DEPTH: usize = 101;
 
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_decode_jsonb(bytes: &[u8]) {
     let Ok(document) = JsonbRef::new(bytes) else {
         return;
     };
+    if document.validate().is_err() {
+        return;
+    }
     let _ = document.to_owned_bytes();
     let _ = document.depth();
     let _ = document.to_serde();
@@ -80,11 +83,17 @@ fn serde_max_depth(root: &serde_json::Value) -> usize {
         }
         match node {
             serde_json::Value::Array(a) => {
+                if d >= MAX_JSON_DEPTH {
+                    return MAX_JSON_DEPTH + 1;
+                }
                 for e in a {
                     stack.push((e, d + 1));
                 }
             }
             serde_json::Value::Object(o) => {
+                if d >= MAX_JSON_DEPTH {
+                    return MAX_JSON_DEPTH + 1;
+                }
                 for (_, v) in o {
                     stack.push((v, d + 1));
                 }
@@ -98,7 +107,7 @@ fn serde_max_depth(root: &serde_json::Value) -> usize {
 pub(crate) fn json_too_deep() -> QueryError {
     json_err(
         crate::error::catalog::ER_JSON_DOCUMENT_TOO_DEEP,
-        format!("The JSON document exceeds the maximum depth of {MAX_JSON_DEPTH} nesting levels."),
+        "The JSON document exceeds the maximum depth of 100 nesting levels.",
     )
 }
 
@@ -165,18 +174,132 @@ pub(crate) fn read_uvarint(b: &[u8], pos: &mut usize) -> Result<u64, QueryError>
 /// Parse JSON text into a `jsonb` byte string. Returns a MySQL-style
 /// `error 3141` (mentioning `func` / `arg_pos`) on invalid input.
 pub(crate) fn parse_text(text: &str, arg_pos: usize, func: &str) -> Result<Vec<u8>, QueryError> {
-    Ok(from_serde(&parse_dom(text, |_| {
-        invalid_json_text(arg_pos, func)
-    })?))
+    let dom = parse_dom(text, |_| invalid_json_text(arg_pos, func))?;
+    encode_document(text, &dom)
 }
 
-/// Keep serde's bounded parser stack; its recursion limit is already deeper
-/// than our document limit. Classify that failure as depth, not invalid text.
+/// Keep wide integer tokens exact instead of staging them through serde's
+/// f64 fallback. Ordinary JSON keeps the existing single-parse fast path.
+fn encode_document(text: &str, dom: &serde_json::Value) -> Result<Vec<u8>, QueryError> {
+    fn has_wide_integer(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let (mut i, mut quoted, mut escaped) = (0, false, false);
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else if byte == b'"' {
+                quoted = true;
+            } else if byte == b'-' || byte.is_ascii_digit() {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    i += 1;
+                }
+                let token = &text[start..i];
+                if !token.contains(['.', 'e', 'E'])
+                    && token.parse::<i64>().is_err()
+                    && token.parse::<u64>().is_err()
+                {
+                    return true;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        false
+    }
+    fn encode_raw(text: &str) -> Result<Vec<u8>, QueryError> {
+        let text = text.trim();
+        let invalid = |_| invalid_json_text(1, "JSON");
+        match text.as_bytes().first() {
+            Some(b'[') => {
+                let values: Vec<Box<serde_json::value::RawValue>> =
+                    serde_json::from_str(text).map_err(invalid)?;
+                let nodes = values
+                    .iter()
+                    .map(|v| encode_raw(v.get()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(build_array(&nodes))
+            }
+            Some(b'{') => {
+                let values: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+                    serde_json::from_str(text).map_err(invalid)?;
+                let pairs = values
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, encode_raw(value.get())?)))
+                    .collect::<Result<Vec<_>, QueryError>>()?;
+                Ok(build_object(&pairs))
+            }
+            Some(b'-' | b'0'..=b'9')
+                if !text.contains(['.', 'e', 'E'])
+                    && text.parse::<i64>().is_err()
+                    && text.parse::<u64>().is_err() =>
+            {
+                let mut out = Vec::with_capacity(text.len() + 6);
+                jsonb::write_text_scalar(jsonb::T_DECIMAL, text, &mut out);
+                Ok(out)
+            }
+            _ => Ok(from_serde(&parse_dom(text, invalid)?)),
+        }
+    }
+    if has_wide_integer(text) {
+        encode_raw(text)
+    } else {
+        Ok(from_serde(dom))
+    }
+}
+
+fn normalize_integer_negative_zero(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("-0") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut normalized = None;
+    let (mut quoted, mut escaped) = (false, false);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == b'-'
+            && bytes.get(i + 1) == Some(&b'0')
+            && bytes
+                .get(i + 2)
+                .is_none_or(|b| matches!(b, b',' | b']' | b'}' | b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            normalized.get_or_insert_with(|| bytes.to_vec())[i] = b' ';
+        }
+    }
+    match normalized {
+        Some(bytes) => std::borrow::Cow::Owned(
+            String::from_utf8(bytes).expect("ASCII replacement preserves UTF-8"),
+        ),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// Keep serde's bounded parser stack, classifying depth failures separately.
 fn parse_dom(
     text: &str,
     invalid: impl FnOnce(serde_json::Error) -> QueryError,
 ) -> Result<serde_json::Value, QueryError> {
-    let dom = serde_json::from_str(text).map_err(|err| {
+    let normalized = normalize_integer_negative_zero(text);
+    let dom = serde_json::from_str(&normalized).map_err(|err| {
         if err.to_string().starts_with("recursion limit exceeded") {
             json_too_deep()
         } else {
@@ -228,7 +351,7 @@ pub(crate) fn column_value<'a>(
             "Invalid JSON text: {err} in value for column '{column}'"
         ))
     })?;
-    Ok(Cow::Owned(from_serde(&dom)))
+    Ok(Cow::Owned(encode_document(text, &dom)?))
 }
 
 /// Parse JSON text, returning `None` (rather than an error) on invalid
@@ -238,11 +361,7 @@ pub(crate) fn column_value<'a>(
 /// runaway path expression cannot silently accept a document a plain
 /// [`parse_text`] would have rejected.
 pub(crate) fn parse_text_opt(text: &str) -> Option<Vec<u8>> {
-    let dom: serde_json::Value = serde_json::from_str(text).ok()?;
-    if serde_max_depth(&dom) > MAX_JSON_DEPTH {
-        return None;
-    }
-    Some(from_serde(&dom))
+    parse_text(text, 1, "JSON path").ok()
 }
 
 /// Encode a [`serde_json::Value`] DOM into `jsonb` bytes.
@@ -289,20 +408,24 @@ pub(crate) fn to_pretty(jsonb: &[u8]) -> String {
 /// coercion used when a JSON document flows into a character column or the
 /// `->>` operator.
 pub(crate) fn unquote_text(jsonb: &[u8]) -> String {
-    match JsonbRef::new(jsonb) {
-        Ok(r) if r.opaque_value().is_some() => {
-            let (ty, bytes) = r.opaque_value().expect("checked opaque value");
-            opaque_text(ty, bytes)
+    let mut out = String::new();
+    if let Ok(node) = JsonbRef::new(jsonb) {
+        if let Some((ty, bytes)) = node.opaque_value() {
+            return opaque_text(ty, bytes);
         }
-        Ok(r) => match r.as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                let mut out = String::new();
-                r.write_text(&mut out);
-                out
-            }
-        },
-        Err(_) => String::new(),
+        append_unquoted(node, &mut out);
+    }
+    out
+}
+
+/// Append the same unquoted representation into an owning column buffer.
+pub(crate) fn append_unquoted(node: JsonbRef<'_>, out: &mut String) {
+    if let Some((ty, bytes)) = node.opaque_value() {
+        out.push_str(&opaque_text(ty, bytes));
+    } else if let Some(text) = node.as_str() {
+        out.push_str(text);
+    } else {
+        node.write_text(out);
     }
 }
 
@@ -414,7 +537,7 @@ pub(crate) fn scalar_from_value(value: &crate::types::Value) -> Vec<u8> {
         Value::Double(v) => serde_json::Number::from_f64(*v)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        Value::Bytes(b) => serde_json::Value::String(binary_json_text(b)),
+        Value::Bytes(b) => return opaque_scalar(15, b),
         Value::Json(b) => return b.clone(),
         // Everything else (YEAR, geometry, vector, …) becomes a JSON string of
         // its canonical text.
@@ -496,4 +619,132 @@ pub(crate) fn opaque_text(ty: u8, bytes: &[u8]) -> String {
         text.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
     }
     text
+}
+
+/// Append a JSON string node without constructing a temporary DOM/value.
+pub(crate) fn append_string_node(text: &str, output: &mut Vec<u8>) {
+    jsonb::write_text_scalar(jsonb::T_STRING, text, output);
+}
+
+/// JSON_KEYS has depth at most two and borrows every key from the document.
+pub(crate) fn append_object_keys(node: JsonbRef<'_>, output: &mut Vec<u8>) -> Option<()> {
+    if !node.is_object() {
+        return None;
+    }
+    let (mut count, mut bytes) = (0usize, 0usize);
+    for (key, _) in node.object_iter() {
+        count = count.checked_add(1)?;
+        bytes = bytes
+            .checked_add(1 + uvarint_len(key.len() as u64))?
+            .checked_add(key.len())?;
+    }
+    let payload = bytes.checked_add(uvarint_len(count as u64))?;
+    output.push(jsonb::T_ARRAY);
+    write_uvarint(output, payload as u64);
+    write_uvarint(output, count as u64);
+    for (key, _) in node.object_iter() {
+        append_string_node(key, output);
+    }
+    Some(())
+}
+
+/// Scalar JSON producers can borrow primitive SQL columns. Booleans and
+/// source-sensitive binary/ENUM/SET/temporal conversions stay with the oracle.
+#[derive(Clone, Copy)]
+pub(crate) enum Primitive<'a> {
+    Null,
+    Int(i64),
+    UInt(u64),
+    Text(&'a str),
+}
+impl Primitive<'_> {
+    pub(crate) fn encoded_len(self) -> usize {
+        match self {
+            Self::Null => 1,
+            Self::Int(_) | Self::UInt(_) => 9,
+            Self::Text(s) => 1 + uvarint_len(s.len() as u64) + s.len(),
+        }
+    }
+    fn append(self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.push(jsonb::T_NULL),
+            Self::Int(n) => {
+                out.push(jsonb::T_I64);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::UInt(n) => {
+                out.push(if n <= i64::MAX as u64 {
+                    jsonb::T_I64
+                } else {
+                    jsonb::T_U64
+                });
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::Text(s) => append_string_node(s, out),
+        }
+    }
+}
+
+pub(crate) fn append_primitive_array(values: &[Primitive<'_>], out: &mut Vec<u8>) -> Option<()> {
+    let payload = values
+        .iter()
+        .try_fold(uvarint_len(values.len() as u64), |sum, value| {
+            sum.checked_add(value.encoded_len())
+        })?;
+    out.push(jsonb::T_ARRAY);
+    write_uvarint(out, payload as u64);
+    write_uvarint(out, values.len() as u64);
+    for value in values {
+        value.append(out);
+    }
+    Some(())
+}
+
+/// Keys are unique and in canonical `(len, bytes)` order at binding time.
+pub(crate) fn append_primitive_object(
+    values: &[(&str, Primitive<'_>)],
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let payload =
+        values
+            .iter()
+            .try_fold(uvarint_len(values.len() as u64), |sum, (key, value)| {
+                sum.checked_add(uvarint_len(key.len() as u64))?
+                    .checked_add(key.len())?
+                    .checked_add(value.encoded_len())
+            })?;
+    out.push(jsonb::T_OBJECT);
+    write_uvarint(out, payload as u64);
+    write_uvarint(out, values.len() as u64);
+    for (key, value) in values {
+        write_uvarint(out, key.len() as u64);
+        out.extend_from_slice(key.as_bytes());
+        value.append(out);
+    }
+    Some(())
+}
+
+/// Concatenate borrowed nodes without allocating an owned buffer per match.
+pub(crate) fn append_borrowed_array(
+    values: &[JsonbRef<'_>],
+    out: &mut Vec<u8>,
+) -> Result<(), QueryError> {
+    let payload = values
+        .iter()
+        .try_fold(uvarint_len(values.len() as u64), |n, v| {
+            n.checked_add(v.as_bytes().len())
+        })
+        .ok_or_else(|| {
+            json_err(
+                crate::error::catalog::ER_JSON_VALUE_TOO_BIG,
+                "JSON value is too large",
+            )
+        })?;
+    out.push(jsonb::T_ARRAY);
+    write_uvarint(out, payload as u64);
+    write_uvarint(out, values.len() as u64);
+    for value in values {
+        out.extend_from_slice(value.as_bytes());
+    }
+    Ok(())
 }

@@ -473,6 +473,27 @@ impl Database {
                     };
                     undo_ptr = next_ptr;
                 }
+                UndoKind::DeleteHeader => {
+                    let before_header = before_header
+                        .ok_or_else(|| undo_corruption(undo_ptr, "missing delete before_header"))?;
+                    if before_values.is_some()
+                        || !before_external.is_empty()
+                        || !working_external.is_empty()
+                    {
+                        return Err(undo_corruption(
+                            undo_ptr,
+                            "header-only delete contains external/value undo",
+                        ));
+                    }
+                    if self.row_version_visible(before_header, txn)? {
+                        return Ok(Some((before_header, working)));
+                    }
+                    current_header = before_header;
+                    let Some(next_ptr) = before_header.undo_ptr else {
+                        return Ok(None);
+                    };
+                    undo_ptr = next_ptr;
+                }
                 UndoKind::UpdateDelta { before_cols } => {
                     let before_header = before_header
                         .ok_or_else(|| undo_corruption(undo_ptr, "missing before_header"))?;
@@ -1051,11 +1072,7 @@ impl Database {
         }
         // The common admission check changes no state. Publication rechecks
         // the limits under the write latch, just as after the old preflight.
-        if self
-            .undo
-            .read()
-            .insert_admission_unpressured(row_count, true)
-        {
+        if self.undo.insert_admission_unpressured(row_count) {
             return Ok(());
         }
         // P2/12 — capture retention_pressure_count before/after admission
@@ -1330,7 +1347,7 @@ impl Database {
                 // needs no undo-directory latch. Publication still takes the
                 // exclusive latch and rechecks the runtime admission policies.
                 let reservation = self.undo_resident_admission.reserve(&record)?;
-                let frame = crate::storage::undo::UndoManager::write_concurrent_persistent_frame(
+                let frame = crate::storage::undo::UndoManager::write_leased_persistent_frame(
                     &shard,
                     &mut encoded,
                 )?;
@@ -1342,7 +1359,7 @@ impl Database {
             // `Instant::now()` — the probe measured the undo publish lock at
             // only ~2–7% of wall time, so it stays off in production.
             let lock_started = undo_publish_lock_probe_enabled().then(std::time::Instant::now);
-            if let Some(((ptr, segment_id, segment_end), reservation)) = concurrent_frame {
+            if let Some(((ptr, segment_id, segment_end, segment_lease), reservation)) = concurrent_frame {
                 let out = self.publish_concurrent_undo_frame(
                     record,
                     encoded,
@@ -1350,6 +1367,7 @@ impl Database {
                     segment_id,
                     segment_end,
                     reservation,
+                    segment_lease,
                 )?;
                 self.record_undo_publish_lock(lock_started);
                 out
@@ -1483,8 +1501,9 @@ impl Database {
                     .unwrap_or(usize::MAX)
             });
             touched_tables.insert(record.table_id);
-            let owns_reclaimable =
-                !record.before_external.is_empty() || matches!(record.kind, UndoKind::Delete);
+            let header_only_delete = matches!(&record.kind, UndoKind::DeleteHeader);
+            let owns_reclaimable = !record.before_external.is_empty()
+                || matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader);
             match record.kind {
                 UndoKind::Insert => {
                     self.rollback_inserted_rows(record.txn_id, record.table_id, &[record.row_id])?;
@@ -1547,15 +1566,36 @@ impl Database {
                     })?;
                     self.free_external_refs(record.table_id, &to_free);
                 }
-                UndoKind::Delete => {
-                    let (Some(header), Some(values)) = (record.before_header, record.before_values)
-                    else {
-                        return Err(error(
-                            crate::error::catalog::ER_WARNING_NOT_COMPLETE_ROLLBACK,
-                            format!(
-                                "rollback incomplete for transaction {txn_id}: delete undo record {ptr} has no before-image"
-                            ),
+                UndoKind::Delete | UndoKind::DeleteHeader => {
+                    let Some(header) = record.before_header else {
+                        return Err(undo_corruption(
+                            ptr,
+                            "delete undo record has no before_header",
                         ));
+                    };
+                    let values = if header_only_delete {
+                        if record.before_values.is_some()
+                            || !record.before_external.is_empty()
+                            || !record.borrowed_external.is_empty()
+                        {
+                            return Err(undo_corruption(ptr, "invalid header-only delete undo"));
+                        }
+                        let Some((values, external)) =
+                            self.read_row_collecting_external(record.table_id, record.row_id)?
+                        else {
+                            return Err(undo_corruption(ptr, "header-only delete row is missing"));
+                        };
+                        if !external.is_empty() {
+                            return Err(undo_corruption(
+                                ptr,
+                                "header-only delete row has external references",
+                            ));
+                        }
+                        values
+                    } else {
+                        record.before_values.ok_or_else(|| {
+                            undo_corruption(ptr, "delete undo record has no before-image")
+                        })?
                     };
                     let mut old_external = record.before_external;
                     old_external.extend(record.borrowed_external);

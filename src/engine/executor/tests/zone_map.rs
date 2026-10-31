@@ -1,5 +1,35 @@
 use super::*;
 
+// Select a genuinely dense data zone. Page zero is allocation metadata and
+// therefore the first physical zone can contain fewer than 64 row mutations.
+fn dense_rebuild_zone_ids(engine: &StorageQueryEngine, name: &str) -> Vec<i64> {
+    let table = engine.database().table(name).unwrap();
+    let rows = engine
+        .database()
+        .scan_rows(
+            &table.qualified_name(),
+            crate::storage::TxnView::read_only(
+                u64::MAX,
+                crate::storage::IsolationLevel::ReadCommitted,
+            ),
+        )
+        .unwrap();
+    let mut zones = std::collections::BTreeMap::<u64, Vec<i64>>::new();
+    for row in rows {
+        let Value::Int(id) = row.values[0] else {
+            panic!("expected integer fixture key")
+        };
+        zones
+            .entry(u64::from(row.row_id.page_id) / u64::from(table.zone_pages()))
+            .or_default()
+            .push(id);
+    }
+    zones
+        .into_values()
+        .find(|ids| ids.len() >= 64)
+        .expect("fixture needs a dense rebuild zone")
+}
+
 #[test]
 fn zone_map_audit_null_and_prefix_differential() {
     let dir = tempfile::tempdir().unwrap();
@@ -344,12 +374,12 @@ fn zone_map_sql_differential_and_diagnostics() {
         ))
         .unwrap();
 
-    insert_repeated_integer_series(&engine, "zm_t", 399, 33);
+    insert_repeated_integer_series(&engine, "zm_t", 1599, 33);
 
     let on = engine
         .execute(
             "SELECT /*+ ZONE_MAP(zm_t) */ id FROM zm_t \
-             WHERE id BETWEEN 350 AND 360",
+             WHERE id BETWEEN 1550 AND 1560",
         )
         .unwrap();
     let skipped = engine
@@ -364,7 +394,7 @@ fn zone_map_sql_differential_and_diagnostics() {
         "selected ZoneMapScan must skip heap zones at runtime"
     );
     let QueryResponse::ResultSet(explain) = engine
-        .execute("EXPLAIN FORMAT=JSON SELECT id FROM zm_t WHERE id BETWEEN 350 AND 360")
+        .execute("EXPLAIN FORMAT=JSON SELECT id FROM zm_t WHERE id BETWEEN 1550 AND 1560")
         .unwrap()
     else {
         panic!("expected explain")
@@ -375,13 +405,13 @@ fn zone_map_sql_differential_and_diagnostics() {
             .contains("\"access_type\": \"zone\"")),
         "expected CBO to choose zone access: {:?}; forced: {:?}",
         explain.rows,
-        engine.execute("EXPLAIN FORMAT=JSON SELECT /*+ ZONE_MAP(zm_t) */ id FROM zm_t WHERE id BETWEEN 350 AND 360")
+        engine.execute("EXPLAIN FORMAT=JSON SELECT /*+ ZONE_MAP(zm_t) */ id FROM zm_t WHERE id BETWEEN 1550 AND 1560")
     );
     engine
         .execute("SET optimizer_switch='zone_map=off'")
         .unwrap();
     let off = engine
-        .execute("SELECT id FROM zm_t WHERE id BETWEEN 350 AND 360")
+        .execute("SELECT id FROM zm_t WHERE id BETWEEN 1550 AND 1560")
         .unwrap();
     assert_eq!(format!("{on:?}"), format!("{off:?}"));
     engine
@@ -390,7 +420,7 @@ fn zone_map_sql_differential_and_diagnostics() {
     let QueryResponse::ResultSet(no_hint) = engine
         .execute(
             "EXPLAIN FORMAT=JSON SELECT /*+ NO_ZONE_MAP(zm_t) */ id \
-             FROM zm_t WHERE id BETWEEN 350 AND 360",
+             FROM zm_t WHERE id BETWEEN 1550 AND 1560",
         )
         .unwrap()
     else {
@@ -406,7 +436,7 @@ fn zone_map_sql_differential_and_diagnostics() {
     let QueryResponse::ResultSet(forced) = engine
         .execute(
             "EXPLAIN FORMAT=JSON SELECT /*+ ZONE_MAP(zm_t) */ id \
-             FROM zm_t WHERE id BETWEEN 350 AND 360",
+             FROM zm_t WHERE id BETWEEN 1550 AND 1560",
         )
         .unwrap()
     else {
@@ -1057,8 +1087,16 @@ fn maintenance_rebuilds_only_stale_zones_and_reports_progress() {
         .db_for_tests()
         .rebuild_zone_map_for_table(&table)
         .unwrap();
+    let ids = dense_rebuild_zone_ids(&engine, "zm_targeted");
+    let selected = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     engine
-        .execute("UPDATE zm_targeted SET v = v + 10000 WHERE id < 64")
+        .execute(&format!(
+            "UPDATE zm_targeted SET v = v + 10000 WHERE id IN ({selected})"
+        ))
         .unwrap();
 
     let QueryResponse::ResultSet(before) = engine
@@ -1268,8 +1306,17 @@ fn targeted_rebuild_merges_racing_dml_instead_of_publishing_a_false_negative() {
         .db_for_tests()
         .rebuild_zone_map_for_table(&table)
         .unwrap();
+    let ids = dense_rebuild_zone_ids(&engine, "zm_race");
+    let racing_id = ids[ids.len() / 2];
+    let selected = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     engine
-        .execute("UPDATE zm_race SET v=v+1000 WHERE id < 64")
+        .execute(&format!(
+            "UPDATE zm_race SET v=v+1000 WHERE id IN ({selected})"
+        ))
         .unwrap();
     engine
         .db_for_tests()
@@ -1284,7 +1331,7 @@ fn targeted_rebuild_merges_racing_dml_instead_of_publishing_a_false_negative() {
 
     barrier.wait();
     engine
-        .execute("UPDATE zm_race SET v=999999 WHERE id=1")
+        .execute(&format!("UPDATE zm_race SET v=999999 WHERE id={racing_id}"))
         .unwrap();
     barrier.wait();
     join.join().unwrap().unwrap();

@@ -157,21 +157,50 @@ impl JsonPath {
         Ok(JsonPath { legs, has_wildcard })
     }
 
+    /// Navigate a concrete path without a result vector or traversal stack.
+    /// Callers retain the general evaluator for wildcards, ranges and descent.
+    pub(crate) fn eval_one<'a>(&self, mut node: JsonbRef<'a>) -> Option<JsonbRef<'a>> {
+        for leg in &self.legs {
+            node = match leg {
+                Leg::Member(key) => node.get(key)?,
+                Leg::Index(spec) => resolve_index(node, *spec)?,
+                _ => return None,
+            };
+        }
+        Some(node)
+    }
+
     /// All nodes matching the path under `root`, in document order.
-    pub(crate) fn eval<'a>(&self, root: JsonbRef<'a>) -> Vec<JsonbRef<'a>> {
-        let mut out = Vec::new();
-        let mut seen = self
-            .legs
-            .iter()
-            .any(|leg| matches!(leg, Leg::Recursive))
-            .then(std::collections::HashSet::new);
-        let mut stack = vec![(root, 0usize)];
+    pub(crate) fn eval<'a>(&self, root: JsonbRef<'a>) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
+        if !self.has_wildcard {
+            return self.eval_one(root).into_iter().collect();
+        }
+        self.eval_general(root)
+    }
+
+    fn eval_general<'a>(&self, root: JsonbRef<'a>) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
+        let mut out = smallvec::SmallVec::new();
+        let deduplicate = self.legs.iter().any(|leg| matches!(leg, Leg::Recursive));
+        let mut seen = smallvec::SmallVec::<[usize; 8]>::new();
+        let mut overflow: Option<std::collections::HashSet<usize>> = None;
+        let mut stack: smallvec::SmallVec<[(JsonbRef<'a>, usize); 16]> =
+            smallvec::smallvec![(root, 0usize)];
         while let Some((node, pos)) = stack.pop() {
             let Some(leg) = self.legs.get(pos) else {
-                if seen
-                    .as_mut()
-                    .is_none_or(|seen| seen.insert(node.identity()))
-                {
+                let unique = if !deduplicate {
+                    true
+                } else if let Some(seen) = &mut overflow {
+                    seen.insert(node.identity())
+                } else if seen.contains(&node.identity()) {
+                    false
+                } else if seen.len() < 8 {
+                    seen.push(node.identity());
+                    true
+                } else {
+                    let set = overflow.get_or_insert_with(|| seen.iter().copied().collect());
+                    set.insert(node.identity())
+                };
+                if unique {
                     out.push(node);
                 }
                 continue;
@@ -187,7 +216,7 @@ impl JsonPath {
                     let children = node
                         .object_iter()
                         .map(|(_, value)| value)
-                        .collect::<Vec<_>>();
+                        .collect::<smallvec::SmallVec<[JsonbRef<'a>; 8]>>();
                     stack.extend(children.into_iter().rev().map(|child| (child, next)));
                 }
                 Leg::Index(spec) => {
@@ -207,7 +236,7 @@ impl JsonPath {
                                 .array_iter()
                                 .skip(start)
                                 .take(end - start + 1)
-                                .collect::<Vec<_>>();
+                                .collect::<smallvec::SmallVec<[JsonbRef<'a>; 8]>>();
                             stack.extend(children.into_iter().rev().map(|child| (child, next)));
                         } else if start == 0 {
                             stack.push((node, next));
@@ -216,7 +245,9 @@ impl JsonPath {
                 }
                 Leg::IndexWild => {
                     if node.is_array() {
-                        let children = node.array_iter().collect::<Vec<_>>();
+                        let children = node
+                            .array_iter()
+                            .collect::<smallvec::SmallVec<[JsonbRef<'a>; 8]>>();
                         stack.extend(children.into_iter().rev().map(|child| (child, next)));
                     }
                 }
@@ -258,13 +289,13 @@ impl JsonPath {
     }
 }
 
-fn direct_children(node: JsonbRef<'_>) -> Vec<JsonbRef<'_>> {
+fn direct_children(node: JsonbRef<'_>) -> smallvec::SmallVec<[JsonbRef<'_>; 8]> {
     if node.is_array() {
         node.array_iter().collect()
     } else if node.is_object() {
         node.object_iter().map(|(_, value)| value).collect()
     } else {
-        Vec::new()
+        smallvec::SmallVec::new()
     }
 }
 
@@ -362,7 +393,7 @@ fn resolve_range(first: IdxSpec, last: IdxSpec, len: usize) -> Option<(usize, us
     };
     let resolve_end = |spec| match spec {
         IdxSpec::FromStart(idx) => Some(idx.min(len - 1)),
-        IdxSpec::FromLast(off) => Some(len.saturating_sub(1).saturating_sub(off)),
+        IdxSpec::FromLast(off) => (len - 1).checked_sub(off),
     };
     let start = resolve_start(first)?;
     let end = resolve_end(last)?;
@@ -411,4 +442,61 @@ fn invalid_path_at(path: &str, byte_pos: usize) -> QueryError {
             "Invalid JSON path expression. The error is around character position {char_pos} in '{path}'."
         ),
     )
+}
+
+#[cfg(test)]
+mod concrete_read_tests {
+    use super::*;
+
+    #[test]
+    fn allocation_free_navigation_matches_general_traversal_for_every_json_kind() {
+        let paths = [
+            "$",
+            "$[0]",
+            "$[last]",
+            "$[last-1]",
+            "$[2]",
+            "$.a",
+            "$.a[0]",
+            "$.a[last]",
+            "$.a[1].b",
+            "$.missing",
+            "$.\"a.b\"",
+            "$.\"中文\"",
+            "$.a[0][0][last]",
+        ];
+        let mut docs = vec![
+            "null".to_owned(),
+            "true".into(),
+            "false".into(),
+            "[]".into(),
+            "{}".into(),
+            "\"文🙂\\n\"".into(),
+            "18446744073709551615".into(),
+            "-9223372036854775808".into(),
+            "123.456700".into(),
+            "1e-308".into(),
+        ];
+        for seed in 0..128 {
+            docs.push(serde_json::json!({"a":[seed,{"b":[null,true,"text"]},[1,2,3]],"a.b":seed,"中文":{"a":seed}}).to_string());
+        }
+        for doc in docs {
+            let bytes = crate::engine::json::parse_text(&doc, 1, "test").unwrap();
+            let root = JsonbRef::new(&bytes).unwrap();
+            for path in paths {
+                let path = JsonPath::parse(path).unwrap();
+                let expected = path
+                    .eval_general(root)
+                    .into_iter()
+                    .map(|v| v.to_owned_bytes())
+                    .collect::<Vec<_>>();
+                let actual = path
+                    .eval_one(root)
+                    .into_iter()
+                    .map(|v| v.to_owned_bytes())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{doc}");
+            }
+        }
+    }
 }

@@ -133,9 +133,12 @@ fn histogram_min_distinct() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStats {
+    /// Advances only when an ANALYZE folds population/modification baselines.
+    #[serde(default)]
+    pub analyze_revision: u64,
     /// SQL-requested histogram snapshots, independent of automatic CBO statistics.
     #[serde(default)]
-    pub explicit_histograms: BTreeMap<String, String>,
+    pub explicit_histograms: BTreeMap<String, SqlHistogram>,
     pub row_count: u64,
     /// Actual heap page count observed by the last ANALYZE. 0 = unknown
     /// (pre-existing stats); consumers fall back to the width-based
@@ -341,6 +344,7 @@ pub struct ConditionalKeyDomainEntry {
 impl TableStats {
     pub(crate) fn empty() -> Self {
         Self {
+            analyze_revision: 0,
             explicit_histograms: BTreeMap::new(),
             row_count: 0,
             heap_page_count: 0,
@@ -2936,6 +2940,74 @@ mod bounded_sketch_tests {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlHistogram {
+    pub buckets: Vec<SqlHistogramBucket>,
+    pub data_type: String,
+    pub null_fraction: f64,
+    pub updated: String,
+    pub sample_fraction: f64,
+    pub singleton: bool,
+    pub requested_buckets: u64,
+    pub collation_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlHistogramBucket {
+    pub lower: Value,
+    pub upper: Value,
+    pub cumulative_frequency: f64,
+    pub distinct_count: u64,
+}
+
+impl SqlHistogram {
+    pub fn to_json(&self) -> String {
+        fn endpoint(value: &Value) -> String {
+            match value {
+                Value::Int(_)
+                | Value::UInt(_)
+                | Value::Float(_)
+                | Value::Double(_)
+                | Value::Decimal(_)
+                | Value::DecimalCompact(..)
+                | Value::Decimal128(..)
+                | Value::DecimalWide(_)
+                | Value::Year(_) => value.to_display_string(),
+                Value::Bytes(bytes) => {
+                    use base64::Engine;
+                    serde_json::to_string(&format!(
+                        "base64:type254:{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ))
+                    .unwrap()
+                }
+                _ => serde_json::to_string(&value.to_display_string()).unwrap(),
+            }
+        }
+        let buckets = self
+            .buckets
+            .iter()
+            .map(|b| {
+                if self.singleton {
+                    format!("[{},{}]", endpoint(&b.upper), b.cumulative_frequency)
+                } else {
+                    format!(
+                        "[{},{},{},{}]",
+                        endpoint(&b.lower),
+                        endpoint(&b.upper),
+                        b.cumulative_frequency,
+                        b.distinct_count
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{\"buckets\":[{}],\"data-type\":\"{}\",\"null-values\":{},\"last-updated\":\"{}\",\"sampling-rate\":{},\"histogram-type\":\"{}\",\"number-of-buckets-specified\":{},\"collation-id\":{},\"auto-update\":false}}",
+            buckets, self.data_type, self.null_fraction, self.updated, self.sample_fraction,
+            if self.singleton { "singleton" } else { "equi-height" }, self.requested_buckets, self.collation_id)
+    }
+}
+
 /// MySQL-compatible histogram JSON; exact decimal endpoints are written as
 /// JSON numbers directly to avoid rounding them through an IEEE double.
 pub(crate) fn sql_histogram(
@@ -2943,7 +3015,7 @@ pub(crate) fn sql_histogram(
     column: &super::ColumnSchema,
     bucket_count: usize,
     population: u64,
-) -> String {
+) -> SqlHistogram {
     use super::DataTypeKind as T;
     let total = values.len();
     values.retain(|v| !matches!(v, Value::Null));
@@ -2993,39 +3065,18 @@ pub(crate) fn sql_histogram(
         T::Set { .. } => "set",
         _ => "string",
     };
-    let endpoint = |v: &Value| -> String {
-        match v {
-            Value::Int(_)
-            | Value::UInt(_)
-            | Value::Float(_)
-            | Value::Double(_)
-            | Value::Decimal(_)
-            | Value::DecimalCompact(..)
-            | Value::Decimal128(..)
-            | Value::DecimalWide(_)
-            | Value::Year(_) => v.to_display_string(),
-            Value::Bytes(bytes) => {
-                use base64::Engine;
-                serde_json::to_string(&format!(
-                    "base64:type254:{}",
-                    base64::engine::general_purpose::STANDARD.encode(bytes)
-                ))
-                .unwrap()
-            }
-            _ => serde_json::to_string(&v.to_display_string()).unwrap(),
-        }
-    };
     let singleton = groups.len() <= bucket_count;
     let mut buckets = Vec::new();
     let mut cumulative = 0;
     if singleton {
         for (v, count) in &groups {
             cumulative += count;
-            buckets.push(format!(
-                "[{},{}]",
-                endpoint(v),
-                cumulative as f64 / total.max(1) as f64
-            ));
+            buckets.push(SqlHistogramBucket {
+                lower: v.clone(),
+                upper: v.clone(),
+                cumulative_frequency: cumulative as f64 / total.max(1) as f64,
+                distinct_count: 1,
+            });
         }
     } else {
         let non_null = total - nulls;
@@ -3034,13 +3085,12 @@ pub(crate) fn sql_histogram(
             cumulative += count;
             if cumulative * bucket_count >= (buckets.len() + 1) * non_null || i + 1 == groups.len()
             {
-                buckets.push(format!(
-                    "[{},{},{},{}]",
-                    endpoint(&groups[lower].0),
-                    endpoint(&groups[i].0),
-                    cumulative as f64 / total.max(1) as f64,
-                    i + 1 - lower
-                ));
+                buckets.push(SqlHistogramBucket {
+                    lower: groups[lower].0.clone(),
+                    upper: groups[i].0.clone(),
+                    cumulative_frequency: cumulative as f64 / total.max(1) as f64,
+                    distinct_count: (i + 1 - lower) as u64,
+                });
                 lower = i + 1;
             }
         }
@@ -3048,8 +3098,18 @@ pub(crate) fn sql_histogram(
     let updated = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S%.6f")
         .to_string();
-    format!("{{\"buckets\":[{}],\"data-type\":\"{}\",\"null-values\":{},\"last-updated\":\"{}\",\"sampling-rate\":{},\"histogram-type\":\"{}\",\"number-of-buckets-specified\":{},\"collation-id\":{},\"auto-update\":false}}",
-        buckets.join(","), data_type, nulls as f64 / total.max(1) as f64, updated,
-        if population == 0 { 1.0 } else { total as f64 / population as f64 },
-        if singleton { "singleton" } else { "equi-height" }, bucket_count, crate::charset::collation_id(collation))
+    SqlHistogram {
+        buckets,
+        data_type: data_type.into(),
+        null_fraction: nulls as f64 / total.max(1) as f64,
+        updated,
+        sample_fraction: if population == 0 {
+            1.0
+        } else {
+            total as f64 / population as f64
+        },
+        singleton,
+        requested_buckets: bucket_count as u64,
+        collation_id: crate::charset::collation_id(collation) as u64,
+    }
 }

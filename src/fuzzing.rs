@@ -345,3 +345,8 @@ mod parser_smoke {
         }
     }
 }
+
+/// Exercise persistence control, row-codec metadata, undo and page decoders.
+pub fn storage_formats(bytes: &[u8]) {
+    crate::storage::fuzz_decode_storage_formats(bytes);
+}

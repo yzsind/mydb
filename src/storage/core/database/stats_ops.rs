@@ -996,26 +996,30 @@ impl Database {
             .remove(&txn_id);
     }
 
-    pub(crate) fn pending_live_row_deltas_snapshot(&self, txn_id: u64) -> HashMap<u64, i64> {
+    pub(crate) fn pending_live_row_deltas_snapshot(
+        &self,
+        txn_id: u64,
+    ) -> smallvec::SmallVec<[(u64, i64); 4]> {
         self.pending_live_row_deltas[txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock()
             .get(&txn_id)
-            .cloned()
+            .map(|tables| {
+                tables
+                    .iter()
+                    .map(|(&table, &delta)| (table, delta))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    pub(crate) fn restore_pending_live_row_deltas(
-        &self,
-        txn_id: u64,
-        snapshot: &HashMap<u64, i64>,
-    ) {
+    pub(crate) fn restore_pending_live_row_deltas(&self, txn_id: u64, snapshot: &[(u64, i64)]) {
         let mut pending = self.pending_live_row_deltas
             [txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock();
         if snapshot.is_empty() {
             pending.remove(&txn_id);
         } else {
-            pending.insert(txn_id, snapshot.clone());
+            pending.insert(txn_id, snapshot.iter().copied().collect());
         }
     }
     pub(crate) fn table_live_row_delta(&self, table_id: u64) -> i64 {
@@ -1330,73 +1334,50 @@ impl Database {
             }
         };
         let publication = (|| {
-            let mut catalog = self.catalog_write()?;
-            // The DDL may have started after the scan began. Recheck under
-            // the catalog publication lock, before consuming either delta
-            // counter; a later background pass must still see stale stats.
             if !is_explicit_analyze && self.catalog.online_pinned_ids.read().contains(&table.id) {
-                return Ok(None);
+                return Ok(false);
             }
-            let stored = catalog.tables.get_mut(table_key).ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NO_SUCH_TABLE,
-                    format!("Table '{table_key}' doesn't exist"),
-                )
-            })?;
-            if stored.id != table.id || stored.schema_version != table.schema_version {
-                return Err(error(
-                    crate::error::catalog::ER_TABLE_DEF_CHANGED,
-                    format!("Table '{table_key}' changed during ANALYZE; retry"),
-                ));
+            if !baseline_aligned {
+                stats.row_count = table.stats.row_count;
             }
-            // Subtract only the aligned pre-snapshot baseline. Commits after
-            // the snapshot remain in the sidecar, even if they finish before
-            // this catalog publication. An unaligned scan keeps the previous
-            // row baseline; all other distributions still use the new view.
-            if baseline_aligned {
-                if let Some(counter) = self.table_live_row_deltas.read().get(&table.id) {
-                    counter.fetch_sub(live_baseline, Ordering::Relaxed);
-                }
-            } else {
-                stats.row_count = stored.stats.row_count;
-            }
-            if let Some(counter) = self.table_modification_deltas.read().get(&table.id) {
-                counter.fetch_sub(modification_baseline, Ordering::Relaxed);
-            }
-            let table_id = stored.id;
-            let stored = Arc::make_mut(stored);
             stats.analyzed_at_unix_ms = Some(
                 current_unix_ms().max(
-                    stored
+                    table
                         .stats
                         .analyzed_at_unix_ms
                         .unwrap_or(0)
                         .saturating_add(1),
                 ),
             );
+            stats.analyze_revision =
+                table.stats.analyze_revision.checked_add(1).ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "statistics analysis revision exhausted",
+                    )
+                })?;
             stats.last_analyze_live_baseline = if baseline_aligned { live_baseline } else { 0 };
             stats.last_analyze_modification_baseline = modification_baseline;
-            stats.explicit_histograms = std::mem::take(&mut stored.stats.explicit_histograms);
-            stored.stats = stats;
-            // Statistics are physical-plan inputs irrespective of who refreshed
-            // them. Publish their dependency revision atomically with the new
-            // statistics, so both existing prepared handles and shared plans
-            // reject the old cost/join order on their next execution. Reuse the
-            // same per-table revision as explicit ANALYZE; unrelated tables keep
-            // their plans, and temporal schema history is unchanged.
-            stored.bump_schema_version_without_system_time_epoch();
-            Ok(Some(table_id))
+            stats.explicit_histograms = table.stats.explicit_histograms.clone();
+            let mut candidate = (*table).clone();
+            candidate.stats = stats;
+            self.publish_stats_candidate_checked(&table, candidate, !is_explicit_analyze)
         })();
-        let table_id = match publication {
-            Ok(Some(id)) => id,
-            Ok(None) => return Ok(false),
+        match publication {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(context) = zone_context {
+                    self.cancel_analyze_zone_build(context);
+                }
+                return Ok(false);
+            }
             Err(err) => {
                 if let Some(context) = zone_context {
                     self.cancel_analyze_zone_build(context);
                 }
                 return Err(err);
             }
-        };
+        }
 
         if is_explicit_analyze {
             let refreshed_table = self.snapshot_table_schema(table_key).ok();
@@ -1419,11 +1400,9 @@ impl Database {
                 (None, _) => self.rebuild_zone_map_for_table(zone_table),
             };
             if require_zone_success {
-                self.note_catalog_stats(table_id);
                 zone_result?;
             }
         }
-        self.note_catalog_stats(table_id);
         Ok(true)
     }
 
@@ -1438,6 +1417,8 @@ impl Database {
     ) -> Result<(), QueryError> {
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_statistics_writable()?;
+        let analyze_lock = self.analyze_lock(&table.qualified_name());
+        let _analyze = analyze_lock.lock();
         let population_barrier = AnalyzePopulationBarrier::try_new(self, table);
         let baseline_aligned = population_barrier.is_some();
         let live_baseline = self.table_live_row_delta(table.id);
@@ -1478,24 +1459,15 @@ impl Database {
             );
         }
 
-        let key = table_key(&table.database, &table.name);
-        let mut catalog = self.catalog_write()?;
-        let stored = catalog.tables.get_mut(&key).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{}' doesn't exist", table.qualified_name()),
-            )
-        })?;
-        if stored.id != table.id || stored.schema_version != table.schema_version {
-            return Err(error(
-                crate::error::catalog::ER_TABLE_DEF_CHANGED,
-                format!(
-                    "Table '{}' changed during ANALYZE; retry",
-                    table.qualified_name()
-                ),
-            ));
-        }
-        let stored = Arc::make_mut(stored);
+        let mut candidate = table.clone();
+        let stored = &mut candidate;
+        stored.stats.analyze_revision =
+            table.stats.analyze_revision.checked_add(1).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "statistics analysis revision exhausted",
+                )
+            })?;
         stored.stats.last_analyze_live_baseline = 0;
         stored.stats.last_analyze_modification_baseline = 0;
         stored.stats.partition_stats.extend(refreshed);
@@ -1526,9 +1498,6 @@ impl Database {
                 } else {
                     represented.max(live_baseline.min(0))
                 };
-                if let Some(counter) = self.table_live_row_deltas.read().get(&table.id) {
-                    counter.fetch_sub(aligned, Ordering::Relaxed);
-                }
                 stored.stats.last_analyze_live_baseline = aligned;
             }
             stored.stats.row_count = new_row_count;
@@ -1547,17 +1516,11 @@ impl Database {
                 ),
             );
             if baseline_aligned && current_ids.iter().all(|id| storage_ids.contains(id)) {
-                if let Some(counter) = self.table_modification_deltas.read().get(&table.id) {
-                    counter.fetch_sub(modification_baseline, Ordering::Relaxed);
-                }
                 stored.stats.last_analyze_modification_baseline = modification_baseline;
                 stored.stats.modified_rows_since_analyze = 0;
             }
         }
-        stored.bump_schema_version_without_system_time_epoch();
-        drop(catalog);
-        self.note_catalog_stats(table.id);
-        self.commit_catalog_txn()
+        self.publish_stats_candidate(table, candidate)
     }
 
     #[cfg(test)]
@@ -1956,6 +1919,7 @@ impl Database {
             .collect();
 
         let stats = TableStats {
+            analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count,
             heap_page_count: page_count,
@@ -2704,6 +2668,7 @@ impl Database {
         }
 
         Ok(TableStats {
+            analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count: live_rows.len() as u64,
             heap_page_count: 0,

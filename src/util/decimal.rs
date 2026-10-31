@@ -1680,3 +1680,16 @@ pub(crate) fn wide_to_f64(value: &crate::types::DecimalWide) -> f64 {
             f64::INFINITY
         })
 }
+
+/// Checked integer conversion for JSON_VALUE and typed multi-valued keys.
+/// This intentionally does not implement scalar CAST's unsigned wrapping.
+pub(crate) fn checked_integer_text(text: &str, unsigned: bool) -> Option<crate::types::Value> {
+    let (magnitude, scale) = parse_exact_decimal_big(text)?;
+    let rounded = rescale_exact(ExactDecimal::from_big(magnitude, scale), 0, true);
+    let (magnitude, _) = rounded.into_big_parts();
+    if unsigned {
+        magnitude.to_u64().map(crate::types::Value::UInt)
+    } else {
+        magnitude.to_i64().map(crate::types::Value::Int)
+    }
+}

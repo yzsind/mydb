@@ -164,7 +164,7 @@ impl Default for IndexBuildOptions {
 // reserved for future use (e.g. persisted `deleted_count` or free
 // slot list head — see docs/storage-compression-opportunities.md
 // optimisation E).
-const PAGE_HEADER_SIZE: usize = 32;
+const PAGE_HEADER_SIZE: usize = 64;
 // Slot directory entry size. Was 8 bytes pre-rowid-6bytes (offset:2 +
 // len:2 + generation:2 + flags:1 + pad:1), then 6 bytes after that
 // refactor (offset:2 + len:2 + flags:1 + pad:1). v10 (HEAP_PAGE_VERSION)
@@ -998,31 +998,6 @@ type BufferFileCacheMap =
 /// register / drop traffic, so the hash speedup compounds across shards.
 type ActiveSnapshotMap = hashbrown::HashMap<u64, ActiveSnapshot, ahash::RandomState>;
 
-/// Undo directory latch. Cold segment I/O is prepared under a read guard and
-/// completed after releasing it, so this lock covers metadata only. Shared
-/// guards let concurrent old-version readers and diagnostics proceed together;
-/// append publication, purge removal and compaction swaps take the write side.
-#[derive(Debug)]
-struct UndoLatch<T>(parking_lot::RwLock<T>);
-
-impl<T> UndoLatch<T> {
-    fn new(value: T) -> Self {
-        Self(parking_lot::RwLock::new(value))
-    }
-
-    fn read(&self) -> parking_lot::RwLockReadGuard<'_, T> {
-        self.0.read()
-    }
-
-    fn write(&self) -> parking_lot::RwLockWriteGuard<'_, T> {
-        self.0.write()
-    }
-
-    fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, T>> {
-        self.0.try_read()
-    }
-}
-
 #[derive(Debug)]
 pub struct Database {
     _snapshot_runtime: Option<crate::storage::image_io::SnapshotRuntime>,
@@ -1076,17 +1051,14 @@ pub struct Database {
     /// Lock-free summary of which transactions own a `lock_manager` lock log.
     lock_log_presence: Arc<super::txn::LockLogPresence>,
     mdl: MdlManager,
-    // parking_lot for the same metastable-convoy reason as `txns`: every
-    // row-level DML appends an undo record under this lock.
-    undo: UndoLatch<UndoTablespace>,
+    /// Sharded live undo publication with an exclusive maintenance barrier.
+    undo: UndoLatch,
     /// Immutable Arc-owned shard routing table shared with `UndoManager`.
     /// Keeping it outside the manager lock prevents every row write from
     /// acquiring a global read guard merely to clone one shard handle.
     undo_append_shards: Arc<[UndoWriteShardHandle]>,
     undo_resident_admission: crate::storage::undo::UndoResidentAdmission,
     undo_append_next_shard: AtomicU64,
-    /// Flat-combining queue for concurrent undo directory publication.
-    undo_publish: UndoPublishQueue,
     /// Mirrors the two runtime gates that require append admission before IO.
     /// Disabling is published before changing either gate; enabling is
     /// published after, so runtime changes cannot admit an unsafe fast append.
@@ -3161,6 +3133,8 @@ struct BufferPageFileKey {
     kind: BufferPageFileKind,
     path: PathBuf,
     hash: u64,
+    owner: [u8; 16],
+    owner_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3175,7 +3149,16 @@ impl BufferPageFileKey {
         kind.hash(&mut hasher);
         path.hash(&mut hasher);
         let hash = hasher.finish();
-        Self { kind, path, hash }
+        let result = page_owner_result(&path);
+        let owner_error = result.as_ref().err().map(ToString::to_string);
+        let owner = result.unwrap_or([0; 16]);
+        Self {
+            kind,
+            path,
+            hash,
+            owner,
+            owner_error,
+        }
     }
 }
 
@@ -3525,6 +3508,8 @@ struct BufferPool {
     /// no longer ping-pongs the line back and forth against the
     /// neighbouring `evictions`/`flushes`/`dirty_pages` counters.
     used_pages: CachePadded<AtomicU64>,
+    /// Bounded additional unflushable pages admitted by generic WAL batching.
+    deferred_wal_pages: CachePadded<AtomicU64>,
     evictions: AtomicU64,
     flushes: AtomicU64,
     /// Logical writes applied to resident page images. Unlike `flushes`, this
@@ -4511,6 +4496,7 @@ include!("core/database/mvcc.rs");
 include!("core/database/undo_publish.rs");
 include!("core/database/startup.rs");
 include!("core/database/stats_ops.rs");
+include!("core/database/stats_recovery.rs");
 include!("core/database/io_handles.rs");
 include!("core/database/sequences.rs");
 include!("core/database/sequence_persistence.rs");
@@ -4855,6 +4841,8 @@ include!("core/row_codec.rs");
 include!("core/constraints.rs");
 include!("core/catalog_io.rs");
 include!("core/bytes.rs");
+include!("core/page_identity.rs");
+include!("core/heap_meta.rs");
 include!("core/errors.rs");
 // The R-tree spatial index is a proper submodule (not `include!`d) so its
 // helper types stay namespaced rather than polluting `storage::core`.

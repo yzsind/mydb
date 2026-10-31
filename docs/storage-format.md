@@ -46,6 +46,8 @@ The following are the canonical paths; files are created on demand, and not ever
 │   │   ├── <index_id>.hvec
 │   │   └── <index_id>.hnsw
 ├── system/
+│   ├── storage.control
+│   ├── object-owners/<path-digest>.owner
 │   ├── catalog/
 │   │   ├── <dd_table_id>.heap
 │   │   ├── <dd_table_id>.lob
@@ -98,7 +100,7 @@ objects, but their lifecycles and recovery semantics differ.
 
 ## 5. Unified Page Conventions
 
-Heap, BTREE, LOB, paged HNSW, paged IVF, and Zone Map files all consist of `16 KiB` pages; page number `n`
+Heap, BTREE, LOB, R-tree, paged HNSW, paged IVF, and Zone Map files all consist of `16 KiB` pages; page number `n`
 sits at file offset `n * 16384`. These pages share the key offsets required for recovery:
 
 | Offset | Length | Convention |
@@ -110,6 +112,8 @@ sits at file offset `n * 16384`. These pages share the key offsets required for 
 | 16 | 4 | CRC32 (IEEE; this field is treated as 0 when computed) |
 | 20 | 4+ | type-specific header and payload |
 
+Heap, BTREE, LOB and R-tree pages reserve bytes 40..56 for a 128-bit physical owner identity and bytes 56..64 for the physical page number. Their CRC covers these fields. The identity derives from the storage UUID and stable object/generation path, with explicit durable transfer proofs for DDL that publishes an existing physical file at a new object path. Opening a copied or misplaced page verifies both the expected owner and its page position; content CRC alone does not establish ownership.
+
 WAL redo uses the page LSN to decide whether a physical page update has already
 been applied. Page-kind magic identifies the layout used for checksum validation
 and recovery.
@@ -120,7 +124,7 @@ framed/append-only layouts with their own magic, version and CRC.
 
 ## 6. Heap, RowId, and Row Records
 
-A `.heap` file has no separate file header; page 0 is an ordinary heap page. The page header is 32 B; the 5 B slot directory grows upward from low
+A `.heap` file reserves page 0 for allocation metadata; row pages start at page 1. The row-page header is 64 B; the 5 B slot directory grows upward from low
 addresses, and row payloads grow downward from the end of the page. A slot stores `offset:u16 + len:u16 + flags:u8`,
 with the states active, deleted-pending, or free. In-page compaction may move payloads but never changes slot IDs.
 
@@ -128,13 +132,15 @@ with the states active, deleted-pending, or free. In-page compaction may move pa
 RowId := page_id u32 LE + slot_id u16 LE       # fixed 6 B
 ```
 
+Heap allocation metadata stores the advertised page count and whether a LOB file has been initialized. Allocation initializes page baselines and WAL-protects the metadata before publishing the new range. Physical space statistics and temporary-table quotas include page 0, including for an empty table. Missing files, a short extent, or zero pages inside the allocated range are corruption. A lost LOB must not be recreated with reused allocation generations.
+
 RowId carries no table ID, because the surrounding heap/index/undo context already binds the owning storage object. A single table
 can address roughly `2^32 * 16 KiB = 64 TiB` at most.
 
-The high-level layout of the current MVCC row v7 is:
+The high-level layout of the current MVCC row v9 is:
 
 ```text
-u8      row_version = 7
+u8      row_version = 9
 u8      flags
 [u64]   last_txn_id
 [u64]   undo_ptr
@@ -181,7 +187,7 @@ generation    u64 LE
 ```
 
 Page 0 of a `.lob` is the meta page, holding the free-list head, the authoritative page-count high-water mark, and the
-next generation. All other pages use a 40 B common header with a payload cap of 16344 B and are chained by `next_page_id`
+next generation. All other pages use a 64 B common header with a payload cap of 16320 B and are chained by `next_page_id`
 into a singly linked list. Head-page flags can mark LZ4 compression and contiguous pages; `total_len` is always the
 decompressed logical length.
 
@@ -192,7 +198,7 @@ historical versions until a purge safely releases them. The generation of each a
 
 A `.idx` file is a 16 KiB page array: page 0 is the meta page, the initial root is page 1, and the remaining pages are leaf, internal,
 or free pages. The meta records the file/page version, page size, root, allocator high-water mark, and
-free-list head. Tree pages use a 24 B common header, and the `(offset:u16,len:u16)` slot array at the tail of the payload supports binary search directly over the raw bytes of a cold page.
+free-list head. Tree pages use a 64 B common header, and the `(offset:u16,len:u16)` slot array at the tail of the payload supports binary search directly over the raw bytes of a cold page.
 
 A leaf entry logically has the form `IndexKey + RowId`, and the total order within a page is `(key, RowId)`. Uniqueness checks only the user-declared key prefix; included columns are a covering suffix and do not participate in uniqueness. Internal separators also carry the
 full key/RowId; the right child immediately follows its separator, and the first child is stored separately in the fixed header.
@@ -347,7 +353,7 @@ No directory scan result may override the Data Dictionary's object identity and 
 
 WAL is a variable-length frame stream under `system/wal/`, with a default
 256 MiB segment rotation threshold. It does not use fixed 16 KiB framing.
-The current WAL v34 segment header is 40 bytes, little-endian:
+The current WAL v40 segment header is 64 bytes, little-endian:
 
 | Offset | Bytes | Field |
 | ---: | ---: | --- |
@@ -356,7 +362,10 @@ The current WAL v34 segment header is 40 bytes, little-endian:
 | 12 | 8 | segment ID |
 | 20 | 8 | creation time, Unix milliseconds |
 | 28 | 8 | `replaces_through`, explicit checkpoint replacement horizon; zero for an ordinary segment |
-| 36 | 4 | CRC32 of bytes 0..36 |
+| 36 | 16 | storage UUID |
+| 52 | 4 | header length, 64 |
+| 56 | 4 | reserved, zero |
+| 60 | 4 | CRC32 of bytes 0..60 |
 
 Each frame has a 48-byte header followed by its type-specific payload:
 
@@ -382,20 +391,34 @@ transaction boundaries, checkpoints, undo, history/ledger tails, sequence
 reservations, and file generation/system-file operations. A `TxnBatch` packs
 ordered logical records and a final commit into one checksummed frame.
 Recovery may truncate a torn/zero preallocated tail under its tail-validation
-rules; a mid-stream checksum failure is an error. The replacement horizon
+rules; a later valid frame makes an interior hole an error. A complete CRC-valid
+frame with unsupported flags, record type, ordering or payload is an error and
+is preserved, including in the active segment. Explicit operator salvage is a
+separate mode that preserves the original segment before discarding history. The replacement horizon
 controls reclamation of superseded segments and must not be inferred merely
 from file names or the current segment ID.
 
 ### 12.2 Undo tablespace
 
-`system/undo/undo-<segment-id>.seg` is an append-only segmented file with a default target of 64 MiB. The 32 B
-segment header contains `MYUNDO1\0`, the tablespace version, and the segment ID; the remainder is reserved as zero.
-Each record uses a 16 B frame header:
+`system/undo/undo-<segment-id>.seg` is an append-only segmented file with a default target of 64 MiB. Its 64 B segment header contains `MYUNDO1\0` at 0..8,
+tablespace version u32 at 8, segment ID u32 at 12, zero reserved bytes at 16..24,
+storage UUID at 24..40, zero reserved bytes at 40..60 and CRC32 of bytes 0..60
+at 60..64. Canonical segments must match the current data-directory UUID.
+Each record uses a 24 B frame header:
 
 ```text
 magic:u32="MUFR" | payload_len:u32 | payload_crc32:u32
-tablespace_version:u32 | undo_payload[]
+tablespace_version:u32 | header_crc32:u32 | frame_offset:u32 | undo_payload[]
 ```
+
+The header CRC covers the first 16 header bytes, the segment ID and the frame
+offset, binding payload length and payload CRC to their physical position.
+The payload's undo pointer must agree with that segment and offset. Segment
+headers also protect their storage identity with CRC32. A bad complete header is
+corruption, never evidence of an incomplete final append. Only the highest
+allocation segment of a write shard may trim a partial append; older segments
+and all atomically published compaction outputs are sealed and reject partial
+tails. Normal recovery preserves their bytes on failure.
 
 An undo payload begins with `UNDO_BINARY_VERSION:u8`, followed by the undo pointer, txn/time, the transaction's
 rollback-chain predecessor, kind, table/RowId, an optional old MVCC header, a full-row or changed-column
@@ -417,10 +440,14 @@ ownership constraints; a LOB chain owned by an old version is released only afte
   `mysql.sequence_values`; `mysql.sequence_retirements` proves retired generations until WAL coverage
   permits reclaiming those proofs. Replay orders states by LSN, including decreasing and cycling values.
   See [Sequences](sequences.md) for gap, reset and asynchronous-failover boundaries.
-- `commit-ledger.v1`: the 16 B header is `MYDBCTL1 + version:u32=1 + reserved:u32`; each subsequent
+- `commit-ledger.v1`: its current header version is 2; the filename is a stable
+  namespace, not the header version. The 64 B header stores `MYDBCTL1` at 0..8,
+  version u32 at 8, header length u32 at 12, storage UUID at 16..32, zero reserved
+  bytes at 32..60 and CRC32 of bytes 0..60 at 60. Each subsequent
   32 B entry is `txn_id:u64 + commit_scn:u64 + commit_unix_us:u64 + crc32:u32 + reserved:u32`.
   WAL commit records can repair the not-yet-checkpointed tail.
-- `history-index.v1`: the 16 B header is `MYDBHIX1 + version:u32=1 + reserved:u32`, followed by
+- `history-index.v1`: the version-2 64 B header uses `MYDBHIX1` and the same
+  length/UUID/reserved/CRC layout as the ledger, followed by
   `txn_id:u64 + payload_len:u32 + crc32:u32 + payload` frames; it is a degradable accelerator.
 - `binlog/`: a MySQL binlog event stream using the MySQL 4 B magic, the 19 B event header,
   and event checksums; it is the replication/CDC interface, not a heap crash-recovery log.
@@ -459,3 +486,64 @@ and the rest has been completed.
 When opening a file, at minimum verify the magic, version, page size (where applicable), structural boundaries, and checksum. A blank, unallocated
 page must be distinguished from a formatted page; corruption of a formatted page must never be silently interpreted as an empty page. A derived structure that fails validation may fall back
 or be rebuilt, but a failed validation of a correctness source of truth must produce a clear error.
+
+## 15. Format Admission and Stable Metadata
+
+`system/storage.control` is a fixed 128-byte admission record independent of the Data Dictionary row codec. Its immutable storage UUID follows physical backups and replicas. Before writable WAL recovery or cleanup, the server checks magic, envelope version, header/page sizes, initialized state, required reader/writer feature masks, the complete format fingerprint and CRC32. The first release accepts the exact supported format set for both writable and immutable opens; it does not mix page versions or silently migrate development directories. Unsupported required features are errors. New compatible features must receive an explicit protocol/version decision before a writer emits them.
+
+Control-file offsets are: magic 0..8 (`MYDBCTL2`), version 8..12, header length 12..16, page size 16..20, initialized state 20..24, required-reader mask 24..32, required-writer mask 32..40, storage UUID 40..56, SHA-256 format fingerprint 56..88, catalog version 88..92, zero reserved bytes 92..124, and CRC32 of bytes 0..124 at 124..128. An initialized directory never bootstraps over a missing dictionary. Missing control metadata with existing object/WAL/undo, temporal or owner-proof bytes is rejected.
+
+`system/object-owners/<path-digest>.owner` authorizes a physical file identity transfer without rewriting its pages. The 84-byte envelope stores `MYDBOWN1`, version u32, zero reserved u32, destination identity digest [16], physical owner [16], storage UUID [16], reserved [16], then CRC32 of the preceding 80 bytes. DDL publishes the proof before changing the namespace; its existing publication/recovery journal controls commit and rollback. Proofs belong to the authoritative backup and replica seed inventory.
+
+Persisted row layouts use a versioned `RowCodecSpec` with explicitly assigned codec IDs and typed parameters. Rust Debug output is not an encoding. IDs 1..21 denote integer, float32, float64, variable decimal, wide decimal, fixed decimal, UTF-8 string, bytes, JSONB, geometry, variable vector, fixed bytes, BIT, fixed vector, ENUM, SET, DATE, TIME, DATETIME, TIMESTAMP and YEAR respectively. Parameters retain widths, signedness, scale, fractional precision, vector domain/dimension and ENUM/SET labels as applicable. Unknown IDs, invalid parameters, missing layout references and malformed authoritative catalog JSON are errors; only rebuildable statistics use degradation defaults.
+
+Vector state files use `MYDBVEC2`, envelope version u16, kind u8, typed payload and trailing CRC32. The independent envelope version covers generation manifests, resident state and publication/retirement records in addition to the paged vector-container version.
+
+Native role/progress/slot, undo manifest and MySQL channel/relay JSON have a checked envelope: `magic=MYDBMETA1`, kind, version, required_features, payload and checksum. CRC32 binds the kind/version/features and exact encoded JSON payload. Relay envelopes remain one JSON record per line and are encoded with a streaming checksum writer. Unsupported versions/features are refused; corrupt relay records are not applied. The binlog manifest has a separately checked version and cannot be overwritten by a reader that does not support it.
+
+The page size and little-endian scalar encoding are fixed for this format epoch. Codec and checksum identities cannot be repurposed. Compression/encryption changes must have explicit algorithm and key/nonce metadata and a required feature/version boundary; reserved bytes alone do not authorize interpreting new semantics with an old reader.
+
+
+## 16. Address and Identity Limits
+
+Heap RowIds use a 32-bit page number and a 16-bit slot number. With 16 KiB
+pages and page 0 reserved for allocation metadata, each independent heap can
+address at most `2^32 - 1` data pages (slightly less than 64 TiB). Partition
+leaves have independent storage identities and heaps. LOB descriptors use
+32-bit page numbers and logical byte lengths; a single value cannot exceed
+`2^32 - 1` bytes. Paged HNSW NodeIds use a 24-bit page and 8-bit slot, addressing
+approximately 256 GiB of node pages; payload and adjacency must also fit a page.
+
+User table, partition and private-build storage IDs share the range
+`[1, 2^48)`; the dictionary namespace starts at `2^48` and temporary tables
+use a separate namespace. Column and row-layout
+IDs are 32-bit; index, generation, WAL LSN and segment identities use their
+registered fixed-width integer fields. Allocation rejects exhaustion before
+publishing a reused or wrapped identity. Filesystem, operating-system and
+resource limits may impose smaller practical bounds. Widening these fields
+requires a new explicit format epoch rather than a native integer cast.
+
+### Compressed transaction batches
+
+WAL v40 permits bounded LZ4 compression inside a `TxnBatch` payload. A high bit
+in its first u32 marks compression; the remaining bits preserve the logical
+record count. The next u32 stores the uncompressed payload length, followed by an append-time
+u64 commit timestamp and an LZ4 block containing the ordinary batch payload.
+The decoder installs that timestamp into the final commit record; system-only
+file batches carry zero. This keeps decision-time assignment outside compression. Decoders reject
+length/count mismatches and expansion beyond 64 KiB. The enclosing frame CRC,
+transaction links, source time, commit boundary and physical before-images
+retain their ordinary meaning. Uncompressed batches remain valid. Writers
+use compression only when a bounded frame saves at least one eighth of its
+payload; larger and incompressible frames retain their ordinary encoding.
+
+### Header-only delete undo
+
+Undo binary v15 adds `DeleteHeader` for inline heap rows whose tombstones retain
+the exact original payload and layout. Its undo record carries the previous
+MVCC header and no copied values or external references. Snapshot traversal
+keeps the retained payload, rollback restores the header and index entries,
+and purge reclaims the tombstone only after all older snapshots release it.
+Rows with external references or unsupported layouts retain full delete undo.
+Physiological WAL still retains the before-bytes needed for catalog-free crash
+undo and point-in-time recovery.

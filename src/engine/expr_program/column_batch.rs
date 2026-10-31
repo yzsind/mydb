@@ -1,5 +1,18 @@
 //! Composable, diagnostic-free column kernels. A decline is side-effect free:
 //! the caller retains the ordered scalar oracle for the complete expression.
+mod boolean_read;
+mod conditional;
+mod crypto_read;
+mod format_read;
+mod integer_string;
+mod json;
+mod numeric_read;
+mod producer;
+mod regexp_read;
+mod string_read;
+mod temporal_read;
+mod temporal_shift;
+mod unsigned_read;
 use super::*;
 use crate::engine::executor::vec::expr_batch::{
     transform_utf8_column, try_temporal_extract_column,
@@ -10,19 +23,42 @@ use crate::engine::executor::vec::{
     schema::BatchSchema,
 };
 use crate::engine::expr::date_format::DateFormatPlan;
+use crate::engine::expr::network::{self, NetworkFunction};
+use boolean_read::BooleanRead;
 use chrono::{Datelike, NaiveDate};
+use conditional::Conditional;
+use crypto_read::CryptoRead;
+use format_read::FormatRead;
+use integer_string::IntegerString;
+use json::JsonRead;
+use numeric_read::NumericRead;
+use producer::Producer;
+use regexp_read::RegexpRead;
+use string_read::StringRead;
+use temporal_read::TemporalRead;
+use temporal_shift::TemporalShift;
+use unsigned_read::UnsignedRead;
 
 #[derive(Clone, Copy)]
 enum Domain {
     Integer(i64, i64),
+    Unsigned,
+    Exact,
+    Approximate,
     Text,
     Binary,
     Temporal,
+    Json,
     Null,
 }
 struct Contract {
     domain: Domain,
     parallel: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTRACT_BIND_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl ExprProgram {
@@ -35,12 +71,17 @@ impl ExprProgram {
     pub(crate) fn column_parallel_safe(&self, schema: &BatchSchema) -> bool {
         contract(&self.root, schema).is_some_and(|c| c.parallel)
     }
+    /// Reservation for a retained output, independent of speculative workspace limits.
+    pub(crate) fn column_retained_bound(&self, batch: &Batch) -> Option<usize> {
+        contract(&self.root, batch.schema())?;
+        workspace(&self.root, batch)?.0.checked_mul(2)
+    }
     pub(crate) fn column_output_bound(&self, batch: &Batch) -> Option<usize> {
         contract(&self.root, batch.schema())?;
-        let (payload, work) = workspace(&self.root, batch)?;
+        let (payload, _) = workspace(&self.root, batch)?;
         let limit = crate::engine::executor::vec::evaluated_batch::byte_target().saturating_mul(2);
         let capacity = payload.checked_mul(2)?;
-        (work <= limit && capacity <= limit).then_some(capacity)
+        (capacity <= limit).then_some(capacity)
     }
     pub(crate) fn try_eval_column(&self, batch: &Batch) -> Option<ColumnVector> {
         contract(&self.root, batch.schema())?;
@@ -55,13 +96,14 @@ impl ExprProgram {
             };
             if work > crate::engine::executor::vec::evaluated_batch::byte_target().saturating_mul(2)
             {
-                return None;
+                evaluate_in_chunks(&self.root, batch, self.referenced_columns(), payload, work)?
+            } else {
+                let mut scratch = batch.memory_charge();
+                if !scratch.add_within(work.checked_mul(2)?, usize::MAX) {
+                    return None;
+                }
+                evaluate(&self.root, batch)?
             }
-            let mut scratch = batch.memory_charge();
-            if !scratch.add_within(work.checked_mul(2)?, usize::MAX) {
-                return None;
-            }
-            evaluate(&self.root, batch)?
         };
         let rows = batch.visible_rows() as u64;
         record_column_eval_rows(rows);
@@ -79,9 +121,16 @@ fn constant(node: &ExprNode) -> Option<std::borrow::Cow<'_, Value>> {
     }
 }
 fn integer(node: &ExprNode) -> Option<i64> {
-    match constant(node)?.as_ref() {
+    let read = |value: &Value| match value {
         Value::Int(n) => Some(*n),
         Value::UInt(n) => i64::try_from(*n).ok(),
+        _ => None,
+    };
+    match node {
+        ExprNode::Const(value) => read(value),
+        ExprNode::Placeholder(index) => {
+            crate::engine::params::with_current_param(*index, |value| read(value?))
+        }
         _ => None,
     }
 }
@@ -164,7 +213,67 @@ fn comparison(op: BinaryOp) -> bool {
     )
 }
 
+/// Per-row octet bound used only to prove absence of packet warnings before
+/// moving a text expression into scan workers. Unknown bounds stay ordered.
+fn string_bound(node: &ExprNode, schema: &BatchSchema) -> Option<u64> {
+    if matches!(contract(node, schema)?.domain, Domain::Integer(..)) {
+        return Some(20);
+    }
+    match node {
+        ExprNode::Column(index) => schema.fields().get(*index)?.source.length.map(u64::from),
+        ExprNode::Const(_) | ExprNode::Placeholder(_) => Some(match constant(node)?.as_ref() {
+            Value::String(s) => s.len() as u64,
+            Value::SmallString(s) => s.len() as u64,
+            Value::Bytes(b) => b.len() as u64,
+            Value::Null => 0,
+            _ => return None,
+        }),
+        ExprNode::Function {
+            kernel: FunctionKernel::LegacyDeterministic("CAST"),
+            args,
+            ..
+        } => string_bound(&args[0], schema),
+        ExprNode::Function {
+            kernel: FunctionKernel::Lpad | FunctionKernel::Rpad,
+            args,
+            ..
+        } => u64::try_from(integer(&args[1])?).ok()?.checked_mul(4),
+        _ => None,
+    }
+}
+
 fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
+    #[cfg(test)]
+    CONTRACT_BIND_VISITS.with(|visits| visits.set(visits.get() + 1));
+    if let Some(read) = NumericRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = FormatRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = BooleanRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = Conditional::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = CryptoRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if matches!(node, ExprNode::Function { .. }) {
+        if let Some(read) = UnsignedRead::bind(node, schema) {
+            return Some(read.contract());
+        }
+    }
+    if let Some(read) = IntegerString::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = RegexpRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = StringRead::bind(node, schema) {
+        return Some(read.contract());
+    }
     let (domain, parallel) = match node {
         ExprNode::Column(index) => {
             let field = schema.fields().get(*index)?;
@@ -178,7 +287,13 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                 {
                     Domain::Integer(i64::MIN, i64::MAX)
                 }
+                ColumnType::Tiny
+                | ColumnType::Short
+                | ColumnType::MediumInt
+                | ColumnType::Long
+                | ColumnType::LongLong => Domain::Unsigned,
                 ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp => Domain::Temporal,
+                ColumnType::Json => Domain::Json,
                 ColumnType::VarString | ColumnType::Blob => {
                     if field.source.flags & crate::mysql::protocol::BINARY_FLAG != 0
                         || field.source.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
@@ -195,6 +310,7 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
         ExprNode::Const(_) | ExprNode::Placeholder(_) => (
             match constant(node)?.as_ref() {
                 Value::Int(n) => Domain::Integer(*n, *n),
+                Value::UInt(_) => Domain::Unsigned,
                 Value::Null => Domain::Null,
                 Value::String(_) | Value::SmallString(_) => Domain::Text,
                 Value::Bytes(_) => Domain::Binary,
@@ -210,21 +326,71 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
             (child.domain, child.parallel)
         }
         ExprNode::Binary {
+            op: BinaryOp::Arrow | BinaryOp::LongArrow,
+            ..
+        } => {
+            return Some(JsonRead::bind(node, schema)?.contract());
+        }
+        ExprNode::Binary {
+            left, right, op, ..
+        } if unsigned_read::bitwise(*op) => {
+            let (a, b) = (contract(left, schema)?, contract(right, schema)?);
+            let numeric = |d| matches!(d, Domain::Integer(..) | Domain::Unsigned | Domain::Null);
+            if !numeric(a.domain) || !numeric(b.domain) {
+                return None;
+            }
+            (Domain::Unsigned, a.parallel && b.parallel)
+        }
+        ExprNode::Binary {
             left,
             op,
             right,
             semantics,
-        } if (matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) || comparison(*op))
+        } if (matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Mod
+        ) || comparison(*op))
             && !semantics.unsigned_subtraction =>
         {
             let (l, r) = (contract(left, schema)?, contract(right, schema)?);
             let (Domain::Integer(a, b), Domain::Integer(c, d)) = (l.domain, r.domain) else {
-                return None;
+                let nonnegative = |domain| {
+                    matches!(domain, Domain::Unsigned | Domain::Null)
+                        || matches!(domain,Domain::Integer(min,_) if min>=0)
+                };
+                return (nonnegative(l.domain)
+                    && nonnegative(r.domain)
+                    && (matches!(l.domain, Domain::Unsigned)
+                        || matches!(r.domain, Domain::Unsigned)))
+                .then_some(Contract {
+                    domain: if comparison(*op) {
+                        Domain::Integer(0, 1)
+                    } else {
+                        Domain::Unsigned
+                    },
+                    parallel: comparison(*op) && l.parallel && r.parallel,
+                });
             };
             if comparison(*op) {
                 return Some(Contract {
                     domain: Domain::Integer(0, 1),
                     parallel: l.parallel && r.parallel,
+                });
+            }
+            if matches!(op, BinaryOp::Mod) {
+                // |MIN| is 2^63: take the unsigned magnitude before
+                // subtracting one, so MAX % MIN remains inside the proof.
+                let bound = c
+                    .unsigned_abs()
+                    .max(d.unsigned_abs())
+                    .saturating_sub(1)
+                    .min(i64::MAX as u64) as i64;
+                return Some(Contract {
+                    domain: Domain::Integer(-bound, bound),
+                    parallel: l.parallel
+                        && r.parallel
+                        && (c > 0 || d < 0)
+                        && !(a == i64::MIN && c <= -1 && d >= -1),
                 });
             }
             let apply = |x: i64, y: i64| match op {
@@ -244,7 +410,90 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                 None => (Domain::Integer(i64::MIN, i64::MAX), false),
             }
         }
-        ExprNode::Function { kernel, args, .. } => {
+        ExprNode::Function {
+            kernel,
+            args,
+            result_coercion,
+            ..
+        } => {
+            if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
+                return Some(TemporalShift::bind(node, schema)?.contract());
+            }
+            if matches!(
+                kernel,
+                FunctionKernel::LegacyDeterministic("GREATEST" | "LEAST")
+            ) {
+                if args.len() < 2 || result_coercion.is_some() {
+                    return None;
+                }
+                let mut parallel = true;
+                let mut all_null = false;
+                for arg in args {
+                    if let ExprNode::Column(index) = arg {
+                        if schema.fields().get(*index)?.source.flags
+                            & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+                            != 0
+                        {
+                            return None;
+                        }
+                    }
+                    let child = contract(arg, schema)?;
+                    match child.domain {
+                        Domain::Integer(..) => {}
+                        Domain::Null => all_null = true,
+                        _ => return None,
+                    }
+                    parallel &= child.parallel;
+                }
+                return Some(Contract {
+                    domain: if all_null {
+                        Domain::Null
+                    } else {
+                        Domain::Integer(i64::MIN, i64::MAX)
+                    },
+                    parallel,
+                });
+            }
+            if let Some(read) = TemporalRead::bind(node, schema) {
+                return Some(read.contract());
+            }
+            if matches!(
+                kernel,
+                FunctionKernel::LegacyDeterministic("JSON_ARRAY" | "JSON_OBJECT")
+            ) {
+                Producer::bind(node, schema)?;
+                return Some(Contract {
+                    domain: Domain::Json,
+                    parallel: true,
+                });
+            }
+            if matches!(kernel, FunctionKernel::LegacyDeterministic("JSON_QUOTE")) {
+                json::quote_column(node, schema)?;
+                return Some(Contract {
+                    domain: Domain::Json,
+                    parallel: true,
+                });
+            }
+            if matches!(
+                kernel,
+                FunctionKernel::JsonExtract
+                    | FunctionKernel::LegacyDeterministic(
+                        "JSON_UNQUOTE"
+                            | "JSON_PRETTY"
+                            | "JSON_SEARCH"
+                            | "JSON_TYPE"
+                            | "JSON_LENGTH"
+                            | "JSON_VALID"
+                            | "JSON_KEYS"
+                            | "JSON_CONTAINS_PATH"
+                            | "JSON_OVERLAPS"
+                            | "JSON_STORAGE_SIZE"
+                            | "JSON_STORAGE_FREE"
+                            | "JSON_VALUE"
+                    )
+            ) {
+                return Some(JsonRead::bind(node, schema)?.contract());
+            }
             if let Some((kind, index)) = temporal_column(*kernel, args) {
                 if !matches!(
                     schema.fields().get(index)?.column_type,
@@ -280,6 +529,54 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                 (child.domain, child.parallel)
             } else {
                 match (kernel, args.as_slice()) {
+                    (FunctionKernel::Network(function), args) => {
+                        function.check_arity(args).ok()?;
+                        let child = contract(&args[0], schema)?;
+                        if args.len() == 2 && integer(&args[1]).is_none() {
+                            return None;
+                        }
+                        let valid = if matches!(function, NetworkFunction::InetNtoa) {
+                            matches!(child.domain, Domain::Integer(..) | Domain::Null)
+                        } else {
+                            matches!(child.domain, Domain::Text | Domain::Binary | Domain::Null)
+                        };
+                        if !valid {
+                            return None;
+                        }
+                        let domain = if function.is_predicate() {
+                            Domain::Integer(0, 1)
+                        } else {
+                            match function {
+                                NetworkFunction::InetAton => Domain::Integer(0, u32::MAX as i64),
+                                NetworkFunction::UuidToBin | NetworkFunction::Inet6Aton => {
+                                    Domain::Binary
+                                }
+                                _ => Domain::Text,
+                            }
+                        };
+                        (domain, child.parallel && function.is_predicate())
+                    }
+                    (FunctionKernel::LegacyDeterministic("CAST"), [arg, target])
+                        if text(target).is_some_and(|s| s.eq_ignore_ascii_case("CHAR")) =>
+                    {
+                        let child = contract(arg, schema)?;
+                        if !matches!(
+                            child.domain,
+                            Domain::Integer(..) | Domain::Text | Domain::Null
+                        ) {
+                            return None;
+                        }
+                        (Domain::Text, child.parallel)
+                    }
+                    (FunctionKernel::Lpad | FunctionKernel::Rpad, [arg, length, pad])
+                        if integer(length).is_some_and(|n| n >= 0) && text(pad).is_some() =>
+                    {
+                        let child = contract(arg, schema)?;
+                        if !matches!(child.domain, Domain::Text | Domain::Null) {
+                            return None;
+                        }
+                        (Domain::Text, child.parallel && (integer(length)? as u64).checked_mul(4).is_some_and(|bytes| bytes <= crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes()))
+                    }
                     (FunctionKernel::Date, [ExprNode::Column(index)])
                         if schema.fields().get(*index)?.column_type == ColumnType::Date =>
                     {
@@ -319,16 +616,46 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                         }
                         (Domain::Integer(0, u32::MAX as i64), child.parallel)
                     }
+                    (
+                        FunctionKernel::Hex
+                        | FunctionKernel::Md5
+                        | FunctionKernel::Sha
+                        | FunctionKernel::Sha1,
+                        [arg],
+                    ) => {
+                        let child = contract(arg, schema)?;
+                        if !matches!(child.domain, Domain::Text | Domain::Binary | Domain::Null) {
+                            return None;
+                        }
+                        (Domain::Text, child.parallel)
+                    }
+                    (FunctionKernel::Sha2, [arg, length])
+                        if integer(length)
+                            .and_then(crate::engine::expr::digest::HashAlgorithm::from_sha2_length)
+                            .is_some() =>
+                    {
+                        let child = contract(arg, schema)?;
+                        if !matches!(child.domain, Domain::Text | Domain::Binary | Domain::Null) {
+                            return None;
+                        }
+                        (Domain::Text, child.parallel)
+                    }
                     (FunctionKernel::Concat, args) if !args.is_empty() => {
                         let mut binary = false;
+                        let mut parallel = true;
+                        let mut bound = Some(0u64);
                         for arg in args {
-                            match contract(arg, schema)?.domain {
-                                Domain::Text | Domain::Null => {}
+                            let child = contract(arg, schema)?;
+                            parallel &= child.parallel;
+                            bound = bound.and_then(|n| n.checked_add(string_bound(arg, schema)?));
+                            match child.domain {
+                                Domain::Text | Domain::Integer(..) | Domain::Null => {}
                                 Domain::Binary => binary = true,
                                 _ => return None,
                             }
                         }
-                        (if binary { Domain::Binary } else { Domain::Text }, false)
+                        parallel &= bound.is_some_and(|bytes| bytes <= crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes());
+                        (if binary { Domain::Binary } else { Domain::Text }, parallel)
                     }
                     (FunctionKernel::Substring, args)
                         if (2..=3).contains(&args.len())
@@ -377,6 +704,53 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
 /// Bound speculative owned buffers from actual lanes, including intermediate
 /// columns. A small numeric result must not admit an enormous string child.
 fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
+    if let Some(read) = NumericRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = BooleanRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = Conditional::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = CryptoRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = UnsignedRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = IntegerString::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = RegexpRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = StringRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = TemporalRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(producer) = Producer::bind(node, batch.schema()) {
+        return producer.workspace(batch);
+    }
+
+    if let Some(column) = json::quote_column(node, batch.schema()) {
+        let input = batch.columns().get(column)?;
+        let bytes = input
+            .memory_bytes()
+            .checked_add(batch.num_rows().checked_mul(16)?)?
+            .checked_add(8)?;
+        return Some((bytes, bytes.checked_mul(2)?.checked_add(256)?));
+    }
+    if !matches!(node, ExprNode::Column(_)) {
+        if let Some(read) = JsonRead::bind(node, batch.schema()) {
+            return read.workspace(batch);
+        }
+    }
     let numeric = batch.num_rows().checked_mul(16)?;
     let offsets = batch.num_rows().checked_add(1)?.checked_mul(8)?;
     match node {
@@ -385,7 +759,7 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             let value = constant(node)?;
             let bytes = match value.as_ref() {
                 Value::Null => 0,
-                Value::Int(_) => numeric,
+                Value::Int(_) | Value::UInt(_) => numeric,
                 Value::String(s) => s
                     .len()
                     .checked_mul(batch.num_rows())?
@@ -413,6 +787,22 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             Some((bytes, work.checked_add(bytes)?))
         }
         ExprNode::Function { kernel, args, .. } => {
+            if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
+                return TemporalShift::bind(node, batch.schema())?.workspace(batch);
+            }
+            if matches!(
+                kernel,
+                FunctionKernel::LegacyDeterministic("GREATEST" | "LEAST")
+            ) {
+                let mut work = numeric.checked_add(
+                    args.len()
+                        .checked_mul(std::mem::size_of::<std::borrow::Cow<'_, ColumnVector>>())?,
+                )?;
+                for arg in args {
+                    work = work.checked_add(workspace(arg, batch)?.1)?;
+                }
+                return Some((numeric, work));
+            }
             if temporal_column(*kernel, args).is_some() {
                 return Some((numeric, numeric.checked_mul(2)?));
             }
@@ -421,6 +811,12 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
                 let mut work = 0usize;
                 for arg in args {
                     let (payload, child) = workspace(arg, batch)?;
+                    let payload =
+                        if matches!(contract(arg, batch.schema())?.domain, Domain::Integer(..)) {
+                            batch.num_rows().checked_mul(20)?.checked_add(offsets)?
+                        } else {
+                            payload
+                        };
                     bytes = bytes.checked_add(payload)?;
                     work = work.checked_add(child)?;
                 }
@@ -428,6 +824,47 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             }
             let (input, work) = workspace(args.first()?, batch)?;
             let bytes = match kernel {
+                FunctionKernel::Network(function) => match function {
+                    NetworkFunction::UuidToBin | NetworkFunction::Inet6Aton => {
+                        batch.num_rows().checked_mul(16)?.checked_add(offsets)?
+                    }
+                    NetworkFunction::BinToUuid => {
+                        batch.num_rows().checked_mul(36)?.checked_add(offsets)?
+                    }
+                    NetworkFunction::InetNtoa | NetworkFunction::Inet6Ntoa => {
+                        batch.num_rows().checked_mul(39)?.checked_add(offsets)?
+                    }
+                    _ => numeric,
+                },
+                FunctionKernel::LegacyDeterministic("CAST") => {
+                    if matches!(
+                        contract(&args[0], batch.schema())?.domain,
+                        Domain::Integer(..)
+                    ) {
+                        batch.num_rows().checked_mul(20)?.checked_add(offsets)?
+                    } else {
+                        input.checked_add(offsets)?
+                    }
+                }
+                FunctionKernel::Lpad | FunctionKernel::Rpad => {
+                    let n = usize::try_from(integer(&args[1])?).ok()?;
+                    let pad = text(&args[2])?;
+                    input
+                        .checked_add(
+                            batch
+                                .num_rows()
+                                .checked_mul(n.checked_mul(pad.len().max(4))?)?,
+                        )?
+                        .checked_add(offsets)?
+                }
+                FunctionKernel::Hex => input.checked_mul(2)?.checked_add(offsets)?,
+                FunctionKernel::Md5
+                | FunctionKernel::Sha
+                | FunctionKernel::Sha1
+                | FunctionKernel::Sha2 => hash_algorithm(*kernel, args)?
+                    .hex_len()
+                    .checked_mul(batch.num_rows())?
+                    .checked_add(offsets)?,
                 FunctionKernel::Length
                 | FunctionKernel::CharLength
                 | FunctionKernel::Abs
@@ -458,6 +895,115 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
         }
         _ => None,
     }
+}
+
+/// Large scan batches need not force composed expressions back to row Values.
+/// Retain one bounded result and evaluate only referenced input lanes in small
+/// morsels. All allocations are admitted before materializing a morsel; a
+/// decline discards every speculative result without publishing diagnostics.
+fn evaluate_in_chunks(
+    node: &ExprNode,
+    batch: &Batch,
+    referenced: &[usize],
+    payload: usize,
+    work: usize,
+) -> Option<ColumnVector> {
+    let limit = crate::engine::executor::vec::evaluated_batch::byte_target().checked_mul(2)?;
+    if payload.checked_mul(2)? > limit || batch.num_rows() <= 1 {
+        return None;
+    }
+    let mut output_charge = batch.memory_charge();
+    if !output_charge.add_within(payload.checked_mul(2)?, usize::MAX) {
+        return None;
+    }
+    let count = batch
+        .num_rows()
+        .checked_mul(limit)?
+        .checked_div(work.max(1))?
+        .clamp(1, 4096);
+    let mut output = ColumnVector::Null { len: 0 };
+    for begin in (0..batch.num_rows()).step_by(count) {
+        crate::engine::cancel::check_cancelled().ok()?;
+        let end = begin.saturating_add(count).min(batch.num_rows());
+        let rows = end - begin;
+        let input_bytes = referenced.iter().try_fold(0usize, |size, &column| {
+            (begin..end).try_fold(size, |size, row| {
+                size.checked_add(batch.columns().get(column)?.owned_value_bytes(row))
+            })
+        })?;
+        let input_charge = input_bytes
+            .checked_mul(2)?
+            .checked_add(
+                batch
+                    .columns()
+                    .len()
+                    .checked_mul(std::mem::size_of::<ColumnVector>())?,
+            )?
+            .checked_add(128)?;
+        if input_charge.checked_add(rows.checked_mul(16)?)? > limit {
+            return None;
+        }
+        let mut charge = batch.memory_charge();
+        if !charge.add_within(input_charge, usize::MAX) {
+            return None;
+        }
+        let mut index_charge = batch.memory_charge();
+        if !index_charge.add_within(rows.checked_mul(16)?, usize::MAX) {
+            return None;
+        }
+        let indices = (begin..end)
+            .map(|row| u32::try_from(row).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let columns = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                if referenced.binary_search(&index).is_ok() {
+                    column.take_indices_exact(&indices)
+                } else {
+                    ColumnVector::Null { len: rows }
+                }
+            })
+            .collect();
+        let compact = Batch::with_row_count(batch.schema().clone(), columns, rows);
+        let actual = compact
+            .memory_bytes()
+            .checked_add(
+                compact
+                    .columns()
+                    .len()
+                    .checked_mul(std::mem::size_of::<ColumnVector>())?,
+            )?
+            .checked_add(128)?;
+        if actual > charge.charged() && !charge.add_within(actual - charge.charged(), usize::MAX) {
+            return None;
+        }
+        let compact = compact.with_memory_charge(charge).ok()?;
+        let (_, work) = workspace(node, &compact)?;
+        if work > limit {
+            return None;
+        }
+        let mut temporary = compact.memory_charge();
+        if !temporary.add_within(work.checked_mul(2)?, usize::MAX) {
+            return None;
+        }
+        let result = evaluate(node, &compact)?;
+        // Typed-lane drift must not promote a small byte result into an
+        // unbudgeted Generic<Value> buffer. The ordered oracle can handle it.
+        if output.len() != 0 && std::mem::discriminant(&output) != std::mem::discriminant(&result) {
+            return None;
+        }
+        if output.len() == 0 {
+            output = result;
+        } else {
+            output.append_rows_from(&result, &(0..rows).collect::<Vec<_>>());
+        }
+        if output.memory_bytes() > payload.checked_mul(2)? {
+            return None;
+        }
+    }
+    Some(output)
 }
 
 /// Compact only visible rows; invisible values never enter speculative kernels.
@@ -524,22 +1070,50 @@ fn evaluate_selected(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
     }
     match result {
         ColumnVector::I64 { data, .. } => scatter_fixed!(data, I64),
+        ColumnVector::U64 { data, .. } => scatter_fixed!(data, U64),
+        ColumnVector::Decimal128 { data, scale, .. } => {
+            let data = positions
+                .iter()
+                .map(|&position| {
+                    if position == usize::MAX {
+                        0
+                    } else {
+                        data[position]
+                    }
+                })
+                .collect();
+            Some(ColumnVector::Decimal128 { data, scale, nulls })
+        }
         ColumnVector::Date32 { data, .. } => scatter_fixed!(data, Date32),
+        ColumnVector::Time64 { data, .. } => scatter_fixed!(data, Time64),
         ColumnVector::DateTime64 { data, .. } => scatter_fixed!(data, DateTime64),
         ColumnVector::Timestamp64 { data, .. } => scatter_fixed!(data, Timestamp64),
         ColumnVector::Null { .. } => Some(ColumnVector::Null { len: rows }),
-        column @ (ColumnVector::Utf8 { .. } | ColumnVector::Bytes { .. }) => {
+        column @ (ColumnVector::Utf8 { .. }
+        | ColumnVector::Bytes { .. }
+        | ColumnVector::Json { .. }) => {
             let mut data = Vec::new();
             let mut offsets = Vec::with_capacity(rows + 1);
             offsets.push(0);
             for (row, &position) in positions.iter().enumerate() {
                 if nulls.as_ref()?.get(row) {
-                    data.extend_from_slice(bytes_at(&column, position)?);
+                    let raw = if let ColumnVector::Json { data, offsets, .. } = &column {
+                        data.get(offsets[position] as usize..offsets[position + 1] as usize)?
+                    } else {
+                        bytes_at(&column, position)?
+                    };
+                    data.extend_from_slice(raw);
                 }
                 offsets.push(u32::try_from(data.len()).ok()?);
             }
             Some(if matches!(column, ColumnVector::Bytes { .. }) {
                 ColumnVector::Bytes {
+                    data,
+                    offsets,
+                    nulls,
+                }
+            } else if matches!(column, ColumnVector::Json { .. }) {
+                ColumnVector::Json {
                     data,
                     offsets,
                     nulls,
@@ -564,6 +1138,48 @@ fn operand<'a>(node: &ExprNode, batch: &'a Batch) -> Option<std::borrow::Cow<'a,
 }
 
 fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
+    if let Some(read) = NumericRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = BooleanRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = Conditional::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = CryptoRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = UnsignedRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = IntegerString::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = RegexpRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = StringRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = TemporalRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(producer) = Producer::bind(node, batch.schema()) {
+        return producer.evaluate(batch);
+    }
+
+    if let Some(column) = json::quote_column(node, batch.schema()) {
+        return json::evaluate_quote(batch.columns().get(column)?);
+    }
+    if !matches!(node, ExprNode::Column(_)) {
+        if let Some(read) = JsonRead::bind(node, batch.schema()) {
+            return read.evaluate(batch);
+        }
+    }
     let rows = batch.num_rows();
     match node {
         ExprNode::Column(index) => batch.columns().get(*index).cloned(),
@@ -572,6 +1188,10 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
             let value = value.as_ref();
             Some(match value {
                 Value::Int(n) => ColumnVector::I64 {
+                    data: vec![*n; rows],
+                    nulls: None,
+                },
+                Value::UInt(n) => ColumnVector::U64 {
                     data: vec![*n; rows],
                     nulls: None,
                 },
@@ -637,6 +1257,7 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
                         BinaryOp::Add => l.checked_add(r)?,
                         BinaryOp::Sub => l.checked_sub(r)?,
                         BinaryOp::Mul => l.checked_mul(r)?,
+                        BinaryOp::Mod => l.checked_rem(r)?,
                         BinaryOp::Eq => i64::from(l == r),
                         BinaryOp::NotEq => i64::from(l != r),
                         BinaryOp::Lt => i64::from(l < r),
@@ -650,6 +1271,12 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
             Some(ColumnVector::I64 { data, nulls })
         }
         ExprNode::Function { kernel, args, .. } => {
+            if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
+                return TemporalShift::bind(node, batch.schema())?.evaluate(batch);
+            }
+            if let FunctionKernel::LegacyDeterministic(name @ ("GREATEST" | "LEAST")) = kernel {
+                return integer_extrema_column(args, batch, *name == "GREATEST");
+            }
             if let Some((kind, index)) = temporal_column(*kernel, args) {
                 return try_temporal_extract_column(kind, batch, index);
             }
@@ -691,6 +1318,27 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
                 };
             }
             match kernel {
+                FunctionKernel::Network(function) => {
+                    let column = operand(&args[0], batch)?;
+                    network_column(
+                        *function,
+                        column.as_ref(),
+                        args.get(1).and_then(integer).unwrap_or(0) != 0,
+                    )
+                }
+                FunctionKernel::LegacyDeterministic("CAST") => {
+                    let column = operand(&args[0], batch)?;
+                    integer_text_column(column.as_ref())
+                }
+                FunctionKernel::Lpad | FunctionKernel::Rpad => {
+                    let column = operand(&args[0], batch)?;
+                    pad_column(
+                        column.as_ref(),
+                        usize::try_from(integer(&args[1])?).ok()?,
+                        &text(&args[2])?,
+                        matches!(kernel, FunctionKernel::Lpad),
+                    )
+                }
                 FunctionKernel::Date => {
                     let column = operand(&args[0], batch)?;
                     if !matches!(
@@ -721,6 +1369,17 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
                         };
                     }
                     Some(ColumnVector::I64 { data, nulls })
+                }
+                FunctionKernel::Hex => {
+                    let column = operand(args.first()?, batch)?;
+                    hex_column(column.as_ref())
+                }
+                FunctionKernel::Md5
+                | FunctionKernel::Sha
+                | FunctionKernel::Sha1
+                | FunctionKernel::Sha2 => {
+                    let column = operand(&args[0], batch)?;
+                    hash_column(hash_algorithm(*kernel, args)?, column.as_ref())
                 }
                 FunctionKernel::Length | FunctionKernel::CharLength => {
                     let col = operand(&args[0], batch)?;
@@ -788,6 +1447,57 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
         }
         _ => None,
     }
+}
+
+// A signed integer comparison never converts through DOUBLE or text.
+// Unsupported runtime lanes decline before any diagnostic is published.
+fn integer_extrema_column(
+    args: &[ExprNode],
+    batch: &Batch,
+    greatest: bool,
+) -> Option<ColumnVector> {
+    let columns = args
+        .iter()
+        .map(|arg| operand(arg, batch))
+        .collect::<Option<Vec<_>>>()?;
+    let rows = batch.num_rows();
+    let mut nulls = None;
+    for column in &columns {
+        match column.as_ref() {
+            ColumnVector::I64 { nulls: valid, .. } => {
+                nulls = crate::engine::executor::vec::expr_batch::merge_nulls(
+                    nulls.as_ref(),
+                    valid.as_ref(),
+                    rows,
+                );
+            }
+            ColumnVector::Null { .. } => nulls = Some(Bitmap::new_all_invalid(rows)),
+            _ => return None,
+        }
+    }
+    let mut data = Vec::with_capacity(rows);
+    for row in 0..rows {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if nulls.as_ref().is_some_and(|valid| !valid.get(row)) {
+            data.push(0);
+            continue;
+        }
+        let mut winner = if greatest { i64::MIN } else { i64::MAX };
+        for column in &columns {
+            let ColumnVector::I64 { data, .. } = column.as_ref() else {
+                return None;
+            };
+            winner = if greatest {
+                winner.max(data[row])
+            } else {
+                winner.min(data[row])
+            };
+        }
+        data.push(winner);
+    }
+    Some(ColumnVector::I64 { data, nulls })
 }
 
 fn validity(column: &ColumnVector) -> Option<Bitmap> {
@@ -894,6 +1604,64 @@ fn slice(column: &ColumnVector, start: i64, len: Option<i64>) -> Option<ColumnVe
         }
     })
 }
+fn hex_column(column: &ColumnVector) -> Option<ColumnVector> {
+    let mut data = String::with_capacity(column.memory_bytes().checked_mul(2)?);
+    let mut offsets = Vec::with_capacity(column.len() + 1);
+    offsets.push(0);
+    for row in 0..column.len() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if !column.is_null(row) {
+            crate::util::hex::append_upper(&mut data, bytes_at(column, row)?);
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    Some(ColumnVector::Utf8 {
+        data: data.into_bytes(),
+        offsets,
+        nulls: validity(column),
+    })
+}
+
+fn hash_algorithm(
+    kernel: FunctionKernel,
+    args: &[ExprNode],
+) -> Option<crate::engine::expr::digest::HashAlgorithm> {
+    use crate::engine::expr::digest::HashAlgorithm;
+    match kernel {
+        FunctionKernel::Md5 => Some(HashAlgorithm::Md5),
+        FunctionKernel::Sha | FunctionKernel::Sha1 => Some(HashAlgorithm::Sha1),
+        FunctionKernel::Sha2 => HashAlgorithm::from_sha2_length(integer(args.get(1)?)?),
+        _ => None,
+    }
+}
+
+fn hash_column(
+    algorithm: crate::engine::expr::digest::HashAlgorithm,
+    column: &ColumnVector,
+) -> Option<ColumnVector> {
+    let mut data = Vec::with_capacity(column.len().checked_mul(algorithm.hex_len())?);
+    let mut offsets = Vec::with_capacity(column.len() + 1);
+    offsets.push(0);
+    for row in 0..column.len() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if !column.is_null(row) {
+            algorithm
+                .append_hex(bytes_at(column, row)?, &mut data)
+                .ok()?;
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    Some(ColumnVector::Utf8 {
+        data,
+        offsets,
+        nulls: validity(column),
+    })
+}
+
 fn right(column: &ColumnVector, count: i64) -> Option<ColumnVector> {
     let binary = matches!(column, ColumnVector::Bytes { .. });
     let mut data = Vec::new();
@@ -955,14 +1723,17 @@ fn concat(args: &[ExprNode], batch: &Batch) -> Option<ColumnVector> {
         if columns.iter().any(|col| col.is_null(row)) {
             nulls.set(row, false);
         } else {
-            let size = columns.iter().try_fold(0usize, |size, col| {
-                size.checked_add(bytes_at(col, row)?.len())
-            })?;
-            if size as u64 > packet {
-                return None;
-            }
+            let begin = data.len();
             for col in &columns {
-                data.extend_from_slice(bytes_at(col, row)?);
+                if let ColumnVector::I64 { data: values, .. } = col.as_ref() {
+                    let mut buffer = itoa::Buffer::new();
+                    data.extend_from_slice(buffer.format(values[row]).as_bytes());
+                } else {
+                    data.extend_from_slice(bytes_at(col, row)?);
+                }
+                if (data.len() - begin) as u64 > packet {
+                    return None;
+                }
             }
         }
         offsets.push(u32::try_from(data.len()).ok()?);
@@ -1055,6 +1826,206 @@ fn format_dates(column: &ColumnVector, format: &str) -> Option<ColumnVector> {
         data: output.into_bytes(),
         offsets,
         nulls: validity(&column),
+    })
+}
+
+fn integer_text_column(column: &ColumnVector) -> Option<ColumnVector> {
+    if matches!(
+        column,
+        ColumnVector::Utf8 { .. } | ColumnVector::Null { .. }
+    ) {
+        return Some(column.clone());
+    }
+    let ColumnVector::I64 { data: values, .. } = column else {
+        return None;
+    };
+    let mut data = Vec::with_capacity(values.len().checked_mul(20)?);
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    offsets.push(0);
+    for (row, value) in values.iter().enumerate() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if !column.is_null(row) {
+            let mut buffer = itoa::Buffer::new();
+            data.extend_from_slice(buffer.format(*value).as_bytes());
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    Some(ColumnVector::Utf8 {
+        data,
+        offsets,
+        nulls: validity(column),
+    })
+}
+
+fn pad_column(column: &ColumnVector, length: usize, pad: &str, left: bool) -> Option<ColumnVector> {
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(column.len() + 1);
+    offsets.push(0);
+    let pad_chars = pad.chars().count();
+    let packet = crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes();
+    for row in 0..column.len() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if !column.is_null(row) {
+            let value = std::str::from_utf8(bytes_at(column, row)?).ok()?;
+            let chars = value.chars().count();
+            if chars >= length {
+                let end = value
+                    .char_indices()
+                    .nth(length)
+                    .map_or(value.len(), |(i, _)| i);
+                data.extend_from_slice(&value.as_bytes()[..end]);
+            } else if pad_chars != 0 {
+                let need = length - chars;
+                let cycles = need / pad_chars;
+                let tail = pad
+                    .char_indices()
+                    .nth(need % pad_chars)
+                    .map_or(pad.len(), |(i, _)| i);
+                let total = cycles
+                    .checked_mul(pad.len())?
+                    .checked_add(tail)?
+                    .checked_add(value.len())?;
+                if total as u64 > packet {
+                    return None;
+                }
+                if !left {
+                    data.extend_from_slice(value.as_bytes());
+                }
+                for _ in 0..cycles {
+                    data.extend_from_slice(pad.as_bytes());
+                }
+                data.extend_from_slice(&pad.as_bytes()[..tail]);
+                if left {
+                    data.extend_from_slice(value.as_bytes());
+                }
+            }
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    Some(ColumnVector::Utf8 {
+        data,
+        offsets,
+        nulls: validity(column),
+    })
+}
+
+/// Speculative parsing never publishes diagnostics. Invalid input declines the
+/// entire batch so the scalar evaluator reports its original warning/error order.
+fn network_column(
+    function: NetworkFunction,
+    column: &ColumnVector,
+    swap: bool,
+) -> Option<ColumnVector> {
+    let mut numeric = Vec::new();
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(column.len() + 1);
+    offsets.push(0);
+    for row in 0..column.len() {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if column.is_null(row) {
+            if function.is_predicate() || matches!(function, NetworkFunction::InetAton) {
+                numeric.push(0);
+            }
+            offsets.push(u32::try_from(data.len()).ok()?);
+            continue;
+        }
+        if matches!(function, NetworkFunction::InetNtoa) {
+            let n = match column {
+                ColumnVector::I64 { data, .. } => u32::try_from(data[row]).ok()?,
+                ColumnVector::U64 { data, .. } => u32::try_from(data[row]).ok()?,
+                _ => return None,
+            };
+            network::append_ipv4(n.to_be_bytes(), &mut data);
+        } else {
+            let raw = bytes_at(column, row)?;
+            // These textual grammars accept ASCII only. Invalid UTF-8 cannot
+            // become a valid address/UUID after lossy scalar conversion.
+            let text = std::str::from_utf8(raw).unwrap_or("");
+            match function {
+                NetworkFunction::IsUuid => {
+                    numeric.push(network::parse_uuid_bytes(&text).is_some() as i64)
+                }
+                NetworkFunction::IsIpv4 => {
+                    numeric.push(network::parse_mysql_strict_ipv4(&text).is_some() as i64)
+                }
+                NetworkFunction::IsIpv6 => {
+                    numeric.push(network::parse_ipv6(&text).is_some() as i64)
+                }
+                NetworkFunction::IsIpv4Compat | NetworkFunction::IsIpv4Mapped => numeric.push(
+                    (matches!(column, ColumnVector::Bytes { .. }) && function.binary_predicate(raw))
+                        as i64,
+                ),
+                NetworkFunction::InetAton => {
+                    numeric.push(network::parse_mysql_legacy_ipv4(&text)? as i64)
+                }
+                NetworkFunction::UuidToBin => {
+                    let mut bytes = network::parse_uuid_bytes(&text)?;
+                    if swap {
+                        network::swap_uuid_time_parts(&mut bytes);
+                    }
+                    data.extend_from_slice(&bytes);
+                }
+                NetworkFunction::BinToUuid => {
+                    let mut bytes: [u8; 16] = raw.try_into().ok()?;
+                    if swap {
+                        network::unswap_uuid_time_parts(&mut bytes);
+                    }
+                    crate::util::uuid::append_ascii(&bytes, &mut data);
+                }
+                NetworkFunction::Inet6Aton => {
+                    if let Some(bytes) = network::parse_mysql_strict_ipv4(&text) {
+                        data.extend_from_slice(&bytes);
+                    } else {
+                        data.extend_from_slice(&network::parse_ipv6(&text)?.octets());
+                    }
+                }
+                NetworkFunction::Inet6Ntoa => {
+                    if !matches!(column, ColumnVector::Bytes { .. }) {
+                        return None;
+                    }
+                    match raw.len() {
+                        4 => network::append_ipv4(raw.try_into().ok()?, &mut data),
+                        16 => network::append_ipv6(raw.try_into().ok()?, &mut data),
+                        _ => return None,
+                    }
+                }
+                NetworkFunction::InetNtoa => unreachable!(),
+            }
+        }
+        offsets.push(u32::try_from(data.len()).ok()?);
+    }
+    let nulls = validity(column);
+    Some(if matches!(function, NetworkFunction::InetAton) {
+        ColumnVector::U64 {
+            data: numeric.into_iter().map(|n| n as u64).collect(),
+            nulls,
+        }
+    } else if function.is_predicate() {
+        ColumnVector::I64 {
+            data: numeric,
+            nulls,
+        }
+    } else if matches!(
+        function,
+        NetworkFunction::UuidToBin | NetworkFunction::Inet6Aton
+    ) {
+        ColumnVector::Bytes {
+            data,
+            offsets,
+            nulls,
+        }
+    } else {
+        ColumnVector::Utf8 {
+            data,
+            offsets,
+            nulls,
+        }
     })
 }
 

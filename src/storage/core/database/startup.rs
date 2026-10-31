@@ -361,12 +361,10 @@ impl Database {
         }
         for path in important_paths {
             let marker = path.with_extension("idx.failed");
-            let planned = match fs::read(&marker) {
-                Ok(bytes) => bytes == b"planned logical redo rebuild",
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-                Err(err) => return Err(io_err(err)),
-            };
-            if !planned {
+            // A structural-redo failure fences a derived tree for the same
+            // heap rebuild as a planned logical redo. Persistent posting
+            // corruption is still rejected by the idx.corrupt fence above.
+            if !marker.try_exists().map_err(io_err)? {
                 validation.validate(path.clone()).map_err(|err| err.map_message(|message|
                     format!("important FULLTEXT index validation failed ({}): {message}", path.display())))?;
             }
@@ -666,7 +664,15 @@ impl Database {
 
     pub(crate) fn prepare_snapshot_indexes(&self) -> Result<(), QueryError> {
         for table in self.user_table_snapshots()? {
-            self.rebuild_indexes(&table)?;
+            if table.is_partitioned() {
+                // Partitioned tables store heaps and local indexes on leaves;
+                // the logical parent has no physical heap to rebuild from.
+                let mut repair = table.clone();
+                repair.indexes.retain(|index| !index.is_spatial());
+                self.rebuild_indexes_for_partition_storage_ids(&repair, &table.storage_ids())?;
+            } else {
+                self.rebuild_indexes(&table)?;
+            }
             self.rebuild_zone_map_for_table(&table)?;
             for index in &table.indexes {
                 if index.is_vector() {

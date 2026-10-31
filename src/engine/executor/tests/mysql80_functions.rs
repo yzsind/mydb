@@ -572,7 +572,8 @@ fn format_bytes_renders_powers_of_1024() {
             FORMAT_BYTES(1024 * 1024), \
             FORMAT_BYTES(1024 * 1024 * 1024)",
     );
-    assert_eq!(row[0], Value::String("0 bytes".into()));
+    // Native MySQL 8.0 formatting pads the base unit to four characters.
+    assert_eq!(row[0], Value::String("   0 bytes".into()));
     assert_eq!(row[1], Value::String("1023 bytes".into()));
     assert_eq!(row[2], Value::String("1.00 KiB".into()));
     assert_eq!(row[3], Value::String("1.00 MiB".into()));
@@ -592,7 +593,8 @@ fn format_pico_time_renders_si_units() {
             FORMAT_PICO_TIME(2500000), \
             FORMAT_PICO_TIME(1500000000000)",
     );
-    assert_eq!(row[0], Value::String("0 ps".into()));
+    // Native MySQL 8.0 formatting pads picoseconds to three characters.
+    assert_eq!(row[0], Value::String("  0 ps".into()));
     assert_eq!(row[1], Value::String("500 ps".into()));
     assert_eq!(row[2], Value::String("1.50 ns".into()));
     assert_eq!(row[3], Value::String("2.50 us".into()));

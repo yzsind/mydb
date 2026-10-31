@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/conversion-charset.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/conversion-charset.json"
+));
 
 function_fixture_test!(cast, "CAST", FIXTURE);
 function_fixture_test!(charset, "CHARSET", FIXTURE);

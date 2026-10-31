@@ -1003,9 +1003,9 @@ fn json_temporal_comparison_uses_temporal_values_not_text_order() {
 fn json_producers_enforce_maximum_document_depth() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
-    // Scalar depth is 1, so 99 wrappers form the largest legal input depth
-    // (100). One direct JSON producer wrapper must reject depth 101.
-    let nested = format!("{}0{}", "[".repeat(99), "]".repeat(99));
+    // A scalar inside 100 containers is legal (JSON_DEPTH = 101).
+    // A producer adding a 101st container must reject it.
+    let nested = format!("{}0{}", "[".repeat(100), "]".repeat(100));
     let err = engine
         .execute(&format!("SELECT JSON_ARRAY(CAST('{}' AS JSON))", nested))
         .unwrap_err();

@@ -427,11 +427,20 @@ fn vector_quantization_retraining_and_parallel_build() {
             .execute(&format!("INSERT INTO items VALUES{rows}"))
             .unwrap();
     }
-    engine.execute("CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32,ef_search=512,quantization=sq4,rerank_mult=512)").unwrap();
+    // Search the complete fixture so exact reranking assertions are
+    // independent of parallel insertion order and quantized-distance ties.
+    engine.execute("CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32,ef_search=4096,quantization=sq4,rerank_mult=1024)").unwrap();
+    assert!(query_rows(
+        &engine,
+        "EXPLAIN SELECT id FROM items ORDER BY L2_DISTANCE(v,'[90,1,2,3,4,5,6]') LIMIT 2"
+    )
+    .iter()
+    .flatten()
+    .any(|value| value.to_display_string().contains("Using vector index")));
     assert_eq!(
         text(
             &engine,
-            "SELECT id FROM items ORDER BY L2_DISTANCE(v,'[90,1,2,3,4,5,6]') LIMIT 1"
+            "SELECT id FROM items ORDER BY L2_DISTANCE(v,'[90,1,2,3,4,5,6]') LIMIT 2"
         ),
         "900"
     );

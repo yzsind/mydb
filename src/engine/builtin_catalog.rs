@@ -146,6 +146,9 @@ macro_rules! scalar_catalog {
         enum FunctionKernel {
             Field(crate::engine::expr::FieldComparisonDomain),
             Math(crate::engine::expr::math::MathFunction),
+            Network(crate::engine::expr::network::NetworkFunction),
+            GeometryConstructor(&'static str, bool),
+            Spatial(crate::engine::geo::sql::SpatialFunctionSpec),
             $($variant,)*
             LegacyDeterministic(&'static str),
             LegacySession(&'static str),
@@ -155,13 +158,13 @@ macro_rules! scalar_catalog {
             fn may_error(self, arity: usize) -> bool {
                 match self {
                     $(Self::$variant => ($diagnostic)(arity),)*
-                    Self::Field(_) | Self::Math(_) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
                 }
             }
             fn is_deterministic(self) -> bool {
                 match self {
                     $(Self::$variant => $deterministic,)*
-                    Self::Field(_) | Self::Math(_) | Self::LegacyDeterministic(_) => true,
+                    Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) => true,
                     Self::LegacySession(_) => false,
                 }
             }
@@ -279,6 +282,21 @@ scalar_catalog! {
         RegexpLike => (true, |_arity| true) {
             [("REGEXP_LIKE", "regexp_like")] => (RegexOrComplex, LongLong, None, false);
         }
+        Char => (true, |_arity| true) {
+            [("CHAR", "char")] => (CheapString, VarString, None, false);
+        }
+        MakeSet => (true, |_arity| true) {
+            [("MAKE_SET", "make_set")] => (RegexOrComplex, VarString, None, false);
+        }
+        IsTrue => (true, |_arity| true) {
+            [("__IS_TRUE", "__is_true")] => (Unknown, LongLong, None, false);
+        }
+        IsFalse => (true, |_arity| true) {
+            [("__IS_FALSE", "__is_false")] => (Unknown, LongLong, None, false);
+        }
+        Benchmark => (false, |_arity| true) {
+            [("BENCHMARK", "benchmark")] => (Volatile, LongLong, None, false);
+        }
         RegexpReplace => (true, |_arity| true) {
             [("REGEXP_REPLACE", "regexp_replace")] => (RegexOrComplex, VarString, None, false);
         }
@@ -299,6 +317,21 @@ scalar_catalog! {
         }
         Crc32 => (true, |arity| arity != 1) {
             [("CRC32", "crc32")] => (CryptoHash, Long, ( Crc32, 1, 1, Immutable, fixed_integer_result(Int, true, true)), false);
+        }
+        Hex => (true, |_arity| true) {
+            [("HEX", "hex")] => (CheapString, VarString, (Hex, 1, 1, Immutable, fixed_string_result(None, true)), true);
+        }
+        Md5 => (true, |arity| arity != 1) {
+            [("MD5", "md5")] => (CryptoHash, VarString, None, false);
+        }
+        Sha1 => (true, |arity| arity != 1) {
+            [("SHA1", "sha1")] => (CryptoHash, VarString, None, false);
+        }
+        Sha => (true, |arity| arity != 1) {
+            [("SHA", "sha")] => (CryptoHash, VarString, None, false);
+        }
+        Sha2 => (true, |_arity| true) {
+            [("SHA2", "sha2")] => (CryptoHash, VarString, None, false);
         }
         AnyValue => (true, |arity| arity != 1) {
             [("ANY_VALUE", "any_value")] => (CheapString, VarString, None, false);
@@ -446,11 +479,12 @@ scalar_catalog! {
             [("FIELD", "field")] => (CheapString, LongLong, None, false);
         }
         LegacyDeterministic {
+            [("IS_UUID", "is_uuid")] => (Unknown, LongLong, ( IsUuid, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
+            [("IS_IPV4_COMPAT", "is_ipv4_compat"), ("IS_IPV4_MAPPED", "is_ipv4_mapped")] => (Unknown, LongLong, None, false);
             [("POW", "pow"), ("POWER", "power"), ("LN", "ln"), ("LOG", "log"), ("LOG2", "log2"), ("LOG10", "log10"), ("EXP", "exp")] => (IntegerArith, Double, None, false);
             [("PI", "pi")] => (IntegerArith, Double, None, true);
             [("BIN", "bin")] => (CheapString, VarString, (Bin, 1, 1, Immutable, fixed_string_result(None, true)), true);
             [("OCT", "oct")] => (CheapString, VarString, None, true);
-            [("HEX", "hex")] => (CheapString, VarString, (Hex, 1, 1, Immutable, fixed_string_result(None, true)), true);
             [("UNHEX", "unhex")] => (CheapString, Blob, None, false);
             [("FIND_IN_SET", "find_in_set"), ("BIT_LENGTH", "bit_length")] => (CheapString, LongLong, None, false);
             [("ELT", "elt"), ("FORMAT", "format"), ("QUOTE", "quote")] => (CheapString, VarString, None, false);
@@ -464,8 +498,6 @@ scalar_catalog! {
             [("JSON_KEYS", "json_keys"), ("JSON_OBJECT", "json_object"), ("JSON_ARRAY", "json_array"), ("JSON_MERGE_PATCH", "json_merge_patch"), ("JSON_MERGE_PRESERVE", "json_merge_preserve"), ("JSON_QUOTE", "json_quote")] => (RegexOrComplex, Json, None, false);
             [("JSON_STORAGE_SIZE", "json_storage_size"), ("JSON_STORAGE_FREE", "json_storage_free")] => (RegexOrComplex, VarString, ( JsonStorage, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
             [("FROM_BASE64", "from_base64")] => (RegexOrComplex, Blob, None, false);
-            [("MD5", "md5"), ("SHA1", "sha1"), ("SHA2", "sha2")] => (CryptoHash, VarString, None, false);
-            [("SHA", "sha")] => (CryptoHash, VarString, None, true);
             [("BIT_COUNT", "bit_count"), ("JSON_SCHEMA_VALID", "json_schema_valid"), ("INET_ATON", "inet_aton"), ("IS_IPV4", "is_ipv4"), ("IS_IPV6", "is_ipv6")] => (Unknown, LongLong, None, false);
             [("DEGREES", "degrees"), ("RADIANS", "radians"), ("SIN", "sin"), ("COS", "cos"), ("TAN", "tan"), ("ASIN", "asin"), ("ACOS", "acos"), ("ATAN", "atan"), ("ATAN2", "atan2"), ("COT", "cot")] => (Unknown, Double, None, false);
             [("__AT_TIME_ZONE", "__at_time_zone")] => (Unknown, DateTime, None, false);
@@ -481,7 +513,7 @@ scalar_catalog! {
         }
         None {
             [("RAND_SEEDED", "rand_seeded")] => (IntegerArith, VarString, None, false);
-            [("CHAR", "char"), ("FORMAT_BYTES", "format_bytes"), ("FORMAT_PICO_TIME", "format_pico_time"), ("VALIDATE_PASSWORD_STRENGTH", "validate_password_strength"), ("STATEMENT_DIGEST_TEXT", "statement_digest_text"), ("INTERVAL", "interval"), ("GROUPING", "grouping"), ("NAME_CONST", "name_const")] => (CheapString, VarString, None, false);
+            [("FORMAT_BYTES", "format_bytes"), ("FORMAT_PICO_TIME", "format_pico_time"), ("VALIDATE_PASSWORD_STRENGTH", "validate_password_strength"), ("STATEMENT_DIGEST_TEXT", "statement_digest_text"), ("INTERVAL", "interval"), ("GROUPING", "grouping"), ("NAME_CONST", "name_const")] => (CheapString, VarString, None, false);
             [("LOCATE", "locate"), ("INSTR", "instr"), ("POSITION", "position")] => (CheapString, LongLong, None, false);
             [("WEIGHT_STRING", "weight_string")] => (CheapString, Blob, None, true);
             [("DAYNAME", "dayname"), ("MONTHNAME", "monthname"), ("TIME_FORMAT", "time_format")] => (DateTimeImmutable, VarString, None, false);
@@ -497,7 +529,7 @@ scalar_catalog! {
             [("SYSTEM_USER", "system_user"), ("CURRENT_ROLE", "current_role"), ("CHARSET", "charset"), ("COLLATION", "collation"), ("ICU_VERSION", "icu_version")] => (SessionDependent, VarString, None, false);
             [("LAST_INSERT_ID", "last_insert_id")] => (SessionDependent, LongLong, ( StatementCounter, 0, 1, Volatile, fixed_integer_result(Big, false, false)), false);
             [("COERCIBILITY", "coercibility")] => (SessionDependent, LongLong, ( Coercibility, 1, 1, Immutable, fixed_integer_result(Int, false, false)), false);
-            [("REGEXP", "regexp"), ("REGEXP_SUBSTR", "regexp_substr"), ("JSON_VALUE", "json_value"), ("MAKE_SET", "make_set")] => (RegexOrComplex, VarString, None, false);
+            [("REGEXP", "regexp"), ("REGEXP_SUBSTR", "regexp_substr"), ("JSON_VALUE", "json_value")] => (RegexOrComplex, VarString, None, false);
             [("REGEXP_INSTR", "regexp_instr")] => (RegexOrComplex, LongLong, None, false);
             [("JSON_SET", "json_set"), ("JSON_INSERT", "json_insert"), ("JSON_REPLACE", "json_replace"), ("JSON_REMOVE", "json_remove"), ("JSON_ARRAY_APPEND", "json_array_append"), ("JSON_ARRAY_INSERT", "json_array_insert"), ("JSON_MERGE", "json_merge"), ("JSON_SEARCH", "json_search")] => (RegexOrComplex, Json, None, false);
             [("STATEMENT_DIGEST", "statement_digest")] => (CryptoHash, VarString, None, true);
@@ -508,12 +540,11 @@ scalar_catalog! {
             [("AI_GENERATE", "ai_generate")] => (Volatile, VarString, ( AiGenerate, 2, 3, Volatile, fixed_ai_text_result()), false);
             [("AI_GENERATE_DETAIL", "ai_generate_detail"), ("AI_EMBED_DETAIL", "ai_embed_detail")] => (Volatile, Json, ( AiDetail, 2, 3, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
             [("AI_EMBED", "ai_embed")] => (Volatile, Vector, ( AiEmbed, 2, 3, Volatile, fixed_ai_vector_result()), false);
-            [("SLEEP", "sleep"), ("BENCHMARK", "benchmark")] => (Volatile, LongLong, None, false);
+            [("SLEEP", "sleep")] => (Volatile, LongLong, None, false);
             [("GET_LOCK", "get_lock"), ("RELEASE_LOCK", "release_lock"), ("IS_FREE_LOCK", "is_free_lock"), ("IS_USED_LOCK", "is_used_lock"), ("RELEASE_ALL_LOCKS", "release_all_locks")] => (Volatile, VarString, None, false);
             [("LOAD_FILE", "load_file")] => (Volatile, Blob, None, false);
             [("__MATCH_AGAINST", "__match_against")] => (Unknown, Double, None, false);
-            [("__IS_TRUE", "__is_true"), ("__IS_FALSE", "__is_false"), ("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("IS_IPV4_COMPAT", "is_ipv4_compat"), ("IS_IPV4_MAPPED", "is_ipv4_mapped"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
-            [("IS_UUID", "is_uuid")] => (Unknown, LongLong, ( IsUuid, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
+            [("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
             [("SYSDATE", "sysdate")] => (Unknown, DateTime, ( CurrentTemporal, 0, 1, Stable, fixed_temporal_result(DateTime, false)), false);
             [("TIMESTAMP", "timestamp")] => (Unknown, DateTime, ( Temporal, 1, 2, Immutable, fixed_temporal_result(DateTime, true)), false);
             [("CONVERT_TZ", "convert_tz")] => (Unknown, DateTime, ( Temporal, 2, 3, Stable, fixed_temporal_result(DateTime, true)), false);

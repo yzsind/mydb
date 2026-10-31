@@ -49,20 +49,23 @@ files and use exactly the same page and row encodings described below. The catal
 generations of these data dictionary heaps.
 
 `system/commit-ledger.v1` is the persistent correctness source of truth for time-travel visibility; it stores fixed-length
-`(txn_id, commit_scn, commit_unix_us)` records protected by CRC32. Since WAL v22, `CommitTxn`
+`(txn_id, commit_scn, commit_unix_us)` records protected by CRC32. Its version-2
+64-byte header binds the ledger to the storage UUID and is itself checksummed. Since WAL v22, `CommitTxn`
 also carries the commit
 time, and startup uses untruncated WAL to repair the ledger tail. Table options persisted in catalog v43
 store `system_time_epoch_us`. The historical old-key index is still only a degradable accelerator: when missing, only performance is affected —
 the executor falls back to heap/undo, and result correctness is unaffected.
 
-`system/history-index.v1` is the historical old-key accelerator sidecar v1: a 16-byte magic/version header followed by
+`system/history-index.v1` is the historical old-key accelerator. Its version-2
+64-byte header binds magic/version/length to the storage UUID and CRC32; the
+stable `.v1` filename does not specify the current header version. It is followed by
 variable-length `txn_id:u64 + payload_len:u32 + crc32:u32 + payload` frames. The `HistoryIndexBatch` introduced in WAL v22 is the
 crash-recovery tail; before allowing WAL truncation, a checkpoint synchronizes the ledger and the
 sidecar together. The sidecar is not a correctness source of truth; when corrupted or incompletely overwritten, it is marked degraded and the system falls back to heap/undo.
 
 ## 3. Heap File and Page Format
 
-A `.heap` file is a 16 KiB page array with no separate file header: a page's file offset is
+A `.heap` file is a 16 KiB page array. Page 0 is allocation metadata, and row pages start at page 1. A page's file offset is
 `page_id * 16384`. `RowId` contains no table ID and is fixed at:
 
 ```text
@@ -72,21 +75,25 @@ RowId := page_id u32 + slot_id u16       # 6 B both logically and on disk
 Every heap handle is already bound to a table, so the table id need not be repeated inside the RowId. A `u32 page_id`
 puts the theoretical addressing ceiling of a single table at roughly 64 TiB.
 
-### 3.1 Heap Page Header
+Page 0 uses magic `0x4d484d31` (`MHM1`), the heap page version, standard LSN/CRC, page size u32 at offset 20, allocated page count u64 at 24 and allocation flags u64 at 32 (bit 0 means the LOB file was initialized). The owner/page fields at 40/56 follow the common identity convention; payload bytes 64..16384 are zero. Its page count is authoritative over extra physical tail bytes. All pages below the published frontier are initialized, and missing/short/zero allocated pages are rejected or repaired from retained WAL.
+
+### 3.1 Heap Row-Page Header
 
 | Absolute offset | Length | Field | Meaning |
 | ---: | ---: | --- | --- |
 | 0 | 4 | magic | `0x4d485032` (`MHP2`) |
-| 4 | 2 | version | `HEAP_PAGE_VERSION` (14 for this layout) |
+| 4 | 2 | version | `HEAP_PAGE_VERSION` (15 for this layout) |
 | 6 | 2 | flags | bit 0: `HEAP_PAGE_REDUCED_REDO`; other bits reserved |
 | 8 | 8 | page_lsn | WAL LSN of the last modification to this page |
 | 16 | 4 | checksum | whole-page CRC32, this field treated as 0 when computed |
 | 20 | 2 | slot_count | number of slots |
 | 22 | 2 | free_start | end of the slot directory / start of the contiguous free area |
 | 24 | 2 | free_end | end of the contiguous free area / start of the record area |
-| 26 | 6 | reserved | currently reserved |
+| 26 | 14 | reserved | zero |
+| 40 | 16 | owner | expected physical file identity |
+| 56 | 8 | page_id | expected physical page number |
 
-The page header is a fixed 32 B. The slot directory grows from offset 32 toward higher addresses, row payloads grow from the page end toward lower addresses,
+The page header is a fixed 64 B. The slot directory grows from offset 64 toward higher addresses, row payloads grow from the page end toward lower addresses,
 and between the two lies the contiguous free area `[free_start, free_end)`.
 
 `HEAP_PAGE_REDUCED_REDO` (`0x0001`) marks a page initialized through a
@@ -119,17 +126,17 @@ does the slot become `FREE`. In-page compaction moves payloads and updates slot 
 A single row must fit the in-page budget. When a new slot is added, the theoretical maximum payload is:
 
 ```text
-16384 - 32 - 5 = 16347 bytes
+16384 - 64 - 5 = 16315 bytes
 ```
 
 An actual INSERT may additionally reserve space under the table's update reserve/PCTFREE policy.
 
-## 4. Heap Row Record Format (MVCC row v7)
+## 4. Heap Row Record Format (MVCC row v9)
 
 The overall layout of a normal row payload is:
 
 ```text
-u8      row_version = 7
+u8      row_version = 9
 u8      flags
 [u64]   last_txn_id              # flags bit 2
 [u64]   undo_ptr                 # flags bit 3
@@ -317,21 +324,23 @@ The ranges of the three u32 fields match the LONGTEXT/LONGBLOB 4 GiB cap and the
 | Offset | Length | Field | Meaning |
 | ---: | ---: | --- | --- |
 | 0 | 4 | magic | `0x4d4f5631` (`MOV1`) |
-| 4 | 2 | version | 3 |
+| 4 | 2 | version | 4 |
 | 6 | 2 | reserved | 0 |
 | 8 | 8 | page_lsn | WAL LSN |
 | 16 | 4 | checksum | CRC32 |
-| 20 | 2 | payload_len | valid payload on this page, at most 16344 |
+| 20 | 2 | payload_len | valid payload on this page, at most 16320 |
 | 22 | 2 | flags | bit 0=head, bit 1=whole chain LZ4 compressed, bit 2=page numbers contiguous |
 | 24 | 8 | next_page_id | 0 means end of chain |
 | 32 | 8 | generation | chain allocation generation; identical on all pages of a chain |
-| 40 | <=16344 | payload | raw or compressed byte-stream fragment |
+| 40 | 16 | owner | expected physical file identity |
+| 56 | 8 | page_id | expected physical page number |
+| 64 | <=16320 | payload | raw or compressed byte-stream fragment |
 
 Only the head page sets the head/compressed/contiguous bits. For a compressed chain, `LobRef.total_len` is still the decompressed length, and the sum of the per-page
 `payload_len` values is the compressed stream length. A LOB chain is immutable once written; an UPDATE creates a new chain, and old chains are held by undo/
 MVCC until the corresponding historical version is purged, after which they enter the free list.
 
-Page 0 uses the same 40 B common header; its first 24 payload bytes are:
+Page 0 uses the same 64 B common header; its first 24 payload bytes are:
 
 ```text
 free_head  u64 LE       # 0 = no free page
@@ -374,17 +383,20 @@ Index pages store no table ID; the index file handle is already bound to the own
 | Offset | Length | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `0x4d494d34` (`MIM4`) |
-| 4 | 2 | page version = 15 |
+| 4 | 2 | page version = 16 |
 | 6 | 2 | reserved = 0 |
 | 8 | 8 | page_lsn, currently written as 0 by the encoder |
 | 16 | 4 | checksum CRC32 |
-| 20 | 4 | index file version = 24 |
+| 20 | 4 | index file version = 25 |
 | 24 | 4 | page size = 16384 |
 | 28 | 4 | reserved/zero padding |
-| 32 | 8 | root_page |
-| 40 | 8 | next_page_id |
-| 48 | 8 | free_page_head, 0=None |
-| 56.. | | zero padding |
+| 32 | 8 | reserved = 0 |
+| 40 | 16 | physical owner identity |
+| 56 | 8 | page_id = 0 |
+| 64 | 8 | root_page |
+| 72 | 8 | next_page_id |
+| 80 | 8 | free_page_head, 0=None |
+| 88.. | | zero padding |
 
 Opening the file validates the page version, file version, page size, and checksum together.
 
@@ -395,13 +407,16 @@ leaf/internal/free pages share:
 | Offset | Length | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `0x4d495038` (`MIP8`) |
-| 4 | 2 | page version = 15 |
+| 4 | 2 | page version = 16 |
 | 6 | 2 | reserved = 0 |
 | 8 | 8 | page_lsn |
 | 16 | 4 | checksum CRC32 |
 | 20 | 4 | payload_len |
-| 24 | `payload_len` | page-specific payload |
-| 24+payload_len.. | | zero padding |
+| 24 | 16 | reserved = 0 |
+| 40 | 16 | physical owner identity |
+| 56 | 8 | physical page number |
+| 64 | `payload_len` | page-specific payload |
+| 64+payload_len.. | | zero padding |
 
 Record offsets in slots are `u16 LE` values relative to the payload start (absolute offset 24).
 
@@ -421,7 +436,7 @@ entry bodies...
 (u16 offset, u16 len) slots[entry_count] LE  # payload tail, sorted by key
 ```
 
-The fixed leaf payload header is 28 B, 52 B together with the common header. The slot array allows binary search directly over the raw page bytes of a cold page,
+The fixed leaf payload header is 28 B, 92 B together with the common header. The slot array allows binary search directly over the raw page bytes of a cold page,
 decoding only O(log N) candidate entries. `payload_len` includes the slot array and is not required to fill the page tail.
 
 `next_leaf` establishes the ascending leaf chain. Entries within a single page are sorted by `(IndexKey, RowId)`, so duplicated
@@ -442,7 +457,7 @@ separator records[key_count]        # IndexEntry followed by right_child u64
 (u16 offset, u16 len) slots[key_count] LE
 ```
 
-The fixed header is `24 + 1 + 1 + 8 + 8 + 4 = 46 B`. The normal B+tree logical invariant remains
+The fixed header is `64 + 1 + 1 + 8 + 8 + 4 = 86 B`. The normal B+tree logical invariant remains
 `child_count = key_count + 1`; the first child lives in the fixed header, and each subsequent child follows its own separator,
 so inserting a separator no longer moves the whole children array. Separators still carry the full 6 B RowId.
 
@@ -575,3 +590,5 @@ Two other encodings are distinct from persistent heap rows and BTREE pages:
    DecimalCompact/Date/Time/DateTime/Year/JSON/Geometry/Vector; ordinary heap rows store none of these tags.
 2. The ADD INDEX external-sort run stream uses `u32 part_count + tagged parts + fixed 6 B RowId`.
    Generic keys in `.idx` pages use the tighter `u8 part_count`.
+
+The data-directory control record, durable owner-transfer proofs, required-feature policy and stable row-codec IDs are specified in [Storage Format](storage-format.md#15-format-admission-and-stable-metadata). Release-format binary fixtures are embedded in the test binaries from `tests/fixtures/storage-format-v1`; changing them requires an explicit format review and version decision.

@@ -58,9 +58,12 @@ where
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
+        self.run_with_listener(bind_listener(self.addr)?).await
+    }
+
+    pub async fn run_with_listener(&self, listener: TcpListener) -> std::io::Result<()> {
         crate::engine::status_counters::initialize_server_clock();
         let open_files = configure_open_files_limit();
-        let listener = bind_listener(self.addr)?;
         let configured_cap = max_connections();
         let cap = effective_max_connections();
         if open_files.capped_by_hard_limit || cap < configured_cap {
@@ -174,6 +177,9 @@ where
             // *active* write blocked by a wedged peer also fails fast.
             tune_socket_keepalive(&stream);
 
+            // SET GLOBAL may change the cap while accept is parked. Admission
+            // must use the current limit, not the pre-accept diagnostic value.
+            let cap = effective_max_connections();
             let Some(slot) = ConnectionSlot::acquire_with_admin_reserve(cap) else {
                 spawn_reject(
                     stream,
@@ -249,6 +255,7 @@ where
                 }
             });
             if let Err(err) = dispatched {
+                self.registry.unregister(connection_id);
                 fatal_accept_error = Some(err);
                 break;
             }
@@ -343,6 +350,7 @@ where
                 if let Some(manager) = crate::replication::global_manager() {
                     manager.stop_all_channels()?;
                 }
+                crate::binlog::shutdown_retention();
                 engine.shutdown()
             })();
             finish_shutdown(result)
@@ -442,33 +450,35 @@ impl OsSignals {
             }
         };
         let hup = signal(SignalKind::hangup())
-            .unwrap_or_else(|err| panic!("failed to install SIGHUP handler: {err}"));
-        Self {
-            term,
-            _hup: Some(hup),
-        }
+            .map_err(|err| {
+                log_message(format_args!("failed to install SIGHUP handler: {err}"));
+            })
+            .ok();
+        Self { term, _hup: hup }
     }
 
     /// Resolve when SIGINT (Ctrl-C) or SIGTERM arrives. Cancel-safe: a
     /// `recv` that loses the accept `select!` race can be re-entered next
     /// iteration without dropping a pending signal.
     async fn recv(&mut self) {
-        match &mut self.term {
-            Some(term) => {
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if let Err(err) = result {
-                            log_message(format_args!("failed to listen for SIGINT: {err}"));
-                            std::future::pending::<()>().await;
-                        }
+        loop {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(err) = result {
+                        log_message(format_args!("failed to listen for SIGINT: {err}"));
+                        std::future::pending::<()>().await;
                     }
-                    _ = term.recv() => {}
+                    return;
                 }
-            }
-            None => {
-                if let Err(err) = tokio::signal::ctrl_c().await {
-                    log_message(format_args!("failed to listen for SIGINT: {err}"));
-                    std::future::pending::<()>().await;
+                _ = async { match &mut self.term {
+                    Some(term) => { term.recv().await; },
+                    None => std::future::pending::<()>().await,
+                }} => return,
+                _ = async { match &mut self._hup {
+                    Some(hup) => { hup.recv().await; },
+                    None => std::future::pending::<()>().await,
+                }} => {
+                    log_message(format_args!("SIGHUP received: configuration reload is unsupported; use SQL FLUSH commands for log maintenance"));
                 }
             }
         }
@@ -751,7 +761,7 @@ fn tune_socket_keepalive(stream: &TcpStream) {
 #[cfg(not(unix))]
 fn tune_socket_keepalive(_stream: &TcpStream) {}
 
-fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+pub fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
@@ -889,6 +899,54 @@ fn load_private_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
 #[cfg(all(unix, test))]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blackbox_connection_cap_reduction_applies_to_waiting_accept() {
+        use crate::engine::StorageQueryEngine;
+        use crate::mysql::packet::read_packet;
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine.execute("SET GLOBAL max_connections=1000").unwrap();
+        let first = ConnectionSlot::acquire(1000).unwrap();
+        let second = ConnectionSlot::acquire(1000).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server =
+            MysqlServer::with_tls(addr, engine.clone(), None, Arc::new(SessionRegistry::new()));
+        let task = tokio::spawn(async move { server.run().await });
+        let mut ready = loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        let greeting = read_packet(&mut ready).await.unwrap().unwrap();
+        assert_eq!(greeting.payload[0], 10);
+        drop(ready);
+        // The listener is waiting with the old cap. Keep two occupied slots so
+        // the new cap permits neither ordinary nor reserved admission.
+        engine.execute("SET GLOBAL max_connections=1").unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), read_packet(&mut client))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        engine.execute("SET GLOBAL max_connections=1000").unwrap();
+        drop(client);
+        drop((first, second));
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            response.payload[0], 0xff,
+            "unexpected handshake after cap reduction"
+        );
+        assert_eq!(
+            u16::from_le_bytes(response.payload[1..3].try_into().unwrap()),
+            1040
+        );
+    }
     use std::os::unix::io::AsRawFd;
     use tokio::net::TcpListener;
 

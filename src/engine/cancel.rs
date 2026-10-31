@@ -32,6 +32,10 @@ use std::time::{Duration, Instant};
 use crate::engine::session_registry::{ProcessStageGuard, ProcessState, SessionHandle};
 use crate::types::QueryError;
 
+/// Amortize deadline/TLS checks across bounded scalar input batches.
+/// Side effects and long-running kernels also keep their own checkpoints.
+pub(crate) const SCALAR_ROW_CANCEL_MASK: usize = 255;
+
 /// Process-wide KILL telemetry. Read by `SHOW ENGINE MYDB STATUS`.
 static KILLED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static KILLED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);

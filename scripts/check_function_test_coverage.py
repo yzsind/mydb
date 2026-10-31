@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DOC_ROOT = ROOT / "docs/function"
 TEST_ROOT = ROOT / "src/engine/executor/tests/function_compat"
-FIXTURE_ROOT = TEST_ROOT / "fixtures"
+FIXTURE_ROOT = ROOT / "tests/fixtures/function-compat"
 INTERNAL_SCALAR_NAMES = {"CHAR_USING", "EXTRACT_COMPOUND", "WEIGHT_STRING_TYPED"}
 UNSUPPORTED_SPATIAL = {
     "ST_BUFFER",

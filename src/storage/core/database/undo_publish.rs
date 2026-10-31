@@ -1,188 +1,634 @@
-// Flat-combining publication of concurrently written undo frames.
-//
-// Every row-level DML publishes one undo record into the shared undo
-// directory under its exclusive latch. The critical section is a few
-// microseconds, but tens of thousands of publications per second turn each
-// latch hand-off (park, wake, reschedule) into the dominant cost: waiters
-// spent far longer queued than the directory was actually held.
-//
-// Publishers instead enqueue their request and one combiner at a time takes
-// the latch and publishes every queued request in a single hold, then wakes
-// their owners directly. Each request keeps its own result, so admission
-// failures still reach the statement that caused them.
+// Live publication and canonical maintenance use independent latches. A short
+// capture swaps dependency-closed live buffers, then releases publishers
+// before accounting, purge, cache I/O or compaction touches the canonical view.
 
-type UndoPublishResult = Result<(u64, Vec<u8>, bool), QueryError>;
+use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+use crate::storage::undo::{PreparedUndoRead, UndoResidentReservation, UndoSegmentLease};
 
-struct UndoPublishRequest {
-    record: crate::storage::undo::UndoRecord,
-    encoded: Vec<u8>,
-    ptr: u64,
-    segment_id: u32,
-    segment_end: u64,
-    reservation: crate::storage::undo::UndoResidentReservation,
+struct PublishedUndo {
+    record: UndoRecord,
+    reservation: UndoResidentReservation,
+    segment_lease: UndoSegmentLease,
+    sequence: u64,
 }
 
-enum UndoPublishState {
-    Queued(UndoPublishRequest),
-    Taken,
-    Done(UndoPublishResult),
+struct UndoPublicationBuffer {
+    records: Vec<Option<PublishedUndo>>,
+    index: hashbrown::HashMap<u64, usize, ahash::RandomState>,
+    map_bound: usize,
+    charge: ControlledMemoryCharge,
 }
-
-struct UndoPublishSlot {
-    state: parking_lot::Mutex<UndoPublishState>,
-    done: AtomicBool,
-    owner: std::thread::Thread,
+impl Default for UndoPublicationBuffer {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            index: Default::default(),
+            map_bound: 0,
+            charge: ControlledMemoryCharge::try_new(ControlledMemoryCategory::SystemMetadata, 0)
+                .expect("zero-byte publication buffer reservation"),
+        }
+    }
 }
-
-#[derive(Default)]
-pub(crate) struct UndoPublishQueue {
-    pending: parking_lot::Mutex<Vec<Arc<UndoPublishSlot>>>,
-    /// Set while one publisher acts as the combiner for the queue.
-    combining: AtomicBool,
-}
-
-impl std::fmt::Debug for UndoPublishQueue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UndoPublishQueue")
-            .field("pending", &self.pending.lock().len())
-            .field("combining", &self.combining.load(Ordering::Relaxed))
-            .finish()
+impl UndoPublicationBuffer {
+    fn insert(
+        &mut self,
+        ptr: u64,
+        mut entry: PublishedUndo,
+        sequence: &AtomicU64,
+    ) -> Result<(), QueryError> {
+        assert!(
+            !self.index.contains_key(&ptr),
+            "duplicate live undo pointer"
+        );
+        let map_bound = if self.index.len() == self.index.capacity() {
+            (self.index.len() + 1).next_power_of_two().max(4)
+                * 2
+                * (std::mem::size_of::<(u64, usize)>() + 1)
+        } else {
+            self.map_bound
+        };
+        let capacity = if self.records.len() == self.records.capacity() {
+            self.records.capacity().saturating_mul(2).max(4)
+        } else {
+            self.records.capacity()
+        };
+        let bytes = map_bound
+            .saturating_add(capacity.saturating_mul(std::mem::size_of::<Option<PublishedUndo>>()));
+        self.charge
+            .try_grow(bytes.saturating_sub(self.charge.bytes()))?;
+        self.index.try_reserve(1).map_err(|_| {
+            error(
+                crate::error::catalog::ER_OUT_OF_RESOURCES,
+                "undo pointer directory allocation failed",
+            )
+        })?;
+        if capacity > self.records.capacity() {
+            self.records
+                .try_reserve_exact(capacity - self.records.len())
+                .map_err(|_| {
+                    error(
+                        crate::error::catalog::ER_OUT_OF_RESOURCES,
+                        "undo publication buffer allocation failed",
+                    )
+                })?;
+        }
+        self.map_bound = map_bound;
+        // Assigned under the owning shard latch: every shard's vector is sorted
+        // and transaction-private append fences order a child's predecessor.
+        entry.sequence = sequence.fetch_add(1, Ordering::Relaxed);
+        self.index.insert(ptr, self.records.len());
+        self.records.push(Some(entry));
+        Ok(())
+    }
+    fn get(&self, ptr: u64) -> Option<&PublishedUndo> {
+        self.index
+            .get(&ptr)
+            .and_then(|index| self.records[*index].as_ref())
+    }
+    fn clear(&mut self) {
+        self.records.clear();
+        self.index.clear();
     }
 }
 
-/// Upper bound on one combiner's hold so readers and purge are not starved
-/// behind an unbounded stream of queued publications.
-const UNDO_PUBLISH_COMBINE_LIMIT: usize = 256;
+struct UndoPublicationShard {
+    live: UndoPublicationBuffer,
+    spare: Option<UndoPublicationBuffer>,
+    live_bytes: u64,
+    _charge: ControlledMemoryCharge,
+}
+struct UndoPublicationLane {
+    state: parking_lot::Mutex<UndoPublicationShard>,
+    count: CachePadded<std::sync::atomic::AtomicUsize>,
+}
 
-/// Busy-wait budget (a few microseconds) before a waiter parks.
-const UNDO_PUBLISH_SPINS: u32 = 256;
+struct UndoLatch {
+    inner: parking_lot::RwLock<UndoTablespace>,
+    publications: Box<[UndoPublicationLane]>,
+    sequence: AtomicU64,
+    stage_allowed: AtomicBool,
+    unrestricted_admission: AtomicBool,
+    cache_limit: AtomicU64,
+    disk_softfail_warn: AtomicBool,
+    canonical_resident: AtomicU64,
+}
+impl std::fmt::Debug for UndoLatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndoLatch")
+            .field("published_count", &self.pending_count())
+            .finish_non_exhaustive()
+    }
+}
 
-/// Backstop for a waiter whose combiner cannot reach it; normal completion
-/// unparks the owner directly.
-const UNDO_PUBLISH_PARK: Duration = Duration::from_micros(200);
+struct UndoDirectoryWriteGuard<'a> {
+    owner: &'a UndoLatch,
+    guard: Option<parking_lot::RwLockWriteGuard<'a, UndoTablespace>>,
+}
+impl std::ops::Deref for UndoDirectoryWriteGuard<'_> {
+    type Target = UndoTablespace;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_deref().expect("live undo write guard")
+    }
+}
+impl std::ops::DerefMut for UndoDirectoryWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_deref_mut().expect("live undo write guard")
+    }
+}
+impl Drop for UndoDirectoryWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = &self.guard {
+            self.owner.refresh_policy(guard);
+        }
+    }
+}
+impl<'a> UndoDirectoryWriteGuard<'a> {
+    fn into_read(mut self) -> parking_lot::RwLockReadGuard<'a, UndoTablespace> {
+        self.owner
+            .refresh_policy(self.guard.as_deref().expect("live undo write guard"));
+        parking_lot::RwLockWriteGuard::downgrade(self.guard.take().unwrap())
+    }
+}
 
-impl Database {
-    /// Publish a frame already written to its rollback segment, combining
-    /// with concurrent publishers under one exclusive directory hold.
+impl UndoLatch {
+    fn pending_count(&self) -> usize {
+        self.publications
+            .iter()
+            .map(|lane| lane.count.load(Ordering::Acquire))
+            .sum()
+    }
+    fn new(value: UndoTablespace) -> Result<Self, QueryError> {
+        let publications = (0..value.shard_count().max(1))
+            .map(|_| {
+                Ok(UndoPublicationLane {
+                    state: parking_lot::Mutex::new(UndoPublicationShard {
+                        live: Default::default(),
+                        spare: None,
+                        live_bytes: 0,
+                        _charge: ControlledMemoryCharge::try_new(
+                            ControlledMemoryCategory::SystemMetadata,
+                            std::mem::size_of::<UndoPublicationLane>(),
+                        )?,
+                    }),
+                    count: CachePadded::new(std::sync::atomic::AtomicUsize::new(0)),
+                })
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?
+            .into_boxed_slice();
+        Ok(Self {
+            stage_allowed: AtomicBool::new(value.sharded_publication_eligible()),
+            unrestricted_admission: AtomicBool::new(
+                value.mem_soft_limit_bytes == 0 && value.tablespace_max_bytes == 0,
+            ),
+            cache_limit: AtomicU64::new(value.mem_cache_limit_bytes),
+            disk_softfail_warn: AtomicBool::new(value.disk_cap_softfail_warn()),
+            canonical_resident: AtomicU64::new(value.resident_bytes),
+            inner: parking_lot::RwLock::new(value),
+            publications,
+            sequence: AtomicU64::new(0),
+        })
+    }
+    fn refresh_policy(&self, value: &UndoTablespace) {
+        self.canonical_resident
+            .store(value.resident_bytes, Ordering::Release);
+        self.cache_limit
+            .store(value.mem_cache_limit_bytes, Ordering::Release);
+        self.unrestricted_admission.store(
+            value.mem_soft_limit_bytes == 0 && value.tablespace_max_bytes == 0,
+            Ordering::Release,
+        );
+        self.stage_allowed
+            .store(value.sharded_publication_eligible(), Ordering::Release);
+        self.disk_softfail_warn
+            .store(value.disk_cap_softfail_warn(), Ordering::Release);
+    }
+    fn shard(&self, ptr: u64) -> usize {
+        crate::storage::undo::publication_shard(ptr) % self.publications.len()
+    }
+    fn consolidate(&self, undo: &mut UndoTablespace) {
+        if self.pending_count() == 0 {
+            return;
+        }
+        // Capture only pointer-sized buffer swaps while publishers are fenced.
+        // Segment leases keep captured/live frames safe from retirement until
+        // their canonical metadata is installed below.
+        let mut snapshots: smallvec::SmallVec<[(UndoPublicationBuffer, usize); 16]> = {
+            let mut lanes: smallvec::SmallVec<[_; 16]> = self
+                .publications
+                .iter()
+                .map(|lane| lane.state.lock())
+                .collect();
+            lanes
+                .iter_mut()
+                .enumerate()
+                .map(|(index, shard)| {
+                    let replacement = shard.spare.take().unwrap_or_default();
+                    let captured = std::mem::replace(&mut shard.live, replacement);
+                    shard.live_bytes = 0;
+                    self.publications[index].count.store(0, Ordering::Release);
+                    (captured, 0)
+                })
+                .collect()
+        };
+        // A k-way merge uses the already-admitted vectors, without allocating
+        // a second record array or scratch sort at a memory-pressure barrier.
+        loop {
+            let next = snapshots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (buffer, position))| {
+                    buffer
+                        .records
+                        .get(*position)
+                        .and_then(Option::as_ref)
+                        .map(|entry| (index, entry.sequence))
+                })
+                .min_by_key(|(_, sequence)| *sequence)
+                .map(|(index, _)| index);
+            let Some(index) = next else {
+                break;
+            };
+            let (buffer, position) = &mut snapshots[index];
+            let entry = buffer.records[*position].take().unwrap();
+            *position += 1;
+            undo.consolidate_published_record(entry.record, entry.reservation);
+            drop(entry.segment_lease);
+        }
+        for (shard, (mut buffer, _)) in self.publications.iter().zip(snapshots) {
+            buffer.clear();
+            let mut shard = shard.state.lock();
+            assert!(
+                shard.spare.is_none(),
+                "one canonical consolidator owns each spare buffer"
+            );
+            shard.spare = Some(buffer);
+        }
+        undo.finish_publication_barrier();
+        self.refresh_policy(undo);
+    }
+    fn write(&self) -> UndoDirectoryWriteGuard<'_> {
+        let mut guard = self.inner.write();
+        self.consolidate(&mut guard);
+        UndoDirectoryWriteGuard {
+            owner: self,
+            guard: Some(guard),
+        }
+    }
+    fn read(&self) -> parking_lot::RwLockReadGuard<'_, UndoTablespace> {
+        let guard = self.inner.read();
+        if self.pending_count() == 0 {
+            return guard;
+        }
+        drop(guard);
+        self.write().into_read()
+    }
+    fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, UndoTablespace>> {
+        let guard = self.inner.try_read()?;
+        // Optional diagnostics/reclaim probes must never acquire live-lane
+        // latches, allocate, or flush undo while their caller owns storage
+        // locks. Mandatory callers use read()/write() to consolidate.
+        (self.pending_count() == 0).then_some(guard)
+    }
+    fn insert_admission_unpressured(&self, row_count: usize) -> bool {
+        if self.unrestricted_admission.load(Ordering::Acquire) {
+            return true;
+        }
+        self.inner
+            .read()
+            .insert_admission_unpressured(row_count, true)
+    }
+    fn prepare_load_owned(&self, ptr: u64) -> Result<Option<PreparedUndoRead>, QueryError> {
+        {
+            if let Some(entry) = self.publications[self.shard(ptr)]
+                .state
+                .lock()
+                .live
+                .get(ptr)
+            {
+                return Ok(Some(PreparedUndoRead::Resident(entry.record.clone())));
+            }
+        }
+        // A record captured by maintenance becomes visible when its canonical
+        // writer finishes. Never retain a lane latch while waiting for it.
+        self.inner.read().prepare_load_owned(ptr)
+    }
     #[allow(clippy::too_many_arguments)]
-    fn publish_concurrent_undo_frame(
+    fn publish(
         &self,
-        record: crate::storage::undo::UndoRecord,
-        encoded: Vec<u8>,
+        mut record: UndoRecord,
+        bytes: Vec<u8>,
         ptr: u64,
         segment_id: u32,
         segment_end: u64,
-        reservation: crate::storage::undo::UndoResidentReservation,
-    ) -> UndoPublishResult {
-        let slot = Arc::new(UndoPublishSlot {
-            state: parking_lot::Mutex::new(UndoPublishState::Queued(UndoPublishRequest {
+        reservation: UndoResidentReservation,
+        segment_lease: UndoSegmentLease,
+    ) -> Result<(u64, Vec<u8>, bool), QueryError> {
+        if !self.stage_allowed.load(Ordering::Acquire) {
+            return self.write().finish_concurrent_persistent_append(
                 record,
-                encoded,
+                bytes,
                 ptr,
                 segment_id,
                 segment_end,
                 reservation,
-            })),
-            done: AtomicBool::new(false),
-            owner: std::thread::current(),
-        });
-        let queue = &self.undo_publish;
-        queue.pending.lock().push(Arc::clone(&slot));
-        loop {
-            if slot.done.load(Ordering::Acquire) {
-                break;
-            }
-            if queue
-                .combining
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.combine_undo_publications();
-                continue;
-            }
-            // A running combiner finishes a batch within microseconds. Spin
-            // briefly before parking: a park/unpark round trip costs two
-            // context switches, more than the wait it replaces.
-            let mut spins = 0;
-            while spins < UNDO_PUBLISH_SPINS
-                && !slot.done.load(Ordering::Acquire)
-                && queue.combining.load(Ordering::Relaxed)
-            {
-                std::hint::spin_loop();
-                spins += 1;
-            }
-            if spins == UNDO_PUBLISH_SPINS {
-                std::thread::park_timeout(UNDO_PUBLISH_PARK);
+            );
+        }
+        record.id = ptr;
+        record.chain_depth = 0; // Derived, in publication order, in canonical state.
+        record.encoded_len = u32::try_from(bytes.len()).map_err(|_| {
+            error(
+                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                "undo record is too large",
+            )
+        })?;
+        let resident = u64::from(record.resident_size);
+        let (count, pending) = {
+            let lane = &self.publications[self.shard(ptr)];
+            let mut shard = lane.state.lock();
+            shard.live.insert(
+                ptr,
+                PublishedUndo {
+                    record,
+                    reservation,
+                    segment_lease,
+                    sequence: 0,
+                },
+                &self.sequence,
+            )?;
+            shard.live_bytes = shard.live_bytes.saturating_add(resident);
+            let count = shard.live.records.len();
+            lane.count.store(count, Ordering::Release);
+            (count, shard.live_bytes)
+        };
+        let limit = self.cache_limit.load(Ordering::Acquire);
+        let headroom = limit.saturating_sub(self.canonical_resident.load(Ordering::Acquire));
+        if count >= 256 || (limit != 0 && pending > headroom / self.publications.len() as u64) {
+            // A maintenance writer already owns a coherent view. It must not
+            // stall new publishers; all live payloads remain governor-admitted.
+            if let Some(mut guard) = self.inner.try_write() {
+                self.consolidate(&mut guard);
+                self.refresh_policy(&guard);
             }
         }
-        let state = std::mem::replace(&mut *slot.state.lock(), UndoPublishState::Taken);
-        match state {
-            UndoPublishState::Done(result) => result,
-            UndoPublishState::Queued(_) | UndoPublishState::Taken => Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "undo publication completed without a result",
-            )),
+        Ok((ptr, bytes, false))
+    }
+}
+
+impl Database {
+    #[allow(clippy::too_many_arguments)]
+    fn publish_concurrent_undo_frame(
+        &self,
+        record: UndoRecord,
+        encoded: Vec<u8>,
+        ptr: u64,
+        segment_id: u32,
+        segment_end: u64,
+        reservation: UndoResidentReservation,
+        segment_lease: UndoSegmentLease,
+    ) -> Result<(u64, Vec<u8>, bool), QueryError> {
+        self.undo.publish(
+            record,
+            encoded,
+            ptr,
+            segment_id,
+            segment_end,
+            reservation,
+            segment_lease,
+        )
+    }
+}
+#[cfg(test)]
+mod sharded_undo_tests {
+    use super::*;
+
+    fn record(previous: Option<u64>) -> UndoRecord {
+        UndoRecord {
+            id: 0,
+            txn_id: 1,
+            created_unix_ms: 1,
+            prev_undo_ptr: previous,
+            kind: UndoKind::Insert,
+            table_id: 1,
+            row_id: RowId::new(0, 0),
+            before_header: None,
+            before_values: None,
+            before_external: Vec::new(),
+            borrowed_external: Vec::new(),
+            chain_depth: 0,
+            cached_size: 0,
+            resident_size: 0,
+            temp_reservation: None,
+            resident: true,
+            encoded_len: 0,
         }
     }
 
-    /// Run as the combiner (the caller won `combining`): drain and publish
-    /// until the queue is empty, then hand the role back. Re-checking the
-    /// queue after releasing the role closes the window in which a publisher
-    /// enqueued after the last drain but saw the role still taken.
-    fn combine_undo_publications(&self) {
-        let queue = &self.undo_publish;
-        loop {
-            let mut completed = Vec::new();
-            {
-                let mut undo = self.undo.write();
-                loop {
-                    let batch = {
-                        let mut pending = queue.pending.lock();
-                        if pending.is_empty() {
-                            break;
-                        }
-                        let take = pending.len().min(UNDO_PUBLISH_COMBINE_LIMIT);
-                        pending.drain(..take).collect::<Vec<_>>()
-                    };
-                    for slot in batch {
-                        let state =
-                            std::mem::replace(&mut *slot.state.lock(), UndoPublishState::Taken);
-                        let request = match state {
-                            UndoPublishState::Queued(request) => request,
-                            other => {
-                                *slot.state.lock() = other;
-                                continue;
-                            }
-                        };
-                        let result = undo.finish_concurrent_persistent_append(
-                            request.record,
-                            request.encoded,
-                            request.ptr,
-                            request.segment_id,
-                            request.segment_end,
-                            request.reservation,
-                        );
-                        *slot.state.lock() = UndoPublishState::Done(result);
-                        completed.push(slot);
-                    }
-                    if completed.len() >= UNDO_PUBLISH_COMBINE_LIMIT {
-                        break;
-                    }
-                }
+    #[test]
+    fn pointer_reads_and_cross_shard_depth_survive_maintenance_barriers() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let manager = UndoTablespace::open_with_segments(
+            &Vec::<crate::wal::WalRecord>::new(),
+            dir.path(),
+            1 << 20,
+        )
+        .unwrap();
+        let shards = manager.concurrent_persistent_append_shards();
+        let admission = manager.resident_admission();
+        let latch = UndoLatch::new(manager).unwrap();
+        let mut previous = None;
+        for depth in 1..=12 {
+            let mut record = record(previous);
+            record.resident_size =
+                crate::storage::undo::estimate_undo_resident_bytes(&record) as u32;
+            let reservation = admission.reserve(&record).unwrap();
+            let mut bytes = crate::storage::undo::encode_undo_record(&record).unwrap();
+            let (ptr, segment, end, lease) = UndoTablespace::write_leased_persistent_frame(
+                &shards[(depth - 1) % shards.len()],
+                &mut bytes,
+            )
+            .unwrap();
+            latch
+                .publish(record, bytes, ptr, segment, end, reservation, lease)
+                .unwrap();
+            assert!(latch.pending_count() > 0);
+            let loaded = latch
+                .prepare_load_owned(ptr)
+                .unwrap()
+                .unwrap()
+                .finish()
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.prev_undo_ptr, previous);
+            // Live entries carry the same unknown diagnostic depth as a cold
+            // on-disk frame. Canonical consolidation computes exact depths.
+            // Alternate reads, writes, and try-reads all expose complete
+            // canonical state, independent of cross-shard drain order.
+            if depth % 3 == 0 {
+                assert_eq!(latch.read().record_count(), depth);
+                assert_eq!(latch.pending_count(), 0);
+            } else if depth % 3 == 1 {
+                assert_eq!(latch.write().record_count(), depth);
+            } else {
+                assert!(latch.try_read().is_none());
+                drop(latch.read());
+                assert_eq!(latch.try_read().unwrap().record_count(), depth);
             }
-            for slot in completed {
-                slot.done.store(true, Ordering::Release);
-                slot.owner.unpark();
-            }
-            queue.combining.store(false, Ordering::SeqCst);
-            if queue.pending.lock().is_empty()
-                || queue
-                    .combining
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-            {
-                return;
-            }
+            assert_eq!(
+                latch.read().load_owned(ptr).unwrap().chain_depth,
+                depth as u32
+            );
+            previous = Some(ptr);
         }
+        latch.write().flush().unwrap();
+        drop(latch);
+        let recovered = UndoTablespace::open_with_segments(
+            &Vec::<crate::wal::WalRecord>::new(),
+            dir.path(),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(recovered.record_count(), 12);
+        assert!(recovered.load_owned(previous.unwrap()).is_some());
+    }
+    #[test]
+    fn live_publication_does_not_wait_for_canonical_maintenance() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let manager = UndoTablespace::open_with_segments(
+            &Vec::<crate::wal::WalRecord>::new(),
+            dir.path(),
+            1 << 20,
+        )
+        .unwrap();
+        let shard = manager.concurrent_persistent_append_shards()[0].clone();
+        let admission = manager.resident_admission();
+        let latch = Arc::new(UndoLatch::new(manager).unwrap());
+        let mut entry = record(None);
+        entry.resident_size = crate::storage::undo::estimate_undo_resident_bytes(&entry) as u32;
+        let reservation = admission.reserve(&entry).unwrap();
+        let mut bytes = crate::storage::undo::encode_undo_record(&entry).unwrap();
+        let (ptr, segment, end, lease) =
+            UndoTablespace::write_leased_persistent_frame(&shard, &mut bytes).unwrap();
+        let maintenance = latch.write();
+        let worker_latch = Arc::clone(&latch);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(worker_latch.publish(entry, bytes, ptr, segment, end, reservation, lease))
+                .unwrap();
+        });
+        let published = receive.recv_timeout(Duration::from_millis(200));
+        drop(maintenance);
+        worker.join().unwrap();
+        published
+            .expect("live publication waited for canonical maintenance")
+            .unwrap();
+        assert!(latch.prepare_load_owned(ptr).unwrap().is_some());
+    }
+    #[test]
+    fn capture_orders_cross_lane_live_chains_before_deriving_depths() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let manager = UndoTablespace::open_with_segments(
+            &Vec::<crate::wal::WalRecord>::new(),
+            dir.path(),
+            1 << 20,
+        )
+        .unwrap();
+        let lanes = manager.concurrent_persistent_append_shards();
+        let admission = manager.resident_admission();
+        let latch = UndoLatch::new(manager).unwrap();
+        let mut previous = None;
+        let mut ids = Vec::new();
+        for index in 0..64 {
+            let mut entry = record(previous);
+            entry.resident_size = crate::storage::undo::estimate_undo_resident_bytes(&entry) as u32;
+            let reservation = admission.reserve(&entry).unwrap();
+            let mut bytes = crate::storage::undo::encode_undo_record(&entry).unwrap();
+            let (ptr, segment, end, lease) = UndoTablespace::write_leased_persistent_frame(
+                &lanes[index % lanes.len()],
+                &mut bytes,
+            )
+            .unwrap();
+            latch
+                .publish(entry, bytes, ptr, segment, end, reservation, lease)
+                .unwrap();
+            ids.push(ptr);
+            previous = Some(ptr);
+        }
+        assert_eq!(latch.pending_count(), ids.len());
+        let canonical = latch.read();
+        for (index, ptr) in ids.iter().enumerate() {
+            let loaded = canonical.load_owned(*ptr).unwrap();
+            assert_eq!(loaded.chain_depth, index as u32 + 1);
+            assert_eq!(
+                loaded.prev_undo_ptr,
+                index.checked_sub(1).map(|prev| ids[prev])
+            );
+        }
+    }
+
+    #[test]
+    fn policy_shadows_follow_writes_and_guard_downgrade() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let manager = UndoTablespace::open_with_segments(
+            &Vec::<crate::wal::WalRecord>::new(),
+            dir.path(),
+            1 << 20,
+        )
+        .unwrap();
+        let latch = UndoLatch::new(manager).unwrap();
+        assert!(latch.stage_allowed.load(Ordering::Acquire));
+        let mut writer = latch.write();
+        writer.set_txn_max_bytes(1024);
+        let reader = writer.into_read();
+        assert!(!latch.stage_allowed.load(Ordering::Acquire));
+        drop(reader);
+        {
+            let mut writer = latch.write();
+            writer.set_txn_max_bytes(0);
+            writer.set_mem_soft_limit_bytes(1024);
+        }
+        assert!(!latch.stage_allowed.load(Ordering::Acquire));
+        assert!(!latch.unrestricted_admission.load(Ordering::Acquire));
+        {
+            let mut writer = latch.write();
+            writer.set_mem_soft_limit_bytes(0);
+            writer.set_mem_cache_limit_bytes(2048);
+        }
+        assert!(latch.stage_allowed.load(Ordering::Acquire));
+        assert!(latch.unrestricted_admission.load(Ordering::Acquire));
+        assert_eq!(latch.cache_limit.load(Ordering::Acquire), 2048);
+    }
+    #[test]
+    fn optional_diagnostics_do_not_reenter_live_lane_latches() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let manager = UndoTablespace::open_with_segments(
+            &Vec::<crate::wal::WalRecord>::new(),
+            dir.path(),
+            1 << 20,
+        )
+        .unwrap();
+        let lane = manager.concurrent_persistent_append_shards()[0].clone();
+        let admission = manager.resident_admission();
+        let latch = Arc::new(UndoLatch::new(manager).unwrap());
+        let mut entry = record(None);
+        entry.resident_size = crate::storage::undo::estimate_undo_resident_bytes(&entry) as u32;
+        let reservation = admission.reserve(&entry).unwrap();
+        let mut bytes = crate::storage::undo::encode_undo_record(&entry).unwrap();
+        let (ptr, segment, end, lease) =
+            UndoTablespace::write_leased_persistent_frame(&lane, &mut bytes).unwrap();
+        latch
+            .publish(entry, bytes, ptr, segment, end, reservation, lease)
+            .unwrap();
+        let held_lane = latch.publications[latch.shard(ptr)].state.lock();
+        let worker_latch = Arc::clone(&latch);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(worker_latch.try_read().is_none()).unwrap();
+        });
+        let skipped = receive.recv_timeout(Duration::from_millis(200));
+        drop(held_lane);
+        worker.join().unwrap();
+        assert!(skipped.expect("optional probe waited on a live publication latch"));
+        assert_eq!(latch.pending_count(), 1);
+        assert_eq!(latch.read().record_count(), 1);
     }
 }

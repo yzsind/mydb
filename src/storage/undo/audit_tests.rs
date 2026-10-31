@@ -2,7 +2,7 @@ use super::purge_tests::make_record;
 use super::*;
 
 #[test]
-fn refactor_undo_full_and_metadata_share_headers_lobs_and_legacy_tail() {
+fn refactor_undo_full_and_metadata_share_headers_lobs_and_reject_truncated_tail() {
     let mut record = make_record(17, 3, 5, Some(11));
     record.kind = UndoKind::Update;
     record.before_values = Some(vec![Value::String("汉字".into()), Value::Int(-7)]);
@@ -23,7 +23,9 @@ fn refactor_undo_full_and_metadata_share_headers_lobs_and_legacy_tail() {
     record.borrowed_external = record.before_external.clone();
     record.chain_depth = 13;
     let bytes = encode_undo_record(&record).unwrap();
-    for (frame, depth) in [(&bytes[..], 13), (&bytes[..bytes.len() - 4], 0)] {
+    assert!(decode_undo_record(&bytes[..bytes.len() - 4]).is_err());
+    assert!(decode_undo_record_metadata(&bytes[..bytes.len() - 4]).is_err());
+    for (frame, depth) in [(&bytes[..], 13)] {
         let full = decode_undo_record(frame).unwrap();
         let metadata = decode_undo_record_metadata(frame).unwrap();
         assert_eq!(

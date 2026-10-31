@@ -327,6 +327,55 @@ impl<'a> JsonbRef<'a> {
         Ok(Self { bytes })
     }
 
+    /// Validate untrusted persisted/exported documents before recursive reads.
+    /// Scalar payloads are borrowed and containers are bounded before descent.
+    pub(crate) fn validate(&self) -> Result<(), QueryError> {
+        fn check(bytes: &[u8], containers: usize) -> Result<(), QueryError> {
+            let node = JsonbRef::new(bytes)?;
+            let malformed = || {
+                json_err(
+                    crate::error::catalog::ER_INVALID_JSON_TEXT,
+                    "malformed JSONB container or UTF-8 payload",
+                )
+            };
+            if node.is_array() || node.is_object() {
+                if containers >= super::MAX_JSON_DEPTH - 1 {
+                    return Err(super::json_too_deep());
+                }
+                let mut pos = 1;
+                read_uvarint(bytes, &mut pos)?;
+                let count = read_uvarint(bytes, &mut pos)?;
+                for _ in 0..count {
+                    if node.is_object() {
+                        let len = usize::try_from(read_uvarint(bytes, &mut pos)?)
+                            .map_err(|_| malformed())?;
+                        let end = pos
+                            .checked_add(len)
+                            .filter(|end| *end <= bytes.len())
+                            .ok_or_else(malformed)?;
+                        std::str::from_utf8(&bytes[pos..end]).map_err(|_| malformed())?;
+                        pos = end;
+                    }
+                    let remaining = bytes.get(pos..).ok_or_else(malformed)?;
+                    let len = JsonbRef::node_len(remaining)?;
+                    check(&remaining[..len], containers + 1)?;
+                    pos += len;
+                }
+                if pos != bytes.len() {
+                    return Err(malformed());
+                }
+            } else if matches!(
+                node.tag(),
+                T_STRING | T_DECIMAL | T_DATE | T_TIME | T_DATETIME | T_TIMESTAMP
+            ) && node.text_payload().is_none()
+            {
+                return Err(malformed());
+            }
+            Ok(())
+        }
+        check(self.bytes, 0)
+    }
+
     #[inline]
     fn tag(&self) -> u8 {
         self.bytes[0]
@@ -401,8 +450,13 @@ impl<'a> JsonbRef<'a> {
     /// The bytes of exactly this node (tag through end), copyable into a
     /// fresh `Value::Json`.
     pub(crate) fn to_owned_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+
+    /// Borrow exactly this node, excluding any following siblings.
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
         let len = Self::node_len(self.bytes).unwrap_or(self.bytes.len());
-        self.bytes[..len.min(self.bytes.len())].to_vec()
+        &self.bytes[..len.min(self.bytes.len())]
     }
 
     pub(crate) fn json_type(&self) -> JsonType {
@@ -648,6 +702,11 @@ impl<'a> JsonbRef<'a> {
     /// Decode this node into a serde_json DOM. Used by the structural
     /// mutators that are simpler to express on a tree.
     pub(crate) fn to_serde(&self) -> Result<Json, QueryError> {
+        self.validate()?;
+        self.to_serde_inner()
+    }
+
+    fn to_serde_inner(&self) -> Result<Json, QueryError> {
         Ok(match self.tag() {
             T_NULL => Json::Null,
             T_TRUE => Json::Bool(true),
@@ -681,14 +740,14 @@ impl<'a> JsonbRef<'a> {
             T_ARRAY => {
                 let mut arr = Vec::new();
                 for elem in self.array_iter() {
-                    arr.push(elem.to_serde()?);
+                    arr.push(elem.to_serde_inner()?);
                 }
                 Json::Array(arr)
             }
             _ => {
                 let mut map = serde_json::Map::new();
                 for (k, v) in self.object_iter() {
-                    map.insert(k.to_string(), v.to_serde()?);
+                    map.insert(k.to_string(), v.to_serde_inner()?);
                 }
                 Json::Object(map)
             }
@@ -697,6 +756,15 @@ impl<'a> JsonbRef<'a> {
 
     /// Append MySQL canonical compact text (`{"a": 1, "b": 2}`).
     pub(crate) fn write_text(&self, out: &mut String) {
+        if let Err(err) = self.validate() {
+            crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Error, &err);
+            out.push_str("null");
+            return;
+        }
+        self.write_text_inner(out);
+    }
+
+    fn write_text_inner(&self, out: &mut String) {
         match self.tag() {
             T_NULL => out.push_str("null"),
             T_TRUE => out.push_str("true"),
@@ -728,7 +796,7 @@ impl<'a> JsonbRef<'a> {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    elem.write_text(out);
+                    elem.write_text_inner(out);
                 }
                 out.push(']');
             }
@@ -740,7 +808,7 @@ impl<'a> JsonbRef<'a> {
                     }
                     write_json_string(k, out);
                     out.push_str(": ");
-                    v.write_text(out);
+                    v.write_text_inner(out);
                 }
                 out.push('}');
             }
@@ -749,6 +817,15 @@ impl<'a> JsonbRef<'a> {
 
     /// Append MySQL `JSON_PRETTY` indented text (two spaces per level).
     pub(crate) fn write_pretty(&self, out: &mut String, indent: usize) {
+        if let Err(err) = self.validate() {
+            crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Error, &err);
+            out.push_str("null");
+            return;
+        }
+        self.write_pretty_inner(out, indent);
+    }
+
+    fn write_pretty_inner(&self, out: &mut String, indent: usize) {
         match self.tag() {
             T_ARRAY => {
                 if self.container_len() == Some(0) {
@@ -762,7 +839,7 @@ impl<'a> JsonbRef<'a> {
                         out.push_str(",\n");
                     }
                     push_indent(out, inner);
-                    elem.write_pretty(out, inner);
+                    elem.write_pretty_inner(out, inner);
                 }
                 out.push('\n');
                 push_indent(out, indent);
@@ -782,13 +859,13 @@ impl<'a> JsonbRef<'a> {
                     push_indent(out, inner);
                     write_json_string(k, out);
                     out.push_str(": ");
-                    v.write_pretty(out, inner);
+                    v.write_pretty_inner(out, inner);
                 }
                 out.push('\n');
                 push_indent(out, indent);
                 out.push('}');
             }
-            _ => self.write_text(out),
+            _ => self.write_text_inner(out),
         }
     }
 
@@ -802,12 +879,26 @@ impl<'a> JsonbRef<'a> {
     /// Maximum nesting depth (`JSON_DEPTH`): scalars = 1, empty
     /// array/object = 1, otherwise 1 + max child depth.
     pub(crate) fn depth(&self) -> usize {
+        if let Err(err) = self.validate() {
+            crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Error, &err);
+            return super::MAX_JSON_DEPTH + 1;
+        }
+        self.depth_inner()
+    }
+
+    fn depth_inner(&self) -> usize {
         match self.tag() {
-            T_ARRAY => 1 + self.array_iter().map(|e| e.depth()).max().unwrap_or(0),
+            T_ARRAY => {
+                1 + self
+                    .array_iter()
+                    .map(|e| e.depth_inner())
+                    .max()
+                    .unwrap_or(0)
+            }
             T_OBJECT => {
                 1 + self
                     .object_iter()
-                    .map(|(_, v)| v.depth())
+                    .map(|(_, v)| v.depth_inner())
                     .max()
                     .unwrap_or(0)
             }

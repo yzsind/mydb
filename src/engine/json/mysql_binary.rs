@@ -36,7 +36,9 @@ struct EncodedValue {
 /// Convert mydb's canonical JSON representation to the byte format carried
 /// by a MySQL `MYSQL_TYPE_JSON` row event.
 pub(crate) fn encode(bytes: &[u8]) -> Result<Vec<u8>, QueryError> {
-    let value = encode_node(JsonbRef::new(bytes)?)?;
+    let node = JsonbRef::new(bytes)?;
+    node.validate()?;
+    let value = encode_node(node)?;
     let mut out = Vec::with_capacity(1 + value.payload.len());
     out.push(value.ty);
     out.extend_from_slice(&value.payload);
@@ -557,6 +559,236 @@ mod tests {
                     .unwrap();
             let dom = serde_json::Value::from(decoded.parse().unwrap());
             assert_eq!(dom, serde_json::Value::String(expected.into()));
+        }
+    }
+}
+
+/// Exact wire-format size without materializing the encoded document.
+/// Container layout and scalar width choices are shared with the encoder.
+pub(crate) fn encoded_size(bytes: &[u8]) -> Result<usize, QueryError> {
+    planned_size(JsonbRef::new(bytes)?)?
+        .1
+        .checked_add(1)
+        .ok_or_else(size_error)
+}
+
+fn size_error() -> QueryError {
+    super::json_err(
+        crate::error::catalog::ER_JSON_VALUE_TOO_BIG,
+        "JSON value is too big for MySQL binary JSON",
+    )
+}
+
+fn variable_length_size(mut n: usize) -> usize {
+    let mut size = 1;
+    while n >= 128 {
+        n >>= 7;
+        size += 1;
+    }
+    size
+}
+
+fn planned_size(node: JsonbRef<'_>) -> Result<(u8, usize), QueryError> {
+    Ok(match node.json_type() {
+        JsonType::Null | JsonType::Boolean => (LITERAL, 1),
+        JsonType::Integer => {
+            let value = node.as_i64().unwrap_or(0);
+            if i16::try_from(value).is_ok() {
+                (INT16, 2)
+            } else if i32::try_from(value).is_ok() {
+                (INT32, 4)
+            } else {
+                (INT64, 8)
+            }
+        }
+        JsonType::UnsignedInteger => {
+            let n = node
+                .exact_number()
+                .and_then(|(n, s)| (s == 0).then_some(n))
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(0);
+            if u16::try_from(n).is_ok() {
+                (UINT16, 2)
+            } else if u32::try_from(n).is_ok() {
+                (UINT32, 4)
+            } else {
+                (UINT64, 8)
+            }
+        }
+        JsonType::Double => (DOUBLE, 8),
+        JsonType::String => {
+            let n = node.as_str().unwrap_or_default().len();
+            (
+                STRING,
+                n.checked_add(variable_length_size(n))
+                    .ok_or_else(size_error)?,
+            )
+        }
+        JsonType::Date | JsonType::Time | JsonType::Datetime | JsonType::Timestamp => (OPAQUE, 10),
+        JsonType::Opaque => {
+            let (_, data) = node
+                .opaque_value()
+                .ok_or_else(|| super::invalid_json_text(1, "opaque JSON"))?;
+            (
+                OPAQUE,
+                data.len()
+                    .checked_add(variable_length_size(data.len()))
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(size_error)?,
+            )
+        }
+        JsonType::Decimal => {
+            // Preserve the encoder's exact decimal validation and packing rules.
+            let value = encode_node(node)?;
+            (value.ty, value.payload.len())
+        }
+        JsonType::Array | JsonType::Object => {
+            let object = node.is_object();
+            let (mut count, mut keys, mut small, mut large) = (0usize, 0usize, 0usize, 0usize);
+            let mut long_key = false;
+            let mut add = |key: Option<&str>, value: JsonbRef<'_>| -> Result<(), QueryError> {
+                let (ty, len) = planned_size(value)?;
+                count = count.checked_add(1).ok_or_else(size_error)?;
+                if let Some(key) = key {
+                    keys = keys.checked_add(key.len()).ok_or_else(size_error)?;
+                    long_key |= key.len() > u16::MAX as usize;
+                }
+                if !is_inline(ty, false) {
+                    small = small.checked_add(len).ok_or_else(size_error)?;
+                }
+                if !is_inline(ty, true) {
+                    large = large.checked_add(len).ok_or_else(size_error)?;
+                }
+                Ok(())
+            };
+            if object {
+                for (key, value) in node.object_iter() {
+                    add(Some(key), value)?;
+                }
+            } else {
+                for value in node.array_iter() {
+                    add(None, value)?;
+                }
+            }
+            // The encoder validates key lengths after encoding all children.
+            if long_key {
+                return Err(size_error());
+            }
+            let size = |width: usize, external: usize| {
+                count
+                    .checked_mul(width + 1 + if object { width + 2 } else { 0 })
+                    .and_then(|n| n.checked_add(width * 2))
+                    .and_then(|n| n.checked_add(keys))
+                    .and_then(|n| n.checked_add(external))
+            };
+            if let Some(size) =
+                size(2, small).filter(|n| *n <= u16::MAX as usize && count <= u16::MAX as usize)
+            {
+                (if object { SMALL_OBJECT } else { SMALL_ARRAY }, size)
+            } else {
+                let size = size(4, large)
+                    .filter(|n| *n <= u32::MAX as usize && count <= u32::MAX as usize)
+                    .ok_or_else(size_error)?;
+                (if object { LARGE_OBJECT } else { LARGE_ARRAY }, size)
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod size_plan_tests {
+    use super::*;
+    #[test]
+    fn size_only_matches_encoder_at_scalar_and_container_layout_boundaries() {
+        let mut nodes = Vec::new();
+        for n in [
+            i64::MIN,
+            i32::MIN as i64 - 1,
+            i32::MIN as i64,
+            i16::MIN as i64 - 1,
+            i16::MIN as i64,
+            0,
+            i16::MAX as i64,
+            i16::MAX as i64 + 1,
+            i32::MAX as i64,
+            i32::MAX as i64 + 1,
+            i64::MAX,
+        ] {
+            nodes.push(super::super::scalar_from_value(&crate::types::Value::Int(
+                n,
+            )));
+        }
+        for n in [
+            u16::MAX as u64,
+            u16::MAX as u64 + 1,
+            u32::MAX as u64,
+            u32::MAX as u64 + 1,
+            u64::MAX,
+        ] {
+            nodes.push(super::super::scalar_from_value(&crate::types::Value::UInt(
+                n,
+            )));
+        }
+        for value in [
+            crate::types::Value::Null,
+            crate::types::Value::Double(1.25),
+            crate::types::Value::Date(0),
+            crate::types::Value::Time(-1234567),
+            crate::types::Value::DateTime(1234567),
+            crate::types::Value::DecimalCompact(12345, 3),
+            crate::types::Value::Decimal(
+                "12345678901234567890123456789012345.123456789012345678901234567890".into(),
+            ),
+        ] {
+            nodes.push(super::super::scalar_from_value(&value));
+        }
+        for n in [0, 1, 127, 128, 16383, 16384, 65500, 65535, 65536, 100000] {
+            nodes.push(super::super::scalar_from_value(
+                &crate::types::Value::String("x".repeat(n)),
+            ));
+            nodes.push(super::super::opaque_scalar(255, &vec![128; n]));
+        }
+        let check =
+            |bytes: &[u8]| assert_eq!(encoded_size(bytes).unwrap(), encode(bytes).unwrap().len());
+        for node in &nodes {
+            check(node);
+        }
+        check(&super::super::build_array(&nodes));
+        let pairs = nodes
+            .iter()
+            .enumerate()
+            .map(|(n, v)| (format!("key{n}"), v.clone()))
+            .collect::<Vec<_>>();
+        check(&super::super::build_object(&pairs));
+        for n in [0, 1, 127, 128, 4096, 21840, 21841, 65535, 65536] {
+            check(&super::super::build_array(&vec![vec![0]; n]));
+        }
+        for n in [1000, 5000, 6000] {
+            check(&super::super::build_object(
+                &(0..n)
+                    .map(|i| (format!("k{i}"), vec![0]))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+
+    #[test]
+    fn size_only_keeps_decimal_and_long_key_error_precedence() {
+        let invalid =
+            super::super::scalar_from_value(&crate::types::Value::Decimal("9".repeat(66)));
+        let docs = [
+            invalid.clone(),
+            super::super::build_object(&[("k".repeat(65536), vec![0])]),
+            super::super::build_object(&[
+                ("k".repeat(65536), vec![0]),
+                ("k".repeat(65537), invalid),
+            ]),
+        ];
+        for doc in docs {
+            let expected = encode(&doc).unwrap_err();
+            let actual = encoded_size(&doc).unwrap_err();
+            assert_eq!(actual.code(), expected.code());
+            assert_eq!(actual.to_string(), expected.to_string());
         }
     }
 }

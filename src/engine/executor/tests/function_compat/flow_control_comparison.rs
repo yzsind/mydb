@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/flow-control-comparison.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/flow-control-comparison.json"
+));
 
 function_fixture_test!(coalesce, "COALESCE", FIXTURE);
 function_fixture_test!(elt, "ELT", FIXTURE);

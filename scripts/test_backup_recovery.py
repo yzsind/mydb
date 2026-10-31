@@ -157,20 +157,22 @@ def wal_format_version():
 
 
 def source_commits_after(data_dir, end_lsn):
-    """Independent bounded decoder for the protected source WAL suffix."""
+    """Independent decoder for source WAL framing and commit envelopes."""
     expected_version = wal_format_version()
     commits={}; spans=[]
     for path in sorted((data_dir/'system'/'wal').glob('wal-*')):
         if not (path.name.endswith('.log') or path.name.endswith('.log.pending')):
             continue
         with path.open('rb') as f:
-            header=f.read(40)
-            if len(header)!=40 or header[:8]!=b'MYDBWAL1':
+            header=f.read(64)
+            if len(header)!=64 or header[:8]!=b'MYDBWAL1':
                 continue
             version = struct.unpack_from('<I', header, 8)[0]
             if version != expected_version:
                 raise ValueError(f'{path}: unsupported source WAL version {version}; '
                                  f'expected {expected_version}')
+            assert struct.unpack_from('<II',header,52)==(64,0)
+            assert zlib.crc32(header[:60])==struct.unpack_from('<I',header,60)[0]
             while True:
                 frame=f.read(48)
                 if not frame or frame[:4]==b'\0'*4:
@@ -187,10 +189,22 @@ def source_commits_after(data_dir, end_lsn):
                 count=1; decision=kind==2
                 if kind==24:
                     count=struct.unpack_from('<I',payload)[0]; offset=4; decision=False
-                    for _ in range(count):
-                        ty,length=struct.unpack_from('<HI',payload,offset);offset+=6
-                        decision=decision or ty==2;offset+=length
-                    assert offset==len(payload)
+                    if count & (1<<31):
+                        # The compressed envelope keeps the logical count and
+                        # decision time outside LZ4 for append-time stamping.
+                        # Commit classification does not require row decoding.
+                        count &= (1<<31)-1
+                        assert 16<len(payload)<=65536+16
+                        raw_size,commit_time=struct.unpack_from('<IQ',payload,4)
+                        assert 4<=raw_size<=65536
+                        decision=commit_time!=0
+                        if decision:assert commit_time==source_time
+                    else:
+                        for _ in range(count):
+                            ty,length=struct.unpack_from('<HI',payload,offset);offset+=6
+                            decision=decision or ty==2;offset+=length
+                        assert offset==len(payload)
+                    assert 1<=count<=257
                 if decision:commits[txn]=(lsn,source_time)
                 if lsn>end_lsn:
                     spans.append((lsn-count+1,lsn))

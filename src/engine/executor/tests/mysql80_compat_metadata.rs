@@ -1032,10 +1032,10 @@ fn audit_histogram_empty_null_and_sampled_tables() {
 }
 
 #[test]
-fn audit_histogram_catalog_budget_fails_atomically() {
+fn audit_histogram_large_object_survives_reopen_without_catalog_trimming() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-    let engine = open_test_engine(dir.path());
+    let engine = StorageQueryEngine::open(dir.path()).unwrap();
     engine
         .execute("CREATE TABLE audit_bighist (id INT, v LONGTEXT)")
         .unwrap();
@@ -1045,13 +1045,24 @@ fn audit_histogram_catalog_budget_fails_atomically() {
     engine
         .execute("ANALYZE TABLE audit_bighist UPDATE HISTOGRAM ON id")
         .unwrap();
-    assert_eq!(
-        engine
-            .execute("ANALYZE TABLE audit_bighist UPDATE HISTOGRAM ON v")
-            .unwrap_err()
-            .code(),
-        1041
-    );
-    let result = rows(&engine,"SELECT COLUMN_NAME FROM information_schema.column_statistics WHERE TABLE_NAME='audit_bighist'");
-    assert_eq!(result, vec![vec![Value::String("id".into())]]);
+    engine
+        .execute("ANALYZE TABLE audit_bighist UPDATE HISTOGRAM ON v")
+        .unwrap();
+    let query="SELECT COLUMN_NAME FROM information_schema.column_statistics WHERE TABLE_NAME='audit_bighist' ORDER BY COLUMN_NAME";
+    let expected = vec![
+        vec![Value::String("id".into())],
+        vec![Value::String("v".into())],
+    ];
+    assert_eq!(rows(&engine, query), expected);
+    drop(engine);
+    let engine = StorageQueryEngine::open(dir.path()).unwrap();
+    assert_eq!(rows(&engine, query), expected);
+    let histogram = &engine
+        .database()
+        .table("test.audit_bighist")
+        .unwrap()
+        .stats
+        .explicit_histograms["v"];
+    assert_eq!(histogram.buckets.len(), 1);
+    assert_eq!(histogram.buckets[0].upper.to_display_string().len(), 600000);
 }

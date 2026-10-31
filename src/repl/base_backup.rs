@@ -55,7 +55,13 @@ const CHUNK_BYTES: usize = 1024 * 1024;
 /// of `schemas/` captures every object file. `system/replication/role.json`
 /// is special-cased below: only `role.json` is included from the
 /// replication state.
-const BACKUP_DIRS: &[&str] = &["schemas", "objects", "system/catalog", "system/undo"];
+const BACKUP_DIRS: &[&str] = &[
+    "schemas",
+    "objects",
+    "system/catalog",
+    "system/undo",
+    "system/object-owners",
+];
 /// Authoritative sidecars that are not stored under `schemas/`. They are
 /// append/checkpoint managed and must be seeded with the heap snapshot; WAL
 /// only contains changes after the backup boundary.
@@ -65,6 +71,7 @@ const BACKUP_FILES: &[&str] = &[
     "system/vector-purges.v1",
     "system/vector-maintenance.jobs",
     "system/commit-clock.v1",
+    "system/storage.control",
 ];
 
 /// Result of [`stream_base_backup`]: the LSN at which the master
@@ -494,6 +501,10 @@ pub(crate) fn cleanup_abandoned_snapshots(data_dir: &Path) -> Result<(), QueryEr
 /// Those scaffolds are not a seeded database. Never infer emptiness when any
 /// progress, catalog data, WAL records or user object files already exist.
 pub(crate) fn replica_needs_initial_seed(data_dir: &Path) -> Result<bool, QueryError> {
+    if crate::storage::control::Control::load(data_dir)?.is_some_and(|control| control.initialized)
+    {
+        return Ok(false);
+    }
     if crate::repl::replica::progress::progress_path(data_dir)
         .try_exists()
         .map_err(io_err)?
@@ -503,8 +514,12 @@ pub(crate) fn replica_needs_initial_seed(data_dir: &Path) -> Result<bool, QueryE
     for table in crate::storage::data_dictionary::dd_tables() {
         let path =
             crate::storage::naming::table_object_generation_path(data_dir, table.id, 1, "heap");
-        match fs::metadata(path) {
-            Ok(metadata) if metadata.len() != 0 => return Ok(false),
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() != 0 => {
+                if !crate::storage::heap_is_empty_allocation_file(&path).unwrap_or(false) {
+                    return Ok(false);
+                }
+            }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(io_err(err)),
@@ -918,6 +933,7 @@ pub(crate) async fn perform_base_backup_into_with_config(
     // state receiver resumes at backup_lsn + 1.
     let master_uuid = crate::repl::role::uuid_bytes_to_string(&ack.master_uuid);
     let progress = ReplicaProgress {
+        statistics: None,
         received_lsn: backup_lsn,
         durable_lsn: backup_lsn,
         applied_lsn: backup_lsn,
@@ -973,9 +989,11 @@ const INSTALL_TARGETS: &[&str] = &[
     "objects",
     "system/catalog",
     "system/undo",
+    "system/object-owners",
     "system/wal",
     "system/commit-ledger.v1",
     "system/commit-clock.v1",
+    "system/storage.control",
     "system/history-index.v1",
     "system/vector-purges.v1",
     "system/vector-maintenance.jobs",
@@ -1047,6 +1065,7 @@ fn validate_backup_relative_path(relative: &str) -> Result<(), QueryError> {
         || relative.starts_with("objects/")
         || relative.starts_with("system/catalog/")
         || relative.starts_with("system/undo/")
+        || relative.starts_with("system/object-owners/")
         || BACKUP_FILES.contains(&relative);
     if !allowed {
         return Err(error(
@@ -1516,6 +1535,7 @@ mod release_audit_tests {
     #[test]
     fn failed_first_open_scaffolding_still_requires_seed_without_discarding_data() {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        crate::storage::control::Control::admit(dir.path()).unwrap();
         fs::create_dir_all(dir.path().join("schemas/mysql/tables")).unwrap();
         fs::create_dir_all(crate::storage::naming::system_catalog_dir(dir.path())).unwrap();
         let properties = crate::storage::naming::table_object_generation_path(

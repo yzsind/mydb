@@ -307,9 +307,19 @@ impl SlotRegistry {
                 continue;
             }
             let bytes = fs::read(entry.path()).map_err(io_to_query)?;
-            let mut state: SlotState = match serde_json::from_slice(&bytes) {
+            let mut state: SlotState = match crate::storage::metadata::decode(
+                crate::storage::metadata::SLOT,
+                crate::storage::format_versions::REPLICATION_SLOT_VERSION,
+                &bytes,
+            ) {
                 Ok(s) => s,
                 Err(e) => {
+                    if e.io_error_kind() == Some(std::io::ErrorKind::Unsupported) {
+                        return Err(error(
+                            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                            e.to_string(),
+                        ));
+                    }
                     // A single corrupt slot must not block the whole
                     // master's replication subsystem from starting.
                     // Quarantine it (rename to `.corrupt`) and carry on;
@@ -464,7 +474,12 @@ impl SlotRegistry {
         let snap = handle.snapshot();
         let path = slot_path(&self.dir, replica_uuid);
         let tmp = path.with_extension("slot.tmp");
-        let bytes = serde_json::to_vec_pretty(&snap).map_err(|e| {
+        let bytes = crate::storage::metadata::encode(
+            crate::storage::metadata::SLOT,
+            crate::storage::format_versions::REPLICATION_SLOT_VERSION,
+            &snap,
+        )
+        .map_err(|e| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!("slot persist: {e}"),

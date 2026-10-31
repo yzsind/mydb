@@ -47,10 +47,7 @@ fn visit_prefix(
     let mut input = BufReader::new(input.take(len));
     let mut header = [0u8; WAL_HEADER_LEN];
     input.read_exact(&mut header).map_err(io_err)?;
-    if &header[..8] != WAL_MAGIC
-        || read_u32(&header, 8) != WAL_VERSION
-        || read_u32(&header, 36) != wal_checksum(&header[..36])
-    {
+    if !segment_header_valid(&header) {
         return Err(error(
             crate::error::catalog::MYDB_ER_BACKUP_FAILED,
             "invalid captured WAL header",
@@ -300,10 +297,7 @@ pub(crate) fn visit_raw_prefix(
     let mut input = BufReader::new(file.take(len));
     let mut header = [0; WAL_HEADER_LEN];
     input.read_exact(&mut header).map_err(io_err)?;
-    if &header[..8] != WAL_MAGIC
-        || read_u32(&header, 8) != WAL_VERSION
-        || read_u32(&header, 36) != wal_checksum(&header[..36])
-    {
+    if !segment_header_valid(&header) {
         return Err(error(
             crate::error::catalog::MYDB_ER_BACKUP_FAILED,
             "invalid WAL prefix header",

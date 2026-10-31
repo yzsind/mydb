@@ -113,27 +113,46 @@ macro_rules! spec {
 // it a supported option-file setting.  Registered GLOBAL sysvars are handled
 // separately below, using their registry metadata as the whitelist.
 static OPTION_SPECS: &[OptionSpec] = &[
-    spec!("http_enabled", "MYDB_HTTP_ENABLED", OptionKind::Bool),
-    spec!(
-        "http_local_config",
-        "MYDB_HTTP_LOCAL_CONFIG",
-        OptionKind::String
-    ),
-    spec!(
-        "http_max_inflight",
-        "MYDB_HTTP_MAX_INFLIGHT",
-        OptionKind::U64Range(1, 256)
-    ),
-    spec!(
-        "http_max_queue",
-        "MYDB_HTTP_MAX_QUEUE",
-        OptionKind::U64Range(1, 4096)
-    ),
-    spec!(
-        "http_memory_limit_mb",
-        "MYDB_HTTP_MEMORY_LIMIT_MB",
-        OptionKind::U64Range(1, 65536)
-    ),
+    OptionSpec {
+        name: "http_enabled",
+        env: "MYDB_HTTP_ENABLED",
+        kind: OptionKind::Bool,
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "http_local_config",
+        env: "MYDB_HTTP_LOCAL_CONFIG",
+        kind: OptionKind::String,
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "http_max_inflight",
+        env: "MYDB_HTTP_MAX_INFLIGHT",
+        kind: OptionKind::U64Range(1, 256),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "http_max_queue",
+        env: "MYDB_HTTP_MAX_QUEUE",
+        kind: OptionKind::U64Range(1, 4096),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "http_memory_limit_mb",
+        env: "MYDB_HTTP_MEMORY_LIMIT_MB",
+        kind: OptionKind::U64Range(1, 65536),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
     spec!(
         "http_max_request_bytes",
         "MYDB_HTTP_MAX_REQUEST_BYTES",
@@ -421,7 +440,7 @@ static OPTION_SPECS: &[OptionSpec] = &[
     OptionSpec {
         name: "tokio_workers",
         env: "MYDB_TOKIO_WORKERS",
-        kind: OptionKind::U64Range(1, u64::MAX),
+        kind: OptionKind::U64Range(1, 1024),
         aliases: &[],
         cli: false,
         sensitive: false,
@@ -1421,7 +1440,12 @@ fn apply_cli(args: &[String], resolved: &mut BTreeMap<String, String>) -> Result
             return Err(ConfigError::new(format!("unknown argument: --{key_raw}")));
         };
         let raw = if matches!(spec.kind, OptionKind::Bool) && inline_value.is_none() {
-            "ON".to_string()
+            if let Some(value) = args.get(i + 1).filter(|v| parse_bool(v).is_some()) {
+                i += 1;
+                value.clone()
+            } else {
+                "ON".to_string()
+            }
         } else if let Some(value) = inline_value {
             value.to_string()
         } else {

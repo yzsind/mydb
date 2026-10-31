@@ -313,6 +313,9 @@ pub(in crate::engine::executor) fn index_order_covers_order_by(
     let mut eq_values = HashMap::new();
     let mut ranges = HashMap::new();
     collect_index_constraints(table, filter, &mut eq_values, &mut ranges);
+    eq_values.retain(|column, value| {
+        crate::planner::index_bounds::equality_fixes_order_value(table, column, value)
+    });
     let mut index_pos = 0usize;
     while index_pos < index.columns.len()
         && eq_values.contains_key(&normalize_expr_column(&index.columns[index_pos]))
@@ -324,6 +327,9 @@ pub(in crate::engine::executor) fn index_order_covers_order_by(
             return false;
         };
         let column = normalize_expr_column(column);
+        if eq_values.contains_key(&column) {
+            continue;
+        }
         let mut matched = false;
         while index_pos < index.columns.len() {
             let index_column = normalize_expr_column(&index.columns[index_pos]);
@@ -2967,6 +2973,8 @@ pub(crate) struct CompactRangeRecipe {
 struct CompactRangeInput {
     columns: Vec<usize>,
     schema: Option<TableSchema>,
+    predicate: Option<Arc<crate::engine::expr_program::ExprProgram>>,
+    parameter_types: u64,
     decode: Arc<(
         RowDecodePlan,
         super::super::mem_budget::ControlledMemoryCharge,
@@ -3066,8 +3074,19 @@ pub(crate) fn compile_compact_range_recipe(
                 swaps.push((out, at));
             }
         }
+        let schema = filter.map(|_| super::plan::projected_schema_view(table, &columns));
+        let predicate = filter.zip(schema.as_ref()).and_then(|(filter, schema)| {
+            crate::engine::expr_program::ExprCompiler::compile_strict(
+                filter,
+                &crate::engine::expr_program::InputSchema::from_table(schema),
+            )
+            .ok()
+            .map(Arc::new)
+        });
         Some(CompactRangeInput {
-            schema: filter.map(|_| super::plan::projected_schema_view(table, &columns)),
+            schema,
+            predicate,
+            parameter_types: crate::engine::expr_type::current_parameter_type_fingerprint(),
             decode: RowDecodePlan::try_compile_cached(&columns, &table.row_codec)?,
             projected: ProjectedReadPlan::new(&columns, table),
             order_slots: order
@@ -3176,7 +3195,16 @@ pub(crate) fn execute_compact_range_recipe(
         return execute_fused_single_table_from_source(db, txn, stmt, plan, source, None)
             .map(|result| result.map(QueryResponse::ResultSet));
     };
+    // Expression programs retain placeholders and bind them at execution.
+    // Type-dependent coercion still gets a fresh program when a handle changes
+    // its parameter domains, rather than reusing the initial typed binding.
+    let reusable_filter = input.predicate.as_ref().filter(|_| {
+        source.1.as_ref().is_some_and(|ids| ids.len() <= 16)
+            && input.parameter_types
+                == crate::engine::expr_type::current_parameter_type_fingerprint()
+    });
     let filter = match (&source.2, &input.schema) {
+        (Some(_), Some(_)) if reusable_filter.is_some() => None,
         (Some(expr), Some(schema)) => match super::plan::CompiledPredicate::compile(expr, schema) {
             Some(program) => Some(program),
             None => {
@@ -3201,12 +3229,24 @@ pub(crate) fn execute_compact_range_recipe(
     restore_row_id_order(&mut pairs, &ids, |(id, _)| *id);
     let mut rows = Vec::with_capacity(pairs.len());
     for (_, values) in pairs {
-        if filter
-            .as_ref()
-            .map(|filter| filter.eval(&values))
-            .transpose()?
-            .unwrap_or(true)
-        {
+        let accepted = if let Some(program) = reusable_filter {
+            match program.eval_simple_predicate_source(&values.as_slice()) {
+                Some(result) => result?,
+                None => {
+                    let mut scratch = crate::engine::expr_program::EvalScratch::default();
+                    crate::engine::expr::truthy(
+                        &program.eval_source(&values.as_slice(), &mut scratch)?,
+                    )
+                }
+            }
+        } else {
+            filter
+                .as_ref()
+                .map(|filter| filter.eval(&values))
+                .transpose()?
+                .unwrap_or(true)
+        };
+        if accepted {
             rows.push(values);
         }
     }

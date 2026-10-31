@@ -196,7 +196,7 @@ fn record_bulk_index_build(index: &IndexFile, direct: bool, started: Instant) {
     }
 }
 const INDEX_MIN_PAGE_BYTES: usize = PAGE_SIZE / 4;
-const INDEX_HEADER_BYTES: usize = 24;
+const INDEX_HEADER_BYTES: usize = 64;
 /// Common index page header (offsets 0..24). The buffer-pool +
 /// WAL layer manages this header uniformly for every page-typed
 /// file (heap / index / overflow / vector / ivf):
@@ -450,6 +450,12 @@ thread_local! {
         std::cell::RefCell::new(None);
     static INDEX_FAIL_WRITE_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INDEX_FAIL_WRITE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Debug)]
+enum BufferedIndexInsert {
+    Complete,
+    Remaining { consumed: usize, lsn: u64 },
 }
 
 #[derive(Debug)]
@@ -2480,6 +2486,7 @@ struct BulkIndexPageWriter {
     images: Vec<u8>,
     first_page: Option<u64>,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    owner: [u8; 16],
 }
 
 impl BulkIndexPageWriter {
@@ -2500,6 +2507,7 @@ impl BulkIndexPageWriter {
             images: Vec::with_capacity(Self::RUN_BYTES),
             first_page: None,
             _charge: charge,
+            owner: index.file_key.owner,
         })
     }
 
@@ -2509,7 +2517,10 @@ impl BulkIndexPageWriter {
             .first_page
             .is_none_or(|first| { page_id == first + (self.images.len() / PAGE_SIZE) as u64 }));
         self.first_page.get_or_insert(page_id);
+        let start = self.images.len();
         self.images.extend_from_slice(image);
+        stamp_page_owner(&mut self.images[start..], &self.owner, page_id);
+        refresh_page_checksum(&mut self.images[start..]);
     }
 
     fn append_leaf(&mut self, page_id: u64, image: &mut [u8], txn_id: u64, lsn: u64) {
@@ -2553,6 +2564,13 @@ impl BulkIndexPageWriter {
     }
 }
 
+fn stamp_bulk_index_images(index: &IndexFile, first_page: u64, images: &mut [u8]) {
+    for (position, image) in images.chunks_exact_mut(PAGE_SIZE).enumerate() {
+        stamp_page_owner(image, &index.file_key.owner, first_page + position as u64);
+        refresh_page_checksum(image);
+    }
+}
+
 /// Streamed external merges retain one producer and a bounded page queue.
 /// Positional writes can overlap both the merge and one another; no worker
 /// publishes a root or performs the final durability barrier.
@@ -2567,6 +2585,7 @@ fn with_parallel_bulk_image_writes<T>(
     let degree = degree.max(1);
     if degree == 1 {
         return produce(&mut |page, images| {
+            stamp_bulk_index_images(index, page, images);
             write_bulk_pages_at(index.durability, file, images, page * PAGE_SIZE as u64)
                 .map_err(io_err)?;
             images.clear();
@@ -2601,6 +2620,7 @@ fn with_parallel_bulk_image_writes<T>(
             }));
         }
         let result = produce(&mut |page, images| {
+            stamp_bulk_index_images(index, page, images);
             let batch =
                 std::mem::replace(images, Vec::with_capacity(BulkIndexPageWriter::RUN_BYTES));
             sender.send((page, batch)).map_err(|_| {
@@ -2861,6 +2881,7 @@ impl IndexFile {
         // files; snapshot restoration must be able to reopen those pages.
         let mut file = if durability == DurabilityMode::Memory
             && !crate::storage::temp_quota::is_temporary_path(&path)
+            && !path.try_exists().map_err(io_err)?
         {
             None
         } else {
@@ -2877,7 +2898,9 @@ impl IndexFile {
                 "corrupt index file length",
             ));
         }
-        let cached_meta = if crate::storage::temp_quota::is_temporary_path(&path) {
+        let cached_meta = if durability == DurabilityMode::Memory
+            || crate::storage::temp_quota::is_temporary_path(&path)
+        {
             // Handle eviction need not evict the buffer frames. Read their
             // current metadata before falling back to the backing file.
             buffer_pool.with_cached_bytes(
@@ -2900,6 +2923,7 @@ impl IndexFile {
                     INDEX_META_PAGE,
                 )?,
             };
+            validate_page_owner(&meta_page, &page_owner(&path), 0)?;
             (decode_index_meta(&meta_page)?, meta_page)
         } else {
             let meta = IndexMeta {
@@ -3035,6 +3059,8 @@ impl IndexFile {
                     let mut meta_image = encode_index_meta(&meta.meta);
                     let root = self.read_page(INDEX_EMPTY_ROOT)?;
                     let mut root_image = encode_index_tree_page(root.as_ref())?;
+                    stamp_page_owner(&mut meta_image, &self.file_key.owner, 0);
+                    stamp_page_owner(&mut root_image, &self.file_key.owner, INDEX_EMPTY_ROOT);
                     let mut log = self.log.lock();
                     let lsn = log.next_lsn();
                     set_page_lsn_if_formatted(&mut meta_image, lsn);
@@ -3700,16 +3726,22 @@ impl IndexFile {
             );
         }
         let entry = IndexEntry { key, row_id };
-        // Always log via the compact logical `IndexBatch` record (one
-        // op, ~24 bytes) and set `logical_wal_lsn` so the downstream
-        // `write_page` calls skip emitting full 32 KB before/after page
-        // images. Recovery already replays IndexBatch via
-        // `redo_index_batch` (which calls `insert_internal` again),
-        // so durability is identical to the old Strict physical path
-        // — only the WAL bytes shrink by ~1000× per index op.
-        self.apply_single_index_op_logged(txn_id, WalIndexOpKind::Insert, entry, |index, entry| {
-            index.insert_entry_concurrent(txn_id, entry)
-        })
+        match self.try_insert_entries_buffered(txn_id, std::slice::from_ref(&entry))? {
+            Some(BufferedIndexInsert::Complete) => Ok(()),
+            Some(BufferedIndexInsert::Remaining { consumed: 0, lsn }) => {
+                let _logical = btree_logical_wal::LsnScope::new(Some(lsn));
+                self.insert_entry_concurrent(txn_id, entry)
+            }
+            Some(BufferedIndexInsert::Remaining { .. }) => {
+                unreachable!("a consumed single entry completes the buffered insert")
+            }
+            None => self.apply_single_index_op_logged(
+                txn_id,
+                WalIndexOpKind::Insert,
+                entry,
+                |index, entry| index.insert_entry_concurrent(txn_id, entry),
+            ),
+        }
     }
 
     /// Insert a batch of `(key, row_id)` entries.
@@ -3851,7 +3883,9 @@ impl IndexFile {
                         // frames permanently unflushable. Fall back to the
                         // canonical eager append and always balance every pin.
                         let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
-                            .and_then(|pre| self.log.lock().append_pre_encoded(pre));
+                            .and_then(|pre| {
+                                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
+                            });
                         match appended {
                             Ok(lsn) => {
                                 for key in &keys {
@@ -3876,7 +3910,9 @@ impl IndexFile {
                         self.buffer_pool.finalize_deferred(key, 0);
                     }
                     let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                    let lsn = Some(self.log.lock().append_pre_encoded(pre)?);
+                    let lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
+                        &self.log, pre,
+                    )?);
                     return self.apply_batch_with_lsn(txn_id, entries.into_vec(), lsn);
                 }
                 Err(e) => {
@@ -3894,7 +3930,9 @@ impl IndexFile {
         let lsn = match payload {
             Some(payload) => {
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-                Some(self.log.lock().append_pre_encoded(pre)?)
+                Some(crate::wal::LogManager::append_pre_encoded_to(
+                    &self.log, pre,
+                )?)
             }
             None => None,
         };
@@ -4102,9 +4140,9 @@ impl IndexFile {
         else {
             return Ok(false);
         };
-        // A non-root leaf's first entry is its parent separator. Moving either
-        // endpoint through slot zero would require the structural slow path.
-        if leaf_id != root_page && (old_pos == 0 || target_pos == 0) {
+        // Parent separators are conservative lower bounds. Raising a leaf's
+        // minimum preserves that bound; only a decrease needs the oracle.
+        if leaf_id != root_page && target_pos == 0 && (old_pos != 0 || new_entry < old_entry) {
             return Ok(false);
         }
         let removed = apply_leaf_reposition(&mut leaf.entries, old_pos, target_pos, new_entry);
@@ -4188,7 +4226,10 @@ impl IndexFile {
                 else {
                     return Ok((false, false));
                 };
-                if leaf_id != root_page && (old_pos == 0 || target_pos == 0) {
+                if leaf_id != root_page
+                    && target_pos == 0
+                    && (old_pos != 0 || new_entry < old_entry)
+                {
                     return Ok((false, false));
                 }
                 let removed =
@@ -4240,7 +4281,6 @@ impl IndexFile {
         let root_page = self.root_page.load(Ordering::Acquire);
         let mut old_leaf = self.read_leaf(old_leaf_id)?;
         let mut new_leaf = self.read_leaf(new_leaf_id)?;
-        let old_original_first = old_leaf.entries.first().cloned();
         let new_original_first = new_leaf.entries.first().cloned();
         let Ok(delete_pos) = old_leaf.entries.binary_search(old_entry) else {
             return Ok(false);
@@ -4263,7 +4303,6 @@ impl IndexFile {
         if old_leaf_id != root_page {
             if old_leaf.entries.is_empty()
                 || encoded_leaf_page_len(&old_leaf) < INDEX_MIN_PAGE_BYTES
-                || old_leaf.entries.first().cloned() != old_original_first
             {
                 return Ok(false);
             }
@@ -4335,11 +4374,10 @@ impl IndexFile {
                     Ok(_) => return Ok((false, false)),
                     Err(pos) => pos,
                 };
-                // Changing a non-root leaf's first key requires refreshing its
-                // parent separator; leave that structural case to the oracle.
-                if (old_leaf_id != root_page && delete_pos == 0)
-                    || (new_leaf_id != root_page && insert_pos == 0)
-                {
+                // Source deletion raises its minimum and keeps the existing
+                // separator valid. Destination minimum decreases still use
+                // the structural oracle.
+                if new_leaf_id != root_page && insert_pos == 0 {
                     return Ok((false, false));
                 }
 
@@ -4381,22 +4419,33 @@ impl IndexFile {
     fn apply_batch_with_lsn(
         &self,
         txn_id: u64,
-        mut entries: Vec<IndexBatchEntry>,
+        entries: Vec<IndexBatchEntry>,
         lsn: Option<u64>,
     ) -> Result<(), QueryError> {
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(lsn);
-        // A single logged DELETE needs no batch topology reservation. Share
-        // the point-delete path and retain its terminal pin/native image.
-        if lsn.is_some() && entries.len() == 1 && entries[0].kind == WalIndexOpKind::Delete {
-            let entry = entries.pop().expect("single delete");
-            let result = self.delete_entry_concurrent(
-                txn_id,
-                IndexEntry {
-                    key: entry.key,
-                    row_id: entry.row_id,
-                },
-            );
+        // Logged deletions share the point-delete oracle: fitting leaves need
+        // only their leaf latch and a shared topology guard. Underflow still
+        // takes the exclusive structural fallback for that entry. Keep the
+        // batch mutation epoch open across entries for range-cursor repair.
+        if lsn.is_some()
+            && entries
+                .iter()
+                .all(|entry| entry.kind == WalIndexOpKind::Delete)
+        {
+            let result = (|| {
+                let _mutation = (entries.len() > 1).then(|| self.begin_mutation());
+                for entry in entries {
+                    self.delete_entry_concurrent(
+                        txn_id,
+                        IndexEntry {
+                            key: entry.key,
+                            row_id: entry.row_id,
+                        },
+                    )?;
+                }
+                Ok(())
+            })();
             btree_logical_wal::set(previous_lsn);
             return result;
         }
@@ -4458,8 +4507,144 @@ impl IndexFile {
             }
             return self.bulk_load_sorted(txn_id, entries);
         }
+        if let Some(outcome) = self.try_insert_entries_buffered(txn_id, &entries)? {
+            return match outcome {
+                BufferedIndexInsert::Complete => Ok(()),
+                BufferedIndexInsert::Remaining { consumed, lsn } => {
+                    let mut entries = entries;
+                    entries.drain(..consumed);
+                    self.insert_entries_with_lsn(txn_id, entries, Some(lsn))
+                }
+            };
+        }
         let lsn = self.append_index_batch_wal(txn_id, WalIndexOpKind::Insert, &entries)?;
         self.insert_entries_with_lsn(txn_id, entries, lsn)
+    }
+
+    /// Buffer bounded leaf-only insert runs. An overflow/structural decline
+    /// appends the complete logical batch before entering the structural
+    /// oracle. Return the applied prefix length so the oracle handles only
+    /// the remaining suffix. Replaying a full leaf's already-applied prefix
+    /// would repeatedly decode that leaf just to rediscover duplicates and
+    /// would prevent a sorted suffix from using the right-edge append path.
+    /// The complete batch remains in WAL for crash recovery and replication.
+    /// None means ineligible; an eligible batch completes or returns its
+    /// remaining position and the LSN covering the complete batch.
+    fn try_insert_entries_buffered(
+        &self,
+        txn_id: u64,
+        entries: &[IndexEntry],
+    ) -> Result<Option<BufferedIndexInsert>, QueryError> {
+        if self.durability == DurabilityMode::Memory
+            || !txn_wal_buffer_index_enabled()
+            || !txn_wal_buffering_active(&self.log, txn_id)
+            || btree_logical_wal::is_deferred()
+            || physical_wal_apply_active()
+        {
+            return Ok(None);
+        }
+        let path = self.relative_path();
+        let mut payload_bytes = 8usize.saturating_add(path.len());
+        let mut ops = Vec::new();
+        for entry in entries {
+            let key_len = encoded_index_key_len(&entry.key)?;
+            payload_bytes = payload_bytes.saturating_add(11).saturating_add(key_len);
+            if payload_bytes > INDEX_BATCH_WAL_TARGET_BYTES {
+                return Ok(None);
+            }
+            let mut key = Vec::with_capacity(key_len);
+            encode_index_key_into(&entry.key, &mut key)?;
+            ops.push(WalIndexOp {
+                kind: WalIndexOpKind::Insert,
+                key,
+                row_id: WalRowId {
+                    page_id: entry.row_id.page_id,
+                    slot_id: entry.row_id.slot_id,
+                },
+            });
+        }
+        let Some(reservation) = self.buffer_pool.reserve_deferred_wal_pages(entries.len()) else {
+            return Ok(None);
+        };
+        let payload = WalPayload::IndexBatch { path, ops };
+        let _logical = btree_logical_wal::LsnScope::new(None);
+        btree_logical_wal::begin_deferred();
+        let mut position = 0;
+        let applied = (|| -> Result<bool, QueryError> {
+            let mut route = smallvec::SmallVec::<[InsertRouteFrame; 4]>::new();
+            while position < entries.len() {
+                let run = SortedIndexEntryRun::prefix(&entries[position..]);
+                let _structure = self.structure_lock.read();
+                let single;
+                let (pinned, end) = if entries.len() == 1 {
+                    single = self
+                        .find_leaf_for_entry_with_candidate(&entries[0], &entries[0])?
+                        .0;
+                    (&single, 1)
+                } else {
+                    self.find_leaf_for_insert_run(
+                        entries,
+                        position,
+                        position + run.0.len(),
+                        &mut route,
+                    )?
+                };
+                let leaf = pinned.frame.key.page_id;
+                let (_latch, _same) = self.lock_leaf_latches(leaf, leaf)?;
+                let _mutation = self.begin_mutation();
+                let run = RoutedIndexEntryRun(SortedIndexEntryRun(&entries[position..end]));
+                let consumed = if entries.len() == 1 {
+                    self.try_insert_leaf_run_in_place::<false>(txn_id, pinned, run)?
+                } else {
+                    self.try_insert_leaf_run_in_place::<true>(txn_id, pinned, run)?
+                };
+                match consumed {
+                    Some(n) if n > 0 => {
+                        position += n;
+                        self.dirty.store(true, Ordering::Release);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            Ok(true)
+        })();
+        let keys = btree_logical_wal::take_deferred();
+        let (payload, keys, _reservation) = if matches!(applied, Ok(true)) {
+            match push_reserved_txn_wal_record(&self.log, txn_id, payload, keys, Some(reservation))
+            {
+                Ok(()) => return Ok(Some(BufferedIndexInsert::Complete)),
+                Err(owned) => owned,
+            }
+        } else {
+            (payload, keys, Some(reservation))
+        };
+        // Drop deferred collection before appending or entering an oracle.
+        // No leaf or topology guard is held while touching the WAL mutex.
+        let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+            .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre));
+        let lsn = match appended {
+            Ok(lsn) => {
+                for key in &keys {
+                    self.buffer_pool.finalize_deferred(key, lsn);
+                }
+                lsn
+            }
+            Err(err) => {
+                // Never make an unlogged dirty image flushable at LSN zero.
+                for key in &keys {
+                    let _ = self.buffer_pool.discard_page(key);
+                }
+                return Err(err);
+            }
+        };
+        match applied {
+            Ok(true) => Ok(Some(BufferedIndexInsert::Complete)),
+            Ok(false) => Ok(Some(BufferedIndexInsert::Remaining {
+                consumed: position,
+                lsn,
+            })),
+            Err(err) => Err(err),
+        }
     }
 
     fn insert_entries_with_lsn(
@@ -4742,7 +4927,7 @@ impl IndexFile {
                 }
                 let pre =
                     LogManager::pre_encode_record(txn_id, WalPayload::IndexBatch { path, ops })?;
-                self.log.lock().append_pre_encoded(pre)?;
+                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                 compensated_last_record |= frame.header.lsn == last_lsn;
             }
         }
@@ -6947,6 +7132,63 @@ impl IndexFile {
             );
         }
         let entry = IndexEntry { key, row_id };
+        if self.durability != DurabilityMode::Memory
+            && txn_wal_buffer_index_enabled()
+            && txn_wal_buffering_active(&self.log, txn_id)
+            && !btree_logical_wal::is_deferred()
+            && !physical_wal_apply_active()
+            && self.online_build_log.is_none()
+        {
+            if let Some(reservation) = self.buffer_pool.reserve_deferred_wal_pages(1) {
+                let payload = WalPayload::IndexBatch {
+                    path: self.relative_path(),
+                    ops: vec![Self::encode_wal_index_op(WalIndexOpKind::Delete, &entry)?],
+                };
+                let _logical = btree_logical_wal::LsnScope::new(None);
+                btree_logical_wal::begin_deferred();
+                let applied = self.try_delete_entry_concurrent(txn_id, &entry);
+                let keys = btree_logical_wal::take_deferred();
+                let (payload, keys, _reservation) = if matches!(applied, Ok(true)) {
+                    match push_reserved_txn_wal_record(
+                        &self.log,
+                        txn_id,
+                        payload,
+                        keys,
+                        Some(reservation),
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(owned) => owned,
+                    }
+                } else {
+                    (payload, keys, Some(reservation))
+                };
+                // Release topology/leaf latches before WAL publication. A
+                // structural decline has not changed the leaf; a successful
+                // deferred mutation keeps its pin until the eager fallback
+                // has assigned a real LSN.
+                let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+                    .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre));
+                let lsn = match appended {
+                    Ok(lsn) => {
+                        for key in &keys {
+                            self.buffer_pool.finalize_deferred(key, lsn);
+                        }
+                        lsn
+                    }
+                    Err(err) => {
+                        for key in &keys {
+                            let _ = self.buffer_pool.discard_page(key);
+                        }
+                        return Err(err);
+                    }
+                };
+                if applied? {
+                    return Ok(());
+                }
+                let _logical = btree_logical_wal::LsnScope::new(Some(lsn));
+                return self.delete_entry_concurrent(txn_id, entry);
+            }
+        }
         // Symmetric with `insert_deferred`: always log via `IndexBatch`
         // so we don't emit a 32 KB per-page before/after image for a
         // single B-tree leaf modification. Recovery replays via
@@ -6963,15 +7205,28 @@ impl IndexFile {
     /// removal alone leaves a safe lower-bound separator until a structural
     /// rebuild refreshes it.
     fn delete_entry_concurrent(&self, txn_id: u64, entry: IndexEntry) -> Result<(), QueryError> {
+        if self.try_delete_entry_concurrent(txn_id, &entry)? {
+            return Ok(());
+        }
+        let _structure = self.structure_lock.write();
+        let _mutation = self.begin_mutation();
+        self.delete_internal_unlocked(txn_id, entry.key, entry.row_id, false)
+    }
+
+    fn try_delete_entry_concurrent(
+        &self,
+        txn_id: u64,
+        entry: &IndexEntry,
+    ) -> Result<bool, QueryError> {
         let completed_without_structure_change = {
             let _structure = self.structure_lock.read();
-            let pinned = self.find_leaf_for_entry_with_candidate(&entry, &entry)?.0;
+            let pinned = self.find_leaf_for_entry_with_candidate(entry, entry)?.0;
             let leaf_id = pinned.frame.key.page_id;
             let (leaf_latch, same_bucket) = self.lock_leaf_latches(leaf_id, leaf_id)?;
             let _mutation = self.begin_mutation();
             let root_page = self.root_page.load(Ordering::Acquire);
             let result =
-                self.try_delete_leaf_nonstructural_in_place(txn_id, &pinned, &entry, root_page)?;
+                self.try_delete_leaf_nonstructural_in_place(txn_id, &pinned, entry, root_page)?;
             drop(same_bucket);
             drop(leaf_latch);
             match result {
@@ -6983,12 +7238,7 @@ impl IndexFile {
                 None => false,
             }
         };
-        if completed_without_structure_change {
-            return Ok(());
-        }
-        let _structure = self.structure_lock.write();
-        let _mutation = self.begin_mutation();
-        self.delete_internal_unlocked(txn_id, entry.key, entry.row_id, false)
+        Ok(completed_without_structure_change)
     }
 
     #[cfg(test)]
@@ -7244,7 +7494,12 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), token, None, true) {
+                if Self::fulltext_prefetch_may_continue(
+                    leaf.entries.last().map(|entry| &entry.key),
+                    token,
+                    None,
+                    true,
+                ) {
                     self.prefetch_fulltext_leaves(next, token, None, true);
                 }
             }
@@ -7301,7 +7556,12 @@ impl IndexFile {
                 }
             };
             if let Some(next) = leaf.next_leaf {
-                if Self::fulltext_prefetch_may_continue(leaf.entries.last().map(|entry| &entry.key), prefix, prefix_upper, false) {
+                if Self::fulltext_prefetch_may_continue(
+                    leaf.entries.last().map(|entry| &entry.key),
+                    prefix,
+                    prefix_upper,
+                    false,
+                ) {
                     self.prefetch_fulltext_leaves(next, prefix, prefix_upper, false);
                 }
             }
@@ -8573,7 +8833,9 @@ impl IndexFile {
                         ops: std::mem::take(&mut ops),
                     },
                 )?;
-                last_lsn = Some(self.log.lock().append_pre_encoded(pre)?);
+                last_lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
+                    &self.log, pre,
+                )?);
                 chunk_payload_bytes = fixed_payload_bytes;
             }
             chunk_payload_bytes = chunk_payload_bytes
@@ -8598,7 +8860,9 @@ impl IndexFile {
                 txn_id,
                 WalPayload::IndexBatch { path, ops },
             )?;
-            last_lsn = Some(self.log.lock().append_pre_encoded(pre)?);
+            last_lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
+                &self.log, pre,
+            )?);
         }
         Ok(last_lsn)
     }
@@ -8612,7 +8876,7 @@ impl IndexFile {
             return Ok(None);
         };
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         Ok(Some(lsn))
     }
 
@@ -8678,7 +8942,7 @@ impl IndexFile {
                 ops: vec![wal_op],
             },
         )?;
-        let lsn = self.log.lock().append_pre_encoded(pre)?;
+        let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(Some(lsn));
         let result = apply(self, entry);
@@ -10782,7 +11046,12 @@ impl IndexFile {
             }
             let mut cursor = header.read_slot_offset(header.count - 1);
             let last = header.decode_key_at(&mut cursor)?;
-            Ok(Self::fulltext_prefetch_may_continue(Some(&last), prefix, upper, exact))
+            Ok(Self::fulltext_prefetch_may_continue(
+                Some(&last),
+                prefix,
+                upper,
+                exact,
+            ))
         });
     }
 
@@ -10798,7 +11067,11 @@ impl IndexFile {
             // missing/loading page, then let asynchronous I/O extend the chain.
             match self.buffer_pool.with_cached_prefetch_bytes(&key, |bytes| {
                 let header = parse_leaf_payload_header(bytes)?;
-                Ok(if continues(&header)? { header.next_leaf } else { None })
+                Ok(if continues(&header)? {
+                    header.next_leaf
+                } else {
+                    None
+                })
             }) {
                 Ok(Some(Some(next))) => start = next,
                 Ok(None) => {
@@ -10920,12 +11193,14 @@ impl IndexFile {
             }
             e
         })?;
+        stamp_page_owner(&mut after, &self.file_key.owner, page_id);
+        refresh_page_checksum(&mut after);
         let lsn = if self.durability == DurabilityMode::Memory {
             0
         } else {
             let before = self.read_raw_page_image(page_id)?;
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             set_page_lsn_if_formatted(&mut after, lsn);
             let path = self.relative_path();
             let reduced = txn_reduced_redo_active(&self.log, txn_id)
@@ -10981,6 +11256,8 @@ impl IndexFile {
 
     fn write_page_direct(&self, page_id: u64, page: IndexPage, lsn: u64) -> Result<(), QueryError> {
         let mut image = encode_index_tree_page(&page)?;
+        stamp_page_owner(&mut image, &self.file_key.owner, page_id);
+        refresh_page_checksum(&mut image);
         if lsn != 0 {
             set_page_lsn_if_formatted(&mut image, lsn);
         }
@@ -10997,6 +11274,8 @@ impl IndexFile {
     fn write_meta_page(&self, txn_id: u64) -> Result<(), QueryError> {
         let mut state = self.meta_state.lock();
         let mut after = encode_index_meta(&state.meta);
+        stamp_page_owner(&mut after, &self.file_key.owner, 0);
+        refresh_page_checksum(&mut after);
         // Physical-replication apply: no local WAL appends (see
         // PHYSICAL_WAL_APPLY); the master's own meta-page PageUpdate
         // records arrive in-stream and converge the on-disk image.
@@ -11024,7 +11303,7 @@ impl IndexFile {
         } else {
             let before = state.meta_image.clone();
             let mut log = self.log.lock();
-            let lsn = log.reserve_lsn()?;
+            let lsn = log.reserve_txn_lsn(txn_id)?;
             set_page_lsn_if_formatted(&mut after, lsn);
             let path = self.relative_path();
             let reduced = txn_reduced_redo_active(&self.log, txn_id)
@@ -11066,6 +11345,8 @@ impl IndexFile {
 
     fn mark_meta_dirty(&self) -> Result<(), QueryError> {
         let mut image = encode_index_meta(&self.meta_state.lock().meta);
+        stamp_page_owner(&mut image, &self.file_key.owner, 0);
+        refresh_page_checksum(&mut image);
         let lsn = btree_logical_wal::current().unwrap_or(0);
         if lsn != 0 {
             set_page_lsn_if_formatted(&mut image, lsn);
@@ -11080,6 +11361,8 @@ impl IndexFile {
 
     fn write_meta_page_direct(&self, lsn: u64) -> Result<(), QueryError> {
         let mut image = encode_index_meta(&self.meta_state.lock().meta);
+        stamp_page_owner(&mut image, &self.file_key.owner, 0);
+        refresh_page_checksum(&mut image);
         if lsn != 0 {
             set_page_lsn_if_formatted(&mut image, lsn);
         }
@@ -11728,9 +12011,9 @@ fn encode_index_meta(meta: &IndexMeta) -> Vec<u8> {
     write_u32(&mut buf, 16, 0);
     write_u32(&mut buf, 20, INDEX_VERSION);
     write_u32(&mut buf, 24, PAGE_SIZE as u32);
-    write_u64(&mut buf, 32, meta.root_page);
-    write_u64(&mut buf, 40, meta.next_page_id);
-    write_u64(&mut buf, 48, meta.free_page_head.unwrap_or(0));
+    write_u64(&mut buf, 64, meta.root_page);
+    write_u64(&mut buf, 72, meta.next_page_id);
+    write_u64(&mut buf, 80, meta.free_page_head.unwrap_or(0));
     let checksum = page_checksum(&buf, 16);
     write_u32(&mut buf, 16, checksum);
     buf
@@ -11778,9 +12061,9 @@ fn decode_index_meta(buf: &[u8]) -> Result<IndexMeta, QueryError> {
         ));
     }
     Ok(IndexMeta {
-        root_page: read_u64(buf, 32),
-        next_page_id: read_u64(buf, 40),
-        free_page_head: match read_u64(buf, 48) {
+        root_page: read_u64(buf, 64),
+        next_page_id: read_u64(buf, 72),
+        free_page_head: match read_u64(buf, 80) {
             0 => None,
             page_id => Some(page_id),
         },
@@ -14765,7 +15048,7 @@ fn try_reposition_raw_leaf(
     if old_pos < new_pos {
         new_pos -= 1;
     }
-    if !may_change_first && (old_pos == 0 || new_pos == 0) {
+    if !may_change_first && new_pos == 0 && (old_pos != 0 || new_entry < old_entry) {
         return Ok(None);
     }
     let Some(encoded) = encode_leaf_entry_for_layout(
@@ -14962,7 +15245,7 @@ fn try_move_between_raw_leaves(
             Err(pos) => pos,
         }
     };
-    if (!old_may_change_first && old_pos == 0) || (!new_may_change_first && new_pos == 0) {
+    if !new_may_change_first && new_pos == 0 {
         return Ok(None);
     }
     let Some(encoded) = encode_leaf_entry_for_layout(
@@ -18298,6 +18581,301 @@ enum ReverseLeafSpan {
     /// `stop`; `terminal` means the low bound cuts inside this leaf
     /// and the scan finishes there.
     Span { stop: usize, terminal: bool },
+}
+
+#[cfg(test)]
+mod logged_delete_batch_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Arc<IndexFile>) {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            crate::wal::LogManager::open(&dir.path().join("wal")).unwrap(),
+        ));
+        let pool = BufferPool::new(
+            256,
+            log.clone(),
+            DurabilityMode::Strict,
+            Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+        );
+        let file = Arc::new(
+            IndexFile::open_with_durability(
+                dir.path().join("delete.idx"),
+                log,
+                DurabilityMode::Strict,
+                pool,
+            )
+            .unwrap(),
+        );
+        (dir, file)
+    }
+
+    #[test]
+    fn logged_delete_batch_can_share_unchanged_topology() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..100u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(i64::from(n))]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let deletes = [10usize, 70].map(|n| IndexBatchEntry {
+            kind: WalIndexOpKind::Delete,
+            key: entries[n].key.clone(),
+            row_id: entries[n].row_id,
+        });
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &deletes)
+            .unwrap()
+            .unwrap();
+        let topology = file.structure_lock.read();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_file = Arc::clone(&file);
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_file.apply_batch_with_lsn(7, deletes.into(), Some(lsn)))
+                .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_millis(200));
+        drop(topology);
+        worker.join().unwrap();
+        result
+            .expect("leaf-only deletion must not wait for a topology reader")
+            .unwrap();
+        for (n, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                file.get_unique_one(&entry.key).unwrap(),
+                (![10, 70].contains(&n)).then_some(entry.row_id)
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_update_can_raise_a_nonroot_minimum_without_changing_topology() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..4000u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(i64::from(n) * 4)]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let first = file.read_leaf(file.leftmost_leaf().unwrap()).unwrap();
+        let leaf_id = first.next_leaf.unwrap();
+        let leaf = file.read_leaf(leaf_id).unwrap();
+        let old = leaf.entries[0].clone();
+        let [KeyPart::Int(value)] = old.key.0.as_slice() else {
+            panic!("integer fixture");
+        };
+        let new = IndexEntry {
+            key: IndexKey::from(vec![KeyPart::Int(value + 1)]),
+            row_id: old.row_id,
+        };
+        let changes = [
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Delete,
+                key: old.key.clone(),
+                row_id: old.row_id,
+            },
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Insert,
+                key: new.key.clone(),
+                row_id: new.row_id,
+            },
+        ];
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &changes)
+            .unwrap()
+            .unwrap();
+        assert!(
+            file.try_apply_two_op_update_batch_fast(7, &changes, Some(lsn))
+                .unwrap(),
+            "raising a leaf minimum preserves its parent lower bound"
+        );
+        file.buffer_pool.flush_and_evict_all().unwrap();
+        assert!(file.get(&old.key, false).unwrap().is_empty());
+        assert_eq!(file.get(&new.key, false).unwrap(), vec![old.row_id]);
+        let replacement_row = RowId {
+            page_id: 2,
+            slot_id: 1,
+        };
+        file.insert_with_txn(8, old.key.clone(), replacement_row)
+            .unwrap();
+        assert_eq!(file.get(&old.key, false).unwrap(), vec![replacement_row]);
+        let all = file.entries().unwrap();
+        assert_eq!(all.len(), entries.len() + 1);
+        assert!(all.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn cross_leaf_nullable_update_can_remove_the_source_minimum() {
+        let (_dir, file) = fixture();
+        let mut entries: Vec<_> = (0..4u16)
+            .flat_map(|group| {
+                (0..600u16).map(move |n| IndexEntry {
+                    key: IndexKey::from(vec![
+                        KeyPart::Int(1),
+                        KeyPart::Int(1),
+                        if group == 0 {
+                            KeyPart::Null
+                        } else {
+                            KeyPart::Int(i64::from(group))
+                        },
+                        KeyPart::Int(i64::from(n) * 4),
+                    ]),
+                    row_id: RowId {
+                        page_id: 1,
+                        slot_id: group * 600 + n,
+                    },
+                })
+            })
+            .collect();
+        entries.sort_unstable();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let first = file.read_leaf(file.leftmost_leaf().unwrap()).unwrap();
+        let source_id = first.next_leaf.unwrap();
+        let source = file.read_leaf(source_id).unwrap();
+        let old = source.entries[0].clone();
+        assert_eq!(old.key.0[2], KeyPart::Null);
+        let KeyPart::Int(order) = old.key.0[3] else {
+            panic!("integer order");
+        };
+        let new = IndexEntry {
+            key: IndexKey::from(vec![
+                KeyPart::Int(1),
+                KeyPart::Int(1),
+                KeyPart::Int(2),
+                KeyPart::Int(order + 1),
+            ]),
+            row_id: old.row_id,
+        };
+        let destination_id = file
+            .find_leaf_for_entry_with_candidate(&new, &new)
+            .unwrap()
+            .0
+            .frame
+            .key
+            .page_id;
+        assert_ne!(source_id, destination_id);
+        // Bulk construction can fill the destination completely. Make room
+        // through the ordinary delete path so this tests the separator rule,
+        // while leaving overflow/underflow on the structural oracle.
+        let destination = file.read_leaf(destination_id).unwrap();
+        let removed_destination = destination.entries[destination.entries.len() / 2].clone();
+        file.delete_deferred(
+            8,
+            removed_destination.key.clone(),
+            removed_destination.row_id,
+        )
+        .unwrap();
+        assert!(
+            encoded_leaf_page_len(&source) > INDEX_MIN_PAGE_BYTES + 128,
+            "source fixture must have deletion headroom: {}",
+            encoded_leaf_page_len(&source)
+        );
+        let changes = [
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Delete,
+                key: old.key.clone(),
+                row_id: old.row_id,
+            },
+            IndexBatchEntry {
+                kind: WalIndexOpKind::Insert,
+                key: new.key.clone(),
+                row_id: new.row_id,
+            },
+        ];
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &changes)
+            .unwrap()
+            .unwrap();
+        assert!(
+            file.try_apply_two_op_update_batch_fast(7, &changes, Some(lsn))
+                .unwrap(),
+            "a non-underflowing source can retain a conservative separator"
+        );
+        file.buffer_pool.flush_and_evict_all().unwrap();
+        assert!(file.get(&old.key, false).unwrap().is_empty());
+        assert_eq!(file.get(&new.key, false).unwrap(), vec![old.row_id]);
+        let mut expected: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry != &old && entry != &removed_destination)
+            .map(|entry| (entry.key, entry.row_id))
+            .collect();
+        expected.push((new.key, new.row_id));
+        expected.sort_unstable();
+        assert_eq!(file.entries().unwrap(), expected);
+    }
+
+    #[test]
+    fn logged_delete_batch_preserves_composite_keys_through_merges_and_root_collapse() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..1000u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![
+                    KeyPart::Int(i64::from(n)),
+                    KeyPart::Null,
+                    KeyPart::Bytes(vec![n as u8; 20 + usize::from(n % 130)]),
+                ]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        assert_ne!(
+            file.root_page.load(Ordering::Acquire),
+            file.leftmost_leaf().unwrap()
+        );
+        let delete = |entry: &IndexEntry| IndexBatchEntry {
+            kind: WalIndexOpKind::Delete,
+            key: entry.key.clone(),
+            row_id: entry.row_id,
+        };
+        let mut deletes: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| n % 137 != 0)
+            .map(|(_, entry)| delete(entry))
+            .collect();
+        // Reapplying an already-deleted entry must remain idempotent after
+        // neighboring leaves have merged and their old route has disappeared.
+        deletes.push(delete(&entries[1]));
+        let lsn = file
+            .append_mixed_index_batch_wal(7, &deletes)
+            .unwrap()
+            .unwrap();
+        file.apply_batch_with_lsn(7, deletes, Some(lsn)).unwrap();
+        let survivors: Vec<_> = entries.iter().step_by(137).collect();
+        assert_eq!(
+            file.range(None, None, false).unwrap(),
+            survivors
+                .iter()
+                .map(|entry| entry.row_id)
+                .collect::<Vec<_>>()
+        );
+        let deletes: Vec<_> = survivors.into_iter().map(delete).collect();
+        let lsn = file
+            .append_mixed_index_batch_wal(8, &deletes)
+            .unwrap()
+            .unwrap();
+        file.apply_batch_with_lsn(8, deletes, Some(lsn)).unwrap();
+        assert!(file.range(None, None, false).unwrap().is_empty());
+        assert_eq!(file.active_mutations.load(Ordering::Acquire), 0);
+        assert_eq!(btree_logical_wal::current(), None);
+    }
 }
 
 #[cfg(test)]

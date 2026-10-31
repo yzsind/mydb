@@ -1853,7 +1853,11 @@ fn radix_sort_short_ascii_index_entries(entries: &mut [IndexEntry]) -> bool {
             }
         }
     }
-    true
+    // ASCII folding is only a candidate ordering: UCA punctuation weights
+    // and contractions can differ. Validate against the authoritative key
+    // comparator before bulk loading; the caller falls back to comparison
+    // sort when the candidate order is incompatible with this collation.
+    entries.windows(2).all(|pair| pair[0] <= pair[1])
 }
 
 #[test]
@@ -2564,21 +2568,43 @@ impl Database {
         if writes.is_empty() {
             return Ok(());
         }
-        // Whole-row WAL is eager. Publish older deferred logical patches and
-        // their undo twins first, preserving mutation order for crash undo.
-        self.publish_wal_before_eager_heap_write(txn_id)?;
-        self.with_heap_mut(table_id, |heap| {
-            for write in writes {
+        if writes.iter().all(|write| !write.header.is_deleted()) {
+            // Preserve one prefix publication and one heap-handle lookup for
+            // an ordinary UPDATE batch, including resizing/LOB rewrites.
+            self.publish_wal_before_eager_heap_write(txn_id)?;
+            return self.with_heap_mut(table_id, |heap| {
+                for write in writes {
+                    heap.write_mvcc_ext(
+                        txn_id,
+                        write.row_id,
+                        write.header,
+                        &write.values,
+                        &write.external,
+                    )?;
+                }
+                Ok(())
+            });
+        }
+        for write in writes {
+            if write.header.is_deleted()
+                && self.with_heap_mut(table_id, |heap| {
+                    heap.try_write_mvcc_tombstone(txn_id, write.row_id, write.header)
+                })?
+            {
+                continue;
+            }
+            self.publish_wal_before_eager_heap_write(txn_id)?;
+            self.with_heap_mut(table_id, |heap| {
                 heap.write_mvcc_ext(
                     txn_id,
                     write.row_id,
                     write.header,
                     &write.values,
                     &write.external,
-                )?;
-            }
-            Ok(())
-        })
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn insert_index_batches_deferred(
@@ -4196,6 +4222,9 @@ impl Database {
         direct: bool,
     ) -> Result<SortedIndexEntries, QueryError> {
         let mut sorter = IndexEntryExternalSorter::with_exact_run_bytes(scratch_bytes);
+        if !table.storage_ids().contains(&table.id) {
+            return sorter.finish_with_degree(self.data_dir(), degree);
+        }
         let key = IndexKey::from(vec![KeyPart::Null]);
         let cosine = index.is_some_and(|i| {
             i.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine

@@ -129,5 +129,40 @@ pub fn run() -> Vec<ExpressionSample> {
             black_box(predicate.eval_predicate_bitmap(black_box(&batch)).unwrap());
         }));
     }
+    let schema = Arc::new(BatchSchema::new(vec![BatchField {
+        table: "t".into(),
+        alias: None,
+        name: "s".into(),
+        column_type: ColumnType::VarString,
+        source: Default::default(),
+    }]));
+    let input = batch_schema_to_input(&schema);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(
+            (0..513)
+                .map(|i| {
+                    if i % 19 == 0 {
+                        Value::Null
+                    } else {
+                        Value::String(format!("中文 aß row {i}"))
+                    }
+                })
+                .collect(),
+        )],
+    );
+    for (name, sql) in [
+        ("md5_column", "MD5(s)"),
+        ("sha256_column", "SHA2(s,256)"),
+        ("nested_hash_column", "SHA2(REVERSE(s),512)"),
+        ("unicode_column", "CHAR_LENGTH(UPPER(s))"),
+        ("hex_column", "HEX(s)"),
+        ("length_column", "LENGTH(s)"),
+    ] {
+        let program = ExprCompiler::compile(&expression(sql), &input).unwrap();
+        results.push(measure(name, 513, || {
+            black_box(eval_value_per_row(black_box(&program), black_box(&batch)).unwrap());
+        }));
+    }
     results
 }

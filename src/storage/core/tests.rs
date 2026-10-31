@@ -879,6 +879,9 @@ fn private_added_index_keeps_identity_after_cold_open() {
     candidate.indexes.push(added.clone());
     let shadow = 100000;
     db.register_reorg_storage_definition(&[shadow], &candidate);
+    let path = db.table_path(shadow);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, encode_heap_meta(&path, 1)).unwrap();
     db.set_cached_heap_codec(shadow, candidate.row_codec.clone())
         .unwrap();
     let txn = db.begin_txn().unwrap();
@@ -4067,8 +4070,8 @@ fn analyze_table_stats_survive_reopen() {
 }
 
 #[test]
-fn wide_table_stats_above_12k_survive_reopen_via_dd_lob() {
-    use crate::storage::data_dictionary::{DD_STATS_JSON_CAP_BYTES, DD_TABLE_STATS};
+fn wide_table_stats_survive_reopen_as_independent_objects() {
+    use crate::storage::data_dictionary::DD_COLUMN_STATS;
 
     const COLUMN_COUNT: usize = 160;
     let dir = tempfile::tempdir().unwrap();
@@ -4109,20 +4112,19 @@ fn wide_table_stats_above_12k_survive_reopen_via_dd_lob() {
 
         let table_id = db.table("test.wide_stats").unwrap().id;
         let persisted = db
-            .scan_dd_table(DD_TABLE_STATS)
+            .scan_dd_table(DD_COLUMN_STATS)
             .unwrap()
             .into_iter()
             .find(|row| row.first() == Some(&Value::UInt(table_id)))
             .expect("wide table stats row should be present");
-        let Value::String(stats_json) = &persisted[2] else {
-            panic!("stats_json should decode from the externalized DD value");
+        let Value::Bytes(payload) = &persisted[7] else {
+            panic!("column stats should use typed binary payloads");
         };
-        assert!(
-            stats_json.len() > 12 * 1024,
-            "fixture must cross the former persistence limit; got {} bytes",
-            stats_json.len()
+        assert!(payload.starts_with(b"MST\x01"));
+        assert_eq!(
+            db.scan_dd_table(DD_COLUMN_STATS).unwrap().len(),
+            COLUMN_COUNT
         );
-        assert!(stats_json.len() <= DD_STATS_JSON_CAP_BYTES);
     }
 
     let db = open_relaxed_test_db(dir.path());
@@ -5086,12 +5088,12 @@ fn alter_copy_generation_intent_rolls_back_uncommitted_swap_on_restart() {
         db.remove_heap_cache_entry(shadow_id).unwrap();
         for (live, backup) in &old_to_backup {
             if live.exists() {
-                std::fs::rename(live, backup).unwrap();
+                rename_owned_file(live, backup).unwrap();
             }
         }
         for (_, live) in &shadow_to_live {
             std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-            std::fs::write(live, []).unwrap();
+            std::fs::write(live, create_empty_heap_image(live, Vec::new())).unwrap();
         }
         let old_path = old_to_backup[0].0.clone();
         let new_path = shadow_to_live[0].1.clone();
@@ -5136,13 +5138,13 @@ fn alter_copy_generation_intent_rolls_forward_committed_swap_on_restart() {
         db.remove_heap_cache_entry(shadow_id).unwrap();
         for (live, backup) in &old_to_backup {
             if live.exists() {
-                std::fs::rename(live, backup).unwrap();
+                rename_owned_file(live, backup).unwrap();
             }
         }
         for (shadow, live) in &shadow_to_live {
             std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
             std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-            std::fs::write(shadow, []).unwrap();
+            std::fs::write(shadow, create_empty_heap_image(shadow, Vec::new())).unwrap();
             let _ = std::fs::remove_file(live);
         }
         {
@@ -5605,7 +5607,7 @@ fn cached_index_decode_revalidates_replaced_page_epoch() {
     // The first decode caches validation for this frame epoch. Replacing the
     // image must invalidate that marker; otherwise the new fast path could
     // decode a structurally plausible page whose CRC no longer matches.
-    let mut corrupted = encoded;
+    let mut corrupted = pool.read_raw_page(key.clone()).unwrap();
     corrupted[PAGE_SIZE - 1] ^= 0x80;
     pool.store_page(key.clone(), corrupted, 2).unwrap();
     let err = pool
@@ -5621,6 +5623,7 @@ fn cached_index_decode_revalidates_replaced_page_epoch() {
 #[test]
 fn buffer_pool_prefetch_run_batches_contiguous_pages() {
     let dir = tempfile::tempdir().unwrap();
+    crate::storage::control::Control::admit(dir.path()).unwrap();
     let path = t_path(dir.path(), "batch", 1, "heap");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = File::create(&path).unwrap();
@@ -5659,6 +5662,7 @@ fn buffer_pool_prefetch_run_batches_contiguous_pages() {
 #[test]
 fn buffer_pool_cold_queue_recycles_before_clock_scan() {
     let dir = tempfile::tempdir().unwrap();
+    crate::storage::control::Control::admit(dir.path()).unwrap();
     let path = t_path(dir.path(), "cold", 2, "heap");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = File::create(&path).unwrap();
@@ -10122,8 +10126,8 @@ fn combined_undo_publication_preserves_commits_and_rollbacks() {
             row.values[0]
         );
     }
-    assert!(db.undo_publish.pending.lock().is_empty());
-    assert!(!db.undo_publish.combining.load(Ordering::SeqCst));
+    drop(db.undo.read());
+    assert_eq!(db.undo.pending_count(), 0);
     db.check_consistency().unwrap();
 }
 
@@ -13113,8 +13117,10 @@ fn heap_page_checksum_detects_corruption_on_open() {
     let heap_path = dir.path().join("1.heap");
     {
         let mut file = OpenOptions::new().write(true).open(&heap_path).unwrap();
-        file.seek(SeekFrom::Start((PAGE_HEADER_SIZE + SLOT_SIZE + 1) as u64))
-            .unwrap();
+        file.seek(SeekFrom::Start(
+            (PAGE_SIZE + PAGE_HEADER_SIZE + SLOT_SIZE + 1) as u64,
+        ))
+        .unwrap();
         file.write_all(&[0x5a]).unwrap();
         file.sync_data().unwrap();
     }
@@ -13237,9 +13243,10 @@ fn off_startup_validation_skips_heap_page_lsn_check_until_read() {
             .open(&heap_path)
             .unwrap();
         let mut page = vec![0; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
         file.read_exact(&mut page).unwrap();
         page[PAGE_HEADER_SIZE + SLOT_SIZE + 1] ^= 0x5a;
-        file.seek(SeekFrom::Start(0)).unwrap();
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
         file.write_all(&page).unwrap();
         file.sync_data().unwrap();
     }
@@ -13844,7 +13851,7 @@ fn dd_object_shards_commit_independent_tables_concurrently() {
 }
 
 #[test]
-fn analyze_replaces_only_one_table_stats_row() {
+fn analyze_updates_only_its_table_revision_and_changed_statistics_objects() {
     use crate::storage::data_dictionary::{
         DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE, DD_TABLES, DD_TABLE_STATS,
     };
@@ -13874,17 +13881,24 @@ fn analyze_replaces_only_one_table_stats_row() {
         vec![],
     )
     .unwrap();
-    let structural_before = [DD_TABLES, DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE]
-        .map(|id| db.scan_dd_table(id).unwrap());
+    let mut table_rows = db.scan_dd_table(DD_TABLES).unwrap();
+    let structural_before =
+        [DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE].map(|id| db.scan_dd_table(id).unwrap());
     let mutations_before = db.catalog_store_stats().2;
     db.analyze_table("test.t").unwrap();
     let mutations = db.catalog_store_stats().2 - mutations_before;
     assert_eq!(
-        mutations, 2,
-        "one current stats row is deleted and inserted"
+        mutations, 6,
+        "table/root revisions are replaced and column/index objects inserted"
     );
     assert_eq!(db.scan_dd_table(DD_TABLE_STATS).unwrap().len(), 1);
-    for (id, before) in [DD_TABLES, DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE]
+    for row in &mut table_rows {
+        if let Value::UInt(version) = &mut row[10] {
+            *version += 1;
+        }
+    }
+    assert_eq!(db.scan_dd_table(DD_TABLES).unwrap(), table_rows);
+    for (id, before) in [DD_COLUMNS, DD_INDEXES, DD_INDEX_COLUMN_USAGE]
         .into_iter()
         .zip(structural_before)
     {
@@ -14470,15 +14484,13 @@ fn assert_single_index_change_uses_logical_wal_without_page_fallback(db: &Databa
         after.index_page_payload_bytes,
         before.index_page_payload_bytes
     );
-    if db.durability_mode() == DurabilityMode::Strict {
-        assert_eq!(
-            after.page_fallback_records,
-            before.page_fallback_records + 1
-        );
-        assert!(after.heap_fpi_payload_bytes > before.heap_fpi_payload_bytes);
-    } else {
-        assert_eq!(after.page_fallback_records, before.page_fallback_records);
-    }
+    // The initial allocation logs the row-page baseline and the heap frontier.
+    // Index maintenance still adds no physical page payload.
+    assert_eq!(
+        after.page_fallback_records,
+        before.page_fallback_records + 2
+    );
+    assert!(after.heap_fpi_payload_bytes > before.heap_fpi_payload_bytes);
 }
 
 #[test]
@@ -15974,12 +15986,12 @@ fn validate_rejects_index_with_broken_leaf_chain() {
         }
     };
     // Read raw page, zero next_leaf in the leaf payload. Layout
-    // (after the 24-byte common header) v19 layout: 1B page_type,
+    // (after the 64-byte common header) v19 layout: 1B page_type,
     // 1B key_layout, 8B base_time, 8B next_leaf, 2B entry_count,
     // entries… (page_table_id removed in v19; entry_count u32 → u16.)
     let mut raw = read_index_page(&mut file, leaf_page_id).unwrap();
-    let payload_start = 24; // INDEX_HEADER_BYTES
-                            // skip page_type (1) + key_layout (1) + base_time (8)
+    let payload_start = INDEX_HEADER_BYTES;
+    // skip page_type (1) + key_layout (1) + base_time (8)
     let next_leaf_off = payload_start + 1 + 1 + 8;
     write_u64(&mut raw, next_leaf_off, 0);
     let new_checksum = page_checksum(&raw, 16);
@@ -20066,7 +20078,7 @@ fn reclaimed_slots_in_older_pages_take_new_rows_before_the_tail() {
         let victims: Vec<RowId> = row_ids
             .iter()
             .copied()
-            .filter(|id| id.page_id == 0)
+            .filter(|id| id.page_id == 1)
             .collect();
         assert!(!victims.is_empty());
         let txn = db.begin_txn().unwrap();
@@ -20087,8 +20099,8 @@ fn reclaimed_slots_in_older_pages_take_new_rows_before_the_tail() {
             db.commit_txn(txn.txn_id).unwrap();
         }
         assert!(
-            inserted.iter().all(|id| id.page_id == 0),
-            "new rows must reuse reclaimed page 0 slots: {inserted:?}"
+            inserted.iter().all(|id| id.page_id == 1),
+            "new rows must reuse reclaimed page 1 slots: {inserted:?}"
         );
         assert_eq!(
             db.heap_page_count(table.id),
@@ -23553,7 +23565,7 @@ fn m5_compression_mvcc_snapshot_rollback_delete_purge() {
 }
 
 #[test]
-fn m5_uncompressed_chain_is_v3_generation_layout_and_reads_back() {
+fn m5_uncompressed_chain_uses_current_generation_layout_and_reads_back() {
     // Compression off still writes overflow v3 without its compression flag; the head
     // persists the same allocation generation as LobRef. Verify raw head bytes directly.
     std::env::set_var("MYDB_LOB_INLINE_MAX", "4096");
@@ -23581,7 +23593,7 @@ fn m5_uncompressed_chain_is_v3_generation_layout_and_reads_back() {
         .row_column_external_ref(table_id, row_id, 1)
         .unwrap()
         .unwrap();
-    // Raw head version is 3 at OVFL_OFF_VERSION=4, little-endian u16;
+    // The head stores the current version at offset 4, little-endian u16;
     // flags at OVFL_OFF_FLAGS=22 contain HEAD only, not compression.
     let head = db
         .with_overflow_read(table_id, |ovf| {
@@ -23594,8 +23606,8 @@ fn m5_uncompressed_chain_is_v3_generation_layout_and_reads_back() {
     let flags = u16::from_le_bytes([head[22], head[23]]);
     let generation = u64::from_le_bytes(head[32..40].try_into().unwrap());
     assert_eq!(
-        version, 3,
-        "Uncompressed chains must use overflow v3 layout"
+        version, OVFL_VERSION,
+        "Uncompressed chains must use the registered overflow layout"
     );
     assert_eq!(generation, lob.generation);
     assert_eq!(
@@ -27076,6 +27088,7 @@ fn ddl_copy_swap_keeps_recovery_bases_until_commit() {
     for ((old, _), (private, _)) in old_paths.iter().zip(&private_paths) {
         if old.exists() {
             fs::create_dir_all(private.parent().unwrap()).unwrap();
+            transfer_page_owner(old, private).unwrap();
             fs::copy(old, private).unwrap();
         }
     }
@@ -27464,6 +27477,139 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
 }
 
 #[test]
+fn blackbox_fulltext_structural_recovery_rebuilds_from_heap() {
+    use crate::engine::{QueryResponse, StorageQueryEngine};
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let path;
+    {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO docs VALUES(1,'alpha beta'),(2,'alpha gamma'),(3,'delta')")
+            .unwrap();
+        let db = engine.database();
+        db.checkpoint().unwrap();
+        let table = db.table("docs").unwrap();
+        path = db.index_path_for_table_schema(&table, table.id, "ft");
+    }
+    // Recovery fences an incomplete structural redo with this durable marker.
+    // Unlike a corrupt posting payload, the index remains derived from the heap.
+    fs::write(path.with_extension("idx.failed"), b"").unwrap();
+    for _ in 0..2 {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        let QueryResponse::ResultSet(rs) = engine
+            .execute("SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha') ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        assert!(!path.with_extension("idx.failed").exists());
+    }
+}
+
+#[test]
+fn blackbox_generated_column_replication_preserves_rows_after_reopen() {
+    use crate::engine::{QueryResponse, StorageQueryEngine};
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let dest = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    for kind in ["STORED", "VIRTUAL"] {
+        let master_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let replica_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+        master
+            .execute("CREATE TABLE t(id INT PRIMARY KEY,a INT)")
+            .unwrap();
+        master
+            .execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)")
+            .unwrap();
+        let source = master.database_for_replication();
+        source.checkpoint().unwrap();
+        copy_tree(master_dir.path(), replica_dir.path());
+        let mut role = crate::repl::role::RoleState::new_standalone();
+        role.role = crate::repl::role::Role::Replica;
+        crate::repl::role::save(replica_dir.path(), &role).unwrap();
+        let start = source.wal_log().lock().next_lsn();
+        {
+            let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+            let target = replica.database_for_replication().clone();
+            master
+                .execute(&format!(
+                    "ALTER TABLE t ADD COLUMN g INT GENERATED ALWAYS AS (a*2) {kind}"
+                ))
+                .unwrap();
+            master.execute("INSERT INTO t(id,a) VALUES(4,40)").unwrap();
+            master.execute("UPDATE t SET a=21 WHERE id=2").unwrap();
+            let log = source.wal_log();
+            let safe = log.lock().next_lsn() - 1;
+            crate::wal::LogManager::sync_durable_to(&log, safe).unwrap();
+            let mut applier = crate::repl::replica::applier::Applier::with_database(
+                replica_dir.path(),
+                target.wal_log(),
+                target.clone(),
+                crate::repl::replica::progress::ReplicaProgress::default(),
+            );
+            let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+            while let Some(chunk) = reader.next_chunk(safe, 1 << 20).unwrap() {
+                applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+            }
+            let QueryResponse::ResultSet(rs) = replica
+                .execute("SELECT id,a,g FROM t ORDER BY id")
+                .unwrap()
+                .materialize()
+                .unwrap()
+            else {
+                panic!("rows")
+            };
+            assert_eq!(
+                rs.rows,
+                vec![
+                    vec![Value::Int(1), Value::Int(10), Value::Int(20)],
+                    vec![Value::Int(2), Value::Int(21), Value::Int(42)],
+                    vec![Value::Int(3), Value::Int(30), Value::Int(60)],
+                    vec![Value::Int(4), Value::Int(40), Value::Int(80)]
+                ],
+                "{kind}"
+            );
+            crate::wal::LogManager::sync_durable_to(&target.wal_log(), safe).unwrap();
+            target.flush_dirty_data().unwrap();
+        }
+        let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+        let QueryResponse::ResultSet(rs) = replica
+            .execute("SELECT id,a,g FROM t ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        let QueryResponse::ResultSet(expected) = master
+            .execute("SELECT id,a,g FROM t ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        assert_eq!(rs.rows, expected.rows, "{kind} after restart");
+    }
+}
+
+#[test]
 fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
     use crate::engine::api::QueryResponse;
     use crate::engine::api::SessionContext;
@@ -27787,3 +27933,986 @@ fn spatial_index_crash_recovery_at_every_split_publication_delete() {
 fn spatial_index_crash_recovery_at_every_split_publication_reuse() {
     check_spatial_index_split_crash_recovery(420, true, &["reuse"]);
 }
+
+#[test]
+fn release_format_rejects_lost_heap_and_dictionary_authority() {
+    for damage in ["missing", "truncated", "zero", "dictionary"] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let config = test_storage_config_with_validation(
+            DurabilityMode::Strict,
+            StartupValidationMode::Full,
+        );
+        let path;
+        {
+            let db = Database::open_with_config(dir.path(), config.clone()).unwrap();
+            create_checkpoint_test_table(&db);
+            insert_checkpoint_test_row(&db, 111);
+            db.checkpoint().unwrap();
+            path = db.table_path(db.table("test.t").unwrap().id);
+        }
+        match damage {
+            "missing" => fs::remove_file(&path).unwrap(),
+            "truncated" => fs::write(&path, []).unwrap(),
+            "zero" => {
+                fs::write(&path, vec![0; fs::metadata(&path).unwrap().len() as usize]).unwrap()
+            }
+            _ => {
+                fs::remove_dir_all(crate::storage::naming::system_catalog_dir(dir.path())).unwrap()
+            }
+        }
+        assert!(
+            Database::open_with_config(dir.path(), config).is_err(),
+            "accepted {damage}"
+        );
+    }
+}
+
+#[test]
+fn release_format_rejects_heap_owner_and_page_position_swaps() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let log = test_log(dir.path());
+    let first = dir.path().join("a.heap");
+    let second = dir.path().join("b.heap");
+    {
+        let a = HeapFile::open(first.clone(), 1, log.clone()).unwrap();
+        let b = HeapFile::open(second.clone(), 2, log.clone()).unwrap();
+        a.insert_mvcc(1, RowHeader::visible(1), &[Value::Int(111)])
+            .unwrap();
+        b.insert_mvcc(2, RowHeader::visible(2), &[Value::Int(222)])
+            .unwrap();
+        a.flush_dirty_pages().unwrap();
+        b.flush_dirty_pages().unwrap();
+    }
+    let a = fs::read(&first).unwrap();
+    let b = fs::read(&second).unwrap();
+    fs::write(&first, &b).unwrap();
+    fs::write(&second, &a).unwrap();
+    assert!(HeapFile::open(first.clone(), 1, log.clone()).is_err());
+    fs::write(&first, &a).unwrap();
+    let mut bytes = a;
+    bytes[PAGE_SIZE + 56..PAGE_SIZE + 64].copy_from_slice(&2u64.to_le_bytes());
+    let checksum = page_checksum(&bytes[PAGE_SIZE..2 * PAGE_SIZE], 16);
+    write_u32(&mut bytes[PAGE_SIZE..2 * PAGE_SIZE], 16, checksum);
+    fs::write(&first, bytes).unwrap();
+    let heap = HeapFile::open(first, 1, log).unwrap();
+    assert!(heap.scan_mvcc().is_err());
+}
+
+#[test]
+fn release_format_golden_page_and_value_corpus() {
+    use crate::storage::format_golden::golden;
+    let page = |mut bytes: Vec<u8>, id| {
+        stamp_page_owner(&mut bytes, &[0xa5; 16], id);
+        set_page_lsn_if_formatted(&mut bytes, 17);
+        bytes
+    };
+    golden!(
+        "heap-meta",
+        &page(encode_heap_meta(Path::new("fixture.heap"), 2), 0)
+    );
+    golden!("heap-page", &page(Page::new().encode(), 1));
+    golden!(
+        "index-meta",
+        &page(
+            encode_index_meta(&IndexMeta {
+                root_page: 1,
+                next_page_id: 2,
+                free_page_head: None
+            }),
+            0
+        )
+    );
+    let entry = IndexEntry {
+        key: IndexKey::from(vec![KeyPart::Int(-17), KeyPart::String("中".into())]),
+        row_id: RowId {
+            page_id: 1,
+            slot_id: 3,
+        },
+    };
+    let leaf = IndexPage::Leaf(IndexLeafPage::new_with_resolved_layout(vec![entry], None));
+    golden!(
+        "index-leaf",
+        &page(encode_index_tree_page(&leaf).unwrap(), 1)
+    );
+    golden!("lob-meta", &page(encode_overflow_meta_page(0, 2, 18), 0));
+    golden!(
+        "lob-page",
+        &page(
+            encode_overflow_page(OVFL_FLAG_HEAD, 0, 17, b"persistent payload"),
+            1
+        )
+    );
+    golden!(
+        "vector-meta",
+        &encode_vector_meta(&VectorMeta::fresh(4, 0, 16, 32, 200))
+    );
+    let mut state = Vec::new();
+    let mut writer = crate::engine::vector::persistence::Writer::new(&mut state, 7).unwrap();
+    writer.u64(17).unwrap();
+    writer.bytes(b"model").unwrap();
+    writer.finish().unwrap();
+    golden!("vector-state", &state);
+    let value = crate::vector::VectorValue::new(
+        crate::vector::VectorDataType::Float16,
+        3,
+        vec![0, 0x3c, 0, 0x38, 0, 0xc0],
+    );
+    golden!("vector-value", &value.encode());
+    assert_eq!(
+        crate::vector::VectorValue::decode(&value.encode()).unwrap(),
+        value
+    );
+    let mut values = Vec::new();
+    encode_row_into(
+        &[
+            Value::Null,
+            Value::Int(-17),
+            Value::UInt(u64::MAX),
+            Value::String("中\0".into()),
+            Value::Bytes(vec![0, 255]),
+            Value::Decimal("123456789012345678901234567890.01".into()),
+            Value::Date(0),
+            Value::Time(-1),
+            Value::DateTime(1),
+            Value::Timestamp(4_102_444_799_123_456),
+        ],
+        &mut values,
+    )
+    .unwrap();
+    golden!("row-values", &values);
+    let spec = row_codec_spec(
+        &DataTypeKind::Decimal {
+            precision: Some(65),
+            scale: Some(30),
+        },
+        false,
+    );
+    golden!("row-codec-spec", &serde_json::to_vec(&spec).unwrap());
+}
+
+#[test]
+fn release_format_shadow_capacity_rejection_preserves_file_extent() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let path = dir.path().join("capacity.heap");
+    let heap = HeapFile::open(path.clone(), 1, test_log(dir.path())).unwrap();
+    heap.page_count
+        .store(u64::from(u32::MAX) + 1, Ordering::Release);
+    let mut batch = ShadowPreparedHeapBatch {
+        encoded_pages: vec![0; PAGE_SIZE],
+        row_ids: vec![RowId {
+            page_id: 0,
+            slot_id: 0,
+        }],
+    };
+    assert!(heap
+        .reserve_prepared_shadow_batch_direct(&mut batch)
+        .is_err());
+    assert_eq!(fs::metadata(path).unwrap().len(), PAGE_SIZE as u64);
+}
+
+#[test]
+fn release_format_golden_all_index_layouts() {
+    let cases = vec![
+        vec![
+            vec![KeyPart::String("a".into())],
+            vec![KeyPart::String("中".into())],
+        ],
+        vec![vec![KeyPart::DateTime(17)], vec![KeyPart::DateTime(19)]],
+        vec![vec![KeyPart::Date(-17)], vec![KeyPart::Date(19)]],
+        vec![
+            vec![KeyPart::Decimal {
+                value: -17,
+                scale: 2,
+            }],
+            vec![KeyPart::Decimal {
+                value: 19,
+                scale: 2,
+            }],
+        ],
+        vec![
+            vec![KeyPart::Decimal {
+                value: -17,
+                scale: 2,
+            }],
+            vec![KeyPart::Decimal {
+                value: 1i128 << 40,
+                scale: 2,
+            }],
+        ],
+        vec![vec![KeyPart::Int(-17)], vec![KeyPart::Int(19)]],
+        vec![vec![KeyPart::Int(-17)], vec![KeyPart::Int(1 << 20)]],
+        vec![
+            vec![KeyPart::Int(-17), KeyPart::Int(2)],
+            vec![KeyPart::Int(19), KeyPart::Int(3)],
+        ],
+        vec![vec![KeyPart::UInt(17)], vec![KeyPart::UInt(19)]],
+        vec![vec![KeyPart::UInt(17)], vec![KeyPart::UInt(1 << 20)]],
+    ];
+    let mut corpus = Vec::new();
+    for (layout, keys) in cases.into_iter().enumerate() {
+        let entries = keys
+            .into_iter()
+            .enumerate()
+            .map(|(slot, key)| IndexEntry {
+                key: IndexKey::from(key),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: slot as u16,
+                },
+            })
+            .collect::<Vec<_>>();
+        let leaf = IndexLeafPage::new_with_resolved_layout(entries.clone(), Some(3));
+        let internal = IndexInternalPage::new_generic(entries.clone(), vec![3, 4, 5]);
+        assert_eq!(leaf.key_layout, layout as u8);
+        assert_eq!(internal.key_layout, layout as u8);
+        for page in [IndexPage::Leaf(leaf), IndexPage::Internal(internal)] {
+            let mut bytes = encode_index_tree_page(&page).unwrap();
+            stamp_page_owner(&mut bytes, &[0xa5; 16], 1);
+            set_page_lsn_if_formatted(&mut bytes, 17);
+            match decode_index_tree_page(&bytes).unwrap() {
+                IndexPage::Leaf(decoded) => assert_eq!(decoded.entries, entries),
+                IndexPage::Internal(decoded) => assert_eq!(decoded.keys, entries),
+                _ => panic!("unexpected free page"),
+            }
+            corpus.extend(bytes);
+        }
+    }
+    crate::storage::format_golden::golden!("index-layouts", &corpus);
+}
+
+#[test]
+fn release_format_golden_all_codec_descriptors() {
+    use crate::vector::VectorDataType;
+    let mut kinds = vec![
+        ColumnKind::Float32,
+        ColumnKind::Float64,
+        ColumnKind::Decimal { scale: 0 },
+        ColumnKind::Decimal { scale: 30 },
+        ColumnKind::DecimalWide { scale: 30 },
+        ColumnKind::VarString,
+        ColumnKind::VarBytes,
+        ColumnKind::Json,
+        ColumnKind::Geometry,
+        ColumnKind::Date,
+        ColumnKind::Year,
+    ];
+    for width in [1, 2, 3, 4, 8] {
+        for signed in [false, true] {
+            kinds.push(ColumnKind::Int { width, signed });
+        }
+    }
+    for width in [4, 8, 16] {
+        kinds.push(ColumnKind::DecimalFixed { width, scale: 2 });
+    }
+    for fsp in 0..=6 {
+        kinds.extend([
+            ColumnKind::Time { fsp },
+            ColumnKind::DateTime { fsp },
+            ColumnKind::Timestamp { fsp },
+        ]);
+    }
+    for datatype in [
+        VectorDataType::Float32,
+        VectorDataType::Float16,
+        VectorDataType::BFloat16,
+        VectorDataType::Int8,
+        VectorDataType::Binary,
+    ] {
+        kinds.push(ColumnKind::Vector {
+            dim: None,
+            datatype,
+        });
+        kinds.push(ColumnKind::Vector {
+            dim: Some(17),
+            datatype,
+        });
+        kinds.push(ColumnKind::VectorFixed { dim: 17, datatype });
+    }
+    for width in [0, 1, 255, 65535] {
+        kinds.push(ColumnKind::FixedBytes { width });
+    }
+    for width in 1..=8 {
+        kinds.push(ColumnKind::Bit { width });
+    }
+    for count in [1, 255, 256, 65535] {
+        kinds.push(ColumnKind::Enum {
+            values: (0..count).map(|i| format!("v{i}")).collect(),
+            width: enum_storage_width(count),
+        });
+    }
+    for count in [1, 8, 9, 16, 17, 24, 25, 32, 33, 64] {
+        kinds.push(ColumnKind::Set {
+            values: (0..count).map(|i| format!("v{i}")).collect(),
+            width: set_storage_width(count),
+        });
+    }
+    let specs = kinds
+        .into_iter()
+        .map(|kind| RowCodecSpec {
+            version: crate::storage::format_versions::ROW_CODEC_SPEC_VERSION,
+            kind,
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&specs).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<RowCodecSpec>>(&bytes).unwrap(),
+        specs
+    );
+    crate::storage::format_golden::golden!("row-codec-matrix", &bytes);
+}
+
+#[test]
+fn release_format_table_id_limit_cannot_enter_dictionary_namespace() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let before = db
+        .scan_dd_table(crate::storage::data_dictionary::DD_DD_PROPERTIES)
+        .unwrap();
+    db.catalog_write().unwrap().next_table_id = crate::storage::data_dictionary::DD_TABLE_ID_BASE;
+    let err = db
+        .create_table(
+            "exhausted",
+            vec![checkpoint_test_pk_column()],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap_err();
+    assert!(
+        err.message().contains("identity space exhausted"),
+        "{err:?}"
+    );
+    assert_eq!(
+        db.scan_dd_table(crate::storage::data_dictionary::DD_DD_PROPERTIES)
+            .unwrap(),
+        before
+    );
+    assert!(db.table("test.exhausted").is_err());
+}
+
+#[test]
+fn release_format_column_and_layout_limits_preserve_existing_identity() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    create_checkpoint_test_table(&db);
+    let mut table = db.table("test.t").unwrap().as_ref().clone();
+    table.next_column_id = u32::MAX;
+    assert!(table.allocate_column_id().is_err());
+    assert_eq!(table.next_column_id, u32::MAX);
+    table.columns[0].physical_pos = u32::MAX;
+    assert!(table.next_physical_pos().is_err());
+    table.row_layouts[0].layout_id = u32::MAX;
+    table.active_layout_id = u32::MAX;
+    table.columns[0].data_type = DataTypeKind::BigInt;
+    assert!(table.publish_new_row_layout().is_err());
+    assert_eq!(table.active_layout_id, u32::MAX);
+    assert_eq!(table.row_layouts.len(), 1);
+}
+
+#[test]
+fn buffered_partial_index_insert_recovers_and_rolls_back_across_leaf_boundaries() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+        db.create_table(
+            "partial_insert",
+            vec![
+                concurrent_index_test_column("id", true),
+                concurrent_index_test_column("v", false),
+            ],
+            vec!["id".into()],
+            vec![crate::parser::IndexDef {
+                name: Some("v_idx".into()),
+                columns: vec!["v".into()],
+                column_prefix_lengths: Vec::new(),
+                column_descending: Vec::new(),
+                key_expressions: Vec::new(),
+                key_expression_multi_valued: Vec::new(),
+                unique: false,
+                included_columns: Vec::new(),
+                index_type: "BTREE".into(),
+                visible: true,
+                comment: String::new(),
+                fulltext_parser: String::new(),
+                vector_options: None,
+            }],
+        )
+        .unwrap();
+        for batch in 0..3 {
+            let txn = db.begin_dml_txn().unwrap();
+            db.insert_rows(
+                txn,
+                "test.partial_insert",
+                (batch * 1000..(batch + 1) * 1000)
+                    .map(|id| vec![Value::Int(id), Value::Int(id % 17)])
+                    .collect(),
+            )
+            .unwrap();
+            if batch == 2 {
+                db.rollback_txn(txn.txn_id).unwrap();
+            } else {
+                db.commit_txn(txn.txn_id).unwrap();
+            }
+        }
+        db.check_consistency().unwrap();
+        db.buffer_pool.shutdown_flusher();
+    }
+    // Reopen without a checkpoint so the full logical batch must replay,
+    // including the prefix already applied before the structural fallback.
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let rows = db
+        .scan_rows(
+            "test.partial_insert",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    let mut actual: Vec<_> = rows.into_iter().map(|row| row.values).collect();
+    actual.sort_by_key(|row| match row[0] {
+        Value::Int(id) => id,
+        _ => unreachable!(),
+    });
+    assert_eq!(
+        actual,
+        (0..2000)
+            .map(|id| vec![Value::Int(id), Value::Int(id % 17)])
+            .collect::<Vec<_>>()
+    );
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn buffered_resident_heap_and_index_inserts_recover_and_rollback_together() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+        db.create_table(
+            "buffered_insert",
+            vec![
+                concurrent_index_test_column("id", true),
+                concurrent_index_test_column("v", false),
+            ],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let seed = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            seed,
+            "test.buffered_insert",
+            vec![vec![Value::Int(1), Value::Int(10)]],
+        )
+        .unwrap();
+        db.commit_txn(seed.txn_id).unwrap();
+        let committed = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            committed,
+            "test.buffered_insert",
+            vec![
+                vec![Value::Int(2), Value::Int(20)],
+                vec![Value::Int(3), Value::Int(30)],
+            ],
+        )
+        .unwrap();
+        {
+            let key = txn_wal_buffer_key(&db.log, committed.txn_id);
+            let shard = txn_wal_buffer_shard(key).lock();
+            let buffer = shard.get(&key).unwrap();
+            assert!(
+                buffer
+                    .entries
+                    .iter()
+                    .any(|(record, _)| matches!(record, WalPayload::HeapInsertBatch { .. })),
+                "resident heap insert must participate in the same deferred durability barrier"
+            );
+            assert!(
+                buffer
+                    .entries
+                    .iter()
+                    .any(|(record, _)| matches!(record, WalPayload::IndexBatch { .. })),
+                "fitting leaf inserts must retain their WAL-before-data pins until append"
+            );
+        }
+        db.commit_txn(committed.txn_id).unwrap();
+        let aborted = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            aborted,
+            "test.buffered_insert",
+            vec![vec![Value::Int(4), Value::Int(40)]],
+        )
+        .unwrap();
+        db.rollback_txn(aborted.txn_id).unwrap();
+        db.check_consistency().unwrap();
+        db.buffer_pool.shutdown_flusher();
+        // Plain Database drop simulates a crash rather than a checkpoint.
+    }
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let mut rows = db
+        .scan_rows(
+            "test.buffered_insert",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    rows.sort_by_key(|row| match row.values[0] {
+        Value::Int(id) => id,
+        _ => unreachable!(),
+    });
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+        ]
+    );
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn buffered_page_publication_fences_a_concurrent_wal_drain() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    db.create_table(
+        "publish_fence",
+        vec![concurrent_index_test_column("id", true)],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(seed, "test.publish_fence", vec![vec![Value::Int(1)]])
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let table = db.table("test.publish_fence").unwrap();
+    let (key, path) = {
+        let handle = db.heap_handle(table.id).unwrap();
+        let heap = handle.read();
+        (
+            heap.page_key(u64::from(ids[0].page_id)),
+            heap.relative_path(),
+        )
+    };
+    let txn = db.begin_dml_txn().unwrap();
+    let (entered, enter_wait) = std::sync::mpsc::channel();
+    let (resume, resume_wait) = std::sync::mpsc::channel();
+    let published = Arc::new(AtomicBool::new(false));
+    let writer_db = Arc::clone(&db);
+    let writer_published = Arc::clone(&published);
+    let writer = std::thread::spawn(move || {
+        let image_key = key.clone();
+        let result = try_buffer_txn_page_write(
+            &writer_db.log,
+            &writer_db.buffer_pool,
+            txn.txn_id,
+            WalPayload::HeapUpdateLogical {
+                path,
+                page_id: ids[0].page_id,
+                slot_id: ids[0].slot_id,
+                patches: Vec::new(),
+                undo_lsn: None,
+            },
+            vec![key],
+            |lsn| {
+                entered.send(()).unwrap();
+                resume_wait.recv().unwrap();
+                writer_db
+                    .buffer_pool
+                    .with_raw_page_mut(image_key, lsn, |_| Ok(()))?;
+                writer_published.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Ok(Ok(()))));
+    });
+    enter_wait.recv().unwrap();
+    let buffer_key = txn_wal_buffer_key(&db.log, txn.txn_id);
+    let fenced = txn_wal_buffer_shard(buffer_key).try_lock().is_none();
+    let drainer_db = Arc::clone(&db);
+    let drainer = std::thread::spawn(move || {
+        drainer_db.flush_txn_wal_buffer(txn.txn_id, None).unwrap();
+        assert!(
+            published.load(Ordering::Acquire),
+            "WAL drain finalized a page before publication"
+        );
+    });
+    resume.send(()).unwrap();
+    writer.join().unwrap();
+    drainer.join().unwrap();
+    assert!(
+        fenced,
+        "parallel WAL drain was not fenced during page publication"
+    );
+    assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 0);
+    db.commit_txn(txn.txn_id).unwrap();
+}
+
+#[test]
+fn deferred_wal_page_budget_releases_headroom_for_eager_progress() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let limit = db.buffer_pool.capacity_pages() / 8;
+    let reservation = db
+        .buffer_pool
+        .reserve_deferred_wal_pages(limit as usize)
+        .unwrap();
+    assert!(db.buffer_pool.reserve_deferred_wal_pages(1).is_none());
+    drop(reservation);
+    let replacement = db.buffer_pool.reserve_deferred_wal_pages(1).unwrap();
+    assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 1);
+    drop(replacement);
+    assert_eq!(db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn buffered_heap_update_recovery_preserves_whole_row_fences_under_pin_pressure() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let mut value = concurrent_index_test_column("v", false);
+    value.data_type = DataType::VarChar(Some(1000));
+    db.create_table(
+        "redo_order",
+        vec![concurrent_index_test_column("id", true), value],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let rows = db
+        .insert_rows(
+            seed,
+            "test.redo_order",
+            vec![vec![Value::Int(1), Value::String("s".repeat(512))]],
+        )
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    db.buffer_pool.shutdown_flusher();
+    let table = db.table("test.redo_order").unwrap();
+    let heap_path = db.heap_handle(table.id).unwrap().read().path.clone();
+    let txn = db.begin_dml_txn().unwrap();
+    db.update_row_by_id(txn, &table, rows[0], |_| {
+        Ok(vec![Value::Int(1), Value::String("m".repeat(510))])
+    })
+    .unwrap();
+    let used = db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire);
+    assert!(used > 0, "first variable-length update must be buffered");
+    let limit = db.buffer_pool.capacity_pages() / 8;
+    let pressure = db
+        .buffer_pool
+        .reserve_deferred_wal_pages((limit - used) as usize)
+        .unwrap();
+    db.update_row_by_id(txn, &table, rows[0], |_| {
+        Ok(vec![Value::Int(1), Value::String("z".repeat(508))])
+    })
+    .unwrap();
+    db.commit_txn(txn.txn_id).unwrap();
+    drop(pressure);
+    std::mem::forget(db);
+    // Force redo instead of accepting a dirty in-memory/disk after-image.
+    fs::remove_file(heap_path).unwrap();
+    let recovered = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let rows = recovered
+        .scan_rows(
+            "test.redo_order",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[1], Value::String("z".repeat(508)));
+    recovered.check_consistency().unwrap();
+}
+
+#[test]
+fn write_path_inline_string_update_uses_sparse_buffered_redo() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    db.create_table(
+        "inline_patch",
+        vec![
+            lob_col("id", DataType::Int, true),
+            lob_col("v", DataType::Text(65535), false),
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            seed,
+            "test.inline_patch",
+            vec![vec![Value::Int(1), Value::String("a".repeat(120))]],
+        )
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let reader = db.begin_txn().unwrap();
+    let writer = db.begin_dml_txn().unwrap();
+    db.update_row_by_id_with_changed_columns(
+        writer,
+        &db.table("test.inline_patch").unwrap(),
+        ids[0],
+        Some(&[1]),
+        |old| Ok(vec![old[0].clone(), Value::String("b".repeat(120))]),
+    )
+    .unwrap();
+    let key = txn_wal_buffer_key(&db.log, writer.txn_id);
+    let sparse = txn_wal_buffer_shard(key).lock().get(&key).unwrap().entries.iter().any(|(p, _)| matches!(p, WalPayload::HeapUpdateLogical { patches, .. } if patches.iter().any(|p| p.after.len() == 120)));
+    assert!(
+        sparse,
+        "an inline same-width string must use column redo instead of a full row"
+    );
+    assert_eq!(
+        db.scan_rows("test.inline_patch", reader).unwrap()[0].values[1],
+        Value::String("a".repeat(120))
+    );
+    db.rollback_txn(writer.txn_id).unwrap();
+    db.rollback_txn(reader.txn_id).unwrap();
+    assert_eq!(
+        db.scan_rows(
+            "test.inline_patch",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+        )
+        .unwrap()[0]
+            .values[1],
+        Value::String("a".repeat(120))
+    );
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn write_path_delete_buffers_header_and_index_redo() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    db.create_table(
+        "delete_patch",
+        vec![
+            lob_col("id", DataType::Int, true),
+            lob_col("v", DataType::Text(65535), false),
+        ],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            seed,
+            "test.delete_patch",
+            (1..=16)
+                .map(|id| vec![Value::Int(id), Value::String("a".repeat(120))])
+                .collect(),
+        )
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let reader = db.begin_txn().unwrap();
+    let writer = db.begin_dml_txn().unwrap();
+    db.delete_row_by_id(writer, &db.table("test.delete_patch").unwrap(), ids[4])
+        .unwrap();
+    let undo_id = db.txns.read().undo_head(writer.txn_id).unwrap().unwrap();
+    let undo = db.load_undo_owned(undo_id).unwrap().unwrap();
+    assert!(matches!(undo.kind, UndoKind::DeleteHeader));
+    assert!(undo.before_values.is_none());
+    assert!(undo.before_external.is_empty());
+    let key = txn_wal_buffer_key(&db.log, writer.txn_id);
+    {
+        let shard = txn_wal_buffer_shard(key).lock();
+        let entries = &shard.get(&key).unwrap().entries;
+        assert!(entries.iter().any(|(p, _)| matches!(p, WalPayload::HeapUpdateLogical { patches, .. } if patches.iter().all(|p| p.after.len() <= 18))), "a tombstone must retain its payload and log only its header");
+        assert!(entries.iter().any(|(p, _)| matches!(p, WalPayload::IndexBatch { ops, .. } if ops.iter().all(|o| matches!(o.kind, WalIndexOpKind::Delete)))), "a fitting leaf deletion must share the transaction WAL buffer");
+    }
+    assert_eq!(db.scan_rows("test.delete_patch", reader).unwrap().len(), 16);
+    db.rollback_txn(writer.txn_id).unwrap();
+    db.rollback_txn(reader.txn_id).unwrap();
+    db.check_consistency().unwrap();
+}
+
+#[test]
+fn write_path_inline_patch_types_null_resize_and_recovery() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let cases = vec![
+        (
+            DataType::Char(Some(120)),
+            Value::String("a".repeat(120)),
+            Value::String("b".repeat(120)),
+        ),
+        (
+            DataType::VarChar(Some(8192)),
+            Value::String("你好".repeat(20)),
+            Value::String("世界".repeat(20)),
+        ),
+        (
+            DataType::Binary(Some(120)),
+            Value::Bytes(vec![0; 120]),
+            Value::Bytes(vec![255; 120]),
+        ),
+        (
+            DataType::VarBinary(Some(8192)),
+            Value::Bytes(vec![0; 120]),
+            Value::Bytes(vec![255; 120]),
+        ),
+        (
+            DataType::Decimal(None),
+            Value::Decimal("123".into()),
+            Value::Decimal("124".into()),
+        ),
+        (
+            DataType::Decimal(Some((65, 10))),
+            Value::Decimal("123456789012345678901234567890.12".into()),
+            Value::Decimal("223456789012345678901234567890.12".into()),
+        ),
+        (
+            DataType::Json,
+            Value::Json(crate::engine::json::parse_text(r#"{"a":1}"#, 1, "test").unwrap()),
+            Value::Json(crate::engine::json::parse_text(r#"{"a":2}"#, 1, "test").unwrap()),
+        ),
+    ];
+    for (case, (kind, old_value, new_value)) in cases.into_iter().enumerate() {
+        let path = root.path().join(case.to_string());
+        let db = Database::open_with_durability(&path, DurabilityMode::Strict).unwrap();
+        db.create_table(
+            "t",
+            vec![
+                lob_col("id", DataType::Int, true),
+                lob_col("v", kind, false),
+            ],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let table = db.table("test.t").unwrap();
+        let seed = db.begin_dml_txn().unwrap();
+        let ids = db
+            .insert_rows(seed, "test.t", vec![vec![Value::Int(1), old_value]])
+            .unwrap();
+        db.commit_txn(seed.txn_id).unwrap();
+        let old = db
+            .scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+            )
+            .unwrap()[0]
+            .values
+            .clone();
+        let writer = db.begin_dml_txn().unwrap();
+        db.update_row_by_id_with_changed_columns(writer, &table, ids[0], Some(&[1]), |r| {
+            Ok(vec![r[0].clone(), new_value.clone()])
+        })
+        .unwrap();
+        let key = txn_wal_buffer_key(&db.log, writer.txn_id);
+        assert!(
+            txn_wal_buffer_shard(key)
+                .lock()
+                .get(&key)
+                .unwrap()
+                .entries
+                .iter()
+                .any(|(p, _)| matches!(p, WalPayload::HeapUpdateLogical { .. })),
+            "case {case} must use sparse redo"
+        );
+        let updated = db.scan_rows("test.t", writer).unwrap()[0].values.clone();
+        db.commit_txn(writer.txn_id).unwrap();
+        if matches!(case, 1 | 3) {
+            let reader = db.begin_txn().unwrap();
+            let resized = db.begin_dml_txn().unwrap();
+            let grown = if case == 1 {
+                Value::String("g".repeat(240))
+            } else {
+                Value::Bytes(vec![0xa5; 240])
+            };
+            db.update_row_by_id_with_changed_columns(resized, &table, ids[0], Some(&[1]), |r| {
+                Ok(vec![r[0].clone(), grown.clone()])
+            })
+            .unwrap();
+            assert_eq!(db.scan_rows("test.t", reader).unwrap()[0].values, updated);
+            assert_eq!(db.scan_rows("test.t", resized).unwrap()[0].values[1], grown);
+            db.rollback_txn(resized.txn_id).unwrap();
+            db.rollback_txn(reader.txn_id).unwrap();
+        }
+        let writer = db.begin_dml_txn().unwrap();
+        db.update_row_by_id_with_changed_columns(writer, &table, ids[0], Some(&[1]), |r| {
+            Ok(vec![r[0].clone(), Value::Null])
+        })
+        .unwrap();
+        assert_eq!(
+            db.scan_rows("test.t", writer).unwrap()[0].values[1],
+            Value::Null
+        );
+        db.rollback_txn(writer.txn_id).unwrap();
+        assert_ne!(old, updated);
+        db.buffer_pool.shutdown_flusher();
+        drop(db);
+        let db = Database::open_with_durability(&path, DurabilityMode::Strict).unwrap();
+        assert_eq!(
+            db.scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+            )
+            .unwrap()[0]
+                .values,
+            updated,
+            "case {case}"
+        );
+        db.check_consistency().unwrap();
+    }
+}
+
+#[test]
+fn write_path_lazy_begin_shares_commit_batch_and_precedes_eager_fallback() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    create_checkpoint_test_table(&db);
+    let table = db.table("test.t").unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(seed, "test.t", vec![vec![Value::Int(1)]])
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    for eager in [false, true] {
+        let txn = db.begin_txn().unwrap();
+        assert_eq!(
+            db.log.lock().last_txn_lsn(txn.txn_id),
+            0,
+            "BEGIN must not acquire the append latch"
+        );
+        if eager {
+            // Reserved-LSN writers must publish the deferred BEGIN before
+            // reserving their own row/page record, including structural DML.
+            let mut log = db.log.lock();
+            let reserved = log.reserve_txn_lsn(txn.txn_id).unwrap();
+            assert!(log.last_txn_lsn(txn.txn_id) < reserved);
+            assert_ne!(log.last_txn_lsn(txn.txn_id), 0);
+        }
+        db.delete_row_by_id(txn, &table, ids[0]).unwrap();
+        db.rollback_txn(txn.txn_id).unwrap();
+    }
+    let committed = db.begin_dml_txn().unwrap();
+    db.delete_row_by_id(committed, &table, ids[0]).unwrap();
+    db.commit_txn(committed.txn_id).unwrap();
+    db.buffer_pool.shutdown_flusher();
+    drop(db);
+    let scan = crate::wal::LogManager::scan(dir.path()).unwrap();
+    let records: Vec<_> = scan
+        .records
+        .iter()
+        .filter(|r| r.txn_id == committed.txn_id)
+        .collect();
+    assert!(matches!(
+        records.first().unwrap().payload,
+        WalPayload::BeginTxn { .. }
+    ));
+    assert!(matches!(
+        records.last().unwrap().payload,
+        WalPayload::CommitTxn { .. }
+    ));
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    assert!(db
+        .scan_rows(
+            "test.t",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+        )
+        .unwrap()
+        .is_empty());
+    db.check_consistency().unwrap();
+}
+
+include!("object_stats_tests.rs");

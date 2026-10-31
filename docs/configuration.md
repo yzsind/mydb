@@ -159,7 +159,9 @@ which suits differential verification or serves as a temporary escape hatch for
 plan cache failures; it does not affect SQL semantics.
 
 Automatic checkpoints are triggered by `MYDB_CHECKPOINT_INTERVAL_MS` or
-`MYDB_CHECKPOINT_WAL_BYTES` and use fuzzy semantics: they persist a fixed-size
+`MYDB_CHECKPOINT_WAL_BYTES`. Setting the interval to zero disables only the
+periodic time trigger; WAL-size and explicit checkpoints remain enabled.
+Automatic checkpoints use fuzzy semantics: they persist a fixed-size
 explicit `redo_lsn` recovery floor, reclaim only sealed WAL segments, and never
 rewrite a very small active segment. `ALTER SYSTEM CHECKPOINT` and a normal
 shutdown use a sharp checkpoint, flushing dirty pages in parallel and collapsing
@@ -483,6 +485,12 @@ depth/repartitioning, hot partition chunking, and memory rejection sources can b
 inspected with `SHOW ENGINE MYDB STATUS`. After a query completes, fails,
 or is canceled, operator charges should return to zero; temporary spill files are
 cleaned up by the query lifecycle.
+
+`temp_disk_reserve_pct` (`MYDB_TEMP_DISK_RESERVE_PCT`) defaults to `2` and
+accepts `0..=90`. Spill admission keeps that percentage of the filesystem's
+total capacity free.
+The global SQL variable `mydb_temp_disk_reserve_pct` changes the reserve at
+runtime. An explicit spill-byte limit remains subject to this free-space check.
 
 The stable boundaries for large results and protocol buffers are as follows:
 `MYDB_PACKET_WRITE_BUFFER_MAX_BYTES` defaults to 16 MiB; when exceeded it flushes
@@ -1159,7 +1167,8 @@ client stops reading, `net_write_timeout` bounds that wait; `KILL CONNECTION`
 can close immediately.
 
 - `SIGINT`, `SIGTERM`, SQL `SHUTDOWN`, and `RESTART` all perform a controlled
-  shutdown; `SIGHUP` does not trigger shutdown. If the final checkpoint fails, the
+  shutdown; `SIGHUP` logs that configuration reload is unsupported and does not
+  trigger shutdown. If the final checkpoint fails, the
   process exits non-zero and `RESTART` does not exec a new image. An SQL OK only
   means the shutdown request was accepted; the final on-disk outcome is
   determined by the process status and the logs.

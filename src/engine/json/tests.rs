@@ -598,7 +598,13 @@ fn planned_jsonb_encoding_matches_reference_at_length_boundaries() {
                     reference_encode(&node),
                     "size={size}, depth={depth}"
                 );
-                assert_eq!(to_serde(&actual).unwrap(), node);
+                if depth == 97 {
+                    assert!(to_serde(&actual)
+                        .unwrap_err()
+                        .is(crate::error::catalog::ER_JSON_DOCUMENT_TOO_DEEP));
+                } else {
+                    assert_eq!(to_serde(&actual).unwrap(), node);
+                }
             }
             node = if depth % 2 == 0 {
                 serde_json::json!([node])
@@ -649,4 +655,28 @@ fn jsonb_encoding_benchmark() {
             eprintln!("JSON_ENCODER bytes={bytes} depth={depth} round={round} old_ms={:.3} new_ms={:.3} speedup={:.3}", elapsed[0]*1000.0, elapsed[1]*1000.0, elapsed[0]/elapsed[1]);
         }
     }
+}
+
+#[test]
+fn audit1031_corrupt_jsonb_is_rejected_before_recursive_reads() {
+    let mut malformed = build_array(&[from_serde(&serde_json::Value::Null)]);
+    *malformed.last_mut().unwrap() = 255;
+    let node = JsonbRef::new(&malformed).unwrap();
+    assert!(node.validate().is_err());
+    assert!(node.to_serde().is_err());
+    assert!(super::mysql_binary::encode(&malformed).is_err());
+    let mut deep = from_serde(&serde_json::Value::Null);
+    for _ in 0..2000 {
+        deep = build_array(&[deep]);
+    }
+    let node = JsonbRef::new(&deep).unwrap();
+    assert!(node
+        .validate()
+        .unwrap_err()
+        .is(crate::error::catalog::ER_JSON_DOCUMENT_TOO_DEEP));
+    assert!(node.to_serde().is_err());
+    assert!(super::mysql_binary::encode(&deep).is_err());
+    let mut output = String::new();
+    node.write_text(&mut output);
+    assert_eq!(output, "null");
 }

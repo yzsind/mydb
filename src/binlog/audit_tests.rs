@@ -581,7 +581,7 @@ fn audit_none_preamble_rotate_has_no_checksum_tail() {
     let manager = BinlogSourceManager::open(dir.path().into(), config).unwrap();
     let file = manager.current_position().unwrap().file;
     for pos in [4, 100] {
-        let preamble = manager.dump_preamble(&file, pos);
+        let preamble = manager.dump_preamble(&file, pos, BinlogChecksum::None);
         assert_eq!(&preamble[0][27..], file.as_bytes());
         if pos > 4 {
             let fde = &preamble[1];
@@ -590,6 +590,28 @@ fn audit_none_preamble_rotate_has_no_checksum_tail() {
                 crc32fast::hash(&fde[..fde.len() - 4]),
                 u32::from_le_bytes(fde[fde.len() - 4..].try_into().unwrap())
             );
+        }
+    }
+}
+
+#[test]
+fn blackbox_fake_rotate_uses_negotiation_before_source_fde() {
+    let dir = directory();
+    let manager = BinlogSourceManager::open(dir.path().into(), test_config(dir.path())).unwrap();
+    let file = manager.current_position().unwrap().file;
+    for position in [4, 100] {
+        let plain = manager.dump_preamble(&file, position, BinlogChecksum::None);
+        let crc = manager.dump_preamble(&file, position, BinlogChecksum::Crc32);
+        assert_eq!(&plain[0][27..], file.as_bytes());
+        assert_eq!(&crc[0][27..crc[0].len() - 4], file.as_bytes());
+        assert_eq!(crc[0].len(), plain[0].len() + 4);
+        assert_eq!(
+            crc32fast::hash(&crc[0][..crc[0].len() - 4]),
+            u32::from_le_bytes(crc[0][crc[0].len() - 4..].try_into().unwrap())
+        );
+        if position > 4 {
+            assert_eq!(plain[1], crc[1]);
+            assert_eq!(plain[1][plain[1].len() - 5], 1);
         }
     }
 }

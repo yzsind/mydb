@@ -425,14 +425,18 @@ impl Database {
     /// together before a physical read.
     pub(crate) fn index_repair_activity(&self, table_id: u64, index_name: &str) -> (bool, u64) {
         let epoch = self.index_repair_rollback_epoch(table_id, index_name);
-        (self.has_pending_index_repairs_for(table_id, index_name), epoch)
+        (
+            self.has_pending_index_repairs_for(table_id, index_name),
+            epoch,
+        )
     }
 
     /// Moves whenever a rolled-back writer removes retired keys of this
     /// index scope. A physical read is only covered by a repair refresh
     /// taken after it when this value did not move across both.
     pub(crate) fn index_repair_rollback_epoch(&self, table_id: u64, index_name: &str) -> u64 {
-        self.index_repair_epochs.rollback_epoch(table_id, index_name)
+        self.index_repair_epochs
+            .rollback_epoch(table_id, index_name)
     }
 
     /// Writer state for an index-repair verdict. Repair writers are always
@@ -582,7 +586,9 @@ impl Database {
     pub(crate) fn index_page_all_visible(&self, page_max_trx_id: u64, view: TxnView) -> bool {
         // Offline rebuilds contain physical rows of surviving XA branches.
         // Their zero bulk-load bound cannot prove transaction visibility.
-        if self.xa_prepared_active.load(Ordering::Acquire)!=0{return false;}
+        if self.xa_prepared_active.load(Ordering::Acquire) != 0 {
+            return false;
+        }
         if view.historical {
             return page_max_trx_id == 0;
         }
@@ -721,6 +727,42 @@ impl Database {
         Ok(ids)
     }
 
+    /// Candidate RowIds for a batch of homogeneous equality/prefix probes.
+    /// Resolve deferred NULLs before entering the concrete-key batch reader;
+    /// the caller retains its ordinary heap visibility/residual-filter pass.
+    pub(crate) fn lookup_index_candidates_many(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        keys: &[IndexKey],
+        txn: TxnView,
+    ) -> Result<Vec<RowId>, QueryError> {
+        self.check_index_read_view(table, index, txn)?;
+        if table.is_partitioned() || txn.historical {
+            let mut ids = Vec::new();
+            for key in keys {
+                ids.extend(if key.0.len() >= index.columns.len() {
+                    self.lookup_index_visible(table, index, key.clone(), txn)?
+                } else {
+                    self.prefix_index_visible(table, index, key.clone(), txn)?
+                });
+            }
+            return Ok(ids);
+        }
+        let mut concrete = Vec::with_capacity(keys.len());
+        for key in keys {
+            let (key, unsatisfiable) = resolve_index_key(index, key.clone())?;
+            if !unsatisfiable {
+                concrete.push(key);
+            }
+        }
+        concrete.sort_unstable();
+        concrete.dedup();
+        let handle = self.cached_index_handle(table.id, &index.name)?;
+        let entries = self
+            .lookup_index_entries_many_visible_with_handle(&handle, table, index, &concrete, txn)?;
+        Ok(entries.into_iter().map(|(_, row)| row).collect())
+    }
 
     /// A unique point lookup must merge old keys before choosing a row.
     /// Version validation coordinates the repair snapshot and physical probe,
@@ -842,13 +884,12 @@ impl Database {
             // point read through the transaction directory.
             let recheck = txn.historical || version & 1 != 0;
             let repairs = if recheck {
-                let repair_key = repair_key.get_or_insert_with(|| {
-                    crate::storage::txn::IndexRepairKey {
+                let repair_key =
+                    repair_key.get_or_insert_with(|| crate::storage::txn::IndexRepairKey {
                         table_id: table.id,
                         index_name: normalize_name(&index.name),
                         key: key.clone(),
-                    }
-                });
+                    });
                 let candidates = self
                     .index_repair_state
                     .exact_candidates_for(repair_key, |writer| writer != txn.txn_id);
@@ -906,12 +947,7 @@ impl Database {
             return self.lookup_index(table, index, key);
         }
         if index.unique {
-            self.check_unique_key_reservation(
-                txn.txn_id,
-                table.id,
-                &index.name,
-                &key,
-            )?;
+            self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, &key)?;
         }
         let ids = self.lookup_index(table, index, key.clone())?;
         if !ids.is_empty() {
@@ -1005,16 +1041,10 @@ impl Database {
         // Write-path probe keys are concrete; unsatisfiable is always false.
         let (key, _) = resolve_index_key(index, key)?;
         if index.unique {
-            self.check_unique_key_reservation(
-                txn.txn_id,
-                table.id,
-                &index.name,
-                &key,
-            )?;
+            self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, &key)?;
         }
         self.lookup_index(&table, index, key).map(Some)
     }
-
 
     pub fn prefix_index(
         &self,
@@ -1169,8 +1199,6 @@ impl Database {
         Ok(ids)
     }
 
-
-
     fn key_index_entries_with_bound<const PREFIX: bool>(
         &self,
         table: &TableSchema,
@@ -1216,7 +1244,8 @@ impl Database {
         // A changed row can have its new physical key AND an old repair key
         // in this range. Deduplicating RowId first arbitrarily kept the new
         // key, which the later MVCC check rejected, losing the visible row.
-        let mut visible = self.filter_visible_index_entries_mask(table, index, entries, txn)?
+        let mut visible = self
+            .filter_visible_index_entries_mask(table, index, entries, txn)?
             .into_iter();
         entries.retain(|_| visible.next().expect("one visibility result per entry"));
         entries.sort_by_key(|entry| entry.1);
@@ -1283,8 +1312,6 @@ impl Database {
     ) -> Result<(Vec<(IndexKey, RowId)>, Option<u64>), QueryError> {
         self.visible_key_index_entries_with_bound::<false>(table, index, key, txn)
     }
-
-
 
     pub fn prefix_index_entries_visible(
         &self,
@@ -2417,9 +2444,9 @@ impl Database {
         if !self.index_repair_epochs.has_keys(table.id, &index.name) {
             return false;
         }
-        let candidates = self
-            .index_repair_state
-            .candidates(table.id, &index.name, low, high, |_| true);
+        let candidates =
+            self.index_repair_state
+                .candidates(table.id, &index.name, low, high, |_| true);
         if candidates.is_empty() {
             return false;
         }
@@ -2636,8 +2663,7 @@ impl Database {
                     high.clone(),
                     |chunk, page_max_trx_id| {
                         bound = page_max_trx_id;
-                        entries
-                            .extend(chunk.iter().map(|(key, row_id)| ((*key).clone(), *row_id)));
+                        entries.extend(chunk.iter().map(|(key, row_id)| ((*key).clone(), *row_id)));
                         Ok(())
                     },
                 )?;
@@ -2749,14 +2775,18 @@ impl Database {
                     low.clone(),
                     high.clone(),
                     |chunk| {
-                        entries
-                            .extend(chunk.iter().map(|(key, row_id)| ((*key).clone(), *row_id)));
+                        entries.extend(chunk.iter().map(|(key, row_id)| ((*key).clone(), *row_id)));
                         Ok(())
                     },
                 )?;
-                if repairs
-                    .merge_entries_once_per_row(self, table, index, leaf_id, &mut entries, epoch)?
-                {
+                if repairs.merge_entries_once_per_row(
+                    self,
+                    table,
+                    index,
+                    leaf_id,
+                    &mut entries,
+                    epoch,
+                )? {
                     break entries;
                 }
             };
@@ -3190,9 +3220,9 @@ impl Database {
             return Ok(());
         }
         if has_live_repairs && !txn.historical {
-            let candidates =
-                self.index_repair_state
-                    .exact_candidates(table.id, &index.name, key);
+            let candidates = self
+                .index_repair_state
+                .exact_candidates(table.id, &index.name, key);
             entries.extend(self.live_index_repair_entries(txn, candidates)?);
         }
         if txn.historical {
@@ -3272,7 +3302,10 @@ impl Database {
                         Some(KeyPart::Bytes(payload)) => payload.as_slice(),
                         _ => &[][..],
                     };
-                    let decoded = FtPayload::decode(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+                    let decoded = FtPayload::decode(
+                        payload,
+                        crate::storage::fulltext::payload::stored_positions(index),
+                    )?;
                     let local = (u64::from(row_id.page_id) << 16) | u64::from(row_id.slot_id);
                     let doc_id = ((storage_id & 0xffff) << 48) | (local & 0x0000_ffff_ffff_ffff);
                     rows.push(FulltextDiagnosticPosting {
@@ -3308,7 +3341,10 @@ impl Database {
         let mut scan_one = |sid: u64| -> Result<(), QueryError> {
             self.with_index_read(sid, &index.name, |index_file| {
                 index_file.fulltext_scan_token(token, |row_id, payload| {
-                    crate::storage::fulltext::payload::FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+                    crate::storage::fulltext::payload::FtPayload::decode_scoring_only(
+                        payload,
+                        crate::storage::fulltext::payload::stored_positions(index),
+                    )?;
                     out.push(row_id);
                     Ok(())
                 })
@@ -3369,8 +3405,11 @@ impl Database {
             self.with_index_read(sid, &index.name, |index_file| {
                 index_file.fulltext_scan_token(token, |row_id, payload| {
                     if want_positions {
-                        let (doc_len, tf, pos_start, pos_len) =
-                            FtPayload::decode_into_arena(payload, &mut batch.positions_arena, crate::storage::fulltext::payload::stored_positions(index))?;
+                        let (doc_len, tf, pos_start, pos_len) = FtPayload::decode_into_arena(
+                            payload,
+                            &mut batch.positions_arena,
+                            crate::storage::fulltext::payload::stored_positions(index),
+                        )?;
                         batch.postings.push(FtPosting {
                             row_id,
                             doc_len,
@@ -3379,7 +3418,10 @@ impl Database {
                             pos_len,
                         });
                     } else {
-                        let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+                        let (doc_len, tf) = FtPayload::decode_scoring_only(
+                            payload,
+                            crate::storage::fulltext::payload::stored_positions(index),
+                        )?;
                         batch.postings.push(FtPosting {
                             row_id,
                             doc_len,
@@ -3459,9 +3501,16 @@ impl Database {
                 _ => &[][..],
             };
             let (doc_len, tf, pos_start, pos_len) = if want_positions {
-                FtPayload::decode_into_arena(payload, &mut batch.positions_arena, crate::storage::fulltext::payload::stored_positions(index))?
+                FtPayload::decode_into_arena(
+                    payload,
+                    &mut batch.positions_arena,
+                    crate::storage::fulltext::payload::stored_positions(index),
+                )?
             } else {
-                let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+                let (doc_len, tf) = FtPayload::decode_scoring_only(
+                    payload,
+                    crate::storage::fulltext::payload::stored_positions(index),
+                )?;
                 (doc_len, tf, 0, 0)
             };
             batch.postings.push(FtPosting {
@@ -3515,7 +3564,10 @@ impl Database {
                             order.push(token.to_string());
                             by_token.entry(token.to_string()).or_default()
                         };
-                        let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+                        let (doc_len, tf) = FtPayload::decode_scoring_only(
+                            payload,
+                            crate::storage::fulltext::payload::stored_positions(index),
+                        )?;
                         batch.postings.push(FtPosting {
                             row_id,
                             doc_len,
@@ -3602,7 +3654,10 @@ impl Database {
                 order.push(token.clone());
                 by_token.entry(token).or_default()
             };
-            let (doc_len, tf) = FtPayload::decode_scoring_only(payload, crate::storage::fulltext::payload::stored_positions(index))?;
+            let (doc_len, tf) = FtPayload::decode_scoring_only(
+                payload,
+                crate::storage::fulltext::payload::stored_positions(index),
+            )?;
             batch.postings.push(FtPosting {
                 row_id,
                 doc_len,

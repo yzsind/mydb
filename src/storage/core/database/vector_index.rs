@@ -4562,7 +4562,7 @@ impl Database {
         #[cfg(test)]
         self.vector_persist_failpoint(3)
             .map_err(std::io::Error::other)?;
-        std::fs::rename(&tmp_path, &final_path)?;
+        rename_owned_file(&tmp_path, &final_path)?;
         #[cfg(test)]
         self.vector_persist_failpoint(4)
             .map_err(std::io::Error::other)?;

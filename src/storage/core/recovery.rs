@@ -1060,7 +1060,10 @@ fn plan_redo_file_partitions_with_context(
             // rows even when its new page zero already covers the reset LSN.
             // Discard that obsolete prefix in both serial and parallel redo.
             let starts_vector_image = header.record_type == T::VectorIndexImage
-                && matches!(records.record(idx)?.payload, WalPayload::VectorIndexImage { offset: 0, .. });
+                && matches!(
+                    records.record(idx)?.payload,
+                    WalPayload::VectorIndexImage { offset: 0, .. }
+                );
             if starts_vector_image || matches!(header.record_type, T::FileDelete | T::FileCreate) {
                 heap.remove(path.as_ref());
                 indexes.remove(path.as_ref());
@@ -1255,8 +1258,12 @@ fn apply_redo_record_inner(
             redo_vector_manifest(data_dir, path, bytes)?;
             state.redone_records += 1;
         }
-        WalPayload::VectorIndexImage { path, offset, total, bytes }
-            if should_redo_record(record, redoable, redo_cutoff) => {
+        WalPayload::VectorIndexImage {
+            path,
+            offset,
+            total,
+            bytes,
+        } if should_redo_record(record, redoable, redo_cutoff) => {
             redo_vector_image(data_dir, path, *offset, *total, bytes, record.lsn)?;
             state.redone_records += 1;
         }
@@ -1634,6 +1641,16 @@ pub(crate) fn write_recovered_file(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_err)?;
     }
+    if bytes.len() >= PAGE_SIZE && has_classic_identity(&bytes[..PAGE_SIZE]) {
+        let owner: [u8; 16] = bytes[40..56].try_into().unwrap();
+        if owner == [0; 16] {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "WAL file image has no owner identity",
+            ));
+        }
+        publish_page_owner(&path, &owner).map_err(io_err)?;
+    }
     fs::write(&path, bytes).map_err(io_err)?;
     note_recovery_write(data_dir, path)?;
     Ok(())
@@ -1660,6 +1677,15 @@ fn resize_recovered_file(
     let current = file.metadata().map_err(io_err)?.len();
     if !grow_only || current < target_len {
         file.set_len(target_len).map_err(io_err)?;
+        note_recovery_write(data_dir, path.clone())?;
+    }
+    if !grow_only && relative.ends_with(".heap") && target_len >= PAGE_SIZE as u64 {
+        let mut meta = vec![0; PAGE_SIZE];
+        read_exact_at_counted(&file, &mut meta, 0).map_err(io_err)?;
+        decode_heap_meta(&meta, &page_owner(&path))?;
+        write_u64(&mut meta, 24, target_len / PAGE_SIZE as u64);
+        refresh_page_checksum(&mut meta);
+        write_all_at(&file, &meta, 0).map_err(io_err)?;
         note_recovery_write(data_dir, path)?;
     }
     Ok(())
@@ -1701,6 +1727,7 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
             || !matches!(
                 read_u32(bytes, 0),
                 HEAP_PAGE_MAGIC
+                    | HEAP_META_MAGIC
                     | INDEX_PAGE_MAGIC
                     | INDEX_META_MAGIC
                     | OVFL_MAGIC
@@ -1876,15 +1903,18 @@ fn redo_page_update_with_context(
         let mut current = vec![0; PAGE_SIZE];
         file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
         file.read_exact(&mut current).map_err(io_err)?;
-        let valid_identity = recovery_page_valid(&current)
-            && zone_identity
-                .is_none_or(|identity| zone_map_page::View::open(&current, identity).is_ok());
+        let valid_identity =
+            validate_page_owner(&current, &page_owner(&data_dir.join(relative)), page_id).is_ok()
+                && recovery_page_valid(&current)
+                && zone_identity
+                    .is_none_or(|identity| zone_map_page::View::open(&current, identity).is_ok());
         if valid_identity && !context.must_redo(lsn) && page_lsn(&current) >= lsn {
             return Ok(());
         }
     }
     let mut page = after.to_vec();
     page.resize(PAGE_SIZE, 0);
+    stamp_page_owner(&mut page, &page_owner(&data_dir.join(relative)), page_id);
     set_page_lsn_if_formatted(&mut page, lsn);
     file.set_len(len.max(offset + PAGE_SIZE as u64))
         .map_err(io_err)?;
@@ -2178,6 +2208,7 @@ fn read_recovery_page(
     let mut buf = vec![0; PAGE_SIZE];
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     file.read_exact(&mut buf).map_err(io_err)?;
+    validate_page_owner(&buf, &page_owner(&data_dir.join(relative)), page_id)?;
     Ok(buf)
 }
 
@@ -3081,34 +3112,74 @@ mod round2_recovery_tests {
 /// Publish an immutable source image without re-stamping any embedded page LSN.
 /// The durable receipt prevents an old CREATE image from replacing later redo.
 pub(crate) fn redo_vector_image(
-    data_dir: &Path, relative: &str, offset: u64, total: u64, bytes: &[u8], lsn: u64,
+    data_dir: &Path,
+    relative: &str,
+    offset: u64,
+    total: u64,
+    bytes: &[u8],
+    lsn: u64,
 ) -> Result<(), QueryError> {
     let path = Path::new(relative);
-    if path.is_absolute() || path.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
         || !relative.starts_with("objects/indexes/")
-        || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("hvec" | "hnsw"))
-        || bytes.is_empty() || bytes.len() > 1024 * 1024
-        || offset.checked_add(bytes.len() as u64).is_none_or(|end| end > total) {
-        return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "invalid vector image publication"));
+        || !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("hvec" | "hnsw")
+        )
+        || bytes.is_empty()
+        || bytes.len() > 1024 * 1024
+        || offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > total)
+    {
+        return Err(error(
+            crate::error::catalog::ER_INDEX_CORRUPT,
+            "invalid vector image publication",
+        ));
     }
     let path = data_dir.join(path);
-    let receipt = path.with_extension(format!("{}.vpub", path.extension().unwrap().to_string_lossy()));
+    let receipt = path.with_extension(format!(
+        "{}.vpub",
+        path.extension().unwrap().to_string_lossy()
+    ));
     match fs::read(&receipt) {
         Ok(bytes) => {
-            if bytes.len() != 12 || crc32fast::hash(&bytes[..8]) != u32::from_le_bytes(bytes[8..].try_into().unwrap()) {
-                return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "invalid vector publication receipt"));
+            if bytes.len() != 12
+                || crc32fast::hash(&bytes[..8])
+                    != u32::from_le_bytes(bytes[8..].try_into().unwrap())
+            {
+                return Err(error(
+                    crate::error::catalog::ER_INDEX_CORRUPT,
+                    "invalid vector publication receipt",
+                ));
             }
-            if u64::from_le_bytes(bytes[..8].try_into().unwrap()) >= lsn { return Ok(()); }
+            if u64::from_le_bytes(bytes[..8].try_into().unwrap()) >= lsn {
+                return Ok(());
+            }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(io_err(err)),
     }
     let parent = path.parent().unwrap();
     fs::create_dir_all(parent).map_err(io_err)?;
-    let incoming = path.with_extension(format!("{}.incoming", path.extension().unwrap().to_string_lossy()));
-    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(offset == 0).open(&incoming).map_err(io_err)?;
+    let incoming = path.with_extension(format!(
+        "{}.incoming",
+        path.extension().unwrap().to_string_lossy()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(offset == 0)
+        .open(&incoming)
+        .map_err(io_err)?;
     if file.metadata().map_err(io_err)?.len() < offset {
-        return Err(error(crate::error::catalog::ER_INDEX_CORRUPT, "vector image chunk has no contiguous predecessor"));
+        return Err(error(
+            crate::error::catalog::ER_INDEX_CORRUPT,
+            "vector image chunk has no contiguous predecessor",
+        ));
     }
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     file.write_all(bytes).map_err(io_err)?;
@@ -3117,28 +3188,39 @@ pub(crate) fn redo_vector_image(
         crate::platform::fs::sync_standard_file_at(&file, &incoming).map_err(io_err)?;
         drop(file);
         invalidate_recovery_page_io(data_dir, relative);
-        fs::rename(&incoming, &path).map_err(io_err)?;
+        rename_owned_file(&incoming, &path).map_err(io_err)?;
         persist_vector_image_receipt(&path, lsn)?;
     }
     Ok(())
 }
 
 pub(crate) fn persist_vector_image_receipt(path: &Path, lsn: u64) -> Result<(), QueryError> {
-    let receipt = path.with_extension(format!("{}.vpub", path.extension().unwrap().to_string_lossy()));
+    let receipt = path.with_extension(format!(
+        "{}.vpub",
+        path.extension().unwrap().to_string_lossy()
+    ));
     let tmp = receipt.with_extension("vpub.tmp");
     let mut bytes = lsn.to_le_bytes().to_vec();
     bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
     let mut file = fs::File::create(&tmp).map_err(io_err)?;
     file.write_all(&bytes).map_err(io_err)?;
     crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
-    fs::rename(&tmp, &receipt).map_err(io_err)?;
+    rename_owned_file(&tmp, &receipt).map_err(io_err)?;
     crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }
 
-pub(crate) fn redo_vector_manifest(data_dir: &Path, relative: &str, bytes: &[u8]) -> Result<(), QueryError> {
+pub(crate) fn redo_vector_manifest(
+    data_dir: &Path,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<(), QueryError> {
     let path = Path::new(relative);
-    if !relative.starts_with("objects/indexes/") || path.extension().and_then(|e| e.to_str()) != Some("vmanifest")
-        || path.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+    if !relative.starts_with("objects/indexes/")
+        || path.extension().and_then(|e| e.to_str()) != Some("vmanifest")
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
         return Err(vector::persistence::corrupt());
     }
     let mut reader = vector::persistence::Reader::new(bytes, 7)?;
@@ -3147,10 +3229,13 @@ pub(crate) fn redo_vector_manifest(data_dir: &Path, relative: &str, bytes: &[u8]
     let path = data_dir.join(path);
     match fs::read(&path) {
         Ok(current) => {
-            let current = VectorGenerationManifest::decode(&current, storage_id, generation, index_id)?;
-            if current.source_lsn >= incoming.source_lsn { return Ok(()); }
+            let current =
+                VectorGenerationManifest::decode(&current, storage_id, generation, index_id)?;
+            if current.source_lsn >= incoming.source_lsn {
+                return Ok(());
+            }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(io_err(err)),
     }
     fs::create_dir_all(path.parent().unwrap()).map_err(io_err)?;
@@ -3158,6 +3243,6 @@ pub(crate) fn redo_vector_manifest(data_dir: &Path, relative: &str, bytes: &[u8]
     let mut file = fs::File::create(&tmp).map_err(io_err)?;
     file.write_all(bytes).map_err(io_err)?;
     crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
-    fs::rename(tmp, &path).map_err(io_err)?;
+    rename_owned_file(tmp, &path).map_err(io_err)?;
     crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)
 }

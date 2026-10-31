@@ -11,6 +11,52 @@ pub(crate) enum ConstraintValue {
     Concrete(Value),
     Param(usize),
 }
+
+/// Equality is an ordering constant only in the column's comparison domain.
+/// Numeric comparison of a character column can match several different
+/// strings; approximate comparison of a DECIMAL can likewise match a range.
+pub(crate) fn equality_fixes_order_value(
+    table: &TableSchema,
+    column: &str,
+    value: &ConstraintValue,
+) -> bool {
+    if matches!(value, ConstraintValue::Concrete(Value::Float(n)) if !n.is_finite())
+        || matches!(value, ConstraintValue::Concrete(Value::Double(n)) if !n.is_finite())
+    {
+        return false;
+    }
+    if matches!(value, ConstraintValue::Concrete(Value::Null)) {
+        return true;
+    }
+    let Ok(position) = table.column_index(column) else {
+        return false;
+    };
+    let column = &table.columns[position];
+    let target = ParamTarget::for_column_with_collation(
+        &column.data_type,
+        column.unsigned,
+        column.collation.as_deref(),
+    );
+    if matches!(target, ParamTarget::JsonScalar) {
+        return false;
+    }
+    if matches!(target, ParamTarget::Decimal { .. }) {
+        let approximate = match value {
+            ConstraintValue::Concrete(value) => matches!(value, Value::Float(_) | Value::Double(_)),
+            ConstraintValue::Param(index) => crate::engine::params::current_param(*index)
+                .is_none_or(|value| matches!(value, Value::Float(_) | Value::Double(_))),
+        };
+        if approximate {
+            return false;
+        }
+    }
+    let target = if matches!(target, ParamTarget::Bytes) {
+        ParamTarget::String
+    } else {
+        target
+    };
+    super::index_in_lookup_preserves_comparison(target, std::slice::from_ref(value))
+}
 impl ConstraintValue {
     pub(crate) fn try_into_key_part(self, target: ParamTarget) -> Option<KeyPart> {
         match self {
@@ -43,25 +89,7 @@ pub(crate) fn target_for_index_column(
     // can't be resolved keeps prepared-statement param binding
     // resilient even for unusual catalog states.
     if let Some(expr) = index.key_expression(pos) {
-        if let Some(Expr::Function { name, args, .. }) = expr.ast.as_ref() {
-            if (name.eq_ignore_ascii_case("CAST") || name.eq_ignore_ascii_case("CONVERT"))
-                && args.len() >= 2
-            {
-                if let Some(Expr::Literal(crate::parser::Literal::String(target))) = args.last() {
-                    let target = target.trim().to_ascii_uppercase();
-                    if target.starts_with("UNSIGNED") {
-                        return crate::storage::ParamTarget::UInt;
-                    }
-                    if target.starts_with("SIGNED") {
-                        return crate::storage::ParamTarget::Int;
-                    }
-                    if target.starts_with("JSON") {
-                        return crate::storage::ParamTarget::JsonScalar;
-                    }
-                }
-            }
-        }
-        return crate::storage::ParamTarget::for_column(&expr.data_type, false);
+        return crate::storage::schema::index_expression_param_target(expr);
     }
     let column_name = index.columns[pos].as_str();
     table

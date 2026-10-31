@@ -75,6 +75,7 @@ pub(crate) struct OnlineWalApplyContext {
 struct OnlineHeapRedoFile {
     file: File,
     len: u64,
+    owner: [u8; 16],
 }
 
 impl OnlineHeapRedoFiles {
@@ -117,8 +118,14 @@ impl OnlineHeapRedoFiles {
                 Err(err) => return Err(io_err(err)),
             };
             let len = file.metadata().map_err(io_err)?.len();
-            self.files
-                .insert(relative.to_string(), OnlineHeapRedoFile { file, len });
+            self.files.insert(
+                relative.to_string(),
+                OnlineHeapRedoFile {
+                    file,
+                    len,
+                    owner: page_owner_result(&path)?,
+                },
+            );
         }
         let entry = self
             .files
@@ -141,7 +148,8 @@ impl OnlineHeapRedoFiles {
         if entry.len >= end {
             entry.file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
             entry.file.read_exact(&mut bytes).map_err(io_err)?;
-            if page_lsn(&bytes) >= lsn {
+            validate_page_owner(&bytes, &entry.owner, page_id)?;
+            if page_lsn(&bytes) >= lsn && recovery_page_valid(&bytes) {
                 return Ok(());
             }
         }
@@ -151,7 +159,9 @@ impl OnlineHeapRedoFiles {
             return Ok(());
         }
         page.set_lsn(lsn);
-        let bytes = page.encode_into_owned();
+        let mut bytes = page.encode_into_owned();
+        stamp_page_owner(&mut bytes, &entry.owner, page_id);
+        refresh_page_checksum(&mut bytes);
         if entry.len < end {
             entry.file.set_len(end).map_err(io_err)?;
             entry.len = end;
@@ -214,7 +224,9 @@ impl Database {
         let lsn = record.lsn;
         let txn_id = record.txn_id;
         let _vector_write = match replica_payload_path(&record.payload) {
-            Some(path) if path.ends_with(".hvec") || path.ends_with(".vmanifest") => self.begin_vector_physical_redo(path)?,
+            Some(path) if path.ends_with(".hvec") || path.ends_with(".vmanifest") => {
+                self.begin_vector_physical_redo(path)?
+            }
             _ => None,
         };
         let _zone_operation = replica_payload_path(&record.payload)
@@ -519,7 +531,19 @@ impl Database {
                 self.note_dd_touch_if_needed(path, txn_id);
                 self.discard_heap_page_only(path, *page_id as u64)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
-                self.note_replicated_table_mutation(txn_id, path, 1, 0);
+                let live_delta = patches
+                    .iter()
+                    .find_map(|patch| {
+                        let offset = 1usize.checked_sub(patch.offset as usize)?;
+                        let before = *patch.before.get(offset)?;
+                        let after = *patch.after.get(offset)?;
+                        Some(
+                            i64::from(after & MVCC_FLAG_DELETED == 0)
+                                - i64::from(before & MVCC_FLAG_DELETED == 0),
+                        )
+                    })
+                    .unwrap_or(0);
+                self.note_replicated_table_mutation(txn_id, path, 1, live_delta);
             }
             WalPayload::HeapDelete {
                 path,
@@ -1267,23 +1291,24 @@ impl Database {
                     let Some(previous) = old_tables.iter().find(|old| old.id == table.id) else {
                         continue;
                     };
-                    if previous.stats.analyzed_at_unix_ms != table.stats.analyzed_at_unix_ms {
+                    if table.stats.analyze_revision < previous.stats.analyze_revision
+                        || (table.active_generation != previous.active_generation
+                            && table.stats.row_count == 0
+                            && table.stats.columns.is_empty())
+                    {
+                        self.drop_table_modification_delta(table.id);
+                        continue;
+                    }
+                    if previous.stats.analyze_revision != table.stats.analyze_revision {
                         // The DD row includes the baselines folded by the
                         // source ANALYZE. Replay only those subtractions;
                         // DML committed after its snapshot stays visible.
                         if let Some(counter) = self.table_live_row_deltas.read().get(&table.id) {
-                            let baseline = table.stats.last_analyze_live_baseline;
-                            let _ = counter.fetch_update(
+                            // The revision transition proves this source baseline has not
+                            // been folded before. Later DELETEs may have reversed the sign.
+                            counter.fetch_sub(
+                                table.stats.last_analyze_live_baseline,
                                 Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| {
-                                    let aligned = if baseline >= 0 {
-                                        baseline.min(current.max(0))
-                                    } else {
-                                        baseline.max(current.min(0))
-                                    };
-                                    Some(current.saturating_sub(aligned))
-                                },
                             );
                         }
                         if let Some(counter) = self.table_modification_deltas.read().get(&table.id)

@@ -148,15 +148,36 @@ fn validate_supported_index_type(index: &IndexSchema) -> Result<(), QueryError> 
     Ok(())
 }
 
-fn resolve_vector_config(columns: &[ColumnSchema], index: &mut IndexSchema) -> Result<(), QueryError> {
-    if !index.is_vector() { return Ok(()); }
+fn resolve_vector_config(
+    columns: &[ColumnSchema],
+    index: &mut IndexSchema,
+) -> Result<(), QueryError> {
+    if !index.is_vector() {
+        return Ok(());
+    }
     let algo = index.vector_algo();
     if index.vector.is_none() {
-        index.vector = crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, None, &index.comment)?;
+        index.vector = crate::storage::vector_config::VectorIndexConfig::from_options(
+            &index.index_type,
+            None,
+            &index.comment,
+        )?;
     }
-    if let Some(column) = index.columns.first().and_then(|name| columns.iter().find(|c|c.name.eq_ignore_ascii_case(name))) {
-        if let DataTypeKind::Vector {datatype,dim: Some(dimension)} = column.data_type {
-            index.vector.as_mut().unwrap().resolve(datatype,dimension,algo)?;
+    if let Some(column) = index
+        .columns
+        .first()
+        .and_then(|name| columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
+    {
+        if let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = column.data_type
+        {
+            index
+                .vector
+                .as_mut()
+                .unwrap()
+                .resolve(datatype, dimension, algo)?;
         }
     }
     Ok(())
@@ -187,7 +208,9 @@ fn validate_vector_index_column(
                         "a vector index requires a fixed dimension",
                     ));
                 }
-                if let Some(mut config)=index.vector.clone(){config.resolve(datatype,dim.unwrap(),index.vector_algo())?;}
+                if let Some(mut config) = index.vector.clone() {
+                    config.resolve(datatype, dim.unwrap(), index.vector_algo())?;
+                }
                 let metric = index.vector_meta_for_table(table).metric_enum();
                 if (datatype == crate::vector::VectorDataType::Binary)
                     != matches!(metric, vector::Metric::Hamming | vector::Metric::Jaccard)
@@ -204,8 +227,13 @@ fn validate_vector_index_column(
                     } = c.data_type
                     {
                         VectorIndexFile::validate_hnsw_layout(
-                            if let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) {
-                                native_vector_geometry(crate::vector::VectorDataType::Int8,(config.quantization.code_len(dim)+9) as u32) as usize
+                            if let Some(config) =
+                                index.vector.as_ref().filter(|v| v.quantization.enabled())
+                            {
+                                native_vector_geometry(
+                                    crate::vector::VectorDataType::Int8,
+                                    (config.quantization.code_len(dim) + 9) as u32,
+                                ) as usize
                             } else if datatype == crate::vector::VectorDataType::Float32 {
                                 dim as usize
                             } else {
@@ -216,9 +244,15 @@ fn validate_vector_index_column(
                     }
                 }
                 if vector_storage_paged() && index.vector_algo() == VectorAlgo::Ivf {
-                    if let Some(config)=index.vector.as_ref().filter(|v|v.quantization.enabled()) {
-                        VectorIndexFile::validate_native_ivf_layout(crate::vector::VectorDataType::Int8,(config.quantization.code_len(dim.unwrap())+9) as u32)?;
-                    } else {VectorIndexFile::validate_native_ivf_layout(datatype, dim.unwrap())?;}
+                    if let Some(config) = index.vector.as_ref().filter(|v| v.quantization.enabled())
+                    {
+                        VectorIndexFile::validate_native_ivf_layout(
+                            crate::vector::VectorDataType::Int8,
+                            (config.quantization.code_len(dim.unwrap()) + 9) as u32,
+                        )?;
+                    } else {
+                        VectorIndexFile::validate_native_ivf_layout(datatype, dim.unwrap())?;
+                    }
                 }
                 if c.nullable {
                     return Err(error(
@@ -554,12 +588,11 @@ fn alter_copy_projection(
     rewrite_mask: &[bool],
 ) -> Option<AlterCopyProjection> {
     if !candidate.check_constraints.is_empty()
-        || candidate
-            .columns
-            .iter()
-            .enumerate()
-            .any(|(idx, column)| column.generated_expr.is_some() || column.default_expr.is_some()
-                || (column.auto_increment && idx >= old_table.columns.len()))
+        || candidate.columns.iter().enumerate().any(|(idx, column)| {
+            column.generated_expr.is_some()
+                || column.default_expr.is_some()
+                || (column.auto_increment && idx >= old_table.columns.len())
+        })
         || candidate.indexes.iter().any(|index| {
             index.has_expression_parts()
                 || index.is_fulltext()
@@ -1063,9 +1096,10 @@ fn prepare_create_table_schema(
                 .unwrap_or_else(|| "functional_index".to_string());
             let mut name = base.clone();
             let mut suffix = 2;
-            while name.eq_ignore_ascii_case("PRIMARY") || index_schemas
-                .iter()
-                .any(|i| i.name.eq_ignore_ascii_case(&name))
+            while name.eq_ignore_ascii_case("PRIMARY")
+                || index_schemas
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(&name))
             {
                 name = format!("{base}_{suffix}");
                 suffix += 1;
@@ -1094,6 +1128,7 @@ fn prepare_create_table_schema(
                             .get(position)
                             .copied()
                             .unwrap_or(false),
+                        collation_id: None,
                         ast: None,
                         program: None,
                     })
@@ -1103,7 +1138,11 @@ fn prepare_create_table_schema(
             primary,
             included_columns,
             state: crate::storage::IndexState::Public,
-            vector: crate::storage::vector_config::VectorIndexConfig::from_options(&index.index_type, index.vector_options.as_ref(), &index.comment)?,
+            vector: crate::storage::vector_config::VectorIndexConfig::from_options(
+                &index.index_type,
+                index.vector_options.as_ref(),
+                &index.comment,
+            )?,
             index_type: index.index_type,
             visible: index.visible,
             comment: index.comment,
@@ -1188,8 +1227,12 @@ impl PreparedCreateTableSchema {
             pctused: self.pctused.unwrap_or(0).min(50),
             mysql_table_options,
         };
-        for index in &mut table.indexes { resolve_vector_config(&table.columns, index)?; }
-        for index in &table.indexes { validate_vector_index_column(&table, index)?; }
+        for index in &mut table.indexes {
+            resolve_vector_config(&table.columns, index)?;
+        }
+        for index in &table.indexes {
+            validate_vector_index_column(&table, index)?;
+        }
         table.check_constraints =
             build_check_constraints_for_table(&table, self.check_defs, None, None)?;
         for (column_name, comment) in self.column_comments {
@@ -1358,12 +1401,10 @@ impl Database {
         let partition_count = prepared.partition_count()?;
         let (id, partition_storage_ids) = {
             let mut catalog = self.catalog_write()?;
-            let id = catalog.next_table_id;
-            catalog.next_table_id += 1;
+            let id = catalog.allocate_table_id()?;
             let mut partition_ids = Vec::with_capacity(partition_count);
             for _ in 0..partition_count {
-                let partition_id = catalog.next_table_id;
-                catalog.next_table_id += 1;
+                let partition_id = catalog.allocate_table_id()?;
                 partition_ids.push(partition_id);
             }
             (id, partition_ids)
@@ -1408,7 +1449,10 @@ impl Database {
             if !created_table.check_constraints.is_empty() {
                 let schema_names =
                     check_constraint_names_in_schema(&catalog, &created_table.database, None);
-                ensure_check_constraint_names_available(&schema_names, &created_table.check_constraints)?;
+                ensure_check_constraint_names_available(
+                    &schema_names,
+                    &created_table.check_constraints,
+                )?;
             }
             let rebuild_fk_runtime =
                 !created_table.foreign_keys.is_empty() || self.catalog.may_have_foreign_keys();
@@ -1423,7 +1467,9 @@ impl Database {
         #[cfg(test)]
         {
             let hook = self.create_finalize_test_hook.lock().unwrap().take();
-            if let Some(hook) = hook { hook.pause(); }
+            if let Some(hook) = hook {
+                hook.pause();
+            }
         }
         let finalize = (|| -> Result<(), QueryError> {
             // Create one heap file per physical storage id. For partitioned
@@ -1459,9 +1505,16 @@ impl Database {
             }
             {
                 let catalog = self.catalog_read()?;
-                let table = catalog.tables.get(&key).filter(|table| table.id == id)
-                    .ok_or_else(|| error(crate::error::catalog::ER_NO_SUCH_TABLE,
-                        format!("catalog table '{key}' changed before CREATE commit")))?;
+                let table = catalog
+                    .tables
+                    .get(&key)
+                    .filter(|table| table.id == id)
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_NO_SUCH_TABLE,
+                            format!("catalog table '{key}' changed before CREATE commit"),
+                        )
+                    })?;
                 self.catalog.register_table(&key, table);
                 self.note_catalog_table(id);
             }
@@ -1485,11 +1538,14 @@ impl Database {
                 Ok(cleanup) => {
                     let intent = self.write_drop_table_intent(&cleanup)?;
                     if self.evict_dropped_table_caches(&created_table).is_ok()
-                        && self.purge_dropped_table_files(&cleanup) {
+                        && self.purge_dropped_table_files(&cleanup)
+                    {
                         self.remove_drop_table_intent(intent.as_ref());
                     }
                 }
-                Err(cleanup_err) => self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}")),
+                Err(cleanup_err) => {
+                    self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}"))
+                }
             }
             self.auto_increment.forget_table(id);
             return Err(err);
@@ -1789,18 +1845,15 @@ impl Database {
         // the ordering of the normal CREATE TABLE path.
         let (id, partition_ids) = {
             let mut catalog = self.catalog_write()?;
-            let id = catalog.next_table_id;
-            catalog.next_table_id += 1;
+            let id = catalog.allocate_table_id()?;
             if let Some(info) = partitioning.as_mut() {
                 for partition in &mut info.partitions {
                     if partition.subpartitions.is_empty() {
-                        partition.storage_id = catalog.next_table_id;
-                        catalog.next_table_id += 1;
+                        partition.storage_id = catalog.allocate_table_id()?;
                     } else {
                         partition.storage_id = 0;
                         for sub in &mut partition.subpartitions {
-                            sub.storage_id = catalog.next_table_id;
-                            catalog.next_table_id += 1;
+                            sub.storage_id = catalog.allocate_table_id()?;
                         }
                     }
                 }
@@ -1877,7 +1930,8 @@ impl Database {
         if let Err(err) = finalize {
             let cleanup = self
                 .table_by_id(id)
-                .map(|table| self.build_drop_table_intent(&table)).transpose();
+                .map(|table| self.build_drop_table_intent(&table))
+                .transpose();
             {
                 let mut catalog = self.catalog_write()?;
                 if catalog.tables.get(&key).is_some_and(|table| table.id == id) {
@@ -1887,10 +1941,14 @@ impl Database {
             match cleanup {
                 Ok(Some(cleanup)) => {
                     let intent = self.write_drop_table_intent(&cleanup)?;
-                    if self.purge_dropped_table_files(&cleanup) { self.remove_drop_table_intent(intent.as_ref()); }
+                    if self.purge_dropped_table_files(&cleanup) {
+                        self.remove_drop_table_intent(intent.as_ref());
+                    }
                 }
-                Ok(None) => {},
-                Err(cleanup_err) => self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}")),
+                Ok(None) => {}
+                Err(cleanup_err) => {
+                    self.quarantine_mvcc(format!("CREATE cleanup failed: {cleanup_err:?}"))
+                }
             }
             self.auto_increment.forget_table(id);
             return Err(err);
@@ -1902,7 +1960,9 @@ impl Database {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_err)?;
         }
-        fs::write(path, Vec::<u8>::new()).map_err(io_err)
+        let bytes = create_empty_heap_image(&path, Vec::new());
+        crate::storage::temp_quota::reserve_extent(&path, bytes.len() as u64)?;
+        fs::write(path, bytes).map_err(io_err)
     }
 
     pub(crate) fn create_temp_table_like(
@@ -1979,6 +2039,7 @@ impl Database {
             Err(err) => return Err(io_err(err)),
         }
         crate::storage::temp_quota::release_file(&path);
+        retire_page_owner_proof(&path);
         Ok(())
     }
 
@@ -2041,12 +2102,20 @@ impl Database {
             }
         }
         crate::storage::temp_quota::release_files(&self.data_dir, table.id);
+        for sid in table.storage_ids() {
+            crate::storage::temp_quota::reserve_extent(&self.table_path(sid), PAGE_SIZE as u64)?;
+        }
         if table.auto_increment_column_index().is_some() {
             self.reset_auto_increment(table.id)?;
         }
         self.drop_table_vector_graphs(&table)?;
         self.initialize_empty_spatial_indexes(&table)?;
-        let vector_names = table.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+        let vector_names = table
+            .indexes
+            .iter()
+            .filter(|index| index.is_vector())
+            .map(|index| index.name.as_str())
+            .collect::<Vec<_>>();
         self.warm_vector_graphs_after_ddl(&table, &vector_names)?;
         Ok(())
     }
@@ -2059,8 +2128,12 @@ impl Database {
         path: &Path,
         file_key: Arc<BufferPageFileKey>,
         page_count: u64,
-        first_page: Option<Vec<u8>>,
+        mut first_page: Option<Vec<u8>>,
     ) -> Result<(), QueryError> {
+        if let Some(image) = first_page.as_mut() {
+            stamp_page_owner(image, &file_key.owner, 0);
+            refresh_page_checksum(image);
+        }
         crate::storage::temp_quota::reserve_extent(path, page_count * PAGE_SIZE as u64)?;
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -2493,7 +2566,7 @@ impl Database {
             .index_path(table.id, new_name)
             .with_extension(if index.is_spatial() { "rtree" } else { "idx" });
         if old_path.exists() {
-            fs::rename(&old_path, &new_path).map_err(io_err)?;
+            rename_owned_file(&old_path, &new_path).map_err(io_err)?;
         }
         crate::storage::temp_quota::rename_file(&old_path, &new_path);
         self.mutate_temp_table_schema(internal_key, |table| {
@@ -2590,8 +2663,8 @@ impl Database {
                     new_column.default = Some(frozen);
                 }
             }
-            new_column.column_id = table.allocate_column_id();
-            new_column.physical_pos = table.next_physical_pos();
+            new_column.column_id = table.allocate_column_id()?;
+            new_column.physical_pos = table.next_physical_pos()?;
             new_column.logical_pos = table.visible_column_count() as u32;
             new_column.state = ColumnState::Public;
             if table.visible_column_count() >= MYSQL_MAX_COLUMNS_PER_TABLE {
@@ -2612,7 +2685,7 @@ impl Database {
                 )?;
                 table.check_constraints.append(&mut checks);
             }
-            table.publish_new_row_layout();
+            table.publish_new_row_layout()?;
             table.build_column_index();
             table.bump_schema_version();
             validate_row_fits_page(table)?;
@@ -2692,7 +2765,7 @@ impl Database {
                     .ok_or_else(|| ddl_table_not_found(&internal_key))?,
             );
             table.columns[target].state = ColumnState::Dropped;
-            table.publish_new_row_layout();
+            table.publish_new_row_layout()?;
             table.build_column_index();
             table.bump_schema_version();
             table_id = table.id;
@@ -2796,7 +2869,7 @@ impl Database {
         self.reject_functional_index_type_change(&old, position, &schema)?;
         let mut candidate = old.as_ref().clone();
         apply_column_def_preserving_identity(&mut candidate.columns[position], schema);
-        candidate.publish_new_row_layout();
+        candidate.publish_new_row_layout()?;
         validate_and_prepare_generated_columns(&mut candidate)?;
         candidate.build_column_index();
         candidate.bump_schema_version();
@@ -2862,7 +2935,7 @@ impl Database {
             rename_check_constraint_column_references(&mut candidate, old_name, &new_name)?;
             rename_column_expression_references(&mut candidate, old_name, &new_name)?;
         }
-        candidate.publish_new_row_layout();
+        candidate.publish_new_row_layout()?;
         validate_and_prepare_generated_columns(&mut candidate)?;
         candidate.build_column_index();
         candidate.bump_schema_version();
@@ -3406,17 +3479,14 @@ impl Database {
         let mut candidate = table.as_ref().clone();
         {
             let mut catalog = self.catalog_write()?;
-            candidate.id = catalog.next_table_id;
-            catalog.next_table_id += 1;
+            candidate.id = catalog.allocate_table_id()?;
             if let Some(partitioning) = &mut candidate.partitioning {
                 for partition in &mut partitioning.partitions {
                     if partition.subpartitions.is_empty() {
-                        partition.storage_id = catalog.next_table_id;
-                        catalog.next_table_id += 1;
+                        partition.storage_id = catalog.allocate_table_id()?;
                     } else {
                         for leaf in &mut partition.subpartitions {
-                            leaf.storage_id = catalog.next_table_id;
-                            catalog.next_table_id += 1;
+                            leaf.storage_id = catalog.allocate_table_id()?;
                         }
                     }
                 }
@@ -3457,7 +3527,12 @@ impl Database {
             self.create_logged_file(txn_id_for_ddl(), self.data_dir.join(path), Vec::new())?;
         }
         self.initialize_empty_spatial_indexes(&candidate)?;
-        let vector_names = candidate.indexes.iter().filter(|index| index.is_vector()).map(|index| index.name.as_str()).collect::<Vec<_>>();
+        let vector_names = candidate
+            .indexes
+            .iter()
+            .filter(|index| index.is_vector())
+            .map(|index| index.name.as_str())
+            .collect::<Vec<_>>();
         if let Err(err) = self.warm_vector_graphs_after_ddl(&candidate, &vector_names) {
             self.evict_table_vector_graphs(candidate.id);
             let cleanup = self.build_drop_table_intent(&candidate)?;
@@ -3614,8 +3689,8 @@ impl Database {
                             "Incorrect column specifier for AUTO_INCREMENT column",
                         ));
                     }
-                    schema.column_id = candidate.allocate_column_id();
-                    schema.physical_pos = candidate.next_physical_pos();
+                    schema.column_id = candidate.allocate_column_id()?;
+                    schema.physical_pos = candidate.next_physical_pos()?;
                     schema.logical_pos = candidate.columns.len() as u32;
                     candidate.columns.push(schema);
                     candidate.build_column_index();
@@ -4487,7 +4562,15 @@ impl Database {
                     format!("duplicate index '{}'", index.name),
                 ));
             }
-            table.next_index_id = table.next_index_id.max(index.index_id.saturating_add(1));
+            table.next_index_id =
+                table
+                    .next_index_id
+                    .max(index.index_id.checked_add(1).ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "physical index identity space exhausted",
+                        )
+                    })?);
             resolve_vector_config(&table.columns, &mut index)?;
             validate_add_index_definition(table, &index)?;
             if index.primary
@@ -4914,8 +4997,8 @@ impl Database {
         // encoded row this column will occupy when a write actually
         // emits it. `logical_pos` controls SHOW COLUMNS / SELECT *
         // ordering and matches MySQL's "append at end" semantics.
-        let column_id = table.allocate_column_id();
-        let physical_pos = table.next_physical_pos();
+        let column_id = table.allocate_column_id()?;
+        let physical_pos = table.next_physical_pos()?;
         let logical_pos = table.columns.len() as u32;
         let mut new_column = new_column_def;
         new_column.read_backfill_default =
@@ -4964,7 +5047,7 @@ impl Database {
             table.build_column_index();
             move_column_in_candidate(table, &name, position)?;
         }
-        table.publish_new_row_layout();
+        table.publish_new_row_layout()?;
         table.build_column_index();
         table.bump_schema_version();
         // Reject a column whose addition pushes the fixed row past a page
@@ -5008,8 +5091,8 @@ impl Database {
         schema_check_names: std::collections::BTreeSet<String>,
     ) -> Result<(), QueryError> {
         let mut candidate = old_table.as_ref().clone();
-        let column_id = candidate.allocate_column_id();
-        let physical_pos = candidate.next_physical_pos();
+        let column_id = candidate.allocate_column_id()?;
+        let physical_pos = candidate.next_physical_pos()?;
         let logical_pos = candidate.columns.len() as u32;
         let mut new_column = new_column_def;
         new_column.column_id = column_id;
@@ -5028,7 +5111,7 @@ impl Database {
             ensure_check_constraint_names_available(&schema_check_names, &new_checks)?;
             candidate.check_constraints.append(&mut new_checks);
         }
-        candidate.publish_new_row_layout();
+        candidate.publish_new_row_layout()?;
         candidate.build_column_index();
         candidate.bump_schema_version();
         // strict=true: existing columns are unchanged (no lossy coercion
@@ -5119,7 +5202,7 @@ impl Database {
         }
         let pos = candidate.column_index(column_name)?;
         candidate.columns[pos].state = ColumnState::Dropped;
-        candidate.publish_new_row_layout();
+        candidate.publish_new_row_layout()?;
         candidate.build_column_index();
         candidate.bump_schema_version();
         let replacements = candidate
@@ -6273,7 +6356,8 @@ impl Database {
                     self.prepare_change_column_candidate(table_name, old_name, new_def.clone())?;
                 Ok(copy_required)
             }
-            A::AddColumn(column) => Ok(column.auto_increment || column.generated.is_some()
+            A::AddColumn(column) => Ok(column.auto_increment
+                || column.generated.is_some()
                 || column.checks.iter().any(|check| check.enforced)
                 || column.default.as_ref().is_some_and(|expr| {
                     crate::parser::visit::try_for_each_expr(expr, |node| {
@@ -6558,8 +6642,8 @@ impl Database {
                             schema.default = Some(frozen);
                         }
                     }
-                    schema.column_id = candidate.allocate_column_id();
-                    schema.physical_pos = candidate.next_physical_pos();
+                    schema.column_id = candidate.allocate_column_id()?;
+                    schema.physical_pos = candidate.next_physical_pos()?;
                     schema.logical_pos = candidate.columns.len() as u32;
                     schema.ordinal_position = schema.logical_pos.saturating_add(1);
                     candidate.columns.push(schema);
@@ -6773,7 +6857,7 @@ impl Database {
             }
         }
         if changes_row_shape {
-            candidate.publish_new_row_layout();
+            candidate.publish_new_row_layout()?;
         }
         validate_table_column_identifiers(&candidate)?;
         validate_and_prepare_generated_columns(&mut candidate)?;
@@ -6806,18 +6890,29 @@ impl Database {
         pos: usize,
         new: &ColumnSchema,
     ) -> Result<(), QueryError> {
-        let affected=|index:&IndexSchema|index.is_vector() && index.columns.iter().any(|name|name.eq_ignore_ascii_case(&table.columns[pos].name));
-        if !table.indexes.iter().any(affected){return Ok(());}
-        if new.nullable || !matches!(new.data_type,DataTypeKind::Vector{..}) {
-            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,"a vector index column must remain VECTOR and NOT NULL; drop the index first"));
+        let affected = |index: &IndexSchema| {
+            index.is_vector()
+                && index
+                    .columns
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&table.columns[pos].name))
+        };
+        if !table.indexes.iter().any(affected) {
+            return Ok(());
+        }
+        if new.nullable || !matches!(new.data_type, DataTypeKind::Vector { .. }) {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "a vector index column must remain VECTOR and NOT NULL; drop the index first",
+            ));
         }
         // Validate before COPY allocates or publishes any shadow generation.
         // CHANGE COLUMN renames keys later; preserve their current name here.
-        let mut prospective=table.clone();
-        prospective.columns[pos]=new.clone();
-        prospective.columns[pos].name=table.columns[pos].name.clone();
-        for index in prospective.indexes.iter().filter(|index|affected(index)) {
-            validate_vector_index_column(&prospective,index)?;
+        let mut prospective = table.clone();
+        prospective.columns[pos] = new.clone();
+        prospective.columns[pos].name = table.columns[pos].name.clone();
+        for index in prospective.indexes.iter().filter(|index| affected(index)) {
+            validate_vector_index_column(&prospective, index)?;
         }
         Ok(())
     }
@@ -7259,7 +7354,8 @@ impl Database {
             .retired_files
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .drain(..).collect::<Vec<_>>();
+            .drain(..)
+            .collect::<Vec<_>>();
         for path in &retired_files {
             if cleanup_failed && path.extension().is_some_and(|ext| ext == "job") {
                 continue;
@@ -7275,7 +7371,10 @@ impl Database {
             }
         }
         if let Err(err) = self.remove_empty_object_directories(retired_files) {
-            log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+            log_message(format!(
+                "ALTER COPY empty-directory cleanup pending: {}",
+                err.message()
+            ));
         }
         let snapshot = Self::alter_copy_job_snapshot(&job);
         let history_bytes = std::mem::size_of::<AlterCopyJobHistoryEntry>()
@@ -7617,7 +7716,11 @@ impl Database {
             for row in source_rows {
                 Self::check_alter_copy_cancelled(&job)?;
                 let values = self.prepare_alter_copy_values(
-                    &candidate, row.values, strict, &mut warnings, &defaults,
+                    &candidate,
+                    row.values,
+                    strict,
+                    &mut warnings,
+                    &defaults,
                 )?;
                 for index in candidate.indexes.iter().filter(|index| index.unique) {
                     let key = candidate.index_key(index, &values)?;
@@ -7735,12 +7838,17 @@ impl Database {
         candidate.row_generation_txn_id = ddl_txn_id;
         let shadow_id = {
             let mut catalog = self.catalog_write()?;
-            let id = catalog.next_table_id;
-            catalog.next_table_id = catalog.next_table_id.saturating_add(1);
+            let id = catalog.allocate_table_id()?;
             id
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
-        candidate.active_generation = old_table.active_generation.saturating_add(1).max(1);
+        candidate.active_generation =
+            old_table.active_generation.checked_add(1).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "table generation space exhausted",
+                )
+            })?;
         self.register_reorg_storage_definition(&[shadow_id], &candidate);
         let mut shadow_table = candidate.clone();
         shadow_table.id = shadow_id;
@@ -7786,6 +7894,7 @@ impl Database {
                 .write(true)
                 .open(&shadow_heap_path)
                 .map_err(io_err)?;
+            fs::write(&shadow_heap_path, encode_heap_meta(&shadow_heap_path, 1)).map_err(io_err)?;
             self.remove_heap_cache_entry(shadow_id)?;
             self.set_cached_heap_codec(shadow_id, candidate.row_codec.clone())?;
             if table_has_externalizable_column(&candidate) {
@@ -8186,28 +8295,31 @@ impl Database {
             }
             Self::enter_alter_copy_finalizing(&job)?;
             let swap_started = Instant::now();
-            let memory_graphs = if !vector_storage_paged() || self.config.durability == DurabilityMode::Memory {
-                let graphs = self.vector_indexes.read();
-                candidate
-                    .indexes
-                    .iter()
-                    .filter(|index| index.is_vector())
-                    .filter_map(|index| {
-                        graphs
-                            .get(&(
-                                shadow_id,
-                                shadow_id,
-                                candidate.active_generation.max(1),
-                                normalize_name(&index.name),
-                            ))
-                            .cloned()
-                            .map(|graph| (normalize_name(&index.name), graph))
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            if !memory_graphs.is_empty() { self.detach_table_vector_graphs(shadow_id); }
+            let memory_graphs =
+                if !vector_storage_paged() || self.config.durability == DurabilityMode::Memory {
+                    let graphs = self.vector_indexes.read();
+                    candidate
+                        .indexes
+                        .iter()
+                        .filter(|index| index.is_vector())
+                        .filter_map(|index| {
+                            graphs
+                                .get(&(
+                                    shadow_id,
+                                    shadow_id,
+                                    candidate.active_generation.max(1),
+                                    normalize_name(&index.name),
+                                ))
+                                .cloned()
+                                .map(|graph| (normalize_name(&index.name), graph))
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+            if !memory_graphs.is_empty() {
+                self.detach_table_vector_graphs(shadow_id);
+            }
             if online_barrier.is_some() {
                 let graphs = self.vector_indexes.read();
                 job.retired_vector_graphs
@@ -8268,13 +8380,14 @@ impl Database {
                 .collect();
             self.publish_copied_vector_owners(&candidate, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
-                .append_wal(
+                .log_copied_generation(ddl_txn_id, &file_swap)
+                .and_then(|_| self.append_wal(
                     ddl_txn_id,
                     WalPayload::DdlCommit {
                         job_id: job.job_id,
                         retired_paths,
                     },
-                )
+                ))
                 .and_then(|_| self.commit_catalog_txn_existing(ddl_txn));
             if let Err(err) = publish {
                 if let Ok(mut catalog) = self.catalog_write() {
@@ -8292,7 +8405,9 @@ impl Database {
             }
             published = true;
             #[cfg(test)]
-            if let Some(hook) = self.vector_copy_committed_test_hook.lock().unwrap().take() { hook.pause(); }
+            if let Some(hook) = self.vector_copy_committed_test_hook.lock().unwrap().take() {
+                hook.pause();
+            }
 
             // A background opener can have cached the source path between
             // the first eviction and catalog publication. Drain it before
@@ -8365,12 +8480,16 @@ impl Database {
         }
         if published {
             self.evict_table_vector_graphs(shadow_id);
-            for index in shadow_table.indexes.iter().filter(|index| index.is_vector()) {
+            for index in shadow_table
+                .indexes
+                .iter()
+                .filter(|index| index.is_vector())
+            {
                 for path in self.vector_file_paths(&shadow_table, &index.name, shadow_id) {
                     self.buffer_pool.discard_pages_for_path(&path)?;
                     match fs::remove_file(path) {
-                        Ok(()) => {},
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                         Err(err) => return Err(io_err(err)),
                     }
                 }
@@ -8395,10 +8514,17 @@ impl Database {
                 let _ = self.finish_shadow_generation_intent(&intent);
             }
         }
-        let shadow_paths = std::iter::once(shadow_heap_path).chain(candidate.indexes.iter()
-            .map(|index| self.index_path_for_table_schema(&candidate, shadow_id, &index.name)));
+        let shadow_paths = std::iter::once(shadow_heap_path).chain(
+            candidate
+                .indexes
+                .iter()
+                .map(|index| self.index_path_for_table_schema(&candidate, shadow_id, &index.name)),
+        );
         if let Err(err) = self.remove_empty_object_directories(shadow_paths) {
-            log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+            log_message(format!(
+                "ALTER COPY empty-directory cleanup pending: {}",
+                err.message()
+            ));
         }
         if owns_job {
             self.unregister_alter_copy_job(old_table.id, result.as_ref().err());
@@ -8826,15 +8952,14 @@ impl Database {
                 // A distinct generation never overwrites the old pathname.
                 // Keep its synced base available to REDO until commit decides.
                 if !new_generation && live.exists() {
-                    fs::rename(live, backup).map_err(io_err)?;
+                    rename_owned_file(live, backup).map_err(io_err)?;
                     performed.old_to_backup.push((live.clone(), backup.clone()));
                 }
             }
             for (shadow, live) in &shadow_to_live {
-                if shadow
-                    .extension()
-                    .is_some_and(|ext| matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec" | "vmanifest")))
-                    && !shadow.exists()
+                if shadow.extension().is_some_and(|ext| {
+                    matches!(ext.to_str(), Some("lob" | "hnsw" | "hvec" | "vmanifest"))
+                }) && !shadow.exists()
                 {
                     continue;
                 }
@@ -8844,9 +8969,9 @@ impl Database {
                 if new_generation {
                     // Keep private WAL paths reachable for loser-transaction
                     // UNDO. Both links name the already-synced private file.
-                    fs::hard_link(shadow, live).map_err(io_err)?;
+                    hard_link_owned_file(shadow, live).map_err(io_err)?;
                 } else {
-                    fs::rename(shadow, live).map_err(io_err)?;
+                    rename_owned_file(shadow, live).map_err(io_err)?;
                 }
                 performed
                     .shadow_to_live
@@ -8873,6 +8998,64 @@ impl Database {
         })
     }
 
+    /// Direct COPY output is durable locally but has no row redo. Publish a
+    /// bounded physical baseline at its final paths before committing the DD.
+    /// Replication and backup replay cannot follow local hard links or intents.
+    fn log_copied_generation(
+        &self,
+        txn_id: u64,
+        swap: &ShadowGenerationFileSwap,
+    ) -> Result<(), QueryError> {
+        if self.config.durability == DurabilityMode::Memory {
+            return Ok(());
+        }
+        let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+            4 * PAGE_SIZE,
+        )?;
+        for (_, path) in &swap.shadow_to_live {
+            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+            if matches!(ext, "idx" | "vmanifest") || !path.try_exists().map_err(io_err)? {
+                continue;
+            }
+            let relative = self.relative_path(path);
+            let mut file = File::open(path).map_err(io_err)?;
+            let total = file.metadata().map_err(io_err)?.len();
+            if matches!(ext, "hvec" | "hnsw") {
+                let _vector_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+                    2 * 1024 * 1024,
+                )?;
+                let mut bytes = vec![0; 1024 * 1024];
+                let mut offset = 0;
+                while offset < total {
+                    let count = (total - offset).min(bytes.len() as u64) as usize;
+                    file.read_exact(&mut bytes[..count]).map_err(io_err)?;
+                    self.append_wal(txn_id, WalPayload::VectorIndexImage {
+                        path: relative.clone(), offset, total, bytes: bytes[..count].to_vec(),
+                    })?;
+                    offset += count as u64;
+                }
+                continue;
+            }
+            if total == 0 || total % PAGE_SIZE as u64 != 0 {
+                return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                    "copied generation has invalid page file length"));
+            }
+            let mut page = vec![0; PAGE_SIZE];
+            file.read_exact(&mut page).map_err(io_err)?;
+            self.append_wal(txn_id, WalPayload::FileCreate {
+                path: relative.clone(), after: page.clone(),
+            })?;
+            for page_id in 1..total / PAGE_SIZE as u64 {
+                crate::engine::cancel::check_cancelled()?;
+                file.read_exact(&mut page).map_err(io_err)?;
+                self.append_wal(txn_id, WalPayload::full_page_image(relative.clone(), page_id, page.clone()))?;
+            }
+        }
+        Ok(())
+    }
+
     fn rollback_shadow_generation_file_swap(
         &self,
         swap: &ShadowGenerationFileSwap,
@@ -8883,7 +9066,7 @@ impl Database {
                 let result = if shadow.exists() {
                     fs::remove_file(live)
                 } else {
-                    fs::rename(live, shadow)
+                    rename_owned_file(live, shadow)
                 };
                 if let Err(err) = result {
                     failure = Some(io_err(err));
@@ -8892,7 +9075,7 @@ impl Database {
         }
         for (live, backup) in swap.old_to_backup.iter().rev() {
             if backup.exists() {
-                if let Err(err) = fs::rename(backup, live) {
+                if let Err(err) = rename_owned_file(backup, live) {
                     failure = Some(io_err(err));
                 }
             }
@@ -8936,10 +9119,16 @@ impl Database {
         }
         self.sync_shadow_generation_directories(&swap)?;
         let _ = fs::remove_file(self.zone_map_file_path(old_table.id));
-        let paths = swap.old_to_backup.into_iter().chain(swap.shadow_to_live)
+        let paths = swap
+            .old_to_backup
+            .into_iter()
+            .chain(swap.shadow_to_live)
             .flat_map(|(a, b)| [a, b]);
         if let Err(err) = self.remove_empty_object_directories(paths) {
-            log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+            log_message(format!(
+                "ALTER COPY empty-directory cleanup pending: {}",
+                err.message()
+            ));
         }
         Ok(())
     }
@@ -8970,9 +9159,15 @@ impl Database {
         // The previous generation's derived map must retire with its heap;
         // resolving zone_map_file_path after publication names the new generation.
         let old_zone_map = crate::storage::naming::table_object_generation_path(
-            &self.data_dir, old_table.id, old_table.active_generation.max(1), "zm",
+            &self.data_dir,
+            old_table.id,
+            old_table.active_generation.max(1),
+            "zm",
         );
-        old_to_backup.push((old_zone_map.clone(), old_zone_map.with_extension(format!("zm.alter-old-{job_id}"))));
+        old_to_backup.push((
+            old_zone_map.clone(),
+            old_zone_map.with_extension(format!("zm.alter-old-{job_id}")),
+        ));
         old_to_backup.extend(old_table.indexes.iter().map(|index| {
             let live = self.index_path_for_table_schema(old_table, old_table.id, &index.name);
             let backup = live.with_extension(format!("idx.alter-old-{job_id}"));
@@ -9075,7 +9270,7 @@ impl Database {
                 crate::platform::fs::sync_before_atomic_rename(&file).map_err(io_err)?;
             }
         }
-        fs::rename(&staging, &path).map_err(io_err)?;
+        rename_owned_file(&staging, &path).map_err(io_err)?;
         if self.config.durability != DurabilityMode::Memory {
             if let Some(parent) = path.parent() {
                 crate::platform::fs::sync_path(parent).map_err(io_err)?;
@@ -9132,10 +9327,16 @@ impl Database {
                 true,
                 "invalid path in ALTER COPY intent",
             )?;
-            let paths = intent.old_to_backup.iter().chain(&intent.shadow_to_live)
+            let paths = intent
+                .old_to_backup
+                .iter()
+                .chain(&intent.shadow_to_live)
                 .flat_map(|(a, b)| [self.data_dir.join(a), self.data_dir.join(b)]);
             if let Err(err) = self.remove_empty_object_directories(paths) {
-                log_message(format!("ALTER COPY empty-directory cleanup pending: {}", err.message()));
+                log_message(format!(
+                    "ALTER COPY empty-directory cleanup pending: {}",
+                    err.message()
+                ));
             }
             self.finish_shadow_generation_intent(&path)?;
         }
@@ -10866,7 +11067,7 @@ fn finish_column_change_candidate(
     auto_increment: bool,
 ) -> Result<(), QueryError> {
     if copy_required {
-        candidate.publish_new_row_layout();
+        candidate.publish_new_row_layout()?;
     }
     validate_and_prepare_generated_columns(candidate)?;
     if auto_increment {
@@ -10955,9 +11156,16 @@ impl Database {
                 )
             })?;
             let mut updated = (**schema).clone();
+            let index_id = updated.next_index_id;
+            updated.next_index_id = index_id.checked_add(1).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "physical index identity space exhausted",
+                )
+            })?;
             updated.indexes.push(IndexSchema {
                 readable_from_scn: 0,
-                index_id: 0,
+                index_id,
                 name: index.to_string(),
                 columns,
                 column_prefix_lengths: Vec::new(),
@@ -11209,12 +11417,8 @@ impl Database {
         let build_sids = {
             let mut catalog = self.catalog_write()?;
             (0..source_sids.len())
-                .map(|_| {
-                    let storage_id = catalog.next_table_id;
-                    catalog.next_table_id = catalog.next_table_id.saturating_add(1);
-                    storage_id
-                })
-                .collect::<Vec<_>>()
+                .map(|_| catalog.allocate_table_id())
+                .collect::<Result<Vec<_>, _>>()?
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
         let replacements = source_sids
@@ -11652,8 +11856,7 @@ impl Database {
             let mut catalog = self.catalog_write()?;
             let mut sids = Vec::with_capacity(storage_id_count);
             for _ in 0..storage_id_count {
-                let sid = catalog.next_table_id;
-                catalog.next_table_id += 1;
+                let sid = catalog.allocate_table_id()?;
                 sids.push(sid);
             }
             sids
@@ -11772,12 +11975,8 @@ impl Database {
         let new_sids: Vec<u64> = {
             let mut catalog = self.catalog_write()?;
             (0..new_count)
-                .map(|_| {
-                    let sid = catalog.next_table_id;
-                    catalog.next_table_id += 1;
-                    sid
-                })
-                .collect()
+                .map(|_| catalog.allocate_table_id())
+                .collect::<Result<Vec<_>, _>>()?
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
 
@@ -11938,12 +12137,8 @@ impl Database {
         let build_sids: Vec<u64> = {
             let mut catalog = self.catalog_write()?;
             (0..drop_from)
-                .map(|_| {
-                    let sid = catalog.next_table_id;
-                    catalog.next_table_id += 1;
-                    sid
-                })
-                .collect()
+                .map(|_| catalog.allocate_table_id())
+                .collect::<Result<Vec<_>, _>>()?
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
         let survivor_partitions: Vec<crate::storage::partitioning::Partition> = part.partitions
@@ -12253,12 +12448,8 @@ impl Database {
         let new_storage_ids: Vec<u64> = {
             let mut catalog = self.catalog_write()?;
             (0..new_storage_count)
-                .map(|_| {
-                    let pid = catalog.next_table_id;
-                    catalog.next_table_id += 1;
-                    pid
-                })
-                .collect()
+                .map(|_| catalog.allocate_table_id())
+                .collect::<Result<Vec<_>, _>>()?
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
         let new_info = build_partition_info_from_def(&synth_def, &table, &new_storage_ids)?;
@@ -12978,7 +13169,7 @@ impl Database {
                 if let Some(parent) = to_abs.parent() {
                     fs::create_dir_all(parent).map_err(io_err)?;
                 }
-                fs::rename(&from_abs, &to_abs).map_err(io_err)?;
+                rename_owned_file(&from_abs, &to_abs).map_err(io_err)?;
             }
         }
         // Catalog mirroring can reopen handles between the first eviction and

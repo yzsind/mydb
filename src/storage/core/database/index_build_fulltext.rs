@@ -148,7 +148,7 @@ fn combine_fulltext_sorters(
         for sorter in sorters {
             for run in &sorter.runs {
                 let destination = tmp.path.join(format!("fulltext-run-{}", runs.len()));
-                fs::rename(run, &destination).map_err(io_err)?;
+                rename_owned_file(run, &destination).map_err(io_err)?;
                 runs.push(destination);
             }
         }

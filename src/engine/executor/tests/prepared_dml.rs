@@ -2778,3 +2778,55 @@ fn prepared_range_update_sparse_error_undo_and_unaffected_foreign_key() {
     .unwrap()
     .expect_err("affected foreign key must still be checked");
 }
+
+#[test]
+fn point_temporal_validation_proof_rebinds_after_schema_change() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    let mut session = SessionContext::default();
+    let sql = "UPDATE t SET v=1 WHERE id=?";
+    let parsed = engine.prepare_cached(&mut session, sql, 1).unwrap();
+    let mut state = PreparedDmlState::default();
+    fast(
+        &engine,
+        &mut session,
+        &mut state,
+        &parsed,
+        sql,
+        &[Value::Int(1)],
+    )
+    .unwrap()
+    .unwrap();
+    let PreparedDmlState::Ready(plan) = &state else {
+        panic!("missing point plan");
+    };
+    assert!(!plan.point_write.as_ref().unwrap().needs_temporal_validation);
+    engine
+        .execute("ALTER TABLE t MODIFY id DATE NOT NULL")
+        .unwrap();
+    fast(
+        &engine,
+        &mut session,
+        &mut state,
+        &parsed,
+        sql,
+        &[Value::String("2026-10-31".into())],
+    )
+    .unwrap()
+    .unwrap();
+    let PreparedDmlState::Ready(plan) = &state else {
+        panic!("missing rebound point plan");
+    };
+    assert!(plan.point_write.as_ref().unwrap().needs_temporal_validation);
+    let params = [Value::String("2026-99-99".into())];
+    let actual = fast(&engine, &mut session, &mut state, &parsed, sql, &params).unwrap();
+    let oracle = legacy(&engine, &mut session, &parsed, sql, &params);
+    match (actual, oracle) {
+        (Ok(actual), Ok(expected)) => assert_eq!(affected(actual), affected(expected)),
+        (Err(actual), Err(expected)) => assert_eq!(actual.code(), expected.code()),
+        (actual, expected) => panic!("temporal diagnostics differ: {actual:?} vs {expected:?}"),
+    }
+}

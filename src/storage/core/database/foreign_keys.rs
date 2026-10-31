@@ -735,24 +735,31 @@ fn fk_parent_violation_err(child: &TableSchema, inbound: &InboundFk) -> QueryErr
 /// Build an index key from `vals` (one per `ref_cols`, in order) using
 /// `table`'s column types and `index`'s prefix metadata. Produces a key
 /// of length `ref_cols.len()` — a prefix of `index` when it is composite.
-fn fk_build_key(
+fn fk_build_key<'a>(
     table: &TableSchema,
     index: &IndexSchema,
     ref_cols: &[String],
-    vals: &[Value],
+    vals: impl IntoIterator<Item = &'a Value>,
 ) -> Result<IndexKey, QueryError> {
-    let mut parts = Vec::with_capacity(ref_cols.len());
+    let mut vals = vals.into_iter();
+    let mut parts = smallvec::SmallVec::<[KeyPart; 4]>::with_capacity(ref_cols.len());
     for (k, col) in ref_cols.iter().enumerate() {
+        let value = vals.next().ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "foreign key value count mismatch",
+            )
+        })?;
         let idx = table.column_index(col)?;
         let column = &table.columns[idx];
         let part = KeyPart::from_column_value_with_collation(
-            &vals[k],
+            value,
             &column.data_type,
             column.collation.as_deref(),
         );
         parts.push(index.apply_prefix_to_key_part(k, part));
     }
-    Ok(IndexKey::from(parts))
+    Ok(IndexKey(parts))
 }
 
 /// How `read_row_committed_or_own` should fold an undo record's
@@ -847,6 +854,7 @@ impl Database {
                                 UndoApply::UpdateDelta(before_cols.clone())
                             }
                             UndoKind::Update | UndoKind::Delete => UndoApply::FullRow,
+                            UndoKind::DeleteHeader => UndoApply::UpdateDelta(Vec::new()),
                         };
                         (apply, rec.before_header, rec.before_values)
                     }
@@ -1074,32 +1082,54 @@ impl Database {
         }
         // Transaction-duration reference locks make a successfully checked
         // parent key stable for the rest of this INSERT statement/txn. Batch
-        // producers commonly group adjacent rows by parent; remember only
-        // the most recent success per FK so a repeated key avoids another
-        // lock-manager, B-tree and heap round trip. This is deliberately a
-        // constant-space cache: row/FK order and the first failing key remain
-        // identical to the scalar oracle, while arbitrary large batches do
-        // not acquire a second row-proportional memory footprint.
+        // producers commonly group adjacent rows by parent; check the most
+        // recent success first, avoiding even a hash probe for that case.
+        // Row/FK order and the first failing key remain identical to the
+        // scalar oracle.
         let mut last_satisfied = vec![None::<IndexKey>; resolved.len()];
+        // Retain earlier successes too, so interleaved parent keys share one
+        // probe. This optional statement-local cache moves keys out of the
+        // previous-success slot instead of cloning them. Under pressure it
+        // drops back to the constant-space consecutive-key cache above.
+        let mut prior_keys: Vec<HashSet<IndexKey, ahash::RandomState>> = Vec::new();
+        let mut cache_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+        let cache_limit = cache_charge.remaining() / 4;
+        let cache_bytes = resolved.len().saturating_mul(
+            std::mem::size_of::<HashSet<IndexKey, ahash::RandomState>>().saturating_add(
+                rows.len()
+                    .saturating_mul(2 * std::mem::size_of::<IndexKey>()),
+            ),
+        );
+        if rows.len() > 2 && cache_charge.add_within(cache_bytes, cache_limit) {
+            prior_keys.resize_with(resolved.len(), Default::default);
+        }
         // Row-outer / FK-inner preserves the single-row path's report order.
         for values in rows {
             for (position, (fk, parent, index, referenced_columns)) in resolved.iter().enumerate() {
                 let Some(key) = self.fk_child_reference_key(fk, parent, index, values)? else {
                     continue;
                 };
-                if last_satisfied[position].as_ref() == Some(&key) {
+                if last_satisfied[position].as_ref() == Some(&key)
+                    || prior_keys
+                        .get(position)
+                        .is_some_and(|seen| seen.contains(&key))
+                {
                     continue;
                 }
-                self.fk_enforce_child_key(
-                    table,
-                    fk,
-                    parent,
-                    index,
-                    referenced_columns,
-                    txn,
-                    &key,
-                )?;
-                last_satisfied[position] = Some(key);
+                self.fk_enforce_child_key(table, fk, parent, index, referenced_columns, txn, &key)?;
+                if let Some(previous) = last_satisfied[position].replace(key) {
+                    if let Some(seen) = prior_keys.get_mut(position) {
+                        let bytes = previous.heap_capacity_bytes();
+                        if (bytes == 0 || cache_charge.add_within(bytes, cache_limit))
+                            && (seen.capacity() != 0 || seen.try_reserve(rows.len()).is_ok())
+                        {
+                            seen.insert(previous);
+                        } else {
+                            prior_keys = Vec::new();
+                            cache_charge.release_bytes(cache_charge.charged());
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1156,15 +1186,7 @@ impl Database {
             .iter()
             .map(|column| parent.column_index(column))
             .collect::<Result<smallvec::SmallVec<[usize; 4]>, _>>()?;
-        self.fk_enforce_child_key(
-            table,
-            fk,
-            parent,
-            index,
-            &referenced_columns,
-            txn,
-            &key,
-        )
+        self.fk_enforce_child_key(table, fk, parent, index, &referenced_columns, txn, &key)
     }
 
     /// Build one child reference key. `None` implements MATCH SIMPLE: any
@@ -1177,14 +1199,23 @@ impl Database {
         values: &[Value],
     ) -> Result<Option<IndexKey>, QueryError> {
         // MATCH SIMPLE: any NULL key column → constraint satisfied.
-        let mut keyvals = Vec::with_capacity(fk.child_col_idx.len());
-        for &ci in &fk.child_col_idx {
-            match values.get(ci) {
-                Some(Value::Null) | None => return Ok(None),
-                Some(v) => keyvals.push(v.clone()),
-            }
+        if fk.child_col_idx.iter().any(|&ci| {
+            values
+                .get(ci)
+                .is_none_or(|value| matches!(value, Value::Null))
+        }) {
+            return Ok(None);
         }
-        fk_build_key(parent, index, &fk.referenced_columns, &keyvals).map(Some)
+        // Borrow the child values directly. KeyPart performs the one required
+        // conversion/copy; a temporary Value vector would clone strings and
+        // allocate again before the inline composite-key storage is built.
+        fk_build_key(
+            parent,
+            index,
+            &fk.referenced_columns,
+            fk.child_col_idx.iter().map(|&ci| &values[ci]),
+        )
+        .map(Some)
     }
 
     fn fk_enforce_child_key(
@@ -1271,8 +1302,8 @@ impl Database {
         key: &IndexKey,
         txn: TxnView,
     ) -> Result<bool, QueryError> {
-        let Some((header, mut values, stored_count)) = self
-            .read_mvcc_row_columns_with_plan(parent.id, row_id, referenced_columns, None)?
+        let Some((header, mut values, stored_count)) =
+            self.read_mvcc_row_columns_with_plan(parent.id, row_id, referenced_columns, None)?
         else {
             return Ok(false);
         };

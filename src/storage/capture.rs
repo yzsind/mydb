@@ -147,7 +147,7 @@ impl CaptureState {
             }
             let value: Envelope = serde_json::from_slice(&bytes).map_err(|e| err(e.to_string()))?;
             let encoded = serde_json::to_vec(&value.leases).map_err(|e| err(e.to_string()))?;
-            if value.version != 1
+            if value.version != crate::storage::format_versions::WAL_RETENTION_VERSION
                 || value.leases.len() > 64
                 || value
                     .leases
@@ -258,7 +258,7 @@ impl CaptureState {
         }
         let bytes = serde_json::to_vec(&next).map_err(|e| err(e.to_string()))?;
         let state = Envelope {
-            version: 1,
+            version: crate::storage::format_versions::WAL_RETENTION_VERSION,
             digest: crate::util::hex::encode_lower(&Sha256::digest(&bytes)),
             leases: next.clone(),
         };

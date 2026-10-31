@@ -4,6 +4,12 @@
 //! Packed index (code point, weight offset, count), followed by little-endian u16 weights.
 const DATA: &[u8] = include_bytes!("charset_uca9_primary.bin");
 const COUNT: usize = 29809;
+pub(super) const PRIMARY_EXPANSION_EXCEPTIONS: &[(char, usize)] = &[
+    ('\u{fdfa}', 24),
+    ('\u{fdfb}', 4),
+    ('\u{337f}', 4),
+    ('\u{321d}', 2),
+];
 const ASCII: &[&[u16]] = &[
     &[],
     &[],
@@ -523,6 +529,32 @@ pub(super) fn ascii_key_size(value: &str) -> usize {
 #[cfg(test)]
 mod compact_key_tests {
     use super::*;
+    #[test]
+    fn primary_weight_expansion_bound_covers_the_complete_packed_table() {
+        let bound = crate::charset::UCA9_PRIMARY_MAX_EXPANSION;
+        for index in 0..COUNT {
+            let position = index * 10;
+            let ch = char::from_u32(u32_at(position)).unwrap();
+            let weights = u16::from_le_bytes([DATA[position + 8], DATA[position + 9]]);
+            assert!(usize::from(weights) * 2 <= ch.len_utf8() * bound, "{ch:?}");
+            let mut utf8 = [0; 4];
+            assert!(
+                usize::from(weights) * 2
+                    <= crate::charset::uca9_primary_byte_bound(
+                        ch.encode_utf8(&mut utf8).as_bytes()
+                    )
+                    .unwrap(),
+                "{ch:?}"
+            );
+        }
+        for ch in (0..128).chain(0xac00..=0xd7a3).filter_map(char::from_u32) {
+            let mut count = 0;
+            scalar(ch, &mut |_| count += 2);
+            assert!(count <= ch.len_utf8() * bound, "{ch:?}");
+        }
+        // Implicit weights emit at most two u16 units per scalar.
+        assert!(bound >= 4);
+    }
     #[test]
     fn audit1022_implicit_cjk_prefixes_keep_a_selective_upper_bound() {
         for ch in ['汉', '字', '漢', '語', '𠀀'] {

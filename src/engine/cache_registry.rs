@@ -184,6 +184,20 @@ pub fn collect() -> Vec<CacheStatsRow> {
 
     let func = crate::engine::func_cache::stats();
     rows.push(CacheStatsRow {
+        name: "gtid_set_parse",
+        kind: "function",
+        scope: "thread",
+        hits: func.gtid_set_hits,
+        misses: func.gtid_set_misses,
+        size_entries: func.gtid_set_entries,
+        capacity_entries: crate::engine::func_cache::GTID_SET_CACHE_CAPACITY as u64,
+        evictions: 0,
+        invalidations: 0,
+        bytes: Some(func.gtid_set_bytes),
+        memory_accounting: CacheMemoryAccounting::GovernedSubset,
+        memory_evictions: None,
+    });
+    rows.push(CacheStatsRow {
         name: "regex_compile",
         kind: "function",
         scope: "thread",

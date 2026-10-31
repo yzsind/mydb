@@ -1,6 +1,9 @@
 use super::*;
 
-const FIXTURE: &str = include_str!("fixtures/vector.json");
+const FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/function-compat/vector.json"
+));
 
 function_fixture_test!(cosine_distance, "COSINE_DISTANCE", FIXTURE);
 function_fixture_test!(distance, "DISTANCE", FIXTURE);

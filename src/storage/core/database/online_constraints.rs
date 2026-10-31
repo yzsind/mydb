@@ -718,7 +718,7 @@ impl Database {
             .iter()
             .any(|action| matches!(action, A::ModifyColumn(_) | A::ChangeColumn { .. }))
         {
-            candidate.publish_new_row_layout();
+            candidate.publish_new_row_layout()?;
             validate_table_column_identifiers(&candidate)?;
             validate_bit_widths(&candidate)?;
             validate_row_fits_page(&candidate)?;
@@ -1282,10 +1282,7 @@ impl Database {
                         self.constraint_barrier(&names, owner, false)?;
                         hold = Some(ConstraintHoldTimer(Instant::now()));
                         self.try_online_index_data_barrier_mode(lock_txn.txn_id, &ids, true)?;
-                        let tail: usize = jobs
-                            .iter()
-                            .map(|j| j.changes.len())
-                            .sum();
+                        let tail: usize = jobs.iter().map(|j| j.changes.len()).sum();
                         let index_tail: usize = targets
                             .iter()
                             .map(|t| t.log.state.lock().entries.len())
@@ -1322,10 +1319,7 @@ impl Database {
                         validation,
                         Some(online_copy_deadline()),
                     )?;
-                    if jobs
-                        .iter()
-                        .any(|j| j.changes.len() != 0)
-                    {
+                    if jobs.iter().any(|j| j.changes.len() != 0) {
                         return Err(error(
                             crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
                             "online constraint has unresolved transactions",

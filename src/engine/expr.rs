@@ -1,7 +1,10 @@
 pub(crate) mod date_format;
+pub(crate) mod digest;
 pub(crate) mod math;
+pub(crate) mod network;
 crate::engine::builtin_catalog::declare_retains_ast!();
 mod string_kernels;
+pub(crate) mod string_search;
 use crate::charset::encode_file_text as load_file_encode_path;
 pub(crate) use crate::parser::boolean::flip_cmp;
 pub(crate) use crate::storage::is_numeric_value as is_numeric;
@@ -22,7 +25,6 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Write},
-    net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     ptr::NonNull,
     time::Duration,
@@ -69,6 +71,7 @@ pub(crate) struct SessionExprInfo {
     auto_increment: (u64, u64),
     time_zone: String,
     timestamp_override: f64,
+    statement_now_micros: i64,
     explicit_defaults_for_timestamp: bool,
     block_encryption_mode: String,
     default_week_format: u32,
@@ -220,6 +223,15 @@ fn capture_session_expr_info_with_variables(
         ),
         time_zone: session.sysvars.time_zone.clone(),
         timestamp_override: session.sysvars.timestamp_override,
+        statement_now_micros: crate::engine::api::stmt_frozen_utc_now_micros(|| {
+            timestamp_override_parts(session.sysvars.timestamp_override)
+                .and_then(|(seconds, micros)| {
+                    seconds
+                        .checked_mul(1_000_000)?
+                        .checked_add(i64::from(micros))
+                })
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_micros())
+        }),
         explicit_defaults_for_timestamp: session.sysvars.explicit_defaults_for_timestamp,
         block_encryption_mode: session.sysvars.block_encryption_mode.clone(),
         default_week_format: session.sysvars.default_week_format as u32,
@@ -288,6 +300,7 @@ pub(crate) fn with_session_expr_info_snapshot<R>(
     info: SessionExprInfo,
     f: impl FnOnce() -> R,
 ) -> R {
+    let _statement_now = crate::engine::api::StatementNowScope::enter(info.statement_now_micros);
     struct SnapshotGuard {
         prev_ptr: Option<NonNull<crate::engine::api::SessionContext>>,
         prev_owned: Option<SessionExprInfo>,
@@ -1095,6 +1108,7 @@ pub(crate) fn eval_lastval() -> Result<Value, QueryError> {
 
 /// `setval('seq', value [, is_called])` — non-transactional counter reset.
 pub(crate) fn eval_setval(name: &str, value: i64, is_called: bool) -> Result<Value, QueryError> {
+    crate::engine::cancel::check_cancelled()?;
     with_seq_ctx(|db, session| {
         let _write = db.acquire_sequence_write_lease()?;
         authorize_sequence_value(db, session, name, true)?;
@@ -1836,13 +1850,17 @@ fn checked_datetime_cast_value(micros: i64) -> Result<Value, QueryError> {
 pub(crate) fn session_timestamp_override() -> Option<(i64, u32)> {
     with_session_view(|view| {
         let raw = view.map(|v| v.timestamp_override()).unwrap_or(0.0);
-        if raw <= 0.0 {
-            return None;
-        }
-        let secs = raw.trunc() as i64;
-        let micros = ((raw - raw.trunc()) * 1e6).round() as u32;
-        Some((secs, micros.min(999_999)))
+        timestamp_override_parts(raw)
     })
+}
+
+fn timestamp_override_parts(raw: f64) -> Option<(i64, u32)> {
+    if raw <= 0.0 {
+        return None;
+    }
+    let secs = raw.trunc() as i64;
+    let micros = ((raw - raw.trunc()) * 1e6).round() as u32;
+    Some((secs, micros.min(999_999)))
 }
 
 pub(crate) fn session_explicit_defaults_for_timestamp() -> bool {
@@ -1864,7 +1882,12 @@ pub(crate) fn session_utc_now() -> chrono::NaiveDateTime {
     let micros = crate::engine::api::stmt_frozen_utc_now_micros(|| {
         // Recomputes on first call inside a statement.
         if let Some((secs, us)) = session_timestamp_override() {
-            return secs * 1_000_000 + us as i64;
+            if let Some(micros) = secs
+                .checked_mul(1_000_000)
+                .and_then(|s| s.checked_add(i64::from(us)))
+            {
+                return micros;
+            }
         }
         chrono::Utc::now().timestamp_micros()
     });
@@ -3500,10 +3523,11 @@ impl From<&Value> for ValueKey {
                 crate::charset::with_default_string_key(s, |bytes| buf.extend_from_slice(bytes));
                 ValueKey::String(buf)
             }
-            // Two equal JSON documents have byte-identical canonical jsonb,
-            // so hashing on the raw bytes keeps GROUP BY / DISTINCT / join
-            // probes on a JSON column correct.
-            Value::Json(v) => ValueKey::Bytes(KeyBytes::from_slice(v)),
+            // JSON numeric tags differ even for equal values (1 and 1.0).
+            // Normalize recursively in the JSON comparison domain.
+            Value::Json(v) => {
+                ValueKey::Bytes(KeyBytes::from_slice(&crate::engine::json::equality_key(v)))
+            }
             // Two equal geometries have byte-identical internal form, so
             // hashing on the raw bytes keeps GROUP BY / DISTINCT correct.
             Value::Geometry(v) => ValueKey::Bytes(KeyBytes::from_slice(v)),
@@ -3690,7 +3714,7 @@ pub(crate) fn write_value_inline_key(value: &Value, out: &mut InlineKeyBuf) {
             let s = unsafe { std::str::from_utf8_unchecked(b) };
             push_string(out, s);
         }
-        Value::Json(v) => push_bytes(out, v),
+        Value::Json(v) => push_bytes(out, &crate::engine::json::equality_key(v)),
         Value::Geometry(v) => push_bytes(out, v),
         Value::Vector(v) => push_bytes(out, &v.encode()),
         Value::DecimalCompact(mag, scale) => {
@@ -4051,7 +4075,7 @@ impl Drop for ExpressionDepthGuard {
 /// legacy row-eval path. Returns `None` for anything other than a
 /// plain column reference — callers then fall back to the process
 /// default collation, which matches the historical behaviour.
-fn resolve_row_expr_collation(
+pub(crate) fn resolve_row_expr_collation(
     expr: &Expr,
     table: &TableSchema,
 ) -> Option<&'static crate::charset::CollationInfo> {
@@ -4308,6 +4332,17 @@ fn eval_expr_legacy_inner(
             )
         }
         Expr::Function { name, args, .. } => {
+            if crate::engine::geo::sql::is_geometry_collection_constructor(name) {
+                let geometry_arguments = args
+                    .iter()
+                    .all(|arg| expr_result_type_in_table(arg, table) == ColumnType::Geometry);
+                let evaluated = eval_args(args, &mut |arg| eval_expr_legacy(arg, table, values))?;
+                return crate::engine::geo::sql::eval_geometry_constructor(
+                    name,
+                    &evaluated,
+                    geometry_arguments,
+                );
+            }
             if name.eq_ignore_ascii_case("FIELD") {
                 let domain = field_comparison_domain(
                     args.iter()
@@ -5235,7 +5270,7 @@ where
             }
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::Int(value_bytes(&value).len() as i64))
+                Ok(Value::Int(value_bytes_ref(&value).len() as i64))
             })
         }
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
@@ -5800,8 +5835,8 @@ where
                     };
                     cast_to_decimal(&value, precision, scale)
                 }
-                "DOUBLE" => Ok(Value::Double(numeric(&value)?)),
-                "FLOAT" => Ok(Value::Float(numeric(&value)? as f32)),
+                "DOUBLE" => cast_to_float(&value, false),
+                "FLOAT" => cast_to_float(&value, true),
                 "BINARY" => {
                     // MySQL 8.0 CAST AS BINARY(n): if `n` is given, pad the
                     // right with 0x00 up to n bytes or truncate down to n
@@ -5864,10 +5899,9 @@ where
                     Value::String(s) => {
                         crate::engine::json::parse_text(&s, 1, "cast").map(Value::Json)
                     }
-                    Value::Bytes(b) => {
-                        crate::engine::json::parse_text(&String::from_utf8_lossy(&b), 1, "cast")
-                            .map(Value::Json)
-                    }
+                    Value::Bytes(b) => Ok(Value::Json(crate::engine::json::scalar_from_value(
+                        &Value::Bytes(b),
+                    ))),
                     // A DECIMAL *value* (`CAST(3.14 AS JSON)`) and temporal
                     // values keep their type/precision via the tagged scalar
                     // encoder (→ JSON DECIMAL/DATE/TIME/DATETIME).
@@ -6206,37 +6240,7 @@ where
                 }
             }
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| match &value {
-                // Numeric input follows CONV(N, 10, 16) per MySQL 8.0 manual:
-                // FLOAT/DOUBLE/DECIMAL are rounded half-away-from-zero to an
-                // integer first (HEX(1.5) → "2"); negative values use the
-                // unsigned two's-complement representation, matching CONV.
-                Value::Int(v) => Ok(Value::String(format!("{:X}", *v as u64))),
-                Value::UInt(v) => Ok(Value::String(format!("{:X}", v))),
-                Value::Float(_)
-                | Value::Double(_)
-                | Value::Decimal(_)
-                | Value::DecimalCompact(_, _)
-                | Value::Decimal128(..)
-                | Value::DecimalWide(..) => {
-                    let n = cast_to_integer(&value, false)?;
-                    let as_int = match n {
-                        Value::Int(v) => v as u64,
-                        Value::UInt(v) => v,
-                        _ => int_value(&n)? as u64,
-                    };
-                    Ok(Value::String(format!("{:X}", as_int)))
-                }
-                // BLOB/binary string: hex-encode the raw bytes. Routing
-                // through string_value would lossily map invalid UTF-8
-                // (e.g. 0xFF) to U+FFFD before encoding.
-                Value::Bytes(b) => Ok(Value::String(hex_upper_encode(b))),
-                // Any other value (String, temporal, ...) is treated as a
-                // byte string: HEX(str) hex-encodes each byte per MySQL 8.0.
-                // Do NOT dispatch to numeric based on parse::<i64>() success —
-                // MySQL keys off the argument type, not on its content.
-                _ => Ok(Value::String(hex_upper_encode(&value_bytes(&value)))),
-            })
+            hex_value(&value)
         }
         "UNHEX" => {
             let value = eval_one(name, args, &mut eval_arg)?;
@@ -6297,34 +6301,18 @@ where
             // is tracked separately.
             expect_min_args(name, args, 1)?;
             let values = eval_args(args, &mut eval_arg)?;
-            let mut out: Vec<u8> = Vec::with_capacity(values.len());
-            for (arg, v) in args.iter().zip(&values) {
-                if matches!(v, Value::Null) {
-                    continue;
-                }
-                // MySQL takes the argument as an integer, so treat any
-                // string/float exactly like a numeric CAST would. Hex/bit
-                // literals retain binary Value storage in most contexts but
-                // are explicitly numeric arguments to CHAR().
-                let numeric;
-                let v = if expr_is_numeric_hexbit_literal(arg) {
-                    numeric = coerce_hex_bytes_to_uint(v.clone());
-                    &numeric
-                } else {
-                    v
-                };
-                let n = string_extent_arg(v) as u32;
-                if n == 0 {
-                    out.push(0);
-                    continue;
-                }
-                // Emit the minimum number of big-endian bytes required.
-                let leading_zero_bytes = (n.leading_zeros() / 8) as usize;
-                for shift in (0..4 - leading_zero_bytes).rev() {
-                    out.push((n >> (shift * 8)) as u8);
-                }
-            }
-            Ok(Value::Bytes(out))
+            let values = args
+                .iter()
+                .zip(values)
+                .map(|(arg, value)| {
+                    if expr_is_numeric_hexbit_literal(arg) {
+                        coerce_hex_bytes_to_uint(value)
+                    } else {
+                        value
+                    }
+                })
+                .collect::<smallvec::SmallVec<[Value; 4]>>();
+            Ok(eval_char_values(&values))
         }
         "CHAR_USING" => {
             expect_arg_count(name, args, 2)?;
@@ -6401,29 +6389,20 @@ where
                 }
                 let s = string_value(&values[0]);
                 let new_str = string_value(&values[3]);
-                let chars: Vec<char> = s.chars().collect();
                 // MySQL: pos outside 1..=CHAR_LENGTH(str) returns the
                 // original string; a negative length replaces through
                 // the end of the string.
-                if pos < 1 || pos as usize > chars.len() {
+                let Some(range) = insert_text_range(&s, pos, len) else {
                     return Ok(Value::String(s));
-                }
-                let start = pos as usize - 1;
-                let end = if len < 0 {
-                    chars.len()
-                } else {
-                    start.saturating_add(len as usize).min(chars.len())
                 };
-                let removed: usize = chars[start..end].iter().map(|c| c.len_utf8()).sum();
-                if string_result_exceeds_packet(
-                    "insert",
-                    (s.len() - removed).saturating_add(new_str.len()) as u64,
-                ) {
+                let size = (s.len() - range.len()).saturating_add(new_str.len());
+                if string_result_exceeds_packet("insert", size as u64) {
                     return Ok(Value::Null);
                 }
-                let mut out: String = chars[..start].iter().collect();
+                let mut out = String::with_capacity(size);
+                out.push_str(&s[..range.start]);
                 out.push_str(&new_str);
-                out.extend(&chars[end..]);
+                out.push_str(&s[range.end..]);
                 Ok(Value::String(out))
             })
         }
@@ -6644,7 +6623,7 @@ where
             }
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::Int((value_bytes(&value).len() * 8) as i64))
+                Ok(Value::Int((value_bytes_ref(&value).len() * 8) as i64))
             })
         }
         "OCTET_LENGTH" => {
@@ -6658,7 +6637,7 @@ where
             }
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::Int(value_bytes(&value).len() as i64))
+                Ok(Value::Int(value_bytes_ref(&value).len() as i64))
             })
         }
         "QUOTE" => {
@@ -7152,18 +7131,21 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
-                let is_datetime = |value: &Value| {
-                    if matches!(
-                        value,
-                        Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_)
-                    ) {
-                        return true;
+                let temporal_kind = |value: &Value| {
+                    match value {
+                        Value::Date(_) => return 0u8,
+                        Value::DateTime(_) | Value::Timestamp(_) => return 1,
+                        Value::Time(_) => return 2,
+                        _ => {}
                     }
                     let text = string_value(value);
-                    let bytes = text.as_bytes();
-                    bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-')
+                    let bytes = text.trim_ascii().as_bytes();
+                    if bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-') {
+                        return u8::from(bytes.len() > 10);
+                    }
+                    2
                 };
-                if is_datetime(&values[0]) != is_datetime(&values[1]) {
+                if temporal_kind(&values[0]) != temporal_kind(&values[1]) {
                     return Ok(Value::Null);
                 }
                 // MySQL: both args must be the same kind (both TIME or
@@ -7612,7 +7594,14 @@ where
             } else {
                 let seconds = numeric(&value)?;
                 if seconds.is_sign_positive() && seconds.is_finite() {
-                    sleep_with_cancel(Duration::from_secs_f64(seconds))?;
+                    // MySQL's interruptible SLEEP treats sub-10us requests
+                    // as zero waits; preserve cancellation without entering
+                    // the operating-system sleep path for this domain.
+                    if seconds < 0.00001 {
+                        crate::engine::cancel::check_cancelled()?;
+                    } else {
+                        sleep_with_cancel(Duration::from_secs_f64(seconds))?;
+                    }
                 }
             }
             Ok(Value::Int(0))
@@ -7620,48 +7609,16 @@ where
         // -- Hash functions --
         "MD5" => {
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| {
-                use md5::Digest;
-                let hash = md5::Md5::digest(value_bytes_ref(&value));
-                Ok(Value::String(crate::util::hex::encode_lower(&hash)))
-            })
+            digest::hash_value(digest::HashAlgorithm::Md5, &value)
         }
         "SHA1" | "SHA" => {
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| {
-                use sha1::Digest;
-                let hash = sha1::Sha1::digest(value_bytes_ref(&value));
-                Ok(Value::String(crate::util::hex::encode_lower(&hash)))
-            })
+            digest::hash_value(digest::HashAlgorithm::Sha1, &value)
         }
         "SHA2" => {
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, &mut eval_arg)?;
-            // MySQL distinguishes the two NULL positions: NULL data
-            // propagates silently, while a NULL/invalid digest length is an
-            // invalid native-function parameter and emits warning 1583.
-            if matches!(values[1], Value::Null) {
-                warn_invalid_sha2_length();
-                return Ok(Value::Null);
-            }
-            use sha2::Digest;
-            let hash_len = int_value(&values[1])?;
-            if !matches!(hash_len, 0 | 224 | 256 | 384 | 512) {
-                warn_invalid_sha2_length();
-                return Ok(Value::Null);
-            }
-            if matches!(values[0], Value::Null) {
-                return Ok(Value::Null);
-            }
-            let input = value_bytes_ref(&values[0]);
-            let hex = match hash_len {
-                224 => crate::util::hex::encode_lower(&sha2::Sha224::digest(&input)),
-                256 | 0 => crate::util::hex::encode_lower(&sha2::Sha256::digest(&input)),
-                384 => crate::util::hex::encode_lower(&sha2::Sha384::digest(&input)),
-                512 => crate::util::hex::encode_lower(&sha2::Sha512::digest(&input)),
-                _ => unreachable!("SHA2 length validated above"),
-            };
-            Ok(Value::String(hex))
+            digest::sha2_value(&values[0], &values[1])
         }
         // -- JSON functions --
         "JSON_EXTRACT" => {
@@ -7851,7 +7808,10 @@ where
                     // so its length is the number of matched locations.
                     return Ok(Value::Int(matches.len() as i64));
                 } else {
-                    matches.into_iter().next().map(|n| n.to_owned_bytes())
+                    matches
+                        .into_iter()
+                        .next()
+                        .map(|n| std::borrow::Cow::Owned(n.to_owned_bytes()))
                 }
             } else {
                 Some(doc_bytes)
@@ -7879,6 +7839,7 @@ where
                 }
                 // JSON_KEYS's path arg is single-value context (see JSON_LENGTH).
                 json_path_extract_one_no_wildcard(&doc_bytes, &string_value(&path_val))?
+                    .map(std::borrow::Cow::Owned)
             } else {
                 Some(doc_bytes)
             };
@@ -7945,26 +7906,26 @@ where
             if matches!(doc_val, Value::Null) || matches!(candidate_val, Value::Null) {
                 return Ok(Value::Null);
             }
-            let doc = json_doc_arg(&doc_val, 1, "json_contains")?;
-            let candidate = json_doc_arg(&candidate_val, 2, "json_contains")?;
+            let doc = json_doc_bytes(&doc_val, 1, "json_contains")?;
+            let candidate = json_doc_bytes(&candidate_val, 2, "json_contains")?;
+            let root = crate::engine::json::JsonbRef::new(&doc)?;
+            let candidate = crate::engine::json::JsonbRef::new(&candidate)?;
             let target = if args.len() == 3 {
                 let path_val = eval_arg(&args[2])?;
                 if matches!(path_val, Value::Null) {
                     return Ok(Value::Null);
                 }
-                // A wildcard path raises 3149 here (MySQL: JSON_CONTAINS
-                // requires a path that addresses a single value).
-                json_path_extract_raw(&doc, &string_value(&path_val))?
+                let path = crate::engine::func_cache::cached_json_path(&string_value(&path_val))?;
+                if path.has_wildcard {
+                    return Err(crate::error::catalog::ER_INVALID_JSON_PATH_WILDCARD.error("In this situation, path expressions may not contain the * and ** tokens or an array range."));
+                }
+                path.eval(root).first().copied()
             } else {
-                Some(doc)
+                Some(root)
             };
             match target {
                 None => Ok(Value::Null),
-                Some(target) => Ok(Value::Int(if json_contains(&target, &candidate) {
-                    1
-                } else {
-                    0
-                })),
+                Some(target) => Ok(Value::Int(i64::from(json_contains(target, candidate)))),
             }
         }
         "__MEMBER_OF" => eval_json_member_of(name, args, eval_arg),
@@ -8035,6 +7996,12 @@ where
     // dispatch into the geometry SQL surface.
     if crate::engine::geo::sql::is_geo_function(upper) {
         let values = eval_args(args, eval_arg)?;
+        if crate::engine::geo::sql::is_geometry_collection_constructor(upper) {
+            let typed = args
+                .iter()
+                .all(|arg| const_expr_type(arg) == ColumnType::Geometry);
+            return crate::engine::geo::sql::eval_geometry_constructor(name, &values, typed);
+        }
         return crate::engine::geo::sql::eval(upper, name, &values);
     }
     // Vector functions (DISTANCE / STRING_TO_VECTOR / VECTOR_DIM / …) dispatch
@@ -8054,7 +8021,8 @@ where
                 // single-line encoding round-trips through mydb's own
                 // FROM_BASE64 but not through the client's when the
                 // client's decoder is strict about line length.
-                let encoded = base64::engine::general_purpose::STANDARD.encode(value_bytes(&value));
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(value_bytes_ref(&value));
                 let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 + 1);
                 for (i, ch) in encoded.chars().enumerate() {
                     if i > 0 && i % 76 == 0 {
@@ -8560,7 +8528,7 @@ where
             let value = eval_one(name, args, eval_arg)?;
             null_or(value, |value| {
                 Ok(Value::Int(
-                    parse_uuid_bytes(&string_value(&value)).is_some() as i64,
+                    parse_uuid_bytes(&str_value(&value)).is_some() as i64
                 ))
             })
         }
@@ -8898,8 +8866,9 @@ where
                 // MySQL reports the on-disk binary-JSON representation, not
                 // our internal JSONB byte count.
                 let bytes = json_doc_bytes(&value, 1, name)?;
-                let mysql_binary = crate::engine::json::mysql_binary::encode(&bytes)?;
-                Ok(Value::Int(mysql_binary.len() as i64))
+                Ok(Value::Int(
+                    crate::engine::json::mysql_binary::encoded_size(&bytes)? as i64,
+                ))
             })
         }
         "JSON_STORAGE_FREE" => {
@@ -9174,8 +9143,8 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let sub = parse_gtid_set(&string_value(&values[0]))?;
-                let sup = parse_gtid_set(&string_value(&values[1]))?;
+                let sub = parsed_gtid_argument(&args[0], &values[0])?;
+                let sup = parsed_gtid_argument(&args[1], &values[1])?;
                 Ok(Value::Int(gtid_set_is_subset(&sub, &sup) as i64))
             })
         }
@@ -9183,8 +9152,8 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let base = parse_gtid_set(&string_value(&values[0]))?;
-                let minus = parse_gtid_set(&string_value(&values[1]))?;
+                let base = parsed_gtid_argument(&args[0], &values[0])?;
+                let minus = parsed_gtid_argument(&args[1], &values[1])?;
                 Ok(Value::String(format_gtid_set(&gtid_set_subtract(
                     &base, &minus,
                 ))))
@@ -10333,10 +10302,10 @@ fn warn_invalid_logarithm() -> Value {
 /// digit prefix of `n` is parsed in `from_base` (warning 1292 on trailing
 /// garbage), saturating at u64::MAX; a leading `-` wraps two's-complement.
 /// A negative `to_base` formats the value as signed.
-fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
+pub(crate) fn parse_conv(n: &str, from_base: u32) -> Option<(u64, bool)> {
     let trimmed = n.trim();
     if trimmed.is_empty() {
-        return Value::Null;
+        return None;
     }
     let (negative, body) = match trimmed.as_bytes().first() {
         Some(b'-') => (true, &trimmed[1..]),
@@ -10371,13 +10340,6 @@ fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
             break;
         }
     }
-    if saturated || consumed < body.len() || consumed == 0 {
-        crate::engine::api::push_statement_warning(
-            crate::error::ConditionLevel::Warning,
-            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-            format!("Truncated incorrect DECIMAL value: '{n}'"),
-        );
-    }
     if saturated {
         magnitude = u64::MAX;
     }
@@ -10386,31 +10348,68 @@ fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
     } else {
         magnitude
     };
-    let digits = |mut num: u64, base: u64| -> String {
-        if num == 0 {
-            return "0".to_string();
-        }
-        let mut out = Vec::new();
-        while num > 0 {
-            let d = (num % base) as u8;
-            out.push(if d < 10 { b'0' + d } else { b'A' + d - 10 });
-            num /= base;
-        }
-        out.reverse();
-        String::from_utf8(out).expect("radix digits are ASCII")
-    };
-    let text = if to_base < 0 {
-        // Signed output base.
-        let signed = value as i64;
-        if signed < 0 {
-            format!("-{}", digits(signed.unsigned_abs(), to_base.unsigned_abs()))
+    Some((value, saturated || consumed < body.len() || consumed == 0))
+}
+
+/// Append radix digits without allocating an intermediate per-row string.
+pub(crate) fn append_conv_digits(value: u64, to_base: i64, out: &mut Vec<u8>) {
+    debug_assert!((2..=36).contains(&to_base.unsigned_abs()));
+    let mut number = value;
+    if to_base < 0 && (value as i64) < 0 {
+        out.push(b'-');
+        number = (value as i64).unsigned_abs();
+    }
+    let base = to_base.unsigned_abs();
+    let mut digits = [0u8; 64];
+    let mut start = digits.len();
+    loop {
+        let digit = (number % base) as u8;
+        start -= 1;
+        digits[start] = if digit < 10 {
+            b'0' + digit
         } else {
-            digits(signed as u64, to_base.unsigned_abs())
+            b'A' + digit - 10
+        };
+        number /= base;
+        if number == 0 {
+            break;
         }
-    } else {
-        digits(value, to_base as u64)
+    }
+    out.extend_from_slice(&digits[start..]);
+}
+
+fn eval_conv(n: &str, from_base: u32, to_base: i64) -> Value {
+    let Some((value, warning)) = parse_conv(n, from_base) else {
+        return Value::Null;
     };
-    Value::String(text)
+    if warning {
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Warning,
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+            format!("Truncated incorrect DECIMAL value: '{n}'"),
+        );
+    }
+    let mut text = Vec::with_capacity(65);
+    append_conv_digits(value, to_base, &mut text);
+    Value::String(String::from_utf8(text).expect("radix digits are ASCII"))
+}
+
+/// Byte boundaries for INSERT on character strings; an invalid position
+/// leaves the source unchanged. No character array is needed.
+pub(crate) fn insert_text_range(s: &str, pos: i64, len: i64) -> Option<std::ops::Range<usize>> {
+    if pos < 1 {
+        return None;
+    }
+    let start = s.char_indices().nth(usize::try_from(pos - 1).ok()?)?.0;
+    let end = if len < 0 {
+        s.len()
+    } else {
+        s[start..]
+            .char_indices()
+            .nth(usize::try_from(len).ok()?)
+            .map_or(s.len(), |(offset, _)| start + offset)
+    };
+    Some(start..end)
 }
 
 pub(crate) fn eval_greatest_least<F>(
@@ -11170,6 +11169,9 @@ pub(crate) fn string_extent_arg(value: &Value) -> i64 {
 }
 
 fn sleep_with_cancel(duration: Duration) -> Result<(), QueryError> {
+    if duration.is_zero() {
+        return crate::engine::cancel::check_cancelled();
+    }
     let _sleeping = crate::engine::cancel::enter_process_stage(
         crate::engine::session_registry::ProcessState::UserSleep,
     );
@@ -11398,7 +11400,15 @@ pub(crate) fn mysql_case_map(s: &str, upper: bool) -> String {
 }
 
 /// MySQL simple case mapping shared by scalar and contiguous column output.
+#[inline]
 pub(crate) fn mysql_case_char(c: char, upper: bool) -> char {
+    if c.is_ascii() {
+        return if upper {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+    }
     if upper {
         let mut mapped = c.to_uppercase();
         let first = mapped.next().unwrap_or(c);
@@ -11713,7 +11723,17 @@ fn find_position_collated(haystack: &str, needle: &str, start: i64, collation_id
         boundaries.push(haystack_key.len());
     }
 
-    for char_index in start_index..char_count {
+    match_collation_search_keys(&haystack_key, &boundaries, &needle_key, start_index)
+}
+
+/// Match complete weight sequences only at original character boundaries.
+pub(crate) fn match_collation_search_keys(
+    haystack_key: &[u8],
+    boundaries: &[usize],
+    needle_key: &[u8],
+    start_index: usize,
+) -> usize {
+    for char_index in start_index..boundaries.len().saturating_sub(1) {
         let key_start = boundaries[char_index];
         let Some(key_end) = key_start.checked_add(needle_key.len()) else {
             return 0;
@@ -11725,7 +11745,7 @@ fn find_position_collated(haystack: &str, needle: &str, start: i64, collation_id
         if first_end < boundaries.len()
             && boundaries[first_end] == key_end
             && first_end > char_index
-            && haystack_key[key_start..key_end] == needle_key
+            && haystack_key[key_start..key_end] == *needle_key
         {
             return char_index + 1;
         }
@@ -12309,7 +12329,7 @@ pub(crate) fn eval_quarter_value(v: &Value) -> Result<Value, QueryError> {
     Ok(Value::Int(((dt.month() - 1) / 3 + 1) as i64))
 }
 
-fn mysql_calendar_day_number(year: i32, month: u32, day: u32) -> i64 {
+pub(crate) fn mysql_calendar_day_number(year: i32, month: u32, day: u32) -> i64 {
     let mut y = i64::from(year);
     let m = i64::from(month);
     let mut days = 365 * y + 31 * (m - 1) + i64::from(day);
@@ -12396,6 +12416,11 @@ pub(crate) fn eval_microsecond_value(v: &Value) -> Result<Value, QueryError> {
     }
 }
 
+/// Read at evaluation time so prepared WEEK expressions observe rebinding.
+pub(crate) fn session_default_week_format() -> u32 {
+    with_session_view(|view| view.map(|v| v.default_week_format()).unwrap_or(0))
+}
+
 /// `WEEK(date[, mode])` — `mode: None` reads the session's
 /// `default_week_format` (so callers passing `None` are
 /// session-dependent / non-deterministic).
@@ -12404,9 +12429,7 @@ pub(crate) fn eval_week_value(v: &Value, mode: Option<i64>) -> Result<Value, Que
         return Ok(Value::Null);
     };
     let mode = mode
-        .unwrap_or_else(|| {
-            with_session_view(|view| view.map(|v| v.default_week_format() as i64).unwrap_or(0))
-        })
+        .unwrap_or_else(|| i64::from(session_default_week_format()))
         .rem_euclid(8) as u32;
     Ok(Value::Int(mysql_calc_week(dt.date(), mode).1 as i64))
 }
@@ -13573,7 +13596,7 @@ fn month_diff(dt1: NaiveDateTime, dt2: NaiveDateTime) -> i64 {
 /// Returns `None` on any mismatch; the caller renders that as NULL,
 /// matching MySQL's non-STRICT default (`STRICT` mode surfacing is
 /// handled at the DML boundary, not here).
-fn str_to_date_native(input: &str, fmt: &str) -> Option<Value> {
+pub(crate) fn str_to_date_native(input: &str, fmt: &str) -> Option<Value> {
     let mut b = StrToDateBuilder::default();
     let input = input.trim();
     let mut ib = input.as_bytes();
@@ -14161,7 +14184,7 @@ fn seconds_to_clamped_time_string(total_secs: i64) -> String {
 /// `[-838:59:59, 838:59:59]`. Used by TIMEDIFF (fsp-aware, range-clamped).
 /// Locale-specific number rendering for `FORMAT(X, D, locale)`.
 #[derive(Clone, Copy)]
-struct NumberStyle {
+pub(crate) struct NumberStyle {
     decimal_point: char,
     /// `None` means "no grouping" (e.g. several Asian locales without a
     /// thousands separator in MySQL's tables — not currently used).
@@ -14184,7 +14207,7 @@ impl NumberStyle {
 /// whether the locale was recognised; caller uses the `false` case to
 /// push MySQL's Warning 1649 `Unknown locale` before falling back to
 /// en_US.
-fn locale_number_style_checked(locale: &str) -> (NumberStyle, bool) {
+pub(crate) fn locale_number_style_checked(locale: &str) -> (NumberStyle, bool) {
     let lower = locale.trim().to_ascii_lowercase();
     let style = match lower.as_str() {
         // "12.332,20"
@@ -14343,31 +14366,59 @@ fn group_number_string(fixed: &str, style: NumberStyle) -> String {
         Some((i, d)) => (i, Some(d)),
         None => (rest, None),
     };
-    let mut grouped_rev = String::new();
-    for (i, ch) in integer_part.chars().rev().enumerate() {
-        if let Some(sep) = style.group_sep {
-            let boundary = if style.indian_grouping {
-                i == 3 || (i > 3 && (i - 3) % 2 == 0)
-            } else {
-                i > 0 && i % 3 == 0
-            };
-            if boundary {
-                grouped_rev.push(sep);
-            }
-        }
-        grouped_rev.push(ch);
-    }
-    let grouped: String = grouped_rev.chars().rev().collect();
-    let mut result = String::new();
+    let mut result = Vec::with_capacity(fixed.len().saturating_mul(2));
     if neg {
-        result.push('-');
+        result.push(b'-');
     }
-    result.push_str(&grouped);
+    style.append_integer(integer_part.as_bytes(), &mut result);
     if let Some(dec) = decimal_part {
-        result.push(style.decimal_point);
-        result.push_str(dec);
+        let mut buffer = [0; 4];
+        result.extend_from_slice(style.decimal_point.encode_utf8(&mut buffer).as_bytes());
+        result.extend_from_slice(dec.as_bytes());
     }
-    result
+    String::from_utf8(result).expect("number formatting produces UTF-8")
+}
+
+impl NumberStyle {
+    fn append_integer(self, digits: &[u8], out: &mut Vec<u8>) {
+        let mut buffer = [0; 4];
+        for (i, &digit) in digits.iter().enumerate() {
+            let remaining = digits.len() - i;
+            let boundary = i > 0
+                && if self.indian_grouping {
+                    remaining == 3 || remaining > 3 && (remaining - 3) % 2 == 0
+                } else {
+                    remaining % 3 == 0
+                };
+            if boundary {
+                if let Some(separator) = self.group_sep {
+                    out.extend_from_slice(separator.encode_utf8(&mut buffer).as_bytes());
+                }
+            }
+            out.push(digit);
+        }
+    }
+
+    /// Render an already rounded coefficient directly into the output lane.
+    pub(crate) fn append_exact(self, magnitude: i128, scale: u8, out: &mut Vec<u8>) {
+        let mut buffer = itoa::Buffer::new();
+        let digits = buffer.format(magnitude.unsigned_abs()).as_bytes();
+        let scale = usize::from(scale);
+        if magnitude < 0 {
+            out.push(b'-');
+        }
+        if digits.len() > scale {
+            self.append_integer(&digits[..digits.len() - scale], out);
+        } else {
+            out.push(b'0');
+        }
+        if scale > 0 {
+            let mut point = [0; 4];
+            out.extend_from_slice(self.decimal_point.encode_utf8(&mut point).as_bytes());
+            out.resize(out.len() + scale.saturating_sub(digits.len()), b'0');
+            out.extend_from_slice(&digits[digits.len().saturating_sub(scale)..]);
+        }
+    }
 }
 
 fn format_datetime_fsp(dt: NaiveDateTime, fsp: usize) -> String {
@@ -14643,6 +14694,46 @@ pub(crate) fn value_bytes_ref(value: &Value) -> std::borrow::Cow<'_, [u8]> {
     }
 }
 
+/// Shared HEX value semantics; encoding provenance is bound by the caller.
+pub(crate) fn hex_value(value: &Value) -> Result<Value, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match value {
+        // Numeric input follows CONV(N, 10, 16) per MySQL 8.0 manual:
+        // FLOAT/DOUBLE/DECIMAL are rounded half-away-from-zero to an
+        // integer first (HEX(1.5) → "2"); negative values use the
+        // unsigned two's-complement representation, matching CONV.
+        Value::Int(v) => Ok(Value::String(format!("{:X}", *v as u64))),
+        Value::UInt(v) => Ok(Value::String(format!("{:X}", v))),
+        Value::Float(_)
+        | Value::Double(_)
+        | Value::Decimal(_)
+        | Value::DecimalCompact(_, _)
+        | Value::Decimal128(..)
+        | Value::DecimalWide(..) => {
+            let n = cast_to_integer(value, false)?;
+            let as_int = match n {
+                Value::Int(v) => v as u64,
+                Value::UInt(v) => v,
+                _ => int_value(&n)? as u64,
+            };
+            Ok(Value::String(format!("{:X}", as_int)))
+        }
+        // BLOB/binary string: hex-encode the raw bytes. Routing
+        // through string_value would lossily map invalid UTF-8
+        // (e.g. 0xFF) to U+FFFD before encoding.
+        Value::Bytes(b) => Ok(Value::String(hex_upper_encode(b))),
+        // Any other value (String, temporal, ...) is treated as a
+        // byte string: HEX(str) hex-encodes each byte per MySQL 8.0.
+        // Do NOT dispatch to numeric based on parse::<i64>() success —
+        // MySQL keys off the argument type, not on its content.
+        _ => Ok(Value::String(hex_upper_encode(
+            value_bytes_ref(value).as_ref(),
+        ))),
+    }
+}
+
 fn function_arg_with_table_octets(
     function_name: &str,
     expr: &Expr,
@@ -14748,7 +14839,7 @@ fn function_arg_with_table_octets(
     crate::charset::encode_string(charset, &text).map(Value::Bytes)
 }
 
-fn regexp_start_byte(subject: &str, pos: usize) -> Result<usize, QueryError> {
+pub(crate) fn regexp_start_byte(subject: &str, pos: usize) -> Result<usize, QueryError> {
     let index = pos - 1;
     if (!subject.is_empty() && index >= subject.chars().count())
         || (subject.is_empty() && index > 0)
@@ -15175,7 +15266,22 @@ pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, Qu
     })
 }
 
-fn soundex_mysql(input: &str) -> String {
+/// Shared numeric-to-octet CHAR rendering after argument evaluation.
+pub(crate) fn eval_char_values(values: &[Value]) -> Value {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        let n = string_extent_arg(value) as u32;
+        let bytes = n.to_be_bytes();
+        let start = ((n.leading_zeros() / 8) as usize).min(3);
+        out.extend_from_slice(&bytes[start..]);
+    }
+    Value::Bytes(out)
+}
+
+pub(crate) fn soundex_mysql(input: &str) -> String {
     fn code(ch: char) -> char {
         match ch.to_ascii_uppercase() {
             'B' | 'F' | 'P' | 'V' => '1',
@@ -15633,10 +15739,8 @@ fn json_value_from_dom(dom: &serde_json::Value) -> Value {
 }
 
 pub(crate) fn checked_json_value(bytes: Vec<u8>) -> Result<Value, QueryError> {
-    let depth = crate::engine::json::JsonbRef::new(&bytes)?.depth();
-    if depth > crate::engine::json::MAX_JSON_DEPTH {
-        return Err(crate::engine::json::json_too_deep());
-    }
+    let root = crate::engine::json::JsonbRef::new(&bytes)?;
+    root.validate()?;
     Ok(Value::Json(bytes))
 }
 
@@ -15730,35 +15834,78 @@ fn json_doc_strict_bytes(value: &Value, arg: usize, function: &str) -> Result<Ve
 /// Get the binary `jsonb` bytes of a JSON-document argument. A
 /// `Value::Json` is used directly; text is parsed once (MySQL error 3141
 /// on invalid input).
-fn json_doc_bytes(value: &Value, arg: usize, function: &str) -> Result<Vec<u8>, QueryError> {
-    json_doc_strict_bytes(value, arg, function)
+fn json_doc_bytes<'a>(
+    value: &'a Value,
+    arg: usize,
+    function: &str,
+) -> Result<std::borrow::Cow<'a, [u8]>, QueryError> {
+    match value {
+        Value::Json(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+        _ => json_doc_strict_bytes(value, arg, function).map(std::borrow::Cow::Owned),
+    }
 }
 
 /// Evaluate one-or-more JSON paths against a binary document and apply
 /// MySQL's autowrap rule: a single non-wildcard path that matches returns
 /// the bare value; multiple paths or any wildcard wraps the matches into a
 /// JSON array; no match yields SQL NULL. Drives `JSON_EXTRACT` and `->`.
-fn json_extract_binary(doc_bytes: &[u8], paths: &[String]) -> Result<Value, QueryError> {
+fn json_extract_binary<P: AsRef<str>>(doc_bytes: &[u8], paths: &[P]) -> Result<Value, QueryError> {
     use crate::engine::json::JsonbRef;
     let root = JsonbRef::new(doc_bytes)?;
-    let mut matched: Vec<Vec<u8>> = Vec::new();
+    let mut single = if paths.len() == 1 {
+        Some(crate::engine::func_cache::cached_json_path(
+            paths[0].as_ref(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(path) = &single {
+        if !path.has_wildcard {
+            return Ok(path
+                .eval_one(root)
+                .map_or(Value::Null, |node| Value::Json(node.to_owned_bytes())));
+        }
+    }
+    let mut matched = smallvec::SmallVec::<[JsonbRef<'_>; 8]>::new();
     let mut wrap = paths.len() > 1;
     for p in paths {
-        let path = crate::engine::func_cache::cached_json_path(p)?;
+        let path = match single.take() {
+            Some(path) => path,
+            None => crate::engine::func_cache::cached_json_path(p.as_ref())?,
+        };
         if path.has_wildcard {
             wrap = true;
         }
         for node in path.eval(root) {
-            matched.push(node.to_owned_bytes());
+            matched.push(node);
         }
     }
     if matched.is_empty() {
         return Ok(Value::Null);
     }
     if matched.len() == 1 && !wrap {
-        return Ok(Value::Json(matched.into_iter().next().unwrap()));
+        return Ok(Value::Json(matched[0].to_owned_bytes()));
     }
-    checked_json_value(crate::engine::json::build_array(&matched))
+    let mut bytes = Vec::new();
+    crate::engine::json::append_borrowed_array(&matched, &mut bytes)?;
+    checked_json_value(bytes)
+}
+
+/// Read-only compiled arguments preserve eager child evaluation while borrowing
+/// the document and path strings through the shared extraction implementation.
+pub(crate) fn json_extract_value_refs(doc: &Value, paths: &[&Value]) -> Result<Value, QueryError> {
+    if matches!(doc, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let bytes = json_doc_bytes(doc, 1, "json_extract")?;
+    let mut texts = smallvec::SmallVec::<[std::borrow::Cow<'_, str>; 4]>::new();
+    for value in paths {
+        if matches!(value, Value::Null) {
+            return Ok(Value::Null);
+        }
+        texts.push(str_value(value));
+    }
+    json_extract_binary(&bytes, &texts)
 }
 
 /// Extract the single node addressed by `path` from a binary document as
@@ -15784,7 +15931,7 @@ fn json_path_extract_one_no_wildcard(
         ));
     }
     let root = crate::engine::json::JsonbRef::new(doc_bytes)?;
-    Ok(jp.eval(root).into_iter().next().map(|n| n.to_owned_bytes()))
+    Ok(jp.eval_one(root).map(|n| n.to_owned_bytes()))
 }
 
 fn eval_json_array_append<F>(
@@ -16031,33 +16178,32 @@ where
     expect_arg_count(name, args, 2)?;
     let values = eval_args(args, eval_arg)?;
     null_if_any(values, |values| {
-        Ok(Value::Int(json_overlaps(
-            &json_doc_arg(&values[0], 1, name)?,
-            &json_doc_arg(&values[1], 2, name)?,
-        ) as i64))
+        let left = json_doc_bytes(&values[0], 1, name)?;
+        let right = json_doc_bytes(&values[1], 2, name)?;
+        Ok(Value::Int(i64::from(json_overlaps(
+            crate::engine::json::JsonbRef::new(&left)?,
+            crate::engine::json::JsonbRef::new(&right)?,
+        ))))
     })
 }
 
-fn json_overlaps(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    use serde_json::Value as J;
-    // Equality here must respect MySQL's cross-subtype numeric rules
-    // (`1 == 1.0`); see `json_dom_equiv` for why raw `==` on serde values
-    // isn't safe.
-    match (left, right) {
-        // Two arrays overlap iff they share at least one *equal* element
-        // (element comparison is equality, not a recursive overlap — the old
-        // recursion made `[[1,2]]` wrongly overlap `[[2,3]]` via the shared 2).
-        (J::Array(l), J::Array(r)) => l.iter().any(|lv| r.iter().any(|rv| json_dom_equiv(lv, rv))),
-        // Array vs non-array: the scalar/object must equal some element
-        // (MySQL treats the non-array as a candidate element). The old `_`
-        // arm made this branch always false.
-        (J::Array(a), other) | (other, J::Array(a)) => a.iter().any(|v| json_dom_equiv(v, other)),
-        // Two objects overlap iff they share a key with an equal value.
-        (J::Object(l), J::Object(r)) => l
-            .iter()
-            .any(|(k, lv)| r.get(k).is_some_and(|rv| json_dom_equiv(lv, rv))),
-        // Two scalars: equal (numeric-subtype aware).
-        (l, r) => json_dom_equiv(l, r),
+pub(crate) fn json_overlaps(
+    left: crate::engine::json::JsonbRef<'_>,
+    right: crate::engine::json::JsonbRef<'_>,
+) -> bool {
+    let equal = |a, b| crate::engine::json::compare_nodes(a, b) == std::cmp::Ordering::Equal;
+    if left.is_array() && right.is_array() {
+        left.array_iter()
+            .any(|a| right.array_iter().any(|b| equal(a, b)))
+    } else if left.is_array() {
+        left.array_iter().any(|a| equal(a, right))
+    } else if right.is_array() {
+        right.array_iter().any(|b| equal(left, b))
+    } else if left.is_object() && right.is_object() {
+        left.object_iter()
+            .any(|(key, value)| right.get(key).is_some_and(|other| equal(value, other)))
+    } else {
+        equal(left, right)
     }
 }
 
@@ -16086,8 +16232,8 @@ where
     }
     let doc = json_doc_bytes(&values[0], 1, name)?;
     let root = crate::engine::json::JsonbRef::new(&doc)?;
-    let one = parse_json_one_or_all(&string_value(&values[1]))?;
-    let pattern = string_value(&values[2]);
+    let one = parse_json_one_or_all(&str_value(&values[1]))?;
+    let pattern = str_value(&values[2]);
     // The 4th arg is the LIKE escape character (previously hard-coded to
     // `\`). NULL / absent → default `\`; an empty string disables escaping.
     let escape = match values.get(3) {
@@ -16121,32 +16267,20 @@ where
     } else {
         scopes.insert(root.identity());
     }
-    let mut matches = Vec::new();
-    let mut stack = vec![(root, String::from("$"), false)];
-    while let Some((node, path, selected)) = stack.pop() {
-        let selected = selected || scopes.contains(&node.identity());
-        if node.is_array() {
-            let children: Vec<_> = node.array_iter().enumerate().collect();
-            stack.extend(
-                children
-                    .into_iter()
-                    .rev()
-                    .map(|(i, child)| (child, format!("{path}[{i}]"), selected)),
-            );
-        } else if node.is_object() {
-            let children: Vec<_> = node.object_iter().collect();
-            stack.extend(children.into_iter().rev().map(|(key, child)| {
-                (child, format!("{path}{}", json_path_key_leg(key)), selected)
-            }));
-        } else if selected && node.json_type() == crate::engine::json::JsonType::String {
-            if match_like_pattern(node.as_str().unwrap_or_default(), &pattern, escape) {
-                matches.push(path);
-                if one {
-                    break;
-                }
-            }
-        }
+    if scopes.is_empty() {
+        return Ok(Value::Null);
     }
+    let mut search = JsonSearch {
+        scopes: &scopes,
+        pattern: &pattern,
+        escape,
+        one,
+        path: String::from("$"),
+        matches: smallvec::SmallVec::new(),
+        visited: 1,
+    };
+    search.visit(root, false)?;
+    let mut matches = search.matches;
     if matches.is_empty() {
         Ok(Value::Null)
     } else if one || matches.len() == 1 {
@@ -16166,16 +16300,156 @@ where
 /// is a valid ECMAScript identifier, `."key"` (escaped) otherwise. The old
 /// code quoted *every* key, so `JSON_SEARCH('{"name":"x"}','one','x')`
 /// returned `$."name"` instead of MySQL's `$.name`.
-fn json_path_key_leg(key: &str) -> String {
+fn append_json_path_key_leg(key: &str, out: &mut String) {
     let mut chars = key.chars();
-    let is_ident = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+    let ident = matches!(chars.next(),Some(c) if c.is_ascii_alphabetic() || c=='_' || c=='$')
         && key
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
-    if is_ident {
-        format!(".{key}")
+    out.push('.');
+    if ident {
+        out.push_str(key);
     } else {
-        format!(".\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+        out.push('"');
+        for c in key.chars() {
+            if matches!(c, '\\' | '"') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+    }
+}
+
+struct JsonSearch<'a> {
+    scopes: &'a std::collections::HashSet<usize>,
+    pattern: &'a str,
+    escape: Option<char>,
+    one: bool,
+    path: String,
+    matches: smallvec::SmallVec<[String; 4]>,
+    visited: usize,
+}
+
+/// An unscoped first-match search needs no identity set or DOM result.
+pub(crate) fn json_search_unscoped_one(
+    root: crate::engine::json::JsonbRef<'_>,
+    pattern: &str,
+    escape: Option<char>,
+) -> Result<Option<String>, QueryError> {
+    let scopes = std::collections::HashSet::new();
+    let mut search = JsonSearch {
+        scopes: &scopes,
+        pattern,
+        escape,
+        one: true,
+        path: "$".into(),
+        matches: smallvec::SmallVec::new(),
+        visited: 1,
+    };
+    search.visit(root, true)?;
+    Ok(search.matches.pop())
+}
+
+enum JsonSearchFrame<'a> {
+    Array {
+        iter: crate::engine::json::ArrayIter<'a>,
+        index: usize,
+        selected: bool,
+        mark: usize,
+    },
+    Object {
+        iter: crate::engine::json::ObjectIter<'a>,
+        selected: bool,
+        mark: usize,
+    },
+}
+
+impl JsonSearch<'_> {
+    /// Keep only container iterators and one reusable path buffer. Neither
+    /// deep documents nor wide containers require recursive Rust calls or
+    /// an owned path for every visited node.
+    fn visit(
+        &mut self,
+        root: crate::engine::json::JsonbRef<'_>,
+        selected: bool,
+    ) -> Result<bool, QueryError> {
+        let mut frames: smallvec::SmallVec<[JsonSearchFrame<'_>; 16]> = smallvec::SmallVec::new();
+        let mut next = Some((root, selected));
+        loop {
+            if let Some((node, parent_selected)) = next.take() {
+                if self.visited & 1023 == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
+                self.visited += 1;
+                let selected = parent_selected || self.scopes.contains(&node.identity());
+                if node.is_array() {
+                    frames.push(JsonSearchFrame::Array {
+                        iter: node.array_iter(),
+                        index: 0,
+                        selected,
+                        mark: self.path.len(),
+                    });
+                } else if node.is_object() {
+                    frames.push(JsonSearchFrame::Object {
+                        iter: node.object_iter(),
+                        selected,
+                        mark: self.path.len(),
+                    });
+                } else if selected
+                    && node.json_type() == crate::engine::json::JsonType::String
+                    && match_like_pattern(
+                        node.as_str().unwrap_or_default(),
+                        self.pattern,
+                        self.escape,
+                    )
+                {
+                    self.matches.push(if self.one {
+                        std::mem::take(&mut self.path)
+                    } else {
+                        self.path.clone()
+                    });
+                    if self.one {
+                        return Ok(true);
+                    }
+                }
+            }
+            let Some(frame) = frames.last_mut() else {
+                break;
+            };
+            match frame {
+                JsonSearchFrame::Array {
+                    iter,
+                    index,
+                    selected,
+                    mark,
+                } => {
+                    self.path.truncate(*mark);
+                    if let Some(child) = iter.next() {
+                        use std::fmt::Write;
+                        let _ = write!(&mut self.path, "[{index}]");
+                        *index += 1;
+                        next = Some((child, *selected));
+                    } else {
+                        frames.pop();
+                    }
+                }
+                JsonSearchFrame::Object {
+                    iter,
+                    selected,
+                    mark,
+                } => {
+                    self.path.truncate(*mark);
+                    if let Some((key, child)) = iter.next() {
+                        append_json_path_key_leg(key, &mut self.path);
+                        next = Some((child, *selected));
+                    } else {
+                        frames.pop();
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -16192,9 +16466,18 @@ where
     use std::borrow::Cow;
     let (returning, on_empty, on_error) = if args.len() == 7 {
         (
-            Cow::Owned(string_value(&eval_arg(&args[2])?)),
-            Cow::Owned(string_value(&eval_arg(&args[3])?)),
-            Cow::Owned(string_value(&eval_arg(&args[5])?)),
+            match &args[2] {
+                Expr::Literal(Literal::String(text)) => Cow::Borrowed(text.as_str()),
+                _ => Cow::Owned(string_value(&eval_arg(&args[2])?)),
+            },
+            match &args[3] {
+                Expr::Literal(Literal::String(text)) => Cow::Borrowed(text.as_str()),
+                _ => Cow::Owned(string_value(&eval_arg(&args[3])?)),
+            },
+            match &args[5] {
+                Expr::Literal(Literal::String(text)) => Cow::Borrowed(text.as_str()),
+                _ => Cow::Owned(string_value(&eval_arg(&args[5])?)),
+            },
         )
     } else {
         (
@@ -16222,14 +16505,21 @@ where
     let empty_default = default_value(&on_empty, 4)?;
     let error_default = default_value(&on_error, 6)?;
     let doc_value = eval_arg(&args[0])?;
-    let path_value = eval_const(&args[1]).map_err(|_| {
-        crate::error::catalog::ER_WRONG_ARGUMENTS
-            .error("The JSON_VALUE path argument must be a string literal")
-    })?;
-    if matches!(doc_value, Value::Null) || matches!(path_value, Value::Null) {
+    let path_value = match &args[1] {
+        Expr::Literal(Literal::String(_)) => None,
+        path => Some(eval_const(path).map_err(|_| {
+            crate::error::catalog::ER_WRONG_ARGUMENTS
+                .error("The JSON_VALUE path argument must be a string literal")
+        })?),
+    };
+    if matches!(doc_value, Value::Null) || matches!(path_value, Some(Value::Null)) {
         return Ok(Value::Null);
     }
-    let doc = match json_doc_strict_bytes(&doc_value, 1, name) {
+    let path_text = match &args[1] {
+        Expr::Literal(Literal::String(text)) => Cow::Borrowed(text.as_str()),
+        _ => str_value(path_value.as_ref().expect("evaluated path")),
+    };
+    let doc = match json_doc_bytes(&doc_value, 1, name) {
         Ok(doc) => doc,
         Err(err) => {
             if err.is_any(&[
@@ -16247,7 +16537,7 @@ where
             return json_value_response(&on_error, error_default, false);
         }
     };
-    let path = crate::engine::func_cache::cached_json_path(&string_value(&path_value))?;
+    let path = crate::engine::func_cache::cached_json_path(&path_text)?;
     let nodes = path.eval(crate::engine::json::JsonbRef::new(&doc)?);
     if nodes.len() > 1 {
         if args.len() == 2 {
@@ -16276,7 +16566,13 @@ where
     }
     match json_value_convert_jsonb(&value, &returning) {
         Ok(value) => Ok(value),
-        Err(_) => json_value_response(&on_error, error_default, false),
+        Err(err) => {
+            crate::engine::api::push_statement_condition(
+                crate::error::ConditionLevel::Warning,
+                &err,
+            );
+            json_value_response(&on_error, error_default, false)
+        }
     }
 }
 
@@ -16334,6 +16630,12 @@ fn json_value_convert_jsonb(jsonb: &[u8], returning: &str) -> Result<Value, Quer
     if target.eq_ignore_ascii_case("JSON") {
         return Ok(Value::Json(jsonb.to_vec()));
     }
+    if node.is_number() && target.eq_ignore_ascii_case("DECIMAL") {
+        return json_value_cast(
+            Value::String(node.number_text().unwrap_or_default()),
+            returning,
+        );
+    }
     let value = match node.json_type() {
         JsonType::Boolean if target.eq_ignore_ascii_case("CHAR") => {
             Value::String(node.as_bool().unwrap_or(false).to_string())
@@ -16388,12 +16690,10 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
             }
             Ok(Value::String(value))
         }
-        "SIGNED" | "SIGNED INTEGER" | "INTEGER" => {
-            cast_to_integer(&json_value_numeric_input(value)?, false)
-        }
-        "UNSIGNED" | "UNSIGNED INTEGER" => cast_to_integer(&json_value_numeric_input(value)?, true),
-        "FLOAT" => Ok(Value::Float(numeric(&value)? as f32)),
-        "DOUBLE" | "REAL" => Ok(Value::Double(numeric(&value)?)),
+        "SIGNED" | "SIGNED INTEGER" | "INTEGER" => json_value_integer(value, false),
+        "UNSIGNED" | "UNSIGNED INTEGER" => json_value_integer(value, true),
+        "FLOAT" => cast_to_float(&value, true),
+        "DOUBLE" | "REAL" => cast_to_float(&value, false),
         "DECIMAL" => json_value_require_conversion(cast_to_decimal(
             &json_value_numeric_input(value)?,
             params.first().copied().unwrap_or(10).clamp(1, 65) as u8,
@@ -16428,6 +16728,18 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
     }
 }
 
+fn json_value_integer(value: Value, unsigned: bool) -> Result<Value, QueryError> {
+    // JSON_VALUE uses ON ERROR for overflow; scalar CAST's wrap/clamp policy
+    // is deliberately different. Round before checking the destination range.
+    let value = json_value_numeric_input(value)?;
+    crate::util::decimal::checked_integer_text(&value.to_display_string(), unsigned).ok_or_else(
+        || {
+            crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST
+                .error("JSON_VALUE integer conversion is out of range")
+        },
+    )
+}
+
 fn json_value_require_conversion(result: Result<Value, QueryError>) -> Result<Value, QueryError> {
     match result? {
         Value::Null => Err(error(
@@ -16454,7 +16766,7 @@ fn json_value_numeric_input(value: Value) -> Result<Value, QueryError> {
         ));
     };
     let text = text.trim();
-    if crate::util::decimal::parse_exact_decimal_str(text).is_some() {
+    if crate::util::decimal::parse_exact_decimal_big(text).is_some() {
         return Ok(Value::Decimal(text.to_string()));
     }
     if let Ok(value) = text.parse::<f64>() {
@@ -16468,58 +16780,7 @@ fn json_value_numeric_input(value: Value) -> Result<Value, QueryError> {
     ))
 }
 
-fn parse_uuid_bytes(input: &str) -> Option<[u8; 16]> {
-    // MySQL accepts the three conventional UUID spellings: canonical
-    // hyphenated, 32 hexadecimal digits, and a canonical UUID enclosed in a
-    // single pair of braces.  Strip braces only as a matched outer pair so
-    // malformed one-sided/nested forms do not become valid accidentally.
-    let braced = input.starts_with('{') && input.ends_with('}') && input.len() >= 2;
-    let input = if braced {
-        let inner = &input[1..input.len() - 1];
-        if inner.contains(['{', '}']) {
-            return None;
-        }
-        inner
-    } else {
-        if input.contains(['{', '}']) {
-            return None;
-        }
-        input
-    };
-    // Hyphens are either absent entirely or present at the canonical UUID
-    // boundaries. Merely deleting every hyphen accepts malformed spellings
-    // such as `12345678-12345678-1234-567812345678`, which MySQL's IS_UUID
-    // explicitly rejects. Braced input is the conventional canonical form.
-    let canonical = input.len() == 36
-        && input.as_bytes().get(8) == Some(&b'-')
-        && input.as_bytes().get(13) == Some(&b'-')
-        && input.as_bytes().get(18) == Some(&b'-')
-        && input.as_bytes().get(23) == Some(&b'-')
-        && input
-            .char_indices()
-            .all(|(index, ch)| matches!(index, 8 | 13 | 18 | 23) || ch.is_ascii_hexdigit());
-    let compact = !braced && input.len() == 32 && input.chars().all(|ch| ch.is_ascii_hexdigit());
-    if !canonical && !compact {
-        return None;
-    }
-    crate::util::uuid::parse(input)
-}
-
-use crate::util::uuid::format as format_uuid_bytes;
-
-fn swap_uuid_time_parts(bytes: &mut [u8; 16]) {
-    let original = *bytes;
-    bytes[0..2].copy_from_slice(&original[6..8]);
-    bytes[2..4].copy_from_slice(&original[4..6]);
-    bytes[4..8].copy_from_slice(&original[0..4]);
-}
-
-fn unswap_uuid_time_parts(bytes: &mut [u8; 16]) {
-    let original = *bytes;
-    bytes[0..4].copy_from_slice(&original[4..8]);
-    bytes[4..6].copy_from_slice(&original[2..4]);
-    bytes[6..8].copy_from_slice(&original[0..2]);
-}
+use network::parse_uuid_bytes;
 
 fn eval_uuid_to_bin<F>(name: &str, args: &[Expr], eval_arg: &mut F) -> Result<Value, QueryError>
 where
@@ -16527,18 +16788,7 @@ where
 {
     expect_arg_range(name, args, 1, 2)?;
     let values = eval_args(args, eval_arg)?;
-    null_if_any(values, |values| {
-        let mut bytes = parse_uuid_bytes(&string_value(&values[0])).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
-                "incorrect uuid value",
-            )
-        })?;
-        if values.get(1).map(int_value).transpose()?.unwrap_or(0) != 0 {
-            swap_uuid_time_parts(&mut bytes);
-        }
-        Ok(Value::Bytes(bytes.to_vec()))
-    })
+    network::NetworkFunction::UuidToBin.evaluate(&values[0], values.get(1))
 }
 
 fn eval_bin_to_uuid<F>(name: &str, args: &[Expr], eval_arg: &mut F) -> Result<Value, QueryError>
@@ -16547,21 +16797,7 @@ where
 {
     expect_arg_range(name, args, 1, 2)?;
     let values = eval_args(args, eval_arg)?;
-    null_if_any(values, |values| {
-        let raw = value_bytes(&values[0]);
-        if raw.len() != 16 {
-            return Err(error(
-                crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
-                "incorrect uuid value",
-            ));
-        }
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&raw);
-        if values.get(1).map(int_value).transpose()?.unwrap_or(0) != 0 {
-            unswap_uuid_time_parts(&mut bytes);
-        }
-        Ok(Value::String(format_uuid_bytes(&bytes)))
-    })
+    network::NetworkFunction::BinToUuid.evaluate(&values[0], values.get(1))
 }
 
 fn eval_inet_aton<F>(name: &str, args: &[Expr], eval_arg: &mut F) -> Result<Value, QueryError>
@@ -16569,68 +16805,7 @@ where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let value = eval_one(name, args, eval_arg)?;
-    null_or(value, |value| {
-        let text = string_value(&value);
-        let Some(packed) = parse_mysql_legacy_ipv4(&text) else {
-            return invalid_string_function_value("string", &text, name);
-        };
-        Ok(Value::UInt(packed as u64))
-    })
-}
-
-/// MySQL retains a historical one-to-four component grammar while still
-/// requiring every written component to be an octet. Missing middle octets
-/// are zero-filled (`127.1` becomes `127.0.0.1`).
-fn parse_mysql_legacy_ipv4(text: &str) -> Option<u32> {
-    let parts = text.split('.').collect::<Vec<_>>();
-    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-    let mut values = Vec::with_capacity(parts.len());
-    for part in parts {
-        if !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        let value = part.parse::<u16>().ok()?;
-        if value > 255 {
-            return None;
-        }
-        values.push(value as u32);
-    }
-    Some(match values.as_slice() {
-        [a] => *a,
-        [a, b] => (a << 24) | b,
-        [a, b, c] => (a << 24) | (b << 16) | c,
-        [a, b, c, d] => (a << 24) | (b << 16) | (c << 8) | d,
-        _ => return None,
-    })
-}
-
-fn parse_mysql_strict_ipv4(text: &str) -> Option<[u8; 4]> {
-    let parts = text.split('.').collect::<Vec<_>>();
-    if parts.len() != 4 {
-        return None;
-    }
-    let mut octets = [0u8; 4];
-    for (index, part) in parts.into_iter().enumerate() {
-        if part.is_empty() || part.len() > 3 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        octets[index] = part.parse::<u16>().ok()?.try_into().ok()?;
-    }
-    Some(octets)
-}
-
-/// Rust deliberately rejects dotted IPv4 components with leading zeroes,
-/// while MySQL's INET6_ATON accepts one-to-three decimal digits in both plain
-/// IPv4 and the dotted tail of IPv6 addresses. Canonicalize just that tail and
-/// leave the IPv6 parser responsible for all other structural validation.
-fn normalize_mysql_ipv6_dotted_tail(text: &str) -> Option<String> {
-    let dot = text.find('.')?;
-    let tail_start = text[..dot].rfind(':').map_or(0, |index| index + 1);
-    let octets = parse_mysql_strict_ipv4(&text[tail_start..])?;
-    let dotted = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
-    Some(format!("{}{dotted}", &text[..tail_start]))
+    network::NetworkFunction::InetAton.evaluate(&value, None)
 }
 
 fn eval_inet_ntoa<F>(name: &str, args: &[Expr], eval_arg: &mut F) -> Result<Value, QueryError>
@@ -16638,17 +16813,7 @@ where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let value = eval_one(name, args, eval_arg)?;
-    null_or(value, |value| {
-        let number = match value {
-            Value::UInt(number) if number <= u32::MAX as u64 => number,
-            Value::Int(number) if (0..=u32::MAX as i64).contains(&number) => number as u64,
-            _ => {
-                let text = string_value(&value);
-                return invalid_string_function_value("integer", &text, name);
-            }
-        };
-        Ok(Value::String(Ipv4Addr::from(number as u32).to_string()))
-    })
+    network::NetworkFunction::InetNtoa.evaluate(&value, None)
 }
 
 fn eval_inet6_aton<F>(name: &str, args: &[Expr], eval_arg: &mut F) -> Result<Value, QueryError>
@@ -16656,20 +16821,7 @@ where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let value = eval_one(name, args, eval_arg)?;
-    null_or(value, |value| {
-        let text = string_value(&value);
-        if let Some(octets) = parse_mysql_strict_ipv4(&text) {
-            Ok(Value::Bytes(octets.to_vec()))
-        } else if let Ok(addr) = normalize_mysql_ipv6_dotted_tail(&text)
-            .as_deref()
-            .unwrap_or(&text)
-            .parse::<Ipv6Addr>()
-        {
-            Ok(Value::Bytes(addr.octets().to_vec()))
-        } else {
-            invalid_string_function_value("IP", &text, name)
-        }
-    })
+    network::NetworkFunction::Inet6Aton.evaluate(&value, None)
 }
 
 #[cold]
@@ -16698,86 +16850,7 @@ where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let value = eval_one(name, args, eval_arg)?;
-    null_or(value, |value| {
-        let Value::Bytes(bytes) = value else {
-            return invalid_string_function_value("string", &string_value(&value), name);
-        };
-        match bytes.len() {
-            4 => Ok(Value::String(
-                Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string(),
-            )),
-            16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&bytes);
-                Ok(Value::String(format_mysql_ipv6(octets)))
-            }
-            _ => invalid_string_function_value("string", "<binary>", name),
-        }
-    })
-}
-
-fn format_mysql_ipv6(octets: [u8; 16]) -> String {
-    let mut words = [0u16; 8];
-    for (index, pair) in octets.chunks_exact(2).enumerate() {
-        words[index] = u16::from_be_bytes([pair[0], pair[1]]);
-    }
-
-    // MySQL renders IPv4-compatible and IPv4-mapped addresses with a dotted
-    // tail, including the legacy all-zero prefix form.
-    let ipv4_tail = u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]]);
-    if words[..6].iter().all(|word| *word == 0) && ipv4_tail > 1 {
-        return format!(
-            "::{}.{}.{}.{}",
-            octets[12], octets[13], octets[14], octets[15]
-        );
-    }
-    if words[..5].iter().all(|word| *word == 0) && words[5] == 0xffff {
-        return format!(
-            "::ffff:{}.{}.{}.{}",
-            octets[12], octets[13], octets[14], octets[15]
-        );
-    }
-
-    // Unlike RFC 5952, MySQL compresses even a single zero hextet. Choose the
-    // longest run, preferring the first on ties.
-    let mut best_start = 0usize;
-    let mut best_len = 0usize;
-    let mut cursor = 0usize;
-    while cursor < words.len() {
-        if words[cursor] != 0 {
-            cursor += 1;
-            continue;
-        }
-        let start = cursor;
-        while cursor < words.len() && words[cursor] == 0 {
-            cursor += 1;
-        }
-        let len = cursor - start;
-        if len > best_len {
-            best_start = start;
-            best_len = len;
-        }
-    }
-
-    let mut out = String::new();
-    let mut index = 0usize;
-    while index < words.len() {
-        if best_len != 0 && index == best_start {
-            out.push_str("::");
-            index += best_len;
-            continue;
-        }
-        if !out.is_empty() && !out.ends_with(':') {
-            out.push(':');
-        }
-        use std::fmt::Write as _;
-        let _ = write!(out, "{:x}", words[index]);
-        index += 1;
-    }
-    if out.ends_with(':') && !out.ends_with("::") {
-        out.push(':');
-    }
-    out
+    network::NetworkFunction::Inet6Ntoa.evaluate(&value, None)
 }
 
 fn eval_ip_predicate<F>(
@@ -16790,37 +16863,9 @@ where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let value = eval_one(name, args, eval_arg)?;
-    null_or(value, |value| {
-        let binary = match &value {
-            Value::Bytes(bytes) if bytes.len() == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(bytes);
-                Some(octets)
-            }
-            _ => None,
-        };
-        let text = string_value(&value);
-        let result = match upper {
-            "IS_IPV4" => parse_mysql_strict_ipv4(&text).is_some(),
-            "IS_IPV6" => normalize_mysql_ipv6_dotted_tail(&text)
-                .as_deref()
-                .unwrap_or(&text)
-                .parse::<Ipv6Addr>()
-                .is_ok(),
-            "IS_IPV4_COMPAT" => binary
-                .map(|octets| {
-                    octets[..12] == [0; 12]
-                        && octets[12..] != [0, 0, 0, 0]
-                        && octets[12..] != [0, 0, 0, 1]
-                })
-                .unwrap_or(false),
-            "IS_IPV4_MAPPED" => binary
-                .map(|octets| octets[..10] == [0; 10] && octets[10..12] == [0xff, 0xff])
-                .unwrap_or(false),
-            _ => false,
-        };
-        Ok(Value::Int(result as i64))
-    })
+    network::NetworkFunction::from_name(upper)
+        .expect("registered IP predicate")
+        .evaluate(&value, None)
 }
 
 fn eval_compress<F>(name: &str, args: &[Expr], eval_arg: &mut F) -> Result<Value, QueryError>
@@ -17135,7 +17180,7 @@ fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn pkcs7_unpadded_len(data: &[u8]) -> Option<usize> {
     let pad = *data.last()? as usize;
     if pad == 0 || pad > 16 || pad > data.len() {
         return None;
@@ -17143,13 +17188,45 @@ fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
     if data[data.len() - pad..].iter().any(|b| *b as usize != pad) {
         return None;
     }
-    data.truncate(data.len() - pad);
+    Some(data.len() - pad)
+}
+
+fn pkcs7_unpad(mut data: Vec<u8>) -> Option<Vec<u8>> {
+    let length = pkcs7_unpadded_len(&data)?;
+    data.truncate(length);
     Some(data)
 }
 
 /// Encrypt/decrypt under one `block_encryption_mode`. `iv` is required
 /// (and already validated to 16 bytes) for every mode except ECB.
 /// Returns `None` only on decrypt padding failure (MySQL → NULL).
+/// Query-local two-argument ECB setup. Warning-producing keys and other
+/// modes retain the scalar path with its original lazy argument evaluation.
+pub(crate) struct AesEcb(AnyAes);
+pub(crate) type AesBlock = aes::cipher::Block<aes::Aes128>;
+impl AesEcb {
+    pub(crate) fn prepare(key: &[u8], encrypt: bool) -> Option<Self> {
+        let mode = with_session_view(|view| view.map(|v| v.block_encryption_mode().to_string()))
+            .unwrap_or_else(|| "aes-128-ecb".to_string());
+        let (width, mode) = parse_block_encryption_mode(&mode).unwrap_or((16, AesChainMode::Ecb));
+        if mode != AesChainMode::Ecb || encrypt && key.len() > width {
+            return None;
+        }
+        AnyAes::new(&mysql_aes_key(key, width)).map(Self)
+    }
+    pub(crate) fn crypt_blocks(&self, encrypt: bool, blocks: &mut [AesBlock]) {
+        use aes::cipher::{BlockDecrypt, BlockEncrypt};
+        match (&self.0, encrypt) {
+            (AnyAes::A128(cipher), true) => cipher.encrypt_blocks(blocks),
+            (AnyAes::A192(cipher), true) => cipher.encrypt_blocks(blocks),
+            (AnyAes::A256(cipher), true) => cipher.encrypt_blocks(blocks),
+            (AnyAes::A128(cipher), false) => cipher.decrypt_blocks(blocks),
+            (AnyAes::A192(cipher), false) => cipher.decrypt_blocks(blocks),
+            (AnyAes::A256(cipher), false) => cipher.decrypt_blocks(blocks),
+        }
+    }
+}
+
 fn aes_run(
     cipher: &AnyAes,
     mode: AesChainMode,
@@ -17416,7 +17493,31 @@ where
 /// Parsed GTID set: lowercase server-uuid → sorted, merged, non-empty
 /// interval list (1-based inclusive bounds). Pure string/set arithmetic
 /// for `GTID_SUBSET` / `GTID_SUBTRACT` — no replication state involved.
-type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+pub(crate) type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+
+enum GtidArgument {
+    Plain(GtidSet),
+    Cached(std::sync::Arc<crate::engine::func_cache::Governed<GtidSet>>),
+}
+impl std::ops::Deref for GtidArgument {
+    type Target = GtidSet;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Plain(value) => value,
+            Self::Cached(value) => value,
+        }
+    }
+}
+fn parsed_gtid_argument(expr: &Expr, value: &Value) -> Result<GtidArgument, QueryError> {
+    let text = string_value(value);
+    // Variable/high-cardinality expressions keep the original no-cache path.
+    // Literal and bound-parameter operands are stable within one execution.
+    if matches!(expr, Expr::Literal(_) | Expr::Placeholder(_)) {
+        crate::engine::func_cache::cached_gtid_set(&text).map(GtidArgument::Cached)
+    } else {
+        parse_gtid_set_uncached(&text).map(GtidArgument::Plain)
+    }
+}
 
 fn malformed_gtid_set(text: &str) -> QueryError {
     error(
@@ -17425,7 +17526,7 @@ fn malformed_gtid_set(text: &str) -> QueryError {
     )
 }
 
-fn parse_gtid_set(text: &str) -> Result<GtidSet, QueryError> {
+pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError> {
     let mut set = GtidSet::new();
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -22159,7 +22260,39 @@ fn round_fsp_fraction(nanos: u32, fsp: u8) -> (String, bool) {
     (digits[..fsp as usize].to_string(), carry)
 }
 
+fn cast_to_float(value: &Value, single: bool) -> Result<Value, QueryError> {
+    let number = numeric(value)?;
+    if !number.is_finite() || (single && !(number as f32).is_finite()) {
+        return Err(error(
+            crate::error::catalog::ER_DATA_OUT_OF_RANGE,
+            if single {
+                "FLOAT value is out of range"
+            } else {
+                "DOUBLE value is out of range"
+            },
+        ));
+    }
+    Ok(if single {
+        Value::Float(number as f32)
+    } else {
+        Value::Double(number)
+    })
+}
+
 pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, QueryError> {
+    if strict_numeric_conversion_is_error()
+        && matches!(
+            value,
+            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+        )
+    {
+        let text = string_value(value);
+        let parsed = crate::util::decimal::parse_lenient_int(&text);
+        if !parsed.clean || text.trim().is_empty() {
+            return Err(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE
+                .error(format!("Truncated incorrect INTEGER value: '{text}'")));
+        }
+    }
     if let Value::UInt(value) = value {
         return Ok(if unsigned {
             Value::UInt(*value)
@@ -22384,6 +22517,14 @@ pub(crate) fn cast_to_decimal(
     scale: u8,
 ) -> Result<Value, QueryError> {
     use crate::util::decimal as dk;
+    // JSON numbers use the same decimal text domain as JSON comparison.
+    // Never stage them in f64 -> i128: Rust saturates that conversion.
+    if let Value::Json(bytes) = value {
+        let node = crate::engine::json::JsonbRef::new(bytes)?;
+        if let Some(text) = node.number_text() {
+            return cast_to_decimal(&Value::String(text), precision, scale);
+        }
+    }
     // Runtime exact lanes, including Decimal128/DecimalWide and legacy
     // textual Decimal, must remain exact across CAST. In particular a
     // DECIMAL(65) coefficient cannot be staged in i128 or f64.
@@ -22395,22 +22536,19 @@ pub(crate) fn cast_to_decimal(
         );
     }
     // A character source is a conversion boundary, but syntactically clean
-    // fixed-point text can still be parsed and rounded without loss. Dirty
-    // and exponent-form coercions retain the existing approximate/warning
-    // rules below.
+    // fixed-point and exponent text can be parsed and rounded without loss.
+    // Dirty coercions retain the approximate/warning rules below.
     if let Value::String(text) = value {
-        if !text.contains(['e', 'E']) {
-            if let Some((magnitude, source_scale)) = dk::parse_exact_decimal_big(text) {
-                return finish_cast_to_decimal_exact(
-                    dk::rescale_exact(
-                        dk::ExactDecimal::from_big(magnitude, source_scale),
-                        scale,
-                        true,
-                    ),
-                    precision,
+        if let Some((magnitude, source_scale)) = dk::parse_exact_decimal_big(text) {
+            return finish_cast_to_decimal_exact(
+                dk::rescale_exact(
+                    dk::ExactDecimal::from_big(magnitude, source_scale),
                     scale,
-                );
-            }
+                    true,
+                ),
+                precision,
+                scale,
+            );
         }
     }
     if let Value::Decimal(text) | Value::String(text) = value {
@@ -22499,8 +22637,34 @@ pub(crate) fn cast_to_decimal(
             if scaled.is_finite() && scaled.abs() < 1.7e38 {
                 Some(scaled as i128)
             } else {
-                // Non-finite / astronomically large double: saturate.
-                Some(if n < 0.0 { i128::MIN + 1 } else { i128::MAX })
+                if n.is_finite() {
+                    if let Some((magnitude, source_scale)) =
+                        dk::parse_exact_decimal_big(&n.to_string())
+                    {
+                        return finish_cast_to_decimal_exact(
+                            dk::rescale_exact(
+                                dk::ExactDecimal::from_big(magnitude, source_scale),
+                                scale,
+                                true,
+                            ),
+                            precision,
+                            scale,
+                        );
+                    }
+                }
+                let magnitude = num_bigint::BigInt::from(10u8).pow(u32::from(precision));
+                return finish_cast_to_decimal_exact(
+                    dk::ExactDecimal::from_big(
+                        if n.is_sign_negative() {
+                            -magnitude
+                        } else {
+                            magnitude
+                        },
+                        scale,
+                    ),
+                    precision,
+                    scale,
+                );
             }
         }
     };
@@ -24223,6 +24387,16 @@ pub(crate) fn compare_values_as_strings(
     left: &Value,
     right: &Value,
 ) -> Result<Ordering, QueryError> {
+    fn text(value: &Value) -> Option<&str> {
+        match value {
+            Value::String(s) => Some(s.as_str()),
+            Value::SmallString(s) => std::str::from_utf8(s).ok(),
+            _ => None,
+        }
+    }
+    if let (Some(left), Some(right)) = (text(left), text(right)) {
+        return Ok(compare_strings_with_scope(left, right));
+    }
     if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
         let left_string;
         let right_string;
@@ -25396,8 +25570,7 @@ pub(crate) fn coerce_result_to_expr_type(
         ExprTypeKind::Decimal {
             precision, scale, ..
         } => cast_to_decimal(&value, precision, scale),
-        ExprTypeKind::Float { single: true, .. } => Ok(Value::Float(numeric(&value)? as f32)),
-        ExprTypeKind::Float { single: false, .. } => Ok(Value::Double(numeric(&value)?)),
+        ExprTypeKind::Float { single, .. } => cast_to_float(&value, single),
         ExprTypeKind::String {
             kind: StringKind::Binary | StringKind::Blob,
         } => {
@@ -26266,44 +26439,6 @@ fn resolve_dom_index(seg: &JsonPathSegment, len: usize) -> Option<usize> {
     }
 }
 
-fn json_path_extract_raw(
-    doc: &serde_json::Value,
-    path: &str,
-) -> Result<Option<serde_json::Value>, QueryError> {
-    let segments = parse_json_path(path)?;
-    let mut current = doc;
-    for segment in &segments {
-        match segment {
-            JsonPathSegment::Key(key) => {
-                let Some(next) = current.get(key.as_str()) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-            _ => {
-                let Some(next) = json_array_get(current, segment) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-        }
-    }
-    Ok(Some(current.clone()))
-}
-
-fn json_array_get<'a>(
-    value: &'a serde_json::Value,
-    seg: &JsonPathSegment,
-) -> Option<&'a serde_json::Value> {
-    if let Some(arr) = value.as_array() {
-        let resolved = resolve_dom_index(seg, arr.len())?;
-        return arr.get(resolved);
-    }
-    // MySQL autowraps a scalar/object as a one-element array for an index
-    // leg. Only index 0 / [last] addresses the wrapped value.
-    (resolve_dom_index(seg, 1) == Some(0)).then_some(value)
-}
-
 fn json_owned_array_get_mut<'a>(
     value: &'a mut OwnedJsonb,
     seg: &JsonPathSegment,
@@ -26449,40 +26584,29 @@ pub(crate) fn value_to_json(val: &Value) -> serde_json::Value {
     }
 }
 
-fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> bool {
-    match (target, candidate) {
-        (serde_json::Value::Array(arr), candidate) => {
-            if let serde_json::Value::Array(cand_arr) = candidate {
-                cand_arr
-                    .iter()
-                    .all(|c| arr.iter().any(|t| json_contains(t, c)))
-            } else {
-                arr.iter().any(|t| json_contains(t, candidate))
-            }
+fn json_contains(
+    target: crate::engine::json::JsonbRef<'_>,
+    candidate: crate::engine::json::JsonbRef<'_>,
+) -> bool {
+    if target.is_array() {
+        if candidate.is_array() {
+            candidate
+                .array_iter()
+                .all(|value| target.array_iter().any(|item| json_contains(item, value)))
+        } else {
+            target
+                .array_iter()
+                .any(|item| json_contains(item, candidate))
         }
-        (serde_json::Value::Object(obj), serde_json::Value::Object(cand)) => cand
-            .iter()
-            .all(|(k, v)| obj.get(k).is_some_and(|tv| json_contains(tv, v))),
-        // Leaf equality: serde_json's Value::PartialEq treats Number(1) and
-        // Number(1.0) as distinct because its Number enum keeps int / float
-        // subtypes apart, so `[1.0]` fails to contain `1` under raw ==.
-        // MySQL's semantics are exact-decimal equality across all numeric
-        // subtypes — delegate to the jsonb compare kernel that already gets
-        // that right (integer / decimal / double all normalised through the
-        // canonical-decimal total order).
-        _ => json_dom_equiv(target, candidate),
+    } else if target.is_object() && candidate.is_object() {
+        candidate.object_iter().all(|(key, value)| {
+            target
+                .get(key)
+                .is_some_and(|item| json_contains(item, value))
+        })
+    } else {
+        crate::engine::json::compare_nodes(target, candidate) == std::cmp::Ordering::Equal
     }
-}
-
-/// Value equality that honours MySQL's cross-subtype numeric rules
-/// (`1 == 1.0 == 1E0 == 1.00`). Uses the jsonb `compare_nodes` kernel so
-/// the semantics stay in one place; the alternative — walking two serde
-/// DOMs and threading a custom Number comparator through every branch — is
-/// error-prone and slower for anything past a scalar.
-fn json_dom_equiv(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    let a_bytes = crate::engine::json::from_serde(a);
-    let b_bytes = crate::engine::json::from_serde(b);
-    crate::engine::json::compare(&a_bytes, &b_bytes) == std::cmp::Ordering::Equal
 }
 
 fn eval_json_member_of<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<Value, QueryError>
@@ -26714,9 +26838,9 @@ pub(crate) fn apply_replication_json_diffs(
 /// Byte-oriented SUBSTRING_INDEX, mirroring `substring_index` semantics
 /// on `&[u8]` (empty delim / count == 0 → empty; positive count returns
 /// the prefix before the `count`-th delim; negative from the tail).
-pub(crate) fn substring_index_bytes(s: &[u8], delim: &[u8], count: i64) -> Vec<u8> {
+pub(crate) fn substring_index_range(s: &[u8], delim: &[u8], count: i64) -> std::ops::Range<usize> {
     if count == 0 || delim.is_empty() || s.is_empty() {
-        return Vec::new();
+        return 0..0;
     }
     // Both signs use the same left-to-right, non-overlapping delimiters.
     let occurrences = || {
@@ -26730,16 +26854,20 @@ pub(crate) fn substring_index_bytes(s: &[u8], delim: &[u8], count: i64) -> Vec<u
     if count > 0 {
         occurrences()
             .nth((count - 1) as usize)
-            .map_or_else(|| s.to_vec(), |pos| s[..pos].to_vec())
+            .map_or_else(|| 0..s.len(), |pos| 0..pos)
     } else {
         let total = occurrences().count();
         let n = count.unsigned_abs();
         if n > total as u64 {
-            return s.to_vec();
+            return 0..s.len();
         }
         let pos = occurrences().nth(total - n as usize).unwrap();
-        s[pos + delim.len()..].to_vec()
+        pos + delim.len()..s.len()
     }
+}
+
+pub(crate) fn substring_index_bytes(s: &[u8], delim: &[u8], count: i64) -> Vec<u8> {
+    s[substring_index_range(s, delim, count)].to_vec()
 }
 
 pub(crate) fn substring_index(s: &str, delim: &str, count: i64) -> String {
@@ -27182,7 +27310,7 @@ pub(crate) fn format_bytes(n: f64) -> String {
     } else if abs >= KIB {
         (n / KIB, "KiB")
     } else {
-        return format!("{} bytes", n as i64);
+        return format!("{:4} bytes", n as i64);
     };
     format!("{:.2} {}", val, unit)
 }
@@ -27194,7 +27322,7 @@ pub(crate) fn format_pico_time(n: f64) -> String {
     }
     let abs = n.abs();
     if abs < 1.0e3 {
-        return format!("{} ps", n as i64);
+        return format!("{:3} ps", n as i64);
     }
     if abs < 1.0e6 {
         return format!("{:.2} ns", n / 1.0e3);
@@ -29009,4 +29137,111 @@ pub(crate) fn with_saved_expr_info<R>(
         previous,
     };
     f()
+}
+
+#[cfg(test)]
+mod json_search_iterator_tests {
+    use super::*;
+    use crate::engine::json::{self, JsonbRef};
+
+    fn reference(
+        node: JsonbRef<'_>,
+        path: String,
+        selected: bool,
+        scopes: &std::collections::HashSet<usize>,
+        pattern: &str,
+        escape: Option<char>,
+        out: &mut Vec<String>,
+    ) {
+        let selected = selected || scopes.contains(&node.identity());
+        if node.is_array() {
+            for (index, child) in node.array_iter().enumerate() {
+                reference(
+                    child,
+                    format!("{path}[{index}]"),
+                    selected,
+                    scopes,
+                    pattern,
+                    escape,
+                    out,
+                );
+            }
+        } else if node.is_object() {
+            for (key, child) in node.object_iter() {
+                let mut child_path = path.clone();
+                append_json_path_key_leg(key, &mut child_path);
+                reference(child, child_path, selected, scopes, pattern, escape, out);
+            }
+        } else if selected
+            && node.json_type() == json::JsonType::String
+            && match_like_pattern(node.as_str().unwrap(), pattern, escape)
+        {
+            out.push(path);
+        }
+    }
+
+    #[test]
+    fn iterator_search_matches_recursive_document_order_scopes_and_escapes() {
+        let mut docs = vec![
+            serde_json::json!({"a":["needle", {"space key":"a%b", "quoted\"\\key":"a_b"}], "中文":"needle", "empty":[], "other":{"child":"needle"}}),
+        ];
+        docs.push(serde_json::Value::Array(
+            (0..1025)
+                .map(|i| serde_json::json!({"leaf": if i%2==0 {"needle"} else {"other"}}))
+                .collect(),
+        ));
+        let mut deep = serde_json::json!("needle");
+        for _ in 0..90 {
+            deep = serde_json::json!({"a":[deep]});
+        }
+        docs.push(deep);
+        for doc in docs {
+            let bytes = json::from_serde(&doc);
+            let root = JsonbRef::new(&bytes).unwrap();
+            for scope in ["$", "$.a", "$**.a", "$.other", "$.absent"] {
+                let scopes = json::JsonPath::parse(scope)
+                    .unwrap()
+                    .eval(root)
+                    .into_iter()
+                    .map(|node| node.identity())
+                    .collect();
+                for pattern in ["needle", "%", "a_b", "a\\%b", "a\\_b"] {
+                    for escape in [None, Some('\\'), Some('!')] {
+                        let mut expected = Vec::new();
+                        reference(
+                            root,
+                            "$".into(),
+                            false,
+                            &scopes,
+                            pattern,
+                            escape,
+                            &mut expected,
+                        );
+                        for one in [false, true] {
+                            let mut search = JsonSearch {
+                                scopes: &scopes,
+                                pattern,
+                                escape,
+                                one,
+                                path: "$".into(),
+                                matches: smallvec::SmallVec::new(),
+                                visited: 1,
+                            };
+                            search.visit(root, false).unwrap();
+                            let limit = if one {
+                                expected.len().min(1)
+                            } else {
+                                expected.len()
+                            };
+                            assert_eq!(
+                                search.matches.as_slice(),
+                                &expected[..limit],
+                                "{scope}/{pattern}/{escape:?}/{one}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -238,7 +238,7 @@ impl Database {
             file.write_all(&bytes).map_err(io_err)?;
             crate::platform::fs::sync_standard_file_at(&file, &tmp).map_err(io_err)?;
         }
-        fs::rename(&tmp, &path).map_err(io_err)?;
+        rename_owned_file(&tmp, &path).map_err(io_err)?;
         #[cfg(test)]
         self.vector_persist_failpoint(5)?;
         crate::platform::fs::sync_path(path.parent().expect("index directory")).map_err(io_err)
@@ -548,7 +548,7 @@ impl Database {
             let mut file = fs::File::create(&tmp).map_err(io_err)?;
             file.write_all(&bytes).map_err(io_err)?;
             file.sync_all().map_err(io_err)?;
-            fs::rename(tmp, &path).map_err(io_err)?;
+            rename_owned_file(tmp, &path).map_err(io_err)?;
             crate::platform::fs::sync_path(path.parent().expect("index directory")).map_err(io_err)
         })();
         match persist {

@@ -519,7 +519,10 @@ pub(crate) fn register(reg: &mut Registry) {
         .with_doc("Percentage of the spill filesystem that must remain free."),
         |_ctx| SysVarValue::UInt(crate::engine::executor::spill_quota::reserve_pct()),
         |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            crate::engine::executor::spill_quota::set_reserve_pct(v.as_u64().unwrap_or(10))
+            crate::engine::executor::spill_quota::set_reserve_pct(
+                v.as_u64()
+                    .unwrap_or(crate::engine::executor::spill_quota::DEFAULT_DISK_RESERVE_PCT),
+            )
         },
     ));
     reg.register(SysVar::settable(
