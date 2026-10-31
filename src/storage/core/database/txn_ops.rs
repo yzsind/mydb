@@ -4071,6 +4071,12 @@ impl Database {
         if self.is_snapshot_read_only() {
             return Ok(());
         }
+        // A replica may have no eligible restartpoint while source work is
+        // incomplete. Its retained durable source WAL is the recovery point;
+        // historical pre-flush dirty-page statistics are not convergence state.
+        if self.physical_replica_mode() {
+            return self.checkpoint();
+        }
         const MAX_SHUTDOWN_CHECKPOINT_PASSES: usize = 8;
         for _ in 0..MAX_SHUTDOWN_CHECKPOINT_PASSES {
             self.checkpoint()?;
@@ -4817,7 +4823,8 @@ impl Database {
         // size-triggered checkpoint seeded it).
         let now_ms = current_unix_ms();
         let time_since_checkpoint = now_ms.saturating_sub(last_unix_ms);
-        let time_triggered = last_unix_ms != 0 && time_since_checkpoint >= interval;
+        let time_triggered =
+            interval != 0 && last_unix_ms != 0 && time_since_checkpoint >= interval;
         let min_auto_interval = interval.saturating_div(4).clamp(
             MIN_AUTO_CHECKPOINT_INTERVAL_MS.min(interval),
             MAX_AUTO_CHECKPOINT_INTERVAL_MS,
@@ -7246,5 +7253,45 @@ mod transaction_audit_tests {
             db.log.lock().durable_lsn() >= lsn,
             "strict barrier must fsync a previously flushed LSN"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit1031_shutdown_tests {
+    use super::*;
+    #[test]
+    fn audit1031_replica_shutdown_without_eligible_restartpoint() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut config = crate::storage::StorageConfig::from_env();
+        config.durability = crate::storage::DurabilityMode::Relaxed;
+        config.buffer_pool_pages = 512;
+        let db = Database::open_with_config(dir.path(), config).unwrap();
+        db.set_physical_replica_mode(true).unwrap();
+        db.last_checkpoint_dirty_pages_atomic
+            .store(1, Ordering::Release);
+        db.checkpoint_for_shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod audit1031_checkpoint_interval_tests {
+    use super::*;
+    #[test]
+    fn audit1031_zero_interval_disables_only_time_trigger() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut config = crate::storage::StorageConfig::from_env();
+        config.durability = crate::storage::DurabilityMode::Relaxed;
+        config.buffer_pool_pages = 512;
+        config.checkpoint_interval = Duration::ZERO;
+        config.checkpoint_wal_bytes = u64::MAX;
+        let db = Database::open_with_config(dir.path(), config).unwrap();
+        db.last_checkpoint_lsn_atomic.store(0, Ordering::Release);
+        db.last_checkpoint_unix_ms_atomic
+            .store(1, Ordering::Release);
+        assert_eq!(db.should_checkpoint(), None);
+        db.set_checkpoint_wal_bytes(1).unwrap();
+        db.wal_bytes_after_last_checkpoint_atomic
+            .store(0, Ordering::Release);
+        assert_eq!(db.should_checkpoint(), Some(CHECKPOINT_TRIGGER_WAL));
     }
 }

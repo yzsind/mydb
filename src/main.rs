@@ -51,6 +51,18 @@ fn main() -> std::io::Result<()> {
         )
         .map_err(startup_error);
     }
+    // Informational commands must remain available even with a broken config.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_help();
+        return Ok(());
+    }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!(
+            "{}",
+            mydb::engine::sysvar::builtin::server::MYDB_VERSION_STRING
+        );
+        return Ok(());
+    }
     let startup = match startup_config::bootstrap(&args) {
         Ok(config) => config,
         Err(err) => {
@@ -141,6 +153,9 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     let config = Config::from_startup();
     configure_open_files_limit();
     let addr = SocketAddr::new(config.host, config.port);
+    // Reserve the socket before bootstrap or recovery can modify the directory.
+    let listener = mydb::mysql::server::bind_listener(addr)?;
+    let addr = listener.local_addr()?;
     let log_config = QueryLogConfig::with_slow_sql_threshold_ms(config.slow_sql_ms);
     let registry = Arc::new(SessionRegistry::new());
     let repository = startup_config::var_os("MYDB_BACKUP_REPOSITORY").map(PathBuf::from);
@@ -176,6 +191,11 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     // pulls a streaming base backup from its master BEFORE the engine
     // opens, so recovery starts from a consistent snapshot.
     let snapshot = mydb::backup::native::is_snapshot(&data_dir).map_err(startup_error)?;
+    let _startup_directory_guard = if !snapshot {
+        Some(mydb::backup::lock_data_directory(&data_dir).map_err(startup_error)?)
+    } else {
+        None
+    };
     let _startup_retention_guard = if !snapshot {
         // Reject corrupt role metadata before recovery can mistake a physical
         // replica for a standalone database and undo its in-flight source work.
@@ -256,7 +276,7 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
         config.slow_sql_ms,
         if config.binlog.enabled { "ON" } else { "OFF" },
     ));
-    server.run().await
+    server.run_with_listener(listener).await
 }
 
 #[derive(Debug, Clone)]

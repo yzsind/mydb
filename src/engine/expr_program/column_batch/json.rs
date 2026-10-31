@@ -29,7 +29,7 @@ pub(super) struct JsonRead {
     output: Output,
     probes: SmallVec<[Arc<Governed<JsonPath>>; 2]>,
     all: bool,
-    rhs: Option<serde_json::Value>,
+    rhs: Option<Vec<u8>>,
     rhs_charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
     pattern: Option<String>,
     escape: Option<char>,
@@ -98,7 +98,7 @@ impl JsonRead {
                         return None;
                     }
                     input.rhs =
-                        Some(crate::engine::json::parse_document(&rhs, 2, "JSON_OVERLAPS").ok()?);
+                        Some(crate::engine::json::parse_text(&rhs, 2, "JSON_OVERLAPS").ok()?);
                     input.rhs_charge = Some(charge);
                     input.output = Output::Overlaps;
                     return Some(input);
@@ -456,10 +456,12 @@ impl JsonRead {
                             .iter()
                             .any(|path| path.eval_one(value).is_some())
                     } as i64),
-                    Output::Overlaps => numeric.push(
-                        crate::engine::expr::json_overlaps_node(value, self.rhs.as_ref()?).ok()?
-                            as i64,
-                    ),
+                    Output::Overlaps => numeric.push(crate::engine::expr::json_overlaps(
+                        // Probe the row with constant keys, preserving the
+                        // compiled object's small-RHS lookup strategy.
+                        JsonbRef::new(self.rhs.as_ref()?).ok()?,
+                        value,
+                    ) as i64),
                     Output::StorageSize => numeric.push(
                         crate::engine::json::mysql_binary::encoded_size(value.as_bytes()).ok()?
                             as i64,
@@ -476,11 +478,13 @@ impl JsonRead {
                             }
                             _ => return None,
                         };
-                        let converted = crate::engine::expr::cast_to_integer(
-                            &v,
-                            self.output == Output::ValueUnsigned,
-                        )
-                        .ok()?;
+                        // JSON_VALUE delegates out-of-range values to its
+                        // scalar ON ERROR path instead of CAST's wrap policy.
+                        let converted = match (v, self.output == Output::ValueUnsigned) {
+                            (Value::Int(n), true) => Value::UInt(u64::try_from(n).ok()?),
+                            (Value::UInt(n), false) => Value::Int(i64::try_from(n).ok()?),
+                            (value, _) => value,
+                        };
                         match converted {
                             Value::UInt(n) => unsigned.push(n),
                             Value::Int(n) => numeric.push(n),

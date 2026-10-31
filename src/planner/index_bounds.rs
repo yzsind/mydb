@@ -89,25 +89,7 @@ pub(crate) fn target_for_index_column(
     // can't be resolved keeps prepared-statement param binding
     // resilient even for unusual catalog states.
     if let Some(expr) = index.key_expression(pos) {
-        if let Some(Expr::Function { name, args, .. }) = expr.ast.as_ref() {
-            if (name.eq_ignore_ascii_case("CAST") || name.eq_ignore_ascii_case("CONVERT"))
-                && args.len() >= 2
-            {
-                if let Some(Expr::Literal(crate::parser::Literal::String(target))) = args.last() {
-                    let target = target.trim().to_ascii_uppercase();
-                    if target.starts_with("UNSIGNED") {
-                        return crate::storage::ParamTarget::UInt;
-                    }
-                    if target.starts_with("SIGNED") {
-                        return crate::storage::ParamTarget::Int;
-                    }
-                    if target.starts_with("JSON") {
-                        return crate::storage::ParamTarget::JsonScalar;
-                    }
-                }
-            }
-        }
-        return crate::storage::ParamTarget::for_column(&expr.data_type, false);
+        return crate::storage::schema::index_expression_param_target(expr);
     }
     let column_name = index.columns[pos].as_str();
     table

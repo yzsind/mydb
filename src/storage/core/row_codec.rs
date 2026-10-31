@@ -1557,7 +1557,11 @@ fn read_value_by_tag(input: &[u8], pos: &mut usize, tag: u8) -> Result<Value, Qu
             let b = read_exact(input, pos, 1)?[0];
             Ok(Value::Year(b))
         }
-        TAG_JSON => Ok(Value::Json(read_var_bytes(input, pos)?)),
+        TAG_JSON => {
+            let bytes = read_var_bytes(input, pos)?;
+            crate::engine::json::JsonbRef::new(&bytes)?.validate()?;
+            Ok(Value::Json(bytes))
+        }
         TAG_GEOMETRY => Ok(Value::Geometry(read_var_bytes(input, pos)?)),
         TAG_VECTOR => Ok(Value::Vector(crate::engine::vector::codec::decode_value(
             &read_var_bytes(input, pos)?,
@@ -4144,7 +4148,10 @@ fn put_var_through_sink<S: RowDecodeSink>(
             sink.put_string(dest, payload);
         }
         OP_VAR_BYTES => sink.put_bytes(dest, payload),
-        OP_VAR_JSON => sink.put_json(dest, payload),
+        OP_VAR_JSON => {
+            crate::engine::json::JsonbRef::new(payload)?.validate()?;
+            sink.put_json(dest, payload);
+        }
         OP_VAR_GEOMETRY => sink.put_geometry(dest, payload),
         OP_VAR_VECTOR => sink.put_vector(dest, payload),
         _ => sink.put_null(dest),
@@ -4919,6 +4926,9 @@ fn decode_var_for_kind_into(
     input: &[u8],
     cell: &mut Value,
 ) -> Result<(), QueryError> {
+    if matches!(kind, ColumnKind::Json) {
+        crate::engine::json::JsonbRef::new(input)?.validate()?;
+    }
     match (kind, &mut *cell) {
         (ColumnKind::VarString, Value::String(s)) => {
             // Copy first, validate second — the order matters for speed.
@@ -5013,7 +5023,10 @@ fn decode_var_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, QueryEr
             }
         }
         ColumnKind::VarBytes => Ok(Value::Bytes(input.to_vec())),
-        ColumnKind::Json => Ok(Value::Json(input.to_vec())),
+        ColumnKind::Json => {
+            crate::engine::json::JsonbRef::new(input)?.validate()?;
+            Ok(Value::Json(input.to_vec()))
+        }
         ColumnKind::Geometry => Ok(Value::Geometry(input.to_vec())),
         ColumnKind::Vector { dim, datatype } => Ok(Value::Vector(vector_from_storage(
             input.to_vec(),

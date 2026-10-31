@@ -11943,8 +11943,8 @@ fn choose_orderby_index_scan(
                         matched = false;
                         break;
                     };
-                    if crate::engine::expr_program::expr_fingerprint(ast)
-                        != crate::engine::expr_program::expr_fingerprint(&item.expr)
+                    if tuple_access::expression_fingerprint(ast)
+                        != tuple_access::expression_fingerprint(&item.expr)
                     {
                         matched = false;
                         break;
@@ -12102,8 +12102,8 @@ fn choose_groupby_index_scan(
                     }
                     Some(crate::storage::IndexKeyPart::Expression(expr_part)) => {
                         expr_part.ast.as_ref().is_some_and(|ast| {
-                            crate::engine::expr_program::expr_fingerprint(ast)
-                                == crate::engine::expr_program::expr_fingerprint(group_expr)
+                            tuple_access::expression_fingerprint(ast)
+                                == tuple_access::expression_fingerprint(group_expr)
                         })
                     }
                     None => false,
@@ -15162,7 +15162,7 @@ fn collect_index_expression_constraints(
                 if plan_constraint_is_null_literal(&value) {
                     return None;
                 }
-                let fp = crate::engine::expr_program::expr_fingerprint(target);
+                let fp = tuple_access::expression_fingerprint(target);
                 eq_values.insert(fp, value);
                 Some(())
             };
@@ -15179,12 +15179,12 @@ fn collect_index_expression_constraints(
             // as the "target" expression, the literal side as the bound.
             if expr_column_name(left).is_none() {
                 if let Some(value) = expr_to_plan_constraint(right) {
-                    let fp = crate::engine::expr_program::expr_fingerprint(left);
+                    let fp = tuple_access::expression_fingerprint(left);
                     record_expression_range(ranges, fp, *op, value);
                 }
             } else if expr_column_name(right).is_none() {
                 if let Some(value) = expr_to_plan_constraint(left) {
-                    let fp = crate::engine::expr_program::expr_fingerprint(right);
+                    let fp = tuple_access::expression_fingerprint(right);
                     record_expression_range(ranges, fp, flip_cmp(*op), value);
                 }
             }
@@ -15199,7 +15199,7 @@ fn collect_index_expression_constraints(
                 if let (Some(low), Some(high)) =
                     (expr_to_plan_constraint(low), expr_to_plan_constraint(high))
                 {
-                    let fp = crate::engine::expr_program::expr_fingerprint(expr);
+                    let fp = tuple_access::expression_fingerprint(expr);
                     record_expression_range(ranges, fp, BinaryOp::GtEq, low);
                     record_expression_range(ranges, fp, BinaryOp::LtEq, high);
                 }
@@ -15245,7 +15245,7 @@ fn collect_index_expression_constraints(
             // B12: hand the escape to the extractor so LIKE-under-ESCAPE
             // still yields a prefix; the extractor drops the special
             // char in-place and pushes the following literal.
-            let fp = crate::engine::expr_program::expr_fingerprint(expr);
+            let fp = tuple_access::expression_fingerprint(expr);
             let Some(shape) =
                 crate::engine::expr::analyze_like_sargable_pattern(&folded_pattern, *escape_char)
             else {
@@ -15621,7 +15621,7 @@ fn collect_index_expression_in_constraints(
                 return;
             };
             if !values.is_empty() {
-                let fp = crate::engine::expr_program::expr_fingerprint(expr);
+                let fp = tuple_access::expression_fingerprint(expr);
                 in_values.insert(fp, values);
             }
         }
@@ -17940,9 +17940,9 @@ fn index_nlj_dependent_range_fraction(
                 )
             })
         }
-        Some(crate::storage::IndexKeyPart::Expression(expr)) => Some(
-            crate::storage::ParamTarget::for_column(&expr.data_type, false),
-        ),
+        Some(crate::storage::IndexKeyPart::Expression(expr)) => {
+            Some(crate::storage::schema::index_expression_param_target(expr))
+        }
         None => None,
     };
     for pos in 0..eq_prefix_len {

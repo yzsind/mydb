@@ -1383,8 +1383,7 @@ where
             Err(err) => {
                 record_handshake_failure();
                 if self.authenticated {
-                    let _ = self.close_session_blocking().await;
-                    self.authenticated = false;
+                    let _ = self.close_authenticated_session().await;
                 }
                 return Err(err);
             }
@@ -1460,7 +1459,7 @@ where
         // `cursor_registry::unregister`.
         crate::engine::cursor_registry::named_close_for_connection(self.connection_id);
         if self.authenticated {
-            if let Err(err) = self.close_session_blocking().await {
+            if let Err(err) = self.close_authenticated_session().await {
                 log_message(format_args!(
                     "connection {} cleanup failed: {} ({})",
                     self.connection_id,
@@ -1471,7 +1470,7 @@ where
         }
         self.handle = None;
         self.registry.unregister(self.connection_id);
-        self.authenticated = false;
+        // Drop retries an incomplete cleanup; engine quota release is idempotent.
         result
     }
 
@@ -1515,7 +1514,10 @@ where
                 (context, result)
             })
             .await
-            .map_err(|err| self.recover_join_error(err))?;
+            .map_err(|err| {
+                self.recover_parked_context();
+                query_join_error(err)
+            })?;
         self.restore_context(context);
         self.process_database = (!self.context.current_database.is_empty())
             .then(|| self.context.current_database.clone());
@@ -2611,64 +2613,42 @@ where
         let Some(handle) = self.handle.as_ref().map(Arc::clone) else {
             return self.codec.read_packet(&mut self.stream).await;
         };
-        loop {
-            let timed_out = {
-                let read = self.codec.read_packet(&mut self.stream);
-                tokio::pin!(read);
-
-                // Pipelined clients and request/response clients running on
-                // another core can already have the next command in the socket
-                // receive buffer after the previous response is flushed.  Poll
-                // the read once before allocating and registering timeout,
-                // shutdown, and KILL futures.  A genuinely idle connection falls
-                // through to the unchanged `select!` path below.
-                let first = std::future::poll_fn(|cx| {
-                    std::task::Poll::Ready(std::future::Future::poll(read.as_mut(), cx))
-                })
-                .await;
-                if let std::task::Poll::Ready(result) = first {
-                    return result;
-                }
-
+        let timed_out = {
+            let read = self.codec.read_packet(&mut self.stream);
+            tokio::pin!(read);
+            let first = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(read.as_mut(), cx))
+            })
+            .await;
+            if let std::task::Poll::Ready(result) = first {
+                return result;
+            }
+            let deadline = async {
                 match idle_timeout {
-                    Some(dur) => {
-                        let timeout = tokio::time::sleep(dur);
-                        tokio::pin!(timeout);
-                        tokio::select! {
-                            result = &mut read => return result,
-                            _ = &mut timeout => true,
-                            _ = crate::mysql::shutdown::shutdown_notified() => return Ok(None),
-                            _ = handle.notified() => {
-                                if self.kill_flag.load(Ordering::Acquire) {
-                                    return Ok(None);
-                                }
-                                false
-                            }
-                        }
-                    }
-                    None => {
-                        tokio::select! {
-                            result = &mut read => return result,
-                            _ = crate::mysql::shutdown::shutdown_notified() => return Ok(None),
-                            _ = handle.notified() => {
-                                if self.kill_flag.load(Ordering::Acquire) {
-                                    return Ok(None);
-                                }
-                                false
-                            }
-                        }
-                    }
+                    Some(dur) => tokio::time::sleep(dur).await,
+                    None => std::future::pending::<()>().await,
                 }
             };
-            if timed_out {
-                let err = error(
-                    crate::error::catalog::ER_CLIENT_INTERACTION_TIMEOUT,
-                    "The client was disconnected by the server because of inactivity. See wait_timeout and interactive_timeout.",
-                );
-                self.write_error_packet(0, &err).await?;
-                return Ok(None);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    result = &mut read => return result,
+                    _ = &mut deadline => break true,
+                    _ = crate::mysql::shutdown::shutdown_notified() => return Ok(None),
+                    _ = handle.notified() => {
+                        if self.kill_flag.load(Ordering::Acquire) { return Ok(None); }
+                        // KILL QUERY while waiting for a command must not drop
+                        // partially consumed packet bytes or reset its deadline.
+                    }
+                }
             }
+        };
+        if timed_out {
+            let err = error(crate::error::catalog::ER_CLIENT_INTERACTION_TIMEOUT,
+                "The client was disconnected by the server because of inactivity. See wait_timeout and interactive_timeout.");
+            self.write_error_packet(0, &err).await?;
         }
+        Ok(None)
     }
 
     async fn handle_statistics(&mut self, payload: &[u8]) -> io::Result<()> {
@@ -3056,7 +3036,6 @@ where
 
         if let Err(err) = self.close_session_blocking().await {
             crate::engine::auth::release_connection(&context.authenticated_as);
-            self.authenticated = false;
             self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
                 .await?;
             return Err(io::Error::other("COM_CHANGE_USER cleanup failed"));
@@ -7816,6 +7795,14 @@ where
         (dml_state, result)
     }
 
+    async fn close_authenticated_session(&mut self) -> Result<(), QueryError> {
+        let result = self.close_session_blocking().await;
+        if result.is_ok() {
+            self.authenticated = false;
+        }
+        result
+    }
+
     async fn close_session_blocking(&mut self) -> Result<(), QueryError> {
         // Session cleanup is broader than transaction rollback: it releases
         // account connection quota, temporary tables, explicit/metadata
@@ -10092,6 +10079,48 @@ mod tests {
         assert!(!statement_has_computed_ordering(
             &parse_statement("SELECT 1").unwrap()
         ));
+    }
+
+    struct FailOnceCleanupEngine(std::sync::atomic::AtomicUsize);
+    impl QueryEngine for FailOnceCleanupEngine {
+        fn execute(&self, _: &mut SessionContext, _: &str) -> Result<QueryResponse, QueryError> {
+            Ok(QueryResponse::Ok)
+        }
+        fn session_cleanup_is_trivial(&self, _: &SessionContext) -> bool {
+            true
+        }
+        fn close_session(&self, _: &mut SessionContext) -> Result<(), QueryError> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(crate::error::catalog::ER_UNKNOWN_ERROR.error("injected cleanup failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit1031_failed_teardown_is_retried_by_drop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let engine = Arc::new(FailOnceCleanupEngine(std::sync::atomic::AtomicUsize::new(
+            0,
+        )));
+        let mut session = Session::try_new(
+            42,
+            peer,
+            stream,
+            None,
+            Arc::clone(&engine),
+            Arc::new(SessionRegistry::new()),
+        )
+        .unwrap();
+        session.authenticated = true;
+        assert!(session.close_authenticated_session().await.is_err());
+        drop(session);
+        assert_eq!(engine.0.load(Ordering::Relaxed), 2);
     }
 
     struct PanicCleanupEngine(std::sync::atomic::AtomicUsize);

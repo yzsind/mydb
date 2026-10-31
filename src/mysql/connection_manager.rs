@@ -118,7 +118,8 @@ impl OpenFilesLimit {
         let fd_capacity = self
             .soft
             .saturating_sub(self.reserve)
-            .saturating_sub(ADMIN_CONNECTION_RESERVE as u64)
+            .saturating_sub(2 * ADMIN_CONNECTION_RESERVE as u64)
+            .saturating_div(2)
             .max(1);
         configured_max.min(fd_capacity.min(usize::MAX as u64) as usize)
     }
@@ -588,16 +589,16 @@ mod tests {
             capped_by_hard_limit: true,
             set_error: None,
         };
-        assert_eq!(limit.effective_max_connections(2000), 502);
+        assert_eq!(limit.effective_max_connections(2000), 246);
     }
 
     #[test]
     fn effective_max_connections_keeps_configured_cap_when_soft_limit_fits() {
         let limit = OpenFilesLimit {
             initial_soft: 1024,
-            soft: 4096,
-            hard: 4096,
-            requested: 2512,
+            soft: 8192,
+            hard: 8192,
+            requested: 4512,
             reserve: 512,
             raised: true,
             capped_by_hard_limit: false,

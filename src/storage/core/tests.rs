@@ -28762,8 +28762,8 @@ fn write_path_inline_patch_types_null_resize_and_recovery() {
         ),
         (
             DataType::Json,
-            Value::Json(br#"{"a":1}"#.to_vec()),
-            Value::Json(br#"{"a":2}"#.to_vec()),
+            Value::Json(crate::engine::json::parse_text(r#"{"a":1}"#, 1, "test").unwrap()),
+            Value::Json(crate::engine::json::parse_text(r#"{"a":2}"#, 1, "test").unwrap()),
         ),
     ];
     for (case, (kind, old_value, new_value)) in cases.into_iter().enumerate() {

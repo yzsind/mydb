@@ -1052,6 +1052,8 @@ fn json_additional_reads_keep_container_scalar_opaque_and_sql_null_semantics() {
         json_value("true"),
         json_value("1"),
         json_value("1.0"),
+        json_value("12345678901234567890123456789012345678901234567890123456789012345"),
+        json_value(r#"{"a":12345678901234567890123456789012345678901234567890123456789012345}"#),
         json_value(r#""1""#),
         json_value("[]"),
         json_value("[1,2]"),
@@ -1073,6 +1075,8 @@ fn json_additional_reads_keep_container_scalar_opaque_and_sql_null_semantics() {
         "JSON_OVERLAPS(x,'null')",
         "JSON_OVERLAPS(x,'1')",
         "JSON_OVERLAPS(x,'1.0')",
+        "JSON_OVERLAPS(x,'12345678901234567890123456789012345678901234567890123456789012345')",
+        "JSON_OVERLAPS(x,'{\"a\":12345678901234567890123456789012345678901234567890123456789012345}')",
         "JSON_OVERLAPS(x,'[1,2]')",
         "JSON_OVERLAPS(x,'[[2,3]]')",
         "JSON_OVERLAPS(x,'{\"a\":1}')",
@@ -1096,17 +1100,31 @@ fn json_value_integer_lane_defers_conversions_defaults_and_ast_sensitive_paths()
         json_value("null"),
         json_value("true"),
         json_value("false"),
-        json_value("-9223372036854775808"),
-        json_value("18446744073709551615"),
         json_value("0"),
     ];
-    for sql in [
-        "JSON_VALUE(x,'$' RETURNING SIGNED)",
-        "JSON_VALUE(x,'$' RETURNING UNSIGNED)",
+    for (sql, boundaries, overflow) in [
+        (
+            "JSON_VALUE(x,'$' RETURNING SIGNED)",
+            ["-9223372036854775808", "9223372036854775807"],
+            "18446744073709551615",
+        ),
+        (
+            "JSON_VALUE(x,'$' RETURNING UNSIGNED)",
+            ["0", "18446744073709551615"],
+            "-9223372036854775808",
+        ),
     ] {
-        parity(sql, ColumnType::Json, values.clone());
+        let mut valid = values.clone();
+        valid.extend(boundaries.map(json_value));
+        parity(sql, ColumnType::Json, valid);
         let (program, schema) = compile(sql, ColumnType::Json);
         assert!(!program.column_parallel_safe(&schema));
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![json_value(overflow)])],
+        );
+        assert_eq!(oracle(&program, &batch).unwrap(), vec![Value::Null]);
+        assert!(program.try_eval_column(&batch).is_none(), "{sql}");
     }
     for sql in [
         "JSON_VALUE(x,'$' RETURNING DECIMAL(65,30))",

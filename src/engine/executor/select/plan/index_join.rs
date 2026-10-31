@@ -193,6 +193,9 @@ pub(in crate::engine::executor::select) fn compile_index_lookup_plan(
         };
 
         let part_target = || -> Result<crate::storage::ParamTarget, QueryError> {
+            if let Some(crate::storage::IndexKeyPart::Expression(expr)) = part {
+                return Ok(crate::storage::schema::index_expression_param_target(expr));
+            }
             let unsigned = match part {
                 Some(crate::storage::IndexKeyPart::Column(name)) => {
                     right_table.schema.columns[right_table.schema.column_index(name)?].unsigned

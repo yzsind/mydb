@@ -3361,41 +3361,43 @@ impl StorageQueryEngine {
     }
 
     pub fn shutdown(&self) -> Result<(), QueryError> {
-        crate::engine::http::shutdown_database(&self.db)?;
-        crate::engine::ai::runtime::shutdown_database(&self.db)?;
-        crate::backup::shutdown_jobs(&self.db)?;
-        // No background writer may race the final checkpoint. In
-        // particular, auto-analyze / zone-map maintenance / undo purge can
-        // append WAL without owning a client connection, so draining the
-        // MySQL connection count alone is not a quiescence barrier.
+        // Stop producers first, then drain services. One service error must
+        // never skip unrelated joins or the final checkpoint.
         if let Some(scheduler) = &self.event_scheduler {
             scheduler.shutdown();
         }
+        let mut first_error = None;
+        let mut record = |result: Result<(), QueryError>| {
+            if let Err(err) = result {
+                crate::util::logging::log_message(format_args!(
+                    "shutdown cleanup failed: {}",
+                    err.message()
+                ));
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        };
+        record(crate::engine::http::shutdown_database(&self.db));
+        record(crate::engine::ai::runtime::shutdown_database(&self.db));
+        record(crate::backup::shutdown_jobs(&self.db));
         self.auto_analyze_worker.shutdown();
         self.zone_map_maintenance_worker.shutdown();
         self.vector_maintenance_worker.shutdown();
         self.undo_purge_worker.shutdown();
         self.memory_pressure_worker.shutdown();
         self.checkpointer.shutdown();
-        crate::backup::shutdown_archiver(&self.db)?;
-
-        // Maintenance that can append WAL is ordered before CheckpointBegin.
-        // Drain any residual deferred-pinned/re-dirtied pages with bounded
-        // sharp passes so graceful shutdown leaves a self-contained recovery
-        // point instead of a recovery tail too large to scan under the process
-        // memory target.
-        self.db.checkpoint_for_shutdown()
+        record(crate::backup::shutdown_archiver(&self.db));
+        record(self.db.checkpoint_for_shutdown());
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn close_session(&self, session: &mut SessionContext) -> Result<(), QueryError> {
-        let cleanup = self.reset_session(session);
-        // P0-D1: release the per-account simultaneous-session counter only on
-        // real disconnect/change-user. COM_RESET_CONNECTION keeps the same
-        // authenticated connection and therefore must not release/re-charge.
-        if !session.internal_system_session {
+        if !session.internal_system_session && !session.connection_quota_released {
+            session.connection_quota_released = true;
             crate::engine::auth::release_connection(&session.authenticated_as);
         }
-        cleanup
+        self.reset_session(session)
     }
 
     pub fn reset_session(&self, session: &mut SessionContext) -> Result<(), QueryError> {

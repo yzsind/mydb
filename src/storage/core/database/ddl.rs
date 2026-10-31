@@ -1128,6 +1128,7 @@ fn prepare_create_table_schema(
                             .get(position)
                             .copied()
                             .unwrap_or(false),
+                        collation_id: None,
                         ast: None,
                         program: None,
                     })

@@ -160,8 +160,12 @@ pub(crate) fn encode_nonnull_from_column_row_with_collation(
                 buf,
             );
         }
+        ColumnVector::Json { offsets, data, .. } => {
+            let bytes = &data[offsets[row] as usize..offsets[row + 1] as usize];
+            buf.push(4);
+            push_len_bytes(&crate::engine::json::equality_key(bytes), buf);
+        }
         ColumnVector::Bytes { offsets, data, .. }
-        | ColumnVector::Json { offsets, data, .. }
         | ColumnVector::Geometry { offsets, data, .. }
         | ColumnVector::Vector { offsets, data, .. } => {
             let bytes = &data[offsets[row] as usize..offsets[row + 1] as usize];

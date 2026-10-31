@@ -4356,7 +4356,13 @@ fn binlog_value_to_mydb(
                     .value()
                     .map(|value| decode_jsonb_node(value, 1))
                     .transpose()?;
-                decoded.push((diff.operation() as u8, diff.path_str().into_owned(), value));
+                let path = std::str::from_utf8(diff.path()).map_err(|_| {
+                    error(
+                        crate::error::catalog::ER_INVALID_JSON_PATH,
+                        "malformed PARTIAL_JSON path: invalid UTF-8",
+                    )
+                })?;
+                decoded.push((diff.operation() as u8, path.to_owned(), value));
             }
             crate::engine::expr::apply_replication_json_diffs(base, &decoded)
         }
@@ -9528,4 +9534,21 @@ mod tests {
 
 fn poisoned_lock(message: &str) -> QueryError {
     error(crate::error::catalog::ER_GET_ERRNO, message)
+}
+
+#[cfg(test)]
+mod audit1031_json_diff_tests {
+    use super::*;
+    #[test]
+    fn audit1031_partial_json_rejects_invalid_utf8_path() {
+        use mysql_common::{binlog::jsondiff::JsonDiff, io::ParseBuf};
+        // REMOVE, lenenc path length, then a path with invalid UTF-8.
+        let bytes = [2, 4, b'$', b'.', 0xff, b'x'];
+        let diff: JsonDiff<'_> = ParseBuf(&bytes).parse(()).unwrap();
+        let event = mysql::binlog::value::BinlogValue::JsonDiff(vec![diff]);
+        let base = Value::Json(crate::engine::json::parse_text("{}", 1, "test").unwrap());
+        let err = binlog_value_to_mydb(&event, &DataTypeKind::Json, false, None, Some(&base))
+            .unwrap_err();
+        assert!(err.message().contains("invalid UTF-8"));
+    }
 }

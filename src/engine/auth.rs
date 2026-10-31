@@ -312,12 +312,26 @@ mod resource_limits {
         if max_conn > 0 && usage.new_conns >= max_conn {
             return Err(err_limit(account, "max_connections_per_hour", max_conn));
         }
-        if max_user_conn > 0
-            && usage
-                .current_conns
-                .saturating_sub(u32::from(replacing_self))
-                >= max_user_conn
+        let global_limit = if max_user_conn == 0 {
+            crate::engine::sysvar::builtin::connection::max_user_connections()
+        } else {
+            u64::from(max_user_conn)
+        };
+        if global_limit > 0
+            && u64::from(
+                usage
+                    .current_conns
+                    .saturating_sub(u32::from(replacing_self)),
+            ) >= global_limit
         {
+            if max_user_conn == 0 {
+                return Err(
+                    crate::error::catalog::ER_TOO_MANY_USER_CONNECTIONS.error(format!(
+                        "User '{}' already has more than 'max_user_connections' active connections",
+                        account.user
+                    )),
+                );
+            }
             return Err(err_limit(account, "max_user_connections", max_user_conn));
         }
         usage.new_conns = usage.new_conns.saturating_add(1);

@@ -2813,6 +2813,7 @@ fn create_index_schema_from_parts(
                         .get(position)
                         .copied()
                         .unwrap_or(false),
+                    collation_id: None,
                     ast: None,
                     program: None,
                 })

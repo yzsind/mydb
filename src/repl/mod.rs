@@ -239,6 +239,9 @@ pub fn physical_replication_active() -> bool {
 /// backup from the configured master so the engine opens on a
 /// consistent snapshot and WAL streaming can resume from `backup_lsn+1`.
 pub async fn maybe_bootstrap_replica(data_dir: &std::path::Path) -> Result<(), QueryError> {
+    // Protect direct library callers as well as main's longer-lived startup
+    // guard. Recovery of an interrupted install also mutates this directory.
+    let _bootstrap_lock = crate::backup::lock_data_directory(data_dir)?;
     // Resolve a crash between staged subtree renames before deciding whether
     // the directory is fresh. Otherwise a partially-installed `schemas/`
     // makes `fresh=false` and can bypass the retry entirely.

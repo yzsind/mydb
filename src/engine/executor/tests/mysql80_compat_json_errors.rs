@@ -334,7 +334,7 @@ fn mvi_insert_non_numeric_element_reports_3903() {
 }
 
 #[test]
-fn mvi_insert_negative_into_unsigned_reports_3903() {
+fn mvi_insert_negative_into_unsigned_reports_3904() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
@@ -353,7 +353,7 @@ fn mvi_insert_negative_into_unsigned_reports_3903() {
         &mut session,
         r#"INSERT INTO mv VALUES (2, '{"tags":[-5]}')"#,
     );
-    assert_code("MVI negative→unsigned 3903", 3903, &e);
+    assert_code("MVI negative→unsigned 3904", 3904, &e);
 }
 
 #[test]

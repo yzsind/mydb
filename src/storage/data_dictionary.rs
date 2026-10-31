@@ -478,6 +478,7 @@ fn index_column_usage_table() -> TableSchema {
                 true,
             ),
             col("expr_multi_valued", DataTypeKind::Bool, false),
+            ucol("expr_collation_id", DataTypeKind::Int, true),
         ],
     )
 }
@@ -1373,6 +1374,7 @@ fn push_table_rows(
                 bv(expr.is_some_and(|e| e.nullable)),
                 expr.map_or(Value::Null, |e| jsonv(&e.referenced_columns)),
                 bv(expr.is_some_and(|e| e.multi_valued)),
+                opt_uv(expr.and_then(|e| e.collation_id).map(u64::from)),
             ]);
             ord += 1;
         }
@@ -1390,6 +1392,7 @@ fn push_table_rows(
                 bv(false),
                 Value::Null,
                 bv(false),
+                Value::Null,
             ]);
             ord += 1;
         }
@@ -2226,6 +2229,7 @@ fn reconstruct_index(
                     nullable: r_bool(p, 9),
                     referenced_columns: r_json::<Vec<String>>(p, 10)?,
                     multi_valued: r_bool(p, 11),
+                    collation_id: r_opt_usize(p, 12).and_then(|id| u16::try_from(id).ok()),
                     ast: None,
                     program: None,
                 }));
