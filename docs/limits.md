@@ -332,7 +332,8 @@ Key configurable ranges:
 | Per-query spill watermark | 42% of executor target | Derived default floor 8 MiB; explicit positive MiB settings can be smaller |
 | Process-wide query spill watermark | = executor target | Setter rejects 0; this is not the process hard memory ceiling |
 | Work-area oversubscription | 100% | 100 – 100,000% |
-| Temp (spill) disk total | derived from fs free − 10% reserve | 0 – 18,446,744,073,709,551,615 |
+| Temp (spill) disk total | derived from fs free − 2% of total filesystem capacity | 0 – 18,446,744,073,709,551,615 |
+| Temp disk reserve (`MYDB_TEMP_DISK_RESERVE_PCT`) | 2% of total filesystem capacity | 0 – 90% |
 | Spill per query | 0 = unlimited | 0 – 18,446,744,073,709,551,615 |
 | CTE resident threshold | = query budget (floor 256 KiB) | 0 = spill immediately |
 | Catalog cache (`MYDB_CATALOG_CACHE_MB`) | 5% of target (2% if target ≤ 1 GiB), capped 256 MiB | 0 = disabled |

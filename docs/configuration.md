@@ -486,6 +486,12 @@ inspected with `SHOW ENGINE MYDB STATUS`. After a query completes, fails,
 or is canceled, operator charges should return to zero; temporary spill files are
 cleaned up by the query lifecycle.
 
+`temp_disk_reserve_pct` (`MYDB_TEMP_DISK_RESERVE_PCT`) defaults to `2` and
+accepts `0..=90`. Spill admission keeps that percentage of the filesystem's
+total capacity free.
+The global SQL variable `mydb_temp_disk_reserve_pct` changes the reserve at
+runtime. An explicit spill-byte limit remains subject to this free-space check.
+
 The stable boundaries for large results and protocol buffers are as follows:
 `MYDB_PACKET_WRITE_BUFFER_MAX_BYTES` defaults to 16 MiB; when exceeded it flushes
 first, and a single oversized plaintext packet is written out directly in frames

@@ -77,6 +77,7 @@ static HASH_AGG_SPILLS: AtomicU64 = AtomicU64::new(0);
 static DISTINCT_SPILLS: AtomicU64 = AtomicU64::new(0);
 static CTE_SPILLS: AtomicU64 = AtomicU64::new(0);
 const CONFIG_UNINITIALIZED: u64 = u64::MAX;
+pub(crate) const DEFAULT_DISK_RESERVE_PCT: u64 = 2;
 static GLOBAL_LIMIT_CONFIG: AtomicU64 = AtomicU64::new(CONFIG_UNINITIALIZED);
 static PER_QUERY_LIMIT_CONFIG: AtomicU64 = AtomicU64::new(CONFIG_UNINITIALIZED);
 static RESERVE_PCT_CONFIG: AtomicU64 = AtomicU64::new(CONFIG_UNINITIALIZED);
@@ -104,7 +105,7 @@ fn env_global_limit_bytes() -> u64 {
 }
 
 /// `MYDB_TEMP_DISK_RESERVE_PCT` — fraction of the volume to always keep
-/// free (default 10 %). Guards against filling the disk even when no
+/// free (default 2 %). Guards against filling the disk even when no
 /// explicit `MYDB_TEMP_DISK_LIMIT` is set.
 fn env_reserve_pct() -> u64 {
     let cur = RESERVE_PCT_CONFIG.load(Ordering::Acquire);
@@ -115,7 +116,7 @@ fn env_reserve_pct() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|v| *v <= 90)
-        .unwrap_or(10);
+        .unwrap_or(DEFAULT_DISK_RESERVE_PCT);
     let _ = RESERVE_PCT_CONFIG.compare_exchange(
         CONFIG_UNINITIALIZED,
         value,
