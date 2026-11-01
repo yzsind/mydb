@@ -1431,6 +1431,7 @@ impl ExprProgram {
         &std::collections::HashSet<crate::engine::expr::ValueKey>,
         bool,
         bool,
+        Option<u16>,
     )> {
         let ExprNode::InConstSet {
             expr,
@@ -1438,6 +1439,7 @@ impl ExprProgram {
             hash_class: Some(InHashClass::String),
             has_null,
             negated,
+            collation_id,
             ..
         } = &self.root
         else {
@@ -1446,7 +1448,7 @@ impl ExprProgram {
         let ExprNode::Column(column) = expr.as_ref() else {
             return None;
         };
-        Some((*column, keys, *has_null, *negated))
+        Some((*column, keys, *has_null, *negated, *collation_id))
     }
 
     /// Root program is
@@ -1463,6 +1465,7 @@ impl ExprProgram {
         &std::collections::HashSet<crate::engine::expr::ValueKey>,
         bool,
         bool,
+        Option<u16>,
     )> {
         let ExprNode::InConstSet {
             expr,
@@ -1470,6 +1473,7 @@ impl ExprProgram {
             hash_class: Some(InHashClass::String),
             has_null,
             negated,
+            collation_id,
             ..
         } = &self.root
         else {
@@ -1481,7 +1485,15 @@ impl ExprProgram {
         let ExprNode::Column(column) = expr.as_ref() else {
             return None;
         };
-        Some((*column, *start, *len, keys, *has_null, *negated))
+        Some((
+            *column,
+            *start,
+            *len,
+            keys,
+            *has_null,
+            *negated,
+            *collation_id,
+        ))
     }
 
     /// Root program is an integer column `[NOT] IN` a fixed integral set.
@@ -3252,6 +3264,7 @@ enum ExprNode {
         values: Vec<Value>,
         keys: HashSet<ValueKey>,
         hash_class: Option<InHashClass>,
+        collation_id: Option<u16>,
         has_null: bool,
         negated: bool,
     },
@@ -4582,6 +4595,7 @@ fn try_compile_in_const_set(
     list: &[Expr],
     negated: bool,
     schema: &InputSchema,
+    collation_id: Option<u16>,
 ) -> Result<Option<ExprNode>, CompileError> {
     const MIN_HASH_LIST_LEN: usize = 4;
     let values = list
@@ -4601,7 +4615,7 @@ fn try_compile_in_const_set(
         values
             .iter()
             .filter(|value| !matches!(value, Value::Null))
-            .map(ValueKey::from)
+            .map(|value| ValueKey::from_with_collation(value, collation_id))
             .collect()
     } else {
         HashSet::new()
@@ -4611,6 +4625,7 @@ fn try_compile_in_const_set(
         values,
         keys,
         hash_class,
+        collation_id,
         has_null,
         negated,
     }))
@@ -5677,28 +5692,38 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             list,
             negated,
         } => {
-            // Mixed/effective collation derivation is the legacy evaluator's
-            // correctness oracle. Until the compiled node carries the full
-            // N-ary descriptor, fall back whenever a non-default column
-            // collation participates; this prevents the fast path from
-            // silently comparing with the process default or bypassing
-            // ER_CANT_AGGREGATE_*.
             let default_collation = crate::charset::default_collation_info().id;
-            if aggregate_input_collation(
+            let effective_collation = aggregate_input_collation(
                 &std::iter::once((**expr).clone())
                     .chain(list.iter().cloned())
                     .collect::<Vec<_>>(),
                 schema,
                 "in",
-            )?
-            .is_some_and(|id| id != default_collation)
+            )?;
+            let nondefault = effective_collation.is_some_and(|id| id != default_collation)
                 || std::iter::once(expr.as_ref())
                     .chain(list.iter())
                     .filter_map(|operand| schema.column_collation_info(operand))
-                    .any(|info| info.id != default_collation)
-            {
+                    .any(|info| info.id != default_collation);
+            // Constant character domains can carry their resolved N-ary
+            // collation. Mixed numeric/binary and dynamic-list comparisons
+            // still require the legacy coercion/diagnostic oracle.
+            let bound_text_set =
+                matches!(input_expr_result_type(expr, schema), ColumnType::VarString)
+                    && list.iter().all(|item| {
+                        matches!(
+                            const_compile_value(item),
+                            Some(Value::String(_) | Value::SmallString(_) | Value::Null)
+                        )
+                    });
+            if nondefault && !bound_text_set {
                 return Err(CompileError::Unsupported);
             }
+            let set_collation = if nondefault {
+                effective_collation
+            } else {
+                None
+            };
             // When the tested operand is statically numeric (e.g. a BIT
             // column), coerce any bit/hex literal list items to their numeric
             // value so `bitcol IN (b'101', b'110')` matches the stored UInt
@@ -5714,7 +5739,9 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             if binary_comparison_needs_charset_binding(&operands, schema, collation) {
                 return Err(CompileError::Unsupported);
             }
-            if let Some(node) = try_compile_in_const_set(expr, list, *negated, schema)? {
+            if let Some(node) =
+                try_compile_in_const_set(expr, list, *negated, schema, set_collation)?
+            {
                 return Ok(node);
             }
             Ok(ExprNode::InList {
@@ -6388,6 +6415,7 @@ fn fold_constants(node: ExprNode) -> ExprNode {
             values,
             keys,
             hash_class,
+            collation_id,
             has_null,
             negated,
         } => {
@@ -6398,6 +6426,7 @@ fn fold_constants(node: ExprNode) -> ExprNode {
                 values,
                 keys,
                 hash_class,
+                collation_id,
                 has_null,
                 negated,
             };
@@ -6761,6 +6790,7 @@ impl ExprNode {
                 values,
                 keys,
                 hash_class,
+                collation_id,
                 has_null,
                 negated,
             } => eval_in_const_set_node(
@@ -6768,6 +6798,7 @@ impl ExprNode {
                 values,
                 keys,
                 *hash_class,
+                *collation_id,
                 *has_null,
                 *negated,
                 row,
@@ -7061,6 +7092,7 @@ fn eval_in_const_set_node(
     values: &[Value],
     keys: &HashSet<ValueKey>,
     hash_class: Option<InHashClass>,
+    collation_id: Option<u16>,
     has_null: bool,
     negated: bool,
     row: &dyn RowSource,
@@ -7074,7 +7106,10 @@ fn eval_in_const_set_node(
         return Ok(Value::Null);
     }
     if hash_class.is_some() && in_hash_class(value.as_value()) == hash_class {
-        let found = keys.contains(&ValueKey::from(value.as_value()));
+        let found = keys.contains(&ValueKey::from_with_collation(
+            value.as_value(),
+            collation_id,
+        ));
         if !found && has_null {
             return Ok(Value::Null);
         }
@@ -7098,7 +7133,9 @@ fn eval_in_const_set_node(
     });
     crate::engine::expr::with_in_validate_all_constants(all_string, || {
         crate::engine::expr::with_expression_warning_dedup(hasher.finish(), || {
-            eval_in_precomputed_values(value.into_owned(), values, negated)
+            crate::engine::expr::with_compare_collation(collation_id, || {
+                eval_in_precomputed_values(value.into_owned(), values, negated)
+            })
         })
     })
 }

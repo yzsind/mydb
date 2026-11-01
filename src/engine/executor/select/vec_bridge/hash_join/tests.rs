@@ -291,3 +291,194 @@ impl HashJoinBatchOperator<'_> {
         self.state.as_ref().map(|state| &state.payload)
     }
 }
+
+#[test]
+fn residual_existence_domain_reduction_preserves_each_probe_row() {
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    use crate::parser::{BinaryOp, JoinType};
+
+    let schema = |table: &str, names: &[&str]| {
+        Arc::new(BatchSchema::new(
+            names
+                .iter()
+                .map(|name| BatchField {
+                    table: table.into(),
+                    alias: None,
+                    name: (*name).into(),
+                    column_type: ColumnType::LongLong,
+                    source: Default::default(),
+                })
+                .collect(),
+        ))
+    };
+    let probe_schema = schema("p", &["k", "v", "id"]);
+    let build_schema = schema("b", &["k", "v"]);
+    let pair_schema = Arc::new(BatchSchema::new(
+        probe_schema
+            .fields()
+            .iter()
+            .chain(build_schema.fields())
+            .cloned()
+            .collect(),
+    ));
+    let probe = Batch::new(
+        probe_schema.clone(),
+        vec![
+            ColumnVector::from_values(vec![
+                Value::Int(7),
+                Value::Int(7),
+                Value::Int(8),
+                Value::Int(9),
+                Value::Null,
+            ]),
+            ColumnVector::from_values(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Null,
+                Value::Int(3),
+                Value::Int(4),
+            ]),
+            ColumnVector::from_values((1..=5).map(Value::Int).collect()),
+        ],
+    );
+    let predicate = Expr::Binary {
+        left: Box::new(Expr::CompoundIdentifier(vec!["b".into(), "v".into()])),
+        op: BinaryOp::NotEq,
+        right: Box::new(Expr::CompoundIdentifier(vec!["p".into(), "v".into()])),
+    };
+    for (null_safe, late_match) in [(false, false), (true, false), (false, true), (true, true)] {
+        for join_type in [JoinType::Semi, JoinType::Anti] {
+            let mut build_keys = vec![Value::Int(99); 1000];
+            let mut build_values = vec![Value::Int(0); 1000];
+            build_keys.extend([
+                Value::Int(7),
+                Value::Int(7),
+                Value::Int(8),
+                Value::Int(9),
+                Value::Null,
+            ]);
+            build_values.extend([
+                Value::Int(1),
+                Value::Int(1),
+                Value::Null,
+                Value::Int(3),
+                Value::Int(0),
+            ]);
+            if late_match {
+                build_keys.extend(std::iter::repeat_n(Value::Int(7), 65));
+                build_values.extend(std::iter::repeat_n(Value::Int(1), 65));
+                build_keys.push(Value::Int(7));
+                build_values.push(Value::Int(2));
+            }
+            let mut build = MaterializedBatchOperator::new(
+                build_schema.clone(),
+                vec![Batch::new(
+                    build_schema.clone(),
+                    vec![
+                        ColumnVector::from_values(build_keys),
+                        ColumnVector::from_values(build_values),
+                    ],
+                )],
+            );
+            let mut operator = HashJoinBatchOperator::for_test_uninitialized(
+                &mut build,
+                Box::new(MaterializedBatchOperator::new(
+                    probe_schema.clone(),
+                    vec![probe.clone()],
+                )),
+                &[0],
+                &[0],
+                &[],
+                pair_schema.clone(),
+                false,
+                vec_hash_join::VecJoinType::Inner,
+            )
+            .unwrap();
+            operator.join_type = join_type;
+            operator.null_safe = vec![null_safe];
+            operator.reverse_semi_anti = true;
+            operator.residual = Some((
+                expr_batch::BatchExprProgram::compile(&predicate, &pair_schema)
+                    .unwrap()
+                    .unwrap(),
+                pair_schema.clone(),
+            ));
+            let budget = Arc::new(MemBudget::new(1024 * 1024));
+            with_query_budget(budget.clone(), || {
+                operator.initialize().unwrap();
+                assert_eq!(
+                    operator.test_payload().unwrap().columns[0].len(),
+                    (if null_safe { 5 } else { 4 }) + if late_match { 66 } else { 0 }
+                );
+                let mut actual = Vec::new();
+                while let Some(batch) = operator.next_batch().unwrap() {
+                    actual.extend(
+                        batch
+                            .visible_indices()
+                            .map(|row| batch.columns()[2].value_at(row)),
+                    );
+                }
+                let mut matched = if late_match { vec![1, 2] } else { vec![2] };
+                if null_safe {
+                    matched.push(5);
+                }
+                let expected: Vec<_> = (1..=5)
+                    .filter(|id| matched.contains(id) == (join_type == JoinType::Semi))
+                    .map(Value::Int)
+                    .collect();
+                assert_eq!(actual, expected);
+                drop(operator);
+                assert_eq!(budget.used(), 0);
+            });
+        }
+    }
+}
+
+#[test]
+fn build_domain_compacts_selected_rows_and_releases_budget_on_refusal() {
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    let schema = Arc::new(BatchSchema::new(vec![BatchField {
+        table: "t".into(),
+        alias: None,
+        name: "k".into(),
+        column_type: ColumnType::LongLong,
+        source: Default::default(),
+    }]));
+    let probe = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![Value::Int(2)])],
+    );
+    let domain =
+        build_domain::BuildDomain::from_probe(&[probe.clone()], &[0], &[false], &[], true, 1)
+            .unwrap();
+    let input = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Null,
+        ])],
+    )
+    .with_selection(Selection::Indices(vec![1, 3]));
+    let mut stream = build_domain::BuildDomainStream::new(
+        Box::new(MaterializedBatchOperator::new(schema, vec![input])),
+        domain,
+        false,
+        vec![0],
+        vec![false],
+        Vec::new(),
+    );
+    let output = stream.next_batch().unwrap().unwrap();
+    assert_eq!(output.num_rows(), 1);
+    assert!(output.selection().is_none());
+    assert_eq!(output.columns()[0].value_at(0), Value::Int(2));
+    assert!(stream.next_batch().unwrap().is_none());
+    let budget = Arc::new(MemBudget::new(1));
+    with_query_budget(budget.clone(), || {
+        assert!(
+            build_domain::BuildDomain::from_probe(&[probe], &[0], &[true], &[], false, 1).is_none()
+        );
+        assert_eq!(budget.used(), 0);
+    });
+}

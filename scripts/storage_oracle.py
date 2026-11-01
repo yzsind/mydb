@@ -4,6 +4,7 @@ Keep explicit format guards aligned with src/storage/format_versions.rs. Unknown
 formats must fail the gate rather than silently weakening its physical checks.
 """
 
+import os
 import struct
 import zlib
 
@@ -18,11 +19,10 @@ SLOT_BYTES = 5
 WAL_VERSION = 40
 WAL_HEADER_BYTES = 64
 WAL_FRAME_BYTES = 48
+UNDO_HEADER_BYTES = 64
 
 
-def wal_frames(root):
-    """Read physical frames without interpreting or decompressing their payloads."""
-    frames = []
+def _read_wal_frames(root):
     for path in sorted((root / "system/wal").glob("*.log")):
         raw = path.read_bytes()
         assert len(raw) >= WAL_HEADER_BYTES and raw[:8] == b"MYDBWAL1", (path, "invalid WAL header")
@@ -39,9 +39,37 @@ def wal_frames(root):
             payload = raw[offset + WAL_FRAME_BYTES:offset + WAL_FRAME_BYTES + size]
             assert len(payload) == size, (path, offset, "truncated WAL payload")
             assert zlib.crc32(raw[offset:offset + 44] + payload) == crc, (path, offset, "WAL frame CRC")
-            frames.append({"lsn": lsn, "txn": txn, "kind": kind, "file": path.name, "payload": payload})
+            yield ({"lsn": lsn, "txn": txn, "kind": kind, "file": path.name, "payload": payload},
+                   memoryview(raw)[offset:offset + WAL_FRAME_BYTES + size])
             offset += WAL_FRAME_BYTES + size
-    return sorted(frames, key=lambda frame: frame["lsn"])
+
+
+def wal_frames(root):
+    """Read physical frames without interpreting or decompressing their payloads."""
+    return sorted((frame for frame, _ in _read_wal_frames(root)), key=lambda frame: frame["lsn"])
+
+
+def wal_frame_bytes(root, first_lsn, last_lsn=None):
+    selected = [(frame["lsn"], raw) for frame, raw in _read_wal_frames(root)
+                if frame["lsn"] >= first_lsn and (last_lsn is None or frame["lsn"] <= last_lsn)]
+    selected.sort(key=lambda item: item[0])
+    return b"".join(raw for _, raw in selected)
+
+
+def truncate_undo_tail(path):
+    """Discard only an owned fixture's undo body, retaining its valid identity."""
+    with path.open("r+b") as output:
+        header = output.read(UNDO_HEADER_BYTES)
+        assert len(header) == UNDO_HEADER_BYTES and header[:8] == b"MYUNDO1\0", (path, "invalid undo header")
+        version, segment = struct.unpack_from("<II", header, 8)
+        assert version == 3, (path, "unsupported undo version", version)
+        assert segment == int(path.stem.removeprefix("undo-"), 16), (path, "undo segment identity")
+        assert zlib.crc32(header[:60]) == struct.unpack_from("<I", header, 60)[0], (path, "undo header CRC")
+        original = output.seek(0, 2)
+        output.truncate(UNDO_HEADER_BYTES)
+        output.flush()
+        os.fsync(output.fileno())
+    return original
 
 
 def heap_versions(root, count):

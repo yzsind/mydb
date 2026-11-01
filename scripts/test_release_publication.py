@@ -20,7 +20,7 @@ import time
 
 import pymysql
 from test_release_storage import StorageServers, start, query, binary_sha256
-from storage_oracle import heap_versions, wal_frames
+from storage_oracle import heap_versions, truncate_undo_tail, wal_frames
 
 
 class Gate:
@@ -28,7 +28,12 @@ class Gate:
         self.root = root
         self.marker = root / 'armed'
         self.hit = root / 'hit.json'
+        temporary = root / 'tmp'
+        temporary.mkdir(exist_ok=True)
         self.extra = {'DYLD_INSERT_LIBRARIES': str(library),
+                      # A syscall fault must not borrow another process's
+                      # successful device-cache barrier through the cache.
+                      'TMPDIR': str(temporary.resolve()),
                       'MYDB_PUBLICATION_ROOT': str((root / 'server').resolve()),
                       'MYDB_PUBLICATION_MARKER': str(self.marker),
                       'MYDB_PUBLICATION_HIT': str(self.hit),
@@ -322,11 +327,7 @@ def gap_case(binary, library, root, action, result):
         kill(process)
         truncated = []
         for path in sorted((root / 'server/system/undo').glob('*.seg')):
-            with path.open('r+b') as output:
-                original = output.seek(0, 2)
-                output.truncate(32)
-                output.flush()
-                os.fsync(output.fileno())
+            original = truncate_undo_tail(path)
             truncated.append({'file': path.name, 'old_size': original})
         result['truncated_owned_segments'] = truncated
         result['durable_undo_frames'] = len(undo)

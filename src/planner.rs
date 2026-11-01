@@ -4,6 +4,7 @@ use column_validation::{validate_expr_columns, validate_window_frame_columns};
 mod semi_anti;
 pub(crate) use join_cost::adaptive_candidate_cost;
 pub(crate) use join_cost::reverse_semi_anti_hash_join_eligible;
+pub(crate) use join_cost::semi_anti_probe_reduction_eligible;
 pub(crate) use semi_anti::expr_has_window_function;
 pub(crate) use semi_anti::qualify_outer_idents_by_owner;
 use semi_anti::*;

@@ -3420,12 +3420,23 @@ impl ValueKey {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn string_from_str(s: &str) -> Self {
+        Self::string_from_str_with_collation(s, None)
+    }
+
+    pub(crate) fn string_from_str_with_collation(s: &str, collation_id: Option<u16>) -> Self {
         // Zero-allocation path: write the key directly into the
         // SmallVec storage. Short ASCII keys (≤22 bytes after
         // PAD SPACE trim) stay inline; longer keys spill once
         // instead of allocating a throwaway `Vec<u8>` first.
         let mut buf = KeyBytes::new();
-        crate::charset::with_default_string_key(s, |bytes| buf.extend_from_slice(bytes));
+        match collation_id {
+            Some(id) => crate::charset::with_collation_key_by_id(id, s, |bytes| {
+                buf.extend_from_slice(bytes)
+            }),
+            None => {
+                crate::charset::with_default_string_key(s, |bytes| buf.extend_from_slice(bytes))
+            }
+        }
         ValueKey::String(buf)
     }
 

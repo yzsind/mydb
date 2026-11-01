@@ -3568,7 +3568,7 @@ fn execute_select_inner(
         && stmt
             .selection
             .as_ref()
-            .is_none_or(system_count_filter_is_exact)
+            .is_none_or(|filter| system_count_filter_is_exact(filter, &stmt.from[0]))
     {
         return execute_system_select(db, stmt, registry);
     }
@@ -6937,7 +6937,7 @@ pub(super) fn execute_system_select(
         && stmt
             .selection
             .as_ref()
-            .is_none_or(system_count_filter_is_exact)
+            .is_none_or(|filter| system_count_filter_is_exact(filter, &table_ref))
     {
         if let Some(count) =
             crate::engine::information_schema::fast_count_rows(db, &table_ref.name, &scan_request)?
@@ -7051,37 +7051,82 @@ fn system_count_pushdown_supported(name: &str) -> bool {
         && matches!(table.to_ascii_lowercase().as_str(), "tables" | "statistics")
 }
 
-/// True when the complete WHERE clause is a conjunction of literal equality
-/// predicates understood by `SystemScanRequest`. Partial predicate pushdown
-/// is safe for ordinary scans, but not for COUNT pushdown because omitted
-/// residuals would change the aggregate.
-fn system_count_filter_is_exact(expr: &Expr) -> bool {
-    fn identifier(expr: &Expr) -> bool {
-        matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+/// Header counts implement only schema/table identity filters. Other equality
+/// conjuncts remain residual predicates, even when a scan producer can use them
+/// to narrow its input. Repeated identity keys also require evaluation: the
+/// request's single field cannot represent contradictory equalities.
+fn system_count_filter_is_exact(expr: &Expr, table: &crate::parser::TableRef) -> bool {
+    fn identity(expr: &Expr, table: &crate::parser::TableRef) -> Option<u8> {
+        let name = match expr {
+            Expr::Identifier(name) => name,
+            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [qualifier, name]
+                    if qualifier.eq_ignore_ascii_case(table.alias.as_deref().unwrap_or_else(
+                        || table.name.rsplit('.').next().unwrap_or(&table.name),
+                    )) =>
+                {
+                    name
+                }
+                [schema, qualifier, name]
+                    if table.alias.is_none()
+                        && schema.eq_ignore_ascii_case("information_schema")
+                        && qualifier.eq_ignore_ascii_case(
+                            table.name.rsplit('.').next().unwrap_or(&table.name),
+                        ) =>
+                {
+                    name
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if name.eq_ignore_ascii_case("table_schema") {
+            Some(1)
+        } else if name.eq_ignore_ascii_case("table_name") {
+            Some(2)
+        } else {
+            None
+        }
     }
-    fn literal(expr: &Expr) -> bool {
-        matches!(
-            expr,
-            Expr::BoundValue(_)
-                | Expr::Literal(crate::parser::Literal::String(_))
-                | Expr::Literal(crate::parser::Literal::Int(_))
-                | Expr::Literal(crate::parser::Literal::UInt(_))
-                | Expr::Placeholder(_)
-        )
+    fn string(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(crate::parser::Literal::String(_))
+            | Expr::BoundValue(Value::String(_)) => true,
+            Expr::Placeholder(index) => {
+                matches!(
+                    crate::engine::params::current_param(*index),
+                    Some(Value::String(_))
+                )
+            }
+            _ => false,
+        }
     }
-    match expr {
-        Expr::Binary {
-            left,
-            op: crate::parser::BinaryOp::And,
-            right,
-        } => system_count_filter_is_exact(left) && system_count_filter_is_exact(right),
-        Expr::Binary {
-            left,
-            op: crate::parser::BinaryOp::Eq,
-            right,
-        } => (identifier(left) && literal(right)) || (identifier(right) && literal(left)),
-        _ => false,
+    fn visit(expr: &Expr, table: &crate::parser::TableRef, seen: &mut u8) -> bool {
+        match expr {
+            Expr::Binary {
+                left,
+                op: crate::parser::BinaryOp::And,
+                right,
+            } => visit(left, table, seen) && visit(right, table, seen),
+            Expr::Binary {
+                left,
+                op: crate::parser::BinaryOp::Eq,
+                right,
+            } => {
+                let key = identity(left, table)
+                    .filter(|_| string(right))
+                    .or_else(|| identity(right, table).filter(|_| string(left)));
+                let Some(key) = key else { return false };
+                if *seen & key != 0 {
+                    return false;
+                }
+                *seen |= key;
+                true
+            }
+            _ => false,
+        }
     }
+    visit(expr, table, &mut 0)
 }
 
 fn system_rows_capacity_bytes(rows: &Vec<Vec<Value>>) -> usize {

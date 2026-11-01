@@ -21206,6 +21206,8 @@ fn reverse_hash_semi_anti_generic_keys_match_index_lookup() {
             "'beta'",
             "'other'",
         ),
+        ("DATE", "'2024-01-01'", "'2024-01-02'", "'2024-01-03'"),
+        ("DOUBLE", "1.25", "2.5", "9.75"),
     ] {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let engine = open_test_engine(dir.path());
@@ -21248,7 +21250,7 @@ fn reverse_hash_semi_anti_generic_keys_match_index_lookup() {
                 ),
             ] {
                 let sql = |hint: &str| {
-                    format!("SELECT {hint} id FROM parent WHERE {existence} (SELECT 1 FROM child WHERE {equality} AND child.part = parent.part AND child.a < child.b) ORDER BY id")
+                    format!("SELECT {hint} id FROM parent WHERE {existence} (SELECT 1 FROM child WHERE {equality} AND child.part = parent.part AND child.a < child.b AND ABS(child.a - parent.part) > 0) ORDER BY id")
                 };
                 let hash = query_rows(&engine, &sql("/*+ HASH_JOIN(child) */"));
                 assert_eq!(

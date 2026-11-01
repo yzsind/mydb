@@ -7,7 +7,7 @@ import tempfile
 import unittest
 import zlib
 
-from storage_oracle import heap_versions, wal_frames
+from storage_oracle import heap_versions, truncate_undo_tail, wal_frame_bytes, wal_frames
 
 
 def checksum(page):
@@ -121,6 +121,50 @@ class WalFrameOracleTests(unittest.TestCase):
         struct.pack_into("<I", self.raw, 8, 65535)
         with self.assertRaisesRegex(AssertionError, "unsupported WAL version"):
             self.inspect(self.raw)
+
+    def test_raw_range_uses_the_same_validated_frame_boundaries(self):
+        self.path.write_bytes(self.raw + bytes(128))
+        self.assertEqual(wal_frame_bytes(self.root, 8, 8), self.raw[64:])
+        self.assertEqual(wal_frame_bytes(self.root, 9), b"")
+        self.assertEqual(wal_frame_bytes(self.root, 1, 7), b"")
+
+
+class UndoTailFixtureTests(unittest.TestCase):
+    def setUp(self):
+        Path("/tmp/mydb").mkdir(exist_ok=True)
+        self.directory = tempfile.TemporaryDirectory(dir="/tmp/mydb")
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "undo-00000010.seg"
+        self.header = bytearray(64)
+        self.header[:8] = b"MYUNDO1\0"
+        struct.pack_into("<II", self.header, 8, 3, 16)
+        self.header[24:40] = bytes(range(16))
+        self.seal()
+
+    def seal(self):
+        struct.pack_into("<I", self.header, 60, zlib.crc32(self.header[:60]))
+        self.path.write_bytes(self.header + b"discard this fixture body")
+
+    def test_tail_loss_preserves_the_complete_current_header(self):
+        old_size = self.path.stat().st_size
+        self.assertEqual(truncate_undo_tail(self.path), old_size)
+        self.assertEqual(self.path.read_bytes(), self.header)
+
+    def test_unknown_format_is_rejected_before_truncation(self):
+        struct.pack_into("<I", self.header, 8, 65535)
+        self.seal()
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(AssertionError, "unsupported undo version"):
+            truncate_undo_tail(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_bad_header_crc_is_rejected_before_truncation(self):
+        self.header[24] ^= 1
+        self.path.write_bytes(self.header + bytes(128))
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(AssertionError, "undo header CRC"):
+            truncate_undo_tail(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 if __name__ == "__main__":

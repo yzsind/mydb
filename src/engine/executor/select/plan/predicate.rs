@@ -166,6 +166,7 @@ pub(super) enum DecodedPredicateLeaf {
         len: Option<i64>,
         keys: std::collections::HashSet<crate::engine::expr::ValueKey>,
         ascii_short: Option<Arc<AsciiShortStringSet>>,
+        collation_id: Option<u16>,
         has_null: bool,
         negated: bool,
     },
@@ -198,12 +199,18 @@ pub(super) struct AsciiShortStringSet {
 }
 
 impl AsciiShortStringSet {
-    fn compile(keys: &std::collections::HashSet<crate::engine::expr::ValueKey>) -> Self {
+    fn compile(
+        keys: &std::collections::HashSet<crate::engine::expr::ValueKey>,
+        collation_id: Option<u16>,
+    ) -> Self {
         let contains = |bytes: &[u8]| {
             // SAFETY: callers enumerate only ASCII bytes.
-            keys.contains(&crate::engine::expr::ValueKey::string_from_str(unsafe {
-                std::str::from_utf8_unchecked(bytes)
-            }))
+            keys.contains(
+                &crate::engine::expr::ValueKey::string_from_str_with_collation(
+                    unsafe { std::str::from_utf8_unchecked(bytes) },
+                    collation_id,
+                ),
+            )
         };
         let mut result = Self {
             empty: contains(b""),
@@ -442,11 +449,12 @@ impl DecodedPredicateProgram {
             if let DecodedPredicateLeaf::SubstringIn {
                 keys,
                 ascii_short,
+                collation_id,
                 len: Some(1 | 2),
                 ..
             } = leaf
             {
-                *ascii_short = Some(Arc::new(AsciiShortStringSet::compile(keys)));
+                *ascii_short = Some(Arc::new(AsciiShortStringSet::compile(keys, *collation_id)));
             }
         }
     }
@@ -505,6 +513,7 @@ impl DecodedPredicateProgram {
                     len,
                     keys,
                     ascii_short,
+                    collation_id,
                     has_null,
                     negated,
                 } if *leaf_column == column => {
@@ -513,7 +522,12 @@ impl DecodedPredicateProgram {
                         .as_ref()
                         .and_then(|set| set.contains(value.as_bytes()))
                         .unwrap_or_else(|| {
-                            keys.contains(&crate::engine::expr::ValueKey::string_from_str(value))
+                            keys.contains(
+                                &crate::engine::expr::ValueKey::string_from_str_with_collation(
+                                    value,
+                                    *collation_id,
+                                ),
+                            )
                         });
                     if found {
                         DecodedTruth::from_bool(!*negated)
@@ -827,7 +841,7 @@ pub(super) fn compile_decoded_predicate_node(
         } => {
             let input = InputSchema::from_table(schema);
             if let Ok(program) = ExprCompiler::compile(expr, &input) {
-                if let Some((column, start, len, keys, has_null, negated)) =
+                if let Some((column, start, len, keys, has_null, negated, collation_id)) =
                     program.as_substring_column_string_in_const_set()
                 {
                     simple_string_predicate_column(schema, column)?;
@@ -838,6 +852,7 @@ pub(super) fn compile_decoded_predicate_node(
                         len,
                         keys: keys.clone(),
                         ascii_short: None,
+                        collation_id,
                         has_null,
                         negated,
                     });
@@ -2111,34 +2126,46 @@ mod ascii_short_tests {
 
     #[test]
     fn short_ascii_membership_exhaustively_matches_collation_oracle() {
-        for literals in [
-            vec![],
-            vec!["", "A", "13", "é"],
-            vec!["ab", "a ", "中", "\0"],
+        for name in [
+            "utf8mb4_0900_ai_ci",
+            "utf8mb4_bin",
+            "utf8mb4_0900_as_cs",
+            "utf8mb4_0900_bin",
         ] {
-            let keys = literals
-                .into_iter()
-                .map(crate::engine::expr::ValueKey::string_from_str)
-                .collect();
-            let set = AsciiShortStringSet::compile(&keys);
-            let check = |bytes: &[u8]| {
-                let value = std::str::from_utf8(bytes).unwrap();
-                assert_eq!(
-                    set.contains(bytes),
-                    Some(keys.contains(&crate::engine::expr::ValueKey::string_from_str(value))),
-                    "{bytes:?}"
-                );
-            };
-            check(b"");
-            for first in 0..128u8 {
-                check(&[first]);
-                for second in 0..128u8 {
-                    check(&[first, second]);
+            let id = crate::charset::resolve_collation(name).unwrap().id;
+            for literals in [
+                vec![],
+                vec!["", "A", "13", "é"],
+                vec!["ab", "a ", "中", "\0"],
+            ] {
+                let keys = literals
+                    .iter()
+                    .map(|value| {
+                        crate::engine::expr::ValueKey::string_from_str_with_collation(
+                            value,
+                            Some(id),
+                        )
+                    })
+                    .collect();
+                let set = AsciiShortStringSet::compile(&keys, Some(id));
+                let check = |bytes: &[u8]| {
+                    let value = std::str::from_utf8(bytes).unwrap();
+                    let expected = literals.iter().any(|literal| {
+                        crate::charset::compare_strings_by_id(id, value, literal).is_eq()
+                    });
+                    assert_eq!(set.contains(bytes), Some(expected), "{name}: {bytes:?}");
+                };
+                check(b"");
+                for first in 0..128u8 {
+                    check(&[first]);
+                    for second in 0..128u8 {
+                        check(&[first, second]);
+                    }
                 }
+                assert_eq!(set.contains("é".as_bytes()), None);
+                assert_eq!(set.contains(b"abc"), None);
+                assert_eq!(set.contains(&[255]), None);
             }
-            assert_eq!(set.contains("é".as_bytes()), None);
-            assert_eq!(set.contains(b"abc"), None);
-            assert_eq!(set.contains(&[255]), None);
         }
     }
 }

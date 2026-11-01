@@ -1,4 +1,5 @@
 mod ai;
+mod collated_constant_in;
 mod critical_audit;
 mod ddl_lock_contract;
 mod fresh_release_audit;
