@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 90
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
@@ -31,13 +31,11 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Build portable package
         run: |
-          mkdir -p C:/tmp/mydb
+          python -c "from pathlib import Path; Path('C:/tmp/mydb').mkdir(parents=True, exist_ok=True)"
           python scripts/package_release.py --output C:/tmp/mydb/release-windows
       - name: Verify extracted package
         run: |
-          python scripts/verify_release_package.py \
-            --package C:/tmp/mydb/release-windows/mydb-*-windows-msvc.zip \
-            --output C:/tmp/mydb/release-windows-smoke
+          python scripts/verify_release_package.py --package (Get-ChildItem C:/tmp/mydb/release-windows/mydb-*-windows-msvc.zip).FullName --output C:/tmp/mydb/release-windows-smoke
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-x64
