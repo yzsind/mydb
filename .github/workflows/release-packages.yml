@@ -2,6 +2,11 @@ name: Release packages
 
 on:
   workflow_dispatch:
+    inputs:
+      build_linux:
+        description: Build the Linux package as well as Windows
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -29,10 +34,25 @@ jobs:
         with:
           python-version: '3.12'
       - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/cache/restore@v4
+        id: windows-cache
+        with:
+          path: |
+            D:/tmp/mydb/release-build
+            C:/Users/runneradmin/.cargo/registry
+          key: release-windows-rust195-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: release-windows-rust195-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock') }}-
       - name: Build portable package
         run: |
           python -c "from pathlib import Path; Path('C:/tmp/mydb').mkdir(parents=True, exist_ok=True)"
           python scripts/package_release.py --output C:/tmp/mydb/release-windows
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            D:/tmp/mydb/release-build
+            C:/Users/runneradmin/.cargo/registry
+          key: ${{ steps.windows-cache.outputs.cache-primary-key }}
       - name: Verify extracted package
         run: |
           python scripts/verify_release_package.py --package (Get-ChildItem C:/tmp/mydb/release-windows/mydb-*-windows-msvc.zip).FullName --output C:/tmp/mydb/release-windows-smoke
@@ -52,6 +72,7 @@ jobs:
           path: C:/tmp/mydb/release-windows-smoke/*.log
 
   linux:
+    if: inputs.build_linux
     name: Linux x86_64 glibc 2.17 package
     runs-on: ubuntu-24.04
     timeout-minutes: 90

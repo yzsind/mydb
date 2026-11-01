@@ -183,5 +183,26 @@ class RuntimeSetupTests(unittest.TestCase):
                 builder.verify_test_artifacts(output, {}, runner)
 
 
+class PackagePreflightTests(unittest.TestCase):
+    def test_missing_license_stops_before_compilation(self):
+        import sys
+        import package_release
+        Path('/tmp/mydb').mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir='/tmp/mydb') as temporary:
+            def command(*args, **kwargs):
+                if args[0] == 'rustc':
+                    return 'host: x86_64-pc-windows-msvc\n'
+                return '{}'
+            with patch.object(sys, 'argv', ['package_release.py', '--output', temporary + '/package']), \
+                 patch.object(package_release, 'source_hash', return_value='source'), \
+                 patch.object(package_release, 'build_provenance', return_value=('head', '')), \
+                 patch.object(package_release, 'command', side_effect=command), \
+                 patch.object(package_release, 'collect_third_party', side_effect=SystemExit('missing license')), \
+                 patch.object(package_release.subprocess, 'run') as build:
+                with self.assertRaisesRegex(SystemExit, 'missing license'):
+                    package_release.main()
+                build.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
