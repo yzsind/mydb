@@ -1278,7 +1278,7 @@ impl BufferPool {
         // Share the ordinary pin CAS with eviction. Merely retaining an Arc
         // does not retain residency: a selected victim may already be owned
         // by an evictor and must take the eager-WAL fallback instead.
-        if !self.try_pin_existing(&frame, AccessIntent::Normal) {
+        if !self.try_pin_existing(&frame, AccessIntent::Scan) {
             return false;
         }
         frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
@@ -1315,6 +1315,38 @@ impl BufferPool {
             }
             frame.deferred_pins.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    fn finalize_deferred_batch(
+        self: &Arc<Self>,
+        finalized: &[(PageKey, u64)],
+    ) -> Result<(), QueryError> {
+        // Publish every real LSN and release every pin first. The same page
+        // may occur in several records; scheduling before the final release
+        // lets a cleaner consume the hint while that page is still deferred.
+        for (key, lsn) in finalized {
+            self.finalize_deferred(key, *lsn);
+        }
+        // Fresh-page initialization makes large heap batches resident, so they
+        // can now use deferred WAL. Retain the ordinary append path's bounded
+        // physical-range hint after drain; scattered OLTP writes stay resident.
+        let mut start = 0;
+        while start < finalized.len() {
+            let mut end = start + 1;
+            while end < finalized.len()
+                && finalized[end].0.file == finalized[start].0.file
+                && finalized[end].0.page_id == finalized[end - 1].0.page_id.saturating_add(1)
+            {
+                end += 1;
+            }
+            self.schedule_bulk_page_range(
+                &finalized[start].0.file,
+                finalized[start].0.page_id,
+                finalized[end - 1].0.page_id,
+            )?;
+            start = end;
+        }
+        Ok(())
     }
 
     /// Remove an evicted/discarded frame's registration. The caller must hold
@@ -2914,7 +2946,7 @@ impl BufferPool {
         let Some(frame) = self.lookup_frame(key)? else {
             return Ok(None);
         };
-        if !self.try_pin_existing(&frame, AccessIntent::Normal) {
+        if !self.try_pin_existing(&frame, AccessIntent::Scan) {
             return Ok(None);
         }
         if !frame.is_ready() {
@@ -2983,7 +3015,7 @@ impl BufferPool {
         }
         loop {
             if let Some(frame) = self.lookup_frame(&key)? {
-                if !self.try_pin_existing(&frame, AccessIntent::Normal) {
+                if !self.try_pin_existing(&frame, admission) {
                     self.wait_for_frame_release(Duration::from_millis(1));
                     continue;
                 }
@@ -3003,7 +3035,7 @@ impl BufferPool {
                         frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
                         btree_logical_wal::push_deferred_key(frame.key.clone());
                     }
-                    if frame.mark_dirty(dirty_lsn) {
+                    if frame.mark_dirty_with_intent(dirty_lsn, admission) {
                         self.dirty_pages.fetch_add(1, Ordering::Relaxed);
                         self.note_dirty(&frame.key, dirty_lsn);
                     }
@@ -5345,11 +5377,25 @@ impl BufferPool {
             // while we wait on the syscall.
             crate::wal::LogManager::sync_durable_to(&self.log, max_dirty_lsn)?;
         }
+        // Queued ranges can contain pages already written by another cleaner
+        // or pinned by deferred WAL. Split at those holes before taking a run
+        // snapshot, rather than making one hole degrade every neighbour into
+        // an individual write. Flush locks below still revalidate this hint.
+        let candidate = |frame: &Arc<Frame>| {
+            frame.dirty.load(Ordering::Acquire)
+                && frame.deferred_pins.load(Ordering::Acquire) == 0
+                && frame.state.load(Ordering::Acquire) != FrameIoState::Discarded as u8
+        };
         let mut flushed = 0;
         let mut start = 0;
         while start < frames.len() {
+            if !candidate(&frames[start]) {
+                start += 1;
+                continue;
+            }
             let mut end = start + 1;
             while end < frames.len()
+                && candidate(&frames[end])
                 && frames[end].key.file == frames[start].key.file
                 && frames[end].key.page_id == frames[end - 1].key.page_id + 1
             {
@@ -5981,6 +6027,39 @@ impl BufferPool {
             .values()
             .cloned()
             .collect())
+    }
+
+    pub(crate) fn reclaim_kernel_cache_headroom(&self, bytes: usize) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            if bytes == 0 {
+                return 0;
+            }
+            // Keep global file-cache latches out of potentially blocking VFS
+            // reclaim. Arc snapshots preserve descriptor/inode identity.
+            let Ok(cache) = self.file_cache.read() else {
+                return 0;
+            };
+            let mut files = cache.values().cloned().collect::<Vec<_>>();
+            drop(cache);
+            files.sort_by_key(|file| file.recently_used.load(Ordering::Relaxed));
+            let mut advised = 0usize;
+            for file in files {
+                advised = advised.saturating_add(advise_cached_file_headroom(
+                    &file,
+                    bytes.saturating_sub(advised),
+                ));
+                if advised >= bytes {
+                    break;
+                }
+            }
+            return advised;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = bytes;
+            0
+        }
     }
 
     /// P0 - cheap pre-check for `flush_and_evict_all`. Probes each cached
@@ -7696,6 +7775,57 @@ fn read_exact_at_counted(file: &File, buf: &mut [u8], offset: u64) -> std::io::R
     crate::util::file::read_exact_at_counted(file, buf, offset, true, None)
 }
 
+/// Fallback for cgroups without a delegated reclaim interface. Advance the
+/// cursor so repeated requests do not keep advising an already-uncached prefix.
+/// Returns bytes advised, not bytes physically reclaimed: the kernel may
+/// retain the entire range even when posix_fadvise succeeds.
+#[cfg(target_os = "linux")]
+fn advise_cached_file_headroom(file: &CachedFile, requested: usize) -> usize {
+    use std::os::fd::AsRawFd;
+    advise_cached_file_headroom_with(
+        file.len(),
+        &file.kernel_cache_reclaim_cursor,
+        requested,
+        |offset, bytes| {
+            let (Ok(offset), Ok(bytes)) =
+                (libc::off_t::try_from(offset), libc::off_t::try_from(bytes))
+            else {
+                return false;
+            };
+            // SAFETY: the Arc owner retains this descriptor; only complete clean
+            // kernel pages can be discarded. Dirty/WAL ordering is unchanged.
+            unsafe {
+                libc::posix_fadvise(
+                    file.file.as_raw_fd(),
+                    offset,
+                    bytes,
+                    libc::POSIX_FADV_DONTNEED,
+                ) == 0
+            }
+        },
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn advise_cached_file_headroom_with(
+    len: u64,
+    cursor: &AtomicU64,
+    requested: usize,
+    advise: impl FnOnce(u64, u64) -> bool,
+) -> usize {
+    if requested == 0 || len == 0 {
+        return 0;
+    }
+    let chunk = requested.min(64 * 1024 * 1024).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let offset = cursor.fetch_add(chunk as u64, Ordering::Relaxed) % len;
+    let bytes = (chunk as u64).min(len - offset);
+    if advise(offset, bytes) {
+        bytes as usize
+    } else {
+        0
+    }
+}
+
 /// Fill scratch storage without first writing zeros that the read replaces.
 /// Success guarantees every byte is initialized; errors expose no byte slice.
 #[cfg(unix)]
@@ -7758,6 +7888,136 @@ fn read_exact_at_uninit(
     // retains its established implementation on non-Unix targets.
     let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len()) };
     read_exact_at_counted(file, bytes, offset).map(|_| ())
+}
+
+#[cfg(test)]
+#[test]
+fn cached_file_headroom_advice_bounds_ranges_and_advances_cursor() {
+    let len = (PAGE_SIZE * 5) as u64;
+    let reclaim_cursor = AtomicU64::new(0);
+    let cursor = || reclaim_cursor.load(Ordering::Relaxed);
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, 0, |_, _| panic!(
+            "zero request issued advice"
+        )),
+        0
+    );
+    assert_eq!(cursor(), 0);
+    // Successful advice may reclaim nothing (for example on tmpfs). Verify
+    // the exact ranges passed to the OS without requiring physical eviction.
+    for (requested, expected_offset, expected_bytes, expected_cursor) in [
+        (1, 0, PAGE_SIZE, PAGE_SIZE),
+        (PAGE_SIZE + 1, PAGE_SIZE, PAGE_SIZE * 2, PAGE_SIZE * 3),
+        (PAGE_SIZE * 3, PAGE_SIZE * 3, PAGE_SIZE * 2, PAGE_SIZE * 6),
+        (PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE * 7),
+    ] {
+        let mut calls = 0;
+        assert_eq!(
+            advise_cached_file_headroom_with(len, &reclaim_cursor, requested, |offset, bytes| {
+                calls += 1;
+                assert_eq!(
+                    (offset, bytes),
+                    (expected_offset as u64, expected_bytes as u64)
+                );
+                true
+            }),
+            expected_bytes
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(cursor(), expected_cursor as u64);
+    }
+
+    let len = 128 * 1024 * 1024;
+    let reclaim_cursor = AtomicU64::new(0);
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, usize::MAX, |offset, bytes| {
+            assert_eq!((offset, bytes), (0, 64 * 1024 * 1024));
+            true
+        }),
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, PAGE_SIZE, |offset, bytes| {
+            assert_eq!((offset, bytes), (64 * 1024 * 1024, PAGE_SIZE as u64));
+            false
+        }),
+        0
+    );
+    assert_eq!(
+        reclaim_cursor.load(Ordering::Relaxed),
+        (64 * 1024 * 1024 + PAGE_SIZE) as u64
+    );
+
+    let len = 0;
+    let reclaim_cursor = AtomicU64::new(0);
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, PAGE_SIZE, |_, _| panic!(
+            "empty file issued advice"
+        )),
+        0
+    );
+    assert_eq!(reclaim_cursor.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(test)]
+#[test]
+#[cfg(target_os = "linux")]
+fn buffered_scan_reads_and_bounded_cache_advice_preserve_data() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let bytes = vec![0x5a; PAGE_SIZE * 64];
+    for lane in 0..3 {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join(format!("scan-{lane}")))
+            .unwrap();
+        write_all_at(&file, &bytes, 0).unwrap();
+        file.sync_all().unwrap();
+        match lane {
+            0 => {
+                let mut actual = vec![0; bytes.len()];
+                read_exact_at_counted(&file, &mut actual, 0).unwrap();
+                assert_eq!(actual, bytes);
+            }
+            1 => {
+                let mut actual = vec![std::mem::MaybeUninit::<u8>::uninit(); bytes.len()];
+                read_exact_at_uninit(&file, &mut actual, 0).unwrap();
+                // SAFETY: the successful read initialized every byte.
+                let actual = unsafe {
+                    std::slice::from_raw_parts(actual.as_ptr().cast::<u8>(), actual.len())
+                };
+                assert_eq!(actual, bytes);
+            }
+            _ => {
+                let mut actual = vec![vec![0; PAGE_SIZE]; 64];
+                let mut pages: Vec<&mut [u8]> = actual.iter_mut().map(Vec::as_mut_slice).collect();
+                read_pages_batch_at(&file, &mut pages, 0).unwrap();
+                assert!(actual.iter().flatten().all(|byte| *byte == 0x5a));
+            }
+        }
+        let cached = CachedFile::new(file, bytes.len() as u64);
+        for step in 1..=2 {
+            assert_eq!(
+                advise_cached_file_headroom(&cached, bytes.len() / 2),
+                bytes.len() / 2
+            );
+            assert_eq!(
+                cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed),
+                (step * bytes.len() / 2) as u64
+            );
+        }
+        let cursor = cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed);
+        assert_eq!(advise_cached_file_headroom(&cached, 0), 0);
+        assert_eq!(
+            cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed),
+            cursor
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("scan-{lane}"))).unwrap(),
+            bytes
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10356,6 +10616,139 @@ mod oldest_dirty_tests {
     }
 
     #[test]
+    fn deferred_wal_drain_restores_bulk_writeback_only_for_contiguous_ranges() {
+        for contiguous in [true, false] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let path = dir.path().join("deferred-bulk.heap");
+            File::create(&path).unwrap();
+            let log = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            ));
+            let pool = BufferPool::new_with_options(
+                128,
+                log,
+                DurabilityMode::Memory,
+                Duration::ZERO,
+                1,
+                0,
+            );
+            let file = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
+            let mut finalized = Vec::new();
+            for page in 0..64 {
+                let page_id = page * if contiguous { 1 } else { 2 };
+                let key = PageKey {
+                    file: Arc::clone(&file),
+                    page_id,
+                };
+                pool.store_page_cold(key.clone(), vec![(page + 1) as u8; PAGE_SIZE], 0)
+                    .unwrap();
+                assert!(pool.add_deferred_pin(&key));
+                finalized.push((key, 0));
+            }
+            assert_eq!(pool.snapshot().write_syscalls, 0);
+            pool.finalize_deferred_batch(&finalized).unwrap();
+            if contiguous {
+                assert_eq!(pool.snapshot().dirty_pages, 0,
+                    "resident deferred batches must retain their bulk writeback hint after WAL drain");
+                assert_eq!(pool.snapshot().write_syscalls, 2);
+                let bytes = fs::read(path).unwrap();
+                for page in 0..64 {
+                    assert!(bytes[page * PAGE_SIZE..(page + 1) * PAGE_SIZE]
+                        .iter()
+                        .all(|byte| *byte == (page + 1) as u8));
+                }
+            } else {
+                assert_eq!(pool.snapshot().dirty_pages, 64);
+                assert_eq!(pool.snapshot().write_syscalls, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_replacement_and_redo_probes_preserve_cache_temperature() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let path = dir.path().join("bulk-temperature.heap");
+        File::create(&path).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool =
+            BufferPool::new_with_options(16, log, DurabilityMode::Memory, Duration::ZERO, 1, 0);
+        let file = Arc::new(BufferPool::heap_file_key(path, 1));
+        for hot in [false, true] {
+            let key = PageKey {
+                file: Arc::clone(&file),
+                page_id: u64::from(hot),
+            };
+            pool.store_page_cold(key.clone(), Page::new().encode(), 1)
+                .unwrap();
+            let frame = pool.lookup_frame(&key).unwrap().unwrap();
+            if hot {
+                for _ in 0..3 {
+                    drop(pool.pin_page(key.clone()).unwrap());
+                }
+            }
+            let before = frame.usage_count.load(Ordering::Acquire);
+            pool.cached_heap_redo_state(&key).unwrap().unwrap();
+            assert!(pool.add_deferred_pin(&key));
+            pool.finalize_deferred(&key, 0);
+            pool.store_page_cold(key.clone(), Page::new().encode(), 2)
+                .unwrap();
+            assert_eq!(frame.usage_count.load(Ordering::Acquire), before,
+                "internal redo inspection and one-pass replacement must not promote cold pages or demote demand-hot pages");
+        }
+    }
+
+    #[test]
+    fn contiguous_writeback_splits_clean_and_deferred_holes_without_fragmenting_runs() {
+        for deferred in [false, true] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let path = dir.path().join("writeback-holes.heap");
+            File::create(&path).unwrap();
+            let log = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            ));
+            let pool =
+                BufferPool::new_with_options(16, log, DurabilityMode::Memory, Duration::ZERO, 1, 0);
+            let file = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
+            let mut frames = Vec::new();
+            for page_id in 0..8 {
+                let key = PageKey {
+                    file: Arc::clone(&file),
+                    page_id,
+                };
+                pool.store_page(key.clone(), vec![page_id as u8; PAGE_SIZE], 0)
+                    .unwrap();
+                frames.push(pool.lookup_frame(&key).unwrap().unwrap());
+            }
+            if deferred {
+                frames[3].deferred_pins.store(1, Ordering::Release);
+            } else {
+                assert_eq!(pool.flush_frame_batch(&frames[3..4]).unwrap(), 1);
+            }
+            let before = pool.snapshot().write_syscalls;
+            assert_eq!(pool.flush_frame_batch(&frames).unwrap(), 7);
+            assert_eq!(
+                pool.snapshot().write_syscalls - before,
+                2,
+                "one unavailable page must not fragment both adjacent dirty runs"
+            );
+            assert_eq!(frames[3].dirty.load(Ordering::Acquire), deferred);
+            frames[3].deferred_pins.store(0, Ordering::Release);
+            assert_eq!(
+                pool.flush_frame_batch(&frames).unwrap(),
+                usize::from(deferred)
+            );
+            let bytes = fs::read(path).unwrap();
+            for page_id in 0..8 {
+                assert!(bytes[page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE]
+                    .iter()
+                    .all(|value| *value == page_id as u8));
+            }
+        }
+    }
+
+    #[test]
     fn contiguous_dirty_pages_flush_with_one_physical_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coalesced.heap");
@@ -10746,6 +11139,10 @@ impl Frame {
     }
 
     fn mark_dirty(&self, dirty_lsn: u64) -> bool {
+        self.mark_dirty_with_intent(dirty_lsn, AccessIntent::Normal)
+    }
+
+    fn mark_dirty_with_intent(&self, dirty_lsn: u64, intent: AccessIntent) -> bool {
         self.dirty_lsn.fetch_max(dirty_lsn, Ordering::AcqRel);
         let was_clean = !self.dirty.swap(true, Ordering::AcqRel);
         self.note_first_dirty_lsn(dirty_lsn);
@@ -10754,7 +11151,7 @@ impl Frame {
             .store(u64::MAX, Ordering::Release);
         self.heap_header_validated_epoch
             .store(u64::MAX, Ordering::Release);
-        self.touch(AccessIntent::Normal);
+        self.touch(intent);
         was_clean
     }
 

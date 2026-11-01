@@ -1,7 +1,25 @@
 //! Conservative single-quoted literals for bulk INSERT. SQL mode is passed
 //! explicitly because tuple decoding can run on scoped worker threads.
 
-pub(super) fn end(bytes: &[u8], mut pos: usize, backslash: bool) -> Option<usize> {
+pub(super) fn end(bytes: &[u8], pos: usize, backslash: bool) -> Option<usize> {
+    scan(bytes, pos, backslash).map(|(end, _)| end)
+}
+
+/// The delimiter scan already proves whether decoding is necessary. Preserve
+/// that result so plain UTF-8 literals need only one scan and one owned copy.
+pub(super) fn literal(source: &str, start: usize, backslash: bool) -> Option<(String, usize)> {
+    let (end, escaped) = scan(source.as_bytes(), start, backslash)?;
+    let body = source.get(start..end)?;
+    let value = if escaped {
+        decode(body, backslash)?
+    } else {
+        body.to_owned()
+    };
+    Some((value, end))
+}
+
+fn scan(bytes: &[u8], mut pos: usize, backslash: bool) -> Option<(usize, bool)> {
+    let mut escaped = false;
     loop {
         pos += if backslash {
             memchr::memchr2(b'\'', b'\\', bytes.get(pos..)?)?
@@ -16,11 +34,13 @@ pub(super) fn end(bytes: &[u8], mut pos: usize, backslash: bool) -> Option<usize
             ) {
                 return None;
             }
+            escaped = true;
             pos += 2;
         } else if bytes.get(pos + 1) == Some(&b'\'') {
+            escaped = true;
             pos += 2;
         } else {
-            return Some(pos);
+            return Some((pos, escaped));
         }
     }
 }

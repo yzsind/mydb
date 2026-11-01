@@ -217,8 +217,12 @@ pub(crate) fn encode_visible_row_payload(
 /// the second full-row codec walk.
 #[derive(Clone)]
 pub(crate) struct CompiledDirectRowEncoder {
-    layout_id: u32,
     layout: RowLayoutCodec,
+    prefix: Vec<u8>,
+    fixed_widths: Vec<usize>,
+    null_bitmap_start: usize,
+    fixed_start: usize,
+    dir_start: usize,
 }
 
 impl CompiledDirectRowEncoder {
@@ -232,9 +236,32 @@ impl CompiledDirectRowEncoder {
         {
             return None;
         }
+        // Layout varints and the zeroed null/fixed/directory section are
+        // schema metadata. Build them once instead of re-encoding/resizing
+        // several times for every row. Only the visible transaction varies.
+        let count = layout.columns.len();
+        let mut prefix = Vec::new();
+        write_mvcc_header(&mut prefix, RowHeader::visible(1), false);
+        write_varint(&mut prefix, codec.active_layout_id as u64);
+        write_varint(&mut prefix, count as u64);
+        let null_bitmap_start = prefix.len();
+        prefix.resize(prefix.len() + count.div_ceil(8), 0);
+        let fixed_start = prefix.len();
+        prefix.resize(prefix.len() + layout.value_layout.fixed_len, 0);
+        let dir_start = prefix.len();
+        prefix.resize(prefix.len() + layout.value_layout.var_count * 2, 0);
+        let fixed_widths = layout
+            .columns
+            .iter()
+            .map(|column| fixed_width_for_kind(&column.kind).unwrap_or(0))
+            .collect();
         Some(Self {
-            layout_id: codec.active_layout_id,
             layout: layout.clone(),
+            fixed_widths,
+            prefix,
+            null_bitmap_start,
+            fixed_start,
+            dir_start,
         })
     }
 
@@ -243,32 +270,27 @@ impl CompiledDirectRowEncoder {
         txn_id: u64,
         variable_bytes_hint: usize,
     ) -> DirectRowPayloadBuilder<'_> {
-        let count = self.layout.columns.len();
-        let value_layout = &self.layout.value_layout;
-        let header = RowHeader::visible(txn_id);
-        let fixed_overhead = mvcc_header_len(&header)
-            .saturating_add(10)
-            .saturating_add(count.div_ceil(8))
-            .saturating_add(value_layout.fixed_len)
-            .saturating_add(value_layout.var_count.saturating_mul(2));
-        let mut out = Vec::with_capacity(fixed_overhead.saturating_add(variable_bytes_hint));
-        write_mvcc_header(&mut out, header, false);
-        write_varint(&mut out, self.layout_id as u64);
-        write_varint(&mut out, count as u64);
-        let null_bitmap_start = out.len();
-        out.resize(null_bitmap_start + count.div_ceil(8), 0);
-        let fixed_start = out.len();
-        out.resize(fixed_start + value_layout.fixed_len, 0);
-        let dir_start = out.len();
-        out.resize(dir_start + value_layout.var_count * 2, 0);
+        let mut out = Vec::with_capacity(self.prefix.len().saturating_add(variable_bytes_hint));
+        let header_delta = if txn_id == 0 {
+            // Zero transaction IDs omit the optional eight-byte field in the
+            // canonical format. Keep the reserved undo slot in both forms.
+            out.extend_from_slice(&self.prefix[..2]);
+            out[1] &= !FLAG_HAS_LAST_TXN_ID;
+            out.extend_from_slice(&self.prefix[10..]);
+            8
+        } else {
+            out.extend_from_slice(&self.prefix);
+            out[2..10].copy_from_slice(&txn_id.to_le_bytes());
+            0
+        };
         let payload_base = out.len();
         DirectRowPayloadBuilder {
             program: self,
             out,
             next_column: 0,
-            null_bitmap_start,
-            fixed_start,
-            dir_start,
+            null_bitmap_start: self.null_bitmap_start - header_delta,
+            fixed_start: self.fixed_start - header_delta,
+            dir_start: self.dir_start - header_delta,
             payload_base,
         }
     }
@@ -301,7 +323,7 @@ impl DirectRowPayloadBuilder<'_> {
                 "direct row encoder expected a fixed-width field",
             )
         })?;
-        let width = fixed_width_for_kind(&column.kind).expect("fixed slot has fixed kind");
+        let width = self.program.fixed_widths[idx];
         self.next_column += 1;
         Ok((
             &column.kind,
@@ -6342,48 +6364,64 @@ fn parse_4_digit(b: &[u8]) -> Option<i32> {
     Some(r)
 }
 
-/// Howard Hinnant's `days_from_civil`: proleptic Gregorian Y/M/D →
-/// days since 1970-01-01. Returns `None` for out-of-range Y/M/D.
-/// Days in `m` of year `y` (proleptic Gregorian). `m` must be 1..=12.
-#[inline]
-pub(crate) fn days_in_month(y: i32, m: u32) -> u32 {
-    crate::util::temporal::days_in_month(y, m).unwrap_or_else(|| {
-        if crate::util::temporal::is_leap_year(y) {
-            29
-        } else {
-            28
-        }
-    })
+// Gregorian year lengths repeat every 400 years. Immutable calendar
+// metadata avoids repeating era/year divisions for every stored temporal
+// value and covers the complete supported year domain, including year zero.
+const GREGORIAN_YEAR_STARTS: [i32; 401] = {
+    let mut starts = [0; 401];
+    let mut year = 0usize;
+    while year < 400 {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        starts[year + 1] = starts[year] + if leap { 366 } else { 365 };
+        year += 1;
+    }
+    starts
+};
+const GREGORIAN_MONTH_STARTS: [[i32; 13]; 2] = [
+    [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365],
+    [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366],
+];
+
+/// Convert a valid proleptic Gregorian date to days since 1970-01-01.
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i32> {
+    if !(0..=9999).contains(&y) || !(1..=12).contains(&m) || d == 0 {
+        return None;
+    }
+    let era = y / 400;
+    let cycle_year = (y % 400) as usize;
+    let year_start = GREGORIAN_YEAR_STARTS[cycle_year];
+    let leap = (GREGORIAN_YEAR_STARTS[cycle_year + 1] - year_start == 366) as usize;
+    let month = m as usize - 1;
+    let month_start = GREGORIAN_MONTH_STARTS[leap][month];
+    let month_end = GREGORIAN_MONTH_STARTS[leap][month + 1];
+    if d > (month_end - month_start) as u32 {
+        return None;
+    }
+    // 0000-01-01 precedes the Unix epoch by 719528 Gregorian days.
+    Some(era * 146097 + year_start + month_start + d as i32 - 1 - 719528)
 }
 
-fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i32> {
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
+#[cfg(test)]
+#[test]
+fn gregorian_cycle_matches_chrono_for_every_supported_calendar_day() {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    for year in 0..=9999 {
+        for month in 1..=12 {
+            for day in 0..=32 {
+                let expected = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                    .map(|date| date.signed_duration_since(epoch).num_days() as i32);
+                assert_eq!(
+                    days_from_civil(year, month, day),
+                    expected,
+                    "{year}-{month}-{day}"
+                );
+            }
+        }
     }
-    // MySQL rejects years outside 0..=9999 (well outside the SQL
-    // standard's 0001..9999 range too). Old code silently clamped on
-    // display, which made writes of `'10000-01-01'` round-trip to
-    // `'9999-01-01'` — a data-loss bug. Refuse the parse instead;
-    // constraints.rs surfaces this via the sql_mode-aware
-    // `invalid_temporal_policy` (strict → 1292, non-strict → warning
-    // + zero-date).
-    if !(0..=9999).contains(&y) {
-        return None;
-    }
-    // Reject impossible calendar dates ('2009-02-31') instead of letting
-    // the era arithmetic silently shift them into the next month.
-    if d > days_in_month(y, m) {
-        return None;
-    }
-    let m = m as i32;
-    let d = d as i32;
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32; // [0, 399]
-    let m_adj = if m > 2 { m - 3 } else { m + 9 } as u32;
-    let doy = (153 * m_adj + 2) / 5 + d as u32 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    Some(era * 146097 + doe as i32 - 719468)
+    assert_eq!(days_from_civil(-1, 1, 1), None);
+    assert_eq!(days_from_civil(10000, 1, 1), None);
+    assert_eq!(days_from_civil(2000, 0, 1), None);
+    assert_eq!(days_from_civil(2000, 13, 1), None);
 }
 
 /// Parse "YYYY-MM-DD" (ASCII, exactly 10 chars at the start) into
@@ -7706,6 +7744,37 @@ mod row_codec_tests {
                 direct.push_value(value).unwrap();
             }
             assert_eq!(direct.finish().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compiled_row_prefix_matches_zero_and_nonzero_transactions_and_wide_layouts() {
+        for count in [0, 1, 8, 127, 128, 255] {
+            let mut c = codec(vec![ColumnKind::VarString; count]);
+            c.active_layout_id = 16384;
+            c.layouts[0].layout_id = 16384;
+            let program = CompiledDirectRowEncoder::compile(&c).unwrap();
+            let values = (0..count)
+                .map(|n| {
+                    if n % 2 == 0 {
+                        Value::Null
+                    } else {
+                        Value::String("文字".into())
+                    }
+                })
+                .collect::<Vec<_>>();
+            for txn in [0, 1, 42, u64::MAX] {
+                let expected = encode_visible_row_payload(&values, &c, txn).unwrap();
+                let mut direct = program.begin_row(txn, 0);
+                for value in &values {
+                    direct.push_value(value).unwrap();
+                }
+                assert_eq!(
+                    direct.finish().unwrap(),
+                    expected,
+                    "count={count} txn={txn}"
+                );
+            }
         }
     }
 

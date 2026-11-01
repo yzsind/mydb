@@ -26502,6 +26502,80 @@ fn release_audit_raw_unique_upper_probe_matches_decoded_keys() {
 }
 
 #[test]
+fn bulk_load_candidate_does_not_read_a_retiring_index_generation() {
+    use crate::engine::StorageQueryEngine;
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = Arc::new(
+        StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .unwrap(),
+    );
+    engine
+        .execute("CREATE TABLE ingest (id INT PRIMARY KEY, v VARCHAR(30))")
+        .unwrap();
+    let db = engine.database();
+    let table = db.table("test.ingest").unwrap();
+    db.with_index_read(table.id, "PRIMARY", |index| {
+        assert!(index.is_empty()?);
+        Ok(())
+    })
+    .unwrap();
+    db.flush_dirty_data().unwrap();
+    let path = db.index_path(table.id, "PRIMARY");
+    let backup = path.with_extension("retiring");
+    let publish_db = db.clone();
+    let publish_path = path.clone();
+    let publish_backup = backup.clone();
+    let table_id = table.id;
+    INDEX_HANDLE_READ_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            publish_db
+                .remove_index_cache_entry(table_id, "PRIMARY")
+                .unwrap();
+            std::fs::rename(publish_path, publish_backup).unwrap();
+        }));
+    });
+    let candidate = db.table_may_be_empty_for_shadow_load(&table);
+    INDEX_HANDLE_READ_TEST_HOOK.with(|hook| {
+        hook.borrow_mut().take();
+    });
+    if backup.exists() {
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&backup, &path).unwrap();
+        db.buffer_pool.discard_pages_for_path(&path).unwrap();
+    }
+    assert!(candidate.expect("an optimistic candidate must not fault a retiring index"));
+    engine.shutdown().unwrap();
+}
+
+#[test]
+fn bulk_index_planning_acquires_write_intent_before_opening_indexes() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.create_table(
+        "test.ingest",
+        vec![checkpoint_test_pk_column()],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let table = db.table("test.ingest").unwrap();
+    let publisher = db.begin_txn().unwrap();
+    let loader = db.begin_txn().unwrap();
+    db.acquire_table_exclusive(publisher.txn_id, table.id)
+        .unwrap();
+    let admitted = db.load_data_index_builders(loader, &table).is_ok();
+    db.rollback_txn(publisher.txn_id).unwrap();
+    db.rollback_txn(loader.txn_id).unwrap();
+    assert!(
+        !admitted,
+        "index planning crossed an exclusive physical publication"
+    );
+}
+
+#[test]
 fn round2_load_index_builder_reserves_unique_keys_before_publication() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
@@ -26515,7 +26589,7 @@ fn round2_load_index_builder_reserves_unique_keys_before_publication() {
     let table = db.table("test.round2_bulk").unwrap();
     let first = db.begin_txn().unwrap();
     let second = db.begin_txn().unwrap();
-    let mut builders = db.load_data_index_builders(&table).unwrap();
+    let mut builders = db.load_data_index_builders(first, &table).unwrap();
     let inserted = db
         .insert_rows_heap_only_detailed(first, "test.round2_bulk", vec![vec![Value::Int(1)]])
         .unwrap();
@@ -28944,3 +29018,289 @@ fn write_path_lazy_begin_shares_commit_batch_and_precedes_eager_fallback() {
 }
 
 include!("object_stats_tests.rs");
+
+#[test]
+fn in_place_publication_rebinds_cached_readers_and_rollback() {
+    use crate::engine::StorageQueryEngine;
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+        dir.path(),
+        test_storage_config(DurabilityMode::Strict, true),
+    )
+    .unwrap();
+    for (name, id, payload) in [("live", 7, "a"), ("donor", 11, "b")] {
+        engine
+            .execute(&format!(
+                "CREATE TABLE {name}(id INT PRIMARY KEY, payload LONGTEXT)"
+            ))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "INSERT INTO {name} VALUES({id},REPEAT('{payload}',20000))"
+            ))
+            .unwrap();
+    }
+    let db = engine.database();
+    let table = db.table("test.live").unwrap();
+    let donor = db.table("test.donor").unwrap();
+    db.flush_dirty_data().unwrap();
+    let heap = db.heap_handle(table.id).unwrap();
+    let index = db.index_handle(table.id, "PRIMARY").unwrap();
+    let lob = db.overflow_handle(table.id).unwrap();
+    let shadow_id = 100000;
+    db.register_reorg_storage_definition(&[shadow_id], &table);
+    let mut candidate = table.as_ref().clone();
+    candidate.id = shadow_id;
+    for (from, to) in [
+        (db.table_path(donor.id), db.table_path(shadow_id)),
+        (
+            db.index_path(donor.id, "PRIMARY"),
+            db.index_path(shadow_id, "PRIMARY"),
+        ),
+        (db.overflow_path(donor.id), db.overflow_path(shadow_id)),
+    ] {
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        transfer_page_owner(&from, &to).unwrap();
+        fs::copy(from, to).unwrap();
+    }
+    let check = |expected| {
+        assert!(Arc::ptr_eq(&heap, &db.heap_handle(table.id).unwrap()));
+        assert!(Arc::ptr_eq(
+            &index,
+            &db.index_handle(table.id, "PRIMARY").unwrap()
+        ));
+        assert!(Arc::ptr_eq(&lob, &db.overflow_handle(table.id).unwrap()));
+        assert!(index
+            .read()
+            .get_unique_one(&IndexKey::from(vec![KeyPart::Int(expected)]))
+            .unwrap()
+            .is_some());
+        let read = db.begin_read_only_txn().unwrap();
+        let rows = db.scan_rows("test.live", read).unwrap();
+        db.rollback_txn(read.txn_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(expected));
+        let payload = if expected == 7 { "a" } else { "b" }.repeat(20000);
+        assert_eq!(rows[0].values[1], Value::String(payload));
+    };
+    check(7);
+    let swap = db
+        .swap_shadow_generation_files(&table, &candidate, shadow_id, 100004)
+        .unwrap();
+    check(11);
+    db.rollback_shadow_generation_file_swap(&swap).unwrap();
+    check(7);
+    db.unregister_reorg_storage_locs(&[shadow_id]);
+    engine.shutdown().unwrap();
+}
+
+#[test]
+fn in_place_publication_excludes_cold_file_opens() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    create_checkpoint_test_table(&db);
+    let table = db.table("test.t").unwrap();
+    let epoch = db.storage_handle_open_epoch(table.id);
+    let (send, recv) = std::sync::mpsc::channel();
+    let (ready, waiting) = std::sync::mpsc::channel();
+    let mut worker = None;
+    db.with_in_place_generation_publication(&table, || {
+        worker = Some(std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            let _open = epoch.publication.read_recursive();
+            send.send(()).unwrap();
+        }));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(recv.recv_timeout(Duration::from_millis(50)).is_err());
+        Ok(())
+    })
+    .unwrap();
+    recv.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.unwrap().join().unwrap();
+}
+
+#[test]
+fn in_place_publication_releases_loader_while_waiting_for_readers() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    create_checkpoint_test_table(&db);
+    let table = db.table("test.t").unwrap();
+    let heap = db.heap_handle(table.id).unwrap();
+    let reader = heap.read();
+    let (waiting, wait) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    let worker_db = db.clone();
+    let worker_table = table.clone();
+    let worker = std::thread::spawn(move || {
+        IN_PLACE_FILE_LATCH_WAIT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                waiting.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+        });
+        worker_db.with_in_place_generation_publication(&worker_table, || Ok(()))
+    });
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    let loader_available = db.zone_map_load_locks[table.id as usize % db.zone_map_load_locks.len()]
+        .try_lock()
+        .is_ok();
+    drop(reader);
+    resume.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    assert!(
+        loader_available,
+        "waiting for a file latch must not retain a loader latch needed by catalog publication"
+    );
+}
+
+#[test]
+fn heap_extent_baseline_preparation_does_not_hold_the_wal_latch() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    create_checkpoint_test_table(&db);
+    let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = unlocked.clone();
+    let log = db.log.clone();
+    HEAP_EXTENT_BASELINE_PREPARE_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            observed.store(
+                log.try_lock_for(Duration::from_millis(250)).is_some(),
+                Ordering::Relaxed,
+            );
+        }));
+    });
+    let txn = db.begin_txn().unwrap();
+    db.insert_rows(
+        txn,
+        "test.t",
+        (0..3000).map(|id| vec![Value::Int(id)]).collect(),
+    )
+    .unwrap();
+    db.commit_txn(txn.txn_id).unwrap();
+    let rows = db
+        .scan_rows(
+            "test.t",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3000);
+    assert!(
+        unlocked.load(Ordering::Relaxed),
+        "page baseline compression/encoding serialized other tables behind the WAL latch"
+    );
+}
+
+#[test]
+fn canonical_integer_key_batches_use_existing_range_reservations() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_memory_test_db(dir.path());
+    for (unsigned, reverse) in [(false, false), (false, true), (true, false), (true, true)] {
+        let txn = db.begin_txn().unwrap();
+        let mut keys = (0..32)
+            .map(|n| {
+                let key = if unsigned {
+                    KeyPart::UInt(u64::MAX - 31 + n)
+                } else {
+                    KeyPart::Int(n as i64 - 16)
+                };
+                (9, "Pk", IndexKey::from(vec![key]))
+            })
+            .collect::<Vec<_>>();
+        if reverse {
+            keys.reverse();
+        }
+        db.lock_unique_keys_nonblocking(txn.txn_id, keys).unwrap();
+        {
+            let manager = db.lock_manager();
+            assert!(
+                manager.unique_locks.is_empty(),
+                "canonical key batches must share range reservations"
+            );
+            assert_eq!(manager.unique_range_locks().count(), 1);
+            assert_eq!(manager.unique_key_lock_count(), 32);
+            assert_eq!(
+                collect_prepared_locks(&manager, txn.txn_id).unwrap().len(),
+                32
+            );
+        }
+        db.rollback_txn(txn.txn_id).unwrap();
+        assert_eq!(db.lock_manager().unique_key_lock_count(), 0);
+    }
+}
+
+#[test]
+fn private_heap_batch_reservation_covers_wide_row_page_fragmentation() {
+    let payloads = vec![vec![7u8; 10000]; 257];
+    let refs = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let reserved = HeapFile::shadow_payload_batch_direct_scratch_capacity(&refs);
+    let batch = HeapFile::prepare_shadow_payload_batch_direct(19, &refs).unwrap();
+    let actual =
+        batch.encoded_pages.capacity() + batch.row_ids.capacity() * std::mem::size_of::<RowId>();
+    assert!(
+        reserved >= actual,
+        "private heap output capacity {actual} exceeds its reservation {reserved}"
+    );
+}
+
+#[test]
+fn private_heap_page_builder_matches_canonical_page_images_and_row_ids() {
+    let max = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+    for lengths in [
+        vec![],
+        vec![0; 2000],
+        vec![10000; 257],
+        vec![max, 0, 1, max],
+        (0..513).map(|n| n * 7919 % (max + 1)).collect(),
+    ] {
+        let payloads = lengths
+            .iter()
+            .enumerate()
+            .map(|(n, len)| {
+                (0..*len)
+                    .map(|offset| (offset.wrapping_mul(31) + n) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let refs = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut batch = HeapFile::prepare_shadow_payload_batch_direct(19, &refs).unwrap();
+        let mut expected = Vec::new();
+        let mut row_ids = Vec::new();
+        let mut page = Page::new();
+        let mut id = 0u64;
+        for payload in &payloads {
+            let slot = match page.insert(payload) {
+                Some(slot) => slot,
+                None => {
+                    page.set_lsn(19);
+                    expected.extend_from_slice(&page.encode_into_owned());
+                    page = Page::new();
+                    id += 1;
+                    page.insert(payload).unwrap()
+                }
+            };
+            row_ids.push(RowId {
+                page_id: id as u32,
+                slot_id: slot,
+            });
+        }
+        if !payloads.is_empty() {
+            page.set_lsn(19);
+            expected.extend_from_slice(&page.encode_into_owned());
+        }
+        // Private preparation may postpone sealing until the reservation
+        // assigns physical identity. Compare the exact final disk images.
+        for bytes in [&mut batch.encoded_pages, &mut expected] {
+            for (id, image) in bytes.chunks_exact_mut(PAGE_SIZE).enumerate() {
+                stamp_page_owner(image, &[0x5a; 16], 123 + id as u64);
+                refresh_page_checksum(image);
+            }
+        }
+        assert_eq!(batch.row_ids, row_ids);
+        assert!(
+            batch.encoded_pages == expected,
+            "canonical private heap image changed"
+        );
+    }
+    let invalid = vec![0; max + 1];
+    assert!(HeapFile::prepare_shadow_payload_batch_direct(19, &[&invalid]).is_err());
+}

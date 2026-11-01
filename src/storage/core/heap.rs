@@ -9,6 +9,8 @@ fn serial_insert_lock_oracle() -> bool {
 thread_local! {
     static HEAP_BATCH_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static HEAP_EXTENT_BASELINE_PREPARE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
     static HEAP_BATCH_HEADER_SLOTS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1270,12 +1272,7 @@ impl HeapFile {
     /// the ALTER COPY orchestrator routes LOB-capable schemas through the
     /// existing compatibility path until an overflow direct builder exists.
     pub(crate) fn shadow_payload_batch_direct_scratch_capacity(payloads: &[&[u8]]) -> usize {
-        let estimated_page_bytes = payloads
-            .iter()
-            .map(|payload| payload.len().saturating_add(SLOT_SIZE))
-            .fold(PAGE_SIZE, usize::saturating_add);
-        let estimated_pages = estimated_page_bytes.div_ceil(PAGE_SIZE).saturating_add(1);
-        estimated_pages
+        fresh_heap_batch_page_count(payloads)
             .saturating_mul(PAGE_SIZE)
             .saturating_add(payloads.len().saturating_mul(std::mem::size_of::<RowId>()))
     }
@@ -1284,54 +1281,79 @@ impl HeapFile {
         build_lsn: u64,
         payloads: &[&[u8]],
     ) -> Result<ShadowPreparedHeapBatch, QueryError> {
-        if payloads.is_empty() {
-            return Ok(ShadowPreparedHeapBatch {
-                encoded_pages: Vec::new(),
-                row_ids: Vec::new(),
-            });
-        }
-        let mut page_id = 0_u64;
-        let mut page = Page::new();
-        let estimated_page_bytes = payloads
-            .iter()
-            .map(|payload| payload.len().saturating_add(SLOT_SIZE))
-            .fold(PAGE_SIZE, usize::saturating_add);
-        let estimated_pages = estimated_page_bytes.div_ceil(PAGE_SIZE).saturating_add(1);
-        // Every completed page already owns a 16 KiB buffer. Reserve the
-        // coalesced write vector once so extending it does not repeatedly
-        // copy the earlier pages in this batch.
-        let mut encoded_pages = Vec::<u8>::with_capacity(estimated_pages.saturating_mul(PAGE_SIZE));
-        let mut row_ids = Vec::with_capacity(payloads.len());
-
-        for &payload in payloads {
+        for payload in payloads {
             if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
                 return Err(error(
                     crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                     "row size is larger than one heap page",
                 ));
             }
-            let slot_id = match page.insert(payload) {
-                Some(slot_id) => slot_id,
-                None => {
-                    page.set_lsn(build_lsn);
-                    encoded_pages.extend_from_slice(&page.encode_into_owned());
-                    page_id = page_id.saturating_add(1);
-                    page = Page::new();
-                    page.insert(payload)
-                        .expect("fresh page should have enough space")
-                }
-            };
-            row_ids.push(RowId {
-                page_id: page_id as u32,
-                slot_id,
+        }
+        let pages = fresh_heap_batch_page_count(payloads);
+        let bytes = pages.checked_mul(PAGE_SIZE).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "private heap batch exceeds address space",
+            )
+        })?;
+        let mut encoded_pages = Vec::new();
+        encoded_pages.try_reserve_exact(bytes).map_err(|_| {
+            error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "private heap batch allocation failed",
+            )
+        })?;
+        encoded_pages.resize(bytes, 0);
+        let mut row_ids = Vec::with_capacity(payloads.len());
+        if payloads.is_empty() {
+            return Ok(ShadowPreparedHeapBatch {
+                encoded_pages,
+                row_ids,
             });
         }
-        page.set_lsn(build_lsn);
-        encoded_pages.extend_from_slice(&page.encode_into_owned());
-
-        let written_pages = encoded_pages.len() / PAGE_SIZE;
-        debug_assert_eq!(encoded_pages.len() % PAGE_SIZE, 0);
-        debug_assert_eq!(written_pages, page_id as usize + 1);
+        // All pages are private. Write slots and payloads directly into the
+        // final contiguous allocation, avoiding a Page/slot Vec per page and
+        // a second full-page copy. Physical identity and checksum are sealed
+        // together by write_reserved_shadow_batch_direct before any file I/O.
+        let mut page_id = 0usize;
+        let mut slots = 0u16;
+        let mut free_start = PAGE_HEADER_SIZE;
+        let mut free_end = PAGE_SIZE;
+        for payload in payloads {
+            if free_end - free_start < payload.len() + SLOT_SIZE {
+                write_heap_page_header(
+                    &mut encoded_pages[page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE],
+                    build_lsn,
+                    slots,
+                    free_start as u16,
+                    free_end as u16,
+                );
+                page_id += 1;
+                slots = 0;
+                free_start = PAGE_HEADER_SIZE;
+                free_end = PAGE_SIZE;
+            }
+            let page = &mut encoded_pages[page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE];
+            free_end -= payload.len();
+            page[free_end..free_end + payload.len()].copy_from_slice(payload);
+            write_u16(page, free_start, free_end as u16);
+            write_u16(page, free_start + 2, payload.len() as u16);
+            page[free_start + 4] = 0;
+            row_ids.push(RowId {
+                page_id: page_id as u32,
+                slot_id: slots,
+            });
+            slots += 1;
+            free_start += SLOT_SIZE;
+        }
+        write_heap_page_header(
+            &mut encoded_pages[page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE],
+            build_lsn,
+            slots,
+            free_start as u16,
+            free_end as u16,
+        );
+        debug_assert_eq!(page_id + 1, pages);
         Ok(ShadowPreparedHeapBatch {
             encoded_pages,
             row_ids,
@@ -4404,10 +4426,24 @@ impl HeapFile {
             } else if self.durability() == DurabilityMode::Memory {
                 0
             } else {
-                self.log.lock().append(
-                    0,
-                    WalPayload::full_page_image(self.relative_path(), id, image.clone()),
-                )?
+                // Compression and record encoding are independent of the
+                // append order. Keep both outside the process-wide WAL latch;
+                // append still assigns the LSN before any page is advertised.
+                #[cfg(test)]
+                HEAP_EXTENT_BASELINE_PREPARE_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                let payload = WalPayload::full_page_image(self.relative_path(), id, image.clone());
+                let pre = {
+                    // The heap extension latch is still held; preserve the
+                    // ordinary append path's non-recursive admission scope.
+                    let _admission =
+                        crate::engine::executor::mem_budget::StorageLatchAdmissionScope::enter();
+                    crate::wal::LogManager::pre_encode_record(0, payload)?
+                };
+                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
             };
             set_page_lsn_if_formatted(&mut image, lsn);
             self.buffer_pool
@@ -6073,6 +6109,33 @@ impl Iterator for HeapPageScan<'_> {
     }
 }
 
+// Exact packing matters for wide rows: summing payload bytes misses the
+// unusable tail of each page and can undercharge a growing output Vec.
+fn fresh_heap_batch_page_count(payloads: &[&[u8]]) -> usize {
+    let mut count = 0usize;
+    let mut free = 0usize;
+    for payload in payloads {
+        let required = payload.len().saturating_add(SLOT_SIZE);
+        if required > free {
+            count = count.saturating_add(1);
+            free = PAGE_SIZE - PAGE_HEADER_SIZE;
+        }
+        free = free.saturating_sub(required);
+    }
+    count
+}
+
+fn write_heap_page_header(buf: &mut [u8], lsn: u64, count: u16, free_start: u16, free_end: u16) {
+    write_u32(buf, 0, HEAP_PAGE_MAGIC);
+    write_u16(buf, 4, HEAP_PAGE_VERSION);
+    write_u16(buf, 6, 0);
+    write_u64(buf, 8, lsn);
+    write_u32(buf, 16, 0);
+    write_u16(buf, 20, count);
+    write_u16(buf, 22, free_start);
+    write_u16(buf, 24, free_end);
+}
+
 #[derive(Debug, Clone)]
 struct Page {
     free_start: u16,
@@ -6285,14 +6348,13 @@ impl Page {
     }
 
     fn write_header_into_with_lsn(&self, buf: &mut [u8], lsn: u64) {
-        write_u32(buf, 0, HEAP_PAGE_MAGIC);
-        write_u16(buf, 4, HEAP_PAGE_VERSION);
-        write_u16(buf, 6, 0);
-        write_u64(buf, 8, lsn);
-        write_u32(buf, 16, 0);
-        write_u16(buf, 20, self.slots.len() as u16);
-        write_u16(buf, 22, self.free_start);
-        write_u16(buf, 24, self.free_end);
+        write_heap_page_header(
+            buf,
+            lsn,
+            self.slots.len() as u16,
+            self.free_start,
+            self.free_end,
+        );
         for (idx, slot) in self.slots.iter().enumerate() {
             let base = PAGE_HEADER_SIZE + idx * SLOT_SIZE;
             write_u16(buf, base, slot.offset);

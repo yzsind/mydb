@@ -780,8 +780,14 @@ impl Database {
 
     pub(crate) fn load_data_index_builders(
         &self,
+        txn: TxnView,
         table: &TableSchema,
     ) -> Result<LoadDataIndexBuilders, QueryError> {
+        self.check_dml_allowed(txn)?;
+        // Index discovery/open is part of this writer's physical access,
+        // not a harmless planning probe. Preserve concurrent appenders (IX
+        // is compatible with IX) while excluding a generation publisher.
+        self.acquire_table_write_binding(txn.txn_id, table)?;
         self.load_data_index_builders_for(table, true)
     }
 
@@ -3577,6 +3583,44 @@ impl Database {
         // reserve. Avoid serializing an empty loop with all savepoint readers.
         if locks.is_empty() {
             return Ok(());
+        }
+        // Encoded batches already contain canonical index keys. Reuse the
+        // same exact integer-range reservation as the row-value entry point;
+        // this covers ascending/descending contiguous keys without allocating
+        // one lock identity per key. Conflicts and all other shapes retain
+        // the point-lock path, including its wait and rollback bookkeeping.
+        if locks.len() > 1 {
+            let number = |key: &IndexKey| match key.0.as_slice() {
+                [KeyPart::Int(value)] => Some((false, i128::from(*value))),
+                [KeyPart::UInt(value)] => Some((true, i128::from(*value))),
+                _ => None,
+            };
+            let (table_id, index_name, first_key) = &locks[0];
+            if let (Some((unsigned, first)), Some((next_unsigned, second))) =
+                (number(first_key), number(&locks[1].2))
+            {
+                let step = second - first;
+                if unsigned == next_unsigned
+                    && (step == 1 || step == -1)
+                    && locks.iter().enumerate().all(|(n, (table, name, key))| {
+                        table == table_id
+                            && name == index_name
+                            && number(key) == Some((unsigned, first + step * n as i128))
+                    })
+                {
+                    let last = first + step * (locks.len() - 1) as i128;
+                    if self.lock_manager().try_lock_integer_range(
+                        txn_id,
+                        *table_id,
+                        index_name,
+                        unsigned,
+                        first.min(last),
+                        first.max(last),
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
         }
         self.lock_manager()
             .lock_unique_keys(txn_id, locks, &self.lock_owner_status())

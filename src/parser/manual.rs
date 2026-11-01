@@ -457,10 +457,9 @@ impl<'a> InsertCursor<'a> {
             b'\'' => {
                 self.i += 1;
                 let start = self.i;
-                self.i = bulk_string::end(self.source.as_bytes(), start, self.backslash_escapes)?;
-                let value =
-                    bulk_string::decode(self.source.get(start..self.i)?, self.backslash_escapes)?;
-                self.i += 1;
+                let (value, end) =
+                    bulk_string::literal(self.source, start, self.backslash_escapes)?;
+                self.i = end + 1;
                 Some(Expr::Literal(Literal::String(value)))
             }
             b'-' | b'+' => {
