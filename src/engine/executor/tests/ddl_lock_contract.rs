@@ -193,24 +193,23 @@ fn cancel_copy_at_publish(wait_for_reader: bool) {
     if !wait_for_reader {
         hook.release();
     }
-    let early = rx.recv_timeout(Duration::from_millis(500));
-    let completed_while_blocked = early.is_ok();
+    // Completion includes rollback and durable shadow-file cleanup. Allow for
+    // loaded CI workers, and keep the reader's MDL held until the receive ends:
+    // cancellation must finish without relying on the blocker being released.
+    let completion = rx.recv_timeout(Duration::from_secs(10));
     if wait_for_reader {
         engine
             .execute_with_session(&mut reader, "ROLLBACK")
             .unwrap();
     }
-    let result = early.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let result =
+        completion.expect("cancelled COPY did not complete with publication blockers held");
     ddl.join().unwrap();
     assert_eq!(
         result
             .expect_err("acknowledged cancellation must prevent publication")
             .code(),
         1317
-    );
-    assert!(
-        completed_while_blocked,
-        "job cancellation did not wake publication wait"
     );
     let table = engine.database().table("test.t").unwrap();
     assert_eq!(
