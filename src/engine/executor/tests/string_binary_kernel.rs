@@ -540,12 +540,19 @@ fn regexp_binary_operand_forces_case_sensitivity() {
     let row = one_row(&engine, "SELECT 'a' REGEXP 'A'");
     assert_eq!(row[0], Value::Int(1));
 
-    // BINARY forces case sensitivity.
-    let row = one_row(&engine, "SELECT _binary 'a' REGEXP 'A'");
+    assert_eq!(
+        engine
+            .execute("SELECT _binary 'a' REGEXP 'A'")
+            .unwrap_err()
+            .code(),
+        3995
+    );
+    // Both binary operands use byte-wise case sensitivity.
+    let row = one_row(&engine, "SELECT _binary 'a' REGEXP _binary 'A'");
     assert_eq!(row[0], Value::Int(0));
 
     // An explicit i flag overrides the binary default.
-    let row = one_row(&engine, "SELECT REGEXP_LIKE(_binary 'a', 'A', 'i')");
+    let row = one_row(&engine, "SELECT REGEXP_LIKE(_binary 'a', _binary 'A', 'i')");
     assert_eq!(row[0], Value::Int(1));
 }
 

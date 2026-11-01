@@ -4362,7 +4362,10 @@ fn index_key_part_max_bytes(column: &ColumnSchema, prefix_len: Option<usize>) ->
         DataTypeKind::Enum { values } => crate::storage::enum_storage_width(values.len()) as u64,
         DataTypeKind::Set { values } => crate::storage::set_storage_width(values.len()) as u64,
         DataTypeKind::Bit { len } => (len.unwrap_or(1) as u64).div_ceil(8),
-        DataTypeKind::Json | DataTypeKind::Geometry { .. } | DataTypeKind::Vector { .. } => 0,
+        DataTypeKind::Vector { dim, datatype } => {
+            12 + datatype.payload_len(dim.unwrap_or(datatype.max_dimension())) as u64
+        }
+        DataTypeKind::Json | DataTypeKind::Geometry { .. } => 0,
     }
 }
 
@@ -4525,6 +4528,12 @@ fn validate_spatial_columns_not_null(
     columns: &[String],
     table_columns: &[ColumnSchema],
 ) -> Result<(), QueryError> {
+    if columns.len() != 1 {
+        return Err(error(
+            crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
+            "A SPATIAL index requires exactly one key part",
+        ));
+    }
     for column in columns {
         let Some(schema) = table_columns
             .iter()

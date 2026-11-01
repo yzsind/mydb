@@ -51,6 +51,7 @@ pub(super) fn lock_select_rows_for_update(
         crate::error::catalog::ER_BAD_FIELD_ERROR
             .error("locking target is not a source of this query")
     })?;
+    let fulltext = super::select::fulltext_row::Providers::new(db, txn, &table, stmt)?;
     // Fast path: unique-key exact match (the common SELECT pk = ? FOR UPDATE
     // shape used by TPC-C's district/customer/warehouse access). Skips the
     // candidate read+filter step entirely — the post-lock re-read in
@@ -73,14 +74,25 @@ pub(super) fn lock_select_rows_for_update(
             return Ok(Some(locked));
         }
     }
-    if let Some(row_ids) = ordered_select_for_update_candidates(db, txn, &table, stmt)? {
-        let locked = apply_lock_clause(db, txn, &table, &row_ids, lock_clause)?;
-        return Ok(Some(locked));
+    if fulltext.is_empty() {
+        if let Some(row_ids) = ordered_select_for_update_candidates(db, txn, &table, stmt)? {
+            return apply_lock_clause(db, txn, &table, &row_ids, lock_clause).map(Some);
+        }
     }
-    let candidates = candidate_row_refs_for_write(db, txn, &table, stmt.selection.as_ref())?;
+    let candidates = candidate_row_refs_for_write(
+        db,
+        txn,
+        &table,
+        if fulltext.is_empty() {
+            stmt.selection.as_ref()
+        } else {
+            None
+        },
+    )?;
     let rows = db.dml_candidate_rows_with_origin_for_write(&table, txn, candidates)?;
     let mut matched = Vec::new();
     for row in rows {
+        let _scores = fulltext.enter(row.row_ref);
         crate::engine::cancel::check_cancelled()?;
         let matches = match &stmt.selection {
             Some(expr) => eval_bool(expr, &table, &row.values)?,
@@ -103,6 +115,7 @@ pub(super) fn lock_select_rows_for_update(
             .collect();
         let mut ranked = Vec::with_capacity(matched.len());
         for row in matched.drain(..) {
+            let _scores = fulltext.enter(row.row_ref);
             let keys = stmt
                 .order_by
                 .iter()
@@ -258,6 +271,7 @@ pub(super) fn execute_locked_single_table_select(
     }
 
     let table = db.table(stmt.table.as_deref().unwrap_or_default())?;
+    let fulltext = super::select::fulltext_row::Providers::new(db, txn, &table, stmt)?;
     let columns = single_table_result_columns(stmt, &table, None)?;
     let mut rows = Vec::with_capacity(row_refs.len());
     for row_ref in row_refs {
@@ -265,6 +279,7 @@ pub(super) fn execute_locked_single_table_select(
         let Some(row) = db.dml_candidate_row_at_for_write(&table, row_ref, txn)? else {
             continue;
         };
+        let _scores = fulltext.enter(row.row_ref);
         if stmt
             .selection
             .as_ref()

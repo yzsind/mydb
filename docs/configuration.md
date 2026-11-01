@@ -148,8 +148,14 @@ scheduler workers (1–32); the default is the smaller of the available CPU coun
 and 4. Pending events enter a bounded queue with twice as many slots as workers;
 queue entries are charged to the unified memory budget as `SystemMetadata`; when
 the budget or the queue is short, the original due-time is kept and retried
-briefly instead of skipping the firing. When the engine shuts down, in-flight
-event SQL is canceled and awaited for at most 2 seconds.
+with exponential backoff from 10 ms to 1 s instead of skipping the firing.
+Persistent admission pressure is logged at most once every 30 seconds.
+When the engine shuts down, in-flight
+event SQL is canceled and awaited until its workers finish. Shutdown does not
+detach a worker that may still own a transaction or write database files.
+Recurring events may overlap when an earlier invocation is still running;
+worker and queue limits bound concurrency. Use an application lock when an
+event requires serialization.
 
 `plan_cache` / `MYDB_PLAN_CACHE` controls the execution plan cache, default `ON`.
 When set to `OFF`, shared SELECT physical plans, prepared SELECT/DML memos, text

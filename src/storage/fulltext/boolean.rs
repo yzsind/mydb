@@ -41,6 +41,11 @@ pub enum Matcher {
     Prefix(String),
     /// `"a b c"` — the tokens must appear contiguous and in order.
     Phrase(Vec<String>),
+    /// A phrase containing filtered words requires the original heap words.
+    FilteredPhrase {
+        terms: Vec<String>,
+        words: Vec<String>,
+    },
 }
 
 /// One parsed boolean-mode clause.
@@ -115,19 +120,31 @@ pub fn parse_boolean_query(
             if !closed {
                 return Err(malformed());
             }
-            let tokens = tokenizer.tokenize(&phrase);
+            let (positioned, _) = tokenizer.positioned_tokens(&phrase);
+            let tokens: Vec<_> = positioned.iter().map(|(t, _)| t.clone()).collect();
+            let words = tokenizer.raw_tokens(&phrase);
+            let span = positioned
+                .first()
+                .zip(positioned.last())
+                .map(|(a, b)| words[a.1 as usize..=b.1 as usize].to_vec())
+                .unwrap_or_default();
+            let matcher = if span.len() != tokens.len() {
+                Matcher::FilteredPhrase {
+                    terms: tokens.clone(),
+                    words: span,
+                }
+            } else {
+                Matcher::Phrase(tokens.clone())
+            };
             if !tokens.is_empty() {
-                clauses.push(BoolClause {
-                    occur,
-                    matcher: Matcher::Phrase(tokens),
-                });
+                clauses.push(BoolClause { occur, matcher });
             }
             continue;
         }
         // Plain word: read until whitespace or a quote.
         let mut word = String::new();
         while let Some(&c) = chars.peek() {
-            if c.is_whitespace() || c == '"' {
+            if c.is_whitespace() || matches!(c, '"' | '+' | '-') {
                 break;
             }
             if matches!(c, '(' | ')' | '>' | '<' | '~' | '@') {
@@ -137,9 +154,9 @@ pub fn parse_boolean_query(
             chars.next();
             if c == '*' {
                 if word.len() == 1
-                    || chars
-                        .peek()
-                        .is_some_and(|next| !next.is_whitespace() && *next != '"')
+                    || chars.peek().is_some_and(|next| {
+                        !next.is_whitespace() && !matches!(next, '"' | '+' | '-')
+                    })
                 {
                     return Err(unsupported_op('*'));
                 }

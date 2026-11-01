@@ -1256,7 +1256,7 @@ impl ExprProgram {
         &self,
     ) -> Option<(
         usize,
-        Arc<crate::engine::func_cache::Governed<regex::Regex>>,
+        Arc<crate::engine::func_cache::Governed<crate::engine::mysql_regex::Regex>>,
         &str,
     )> {
         let ExprNode::Function {
@@ -8306,11 +8306,11 @@ fn eval_regexp_like(
     if matches!(match_type, Some(Value::Null)) {
         return Ok(Value::Null);
     }
-    let binary = matches!(text, Value::Bytes(_)) || matches!(pattern, Value::Bytes(_));
-    let text = string_value(&text);
-    let pattern = string_value(&pattern);
-    let re = crate::engine::expr::mysql_regex_for_operand(&pattern, match_type.as_ref(), binary)?;
-    Ok(Value::Int(re.is_match(&text) as i64))
+    let mut values = vec![text, pattern];
+    if let Some(flags) = match_type {
+        values.push(flags);
+    }
+    crate::engine::expr::eval_regexp_like_values(&values)
 }
 
 fn eval_regexp_replace(

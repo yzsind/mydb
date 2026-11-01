@@ -143,8 +143,8 @@ spatial_functions! {
     "ST_ISCLOSED" => (1, 1, AnyNull, Integer);
     "ST_X" => (1, 2, AnyNull, XAccessor);
     "ST_Y" => (1, 2, AnyNull, XAccessor);
-    "ST_LATITUDE" => (1, 2, AnyNull, Double);
-    "ST_LONGITUDE" => (1, 2, AnyNull, Double);
+    "ST_LATITUDE" => (1, 2, AnyNull, XAccessor);
+    "ST_LONGITUDE" => (1, 2, AnyNull, XAccessor);
     "ST_STARTPOINT" => (1, 1, AnyNull, Geometry);
     "ST_ENDPOINT" => (1, 1, AnyNull, Geometry);
     "ST_POINTN" => (2, 2, AnyNull, Geometry);
@@ -296,7 +296,7 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
         SpatialNullPolicy::AnyNull => {}
         SpatialNullPolicy::Evaluate => {}
     }
-    match spec.canonical_id {
+    let result = match spec.canonical_id {
         // ---- constructors ----
         "ST_GEOMFROMTEXT" => from_text(name, values, None),
         "ST_POINTFROMTEXT" => from_text(name, values, Some(WKB_POINT)),
@@ -491,7 +491,14 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
             crate::error::catalog::ER_SP_DOES_NOT_EXIST,
             format!("spatial function '{name}' is not supported"),
         )),
+    }?;
+    if matches!(result, Value::Double(value) if !value.is_finite()) {
+        return Err(geo_err(
+            crate::error::catalog::ER_DATA_OUT_OF_RANGE,
+            format!("Spatial result is out of range in function {name}."),
+        ));
     }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +559,9 @@ fn geohash_encode(lon: f64, lat: f64, len: usize) -> String {
 
 /// Decode a geohash to the centre (longitude, latitude) of its cell.
 fn geohash_decode(hash: &str) -> Option<(f64, f64)> {
+    if hash.is_empty() || !hash.is_ascii() {
+        return None;
+    }
     let mut lon_range = (-180.0f64, 180.0f64);
     let mut lat_range = (-90.0f64, 90.0f64);
     let mut even = true;
@@ -592,9 +602,15 @@ fn st_geohash(name: &str, values: &[Value]) -> Result<Value, QueryError> {
         (as_f64(&values[0])?, as_f64(&values[1])?, 2)
     } else {
         let g = geom_value(&values[0], name)?;
+        if !matches!(g.srid, 0 | 4326) {
+            return Err(geo_err(
+                crate::error::catalog::ER_ONLY_IMPLEMENTED_FOR_SRID_0_AND_4326,
+                format!("Function {name} is only defined for SRID 0 and SRID 4326."),
+            ));
+        }
         let Geom::Point(c) = g.geom else {
             return Err(geo_err(
-                crate::error::catalog::ER_SRS_NOT_GEOGRAPHIC,
+                crate::error::catalog::ER_INCORRECT_TYPE,
                 format!("function {name} is only defined for POINT values."),
             ));
         };
@@ -653,7 +669,7 @@ fn st_point_from_geohash(name: &str, values: &[Value]) -> Result<Value, QueryErr
     let hash = text_of(&values[0]);
     let (lon, lat) = geohash_decode(&hash).ok_or_else(|| {
         geo_err(
-            crate::error::catalog::ER_WRONG_ARGUMENTS,
+            crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
             format!("Incorrect arguments to {name} (not a valid geohash string)"),
         )
     })?;
@@ -1076,16 +1092,20 @@ fn xy(name: &str, values: &[Value], x_axis: bool) -> Result<Value, QueryError> {
     let g = geom_value(&values[0], name)?;
     let Geom::Point(c) = g.geom else {
         return Err(geo_err(
-            crate::error::catalog::ER_SRS_NOT_GEOGRAPHIC,
+            crate::error::catalog::ER_UNEXPECTED_GEOMETRY_TYPE,
             format!("function {name} is only defined for POINT values."),
         ));
     };
     let coordinate_is_x =
         if name.eq_ignore_ascii_case("ST_LATITUDE") || name.eq_ignore_ascii_case("ST_LONGITUDE") {
-            let lat_long = matches!(
-                super::srs::require(g.srid, name)?.axis_order,
-                super::srs::AxisOrder::LatLong
-            );
+            let srs = super::srs::require(g.srid, name)?;
+            if srs.kind != super::srs::SrsKind::Geographic {
+                return Err(geo_err(
+                    crate::error::catalog::ER_SRS_NOT_GEOGRAPHIC,
+                    format!("Function {name} requires a geographic spatial reference system."),
+                ));
+            }
+            let lat_long = matches!(srs.axis_order, super::srs::AxisOrder::LatLong);
             if name.eq_ignore_ascii_case("ST_LATITUDE") {
                 lat_long
             } else {
@@ -1431,7 +1451,14 @@ fn curve_coords<'a>(geometry: &'a Geometry, name: &str) -> Result<&'a [Coord], Q
     match &geometry.geom {
         Geom::LineString(coords) => Ok(coords),
         _ => Err(geo_err(
-            crate::error::catalog::ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS,
+            match super::srs::require(geometry.srid, name)?.kind {
+                super::srs::SrsKind::Cartesian | super::srs::SrsKind::Projected => {
+                    crate::error::catalog::ER_NOT_IMPLEMENTED_FOR_CARTESIAN_SRS
+                }
+                super::srs::SrsKind::Geographic => {
+                    crate::error::catalog::ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS
+                }
+            },
             format!("Function {name} is implemented only for LineString arguments."),
         )),
     }
@@ -1605,49 +1632,78 @@ fn simplify_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> 
         }
         ((dy * point.x - dx * point.y + end.x * start.y - end.y * start.x).abs()) / dx.hypot(dy)
     }
-    fn simplify_line(points: &[Coord], tolerance: f64) -> Vec<Coord> {
+    fn simplify_line(points: &[Coord], tolerance: f64) -> Result<Vec<Coord>, QueryError> {
         if points.len() <= 2 {
-            return points.to_vec();
+            return Ok(points.to_vec());
         }
-        let mut max_distance = 0.0;
-        let mut split = 0;
-        for index in 1..points.len() - 1 {
-            let distance =
-                perpendicular_distance(points[index], points[0], points[points.len() - 1]);
-            if distance > max_distance {
-                max_distance = distance;
-                split = index;
+        let _scratch = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+            points.len().saturating_mul(
+                std::mem::size_of::<Coord>() + 2 * std::mem::size_of::<usize>() + 1,
+            ),
+        )?;
+        let mut keep = vec![false; points.len()];
+        keep[0] = true;
+        keep[points.len() - 1] = true;
+        let mut work = Vec::with_capacity(points.len());
+        work.push((0, points.len() - 1));
+        while let Some((start, end)) = work.pop() {
+            let mut max_distance = 0.0;
+            let mut split = start;
+            for index in start + 1..end {
+                let distance = perpendicular_distance(points[index], points[start], points[end]);
+                if !distance.is_finite() {
+                    return Err(geo_err(
+                        crate::error::catalog::ER_DATA_OUT_OF_RANGE,
+                        "ST_Simplify distance is out of range",
+                    ));
+                }
+                if distance > max_distance {
+                    max_distance = distance;
+                    split = index;
+                }
+            }
+            if max_distance > tolerance {
+                keep[split] = true;
+                if split > start + 1 {
+                    work.push((start, split));
+                }
+                if end > split + 1 {
+                    work.push((split, end));
+                }
             }
         }
-        if max_distance <= tolerance {
-            return vec![points[0], points[points.len() - 1]];
-        }
-        let mut left = simplify_line(&points[..=split], tolerance);
-        let right = simplify_line(&points[split..], tolerance);
-        left.pop();
-        left.extend(right);
-        left
+        Ok(points
+            .iter()
+            .zip(keep)
+            .filter_map(|(point, keep)| keep.then_some(*point))
+            .collect())
     }
-    fn simplify(geom: &mut Geom, tolerance: f64) {
+    fn simplify(geom: &mut Geom, tolerance: f64) -> Result<(), QueryError> {
         match geom {
-            Geom::LineString(line) => *line = simplify_line(line, tolerance),
+            Geom::LineString(line) => *line = simplify_line(line, tolerance)?,
             Geom::Polygon(rings) | Geom::MultiLineString(rings) => {
-                rings
-                    .iter_mut()
-                    .for_each(|ring| *ring = simplify_line(ring, tolerance));
+                for ring in rings {
+                    *ring = simplify_line(ring, tolerance)?;
+                }
             }
-            Geom::MultiPolygon(polygons) => polygons.iter_mut().for_each(|polygon| {
-                polygon
-                    .iter_mut()
-                    .for_each(|ring| *ring = simplify_line(ring, tolerance))
-            }),
-            Geom::GeometryCollection(geometries) => geometries
-                .iter_mut()
-                .for_each(|geom| simplify(geom, tolerance)),
+            Geom::MultiPolygon(polygons) => {
+                for polygon in polygons {
+                    for ring in polygon {
+                        *ring = simplify_line(ring, tolerance)?;
+                    }
+                }
+            }
+            Geom::GeometryCollection(geometries) => {
+                for geom in geometries {
+                    simplify(geom, tolerance)?;
+                }
+            }
             Geom::Point(_) | Geom::MultiPoint(_) => {}
         }
+        Ok(())
     }
-    simplify(&mut geometry.geom, tolerance);
+    simplify(&mut geometry.geom, tolerance)?;
     Ok(geom_to_value(geometry))
 }
 

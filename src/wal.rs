@@ -1368,9 +1368,19 @@ pub struct PreEncodedRecord {
     txn_id: u64,
     lsn_span: u64,
     retain_large_buffer: bool,
+    admitted_drain: bool,
     payload_checksum: Option<PayloadChecksum>,
     #[cfg(test)]
     drop_observer: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl PreEncodedRecord {
+    /// Deferred redo already owns dirty page images. Budget pressure may
+    /// reject new DML, but draining this redo must retain the emergency path.
+    pub(crate) fn for_admitted_drain(mut self) -> Self {
+        self.admitted_drain = true;
+        self
+    }
 }
 
 struct WalRecordBuffer {
@@ -2564,6 +2574,7 @@ impl LogManager {
             txn_id,
             lsn_span,
             retain_large_buffer: true,
+            admitted_drain: false,
             #[cfg(test)]
             drop_observer: None,
         })
@@ -2659,7 +2670,7 @@ impl LogManager {
         administrative: bool,
     ) -> Result<u64, QueryError> {
         self.publish_buffered_begin(rec.txn_id)?;
-        let _disk = if !administrative {
+        let _disk = if !administrative && !rec.admitted_drain {
             self.check_wal_budget(&rec.payload, rec.bytes.len() as u64)?
         } else {
             self.budget
@@ -3313,6 +3324,7 @@ impl LogManager {
         // leader into a no-op.
         let sync_gate = {
             let log_guard = log.lock();
+            log_guard.validate_sync_target(lsn)?;
             // A page cleaner with an already durable image must not queue
             // behind an unrelated commit's in-flight fsync.
             if lsn <= log_guard.durable_lsn && !log_guard.directory_sync_pending {
@@ -3380,6 +3392,7 @@ impl LogManager {
         if self.directory_sync_pending {
             self.publish_synced_prefix(self.durable_lsn)?;
         }
+        self.validate_sync_target(lsn)?;
         if lsn <= self.durable_lsn {
             return Ok(None);
         }
@@ -3388,23 +3401,34 @@ impl LogManager {
         Ok(Some(self.sync_files_and_high_water(lsn)))
     }
 
-    fn sync_files_and_high_water(&self, lsn: u64) -> (Vec<Arc<File>>, u64) {
+    fn validate_sync_target(&self, lsn: u64) -> Result<(), QueryError> {
+        let head = self
+            .active_info
+            .last_lsn
+            .max(self.pending_sealed_sync.last().map_or(0, |s| s.last_lsn));
+        if lsn > head {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                format!(
+                    "WAL synchronization requested unappended LSN {lsn} (appended head {head})"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync_files_and_high_water(&self, _lsn: u64) -> (Vec<Arc<File>>, u64) {
         // `last_lsn` is captured under the log mutex right after the flush, so
         // it is a conservative lower bound on what the fsync will persist:
         // records appended *after* this point are not guaranteed flushed and
-        // are deliberately excluded. Never below the requested `lsn` (the
-        // caller's record was appended, so `last_lsn >= lsn`), but `.max` keeps
-        // it defensive.
-        let high_water = self
-            .active_info
-            .last_lsn
-            .max(
-                self.pending_sealed_sync
-                    .last()
-                    .map(|s| s.last_lsn)
-                    .unwrap_or(0),
-            )
-            .max(lsn);
+        // are deliberately excluded. Validation rejects future requests;
+        // the requested LSN must never inflate this durable prefix.
+        let high_water = self.active_info.last_lsn.max(
+            self.pending_sealed_sync
+                .last()
+                .map(|s| s.last_lsn)
+                .unwrap_or(0),
+        );
         let mut files = self
             .pending_sealed_sync
             .iter()

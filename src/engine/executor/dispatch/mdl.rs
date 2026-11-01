@@ -1416,6 +1416,18 @@ fn enforce_explicit_table_locks(
 }
 
 fn explicit_locks_reject_statement(statement: &Statement) -> bool {
+    if matches!(statement, Statement::CreateTable(table) if table.temporary)
+        || matches!(
+            statement,
+            Statement::CreateTableLike {
+                temporary: true,
+                ..
+            }
+        )
+        || matches!(statement, Statement::CreateTableAsSelect { table, .. } if table.temporary)
+    {
+        return false;
+    }
     // Statements MySQL rejects outright while a session holds explicit table
     // locks (ER_LOCK_OR_ACTIVE_TRANSACTION 1192). Table-scoped DDL/maintenance
     // that MySQL *permits* on a WRITE-locked table — `ALTER TABLE`,

@@ -31,7 +31,7 @@ use lru::LruCache;
 use crate::engine::json::JsonPath;
 use crate::types::QueryError;
 
-pub(crate) const REGEX_CACHE_CAPACITY: usize = 128;
+pub(crate) const REGEX_CACHE_CAPACITY: usize = 1024;
 pub(crate) const GTID_SET_CACHE_CAPACITY: usize = 128;
 pub(crate) const JSON_PATH_CACHE_CAPACITY: usize = 512;
 pub(crate) const JSON_SCHEMA_CACHE_CAPACITY: usize = 64;
@@ -72,7 +72,7 @@ impl<T> Deref for Governed<T> {
 }
 
 impl<T> Governed<T> {
-    fn new(value: T, bytes: usize) -> Self {
+    pub(crate) fn new(value: T, bytes: usize) -> Self {
         Self {
             value,
             charge: crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
@@ -82,7 +82,7 @@ impl<T> Governed<T> {
         }
     }
 
-    fn admitted(&self) -> bool {
+    pub(crate) fn admitted(&self) -> bool {
         self.charge.is_some()
     }
 
@@ -95,7 +95,7 @@ impl<T> Governed<T> {
 struct RegexCacheEntry {
     pattern: String,
     match_type: String,
-    regex: Arc<Governed<regex::Regex>>,
+    regex: Arc<Governed<crate::engine::mysql_regex::Regex>>,
 }
 
 #[derive(Debug)]
@@ -185,7 +185,7 @@ pub(crate) fn cached_gtid_set(
 pub(crate) fn cached_regex(
     pattern: &str,
     match_type: &str,
-) -> Result<Arc<Governed<regex::Regex>>, QueryError> {
+) -> Result<Arc<Governed<crate::engine::mysql_regex::Regex>>, QueryError> {
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let hash = borrowed_hash((pattern, match_type));
@@ -209,10 +209,9 @@ pub(crate) fn cached_regex(
             // allowance; optional admission skips caching under pressure.
             .saturating_add(pattern.len().saturating_mul(64))
             .saturating_add(64 * 1_024);
-        let re = Arc::new(Governed::new(
-            compile_mysql_regex(pattern, match_type)?,
-            bytes,
-        ));
+        let compiled = compile_mysql_regex(pattern, match_type)?;
+        let bytes = bytes.saturating_add(compiled.extra_bytes());
+        let re = Arc::new(Governed::new(compiled, bytes));
         if re.admitted() {
             let entry = RegexCacheEntry {
                 pattern: pattern.to_owned(),
@@ -227,7 +226,10 @@ pub(crate) fn cached_regex(
     })
 }
 
-fn compile_mysql_regex(pattern: &str, match_type: &str) -> Result<regex::Regex, QueryError> {
+fn compile_mysql_regex(
+    pattern: &str,
+    match_type: &str,
+) -> Result<crate::engine::mysql_regex::Regex, QueryError> {
     if pattern.is_empty() {
         return Err(crate::error::catalog::ER_REGEXP_ILLEGAL_ARGUMENT
             .error("Illegal argument to a regular expression."));
@@ -246,15 +248,16 @@ fn compile_mysql_regex(pattern: &str, match_type: &str) -> Result<regex::Regex, 
         return Err(crate::error::catalog::ER_REGEXP_INTERNAL_ERROR
             .error("regular expression exceeded the implementation resource limit"));
     }
-    // Rust's `regex` crate intentionally keeps POSIX bracket classes ASCII
-    // only. MySQL's ICU regexp engine applies them to the decoded character
-    // repertoire instead (for example latin1 0xff is lowercase and koi8r
-    // 0xff is uppercase). Translate the character classes whose Unicode
-    // semantics differ; ASCII inputs remain byte-for-byte equivalent.
-    let pattern = pattern
-        .replace("[[:lower:]]", r"\p{Lowercase}")
-        .replace("[[:upper:]]", r"\p{Uppercase}")
-        .replace("[[:alpha:]]", r"\p{Alphabetic}");
+    let insensitive = match_type
+        .chars()
+        .filter(|c| matches!(c, 'i' | 'c'))
+        .next_back()
+        == Some('i');
+    let (pattern, nfa_pattern, anchors) = crate::engine::mysql_regex::translate(
+        pattern,
+        match_type.contains('n'),
+        match_type.contains('u'),
+    );
     // Keep multiline mode visible to consumers proving whole-string matches.
     // RegexBuilder flags are otherwise absent from Regex::as_str().
     let pattern = if match_type.contains('m') {
@@ -281,7 +284,7 @@ fn compile_mysql_regex(pattern: &str, match_type: &str) -> Result<regex::Regex, 
             _ => {}
         }
     }
-    builder.build().map_err(|e| {
+    let fast = builder.build().map_err(|e| {
         let message = e.to_string();
         let spec = if message.contains("unclosed character class") {
             crate::error::catalog::ER_REGEXP_MISSING_CLOSE_BRACKET
@@ -297,6 +300,19 @@ fn compile_mysql_regex(pattern: &str, match_type: &str) -> Result<regex::Regex, 
         // otherwise MTR/CLI clients mistake the continuation for result rows.
         let summary = message.lines().last().unwrap_or("invalid pattern");
         spec.error(format!("invalid regular expression: {summary}"))
+    })?;
+    crate::engine::mysql_regex::Regex::compile(
+        fast,
+        &nfa_pattern,
+        insensitive,
+        match_type.contains('m'),
+        match_type.contains('n'),
+        match_type.contains('u'),
+        anchors,
+    )
+    .map_err(|_| {
+        crate::error::catalog::ER_REGEXP_INTERNAL_ERROR
+            .error("regular expression exceeded the implementation resource limit")
     })
 }
 

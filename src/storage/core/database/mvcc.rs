@@ -1446,6 +1446,7 @@ impl Database {
         undo_next_lsn: u64,
         undo_skip: (u64, u64),
     ) -> Result<HashSet<u64>, QueryError> {
+        let _budget = self.capture.budget.rollback_scope();
         #[cfg(test)]
         let batch_record_limit = ROLLBACK_BATCH_RECORD_LIMIT.with(|limit| limit.get());
         #[cfg(not(test))]
@@ -1827,6 +1828,7 @@ impl Database {
         table_id: u64,
         row_ids: &[RowId],
     ) -> Result<(), QueryError> {
+        let _budget = self.capture.budget.rollback_scope();
         self.rollback_inserted_rows_inner(table_id, row_ids)
             .map_err(|err| {
                 self.quarantine_mvcc(format!(

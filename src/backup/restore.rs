@@ -709,6 +709,16 @@ pub(super) fn validate_destination(
             .next()
             .is_some()
     {
+        if native::inspect(destination)
+            .ok()
+            .flatten()
+            .is_some_and(|image| {
+                image.kind == native::ImageKind::RestoredImage
+                    && image.state == native::State::ReadOnly
+            })
+        {
+            return Err(backup_err("restore target already contains a read-only recovery image; run mydb-backup confirm to verify it, then start it or promote it if it is the intended recovery; use a different empty directory for another restore"));
+        }
         return Err(backup_err("restore target must be empty or absent"));
     }
     for parent in destination.ancestors().skip(1) {

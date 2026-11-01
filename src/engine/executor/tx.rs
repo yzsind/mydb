@@ -449,6 +449,7 @@ pub(super) fn ensure_statement_dml_txn(
     db: &Arc<Database>,
     session: &mut SessionContext,
 ) -> Result<TxnView, QueryError> {
+    db.check_write_statement_budget()?;
     ensure_statement_txn_kind(db, session, /* dml = */ true)
 }
 

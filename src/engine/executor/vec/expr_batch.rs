@@ -3020,7 +3020,7 @@ pub(crate) fn transform_utf8_column(
 }
 
 fn regexp_replace_utf8_column(
-    regex: &regex::Regex,
+    regex: &crate::engine::mysql_regex::Regex,
     replacement: &str,
     offsets: &[u32],
     input: &[u8],
@@ -3035,6 +3035,7 @@ fn regexp_replace_utf8_column(
     // SAFETY: the Utf8 lane invariant guarantees valid UTF-8 and every stored
     // offset is produced at an original value boundary.
     let input = unsafe { std::str::from_utf8_unchecked(input) };
+    let _memory = regex.search_scope(input).ok()?;
     let mut validity = nulls.clone().unwrap_or_else(|| Bitmap::new_all_valid(rows));
     let mut retain_nulls = nulls.is_some();
     if let Some(selection) = selection {

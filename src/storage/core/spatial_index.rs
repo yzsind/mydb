@@ -459,6 +459,16 @@ impl SpatialIndexFile {
     fn fail_publication(&self, lsn: u64) {
         self.failed.store(true, Ordering::Release);
         if self.durability != DurabilityMode::Memory {
+            // A durable failure fence must not outlive the WAL batch that
+            // recovery needs to clear it. Page writeback already obeys WAL
+            // before data, so an undurable batch cannot have durable pages.
+            if let Err(error) = LogManager::sync_durable_to(&self.log, lsn) {
+                crate::util::logging::log_message(format_args!(
+                    "spatial publication WAL barrier failed: {}",
+                    error.message()
+                ));
+                return;
+            }
             let marker = self.path.with_extension("rtree.failed");
             if let Ok(mut file) = File::create(&marker) {
                 let _ = file.write_all(&lsn.to_le_bytes());
@@ -1534,6 +1544,23 @@ mod tests {
         assert_eq!(tree.count_pages(), pages);
         tree.validate().unwrap();
     }
+    #[test]
+    fn audit_failure_fence_is_ordered_after_its_wal_batch() {
+        let dir = directory();
+        let tree = open(dir.path(), true);
+        tree.log.lock().set_write_buffer_enabled(true).unwrap();
+        tree.apply(0, [entry(1, WalIndexOpKind::Insert)]).unwrap();
+        let lsn = tree.log.lock().last_lsn();
+        tree.fail_publication(lsn);
+        assert!(tree.log.lock().durable_lsn() >= lsn);
+        assert_eq!(
+            fs::read(tree.path.with_extension("rtree.failed")).unwrap(),
+            lsn.to_le_bytes()
+        );
+        let scan = LogManager::scan(dir.path()).unwrap();
+        assert!(scan.records.iter().any(|record| record.lsn == lsn));
+    }
+
     #[test]
     fn spatial_index_wal_replay_is_idempotent_and_repairs_torn_pages() {
         let source = directory();

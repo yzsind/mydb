@@ -768,6 +768,7 @@ Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` 
 - In-procedure SQL-level `PREPARE` uses a connection-scoped lifetime and pre-parsed ASTs that can execute/deallocate across `CALL`s; dynamic SQL captures no locals, and functions/triggers continue to be rejected with 1336.
 - SQL PREPARE and COM_STMT prepared `CALL` support IN/OUT/INOUT placeholders; the binary protocol sets `SERVER_PS_OUT_PARAMS` on the OUT-parameter single-row result set.
 - `GET CURRENT/STACKED DIAGNOSTICS` uses a multi-condition, 1-based condition area; an `SQLWARNING` HANDLER can capture class-01 warnings produced by a statement, and named CONDITIONs can be used with SIGNAL/RESIGNAL.
+- Diagnostic object fields (`CONSTRAINT_NAME`, `TABLE_NAME`, and related items) preserve explicit SIGNAL/RESIGNAL information. Engine conditions without that structured information return an empty string; object names are not inferred from error messages.
 - Direct functions and static nested `CALL`s pin their version within the statement's MDL batch; both direct and nested calls check routine-level `EXECUTE`.
 - Block-level locals, conditions, and cursors are lexically scoped; declaration order, duplicate declarations, and `LEAVE` / `ITERATE` labels are validated at creation/recompilation.
 - Parameters, locals, OUT/INOUT, and RETURN reuse the DML type-conversion implementation; argument evaluation and IN/INOUT assignment use the caller's mode, while the procedure body/locals/RETURN use the creation-time `sql_mode`; on routine exit the caller's database, security identity, roles, and mode are restored.
@@ -799,6 +800,8 @@ Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` 
 **✅** `CREATE [DEFINER=][IF NOT EXISTS] EVENT [OR REPLACE]`, `ALTER`/`DROP EVENT`, `SHOW EVENTS`/`SHOW CREATE EVENT`, `information_schema.events`, the `event_scheduler` sysvar.
 
 - Persisted `mysql.events` (sql_mode / time_zone snapshots); a per-engine background scheduler thread uses `Notify` wakeups and a bounded worker pool, independent events may run concurrently, and bodies check privileges under the definer identity.
+- Recurring executions of the same event may overlap, as in MySQL 8.0. Each execution starts with a fresh statement clock and replays the stored mode, including an empty `sql_mode`.
+- `ALTER EVENT` without an explicit DEFINER adopts the altering account as definer to prevent retaining another account's authority. `ORIGINATOR` currently reports the local `server_id`; the original creator's server ID is not persisted across native replication.
 - `ON SCHEDULE AT/EVERY … STARTS/ENDS`, `ON COMPLETION [NOT] PRESERVE`, calendar interval stepping (month-end clamp) + MICROSECOND + 11 compound units, and skipping missed periods.
 - CREATE/ALTER compound bodies support `BEGIN … END`, locals, branches, loops, and exception handling; one-shot PRESERVE events keep their definition after completion and become DISABLED.
 - Runtime modification after starting with `MYDB_EVENT_SCHEDULER=disabled` reports 1290; ON/OFF can be toggled dynamically.
@@ -1172,7 +1175,7 @@ The following expression differences are retained:
 - String vs. DECIMAL comparisons keep exact fixed-point semantics instead of simulating the precision loss of a DOUBLE conversion.
 - Regex continues to use a resource-bounded automaton engine. Backreferences report explicit errors; Unicode case folding uses simple folding
   and does not promise ICU's multi-character full folding (for example `ss`/`ß`). This is the trade-off between resource controllability and full ICU compatibility.
-- A negative occurrence in `REGEXP_REPLACE` explicitly reports 1210, keeping strict parameter checking.
+- As in MySQL 8.0, a negative occurrence selects the first regex match; zero selects the first match in search functions and all matches in `REGEXP_REPLACE`. Position validation uses the full integer range rather than emulating 32-bit wraparound.
 - `aes-*-ctr` remains a mydb extension.
 - The base `utf8mb4_0900_ai_ci` of `WEIGHT_STRING` uses Unicode 9.0 DUCET primary weight data;
   legacy UTF-8 `_bin` emits three-byte code point weights. `utf8mb3_general_ci` and

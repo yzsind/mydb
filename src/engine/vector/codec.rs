@@ -860,6 +860,23 @@ pub(crate) fn from_build_f32(
     Ok(VectorValue::new(datatype, values.len() as u32, payload))
 }
 
+/// Comparisons accept raw binary protocol payloads as well as strict text.
+/// The column's scalar format also governs text literals and index probes.
+pub(crate) fn coerce_comparison_value(
+    value: &crate::types::Value,
+    datatype: VectorDataType,
+) -> Result<VectorValue, QueryError> {
+    use crate::types::Value;
+    match value {
+        Value::Vector(value) => {
+            validate_internal(value)?;
+            Ok(value.clone())
+        }
+        Value::Bytes(bytes) => convert_value(&coerce_bytes_to_internal(bytes)?, datatype, None),
+        _ => coerce_value(value.clone(), datatype, None),
+    }
+}
+
 pub(crate) fn coerce_value(
     value: crate::types::Value,
     datatype: VectorDataType,

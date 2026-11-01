@@ -364,7 +364,7 @@ impl Database {
             // A structural-redo failure fences a derived tree for the same
             // heap rebuild as a planned logical redo. Persistent posting
             // corruption is still rejected by the idx.corrupt fence above.
-            if !marker.try_exists().map_err(io_err)? {
+            if !marker.try_exists().map_err(io_err)? && path.try_exists().map_err(io_err)? {
                 validation.validate(path.clone()).map_err(|err| err.map_message(|message|
                     format!("important FULLTEXT index validation failed ({}): {message}", path.display())))?;
             }

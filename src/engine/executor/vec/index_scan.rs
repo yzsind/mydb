@@ -673,6 +673,7 @@ fn runtime_int_key_part(value: i128, target: crate::storage::ParamTarget) -> Opt
         ParamTarget::Float32
         | ParamTarget::Float64
         | ParamTarget::Bytes
+        | ParamTarget::Vector { .. }
         | ParamTarget::JsonScalar
         | ParamTarget::CharString
         | ParamTarget::CollatedCharString { .. }

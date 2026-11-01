@@ -348,7 +348,10 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .is_some_and(|s| s.effective == Policy::Continuous && s.lifecycle == "ACTIVE")
+                .is_some_and(|s| {
+                    s.pending.is_some()
+                        || (s.effective == Policy::Continuous && s.lifecycle == "ACTIVE")
+                })
             {
                 this.start_scheduler()?;
             }
@@ -379,6 +382,34 @@ impl Coordinator {
                     let Some(this) = weak.upgrade() else { break };
                     if this.stop.load(Ordering::Acquire) {
                         break;
+                    }
+                    // A failed initial capture may leave a durable candidate
+                    // pin while its repository is unavailable. Retry even in
+                    // MANUAL mode, once the capture no longer owns that state.
+                    let pending_base = this
+                        .control
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(|s| s.pending.is_some());
+                    if pending_base {
+                        if this.capturing.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let _control = super::resources::ContextScope::control();
+                        let _archive = this.archive.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Err(error) = this.reconcile() {
+                            this.record_error(&error);
+                        }
+                        if this
+                            .control
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .is_some_and(|s| s.pending.is_some())
+                        {
+                            continue;
+                        }
                     }
                     let continuous = this
                         .control
@@ -720,6 +751,7 @@ impl Coordinator {
         };
         let mut rearm_lease = None;
         let rearming = policy != Policy::Disabled
+            && state.effective != Policy::Disabled
             && state.stream_id.is_some()
             && (state.lifecycle == "BROKEN" || !state.error.is_empty());
         if rearming {
@@ -1063,6 +1095,8 @@ impl Coordinator {
                     )?;
                     check_cancelled(cancel)?;
                     this.phase(id, "VALIDATING_CONTINUATION");
+                    #[cfg(test)]
+                    super::faults::hit("base_before_verify", &this.root)?;
                     let image = native::verify(&operation.join("data"))?;
                     let marker = read_bounded(
                         &operation.join("data").join(native::MARKER),
@@ -1157,6 +1191,8 @@ impl Coordinator {
                         this.start_scheduler()?;
                     }
                     this.phase(id, "QUERY_READY");
+                    #[cfg(test)]
+                    super::faults::hit("base_query_ready", &this.root)?;
                     Ok(())
                 })();
                 if result.is_err() {
@@ -1533,6 +1569,60 @@ impl Coordinator {
     }
     fn reconcile(&self) -> Result<(), QueryError> {
         let _database = self.db()?;
+        // Immutable baseline hashing can take minutes. Retain a repository
+        // lease while validating, but leave status and budget patches usable.
+        let pending = self
+            .control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|state| {
+                state.pending.as_ref().map(|pending| {
+                    (
+                        state.repository.clone(),
+                        state.repository_id.clone(),
+                        pending.base_id.clone(),
+                    )
+                })
+            });
+        let pending = pending.or_else(|| {
+            let guard = self.control.lock().unwrap_or_else(|e| e.into_inner());
+            let state = guard.as_ref().filter(|state| state.stream_id.is_none())?;
+            let lease = _database.capture.leases().get("archive")?.clone();
+            let proof: (PathBuf, String, String, u64, u64) =
+                serde_json::from_str(&lease.proof).ok()?;
+            Some((
+                state.repository.clone(),
+                state.repository_id.clone(),
+                proof.1,
+            ))
+        });
+        let verified_pending = if let Some((path, identity, base_id)) = pending {
+            if path.join("bases").join(&base_id).exists() {
+                let repo = Repository::open(&path, None)?;
+                let lease = Lease::acquire(&repo.root, false)?;
+                if repo.header.id != identity {
+                    None
+                } else {
+                    let (base, _) = repo.base(&base_id)?;
+                    let mut published = false;
+                    repo.visit_live(&repo.position()?, |_, event| {
+                        published |=
+                            matches!(event, Publication::Base { base: b } if b.id == base_id);
+                        Ok(())
+                    })?;
+                    if !published {
+                        sync_tree(&path.join("bases").join(&base_id))?;
+                        sync_dir(&path.join("bases"))?;
+                    }
+                    Some((identity, base, lease))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut guard = self.control.lock().unwrap_or_else(|e| e.into_inner());
         let Some(state) = guard.as_mut() else {
             return Ok(());
@@ -1609,7 +1699,15 @@ impl Coordinator {
         if let Some(pending) = state.pending.clone() {
             let path = repo.root.join("bases").join(&pending.base_id);
             if path.exists() {
-                let (base, _) = repo.base(&pending.base_id)?;
+                let base = verified_pending
+                    .as_ref()
+                    .filter(|(identity, base, _)| {
+                        *identity == state.repository_id && base.id == pending.base_id
+                    })
+                    .map(|(_, base, _)| base.clone())
+                    .ok_or_else(|| {
+                        backup_err("pending baseline changed during validation; retry")
+                    })?;
                 let mut published = false;
                 repo.visit_live(&repo.position()?, |_, event| {
                     if matches!(event,Publication::Base{base:b}if b.id==base.id) {
@@ -1618,8 +1716,6 @@ impl Coordinator {
                     Ok(())
                 })?;
                 if !published {
-                    sync_tree(&path)?;
-                    sync_dir(&repo.root.join("bases"))?;
                     repo.publish(Publication::Base { base })?;
                 }
             } else {
@@ -1637,7 +1733,15 @@ impl Coordinator {
                     return Err(backup_err("candidate archive lease identity mismatch"));
                 }
                 if repo.root.join("bases").join(&proof.1).exists() {
-                    let (base, _) = repo.base(&proof.1)?;
+                    let base = verified_pending
+                        .as_ref()
+                        .filter(|(identity, base, _)| {
+                            *identity == state.repository_id && base.id == proof.1
+                        })
+                        .map(|(_, base, _)| base.clone())
+                        .ok_or_else(|| {
+                            backup_err("candidate baseline changed during validation; retry")
+                        })?;
                     if base.stream_id.as_deref() != Some(&proof.2) {
                         return Err(backup_err("candidate stream mismatch"));
                     }
@@ -1688,11 +1792,6 @@ impl Coordinator {
             }
             let bytes = serde_json::to_vec(&publication).map_err(|e| backup_err(e.to_string()))?;
             metadata.try_grow(bytes.len().saturating_mul(16))?;
-            if publications.len() >= 1024 {
-                return Err(backup_err(
-                    "unacknowledged catalog backlog exceeds reconciliation budget",
-                ));
-            }
             publications.push(publication);
             Ok(())
         })?;
@@ -1701,7 +1800,16 @@ impl Coordinator {
                 Publication::Base { base }
                     if state.pending.as_ref().is_some_and(|p| p.base_id == base.id) =>
                 {
-                    repo.base(&base.id)?;
+                    if !verified_pending
+                        .as_ref()
+                        .is_some_and(|(identity, verified, _)| {
+                            *identity == state.repository_id && verified.id == base.id
+                        })
+                    {
+                        return Err(backup_err(
+                            "pending baseline changed during validation; retry",
+                        ));
+                    }
                     let expected = state.pending.as_ref().unwrap();
                     if base.source_id != state.source_id
                         || base.timeline_id != state.timeline_id
@@ -2202,6 +2310,18 @@ impl Coordinator {
                 let _archive = this.archive.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = this.reconcile();
             }
+            if result.is_err()
+                && this
+                    .control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|s| s.pending.is_some())
+            {
+                if let Err(error) = this.start_scheduler() {
+                    this.record_error(&error);
+                }
+            }
             let control = this
                 .control
                 .lock()
@@ -2300,7 +2420,10 @@ impl Coordinator {
     pub(crate) fn cancel(&self, id: &str) -> Result<(), QueryError> {
         let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         let entry = jobs.get(id).ok_or_else(|| backup_err("job not found"))?;
-        if entry.job.state != "RUNNING" || entry.job.phase.starts_with("PUBLISH") {
+        if entry.job.state != "RUNNING"
+            || entry.job.phase.starts_with("PUBLISH")
+            || entry.job.phase == "QUERY_READY"
+        {
             return Err(backup_err(format!(
                 "job cannot be cancelled in {} / {}",
                 entry.job.state, entry.job.phase
@@ -2378,6 +2501,10 @@ fn test_fault(point: u8) -> Result<(), QueryError> {
 
 #[cfg(test)]
 impl Coordinator {
+    pub(crate) fn test_reconcile(&self) -> Result<(), QueryError> {
+        let _archive = self.archive.lock().unwrap();
+        self.reconcile()
+    }
     pub(crate) fn test_start_scheduler(self: &Arc<Self>) -> Result<(), QueryError> {
         self.start_scheduler()
     }

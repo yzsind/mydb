@@ -1031,6 +1031,13 @@ impl Database {
         Ok(txn)
     }
 
+    /// Gate each new SQL write statement while allowing an admitted
+    /// transaction to commit or physically roll back under WAL pressure.
+    pub(crate) fn check_write_statement_budget(&self) -> Result<(), QueryError> {
+        self.capture.budget.check(1)
+    }
+
+
     /// Begin a DML transaction. Identical to [`begin_txn`] except that the
     /// slot is flagged as a writer under the SAME txns write-lock acquisition
     /// (instead of lazily on the first `push_undo_with_flush`). The lazy
@@ -3840,7 +3847,8 @@ impl Database {
                     let mut tail_keys = Vec::new();
                     for (idx, (payload, keys)) in entries.into_iter().enumerate() {
                         if idx < prefix_len {
-                            let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
+                            let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?
+                                .for_admitted_drain();
                             let lsn =
                                 crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
                             for key in keys {
@@ -3857,7 +3865,8 @@ impl Database {
                         WalPayload::TxnBatch {
                             records: tail_records,
                         },
-                    )?;
+                    )?
+                    .for_admitted_drain();
                     let (final_lsn, time) = crate::wal::LogManager::append_timed_to(
                         &self.log,
                         tail,
@@ -3873,7 +3882,8 @@ impl Database {
                     let mut encoded = Vec::with_capacity(entries.len());
                     for (payload, keys) in entries {
                         encoded.push((
-                            crate::wal::LogManager::pre_encode_record(txn_id, payload)?,
+                            crate::wal::LogManager::pre_encode_record(txn_id, payload)?
+                                .for_admitted_drain(),
                             keys,
                         ));
                     }

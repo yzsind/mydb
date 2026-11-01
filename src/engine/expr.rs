@@ -7,6 +7,7 @@ mod formatting_tests;
 mod gtid_tests;
 pub(crate) mod math;
 pub(crate) mod network;
+mod regexp_binary;
 crate::engine::builtin_catalog::declare_retains_ast!();
 mod string_kernels;
 pub(crate) mod string_search;
@@ -5365,17 +5366,21 @@ where
             let value = eval_one(name, args, &mut eval_arg)?;
             eval_reverse_value(value)
         }
+        "__MATCH_AGAINST" => {
+            let expr = Expr::Function {
+                name: crate::parser::FT_MATCH_FUNCTION.to_owned(),
+                args: args.to_vec(),
+                distinct: false,
+            };
+            crate::engine::executor::select::fulltext_row::current_score(&expr).ok_or_else(|| {
+                crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("MATCH requires a FULLTEXT score provider in this query block")
+            })
+        }
         "REGEXP_LIKE" => {
             expect_arg_range(name, args, 2, 3)?;
             let values = eval_args(args, &mut eval_arg)?;
-            null_if_any(values, |values| {
-                let text = string_value(&values[0]);
-                let pattern = string_value(&values[1]);
-                let binary =
-                    matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
-                let re = mysql_regex_for_operand(&pattern, values.get(2), binary)?;
-                Ok(Value::Int(if re.is_match(&text) { 1 } else { 0 }))
-            })
+            null_if_any(values, |values| eval_regexp_like_values(&values))
         }
         "LOCATE" => {
             // String search is directional: MySQL coerces the needle into
@@ -8190,10 +8195,14 @@ where
             expect_arg_range(name, args, 2, 6)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
+                if regexp_binary::binary_operands(&values, 2)? {
+                    return regexp_binary::evaluate("REGEXP_INSTR", &values);
+                }
                 let expr = string_value(&values[0]);
                 let binary =
                     matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
                 let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(5), binary)?;
+                let _memory = re.search_scope(&expr)?;
                 let pos = values.get(2).map(int_value).transpose()?.unwrap_or(1);
                 if pos < 1 {
                     return Err(error(
@@ -8241,10 +8250,14 @@ where
             expect_arg_range(name, args, 2, 5)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
+                if regexp_binary::binary_operands(&values, 2)? {
+                    return regexp_binary::evaluate("REGEXP_SUBSTR", &values);
+                }
                 let expr = string_value(&values[0]);
                 let binary =
                     matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
                 let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(4), binary)?;
+                let _memory = re.search_scope(&expr)?;
                 let pos = values.get(2).map(int_value).transpose()?.unwrap_or(1);
                 if pos < 1 {
                     return Err(crate::error::catalog::ER_WRONG_PARAMETERS_TO_NATIVE_FCT
@@ -8257,8 +8270,12 @@ where
                     .transpose()?
                     .unwrap_or(1)
                     .max(1);
-                let start_byte = regexp_start_byte(&expr, pos)?;
-                for (idx, mat) in re.find_iter(&expr[start_byte..]).enumerate() {
+                let start_byte = regexp_start_byte_allow_end(&expr, pos)?;
+                for (idx, mat) in re
+                    .find_iter(&expr)
+                    .filter(|m| m.start() >= start_byte)
+                    .enumerate()
+                {
                     if idx as i64 + 1 == occurrence {
                         return Ok(Value::String(mat.as_str().to_string()));
                     }
@@ -14882,6 +14899,25 @@ fn function_arg_with_table_octets(
     crate::charset::encode_string(charset, &text).map(Value::Bytes)
 }
 
+pub(crate) fn eval_regexp_like_values(values: &[Value]) -> Result<Value, QueryError> {
+    if regexp_binary::binary_operands(values, 2)? {
+        return regexp_binary::evaluate("REGEXP_LIKE", values);
+    }
+    let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(2), false)?;
+    let text = string_value(&values[0]);
+    let _memory = re.search_scope(&text)?;
+    Ok(Value::Int(re.is_match(&text) as i64))
+}
+
+pub(crate) fn regexp_start_byte_allow_end(subject: &str, pos: usize) -> Result<usize, QueryError> {
+    pos.checked_sub(1)
+        .and_then(|i| char_to_byte_index(subject, i))
+        .ok_or_else(|| {
+            crate::error::catalog::ER_REGEXP_INDEX_OUTOFBOUNDS_ERROR
+                .error("Index out of bounds in regular expression search.")
+        })
+}
+
 pub(crate) fn regexp_start_byte(subject: &str, pos: usize) -> Result<usize, QueryError> {
     let index = pos - 1;
     if (!subject.is_empty() && index >= subject.chars().count())
@@ -14928,7 +14964,10 @@ pub(crate) fn mysql_regex_for_operand(
     pattern: &str,
     match_type: Option<&Value>,
     binary_operand: bool,
-) -> Result<std::sync::Arc<crate::engine::func_cache::Governed<regex::Regex>>, QueryError> {
+) -> Result<
+    std::sync::Arc<crate::engine::func_cache::Governed<crate::engine::mysql_regex::Regex>>,
+    QueryError,
+> {
     if pattern.is_empty() {
         return Err(crate::error::catalog::ER_REGEXP_ILLEGAL_ARGUMENT
             .error("Illegal argument to a regular expression."));
@@ -14959,7 +14998,7 @@ pub(crate) fn mysql_regex_for_operand(
 }
 
 fn mysql_regexp_replacement<'a>(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     replacement: &'a str,
 ) -> Result<std::borrow::Cow<'a, str>, QueryError> {
     if !replacement.contains(['$', '\\']) {
@@ -15081,10 +15120,10 @@ fn mysql_regexp_replacement<'a>(
 /// Append a replace-all result directly to a caller-owned byte lane.
 ///
 /// The common literal-replacement case avoids constructing one temporary
-/// `String` per input row. Replacement strings containing `$` retain the
-/// regex crate's capture-expansion semantics by delegating to `replace_all`.
+/// `String` per input row. Capture expansion appends directly to the same
+/// bounded output lane.
 pub(crate) fn regexp_replace_all_into(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
@@ -15093,7 +15132,7 @@ pub(crate) fn regexp_replace_all_into(
 }
 
 fn regexp_replace_all_bounded(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
@@ -15102,25 +15141,30 @@ fn regexp_replace_all_bounded(
     if base == output.len() && !replacement.contains('$') && regexp_replace_has_single_match(re) {
         return regexp_replace_single_into(re, input, replacement, output);
     }
+    if input.is_empty() {
+        return true;
+    }
     let mut last = 0usize;
-    if replacement.contains('$') {
-        for captures in re.captures_iter(input) {
-            let matched = captures.get(0).expect("capture zero exists");
-            if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
-                || !regexp_expand(&captures, replacement, output, base)
-            {
-                return false;
-            }
-            last = matched.end();
+    let mut search = 0;
+    while let Some(captures) = re.captures_at(input, search) {
+        let matched = captures.get(0).expect("capture zero exists");
+        if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
+            || !(if replacement.contains('$') {
+                regexp_expand(&captures, replacement, output, base)
+            } else {
+                regexp_append(output, base, replacement.as_bytes())
+            })
+        {
+            return false;
         }
-    } else {
-        for matched in re.find_iter(input) {
-            if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
-                || !regexp_append(output, base, replacement.as_bytes())
-            {
-                return false;
+        last = matched.end();
+        if matched.is_empty() {
+            if last == input.len() {
+                break;
             }
-            last = matched.end();
+            search = last + input[last..].chars().next().unwrap().len_utf8();
+        } else {
+            search = last;
         }
     }
     regexp_append(output, base, &input.as_bytes()[last..])
@@ -15145,7 +15189,7 @@ fn regexp_append(output: &mut Vec<u8>, base: usize, bytes: &[u8]) -> bool {
 // Expand directly into the bounded row lane instead of allocating an unbounded
 // temporary with Captures::expand or Regex::replace_all.
 fn regexp_expand(
-    captures: &regex::Captures<'_>,
+    captures: &crate::engine::mysql_regex::Captures<'_>,
     replacement: &str,
     output: &mut Vec<u8>,
     base: usize,
@@ -15211,7 +15255,7 @@ fn regexp_expand(
 }
 
 #[inline]
-pub(crate) fn regexp_replace_has_single_match(re: &regex::Regex) -> bool {
+pub(crate) fn regexp_replace_has_single_match(re: &crate::engine::mysql_regex::Regex) -> bool {
     let pattern = re.as_str().as_bytes();
     pattern.first() == Some(&b'^')
         && pattern.last() == Some(&b'$')
@@ -15223,13 +15267,21 @@ pub(crate) fn regexp_replace_has_single_match(re: &regex::Regex) -> bool {
 
 #[inline]
 pub(crate) fn regexp_replace_single_into(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
 ) -> bool {
     let base = output.len();
-    if !input.ends_with('\n') {
+    if input.is_empty() {
+        return true;
+    }
+    if !input.chars().any(|c| {
+        matches!(
+            c,
+            '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+    }) {
         return regexp_append(
             output,
             base,
@@ -15253,6 +15305,9 @@ pub(crate) fn regexp_replace_single_into(
 /// and the compiled expression kernel. Arity is checked by the callers.
 pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, QueryError> {
     null_if_any(values, |values| {
+        if regexp_binary::binary_operands(&values, 3)? {
+            return regexp_binary::evaluate("REGEXP_REPLACE", &values);
+        }
         let expr = string_value(&values[0]);
         let pat = string_value(&values[1]);
         let repl = string_value(&values[2]);
@@ -15274,35 +15329,47 @@ pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, Qu
         let occurrence = if occurrence < 0 { 1 } else { occurrence };
         let binary = matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
         let re = mysql_regex_for_operand(&pat, values.get(5), binary)?;
-        let start_byte = regexp_start_byte(&expr, pos)?;
-        let tail = &expr[start_byte..];
-        let repl = if repl.contains(['$', '\\'])
-            && (if occurrence == 0 {
-                re.is_match(tail)
+        let _memory = re.search_scope(&expr)?;
+        let start_byte = regexp_start_byte_allow_end(&expr, pos)?;
+        if expr.is_empty() {
+            return Ok(Value::String(expr));
+        }
+        let mut parsed_replacement = None;
+        let mut bytes = Vec::new();
+        let mut copied = 0;
+        let mut search = start_byte;
+        let mut seen = 0;
+        while let Some(captures) = re.captures_at(&expr, search) {
+            let matched = captures.get(0).unwrap();
+            seen += 1;
+            if occurrence == 0 || seen == occurrence {
+                if parsed_replacement.is_none() {
+                    parsed_replacement = Some(mysql_regexp_replacement(&re, &repl)?);
+                }
+                let replacement = parsed_replacement.as_ref().unwrap();
+                if !regexp_append(&mut bytes, 0, &expr.as_bytes()[copied..matched.start()])
+                    || !regexp_expand(&captures, replacement, &mut bytes, 0)
+                {
+                    return Ok(Value::Null);
+                }
+                copied = matched.end();
+            }
+            if matched.is_empty() {
+                if matched.end() == expr.len() {
+                    break;
+                }
+                search = matched.end() + expr[matched.end()..].chars().next().unwrap().len_utf8();
             } else {
-                re.find_iter(tail).nth((occurrence - 1) as usize).is_some()
-            }) {
-            mysql_regexp_replacement(&re, &repl)?
-        } else {
-            std::borrow::Cow::Borrowed(repl.as_str())
-        };
-        if string_result_exceeds_packet("regexp_replace", start_byte as u64) {
+                search = matched.end();
+            }
+            if occurrence != 0 && seen == occurrence {
+                break;
+            }
+        }
+        if !regexp_append(&mut bytes, 0, &expr.as_bytes()[copied..]) {
             return Ok(Value::Null);
         }
-        let mut bytes = expr[..start_byte].as_bytes().to_vec();
-        let success = if occurrence == 0 {
-            regexp_replace_all_bounded(&re, tail, &repl, &mut bytes, 0)
-        } else if let Some(captures) = re.captures_iter(tail).nth((occurrence - 1) as usize) {
-            let matched = captures.get(0).expect("capture zero exists");
-            regexp_append(&mut bytes, 0, &tail.as_bytes()[..matched.start()])
-                && regexp_expand(&captures, &repl, &mut bytes, 0)
-                && regexp_append(&mut bytes, 0, &tail.as_bytes()[matched.end()..])
-        } else {
-            regexp_append(&mut bytes, 0, tail.as_bytes())
-        };
-        if !success {
-            return Ok(Value::Null);
-        }
+
         Ok(Value::String(
             String::from_utf8(bytes).expect("regexp replacement preserves UTF-8"),
         ))
@@ -21651,33 +21718,28 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
             }
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
-                if upper == "REGEXP_LIKE"
-                    && !args.iter().take(2).any(|arg| {
-                        matches!(
-                            arg,
-                            Expr::Literal(Literal::Null) | Expr::BoundValue(Value::Null)
-                        )
-                    })
-                    && args.iter().any(|arg| {
-                        matches!(
-                            arg,
-                            Expr::Function {
-                                name,
-                                args,
-                                ..
-                            } if name.eq_ignore_ascii_case("CAST")
-                                && matches!(
-                                    args.get(1),
-                                    Some(Expr::Literal(Literal::String(kind)))
-                                        if kind.to_ascii_uppercase().starts_with("BINARY")
-                                )
-                        )
-                    })
-                {
-                    return Err(error(
-                        crate::error::catalog::ER_CHARACTER_SET_MISMATCH,
-                        "Character set 'binary' cannot be used in conjunction with 'regexp_like'.",
-                    ));
+                if matches!(
+                    upper.as_str(),
+                    "REGEXP_LIKE" | "REGEXP_INSTR" | "REGEXP_SUBSTR" | "REGEXP_REPLACE"
+                ) {
+                    let operands = if upper == "REGEXP_REPLACE" { 3 } else { 2 };
+                    let classes = args
+                        .iter()
+                        .take(operands)
+                        .map(|arg| expr_type_descriptor(arg, table).class)
+                        .collect::<Vec<_>>();
+                    if !classes
+                        .iter()
+                        .any(|c| matches!(c, ExprTypeClass::Null | ExprTypeClass::Unknown))
+                    {
+                        let binary = classes
+                            .iter()
+                            .filter(|c| matches!(c, ExprTypeClass::BinaryString))
+                            .count();
+                        if binary != 0 && binary != operands {
+                            return Err(crate::error::catalog::ER_CHARACTER_SET_MISMATCH.error("Character set 'binary' cannot be used with text regular expression operands"));
+                        }
+                    }
                 }
                 // Resolve deterministic charset failures in nested locator
                 // calls before the enclosing function is bound. A standalone
@@ -24912,8 +24974,12 @@ pub(crate) fn compare_values(left: &Value, right: &Value) -> Result<Ordering, Qu
     // `DISTINCT` / `GROUP BY` / `=` on a vector column are well-defined.
     // Similarity ordering is expressed via `DISTANCE()`, not raw comparison.
     if matches!(left, Value::Vector(_)) || matches!(right, Value::Vector(_)) {
-        let lb = vector_bytes_for_compare(left);
-        let rb = vector_bytes_for_compare(right);
+        let datatype = match (left, right) {
+            (Value::Vector(v), _) | (_, Value::Vector(v)) => v.datatype,
+            _ => unreachable!(),
+        };
+        let lb = crate::engine::vector::codec::coerce_comparison_value(left, datatype)?;
+        let rb = crate::engine::vector::codec::coerce_comparison_value(right, datatype)?;
         return Ok(crate::engine::vector::compare(&lb, &rb));
     }
     // Temporal/string coercion has precedence over the generic numeric
@@ -25133,20 +25199,6 @@ fn geometry_bytes_for_compare(value: &Value) -> Vec<u8> {
         Value::String(s) => s.as_bytes().to_vec(),
         Value::SmallString(s) => s.as_ref().to_vec(),
         other => other.to_display_string().into_bytes(),
-    }
-}
-
-/// Coerce a value to internal vector bytes for vector comparison. A
-/// `Value::Vector` is used directly; text/bytes are parsed; anything else
-/// falls back to its display bytes (deterministic).
-fn vector_bytes_for_compare(value: &Value) -> crate::vector::VectorValue {
-    match value {
-        Value::Vector(b) => b.clone(),
-        Value::Bytes(b) => crate::engine::vector::coerce_bytes_to_internal(b).unwrap_or_default(),
-        Value::String(s) => {
-            crate::engine::vector::coerce_bytes_to_internal(s.as_bytes()).unwrap_or_default()
-        }
-        other => other.to_display_string().into_bytes().into(),
     }
 }
 
@@ -29171,7 +29223,7 @@ fn expr_audit_kernel_throughput() {
             black_box(eval_arithmetic(black_box(&left), BinaryOp::Div, black_box(&right)).unwrap());
         }
         eprintln!("compact_div_ns {}", start.elapsed().as_nanos() / 200_000);
-        let re = regex::Regex::new("^a.*z$").unwrap();
+        let re = crate::engine::func_cache::cached_regex("^a.*z$", "").unwrap();
         let mut out = Vec::with_capacity(128);
         let start = Instant::now();
         for _ in 0..200_000 {

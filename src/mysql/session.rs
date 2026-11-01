@@ -3041,6 +3041,7 @@ where
             return Err(io::Error::other("COM_CHANGE_USER cleanup failed"));
         }
 
+        crate::engine::cursor_registry::named_close_for_connection(self.connection_id);
         self.clear_prepared();
         self.context = Box::new(context);
         self.init_connection_timeouts();

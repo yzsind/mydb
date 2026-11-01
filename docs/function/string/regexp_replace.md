@@ -35,7 +35,7 @@ Result: yourdb
 
 ## Notes
 
-- Regular expression positions count text characters. Matching uses the resolved collation and match flags; unsupported backreferences return an explicit error. Do not treat a byte-string operand as a guarantee of byte-offset results.
+- Text operands use character positions and the resolved collation. When all string operands are binary, matching, positions, and results preserve bytes; mixing binary and text operands returns error 3995. Unsupported pattern backreferences return an explicit error.
 
 ## Related Functions
 

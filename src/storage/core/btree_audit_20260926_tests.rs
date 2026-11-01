@@ -672,6 +672,7 @@ fn audit_20260926_bulk_failure_logs_empty_tree_compensation() {
     // A replica consumes logical batches and ignores primary page images.
     let (_replica_dir, replica) = audit_index_raw("replica.idx");
     for record in records {
+        if record.lsn>replica.log.lock().last_lsn() {replica.log.lock().append_reserved(record.lsn,record.txn_id,record.payload.clone()).unwrap();}
         if let WalPayload::IndexBatch { ops, .. } = record.payload {
             let entries = ops
                 .into_iter()
@@ -820,6 +821,10 @@ fn replay_records(records: &[crate::wal::WalRecord], relative: &str) -> Vec<(Ind
     let log = Arc::new(parking_lot::Mutex::new(
         LogManager::open(dir.path()).unwrap(),
     ));
+    // Production replay receives an already persisted WAL prefix.
+    for record in records {
+        log.lock().append_reserved(record.lsn,record.txn_id,record.payload.clone()).unwrap();
+    }
     let mut redo = RedoState::new(Some(log.clone()));
     let committed = records.iter().map(|r| r.txn_id).collect::<RecoveryTxnSet>();
     for record in records {

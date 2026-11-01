@@ -325,6 +325,13 @@ implicit scaling or clamping. BINARY text contains zeroes and ones, and unused
 high bits of its final byte must be zero. See [vector datatypes and indexes](vector-indexes.md)
 for conversion, raw binary I/O, and paged-index admission limits.
 
+Plain BTREE, UNIQUE, and primary keys may use small VECTOR values. Key width
+includes the 12-byte vector header and the declared maximum payload; the normal
+3,072-byte combined key limit applies at DDL time. Equality, DISTINCT, grouping,
+and unique keys use the encoded bits, so positive and negative floating-point
+zero remain distinct even when their text forms are both `0`. Text comparison
+operands must be valid vector literals; malformed text returns an error.
+
 ```sql
 CREATE TABLE documents (
     id        BIGINT PRIMARY KEY,

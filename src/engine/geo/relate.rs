@@ -255,6 +255,40 @@ fn intersects(a: &Geom, b: &Geom) -> bool {
 /// of `b` is in the exterior of `a`, and their interiors meet.
 fn contains(a: &Geom, b: &Geom) -> bool {
     use geo::Relate;
+    if matches!(a, Geom::GeometryCollection(_)) || matches!(b, Geom::GeometryCollection(_)) {
+        use geo::BooleanOps;
+        let left = topology_groups(a);
+        let right = topology_groups(b);
+        let polygons = left.iter().find_map(|g| match g {
+            geo::Geometry::MultiPolygon(polygons) => Some(polygons),
+            _ => None,
+        });
+        let lines = left.iter().find_map(|g| match g {
+            geo::Geometry::MultiLineString(lines) => Some(lines),
+            _ => None,
+        });
+        let covered = right.iter().all(|part| match part {
+            geo::Geometry::MultiPoint(points) => points
+                .0
+                .iter()
+                .all(|point| left.iter().any(|g| g.relate(point).is_covers())),
+            geo::Geometry::MultiLineString(target) => {
+                let outside = polygons.map(|polygons| polygons.clip(target, true));
+                let outside = outside.as_ref().unwrap_or(target);
+                outside.0.is_empty() || lines.is_some_and(|lines| lines.relate(outside).is_covers())
+            }
+            geo::Geometry::MultiPolygon(target) => {
+                polygons.is_some_and(|polygons| polygons.relate(target).is_covers())
+            }
+            _ => unreachable!("normalized dimensional groups"),
+        });
+        return covered
+            && left.iter().any(|a| {
+                right
+                    .iter()
+                    .any(|b| a.relate(b).matches("T********").expect("valid DE-9IM mask"))
+            });
+    }
     topology_geometry(a)
         .relate(&topology_geometry(b))
         .is_contains()

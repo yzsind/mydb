@@ -148,15 +148,19 @@ fn polygon_area(rings: &[Vec<Coord>]) -> f64 {
     for hole in &rings[1..] {
         a -= ring_signed_area(hole).abs();
     }
-    a.max(0.0)
+    if a.is_finite() {
+        a.max(0.0)
+    } else {
+        a
+    }
 }
 
 /// MySQL `ST_Area`: total surface area (0 for non-areal geometry).
 pub(crate) fn area(geom: &Geom) -> f64 {
     match geom {
         Geom::Polygon(rings) => polygon_area(rings),
-        Geom::MultiPolygon(ps) => ps.iter().map(|p| polygon_area(p)).sum(),
-        Geom::GeometryCollection(gs) => gs.iter().map(area).sum(),
+        Geom::MultiPolygon(ps) => ps.iter().map(|p| polygon_area(p)).fold(0.0, |a, b| a + b),
+        Geom::GeometryCollection(gs) => gs.iter().map(area).fold(0.0, |a, b| a + b),
         _ => 0.0,
     }
 }
@@ -170,8 +174,8 @@ fn line_length(cs: &[Coord]) -> f64 {
 pub(crate) fn length(geom: &Geom) -> f64 {
     match geom {
         Geom::LineString(cs) => line_length(cs),
-        Geom::MultiLineString(ls) => ls.iter().map(|l| line_length(l)).sum(),
-        Geom::GeometryCollection(gs) => gs.iter().map(length).sum(),
+        Geom::MultiLineString(ls) => ls.iter().map(|l| line_length(l)).fold(0.0, |a, b| a + b),
+        Geom::GeometryCollection(gs) => gs.iter().map(length).fold(0.0, |a, b| a + b),
         _ => 0.0,
     }
 }

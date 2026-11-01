@@ -248,3 +248,24 @@ fn file_compensation_codec_covers_all_actions() {
         assert_eq!(encode_record(&restored).unwrap(), bytes);
     }
 }
+
+#[test]
+fn synchronization_cannot_publish_a_future_allocation() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let log = Arc::new(parking_lot::Mutex::new(
+        LogManager::open(dir.path()).unwrap(),
+    ));
+    let first = log.lock().append(0, WalPayload::CheckpointBegin).unwrap();
+    LogManager::sync_durable_to(&log, first).unwrap();
+    let future = log.lock().next_lsn();
+    assert!(LogManager::sync_durable_to(&log, future)
+        .unwrap_err()
+        .message()
+        .contains("unappended"));
+    assert!(log.lock().prepare_sync_to(future).is_err());
+    assert_eq!(log.lock().durable_lsn(), first);
+    let appended = log.lock().append(0, WalPayload::CheckpointBegin).unwrap();
+    assert_eq!(appended, future);
+    LogManager::sync_durable_to(&log, appended).unwrap();
+    assert_eq!(log.lock().durable_lsn(), appended);
+}

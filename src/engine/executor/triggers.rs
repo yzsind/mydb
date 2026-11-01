@@ -263,8 +263,14 @@ fn fire_row_triggers(
     new_writable: bool,
     registry: &SessionRegistry,
 ) -> Result<Option<Vec<Value>>, QueryError> {
+    let before = timing == TriggerTimingSchema::Before;
     let triggers = db.triggers_for_table_event(&table.qualified_name(), event, timing);
     for trigger in triggers {
+        if before {
+            if let Some(values) = new_values.as_mut() {
+                db.materialize_generated_columns_for_insert(table, values)?;
+            }
+        }
         let result = super::routines::execute_trigger_body(
             db,
             session,
@@ -429,13 +435,28 @@ fn trigger_statement_returns_rows(statement: &Statement) -> bool {
 
 /// Validate pseudo-row references structurally, including SQL subqueries and
 /// unreachable branches. String literals/comments are never interpreted as SQL.
-struct TriggerRowValidator {
+struct TriggerRowValidator<'a> {
     event: TriggerEvent,
     timing: TriggerTiming,
     error: Option<QueryError>,
+    table: Option<&'a TableSchema>,
 }
 
-impl TriggerRowValidator {
+impl TriggerRowValidator<'_> {
+    fn column(&mut self, qualifier: &str, column: &str, write: bool) {
+        self.qualifier(qualifier, write);
+        if self.error.is_none()
+            && (qualifier.eq_ignore_ascii_case("OLD") || qualifier.eq_ignore_ascii_case("NEW"))
+            && self
+                .table
+                .is_some_and(|table| table.column_index(column).is_err())
+        {
+            self.error = Some(error(
+                crate::error::catalog::ER_BAD_FIELD_ERROR,
+                format!("Unknown column '{column}' in '{qualifier}'"),
+            ));
+        }
+    }
     fn qualifier(&mut self, qualifier: &str, write: bool) {
         if self.error.is_some() {
             return;
@@ -459,8 +480,8 @@ impl TriggerRowValidator {
 
     fn target(&mut self, target: &crate::parser::RoutineTarget) {
         if let crate::parser::RoutineTarget::Local(name) = target {
-            if let Some((qualifier, _)) = name.split_once('.') {
-                self.qualifier(qualifier, true);
+            if let Some((qualifier, column)) = name.split_once('.') {
+                self.column(qualifier, column, true);
             }
         }
     }
@@ -610,10 +631,12 @@ impl TriggerRowValidator {
     }
 }
 
-impl crate::parser::visit::AstVisitorMut for TriggerRowValidator {
+impl crate::parser::visit::AstVisitorMut for TriggerRowValidator<'_> {
     fn enter_expr(&mut self, expr: &mut Expr) {
         match expr {
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => self.qualifier(&parts[0], false),
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                self.column(&parts[0], &parts[1], false)
+            }
             _ => {}
         }
     }
@@ -628,10 +651,27 @@ fn validate_trigger_rows(
         event,
         timing,
         error: None,
+        table: None,
     };
     validator.statements(statements)?;
     match validator.error {
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+pub(super) fn validate_trigger_columns(
+    statements: &mut [RoutineStmt],
+    table: &TableSchema,
+    event: TriggerEvent,
+    timing: TriggerTiming,
+) -> Result<(), QueryError> {
+    let mut validator = TriggerRowValidator {
+        event,
+        timing,
+        error: None,
+        table: Some(table),
+    };
+    validator.statements(statements)?;
+    validator.error.map_or(Ok(()), Err)
 }

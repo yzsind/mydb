@@ -4638,7 +4638,7 @@ pub(super) fn fulltext_row_contains_phrase(
             Some(Value::Null) | None => continue,
             Some(value) => value.to_display_string(),
         };
-        let tokens = tokenizer.tokenize(&text);
+        let tokens = tokenizer.raw_tokens(&text);
         if tokens.windows(needle.len()).any(|window| window == needle) {
             return Ok(true);
         }
@@ -4752,7 +4752,9 @@ pub(super) fn fulltext_boolean_candidates(
     // Pre-scan clauses to know which tokens need positions (phrase clauses).
     let mut phrase_tokens: AhHashSet<&str> = ah_hash_set();
     for clause in &clauses {
-        if let Matcher::Phrase(tokens) = &clause.matcher {
+        if let Matcher::Phrase(tokens) | Matcher::FilteredPhrase { terms: tokens, .. } =
+            &clause.matcher
+        {
             for t in tokens {
                 phrase_tokens.insert(t.as_str());
             }
@@ -4811,7 +4813,7 @@ pub(super) fn fulltext_boolean_candidates(
                 }
                 rowset
             }
-            Matcher::Phrase(tokens) => {
+            Matcher::Phrase(tokens) | Matcher::FilteredPhrase { terms: tokens, .. } => {
                 // Populate one shared, row-ordered batch per distinct token.
                 // Repeated phrase terms borrow the same arena; scoring reuses
                 // these batches without another B-tree scan.
@@ -4843,7 +4845,10 @@ pub(super) fn fulltext_boolean_candidates(
                             positions_scratch
                                 .push(&batch.positions_arena[start..start + p.pos_len as usize]);
                         }
-                        let matched = if have_positions {
+                        let matched = if let Matcher::FilteredPhrase { words, .. } = &clause.matcher
+                        {
+                            source.contains_phrase(row_id, tokenizer, columns, words)?
+                        } else if have_positions {
                             positions_phrase_match(&positions_scratch)
                         } else {
                             source.contains_phrase(row_id, tokenizer, columns, tokens)?
@@ -4909,8 +4914,8 @@ pub(super) fn fulltext_boolean_candidates(
     Ok((candidates, scoring))
 }
 
-pub(super) struct FtMatchRuntime {
-    pub(super) fingerprint: u64,
+pub(in crate::engine::executor) struct FtMatchRuntime {
+    pub(in crate::engine::executor) fingerprint: u64,
     pub(super) restrict: bool,
     pub(super) need_score: bool,
     pub(super) candidates: Vec<RowId>,
@@ -4944,7 +4949,7 @@ pub(super) fn resolve_fulltext_query(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_fulltext_match_runtime(
+pub(in crate::engine::executor) fn build_fulltext_match_runtime(
     db: &Arc<Database>,
     txn: TxnView,
     table: &PlanTable,
@@ -5030,7 +5035,10 @@ pub(super) fn build_fulltext_match_runtime(
     })
 }
 
-pub(super) fn fulltext_runtime_score(runtime: &FtMatchRuntime, row_id: RowId) -> f64 {
+pub(in crate::engine::executor) fn fulltext_runtime_score(
+    runtime: &FtMatchRuntime,
+    row_id: RowId,
+) -> f64 {
     if !runtime.need_score {
         return 0.0;
     }

@@ -1029,13 +1029,16 @@ impl Database {
     ) -> Result<(), QueryError> {
         let _timer = OnlineIndexTimer(&ONLINE_INDEX_BARRIER_WAIT_US, Instant::now());
         let started = Instant::now();
-        let mut drain_started = started;
         let key = MdlObjectKey::table(&table.database, &table.name);
         loop {
             if !cleanup {
                 self.ensure_operational()?;
                 crate::engine::cancel::check_cancelled()?;
                 check()?;
+            }
+            if !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout() {
+                return Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                    "online index build timed out waiting for metadata lock"));
             }
             match self.acquire_mdl(
                 owner,
@@ -1049,6 +1052,27 @@ impl Database {
             ) {
                 Ok(()) => return Ok(()),
                 Err(err) if is_lock_wait_pending_error(&err) => {
+                    if self.mdl.has_long_lived_blocker(&key,owner,mode) {
+                        // Publish the initial wait, then withdraw the ticket
+                        // for the holder's entire remaining lifetime. Repeated
+                        // short fence/yield cycles would starve unrelated DML.
+                        self.wait_for_ddl_signal(Duration::from_millis(10))?;
+                        self.mdl.clear_pending_for_owner(owner);
+                        self.notify_non_row_lock_waiters();
+                        while self.mdl.has_long_lived_blocker(&key,owner,mode) {
+                            if !cleanup {
+                                self.ensure_operational()?;
+                                crate::engine::cancel::check_cancelled()?;
+                                check()?;
+                                if started.elapsed()>=crate::storage::txn::metadata_wait_timeout() {
+                                    return Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,"online index build timed out waiting for metadata lock"));
+                                }
+                            }
+                            self.wait_for_ddl_signal(Duration::from_millis(10))?;
+                        }
+                        continue;
+                    }
+
                     // Exclusive COPY barriers must fence new fast readers so
                     // an uninterrupted read stream cannot starve publication.
                     // A non-exclusive barrier first tries without queueing
@@ -1060,12 +1084,9 @@ impl Database {
                     // statement readers still drain with the ticket queued.
                     let fence = mode == MdlLockType::Exclusive
                         || started.elapsed() >= ONLINE_INDEX_BARRIER_UNFENCED_GRACE;
-                    let yield_to_holder = drain_started.elapsed() >= Duration::from_millis(100)
-                        && self.mdl.has_long_lived_blocker(&key, owner, mode);
-                    if !fence || yield_to_holder {
+                    if !fence {
                         self.mdl.clear_pending_for_owner(owner);
                         self.notify_non_row_lock_waiters();
-                        drain_started = Instant::now();
                     }
                     // The caller's MDL guard clears pending tickets on exit.
                     if !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout()

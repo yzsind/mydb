@@ -1273,7 +1273,7 @@ struct BinlogColumn {
     // while binlog is enabled.
     enum_set_values: Option<Arc<Vec<String>>>,
     /// Native VECTOR dimension when this column is exposed on the MySQL 8.0
-    /// wire as LONG BLOB + `MYDBVEC1` envelope.
+    /// wire as LONG BLOB + `MYDBVEC2` envelope.
     vector_dim: Option<u32>,
     /// None for binary/numeric columns; storage text is UTF-8 and must be
     /// transcoded when the declared column uses another wire character set.

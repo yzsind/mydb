@@ -261,6 +261,11 @@ impl<'a> WktParser<'a> {
                     return Ok(Geom::GeometryCollection(Vec::new()));
                 }
                 self.expect(b'(')?;
+                self.skip_ws();
+                if self.peek() == Some(b')') {
+                    self.pos += 1;
+                    return Ok(Geom::GeometryCollection(Vec::new()));
+                }
                 let mut out = vec![self.parse_geom(depth + 1)?];
                 loop {
                     self.skip_ws();

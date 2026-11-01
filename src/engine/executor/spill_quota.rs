@@ -342,14 +342,19 @@ fn quota_error(requested: u64, scope: QuotaScope, used: u64, limit: u64) -> Quer
     // configured zero means auto, not "disable spilling". Do not suggest
     // increasing a byte quota when the filesystem has no usable headroom.
     let message = if matches!(scope, QuotaScope::Volume) {
-        format!("out of temp disk space: spill filesystem has {limit} bytes of headroom after the volume reserve, with {used} bytes reserved for pending writes; cannot reserve {requested} additional bytes. Free disk space or move the data directory to a filesystem with available space.")
+        format!("out of temp disk space: spill filesystem has {limit} bytes of headroom after reserving {}% of total volume capacity, with {used} bytes reserved for pending writes; cannot reserve {requested} additional bytes. Free disk space, move the data directory, or adjust mydb_temp_disk_reserve_pct (MYDB_TEMP_DISK_RESERVE_PCT). Usable headroom is available bytes minus total volume bytes times the reserve percentage.", env_reserve_pct())
     } else if matches!(scope, QuotaScope::Global) && limit == 0 {
-        "out of temp disk space: no space available for spill on the temporary-file \
+        format!(
+            "out of temp disk space: no space available for spill on the temporary-file \
          filesystem (effective global temp-disk limit: 0 bytes). Free disk space or \
          move the data directory to a filesystem with available space. \
          Filesystem-reserved blocks are excluded even when running as root; \
-         increasing MYDB_TEMP_DISK_LIMIT cannot override filesystem availability."
-            .to_string()
+         increasing MYDB_TEMP_DISK_LIMIT cannot override filesystem availability. \
+         The volume reserve is {}% of total capacity; adjust mydb_temp_disk_reserve_pct \
+         (MYDB_TEMP_DISK_RESERVE_PCT) if appropriate. Usable headroom is available bytes \
+         minus total volume bytes times the reserve percentage.",
+            env_reserve_pct()
+        )
     } else {
         let operation = if requested == 0 {
             "cannot create spill directory: no quota headroom remains".to_string()

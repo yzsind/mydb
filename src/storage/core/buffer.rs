@@ -10320,6 +10320,7 @@ mod oldest_dirty_tests {
         let pool =
             BufferPool::new_with_options(100, log, DurabilityMode::Strict, Duration::ZERO, 1, 0);
         pool.shutdown_flusher();
+        for _ in 0..4 {pool.log.lock().append(0,WalPayload::CheckpointBegin).unwrap();}
         let file = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
         for page_id in 0..50 {
             pool.store_page(
@@ -10370,6 +10371,7 @@ mod oldest_dirty_tests {
             1,
             0,
         );
+        for _ in 0..4 {pool.log.lock().append(0,WalPayload::CheckpointBegin).unwrap();}
         let file_key = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
         let mut frames = Vec::new();
         for page_id in 0..3 {
