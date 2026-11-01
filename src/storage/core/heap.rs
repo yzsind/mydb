@@ -9,6 +9,8 @@ fn serial_insert_lock_oracle() -> bool {
 thread_local! {
     static HEAP_BATCH_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static HEAP_EXTENT_BASELINE_PREPARE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
     static HEAP_BATCH_HEADER_SLOTS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1303,6 +1305,9 @@ impl HeapFile {
         let mut encoded_pages = Vec::<u8>::with_capacity(estimated_pages.saturating_mul(PAGE_SIZE));
         let mut row_ids = Vec::with_capacity(payloads.len());
 
+        // All pages are private and freshly allocated: no reusable slots can
+        // exist. Use the same append primitive as ordinary fresh-page batches
+        // instead of scanning the growing slot directory for every row.
         for &payload in payloads {
             if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
                 return Err(error(
@@ -1310,14 +1315,14 @@ impl HeapFile {
                     "row size is larger than one heap page",
                 ));
             }
-            let slot_id = match page.insert(payload) {
+            let slot_id = match page.insert_append_only_with_reserve(payload, 0) {
                 Some(slot_id) => slot_id,
                 None => {
                     page.set_lsn(build_lsn);
                     encoded_pages.extend_from_slice(&page.encode_into_owned());
                     page_id = page_id.saturating_add(1);
                     page = Page::new();
-                    page.insert(payload)
+                    page.insert_append_only_with_reserve(payload, 0)
                         .expect("fresh page should have enough space")
                 }
             };
@@ -4404,10 +4409,24 @@ impl HeapFile {
             } else if self.durability() == DurabilityMode::Memory {
                 0
             } else {
-                self.log.lock().append(
-                    0,
-                    WalPayload::full_page_image(self.relative_path(), id, image.clone()),
-                )?
+                // Compression and record encoding are independent of the
+                // append order. Keep both outside the process-wide WAL latch;
+                // append still assigns the LSN before any page is advertised.
+                #[cfg(test)]
+                HEAP_EXTENT_BASELINE_PREPARE_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                let payload = WalPayload::full_page_image(self.relative_path(), id, image.clone());
+                let pre = {
+                    // The heap extension latch is still held; preserve the
+                    // ordinary append path's non-recursive admission scope.
+                    let _admission =
+                        crate::engine::executor::mem_budget::StorageLatchAdmissionScope::enter();
+                    crate::wal::LogManager::pre_encode_record(0, payload)?
+                };
+                crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
             };
             set_page_lsn_if_formatted(&mut image, lsn);
             self.buffer_pool

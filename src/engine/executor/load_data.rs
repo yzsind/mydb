@@ -1849,6 +1849,102 @@ enum LoadReplayStorage {
         _charge: mem_budget::ControlledMemoryCharge,
     },
     Spill(super::spill_quota::ProtocolSpillFile),
+    Capture(Box<LoadReplayCapture>),
+}
+
+// One bounded, charged buffer serves first as the initial input prefix and,
+// only if replay-file writes fail, as the unwritten tail needed for fallback.
+const LOAD_REPLAY_COPY_BYTES: usize = 1024 * 1024;
+
+struct LoadReplayCapture {
+    file: super::spill_quota::ProtocolSpillFile,
+    source: Box<dyn Read>,
+    pending: std::io::Cursor<Vec<u8>>,
+    _charge: mem_budget::ControlledMemoryCharge,
+    prefix_pending: bool,
+    replaying: bool,
+    replay_file_done: bool,
+    capture_failed: bool,
+}
+
+impl LoadReplayCapture {
+    fn rewind(&mut self) -> Result<(), QueryError> {
+        self.file.rewind()?;
+        if !self.capture_failed {
+            // Initial/pre-read bytes are already in the file. Only an
+            // unwritten tail from a failed capture must follow that prefix.
+            self.pending.get_mut().clear();
+        }
+        self.pending.set_position(0);
+        self.replaying = true;
+        self.replay_file_done = false;
+        Ok(())
+    }
+}
+
+impl Read for LoadReplayCapture {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.replaying {
+            if !self.replay_file_done {
+                let n = self.file.read(output)?;
+                if n != 0 {
+                    return Ok(n);
+                }
+                self.replay_file_done = true;
+            }
+            let n = self.pending.read(output)?;
+            if n != 0 {
+                return Ok(n);
+            }
+            // Ordered fallback is the final pass; no second copy is needed.
+            return self.source.read(output);
+        }
+        if self.capture_failed {
+            return Err(std::io::Error::other(
+                "replay capture requires ordered fallback",
+            ));
+        }
+        if self.prefix_pending {
+            let n = self.pending.read(output)?;
+            if n != 0 {
+                return Ok(n);
+            }
+            self.pending.get_mut().clear();
+            self.pending.set_position(0);
+            self.prefix_pending = false;
+        }
+        // A failed disk write must not lose source bytes already delivered
+        // into the caller's buffer. Bound the read to the reserved tail size.
+        let limit = output.len().min(LOAD_REPLAY_COPY_BYTES);
+        let n = self.source.read(&mut output[..limit])?;
+        let mut written = 0;
+        while written < n {
+            let failure = match self.file.write(&output[written..n]) {
+                Ok(0) => Some(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "short replay write",
+                )),
+                Ok(bytes) => {
+                    written += bytes;
+                    None
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => Some(err),
+            };
+            if let Some(err) = failure {
+                self.pending
+                    .get_mut()
+                    .extend_from_slice(&output[written..n]);
+                self.pending.set_position(0);
+                self.capture_failed = true;
+                return Err(err);
+            }
+        }
+        Ok(n)
+    }
 }
 
 impl LoadReplayStorage {
@@ -1859,7 +1955,12 @@ impl LoadReplayStorage {
                 Ok(())
             }
             Self::Spill(file) => file.rewind(),
+            Self::Capture(capture) => capture.rewind(),
         }
+    }
+
+    fn capture_failed(&self) -> bool {
+        matches!(self, Self::Capture(capture) if capture.capture_failed)
     }
 }
 
@@ -1868,6 +1969,7 @@ impl Read for LoadReplayStorage {
         match self {
             Self::Memory { bytes, .. } => bytes.read(output),
             Self::Spill(file) => file.read(output),
+            Self::Capture(capture) => capture.read(output),
         }
     }
 }
@@ -1905,15 +2007,16 @@ impl Read for LoadReplayRemainder {
 
 /// A private-generation attempt may discover a duplicate only after sorting
 /// the complete input. Retain a quota-accounted replay copy, never the complete
-/// input in RAM. Temp space is optional: if admission fails partway through,
-/// join the written prefix, unwritten bytes and original stream without losing
-/// or duplicating a byte, and continue on the ordinary IGNORE path.
+/// input in RAM. Capture large input as the parser consumes it so successful
+/// imports do not wait for a complete copy and then read that copy again.
+/// Temp space is optional: failed capture retains its unwritten tail for an
+/// ordered replay of the file prefix, tail and remaining original stream.
 fn stage_ignore_load_input(
     db: &Database,
     mut source: Box<dyn Read>,
     connection_id: u32,
 ) -> Result<(Box<dyn Read>, Option<LoadReplayFile>), QueryError> {
-    const COPY_BYTES: usize = 1024 * 1024;
+    const COPY_BYTES: usize = LOAD_REPLAY_COPY_BYTES;
     let Some(charge) = mem_budget::ControlledMemoryCharge::try_new_optional(
         mem_budget::ControlledMemoryCategory::StorageScratch,
         COPY_BYTES,
@@ -1956,51 +2059,49 @@ fn stage_ignore_load_input(
             return Ok((Box::new(remainder.chain(source)), None));
         }
     };
-    let mut n = used;
-    loop {
-        crate::engine::cancel::check_cancelled()?;
-        let mut offset = 0usize;
-        while offset < n {
-            match file.write(&bytes[offset..n]) {
-                Ok(0) | Err(_) => {
-                    file.rewind()?;
-                    bytes.truncate(n);
-                    let mut remainder = std::io::Cursor::new(bytes);
-                    remainder.set_position(offset as u64);
-                    let remainder = LoadReplayRemainder {
-                        bytes: remainder,
-                        _charge: charge,
-                    };
-                    let prefix =
-                        std::rc::Rc::new(std::cell::RefCell::new(LoadReplayStorage::Spill(file)));
-                    return Ok((
-                        Box::new(
-                            LoadReplayReader(Some(prefix))
-                                .chain(remainder)
-                                .chain(source),
-                        ),
-                        None,
-                    ));
-                }
-                Ok(written) => offset += written,
+    let mut offset = 0usize;
+    while offset < used {
+        match file.write(&bytes[offset..used]) {
+            Ok(0) | Err(_) => {
+                file.rewind()?;
+                bytes.truncate(used);
+                let mut remainder = std::io::Cursor::new(bytes);
+                remainder.set_position(offset as u64);
+                let remainder = LoadReplayRemainder {
+                    bytes: remainder,
+                    _charge: charge,
+                };
+                let prefix =
+                    std::rc::Rc::new(std::cell::RefCell::new(LoadReplayStorage::Spill(file)));
+                return Ok((
+                    Box::new(
+                        LoadReplayReader(Some(prefix))
+                            .chain(remainder)
+                            .chain(source),
+                    ),
+                    None,
+                ));
             }
-        }
-        n = 0;
-        while n < COPY_BYTES {
-            crate::engine::cancel::check_cancelled()?;
-            match source.read(&mut bytes[n..]) {
-                Ok(0) => break,
-                Ok(read) => n += read,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(io_err(err)),
-            }
-        }
-        if n == 0 {
-            file.rewind()?;
-            let file = std::rc::Rc::new(std::cell::RefCell::new(LoadReplayStorage::Spill(file)));
-            return Ok((Box::new(LoadReplayReader(Some(file.clone()))), Some(file)));
+            Ok(written) => offset += written,
         }
     }
+    let capture = LoadReplayCapture {
+        file,
+        source,
+        pending: std::io::Cursor::new(bytes),
+        _charge: charge,
+        prefix_pending: true,
+        replaying: false,
+        replay_file_done: false,
+        capture_failed: false,
+    };
+    let replay = std::rc::Rc::new(std::cell::RefCell::new(LoadReplayStorage::Capture(
+        Box::new(capture),
+    )));
+    Ok((
+        Box::new(LoadReplayReader(Some(replay.clone()))),
+        Some(replay),
+    ))
 }
 
 const IGNORE_LOAD_REPLAY: &str = "parallel IGNORE load requires ordered replay";
@@ -2081,8 +2182,17 @@ fn execute_load_data_ignore_parallel(
             Err(err) => {
                 // Decode/I/O admission can fail before the writer's normal
                 // finalization. Workers have stopped before rollback/replay.
-                let err = finish_statement_txn::<()>(db, session, Err(err)).unwrap_err();
-                if !ignore_load_can_replay(&err) {
+                let can_replay = ignore_load_can_replay(&err) || replay.borrow().capture_failed();
+                // Distinguish successful compensation from a rollback failure
+                // before allowing any retry, even if that failure is normally
+                // a replayable error class (for example allocation pressure).
+                let cleanup =
+                    finish_statement_txn::<()>(db, session, Err(ignore_load_replay_error()))
+                        .unwrap_err();
+                if cleanup.message() != IGNORE_LOAD_REPLAY {
+                    return Err(cleanup);
+                }
+                if !can_replay {
                     return Err(err);
                 }
                 replay.borrow_mut().rewind()?;
@@ -7970,6 +8080,128 @@ mod tests {
     }
 
     #[test]
+    fn local_replay_capture_starts_before_the_full_input_is_consumed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (engine, _tmp) = setup_strict_load_engine();
+        struct Counted(std::io::Cursor<Vec<u8>>, Arc<AtomicUsize>);
+        impl Read for Counted {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(out)?;
+                self.1.fetch_add(n, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        let input = (0..(3 * 1024 * 1024 + 117))
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let (mut reader, replay) = stage_ignore_load_input(
+            &engine.db,
+            Box::new(Counted(
+                std::io::Cursor::new(input.clone()),
+                consumed.clone(),
+            )),
+            0,
+        )
+        .unwrap();
+        assert!(
+            consumed.load(Ordering::Relaxed) <= 1024 * 1024,
+            "the parser must start while large protocol input is still arriving"
+        );
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, input);
+        let replay = replay.unwrap();
+        replay.borrow_mut().rewind().unwrap();
+        let mut actual = Vec::new();
+        LoadReplayReader(Some(replay))
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, input);
+    }
+
+    #[test]
+    fn local_incremental_replay_preserves_an_unconsumed_source_tail() {
+        let (engine, _tmp) = setup_strict_load_engine();
+        let input = (0..(3 * 1024 * 1024 + 117))
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        for prefix in [17, 1024 * 1024 + 373, 2 * 1024 * 1024 + 33] {
+            let (mut reader, replay) = stage_ignore_load_input(
+                &engine.db,
+                Box::new(std::io::Cursor::new(input.clone())),
+                0,
+            )
+            .unwrap();
+            let mut received = vec![0; prefix];
+            reader.read_exact(&mut received).unwrap();
+            assert_eq!(received, input[..prefix]);
+            let replay = replay.unwrap();
+            replay.borrow_mut().rewind().unwrap();
+            drop(reader);
+            let mut actual = Vec::new();
+            LoadReplayReader(Some(replay))
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, input);
+        }
+    }
+
+    #[test]
+    fn local_streaming_replay_matches_ordered_rows_and_warnings_after_errors_or_quota() {
+        let (engine, _tmp) = setup_strict_load_engine();
+        let prior_limit = super::super::spill_quota::per_query_limit_bytes();
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::super::spill_quota::set_per_query_limit_bytes(self.0);
+            }
+        }
+        let _restore = Restore(prior_limit);
+        let body = (1..=12000)
+            .map(|id| format!("{id}|a{id}{}|b{id}{}\n", "x".repeat(96), "y".repeat(96)))
+            .collect::<String>();
+        assert!(body.len() > 2 * LOAD_REPLAY_COPY_BYTES);
+        for case in ["success", "duplicate", "conversion", "quota"] {
+            let mut input = if case == "conversion" {
+                "bad|中|early\n".to_owned()
+            } else {
+                String::new()
+            };
+            input.push_str(&body);
+            if case == "duplicate" || case == "quota" {
+                input.push_str("13000|dup|one\n13001|dup|two\n13002|new|two\n1|late|late\n");
+            }
+            let mut outputs = Vec::new();
+            for degree in [1, 4] {
+                super::super::spill_quota::set_per_query_limit_bytes(if case == "quota" {
+                    (LOAD_REPLAY_COPY_BYTES + 100000) as u64
+                } else {
+                    0
+                });
+                let table = format!("stream_{case}");
+                engine.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, a VARCHAR(160) UNIQUE, b VARCHAR(160) UNIQUE)")).unwrap();
+                let before = super::super::spill_quota::global_spilled_bytes();
+                let diagnostics = import_local_for_test(&engine, &table, degree, &input);
+                assert_eq!(super::super::spill_quota::global_spilled_bytes(), before);
+                let QueryResponse::ResultSet(rows) = engine
+                    .execute(&format!("SELECT * FROM {table} ORDER BY id"))
+                    .unwrap()
+                else {
+                    panic!("expected rows")
+                };
+                outputs.push((rows.rows, diagnostics));
+                engine.execute(&format!("DROP TABLE {table}")).unwrap();
+            }
+            assert!(outputs[0].0 == outputs[1].0, "row mismatch in case={case}");
+            assert_eq!(
+                outputs[0].1, outputs[1].1,
+                "diagnostic mismatch in case={case}"
+            );
+        }
+    }
+
+    #[test]
     fn local_parallel_quota_fallback_preserves_every_byte_and_releases_prefix() {
         let (engine, _tmp) = setup_strict_load_engine();
         struct Chunks(std::io::Cursor<Vec<u8>>);
@@ -8003,10 +8235,17 @@ mod tests {
                 0,
             )
             .unwrap();
-            assert!(replay.is_none());
+            let replay = replay.expect("large input starts incremental capture");
             assert!(super::super::spill_quota::global_spilled_bytes() > before);
+            let mut trial = Vec::new();
+            assert!(reader.read_to_end(&mut trial).is_err());
+            assert!(replay.borrow().capture_failed());
+            replay.borrow_mut().rewind().unwrap();
+            drop(reader);
             let mut actual = Vec::new();
-            reader.read_to_end(&mut actual).unwrap();
+            LoadReplayReader(Some(replay))
+                .read_to_end(&mut actual)
+                .unwrap();
             assert_eq!(actual, input);
             assert_eq!(super::super::spill_quota::global_spilled_bytes(), before);
         }

@@ -133,6 +133,31 @@ impl KernelCachePressureEvents {
     }
 }
 
+/// Proactive reclaim is useful when hot clean pages dominate the available
+/// cold set. A large clean inactive list already gives ordinary kernel reclaim
+/// enough victims; repeatedly scanning it duplicates the buffered writer's IO.
+#[cfg(any(test, target_os = "linux"))]
+fn kernel_cache_lru_requires_relief(stat: &str) -> bool {
+    let value = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            stat.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == *key)
+                    .then(|| fields.next()?.parse::<u64>().ok())
+                    .flatten()
+            })
+        })
+    };
+    let (Some(inactive), Some(active)) = (
+        value(&["total_inactive_file", "inactive_file"]),
+        value(&["total_active_file", "active_file"]),
+    ) else {
+        return true;
+    };
+    let cold_clean = inactive.saturating_sub(parse_writeback_pressure_bytes(stat));
+    cold_clean < active || cold_clean < (MAX_PRESSURE_ALLOWANCE_BYTES as u64).saturating_mul(2)
+}
+
 /// A full, healthy file cache is useful memory, not a reason to evict it.
 /// Only new controller limit-pressure events arm proactive relief. Counter
 /// resets are benign; older controllers retain conservative bounded relief.
@@ -158,7 +183,13 @@ pub(crate) fn kernel_cache_pressure_observed() -> bool {
                 current_linux_cgroup_v1_path()
                     .and_then(|path| read_cgroup_u64(&path.join("memory.failcnt")))
             });
-        return history.observe(counter);
+        if !history.observe(counter) {
+            return false;
+        }
+        let stat = current_linux_cgroup_v2_path()
+            .or_else(current_linux_cgroup_v1_path)
+            .and_then(|path| std::fs::read_to_string(path.join("memory.stat")).ok());
+        return stat.as_deref().is_none_or(kernel_cache_lru_requires_relief);
     }
     #[cfg(not(target_os = "linux"))]
     false
@@ -266,6 +297,67 @@ fn kernel_cache_reclaim_request_preserves_swap_policy_and_handles_missing_contro
         "8192 swappiness=0\n"
     );
     assert!(!try_reclaim_kernel_cache_at(dir.path(), 0));
+}
+
+#[cfg(test)]
+#[test]
+fn kernel_cache_lru_retains_protection_for_hot_dirty_unknown_and_small_cold_sets() {
+    let mib: u64 = 1024 * 1024;
+    assert!(!kernel_cache_lru_requires_relief(&format!(
+        "inactive_file {}\nactive_file {}\nfile_dirty {}\nfile_writeback {}\n",
+        4096 * mib,
+        8 * mib,
+        16 * mib,
+        32 * mib
+    )));
+    assert!(kernel_cache_lru_requires_relief(&format!(
+        "inactive_file {}\nactive_file {}\n",
+        1400 * mib,
+        7300 * mib
+    )));
+    assert!(kernel_cache_lru_requires_relief(&format!(
+        "inactive_file {}\nactive_file {}\nfile_dirty {}\n",
+        1024 * mib,
+        512 * mib,
+        768 * mib
+    )));
+    assert!(kernel_cache_lru_requires_relief(
+        "inactive_file 1024\nactive_file 0\n"
+    ));
+    assert!(kernel_cache_lru_requires_relief("anon 1234\n"));
+    assert!(!kernel_cache_lru_requires_relief(&format!(
+        "total_inactive_file {}\ntotal_active_file {}\ntotal_dirty {}\ntotal_writeback {}\n",
+        4096 * mib,
+        8 * mib,
+        16 * mib,
+        32 * mib
+    )));
+}
+
+#[cfg(test)]
+#[test]
+fn bulk_rss_prescreen_keeps_exact_checks_at_pressure_or_unknown_samples() {
+    let mib = 1024 * 1024;
+    assert_eq!(
+        bulk_resident_footprint("Name: mydb\nVmRSS: 1024 kB\nHugetlbPages: 2048 kB\n"),
+        Some(3 * mib)
+    );
+    assert_eq!(bulk_resident_footprint("VmRSS: invalid kB\n"), None);
+    assert_eq!(bulk_resident_footprint("Name: mydb\n"), None);
+    assert!(!bulk_private_measurement_needed(
+        Some(4 * 1024 * mib),
+        8 * 1024 * mib
+    ));
+    assert!(bulk_private_measurement_needed(
+        Some(8 * 1024 * mib - 64 * mib),
+        8 * 1024 * mib
+    ));
+    assert!(bulk_private_measurement_needed(None, 8 * 1024 * mib));
+    assert!(!bulk_private_measurement_needed(None, 0));
+    assert!(bulk_private_measurement_needed(
+        Some(u64::MAX),
+        8 * 1024 * mib
+    ));
 }
 
 struct WakeState {
@@ -1511,13 +1603,63 @@ fn reclaim_using(reclaim: fn() -> bool) -> u64 {
 /// pay the allocator-wide trim only after it has crossed the configured hard
 /// target. `malloc_trim` / `mi_collect` are process-wide and thread-safe.
 pub(crate) fn reclaim_bulk_statement_boundary() {
+    let target = crate::engine::executor::mem_budget::memory_target_bytes() as u64;
+    if target == 0 {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // status is a bounded counter snapshot; smaps_rollup walks the page
+        // tables and serializes concurrent bulk writers on the process mmap
+        // lock. Keep that accurate measurement when near the target or when
+        // the cheap sample is unavailable. This is only an allocator hint;
+        // hard logical/physical admission retains its independent checks.
+        let rss = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|stat| bulk_resident_footprint(&stat));
+        if !bulk_private_measurement_needed(rss, target) {
+            return;
+        }
+    }
     let Some(current) = current_private_footprint_bytes() else {
         return;
     };
-    let target = crate::engine::executor::mem_budget::memory_target_bytes() as u64;
     if should_reclaim_bulk_statement_boundary(current, target) {
         reclaim_now();
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn bulk_resident_footprint(stat: &str) -> Option<u64> {
+    let mut rss = None;
+    let mut huge = 0u64;
+    for line in stat.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if matches!(key, "VmRSS" | "HugetlbPages") {
+            let bytes = value
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?
+                .saturating_mul(1024);
+            if key == "VmRSS" {
+                rss = Some(bytes);
+            } else {
+                huge = bytes;
+            }
+        }
+    }
+    rss.map(|rss| rss.saturating_add(huge))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn bulk_private_measurement_needed(resident: Option<u64>, target: u64) -> bool {
+    target != 0
+        && resident.is_none_or(|resident| {
+            resident.saturating_add(MAX_PRESSURE_ALLOWANCE_BYTES as u64) >= target
+        })
 }
 
 #[inline]

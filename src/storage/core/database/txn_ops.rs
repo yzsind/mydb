@@ -3916,9 +3916,7 @@ impl Database {
                 }
             };
             // Publish real LSNs and release deferred pins OUTSIDE the WAL mutex.
-            for (key, lsn) in finalize {
-                self.buffer_pool.finalize_deferred(&key, lsn);
-            }
+            self.buffer_pool.finalize_deferred_batch(&finalize)?;
             Ok(final_lsn)
         })();
         match result {
