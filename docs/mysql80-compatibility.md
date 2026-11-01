@@ -1144,7 +1144,7 @@ degenerate into no-ops.
 
 ## 14. Version and Runtime
 
-- **Product version**: `1.0.0`; the MySQL handshake/SQL compatibility baseline remains 8.0.46, and the version string may append the product version and build date.
+- **Product version**: `1.1.0`; the MySQL handshake/SQL compatibility baseline remains 8.0.46, and the version string may append the product version and build date.
 - **Default port**: 8738; **pre-created database**: `test` (`DATABASE()` is NULL when the connection specifies no database, and unqualified table names report 1046); **default data directory**: `./data`.
 - **Default account**: `'root'@'localhost'` / `root` (bootstrap only; changeable via `MYDB_ROOT_PASSWORD`);
   the local TCP loopback matches localhost, and no remote root account is created by default.

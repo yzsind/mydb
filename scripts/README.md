@@ -19,6 +19,7 @@ optional dependencies.
 |---|---|
 | Portable Linux build and ABI contract | `build_linux_glibc217.py`, `check_elf_abi.py`, `verify_linux_compat.py` |
 | Host-native release packaging and licenses | `package_release.py`, `release_licenses.py` |
+| Extracted release package, version, TLS and crash recovery checks | `verify_release_package.py --package ARCHIVE --output /tmp/mydb/package-check` |
 | Windows checks and native isolated tests | `check_windows.py`, `test_windows_native.ps1` |
 | Ubuntu development environment | `setup_ubuntu.sh` |
 | Build and runtime-matrix command regressions | `test_release_build.py`, `test_linux_compat.py`, `test_elf_abi.py` |

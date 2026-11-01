@@ -13,25 +13,25 @@ the Visual C++ runtime and Universal CRT.
 
 ## Operating systems
 
-The table below describes source-build support and platform verification. The
-unpublished 1.0.0 first-distribution candidate is scoped to macOS arm64 archives,
-Linux x86_64/glibc 2.17 archives, and the locally verified `linux/amd64` image.
-Other source-build targets and historical Windows verification do not imply
-artifacts are included in that candidate. See
+The table below describes source-build support and platform verification.
+The 1.1.0 release provides portable archives for macOS arm64, Linux x86_64
+with glibc 2.17 or newer, and Windows x64. Docker images can be built locally;
+they are not included in the GitHub release. Other source-build targets do
+not imply prebuilt packages are available. See
 [platforms and distribution](../README.md#platforms-and-distribution).
 
 | Platform | Status | Notes |
 | --- | --- | --- |
-| Linux x86_64 | Supported | The candidate archive targets glibc 2.17 or newer; see below for kernel and filesystem notes |
-| Linux aarch64 | Supported | Source builds and Dockerfile support (`linux/arm64`); outside this candidate |
+| Linux x86_64 | Supported | The release archive targets glibc 2.17 or newer; see below for kernel and filesystem notes |
+| Linux aarch64 | Supported | Source builds and Dockerfile support (`linux/arm64`); source builds only |
 | macOS (Apple Silicon and Intel) | Supported | Development and regression platform; CI runs a compile and release smoke pass on macOS |
 | Windows 11 x64 | Native foreground operation verified | Local NTFS, ordinary account; startup, TLS, SQL, process crash recovery, replication tests, and backup/restore verified |
 | Windows 10 x64 / Windows Server 2016 and later x64 | Expected compatible; not individually verified | Within the toolchain baseline; require compatible runtimes and local NTFS; this is a static compatibility assessment, not native acceptance |
-| Docker (`linux/amd64`, `linux/arm64`) | Supported | Local builds use `debian:bookworm-slim`; only amd64 is in this candidate; see [Docker](docker.md) |
+| Docker (`linux/amd64`, `linux/arm64`) | Supported | Local builds use `debian:bookworm-slim`; images are built locally; see [Docker](docker.md) |
 
 ### Linux
 
-The x86_64 candidate archive targets glibc 2.17, providing a libc baseline for
+The x86_64 release archive targets glibc 2.17, providing a libc baseline for
 distributions from RHEL/CentOS 7 era onward, as well as current Ubuntu, Debian,
 and SUSE releases. Building from source works on any distribution with a
 supported Rust toolchain.
