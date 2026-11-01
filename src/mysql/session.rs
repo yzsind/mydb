@@ -4432,7 +4432,21 @@ where
     ) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        let (reader, mut writer) = tokio::net::UnixStream::pair()?;
+        let (reader, writer) = tokio::net::UnixStream::pair()?;
+        // LOCAL clients commonly send small protocol packets. Coalesce only
+        // the internal pipe writes, preserving packet framing and bounded
+        // backpressure. Under admission pressure keep the unbuffered path.
+        let pipe_buffer_charge =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::ProtocolTransient,
+                256 * 1024,
+            );
+        let capacity = if pipe_buffer_charge.is_some() {
+            256 * 1024
+        } else {
+            0
+        };
+        let mut writer = tokio::io::BufWriter::with_capacity(capacity, writer);
         let std_reader = reader.into_std()?;
         std_reader.set_nonblocking(false)?;
         load_stmt.data = None;
@@ -4517,8 +4531,27 @@ where
             }
         };
         let response_seq = last_seq.wrapping_add(1);
-        let _ = writer.shutdown().await;
+        // BufWriter shutdown flushes the final partial block before EOF.
+        // A failed/cancelled flush must not let the reader commit a prefix.
+        let shutdown = tokio::select! {
+            biased;
+            _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) =>
+                Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+            result = writer.shutdown() => result,
+        };
+        if let Err(err) = shutdown {
+            if let Some(token) = &input_cancel {
+                token.cancel_local();
+            }
+            pipe_error.get_or_insert_with(|| {
+                error(
+                    crate::error::catalog::ER_UNKNOWN_ERROR,
+                    format!("LOAD DATA LOCAL stream flush: {err}"),
+                )
+            });
+        }
         drop(writer);
+        drop(pipe_buffer_charge);
 
         let join_result = execution.await;
         let (context, mut result) = match join_result {
