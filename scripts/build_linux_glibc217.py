@@ -45,7 +45,7 @@ def source_hash(root):
                               and not (relative == Path('tests/fuzz') and name in ('corpus', 'artifacts', 'coverage'))
                               and not (relative == Path('tests/mydb-test') and name == 'triage')]
             files.extend(Path(parent) / name for name in names if name != '.DS_Store')
-    for path in sorted(files):
+    for path in sorted(files, key=lambda path: tuple(path.relative_to(root).parts)):
         if path.name.startswith('._'):
             raise SystemExit('source contains filesystem metadata sidecars: ' + str(path))
         digest.update(path.relative_to(root).as_posix().encode() + b'\0')
