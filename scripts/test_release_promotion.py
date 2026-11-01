@@ -23,7 +23,7 @@ import pymysql
 from test_native_readiness import free_port, query, status
 from test_release_storage import StorageServers, binary_sha256
 from test_release_publication import Gate, heap_versions, kill, setup, sql_outcome, verify, wal_frames
-from storage_oracle import wal_frame_bytes
+from storage_oracle import metadata_payload, wal_frame_bytes
 
 
 def decode_wal(raw):
@@ -246,7 +246,7 @@ def wait_applied(connection, target, exact=False):
 
 
 def role_file(root):
-    return json.loads((root / 'system/replication/role.json').read_text())
+    return metadata_payload(root / 'system/replication/role.json', 6, 3)
 
 
 def local_wal_bytes(root, first_lsn, last_lsn=None):

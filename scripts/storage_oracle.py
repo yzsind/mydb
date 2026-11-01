@@ -5,6 +5,8 @@ formats must fail the gate rather than silently weakening its physical checks.
 """
 
 import os
+import json
+import re
 import struct
 import zlib
 
@@ -20,6 +22,33 @@ WAL_VERSION = 40
 WAL_HEADER_BYTES = 64
 WAL_FRAME_BYTES = 48
 UNDO_HEADER_BYTES = 64
+
+
+def metadata_payload(path, kind, version):
+    """Validate the current metadata envelope over its original payload bytes."""
+    def unique_object(pairs):
+        result = {}
+        for name, value in pairs:
+            assert name not in result, (path, "duplicate metadata field", name)
+            result[name] = value
+        return result
+
+    raw = path.read_bytes().decode("utf-8")
+    envelope = json.loads(raw, object_pairs_hook=unique_object)
+    assert isinstance(envelope, dict) and set(envelope) == {
+        "magic", "kind", "version", "required_features", "payload", "checksum"
+    }, (path, "invalid metadata envelope")
+    assert envelope["magic"] == "MYDBMETA1", (path, "metadata magic")
+    for field, expected in (("kind", kind), ("version", version), ("required_features", 0)):
+        assert type(envelope[field]) is int and envelope[field] == expected, (path, "unsupported metadata", field)
+    # The other envelope fields have fixed scalar domains, so the first
+    # payload key is necessarily the top-level member, irrespective of order.
+    member = re.search(r'"payload"\s*:\s*', raw)
+    assert member is not None, (path, "missing metadata payload")
+    _, end = json.JSONDecoder().raw_decode(raw, member.end())
+    prefix = b"MYDBMETA1\0" + struct.pack("<HHQ", kind, version, 0)
+    assert zlib.crc32(prefix + raw[member.end():end].encode("utf-8")) == envelope["checksum"], (path, "metadata checksum")
+    return envelope["payload"]
 
 
 def _read_wal_frames(root):

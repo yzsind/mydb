@@ -20,7 +20,7 @@ import time
 
 import pymysql
 from test_release_storage import StorageServers, start, query, binary_sha256
-from storage_oracle import heap_versions, truncate_undo_tail, wal_frames
+from storage_oracle import heap_versions, metadata_payload, truncate_undo_tail, wal_frames
 
 
 class Gate:
@@ -342,7 +342,7 @@ def gap_case(binary, library, root, action, result):
         process = servers.processes[-1]
         result['hit'] = gate.wait(process, future, True)
         manifest_path = root / 'server/system/undo/undo.manifest'
-        manifest = json.loads(manifest_path.read_text())
+        manifest = metadata_payload(manifest_path, 5, 3)
         pending = manifest['pending_recovery_segments']
         assert len(pending) > 1, pending
         finals = sum((manifest_path.parent / f'undo-{segment:08x}.seg').exists() for segment in pending)
@@ -362,7 +362,7 @@ def gap_case(binary, library, root, action, result):
         process, admin, port = start(servers, extra)
         verify(admin, expected)
         assert len(query(admin, 'XA RECOVER')) == 1
-        assert not json.loads(manifest_path.read_text())['pending_recovery_segments']
+        assert not metadata_payload(manifest_path, 5, 3)['pending_recovery_segments']
         query(admin, "XA ROLLBACK 'gap_gate'")
         for restart in range(2):
             verify(admin, expected)

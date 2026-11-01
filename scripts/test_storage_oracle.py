@@ -3,11 +3,12 @@
 
 from pathlib import Path
 import struct
+import json
 import tempfile
 import unittest
 import zlib
 
-from storage_oracle import heap_versions, truncate_undo_tail, wal_frame_bytes, wal_frames
+from storage_oracle import heap_versions, metadata_payload, truncate_undo_tail, wal_frame_bytes, wal_frames
 
 
 def checksum(page):
@@ -165,6 +166,39 @@ class UndoTailFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "undo header CRC"):
             truncate_undo_tail(self.path)
         self.assertEqual(self.path.read_bytes(), before)
+
+
+class MetadataEnvelopeTests(unittest.TestCase):
+    def setUp(self):
+        Path("/tmp/mydb").mkdir(exist_ok=True)
+        self.directory = tempfile.TemporaryDirectory(dir="/tmp/mydb")
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "undo.manifest"
+        self.payload = '{ "pending_recovery_segments": [31, 47], "label": "中文" }'
+        prefix = b"MYDBMETA1\0" + struct.pack("<HHQ", 5, 3, 0)
+        self.crc = zlib.crc32(prefix + self.payload.encode("utf-8"))
+        self.raw = ('{"magic":"MYDBMETA1","kind":5,"version":3,"required_features":0,'
+                    '"payload":' + self.payload + ',"checksum":' + str(self.crc) + '}')
+
+    def test_current_envelope_uses_original_payload_spacing_and_encoding(self):
+        self.path.write_bytes(self.raw.encode("utf-8"))
+        self.assertEqual(metadata_payload(self.path, 5, 3), json.loads(self.payload))
+
+    def test_payload_damage_is_rejected(self):
+        self.path.write_text(self.raw.replace('[31, 47]', '[31, 48]'))
+        with self.assertRaisesRegex(AssertionError, "metadata checksum"):
+            metadata_payload(self.path, 5, 3)
+
+    def test_future_format_and_features_are_rejected(self):
+        for before, after in [('"version":3', '"version":4'), ('"required_features":0', '"required_features":1')]:
+            self.path.write_text(self.raw.replace(before, after))
+            with self.assertRaisesRegex(AssertionError, "unsupported metadata"):
+                metadata_payload(self.path, 5, 3)
+
+    def test_duplicate_envelope_member_is_rejected(self):
+        self.path.write_text(self.raw.replace('"kind":5', '"kind":5,"kind":5'))
+        with self.assertRaisesRegex(AssertionError, "duplicate metadata field"):
+            metadata_payload(self.path, 5, 3)
 
 
 if __name__ == "__main__":
