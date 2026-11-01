@@ -11,6 +11,7 @@ import subprocess
 import tarfile
 import tempfile
 import tomllib
+import zipfile
 
 from build_linux_glibc217 import source_hash
 from release_licenses import collect_third_party
@@ -93,19 +94,28 @@ def main():
                     "release_binaries": ["mydb", "mydb-backup", "mydb-cli"],
                     "packager_sha256": sha256(Path(__file__).resolve()),
                     "license_collector_sha256": sha256(Path(__file__).with_name("release_licenses.py")),
-                    "files": {str(p.relative_to(payload)): sha256(p) for p in sorted(payload.rglob("*")) if p.is_file()}}
+                    "files": {p.relative_to(payload).as_posix(): sha256(p) for p in sorted(payload.rglob("*")) if p.is_file()}}
         (payload / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        archive = stage / (prefix + ".tar.gz")
-        with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as zipped:
-            with tarfile.open(fileobj=zipped, mode="w") as bundle:
+        archive = stage / (prefix + (".zip" if os.name == "nt" else ".tar.gz"))
+        if os.name == "nt":
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
                 for path in sorted(payload.rglob("*")):
-                    if not path.is_file():
-                        continue
-                    entry = bundle.gettarinfo(str(path), arcname=str(path.relative_to(stage)))
-                    entry.uid = entry.gid = entry.mtime = 0
-                    entry.uname = entry.gname = ""
-                    with path.open("rb") as file:
-                        bundle.addfile(entry, file)
+                    if path.is_file():
+                        entry = zipfile.ZipInfo(path.relative_to(stage).as_posix())
+                        entry.compress_type = zipfile.ZIP_DEFLATED
+                        with path.open("rb") as source, bundle.open(entry, "w") as output:
+                            shutil.copyfileobj(source, output)
+        else:
+            with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as zipped:
+                with tarfile.open(fileobj=zipped, mode="w") as bundle:
+                    for path in sorted(payload.rglob("*")):
+                        if not path.is_file():
+                            continue
+                        entry = bundle.gettarinfo(str(path), arcname=str(path.relative_to(stage)))
+                        entry.uid = entry.gid = entry.mtime = 0
+                        entry.uname = entry.gname = ""
+                        with path.open("rb") as file:
+                            bundle.addfile(entry, file)
         (stage / "SHA256SUMS").write_text(f"{sha256(archive)}  {archive.name}\n")
         destination.mkdir()
         for path in stage.iterdir():

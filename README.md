@@ -8,7 +8,7 @@
 
 Let agents manage data flexibly — transactions, analytics, AI model calls and hybrid search through SQL.
 
-[Download](https://github.com/yzsind/mydb/releases/tag/v1.0.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
+[Download](https://github.com/yzsind/mydb/releases/tag/v1.1.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
 </div>
 
@@ -44,7 +44,7 @@ conditions, and limitations.
 ## Quick Start
 
 Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from the
-[1.0.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.0.0), which also
+[1.1.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.1.0), which also
 includes SHA256 checksums and platform validation details.
 
 ### Run a downloaded binary

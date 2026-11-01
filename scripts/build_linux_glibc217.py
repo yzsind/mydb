@@ -48,7 +48,7 @@ def source_hash(root):
     for path in sorted(files):
         if path.name.startswith('._'):
             raise SystemExit('source contains filesystem metadata sidecars: ' + str(path))
-        digest.update(str(path.relative_to(root)).encode() + b'\0')
+        digest.update(path.relative_to(root).as_posix().encode() + b'\0')
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
