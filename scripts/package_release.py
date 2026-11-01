@@ -53,11 +53,7 @@ def main():
     # from replacing release executables between cargo and artifact capture.
     build_dir = Path("/tmp/mydb/release-build") / before
     env = dict(os.environ, TMPDIR="/tmp/mydb", CARGO_TARGET_DIR=str(build_dir))
-    subprocess.run(["cargo", "build", "--locked", "--release", "--features", "tools",
-                    "--bin", "mydb", "--bin", "mydb-backup"], cwd=ROOT, env=env, check=True)
     client_manifest = ROOT / "clients/mydb-cli/Cargo.toml"
-    subprocess.run(["cargo", "build", "--manifest-path", str(client_manifest), "--locked", "--release"],
-                   cwd=ROOT, env=env, check=True)
     rust = command("rustc", "-vV")
     host = next(line.removeprefix("host: ") for line in rust.splitlines() if line.startswith("host: "))
     metadata = json.loads(command("cargo", "metadata", "--locked", "--features", "tools",
@@ -70,6 +66,12 @@ def main():
         stage = Path(temporary)
         payload = stage / prefix
         payload.mkdir()
+        collect_third_party(ROOT, payload, metadata, extra_metadata=[client_metadata],
+                            extra_lockfiles=[ROOT / "clients/mydb-cli/Cargo.lock"])
+        subprocess.run(["cargo", "build", "--locked", "--release", "--features", "tools",
+                        "--bin", "mydb", "--bin", "mydb-backup"], cwd=ROOT, env=env, check=True)
+        subprocess.run(["cargo", "build", "--manifest-path", str(client_manifest), "--locked", "--release"],
+                       cwd=ROOT, env=env, check=True)
         target = Path(metadata["target_directory"]) / "release"
         for name in ["mydb", "mydb-backup", "mydb-cli"]:
             executable = name + (".exe" if os.name == "nt" else "")
@@ -81,8 +83,6 @@ def main():
             shutil.copy2(ROOT / name, output)
         shutil.copytree(ROOT / "docs", payload / "docs")
         shutil.copy2(ROOT / "clients/mydb-cli/Cargo.lock", payload / "mydb-cli.Cargo.lock")
-        collect_third_party(ROOT, payload, metadata, extra_metadata=[client_metadata],
-                            extra_lockfiles=[ROOT / "clients/mydb-cli/Cargo.lock"])
         if source_hash(ROOT) != before:
             raise SystemExit("source changed during build; candidate was not published")
         manifest = {"schema_version": 1, "version": version, "host": host,
