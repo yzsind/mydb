@@ -7777,34 +7777,49 @@ fn read_exact_at_counted(file: &File, buf: &mut [u8], offset: u64) -> std::io::R
 
 /// Fallback for cgroups without a delegated reclaim interface. Advance the
 /// cursor so repeated requests do not keep advising an already-uncached prefix.
+/// Returns bytes advised, not bytes physically reclaimed: the kernel may
+/// retain the entire range even when posix_fadvise succeeds.
 #[cfg(target_os = "linux")]
 fn advise_cached_file_headroom(file: &CachedFile, requested: usize) -> usize {
     use std::os::fd::AsRawFd;
-    let len = file.len();
+    advise_cached_file_headroom_with(
+        file.len(),
+        &file.kernel_cache_reclaim_cursor,
+        requested,
+        |offset, bytes| {
+            let (Ok(offset), Ok(bytes)) =
+                (libc::off_t::try_from(offset), libc::off_t::try_from(bytes))
+            else {
+                return false;
+            };
+            // SAFETY: the Arc owner retains this descriptor; only complete clean
+            // kernel pages can be discarded. Dirty/WAL ordering is unchanged.
+            unsafe {
+                libc::posix_fadvise(
+                    file.file.as_raw_fd(),
+                    offset,
+                    bytes,
+                    libc::POSIX_FADV_DONTNEED,
+                ) == 0
+            }
+        },
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn advise_cached_file_headroom_with(
+    len: u64,
+    cursor: &AtomicU64,
+    requested: usize,
+    advise: impl FnOnce(u64, u64) -> bool,
+) -> usize {
     if requested == 0 || len == 0 {
         return 0;
     }
     let chunk = requested.min(64 * 1024 * 1024).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-    let offset = file
-        .kernel_cache_reclaim_cursor
-        .fetch_add(chunk as u64, Ordering::Relaxed)
-        % len;
+    let offset = cursor.fetch_add(chunk as u64, Ordering::Relaxed) % len;
     let bytes = (chunk as u64).min(len - offset);
-    let (Ok(offset), Ok(bytes)) = (libc::off_t::try_from(offset), libc::off_t::try_from(bytes))
-    else {
-        return 0;
-    };
-    // SAFETY: the Arc owner retains this descriptor; only complete clean
-    // kernel pages can be discarded. Dirty/WAL ordering is unchanged.
-    let result = unsafe {
-        libc::posix_fadvise(
-            file.file.as_raw_fd(),
-            offset,
-            bytes,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    if result == 0 {
+    if advise(offset, bytes) {
         bytes as usize
     } else {
         0
@@ -7877,21 +7892,79 @@ fn read_exact_at_uninit(
 
 #[cfg(test)]
 #[test]
-#[cfg(target_os = "linux")]
-fn buffered_scan_cache_waits_for_bounded_physical_relief() {
-    use std::os::fd::AsRawFd;
-    struct Mapping(*mut libc::c_void, usize);
-    impl Drop for Mapping {
-        fn drop(&mut self) {
-            // SAFETY: this mapping is owned exclusively by the test.
-            unsafe {
-                libc::munmap(self.0, self.1);
-            }
-        }
+fn cached_file_headroom_advice_bounds_ranges_and_advances_cursor() {
+    let len = (PAGE_SIZE * 5) as u64;
+    let reclaim_cursor = AtomicU64::new(0);
+    let cursor = || reclaim_cursor.load(Ordering::Relaxed);
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, 0, |_, _| panic!(
+            "zero request issued advice"
+        )),
+        0
+    );
+    assert_eq!(cursor(), 0);
+    // Successful advice may reclaim nothing (for example on tmpfs). Verify
+    // the exact ranges passed to the OS without requiring physical eviction.
+    for (requested, expected_offset, expected_bytes, expected_cursor) in [
+        (1, 0, PAGE_SIZE, PAGE_SIZE),
+        (PAGE_SIZE + 1, PAGE_SIZE, PAGE_SIZE * 2, PAGE_SIZE * 3),
+        (PAGE_SIZE * 3, PAGE_SIZE * 3, PAGE_SIZE * 2, PAGE_SIZE * 6),
+        (PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE * 7),
+    ] {
+        let mut calls = 0;
+        assert_eq!(
+            advise_cached_file_headroom_with(len, &reclaim_cursor, requested, |offset, bytes| {
+                calls += 1;
+                assert_eq!(
+                    (offset, bytes),
+                    (expected_offset as u64, expected_bytes as u64)
+                );
+                true
+            }),
+            expected_bytes
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(cursor(), expected_cursor as u64);
     }
+
+    let len = 128 * 1024 * 1024;
+    let reclaim_cursor = AtomicU64::new(0);
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, usize::MAX, |offset, bytes| {
+            assert_eq!((offset, bytes), (0, 64 * 1024 * 1024));
+            true
+        }),
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, PAGE_SIZE, |offset, bytes| {
+            assert_eq!((offset, bytes), (64 * 1024 * 1024, PAGE_SIZE as u64));
+            false
+        }),
+        0
+    );
+    assert_eq!(
+        reclaim_cursor.load(Ordering::Relaxed),
+        (64 * 1024 * 1024 + PAGE_SIZE) as u64
+    );
+
+    let len = 0;
+    let reclaim_cursor = AtomicU64::new(0);
+    assert_eq!(
+        advise_cached_file_headroom_with(len, &reclaim_cursor, PAGE_SIZE, |_, _| panic!(
+            "empty file issued advice"
+        )),
+        0
+    );
+    assert_eq!(reclaim_cursor.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(test)]
+#[test]
+#[cfg(target_os = "linux")]
+fn buffered_scan_reads_and_bounded_cache_advice_preserve_data() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let bytes = vec![0x5a; PAGE_SIZE * 64];
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     for lane in 0..3 {
         let file = OpenOptions::new()
             .read(true)
@@ -7901,30 +7974,6 @@ fn buffered_scan_cache_waits_for_bounded_physical_relief() {
             .unwrap();
         write_all_at(&file, &bytes, 0).unwrap();
         file.sync_all().unwrap();
-        // PROT_NONE leaves PTEs absent: mincore observes the file cache
-        // without pinning pages against the advice being tested.
-        let address = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes.len(),
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(address, libc::MAP_FAILED);
-        let mapping = Mapping(address, bytes.len());
-        let resident = || {
-            let mut states = vec![0u8; bytes.len().div_ceil(page_size)];
-            assert_eq!(
-                unsafe { libc::mincore(mapping.0, mapping.1, states.as_mut_ptr()) },
-                0
-            );
-            states.into_iter().filter(|value| value & 1 != 0).count()
-        };
-        let before = resident();
-        assert!(before > 0);
         match lane {
             0 => {
                 let mut actual = vec![0; bytes.len()];
@@ -7934,6 +7983,7 @@ fn buffered_scan_cache_waits_for_bounded_physical_relief() {
             1 => {
                 let mut actual = vec![std::mem::MaybeUninit::<u8>::uninit(); bytes.len()];
                 read_exact_at_uninit(&file, &mut actual, 0).unwrap();
+                // SAFETY: the successful read initialized every byte.
                 let actual = unsafe {
                     std::slice::from_raw_parts(actual.as_ptr().cast::<u8>(), actual.len())
                 };
@@ -7946,38 +7996,18 @@ fn buffered_scan_cache_waits_for_bounded_physical_relief() {
                 assert!(actual.iter().flatten().all(|byte| *byte == 0x5a));
             }
         }
-        assert_eq!(
-            resident(),
-            before,
-            "ordinary reads must preserve the useful kernel cache"
-        );
         let cached = CachedFile::new(file, bytes.len() as u64);
-        // DONTNEED is best effort: transient page references or locks can
-        // prevent eviction even after fsync. Retry the same range so kernel
-        // scheduling cannot fail the fixture or expand its eviction budget.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let after = loop {
+        for step in 1..=2 {
             assert_eq!(
                 advise_cached_file_headroom(&cached, bytes.len() / 2),
                 bytes.len() / 2
             );
-            let after = resident();
-            if after < before || Instant::now() >= deadline {
-                break after;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-            cached.kernel_cache_reclaim_cursor.store(0, Ordering::Relaxed);
-        };
-        assert!(
-            after < before,
-            "lane {lane} did not reclaim clean cache before the deadline: {before} -> {after}"
-        );
-        assert!(
-            after >= before / 2,
-            "lane {lane} discarded more than requested"
-        );
+            assert_eq!(
+                cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed),
+                (step * bytes.len() / 2) as u64
+            );
+        }
         let cursor = cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed);
-        assert_eq!(cursor, (bytes.len() / 2) as u64);
         assert_eq!(advise_cached_file_headroom(&cached, 0), 0);
         assert_eq!(
             cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed),
