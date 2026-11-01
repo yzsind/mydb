@@ -24,6 +24,7 @@ optional dependencies.
 | Ubuntu development environment | `setup_ubuntu.sh` |
 | Build and runtime-matrix command regressions | `test_release_build.py`, `test_linux_compat.py`, `test_elf_abi.py` |
 | Native replication recovery and binary protocol | `test_native_readiness.py --binary target/debug/mydb` |
+| Acknowledged-state and interrupted-DDL crash recovery | `test_crash_recovery.py --binary target/release/mydb --output /tmp/mydb/crash-recovery --rounds 10`; requires PyMySQL and retains an independent typed-row oracle |
 | Physical backup and WAL recovery | `test_backup_recovery.py --profile debug --rows 1000 --pairs 1`; add `--encrypted` for encrypted backups |
 | Security, storage failure, atomic publication, and promotion | `test_release_security.py`, `test_release_storage.py`, `test_release_publication.py`, `test_release_promotion.py`; instrumentation sources remain in `fixtures/` |
 | Replication consistency under load | `run_repl_tpcc_consistency.sh`, `run_mysql_repl_tpcc_consistency.sh`, `run_mydb_master_mysql_replica.sh`, `check_benchmarksql_consistency.sql` |
@@ -45,6 +46,14 @@ not depend on private tools. Historical audit drivers and one-off verification
 regressions (`verify_*_audit.py`, `test_*_audit*.py`, `*_audit_verify.py`, and
 similar) live in `scripts-internal/` and are not needed by public builds or
 default correctness runs.
+
+`storage_oracle.py` provides the physical heap-version and WAL-frame checks used
+by publication and promotion gates. It rejects unsupported formats, bad bounds,
+and checksums explicitly; `test_storage_oracle.py` runs dependency-free negative
+controls. The crash-recovery gate covers both buffered and eager WAL paths
+(`--buffering 1|0`), including fresh writes after recovery and a second SIGKILL.
+Timed DDL interruption supplements deterministic syscall fault gates; it does
+not prove that every internal publication boundary was reached.
 
 Query schemas, SQL files, and externally generated expected TSV files are
 regression inputs. Rust parser and executor tests use some TPC-DS files through

@@ -46,6 +46,7 @@ jobs:
       - run: scripts/render_storage_format_versions.sh --check
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_tests.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_storage_oracle.py
       # The repository still has a sizeable style-warning backlog. Keep new
       # correctness/suspicious defects blocking while that backlog is reduced.
       - run: cargo clippy --locked --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
@@ -138,6 +139,7 @@ jobs:
       - run: python scripts/test_backup_recovery.py --profile debug --rows 1000 --pairs 1 --encrypted
       - run: python scripts/test_release_security.py --binary target/debug/mydb --output /tmp/mydb/release-security-ci
       - run: python scripts/test_release_storage.py --binary target/debug/mydb --output /tmp/mydb/release-storage-ci
+      - run: python scripts/test_crash_recovery.py --binary target/debug/mydb --output /tmp/mydb/crash-recovery-ci --rows 200 --rounds 1
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -149,6 +151,7 @@ jobs:
             /tmp/mydb/backup-recovery-*
             /tmp/mydb/release-security-ci
             /tmp/mydb/release-storage-ci
+            /tmp/mydb/crash-recovery-ci
 
   feature-matrix:
     name: Compile feature surface (${{ matrix.name }})
