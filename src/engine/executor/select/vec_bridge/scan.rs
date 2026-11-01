@@ -988,7 +988,7 @@ pub(super) enum ParallelStorageWorker {
 }
 
 pub(super) struct AggregateStorageWorker {
-    pub(super) source: ParallelStorageWorker,
+    pub(super) source: Option<ParallelStorageWorker>,
     pub(super) _charge: Arc<mem_budget::ControlledMemoryCharge>,
     pub(super) context: crate::engine::executor::select::execution_context::ExecutionContext,
     pub(super) work: Arc<AggregateScanWork>,
@@ -1024,26 +1024,37 @@ impl AggregateScanWork {
 }
 
 impl crate::engine::executor::vec::stream::ParallelBatchWorker for AggregateStorageWorker {
+    fn take_coordinator_pull(
+        &mut self,
+        abort: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Box<dyn BatchOperator>> {
+        Some(Box::new(CoordinatorStoragePull {
+            source: self.source.take()?,
+            context: self.context.clone(),
+            work: self.work.clone(),
+            worker: self.worker,
+            _charge: self._charge.clone(),
+            abort,
+        }))
+    }
+
     fn run(
         mut self: Box<Self>,
         consume: &mut dyn FnMut(Batch) -> Result<(), QueryError>,
         abort: &std::sync::atomic::AtomicBool,
     ) -> Result<(), QueryError> {
-        let db = self.source.db();
+        let mut source = self.source.take().expect("untransferred scan worker");
+        let db = source.db();
         self.context.run(&db, || loop {
-            self.context.cancellation().check()?;
-            if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(
-                    crate::error::catalog::ER_QUERY_INTERRUPTED.error("parallel aggregate aborted")
-                );
-            }
-            if let Some(batch) = self.source.next_batch()? {
+            if let Some(batch) = next_storage_worker_batch(
+                &mut source,
+                &self.context,
+                &self.work,
+                self.worker,
+                abort,
+                false,
+            )? {
                 consume(batch)?;
-            } else if let Some(task) = self.work.next(self.worker) {
-                match &mut self.source {
-                    ParallelStorageWorker::Plain(source) => source.tasks.push_back(task),
-                    ParallelStorageWorker::Filtered(source) => source.tasks.push_back(task),
-                }
             } else {
                 return Ok(());
             }
@@ -1051,7 +1062,81 @@ impl crate::engine::executor::vec::stream::ParallelBatchWorker for AggregateStor
     }
 }
 
+fn next_storage_worker_batch(
+    source: &mut ParallelStorageWorker,
+    context: &super::super::execution_context::ExecutionContext,
+    work: &AggregateScanWork,
+    worker: usize,
+    abort: &std::sync::atomic::AtomicBool,
+    yield_empty_morsel: bool,
+) -> Result<Option<Batch>, QueryError> {
+    let mut assigned_morsel = false;
+    loop {
+        context.cancellation().check()?;
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(
+                crate::error::catalog::ER_QUERY_INTERRUPTED.error("parallel aggregate aborted")
+            );
+        }
+        if let Some(batch) = source.next_batch()? {
+            return Ok(Some(batch));
+        }
+        if assigned_morsel && yield_empty_morsel {
+            // No visible output from this bounded assignment. Give the pull
+            // coordinator a chance to drain ready peers before taking more.
+            let schema = source.schema().clone();
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|_| ColumnVector::Null { len: 0 })
+                .collect();
+            return Ok(Some(Batch::with_row_count(schema, columns, 0)));
+        }
+        let Some(task) = work.next(worker) else {
+            return Ok(None);
+        };
+        match source {
+            ParallelStorageWorker::Plain(source) => source.tasks.push_back(task),
+            ParallelStorageWorker::Filtered(source) => source.tasks.push_back(task),
+        }
+        assigned_morsel = true;
+    }
+}
+
+struct CoordinatorStoragePull {
+    source: ParallelStorageWorker,
+    context: super::super::execution_context::ExecutionContext,
+    work: Arc<AggregateScanWork>,
+    worker: usize,
+    _charge: Arc<mem_budget::ControlledMemoryCharge>,
+    abort: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BatchOperator for CoordinatorStoragePull {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        self.source.schema()
+    }
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        self.context.run(&self.source.db(), || {
+            next_storage_worker_batch(
+                &mut self.source,
+                &self.context,
+                &self.work,
+                self.worker,
+                &self.abort,
+                true,
+            )
+        })
+    }
+}
+
 impl ParallelStorageWorker {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        match self {
+            Self::Plain(source) => &source.schema,
+            Self::Filtered(source) => &source.schema,
+        }
+    }
     pub(super) fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
         match self {
             Self::Plain(stream) => stream.next_batch(),
@@ -1452,7 +1537,7 @@ impl BatchOperator for ParallelStorageBatchStream {
                 }
             };
             result.push(Box::new(AggregateStorageWorker {
-                source: worker,
+                source: Some(worker),
                 _charge: charge.clone(),
                 context: self.execution.worker_context.clone(),
                 work: work.clone(),

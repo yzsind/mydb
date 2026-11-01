@@ -6476,17 +6476,18 @@ impl IndexFile {
     }
 
     fn lazy_mutation_lsn(&self) -> u64 {
-        if self.durability == DurabilityMode::Memory
-            && btree_logical_wal::current().is_none()
-            && !btree_logical_wal::is_deferred()
-            && !physical_wal_apply_active()
-            && !self.log_atomics.physical_replica()
-        {
+        if btree_logical_wal::is_deferred() {
+            // Deferred pins prevent writeback until the real record is
+            // appended and finalize_deferred publishes its LSN.
+            0
+        } else if let Some(lsn)=btree_logical_wal::current() {
+            lsn
+        } else if self.durability == DurabilityMode::Memory {
             0
         } else {
-            // Explicit logical/replica replay retains its existing WAL anchor,
-            // including a memory-backed cache of the source's index pages.
-            self.log_atomics.next_lsn().max(1)
+            // Replica replay without an explicit logical scope can only
+            // reference the received prefix, never the next allocation.
+            self.log_atomics.next_lsn().saturating_sub(1)
         }
     }
 
@@ -11140,7 +11141,7 @@ impl IndexFile {
         if btree_logical_wal::is_deferred() {
             // The buffer pool installs deferred pins under its image/shard
             // latch, including when this page must first become resident.
-            let peek_lsn = self.log_atomics.next_lsn().max(1);
+            let peek_lsn = self.lazy_mutation_lsn();
             self.store_index_page_transient(key, peek_lsn, oracle)?;
             self.dirty.store(true, Ordering::Release);
             return Ok(());
@@ -11153,7 +11154,7 @@ impl IndexFile {
             // checkpoint. If a crash tears the cached index page, the page
             // checksum/tree validator catches it and startup rebuilds the
             // affected index from the heap.
-            let peek_lsn = self.log_atomics.next_lsn().max(1);
+            let peek_lsn = self.lazy_mutation_lsn();
             self.store_index_page_transient(key, peek_lsn, oracle)?;
             self.dirty.store(true, Ordering::Release);
             return Ok(());
@@ -11295,7 +11296,7 @@ impl IndexFile {
             return Ok(());
         }
         let lsn = if btree_logical_wal::current().is_some() {
-            let peek_lsn = self.log_atomics.next_lsn().max(1);
+            let peek_lsn = self.lazy_mutation_lsn();
             set_page_lsn_if_formatted(&mut after, peek_lsn);
             peek_lsn
         } else if self.durability == DurabilityMode::Memory {

@@ -930,6 +930,225 @@ fn archive_ack_cannot_overwrite_a_budget_patch_accepted_during_bulk_work() {
 }
 
 #[test]
+fn release_audit_archive_publication_serializes_disable_and_discard() {
+    for discard in [false, true] {
+        let f = Fixture::new();
+        f.source.execute("UPDATE t SET v=42 WHERE id=1").unwrap();
+        let (entered, ready) = mpsc::sync_channel(0);
+        let (release, wait) = mpsc::sync_channel(0);
+        super::faults::install("archive_before_publish", &f.repository, move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(30)).unwrap();
+            Ok(())
+        });
+        let request = f.coordinator.backup_wal(&f.repository).unwrap();
+        ready.recv_timeout(Duration::from_secs(30)).unwrap();
+        let c = f.coordinator.clone();
+        let repository = f.repository.clone();
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(c.configure(&repository, Policy::Disabled, discard, None))
+                .unwrap();
+        });
+        let blocked = result.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(
+            matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "policy change bypassed the archive mutex"
+        );
+        Fixture::wait(&f.coordinator, request);
+        if let Some(stop) = result
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap()
+        {
+            Fixture::wait(&f.coordinator, stop);
+        }
+        worker.join().unwrap();
+        let control = f.coordinator.control.lock().unwrap().clone().unwrap();
+        assert_eq!(control.lifecycle, "CLOSED");
+        assert_eq!(control.effective, Policy::Disabled);
+        assert_eq!(control.close_discarded, discard);
+        assert!(!f
+            .source
+            .db_handle()
+            .capture
+            .leases()
+            .contains_key("archive"));
+    }
+}
+
+#[test]
+fn release_audit_queued_wal_failure_does_not_prevent_a_new_stream_after_discard() {
+    let f = Fixture::new();
+    let (entered, ready) = mpsc::sync_channel(0);
+    let (release, wait) = mpsc::sync_channel(0);
+    super::faults::install(
+        "wal_before_execute",
+        f.source.db_handle().data_dir(),
+        move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(30)).unwrap();
+            Ok(())
+        },
+    );
+    let request = f.coordinator.backup_wal(&f.repository).unwrap();
+    ready.recv_timeout(Duration::from_secs(30)).unwrap();
+    let disabled = f
+        .coordinator
+        .configure(&f.repository, Policy::Disabled, true, None);
+    release.send(()).unwrap();
+    disabled.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if f.coordinator
+            .jobs()
+            .iter()
+            .any(|j| j.id == request.id && j.state == "FAILED")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    f.coordinator
+        .configure(&f.repository, Policy::Manual, false, None)
+        .unwrap();
+    assert_eq!(
+        f.coordinator
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lifecycle,
+        "WAITING_BASE"
+    );
+    Fixture::wait(&f.coordinator, f.coordinator.backup(&f.repository).unwrap());
+    Fixture::wait(
+        &f.coordinator,
+        f.coordinator.backup_wal(&f.repository).unwrap(),
+    );
+}
+
+#[test]
+fn release_audit_pending_base_hashing_does_not_hold_the_status_lock() {
+    let f = Fixture::new();
+    {
+        let mut guard = f.coordinator.control.lock().unwrap();
+        let state = guard.as_mut().unwrap();
+        state.pending = Some(super::coordinator::Pending {
+            base_id: f.base.clone(),
+            stream_id: state.stream_id.clone().unwrap(),
+            end: state.cursor,
+            time: state.covered_time,
+            hint: state.hint,
+        });
+        state.stream_id = None;
+        state.lifecycle = "PREPARING_BASE".into();
+        state.position = Default::default();
+    }
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let observed = unlocked.clone();
+    let c = f.coordinator.clone();
+    super::faults::install(
+        "base_before_full_verify",
+        &f.repository.join("bases").join(&f.base),
+        move || {
+            observed.store(c.control.try_lock().is_ok(), Ordering::Release);
+            Ok(())
+        },
+    );
+    f.coordinator.test_reconcile().unwrap();
+    assert!(
+        unlocked.load(Ordering::Acquire),
+        "full baseline hashing blocked status and policy administration"
+    );
+    assert_eq!(
+        f.coordinator
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lifecycle,
+        "ACTIVE"
+    );
+}
+
+#[test]
+fn release_audit_reconciles_more_than_1024_unacknowledged_ranges() {
+    let f = Fixture::new();
+    let sync = crate::platform::fs::FixtureSyncBatch::new(f.root.path()).unwrap();
+    let state = f.coordinator.control.lock().unwrap().clone().unwrap();
+    for _ in 0..1030 {
+        f.source.execute("UPDATE t SET v=v+1 WHERE id=1").unwrap();
+    }
+    let log = f.source.db_handle().wal_log();
+    let prefixes = log
+        .lock()
+        .pin_prefix_after(state.cursor, state.hint)
+        .unwrap();
+    let repo = super::repository::Repository::open(&f.repository, None).unwrap();
+    let mut count = 0;
+    let mut archived_head = state.cursor;
+    for prefix in &prefixes {
+        crate::wal::visit_pinned_range(
+            prefix,
+            prefix.first_lsn.max(state.cursor + 1) - 1,
+            u64::MAX,
+            |first, last, time, offset, raw| {
+                let chunk = repo.store_blob(raw)?;
+                repo.publish_range(super::repository::Range {
+                    id: random_uuid(),
+                    stream_id: state.stream_id.clone().unwrap(),
+                    source_id: state.source_id.clone(),
+                    timeline_id: state.timeline_id.clone(),
+                    first_lsn: first,
+                    last_lsn: last,
+                    covered_time: time,
+                    frame_count: 1,
+                    raw_bytes: raw.len() as u64,
+                    chunks: vec![chunk],
+                    source_spans: vec![super::repository::SourceSpan {
+                        segment_id: prefix.segment_id,
+                        first_lsn: first,
+                        last_lsn: last,
+                        start_offset: offset - raw.len() as u64,
+                        end_offset: offset,
+                        captured_valid_len: prefix.len,
+                    }],
+                })?;
+                count += 1;
+                archived_head = last;
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+    assert!(
+        count > 1024,
+        "fixture did not exceed the old event-count cap"
+    );
+    f.coordinator.test_reconcile().unwrap();
+    assert_eq!(
+        f.coordinator
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cursor,
+        archived_head
+    );
+    assert_eq!(
+        f.source.db_handle().capture.leases()["archive"].floor,
+        archived_head + 1
+    );
+    sync.finish().unwrap();
+}
+
+#[test]
 fn one_off_full_reports_its_own_repository_and_immutable_boundary() {
     let f = Fixture::new();
     let original = f.coordinator.control.lock().unwrap().clone().unwrap();

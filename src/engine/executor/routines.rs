@@ -56,7 +56,7 @@ struct ParameterizedStaticStatement {
 }
 
 type RoutineCacheKey = (String, String, String, u64, u64, String);
-type TriggerCacheKey = (String, String, u64, u64, String);
+type TriggerCacheKey = (String, String, u64, u64, String, u64, u64);
 
 static ROUTINE_CACHE: OnceLock<Mutex<LruCache<RoutineCacheKey, Arc<RoutineProgram>>>> =
     OnceLock::new();
@@ -1144,6 +1144,9 @@ fn validate_function_stmt(stmt: &RoutineStmt) -> Result<(), QueryError> {
             ))
         }
         RoutineStmt::Sql(sql) => {
+            let statement = parse_statement(sql).map_err(|err| err.spec.error(err.message))?;
+            reject_restricted_sql_statement(&SessionContext::default(), &statement, None)
+                .map_err(|err| err.query_error())?;
             let upper = sql.trim_start().to_ascii_uppercase();
             if upper.starts_with("START TRANSACTION")
                 || upper.starts_with("BEGIN")
@@ -1277,7 +1280,7 @@ pub(super) fn execute_event_body(
     let result = result?;
     cleanup?;
     for response in result.responses {
-        response.materialize()?;
+        result_sink::discard(response)?;
     }
     Ok(())
 }
@@ -1372,13 +1375,18 @@ fn compile_routine_in_namespace(
     Ok(program)
 }
 
-fn compile_trigger(trigger: &TriggerSchema) -> Result<Arc<RoutineProgram>, QueryError> {
+fn compile_trigger(
+    trigger: &TriggerSchema,
+    table: &TableSchema,
+) -> Result<Arc<RoutineProgram>, QueryError> {
     let key = (
         trigger.database.clone(),
         trigger.name.clone(),
         trigger.schema_version,
         stable_sql_hash(&trigger.body_sql),
         trigger.sql_mode.clone(),
+        table.id,
+        table.schema_version,
     );
     let cache = trigger_cache();
     if let Some(program) = cache
@@ -1414,12 +1422,25 @@ fn compile_trigger(trigger: &TriggerSchema) -> Result<Arc<RoutineProgram>, Query
     let mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&trigger.sql_mode)
         | crate::engine::api::TEMPORAL_MODE_EXPLICIT;
     let _mode = crate::parser::ParserSqlModeGuard::activate(mode_bits);
-    let body = parse_routine_body_sql(&trigger.body_sql).map_err(|err| {
+    let mut body = parse_routine_body_sql(&trigger.body_sql).map_err(|err| {
         error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             format!("invalid trigger body: {}", err.message),
         )
     })?;
+    super::triggers::validate_trigger_columns(
+        &mut body.statements,
+        table,
+        match trigger.event {
+            crate::storage::TriggerEventSchema::Insert => crate::parser::TriggerEvent::Insert,
+            crate::storage::TriggerEventSchema::Update => crate::parser::TriggerEvent::Update,
+            crate::storage::TriggerEventSchema::Delete => crate::parser::TriggerEvent::Delete,
+        },
+        match trigger.timing {
+            crate::storage::TriggerTimingSchema::Before => crate::parser::TriggerTiming::Before,
+            crate::storage::TriggerTimingSchema::After => crate::parser::TriggerTiming::After,
+        },
+    )?;
     validate_routine_structure(&body.statements, &mut Vec::new(), &BTreeMap::new())?;
     let static_statements = Arc::new(compile_static_statements(&body)?);
     let program = Arc::new(RoutineProgram {
@@ -1992,7 +2013,7 @@ fn execute_function_schema_with_program(
     }
     result.return_value.ok_or_else(|| {
         error(
-            crate::error::catalog::ER_SP_NORETURN,
+            crate::error::catalog::ER_SP_NORETURNEND,
             format!("FUNCTION {} ended without RETURN", routine.name),
         )
     })
@@ -2399,7 +2420,7 @@ fn execute_trigger_body_inner(
     registry: &SessionRegistry,
 ) -> Result<Option<Vec<Value>>, QueryError> {
     let _partition_scope = super::partition_router::suspend_pruned_partitions();
-    let program = compile_trigger(trigger)?;
+    let program = compile_trigger(trigger, table)?;
     let mut frame = RoutineFrame {
         locals: HashMap::new(),
         local_types: HashMap::new(),
@@ -3351,7 +3372,7 @@ fn exec_stmt(
                 .into());
             };
             let Some(row) = result_cursor.next_row()? else {
-                return Err(not_found_condition());
+                return Err(error(crate::error::catalog::ER_SP_FETCH_NO_DATA, "No data").into());
             };
             if row.len() != targets.len() {
                 return Err(error(
@@ -3667,7 +3688,11 @@ fn exec_stmt(
                 frame.forbid_transaction_control,
                 frame.trigger_table.as_deref(),
             ) {
-                Ok(response) if frame.active_handler_scopes == 0 => response,
+                Ok(response)
+                    if frame.active_handler_scopes == 0 || result_sink::is_discarding() =>
+                {
+                    response
+                }
                 Ok(response) => response.materialize().map_err(RoutineExecError::Query)?,
                 Err(err) => {
                     // A SELECT sends result-column metadata before it starts
@@ -4102,6 +4127,21 @@ fn reject_restricted_sql_statement(
         )
     };
     match statement {
+        Statement::LockTables(_)
+        | Statement::UnlockTables
+        | Statement::FlushPrivileges
+        | Statement::FlushUserResources
+        | Statement::FlushHosts
+        | Statement::FlushStatus
+        | Statement::FlushTables { .. }
+        | Statement::FlushQueryCache
+        | Statement::FlushLogs { .. } => {
+            return Err(error(
+                crate::error::catalog::ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG,
+                "This statement is not allowed in a stored function or trigger",
+            )
+            .into())
+        }
         Statement::Begin { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }

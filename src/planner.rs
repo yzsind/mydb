@@ -2123,7 +2123,7 @@ fn collect_fulltext_matches_in_expr(
     });
 }
 
-fn collect_fulltext_matches_in_select(select: &Select) -> Vec<Expr> {
+pub(crate) fn collect_fulltext_matches_in_select(select: &Select) -> Vec<Expr> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     if let Some(selection) = &select.selection {
@@ -9075,7 +9075,7 @@ fn find_fulltext_match(expr: &Expr) -> Option<&Expr> {
 
 /// Decode the parser's `__match_against(mode, query, col, ...)` argument
 /// layout into `(mode, query, columns)`. `None` if the node is malformed.
-fn fulltext_match_parts(
+pub(crate) fn fulltext_match_parts(
     match_expr: &Expr,
 ) -> Option<(crate::parser::FtMode, String, Option<usize>, Vec<String>)> {
     let Expr::Function { name, args, .. } = match_expr else {
@@ -9149,7 +9149,7 @@ fn is_positive_fulltext_conjunct(filter: &Expr, match_fingerprint: u64) -> bool 
 /// Find a queryable FULLTEXT index whose column set exactly equals the
 /// MATCH column list (order-independent). MySQL requires an exact match —
 /// never a prefix — so we compare sorted, lower-cased name sets.
-fn find_matching_fulltext_index<'a>(
+pub(crate) fn find_matching_fulltext_index<'a>(
     table: &'a TableSchema,
     match_columns: &[String],
 ) -> Option<&'a IndexSchema> {

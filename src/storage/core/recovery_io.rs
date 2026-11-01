@@ -651,6 +651,7 @@ mod recovery_io_tests {
                     }
                 })
                 .collect::<Vec<_>>();
+            log.lock().append_reserved(lsn,0,WalPayload::CheckpointBegin).unwrap();
             let mut indexes = HashMap::new();
             redo_index_batch(
                 dir.path(),
@@ -1129,6 +1130,7 @@ mod recovery_index_lsn_tests {
         let log = Arc::new(parking_lot::Mutex::new(
             LogManager::open(dir.path()).unwrap(),
         ));
+        log.lock().append_reserved(10,0,WalPayload::CheckpointBegin).unwrap();
         let index = IndexFile::open_for_recovery(dir.path().join("new.idx"), log, 10).unwrap();
         let key = IndexKey::from(vec![KeyPart::Int(1)]);
         let row = RowId {

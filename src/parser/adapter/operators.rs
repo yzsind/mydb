@@ -72,6 +72,7 @@ fn parse_ordinary_sql(
     let bit_literals = super::literals::may_contain(sql);
     let mut tokens = super::literals::tokenize(dialect, sql)
         .map_err(|err| ParserError::TokenizerError(err.to_string()))?;
+    super::super::token_output::observe(sql, &tokens);
     if bit_literals {
         super::literals::normalize(&mut tokens);
     }

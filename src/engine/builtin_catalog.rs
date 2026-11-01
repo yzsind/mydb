@@ -507,23 +507,26 @@ scalar_catalog! {
             [("CONV", "conv"), ("GREATEST", "greatest"), ("LEAST", "least"), ("INSERT", "insert"), ("BIN_TO_UUID", "bin_to_uuid"), ("INET6_NTOA", "inet6_ntoa"), ("CONVERT_USING", "convert_using"), ("COLLATE", "collate")] => (Unknown, VarString, None, false);
         }
         LegacySession {
+            [("MAKEDATE", "makedate")] => (DateTimeImmutable, Date, (Temporal, 1, 2, Immutable, fixed_temporal_result(Date, true)), false);
+            [("TIMEDIFF", "timediff")] => (DateTimeImmutable, Time, (Temporal, 2, 2, Immutable, fixed_temporal_result(Time, true)), false);
+            [("PERIOD_ADD", "period_add"), ("PERIOD_DIFF", "period_diff")] => (DateTimeImmutable, VarString, ( Period, 2, 2, Immutable, fixed_integer_result(Big, false, true)), false);
+            [("CONVERT_TZ", "convert_tz")] => (Unknown, DateTime, ( Temporal, 2, 3, Stable, fixed_temporal_result(DateTime, true)), false);
+            [("TIME_FORMAT", "time_format")] => (DateTimeImmutable, VarString, None, false);
+            [("FORMAT_BYTES", "format_bytes"), ("FORMAT_PICO_TIME", "format_pico_time")] => (CheapString, VarString, None, false);
             [("HTTP_GET", "http_get"), ("HTTP_HEAD", "http_head"), ("HTTP_OPTIONS", "http_options"), ("HTTP_DELETE", "http_delete")] => (Volatile, Json, ( HttpRead, 1, 2, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
             [("HTTP_REQUEST", "http_request"), ("HTTP_POST", "http_post"), ("HTTP_PUT", "http_put"), ("HTTP_PATCH", "http_patch")] => (Volatile, Json, ( HttpWrite, 2, 3, Volatile, ExprType::new(ExprTypeKind::Json, true)), false);
             [("__TIMESTAMP_LITERAL", "__timestamp_literal")] => (Unknown, DateTime, None, true);
         }
         None {
             [("RAND_SEEDED", "rand_seeded")] => (IntegerArith, VarString, None, false);
-            [("FORMAT_BYTES", "format_bytes"), ("FORMAT_PICO_TIME", "format_pico_time"), ("VALIDATE_PASSWORD_STRENGTH", "validate_password_strength"), ("STATEMENT_DIGEST_TEXT", "statement_digest_text"), ("INTERVAL", "interval"), ("GROUPING", "grouping"), ("NAME_CONST", "name_const")] => (CheapString, VarString, None, false);
+            [("VALIDATE_PASSWORD_STRENGTH", "validate_password_strength"), ("STATEMENT_DIGEST_TEXT", "statement_digest_text"), ("INTERVAL", "interval"), ("GROUPING", "grouping"), ("NAME_CONST", "name_const")] => (CheapString, VarString, None, false);
             [("LOCATE", "locate"), ("INSTR", "instr"), ("POSITION", "position")] => (CheapString, LongLong, None, false);
             [("WEIGHT_STRING", "weight_string")] => (CheapString, Blob, None, true);
-            [("DAYNAME", "dayname"), ("MONTHNAME", "monthname"), ("TIME_FORMAT", "time_format")] => (DateTimeImmutable, VarString, None, false);
+            [("DAYNAME", "dayname"), ("MONTHNAME", "monthname")] => (DateTimeImmutable, VarString, None, false);
             [("TIME", "time")] => (DateTimeImmutable, VarString, (Temporal, 1, 2, Immutable, fixed_temporal_result(Time, true)), true);
-            [("MAKEDATE", "makedate")] => (DateTimeImmutable, Date, (Temporal, 1, 2, Immutable, fixed_temporal_result(Date, true)), false);
             [("MAKETIME", "maketime")] => (DateTimeImmutable, VarString, (Temporal, 3, 3, Immutable, fixed_temporal_result(Time, true)), false);
-            [("TIMEDIFF", "timediff")] => (DateTimeImmutable, Time, (Temporal, 2, 2, Immutable, fixed_temporal_result(Time, true)), false);
             [("TIMESTAMPDIFF", "timestampdiff")] => (DateTimeImmutable, LongLong, None, false);
             [("TIMESTAMPADD", "timestampadd"), ("ADDTIME", "addtime"), ("SUBTIME", "subtime")] => (DateTimeImmutable, DateTime, None, false);
-            [("PERIOD_ADD", "period_add"), ("PERIOD_DIFF", "period_diff")] => (DateTimeImmutable, VarString, ( Period, 2, 2, Immutable, fixed_integer_result(Big, false, true)), false);
             [("YEARWEEK", "yearweek")] => (DateTimeImmutable, VarString, ( YearWeek, 1, 2, Immutable, fixed_integer_result(Int, false, true)), false);
             [("FROM_UNIXTIME", "from_unixtime")] => (DateTimeStable, DateTime, ( Temporal, 1, 2, Stable, fixed_temporal_result(DateTime, true)), false);
             [("SYSTEM_USER", "system_user"), ("CURRENT_ROLE", "current_role"), ("CHARSET", "charset"), ("COLLATION", "collation"), ("ICU_VERSION", "icu_version")] => (SessionDependent, VarString, None, false);
@@ -547,7 +550,6 @@ scalar_catalog! {
             [("EXTRACT_COMPOUND", "extract_compound"), ("TO_SECONDS", "to_seconds"), ("__MEMBER_OF", "__member_of"), ("KEYRING_KEY_GENERATE", "keyring_key_generate"), ("KEYRING_KEY_STORE", "keyring_key_store"), ("KEYRING_KEY_REMOVE", "keyring_key_remove"), ("KEYRING_KEY_LENGTH", "keyring_key_length"), ("UNCOMPRESSED_LENGTH", "uncompressed_length")] => (Unknown, LongLong, None, false);
             [("SYSDATE", "sysdate")] => (Unknown, DateTime, ( CurrentTemporal, 0, 1, Stable, fixed_temporal_result(DateTime, false)), false);
             [("TIMESTAMP", "timestamp")] => (Unknown, DateTime, ( Temporal, 1, 2, Immutable, fixed_temporal_result(DateTime, true)), false);
-            [("CONVERT_TZ", "convert_tz")] => (Unknown, DateTime, ( Temporal, 2, 3, Stable, fixed_temporal_result(DateTime, true)), false);
             [("WEIGHT_STRING_TYPED", "weight_string_typed")] => (Unknown, Blob, None, true);
             [("JSON_SCHEMA_VALIDATION_REPORT", "json_schema_validation_report"), ("JSON_ARRAYAGG", "json_arrayagg"), ("JSON_OBJECTAGG", "json_objectagg")] => (Unknown, Json, None, false);
             [("VECTOR_DIM", "vector_dim")] => (Unknown, VarString, ( VectorDim, 1, 1, Immutable, fixed_integer_result(Int, false, true)), false);

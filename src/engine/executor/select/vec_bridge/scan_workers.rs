@@ -35,7 +35,7 @@ impl ScanWorkers {
         self
     }
 
-    fn finish(&mut self) -> Result<(), QueryError> {
+    pub(super) fn finish(&mut self) -> Result<(), QueryError> {
         self.finished = true;
         // Disconnect before joining: a queued batch owns its memory charge,
         // and a producer must never wait for a consumer that has exited.
@@ -52,6 +52,28 @@ impl ScanWorkers {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    /// Drain a ready peer without parking the coordinator while it still has
+    /// local work. A closed peer channel is joined by the final blocking pull.
+    pub(super) fn try_next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        if self.finished {
+            return Ok(None);
+        }
+        match self
+            .receiver
+            .as_ref()
+            .expect("scan workers started")
+            .try_recv()
+        {
+            Ok(Ok(batch)) => Ok(Some(batch.batch)),
+            Ok(Err(error)) => {
+                self.worker_context.cancellation().cancel_local();
+                let _ = self.finish();
+                Err(error)
+            }
+            Err(_) => Ok(None),
         }
     }
 
@@ -103,6 +125,30 @@ mod tests {
             budget,
         )
         .fork_worker_cancellation()
+    }
+
+    #[test]
+    fn ready_peer_poll_keeps_eof_and_failure_lifecycle() {
+        let budget = Arc::new(mem_budget::MemBudget::new(4096));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut group = ScanWorkers::new(context(budget), "test panic").with_channel(rx, vec![]);
+        assert!(group.try_next_batch().unwrap().is_none());
+        assert!(!group.finished);
+        drop(tx);
+        assert!(group.try_next_batch().unwrap().is_none());
+        assert!(!group.finished);
+        assert!(group.next_batch().unwrap().is_none());
+        assert!(group.finished);
+        assert!(group.try_next_batch().unwrap().is_none());
+
+        let budget = Arc::new(mem_budget::MemBudget::new(4096));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut group = ScanWorkers::new(context(budget), "test panic").with_channel(rx, vec![]);
+        let error = crate::error::catalog::ER_OUT_OF_RESOURCES.error("peer test failure");
+        tx.send(Err(error.clone())).unwrap();
+        assert_eq!(group.try_next_batch().unwrap_err(), error);
+        assert!(group.finished);
+        assert!(group.next_batch().unwrap().is_none());
     }
 
     #[test]

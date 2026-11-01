@@ -60,6 +60,9 @@ pub(super) fn try_parallel_projection<'a>(
         execution: ScanWorkers::new(context, "parallel projection worker panicked"),
         abort: Arc::new(AtomicBool::new(false)),
         active: Arc::new(AtomicUsize::new(0)),
+        local: None,
+        local_observed: false,
+        prefer_peer: false,
         key: analyze_stats::plan_key(peel_projection(plan)),
         _charge: Arc::new(charge),
     })))
@@ -73,6 +76,9 @@ struct ParallelProjection {
     execution: ScanWorkers,
     abort: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    local: Option<Box<dyn BatchOperator>>,
+    local_observed: bool,
+    prefer_peer: bool,
     key: Option<crate::planner::PlanNodeId>,
     _charge: Arc<mem_budget::ControlledMemoryCharge>,
 }
@@ -95,9 +101,14 @@ fn project(
         .iter()
         .map(|item| match item {
             VecResultProjection::Expr(program) => {
-                let reserve = program.column_retained_bound(&batch).unwrap_or(0);
+                let prepared = program.prepare_column(&batch);
+                let reserve = match &prepared {
+                    Some(prepared) => prepared.retained_bound(),
+                    None => program.column_retained_bound(&batch),
+                }
+                .unwrap_or(0);
                 retained.add_force(reserve)?;
-                let column = expr_batch::eval_to_column(program, &batch)?;
+                let column = expr_batch::eval_to_column_prepared(program, &batch, prepared)?;
                 let actual = column.memory_bytes();
                 if actual > reserve {
                     retained.add_force(actual - reserve)?;
@@ -153,13 +164,23 @@ fn project(
 
 impl ParallelProjection {
     fn start(&mut self) -> Result<(), QueryError> {
-        let Some(workers) = self.pending.take() else {
+        let Some(mut workers) = self.pending.take() else {
             return Ok(());
         };
         self.execution.txn_pressure = self
             .execution
             .worker_context
             .enter_parallel_read_pressure()?;
+        // The coordinator already owns an execution thread. Give it one
+        // partition while peers retain their independent, bounded exchange.
+        // Refusal preserves the existing worker execution for other sources.
+        for index in 0..workers.len() {
+            if let Some(local) = workers[index].take_coordinator_pull(self.abort.clone()) {
+                self.local = Some(local);
+                drop(workers.remove(index));
+                break;
+            }
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel(workers.len().saturating_mul(2).max(1));
         self.execution.receiver = Some(rx);
         for worker in workers {
@@ -233,6 +254,78 @@ impl BatchOperator for ParallelProjection {
     }
     fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
         self.start()?;
+        if self.execution.finished {
+            return Ok(None);
+        }
+        if self.local.is_some() {
+            if self.prefer_peer {
+                match self.execution.try_next_batch() {
+                    Ok(Some(batch)) => {
+                        self.prefer_peer = false;
+                        return Ok(Some(batch));
+                    }
+                    Err(error) => {
+                        self.abort.store(true, Ordering::Relaxed);
+                        self.local.take();
+                        return Err(error);
+                    }
+                    Ok(None) => {}
+                }
+            }
+            let context = self.execution.worker_context.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                context.cancellation().check()?;
+                let Some(batch) = self
+                    .local
+                    .as_mut()
+                    .expect("local scan installed")
+                    .next_batch()?
+                else {
+                    return Ok(None);
+                };
+                let rows = batch.visible_rows();
+                if rows == 0 {
+                    if let Some(peer) = self.execution.try_next_batch()? {
+                        return Ok(Some(peer));
+                    }
+                    continue;
+                }
+                return context.run(&self.db, || {
+                    if !self.local_observed {
+                        self.local_observed = true;
+                        self.active.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let batch = project(batch, &self.projection, &self.schema)?;
+                    analyze_stats::add_parallel_projection_runtime(
+                        self.key,
+                        rows as u64,
+                        self.active.load(Ordering::Relaxed) as u32,
+                    );
+                    Ok(Some(batch))
+                });
+            }))
+            .unwrap_or_else(|_| {
+                Err(crate::error::catalog::ER_UNKNOWN_ERROR
+                    .error("parallel projection worker panicked"))
+            });
+            match result {
+                Ok(Some(batch)) => {
+                    self.prefer_peer = true;
+                    return Ok(Some(batch));
+                }
+                Ok(None) => {
+                    self.local.take();
+                }
+                Err(error) => {
+                    let error = context.terminal_error(error);
+                    self.abort.store(true, Ordering::Relaxed);
+                    self.local.take();
+                    context.cancellation().cancel_local();
+                    let _ = self.execution.finish();
+                    return Err(error);
+                }
+            }
+        }
         self.execution.next_batch()
     }
 }
@@ -242,3 +335,6 @@ impl Drop for ParallelProjection {
         self.abort.store(true, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests;

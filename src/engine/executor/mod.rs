@@ -138,22 +138,7 @@ fn begin_statement_diagnostics(session: &mut SessionContext, sql: &str) -> bool 
     let preserve_warnings = preserves_statement_diagnostics(sql);
     crate::engine::perf_events::clear_thread_wait_samples();
     crate::engine::perf_events::start_statement_rows_examined();
-    crate::engine::api::clear_statement_warnings();
-    // Reset the per-statement NOW() freeze (B-24) so every top-level
-    // statement re-samples the wall clock exactly once, and every
-    // NOW()/CURRENT_TIMESTAMP/UNIX_TIMESTAMP call within it returns the
-    // same value — matching MySQL 8.0's documented behaviour.
-    crate::engine::api::clear_statement_now_freeze();
-    // Reset per-statement `RAND(N)` LCG state so `SELECT RAND(5)`
-    // executed twice returns the same first value both times, matching
-    // MySQL's documented seeded RAND repeatability.
-    crate::engine::expr::clear_statement_rand_state();
-    crate::engine::api::clear_statement_insert_id();
-    crate::engine::api::clear_statement_matched_rows();
-    let _ = crate::engine::api::take_statement_dml_candidate_rows();
-    crate::engine::api::clear_statement_info();
-    crate::engine::api::clear_insert_duplicates();
-    crate::engine::api::clear_statement_odku_stats();
+    reset_statement_expression_state();
     session.statement_insert_id = 0;
     crate::engine::perf_events::begin_statement(session, sql);
     if !preserve_warnings {
@@ -171,6 +156,19 @@ fn begin_statement_diagnostics(session: &mut SessionContext, sql: &str) -> bool 
         && !crate::engine::system::references_diagnostics_count(
             &normalize_sql(sql).to_ascii_uppercase(),
         )
+}
+
+fn reset_statement_expression_state() {
+    // Worker threads serve multiple statements and event invocations.
+    crate::engine::api::clear_statement_warnings();
+    crate::engine::api::clear_statement_now_freeze();
+    crate::engine::expr::clear_statement_rand_state();
+    crate::engine::api::clear_statement_insert_id();
+    crate::engine::api::clear_statement_matched_rows();
+    let _ = crate::engine::api::take_statement_dml_candidate_rows();
+    crate::engine::api::clear_statement_info();
+    crate::engine::api::clear_insert_duplicates();
+    crate::engine::api::clear_statement_odku_stats();
 }
 
 fn warn_statement_digest_charset_conversion(sql: &str) {
@@ -2524,6 +2522,26 @@ impl ResultCursor for ObservedStreamCursor {
         self.inner
             .as_ref()
             .map_or(1, |inner| inner.external_batch_rows())
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<crate::engine::api::ResultChunk>, QueryError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        match inner.next_chunk() {
+            Ok(Some(chunk)) => {
+                self.rows_sent = self.rows_sent.saturating_add(chunk.rows() as u64);
+                Ok(Some(chunk))
+            }
+            Ok(None) => {
+                self.finish(None);
+                Ok(None)
+            }
+            Err(error) => {
+                self.finish(Some(error.clone()));
+                Err(error)
+            }
+        }
     }
 
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {

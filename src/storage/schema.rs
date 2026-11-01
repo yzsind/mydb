@@ -3034,6 +3034,9 @@ pub enum ParamTarget {
         scale: u8,
     },
     Bytes,
+    Vector {
+        datatype: crate::vector::VectorDataType,
+    },
     /// SQL scalar coerced into the canonical binary-JSON representation used
     /// by functional indexes such as `JSON_EXTRACT(doc, '$.x')`.
     JsonScalar,
@@ -3361,8 +3364,10 @@ impl ParamTarget {
             DataTypeKind::Binary { .. }
             | DataTypeKind::VarBinary { .. }
             | DataTypeKind::Blob { .. }
-            | DataTypeKind::Geometry { .. }
-            | DataTypeKind::Vector { .. } => ParamTarget::Bytes,
+            | DataTypeKind::Geometry { .. } => ParamTarget::Bytes,
+            DataTypeKind::Vector { datatype, .. } => ParamTarget::Vector {
+                datatype: *datatype,
+            },
             // BIT is decoded off the heap as `Value::UInt` and its stored
             // index key is `KeyPart::UInt` (via `KeyPart::from_value`), so a
             // prepared-statement probe must build the same variant.
@@ -3674,6 +3679,8 @@ impl KeyPart {
             },
             ParamTarget::Bytes => match value {
                 Value::Bytes(b) => KeyPart::Bytes(b),
+                Value::Geometry(b) => KeyPart::Bytes(b),
+                Value::Vector(value) => KeyPart::Bytes(value.encode()),
                 value @ (Value::String(_) | Value::SmallString(_)) => {
                     let Value::Bytes(bytes) = crate::engine::expr::encode_binary_assignment_value(
                         value,
@@ -3687,6 +3694,9 @@ impl KeyPart {
                 Value::Decimal(s) => KeyPart::Bytes(s.into_bytes()),
                 other => KeyPart::Bytes(other.to_display_string().into_bytes()),
             },
+            ParamTarget::Vector { datatype } => KeyPart::Bytes(
+                crate::engine::vector::codec::coerce_comparison_value(&value, datatype)?.encode(),
+            ),
             ParamTarget::JsonScalar => match value {
                 Value::Json(bytes) => KeyPart::Bytes(bytes),
                 other => KeyPart::Bytes(crate::engine::json::scalar_from_value(&other)),
@@ -4920,18 +4930,18 @@ impl TableSchema {
                 // Leave a gap between columns: tokens in different columns are not adjacent, so phrases never match across columns.
                 next_pos = next_pos.saturating_add(u64::from(cfg.position_gap));
             }
-            let tokens = tokenizer.tokenize(&text);
+            let (tokens, extent) = tokenizer.positioned_tokens(&text);
             doc_len = doc_len.saturating_add(tokens.len() as u64);
             let last_position = (cfg.positions && !tokens.is_empty())
-                .then(|| next_pos.saturating_add(tokens.len() as u64 - 1));
+                .then(|| next_pos.saturating_add(tokens.last().unwrap().1));
             crate::storage::fulltext::payload::validate_document_extent(doc_len, last_position)?;
-            for token in tokens {
+            for (token, offset) in tokens {
                 positions_by_token
                     .entry(token)
                     .or_default()
-                    .push(next_pos as u32);
-                next_pos = next_pos.saturating_add(1);
+                    .push(next_pos.saturating_add(offset) as u32);
             }
+            next_pos = next_pos.saturating_add(extent);
         }
         Ok(positions_by_token
             .into_iter()

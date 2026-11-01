@@ -69,6 +69,7 @@ pub(crate) mod keyring;
 pub mod logging;
 pub(crate) mod memory_reclaimer;
 pub(crate) mod memory_status;
+pub(crate) mod mysql_regex;
 pub(crate) mod mysql_schema;
 pub mod params;
 pub mod password_policy;

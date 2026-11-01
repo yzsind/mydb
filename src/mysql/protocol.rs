@@ -1036,6 +1036,134 @@ pub(crate) fn vector_text_row_packet_into(
     write_text_row::<true>(row, payload, charset, Some(columns));
 }
 
+/// Encode borrowed batch cells with the same metadata rules as the row oracle.
+/// Variable-width values never acquire an intermediate owned Value.
+pub(crate) fn columnar_text_row_packet_into(
+    batch: &crate::engine::executor::vec::batch::Batch,
+    row: usize,
+    payload: &mut Vec<u8>,
+    charset: Option<&'static crate::charset::CharsetInfo>,
+    columns: &[Column],
+) {
+    use crate::engine::executor::vec::batch::ColumnVector;
+    payload.clear();
+    for (index, vector) in batch.columns().iter().enumerate() {
+        if vector.is_null(row) {
+            payload.push(0xfb);
+            continue;
+        }
+        let column = columns.get(index);
+        let charset = result_charset_for_column(charset, column);
+        macro_rules! integer {
+            ($value:expr, $raw:expr) => {{
+                if let Some(ColumnType::Bit { bits }) = column.map(|c| c.column_type) {
+                    let bytes = ($raw as u64).to_be_bytes();
+                    let width = usize::from(bits.max(1)).div_ceil(8);
+                    write_lenenc_string(payload, &bytes[bytes.len() - width..]);
+                } else {
+                    let mut buffer = itoa::Buffer::new();
+                    write_lenenc_string(payload, buffer.format($value).as_bytes());
+                }
+            }};
+        }
+        macro_rules! fixed {
+            ($value:expr) => {
+                write_text_value(
+                    payload,
+                    &$value,
+                    charset,
+                    column.and_then(|c| c.source.decimals),
+                    column.map(|c| c.column_type),
+                )
+            };
+        }
+        match vector {
+            ColumnVector::Utf8 { offsets, data, .. } => {
+                let bytes = &data[offsets[row] as usize..offsets[row + 1] as usize];
+                match std::str::from_utf8(bytes) {
+                    Ok(text) => write_text_string(payload, text, charset),
+                    Err(_) => write_lenenc_string(payload, bytes),
+                }
+            }
+            ColumnVector::Bytes { offsets, data, .. }
+            | ColumnVector::Geometry { offsets, data, .. } => {
+                write_lenenc_string(
+                    payload,
+                    &data[offsets[row] as usize..offsets[row + 1] as usize],
+                );
+            }
+            ColumnVector::Json { offsets, data, .. } => {
+                write_json_result(
+                    payload,
+                    &data[offsets[row] as usize..offsets[row + 1] as usize],
+                    charset,
+                );
+            }
+            ColumnVector::Generic { values } => write_text_value(
+                payload,
+                &values[row],
+                charset,
+                column.and_then(|c| c.source.decimals),
+                column.map(|c| c.column_type),
+            ),
+            ColumnVector::Bool { values, .. } => {
+                integer!(values.get(row) as i64, values.get(row) as u64)
+            }
+            ColumnVector::I64 { data, .. } => integer!(data[row], data[row]),
+            ColumnVector::U64 { data, .. } => integer!(data[row], data[row]),
+            ColumnVector::F64 { data, .. } => fixed!(Value::Double(data[row])),
+            ColumnVector::Date32 { data, .. } => fixed!(Value::Date(data[row])),
+            ColumnVector::Time64 { data, .. } => fixed!(Value::Time(data[row])),
+            ColumnVector::DateTime64 { data, .. } => fixed!(Value::DateTime(data[row])),
+            ColumnVector::Timestamp64 { data, .. } => fixed!(Value::Timestamp(data[row])),
+            ColumnVector::Decimal32 { data, scale, .. } => {
+                fixed!(Value::DecimalCompact(i64::from(data[row]), *scale))
+            }
+            ColumnVector::Decimal64 { data, scale, .. } => {
+                fixed!(Value::DecimalCompact(data[row], *scale))
+            }
+            _ => fixed!(vector.value_at(row)),
+        }
+    }
+}
+
+pub(crate) fn estimate_columnar_text_row_bytes(
+    batch: &crate::engine::executor::vec::batch::Batch,
+    row: usize,
+) -> usize {
+    use crate::engine::executor::vec::batch::ColumnVector;
+    batch
+        .columns()
+        .iter()
+        .map(|column| {
+            if column.is_null(row) {
+                return 1;
+            }
+            match column {
+                ColumnVector::Utf8 { offsets, .. }
+                | ColumnVector::Bytes { offsets, .. }
+                | ColumnVector::Json { offsets, .. }
+                | ColumnVector::Geometry { offsets, .. } => {
+                    9 + (offsets[row + 1] - offsets[row]) as usize
+                }
+                ColumnVector::Generic { values } => estimate_text_value_bytes(&values[row]),
+                ColumnVector::Null { .. } => 1,
+                ColumnVector::Bool { .. } | ColumnVector::I64 { .. } | ColumnVector::U64 { .. } => {
+                    22
+                }
+                ColumnVector::F64 { .. } => 26,
+                ColumnVector::Date32 { .. } => 12,
+                ColumnVector::Time64 { .. } => 32,
+                ColumnVector::DateTime64 { .. } | ColumnVector::Timestamp64 { .. } => 28,
+                ColumnVector::Decimal32 { .. } | ColumnVector::Decimal64 { .. } => 48,
+                ColumnVector::Decimal128 { .. } => 58,
+                ColumnVector::DecimalWide { .. } => 76,
+                _ => estimate_text_value_bytes(&column.value_at(row)),
+            }
+        })
+        .sum()
+}
+
 fn write_text_row<const VECTOR_TEXT: bool>(
     row: &[Value],
     payload: &mut Vec<u8>,
@@ -3040,6 +3168,94 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_columnar_text_matches_owned_rows_across_types_and_charsets() {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector},
+            schema::{BatchField, BatchSchema},
+        };
+        use std::sync::Arc;
+        let cases = vec![
+            (ColumnType::LongLong, Value::Int(i64::MIN)),
+            (ColumnType::LongLong, Value::UInt(u64::MAX)),
+            (ColumnType::Bit { bits: 63 }, Value::UInt(0x123456789abcdef)),
+            (ColumnType::Float, Value::Double(1.234567891)),
+            (ColumnType::Double, Value::Double(-1.25e30)),
+            (ColumnType::VarString, Value::String("你好 café \0".into())),
+            (ColumnType::Blob, Value::Bytes(vec![0, 0xff, 0xc0, 7])),
+            (ColumnType::Date, Value::Date(12345)),
+            (ColumnType::Time, Value::Time(-12345678901)),
+            (ColumnType::Time, Value::Time(i64::MIN)),
+            (ColumnType::Time, Value::Time(i64::MAX)),
+            (ColumnType::DateTime, Value::DateTime(1234567890123456)),
+            (
+                ColumnType::Decimal {
+                    precision: 18,
+                    scale: 4,
+                },
+                Value::DecimalCompact(-123456789, 4),
+            ),
+            (
+                ColumnType::Json,
+                Value::Json(
+                    crate::engine::json::parse_text(r#"{"a":[1,null,"你好"]}"#, 1, "test").unwrap(),
+                ),
+            ),
+        ];
+        let columns: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, _))| Column {
+                name: format!("c{i}"),
+                column_type: *kind,
+                source: crate::types::ColumnSource {
+                    decimals: Some(6),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let schema = Arc::new(BatchSchema::new(
+            columns
+                .iter()
+                .map(|column| BatchField {
+                    table: String::new(),
+                    alias: None,
+                    name: column.name.clone(),
+                    column_type: column.column_type,
+                    source: column.source.clone(),
+                })
+                .collect(),
+        ));
+        let batch = Batch::new(
+            schema,
+            cases
+                .into_iter()
+                .map(|(_, value)| ColumnVector::from_values(vec![value, Value::Null]))
+                .collect(),
+        );
+        for charset in [
+            None,
+            Some("utf8mb4"),
+            Some("latin1"),
+            Some("utf16"),
+            Some("binary"),
+        ] {
+            let info = crate::charset::resolve_result_charset(charset);
+            for row in 0..2 {
+                let mut expected = Vec::new();
+                text_row_packet_into_with_columns_info(
+                    &batch.row(row),
+                    &mut expected,
+                    info,
+                    Some(&columns),
+                );
+                let mut actual = Vec::new();
+                columnar_text_row_packet_into(&batch, row, &mut actual, info, &columns);
+                assert_eq!(actual, expected, "charset={charset:?}, row={row}");
+            }
+        }
+    }
 
     #[test]
     fn refactor_query_and_execute_parameter_wire_matrix() {

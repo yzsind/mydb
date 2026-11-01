@@ -3041,6 +3041,7 @@ where
             return Err(io::Error::other("COM_CHANGE_USER cleanup failed"));
         }
 
+        crate::engine::cursor_registry::named_close_for_connection(self.connection_id);
         self.clear_prepared();
         self.context = Box::new(context);
         self.init_connection_timeouts();
@@ -5864,6 +5865,7 @@ where
         )
         .await?;
         batch.flush().await?;
+        batch.begin_streaming_rows();
 
         let mut row_payload = Vec::new();
         let mut sent_rows = 0_u64;
@@ -5892,12 +5894,26 @@ where
                 encoding,
                 &mut row_payload,
             );
-            sequence_id = match &kill_notify {
-                Some(notify) => {
-                    write_cancellable_stream_packet(&mut batch, sequence_id, &row_payload, notify)
+            sequence_id = if let Some(next) = try_stage_stream_packet(
+                &mut batch,
+                sequence_id,
+                &row_payload,
+                kill_notify.as_deref(),
+            )? {
+                next
+            } else {
+                match &kill_notify {
+                    Some(notify) => {
+                        write_cancellable_stream_packet(
+                            &mut batch,
+                            sequence_id,
+                            &row_payload,
+                            notify,
+                        )
                         .await?
+                    }
+                    None => batch.write_packet_seq(sequence_id, &row_payload).await?,
                 }
-                None => batch.write_packet_seq(sequence_id, &row_payload).await?,
             };
             sent_rows = sent_rows.saturating_add(1);
         }
@@ -5946,6 +5962,7 @@ where
         )
         .await?;
         batch.flush().await?;
+        batch.begin_streaming_rows();
 
         let mut sent_rows = 0_u64;
 
@@ -5959,6 +5976,7 @@ where
         ));
         let found_rows = result.found_rows;
         let mut cursor = result.cursor;
+        let mut pending = PendingStreamRows::default();
         let external = cursor.external_io();
         let http = cursor.external_http_io();
         let batch_rows = if external {
@@ -5971,116 +5989,156 @@ where
         };
         let batch_bytes = stream_offload_batch_bytes();
 
+        let mut encoded = EncodedStreamRows::new();
+        let mut scratch = Vec::new();
+        let mut scratch_charge =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::ProtocolTransient,
+                0,
+            )
+            .expect("zero-byte protocol reservation cannot fail");
         loop {
-            let cols = Arc::clone(&columns);
-            let zf = Arc::clone(&zerofill);
-            let _admission = if external {
-                match if http {
-                    crate::engine::http::admit_coordinator()
-                } else {
-                    crate::engine::ai::runtime::admit_coordinator()
-                } {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        return finish_failed_stream(batch, sequence_id, &e, &mut self.text_batch)
-                            .await
-                    }
-                }
+            let ready = !external
+                && zerofill.is_none()
+                && match encoding {
+                    StreamRowEncoding::Text(charset) => pending.encode_ready_text(
+                        &columns,
+                        charset,
+                        &mut encoded,
+                        &mut scratch,
+                        batch_rows,
+                        batch_bytes,
+                    ),
+                    _ => false,
+                };
+            let (pull_err, exhausted) = if ready {
+                // Keep the same bounded scheduling cadence even when all
+                // packet writes fit the socket staging buffer immediately.
+                tokio::task::yield_now().await;
+                (None, false)
             } else {
-                None
-            };
-            let work = move || {
-                let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(batch_rows);
-                let mut encoded_bytes = 0usize;
-                let mut memory_charge =
-                    crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
-                        crate::engine::executor::mem_budget::ControlledMemoryCategory::ProtocolTransient,
-                        0,
-                    )
-                    .expect("zero-byte protocol reservation cannot fail");
-                let mut err: Option<QueryError> = None;
-                let mut exhausted = false;
-                let mut scratch = Vec::new();
-                while encoded.len() < batch_rows {
-                    match cursor.next_row() {
-                        Ok(Some(row)) => {
-                            let estimate = estimate_stream_row_bytes(&row, &cols, encoding);
-                            if let Err(e) = memory_charge.try_grow(estimate) {
-                                err = Some(e);
-                                break;
-                            }
-                            if scratch.try_reserve_exact(estimate).is_err() {
-                                memory_charge.shrink(estimate);
-                                err = Some(error(
-                                    crate::error::catalog::ER_OUTOFMEMORY,
-                                    "out of memory while encoding MySQL result row",
-                                ));
-                                break;
-                            }
-                            encode_stream_row(
-                                &row,
-                                cols.as_slice(),
-                                zf.as_deref(),
-                                encoding,
-                                &mut scratch,
-                            );
-                            if scratch.capacity() > estimate {
-                                if let Err(e) =
-                                    memory_charge.try_grow(scratch.capacity() - estimate)
-                                {
+                let cols = Arc::clone(&columns);
+                let zf = Arc::clone(&zerofill);
+                let _admission = if external {
+                    match if http {
+                        crate::engine::http::admit_coordinator()
+                    } else {
+                        crate::engine::ai::runtime::admit_coordinator()
+                    } {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            return finish_failed_stream(
+                                batch,
+                                sequence_id,
+                                &e,
+                                &mut self.text_batch,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    None
+                };
+                let work = move || {
+                    encoded.clear();
+                    let mut err: Option<QueryError> = None;
+                    let mut exhausted = false;
+                    while encoded.len() < batch_rows {
+                        match pending.next(cursor.as_mut()) {
+                            Ok(Some(row)) => {
+                                if let Err(e) = row.encode(
+                                    &cols,
+                                    zf.as_deref(),
+                                    encoding,
+                                    &mut scratch,
+                                    &mut scratch_charge,
+                                ) {
                                     err = Some(e);
                                     break;
                                 }
+                                if let Err(e) = encoded.push(&scratch) {
+                                    err = Some(e);
+                                    break;
+                                }
+                                if encoded.data.len() >= batch_bytes {
+                                    break;
+                                }
                             }
-                            encoded_bytes = encoded_bytes.saturating_add(scratch.capacity());
-                            encoded.push(std::mem::take(&mut scratch));
-                            if encoded_bytes >= batch_bytes {
+                            Ok(None) => {
+                                exhausted = true;
+                                break;
+                            }
+                            Err(e) => {
+                                err = Some(e);
                                 break;
                             }
                         }
-                        Ok(None) => {
-                            exhausted = true;
-                            break;
-                        }
-                        Err(e) => {
-                            err = Some(e);
-                            break;
-                        }
                     }
+                    (
+                        cursor,
+                        pending,
+                        encoded,
+                        scratch,
+                        scratch_charge,
+                        err,
+                        exhausted,
+                    )
+                };
+                let pulled = if http {
+                    crate::engine::http::spawn_coordinator(work)
+                } else if external {
+                    crate::engine::ai::runtime::spawn_coordinator(work)
+                } else {
+                    crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
                 }
-                (cursor, encoded, err, exhausted, memory_charge)
-            };
-            let pulled = if http {
-                crate::engine::http::spawn_coordinator(work)
-            } else if external {
-                crate::engine::ai::runtime::spawn_coordinator(work)
-            } else {
-                crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
-            }
-            .await;
-            let (ret_cursor, encoded, pull_err, exhausted, _encoded_charge) = match pulled {
-                Ok(tuple) => tuple,
-                Err(join_err) => {
-                    // Blocking task panicked — surface as an I/O error that
-                    // tears the connection, matching how the legacy loop's
-                    // `next_row` error propagated.
-                    let qerr = query_join_error(join_err);
-                    return Err(io::Error::new(io::ErrorKind::Other, qerr.message()));
-                }
-            };
-            cursor = ret_cursor;
+                .await;
+                let (
+                    ret_cursor,
+                    ret_pending,
+                    ret_encoded,
+                    ret_scratch,
+                    ret_scratch_charge,
+                    pull_err,
+                    exhausted,
+                ) = match pulled {
+                    Ok(tuple) => tuple,
+                    Err(join_err) => {
+                        // Blocking task panicked — surface as an I/O error that
+                        // tears the connection, matching how the legacy loop's
+                        // `next_row` error propagated.
+                        let qerr = query_join_error(join_err);
+                        return Err(io::Error::new(io::ErrorKind::Other, qerr.message()));
+                    }
+                };
+                cursor = ret_cursor;
+                pending = ret_pending;
+                encoded = ret_encoded;
+                scratch = ret_scratch;
+                scratch_charge = ret_scratch_charge;
 
-            for packet in &encoded {
+                (pull_err, exhausted)
+            };
+
+            for packet in encoded.iter() {
                 if let Some(err) = self.context.cancelled_error() {
                     return finish_failed_stream(batch, sequence_id, &err, &mut self.text_batch)
                         .await;
                 }
-                sequence_id = match &kill_notify {
-                    Some(notify) => {
-                        write_cancellable_stream_packet(&mut batch, sequence_id, packet, notify)
-                            .await?
+                sequence_id = if let Some(next) = try_stage_stream_packet(
+                    &mut batch,
+                    sequence_id,
+                    packet,
+                    kill_notify.as_deref(),
+                )? {
+                    next
+                } else {
+                    match &kill_notify {
+                        Some(notify) => {
+                            write_cancellable_stream_packet(&mut batch, sequence_id, packet, notify)
+                                .await?
+                        }
+                        None => batch.write_packet_seq(sequence_id, packet).await?,
                     }
-                    None => batch.write_packet_seq(sequence_id, packet).await?,
                 };
                 sent_rows = sent_rows.saturating_add(1);
             }
@@ -8534,6 +8592,308 @@ fn ensure_governed_scratch_capacity(
     Ok(())
 }
 
+#[derive(Default)]
+struct PendingStreamRows {
+    rows: std::vec::IntoIter<Vec<crate::types::Value>>,
+    indices: PendingVisibleRows,
+    columnar: Option<crate::engine::api::ResultBatch>,
+}
+
+#[derive(Default)]
+enum PendingVisibleRows {
+    #[default]
+    Empty,
+    Range(std::ops::Range<usize>),
+    Indices(std::vec::IntoIter<u32>),
+    Mask(std::iter::Peekable<crate::engine::executor::vec::bitmap::OwnedBitmapTrueIter>),
+}
+impl PendingVisibleRows {
+    fn peek(&mut self) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::Range(rows) => (rows.start < rows.end).then_some(rows.start),
+            Self::Indices(rows) => rows.as_slice().first().map(|row| *row as usize),
+            Self::Mask(rows) => rows.peek().copied(),
+        }
+    }
+}
+impl Iterator for PendingVisibleRows {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::Range(rows) => rows.next(),
+            Self::Indices(rows) => rows.next().map(|row| row as usize),
+            Self::Mask(rows) => rows.next(),
+        }
+    }
+}
+
+enum StreamResultRow<'a> {
+    Owned(Vec<crate::types::Value>),
+    Columnar(&'a crate::engine::executor::vec::batch::Batch, usize),
+}
+
+impl PendingStreamRows {
+    /// Drain only already-owned cells with bounded, allocation-free encoding.
+    /// This never calls the blocking cursor, grows memory or drops the batch.
+    /// A miss leaves the next row available to the ordinary blocking path.
+    fn encode_ready_text(
+        &mut self,
+        columns: &[Column],
+        charset: Option<&'static crate::charset::CharsetInfo>,
+        encoded: &mut EncodedStreamRows,
+        scratch: &mut Vec<u8>,
+        row_limit: usize,
+        byte_limit: usize,
+    ) -> bool {
+        use crate::engine::executor::vec::batch::ColumnVector;
+        let Some(charset) = charset.filter(|c| matches!(c.name, "utf8mb4" | "binary")) else {
+            return false;
+        };
+        let Some(owned) = self.columnar.as_ref() else {
+            return false;
+        };
+        let batch = &owned.batch;
+        if !self.rows.as_slice().is_empty()
+            || batch.columns().len() > 64
+            || !batch.columns().iter().all(|column| {
+                matches!(
+                    column,
+                    ColumnVector::Null { .. }
+                        | ColumnVector::Bool { .. }
+                        | ColumnVector::I64 { .. }
+                        | ColumnVector::U64 { .. }
+                        | ColumnVector::Utf8 { .. }
+                        | ColumnVector::Bytes { .. }
+                        | ColumnVector::Geometry { .. }
+                        | ColumnVector::Date32 { .. }
+                        | ColumnVector::Time64 { .. }
+                        | ColumnVector::DateTime64 { .. }
+                        | ColumnVector::Timestamp64 { .. }
+                        | ColumnVector::Decimal32 { .. }
+                        | ColumnVector::Decimal64 { .. }
+                )
+            })
+        {
+            return false;
+        }
+        encoded.clear();
+        let byte_limit = byte_limit.min(64 * 1024);
+        while encoded.len() < row_limit.min(256) {
+            let Some(row) = self.indices.peek() else {
+                break;
+            };
+            let bound = crate::mysql::protocol::estimate_columnar_text_row_bytes(batch, row);
+            let needed = encoded.data.len().saturating_add(8).saturating_add(bound);
+            if bound > 16 * 1024
+                || bound > scratch.capacity()
+                || needed > encoded.data.capacity()
+                || needed > byte_limit
+            {
+                break;
+            }
+            crate::mysql::protocol::columnar_text_row_packet_into(
+                batch,
+                row,
+                scratch,
+                Some(charset),
+                columns,
+            );
+            debug_assert!(scratch.len() <= bound);
+            // Capacity has been reserved and charged by an earlier blocking
+            // pull. No allocator/governor/reclaimer runs on the reactor.
+            encoded
+                .data
+                .extend_from_slice(&(scratch.len() as u64).to_le_bytes());
+            encoded.data.extend_from_slice(scratch);
+            encoded.rows += 1;
+            self.indices.next();
+        }
+        encoded.len() != 0
+    }
+
+    fn next<'a>(
+        &'a mut self,
+        cursor: &mut dyn crate::engine::api::ResultCursor,
+    ) -> Result<Option<StreamResultRow<'a>>, QueryError> {
+        use crate::engine::api::ResultChunk;
+        loop {
+            if let Some(row) = self.rows.next() {
+                return Ok(Some(StreamResultRow::Owned(row)));
+            }
+            if let Some(index) = self.indices.next() {
+                return Ok(Some(StreamResultRow::Columnar(
+                    &self.columnar.as_ref().expect("pending batch").batch,
+                    index,
+                )));
+            }
+            // Release the moved selection before refunding its batch owner.
+            self.indices = PendingVisibleRows::Empty;
+            self.columnar = None;
+            match cursor.next_chunk()? {
+                None => return Ok(None),
+                Some(ResultChunk::Row(row)) => return Ok(Some(StreamResultRow::Owned(row))),
+                Some(ResultChunk::Rows(rows)) => self.rows = rows.into_iter(),
+                Some(ResultChunk::Columnar(mut owned)) => {
+                    use crate::engine::executor::vec::batch::Selection;
+                    self.indices = match owned.batch.selection.take() {
+                        None => PendingVisibleRows::Range(0..owned.batch.num_rows()),
+                        Some(Selection::Range { start, len }) => PendingVisibleRows::Range(
+                            start as usize..start.saturating_add(len) as usize,
+                        ),
+                        Some(Selection::Indices(rows)) => {
+                            PendingVisibleRows::Indices(rows.into_iter())
+                        }
+                        Some(Selection::Mask(rows)) => {
+                            PendingVisibleRows::Mask(rows.into_iter_true().peekable())
+                        }
+                    };
+                    self.columnar = Some(owned);
+                }
+            }
+        }
+    }
+}
+
+impl StreamResultRow<'_> {
+    fn encode(
+        &self,
+        columns: &[Column],
+        zerofill: Option<&[u16]>,
+        encoding: StreamRowEncoding,
+        scratch: &mut Vec<u8>,
+        charge: &mut crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    ) -> Result<(), QueryError> {
+        let values;
+        let row = match self {
+            Self::Columnar(batch, index)
+                if matches!(encoding, StreamRowEncoding::Text(_)) && zerofill.is_none() =>
+            {
+                let StreamRowEncoding::Text(charset) = encoding else {
+                    unreachable!()
+                };
+                let estimate =
+                    crate::mysql::protocol::estimate_columnar_text_row_bytes(batch, *index);
+                ensure_governed_scratch_capacity(scratch, charge, estimate)?;
+                let old = scratch.capacity();
+                crate::mysql::protocol::columnar_text_row_packet_into(
+                    batch, *index, scratch, charset, columns,
+                );
+                charge.try_grow(scratch.capacity() - old)?;
+                return Ok(());
+            }
+            Self::Columnar(batch, index) => {
+                values = batch.row(*index);
+                &values
+            }
+            Self::Owned(row) => row,
+        };
+        ensure_governed_scratch_capacity(
+            scratch,
+            charge,
+            estimate_stream_row_bytes(row, columns, encoding),
+        )?;
+        let old = scratch.capacity();
+        encode_stream_row(row, columns, zerofill, encoding, scratch);
+        charge.try_grow(scratch.capacity() - old)
+    }
+}
+
+/// Contiguous packets retain one governed allocation per hand-off, rather
+/// than allocating and charging a separate vector for every result row.
+struct EncodedStreamRows {
+    data: Vec<u8>,
+    rows: usize,
+    charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl EncodedStreamRows {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            rows: 0,
+            charge: crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::ProtocolTransient,
+                0,
+            )
+            .expect("zero-byte protocol reservation cannot fail"),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.rows = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn push(&mut self, packet: &[u8]) -> Result<(), QueryError> {
+        let needed = self
+            .data
+            .len()
+            .checked_add(8)
+            .and_then(|n| n.checked_add(packet.len()))
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "result packet batch is too large",
+                )
+            })?;
+        if needed > self.data.capacity() {
+            let target = needed
+                .checked_next_power_of_two()
+                .unwrap_or(needed)
+                .max(4096);
+            // Spare capacity is optional; a tight memory limit must still be
+            // able to admit the exact bytes required by an indivisible row.
+            let old = self.data.capacity();
+            if self.charge.try_grow_optional(target - old) {
+                if self
+                    .data
+                    .try_reserve_exact(target - self.data.len())
+                    .is_err()
+                {
+                    self.charge.shrink(target - old);
+                    return Err(error(
+                        crate::error::catalog::ER_OUTOFMEMORY,
+                        "out of memory while encoding result batch",
+                    ));
+                }
+                let actual = self.data.capacity();
+                if actual > target {
+                    self.charge.try_grow(actual - target)?;
+                } else {
+                    self.charge.shrink(target - actual);
+                }
+            } else {
+                ensure_governed_scratch_capacity(&mut self.data, &mut self.charge, needed)?;
+            }
+        }
+        self.data
+            .extend_from_slice(&(packet.len() as u64).to_le_bytes());
+        self.data.extend_from_slice(packet);
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        let mut remaining = self.data.as_slice();
+        std::iter::from_fn(move || {
+            if remaining.is_empty() {
+                return None;
+            }
+            let len =
+                u64::from_le_bytes(remaining[..8].try_into().expect("packet length")) as usize;
+            let packet = &remaining[8..8 + len];
+            remaining = &remaining[8 + len..];
+            Some(packet)
+        })
+    }
+}
+
 fn estimate_stream_row_bytes(
     row: &[crate::types::Value],
     columns: &[Column],
@@ -8639,12 +8999,33 @@ fn stream_offload_batch_bytes() -> usize {
 /// Finish the current protocol frame after KILL QUERY, then let the caller
 /// emit ERR at the next row boundary. Dropping a partial write corrupts the
 /// protocol (including compressed frames). Only KILL CONNECTION may do so.
+/// Avoid constructing a socket-write future when a complete frame fits the
+/// already-admitted staging buffer. Keep connection KILL's original boundary.
+#[inline]
+fn try_stage_stream_packet<W: AsyncWrite + Unpin>(
+    batch: &mut PacketBatchWriter<'_, W>,
+    sequence_id: u8,
+    payload: &[u8],
+    notify: Option<&SessionHandle>,
+) -> io::Result<Option<u8>> {
+    if notify.is_some_and(|notify| notify.kill_flag().load(Ordering::Acquire)) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "connection killed during result write",
+        ));
+    }
+    Ok(batch.try_buffer_packet_seq(sequence_id, payload))
+}
+
 async fn write_cancellable_stream_packet<W: AsyncWrite + Unpin>(
     batch: &mut PacketBatchWriter<'_, W>,
     sequence_id: u8,
     payload: &[u8],
     notify: &SessionHandle,
 ) -> io::Result<u8> {
+    if let Some(next) = try_stage_stream_packet(batch, sequence_id, payload, Some(notify))? {
+        return Ok(next);
+    }
     let write = batch.write_packet_seq(sequence_id, payload);
     tokio::pin!(write);
     loop {
@@ -10042,6 +10423,21 @@ fn bind_sql_params(
 mod tests {
     use super::*;
 
+    #[test]
+    fn contiguous_stream_packets_preserve_empty_and_wide_packets_and_charge_capacity() {
+        let packets = vec![Vec::new(), vec![0, 255, 1], vec![42; 70000], vec![7; 4]];
+        let mut encoded = EncodedStreamRows::new();
+        for packet in &packets {
+            encoded.push(packet).unwrap();
+            assert_eq!(encoded.charge.bytes(), encoded.data.capacity());
+        }
+        assert_eq!(encoded.len(), packets.len());
+        assert_eq!(
+            encoded.iter().collect::<Vec<_>>(),
+            packets.iter().map(Vec::as_slice).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn peer_monitor_preserves_pipeline_bytes_and_observes_closed_transport() {
         use tokio::io::AsyncWriteExt;
@@ -10692,6 +11088,244 @@ mod tests {
             prepared.estimated_memory_bytes() - base,
             (3 * std::mem::size_of::<StmtParamType>()) as u64
         );
+    }
+
+    #[test]
+    fn pending_stream_rows_move_selections_preserve_duplicates_and_terminal_errors() {
+        use crate::engine::api::{ResultBatch, ResultChunk, ResultCursor};
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector, Selection},
+            bitmap::Bitmap,
+            schema::{BatchField, BatchSchema},
+        };
+        #[derive(Debug)]
+        struct Chunks(std::collections::VecDeque<Result<ResultChunk, QueryError>>);
+        impl ResultCursor for Chunks {
+            fn next_row(&mut self) -> Result<Option<Vec<crate::types::Value>>, QueryError> {
+                panic!("chunk reader must not request rows")
+            }
+            fn next_chunk(&mut self) -> Result<Option<ResultChunk>, QueryError> {
+                self.0.pop_front().transpose()
+            }
+        }
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "x".into(),
+            column_type: crate::types::ColumnType::LongLong,
+            source: Default::default(),
+        }]));
+        let make = |selection: Option<Selection>| {
+            let mut batch = Batch::new(
+                schema.clone(),
+                vec![ColumnVector::I64 {
+                    data: (0..130).collect(),
+                    nulls: None,
+                }],
+            );
+            batch.selection = selection;
+            Ok(ResultChunk::Columnar(ResultBatch {
+                batch,
+                charge: None,
+            }))
+        };
+        let mut mask = Bitmap::new_all_invalid(130);
+        for row in [0, 64, 129] {
+            mask.set(row, true);
+        }
+        let mut cursor = Chunks(std::collections::VecDeque::from([
+            Ok(ResultChunk::Row(vec![crate::types::Value::Int(7)])),
+            make(Some(Selection::Range { start: 1, len: 2 })),
+            make(Some(Selection::Indices(vec![2, 0, 2]))),
+            make(Some(Selection::Indices(Vec::new()))),
+            make(Some(Selection::Mask(mask))),
+            Ok(ResultChunk::Rows(vec![
+                vec![crate::types::Value::Int(8)],
+                vec![crate::types::Value::Int(9)],
+            ])),
+            Err(crate::engine::cancel::interrupted_error()),
+        ]));
+        let mut pending = PendingStreamRows::default();
+        let mut values = Vec::new();
+        loop {
+            match pending.next(&mut cursor) {
+                Ok(Some(StreamResultRow::Owned(row))) => values.push(row[0].clone()),
+                Ok(Some(StreamResultRow::Columnar(batch, row))) => {
+                    values.push(batch.columns()[0].value_at(row))
+                }
+                Ok(None) => panic!("terminal error was lost"),
+                Err(error) => {
+                    assert_eq!(error.code(), 1317);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            values,
+            [7, 1, 2, 2, 0, 2, 0, 64, 129, 8, 9].map(crate::types::Value::Int)
+        );
+        assert!(pending.columnar.is_none());
+    }
+
+    #[test]
+    fn ready_text_drain_preserves_selection_bytes_capacity_and_fallback_position() {
+        use crate::engine::api::ResultBatch;
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector},
+            bitmap::Bitmap,
+            schema::{BatchField, BatchSchema},
+        };
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "s".into(),
+            column_type: crate::types::ColumnType::VarString,
+            source: Default::default(),
+        }]));
+        let columns = vec![Column {
+            name: "s".into(),
+            column_type: crate::types::ColumnType::VarString,
+            source: Default::default(),
+        }];
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                crate::types::Value::String("数据库🙂".into()),
+                crate::types::Value::Null,
+                crate::types::Value::String("last".into()),
+            ])],
+        );
+        let mut mask = Bitmap::new_all_invalid(3);
+        mask.set(0, true);
+        mask.set(2, true);
+        for (indices, expected) in [
+            (PendingVisibleRows::Range(0..3), vec![0, 1, 2]),
+            (
+                PendingVisibleRows::Indices(vec![2, 0, 2].into_iter()),
+                vec![2, 0, 2],
+            ),
+            (
+                PendingVisibleRows::Mask(mask.into_iter_true().peekable()),
+                vec![0, 2],
+            ),
+        ] {
+            let mut pending = PendingStreamRows {
+                indices,
+                columnar: Some(ResultBatch {
+                    batch: batch.clone(),
+                    charge: None,
+                }),
+                ..Default::default()
+            };
+            let mut encoded = EncodedStreamRows::new();
+            encoded.push(b"").unwrap();
+            encoded.clear();
+            let mut scratch = Vec::new();
+            let utf8 = crate::charset::resolve_result_charset(Some("utf8mb4"));
+            // Missing capacity and converting charsets must leave the first row untouched.
+            assert!(!pending.encode_ready_text(
+                &columns,
+                utf8,
+                &mut encoded,
+                &mut scratch,
+                256,
+                65536
+            ));
+            assert_eq!(pending.indices.peek(), expected.first().copied());
+            scratch.reserve_exact(512);
+            let latin1 = crate::charset::resolve_result_charset(Some("latin1"));
+            assert!(!pending.encode_ready_text(
+                &columns,
+                latin1,
+                &mut encoded,
+                &mut scratch,
+                256,
+                65536
+            ));
+            assert_eq!(pending.indices.peek(), expected.first().copied());
+            let capacities = (
+                encoded.data.capacity(),
+                scratch.capacity(),
+                encoded.charge.bytes(),
+            );
+            assert!(pending.encode_ready_text(
+                &columns,
+                utf8,
+                &mut encoded,
+                &mut scratch,
+                256,
+                65536
+            ));
+            let oracle = expected
+                .iter()
+                .map(|row| {
+                    let mut packet = Vec::new();
+                    crate::mysql::protocol::text_row_packet_into_with_columns_info(
+                        &batch.row(*row),
+                        &mut packet,
+                        utf8,
+                        Some(&columns),
+                    );
+                    packet
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                encoded.iter().collect::<Vec<_>>(),
+                oracle.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                (
+                    encoded.data.capacity(),
+                    scratch.capacity(),
+                    encoded.charge.bytes()
+                ),
+                capacities
+            );
+            assert_eq!(pending.indices.peek(), None);
+        }
+        for value in [
+            crate::types::Value::String("x".repeat(20000)),
+            crate::types::Value::Double(1.25),
+        ] {
+            let mut pending = PendingStreamRows {
+                indices: PendingVisibleRows::Range(0..1),
+                columnar: Some(ResultBatch {
+                    batch: Batch::new(schema.clone(), vec![ColumnVector::from_values(vec![value])]),
+                    charge: None,
+                }),
+                ..Default::default()
+            };
+            let mut encoded = EncodedStreamRows::new();
+            encoded.push(b"").unwrap();
+            encoded.clear();
+            let mut scratch = Vec::with_capacity(32768);
+            assert!(!pending.encode_ready_text(
+                &columns,
+                crate::charset::resolve_result_charset(Some("utf8mb4")),
+                &mut encoded,
+                &mut scratch,
+                256,
+                65536
+            ));
+            assert_eq!(pending.indices.peek(), Some(0));
+        }
+    }
+
+    #[test]
+    fn encoded_stream_rows_clear_reuses_charged_capacity() {
+        let mut rows = EncodedStreamRows::new();
+        rows.push(b"first").unwrap();
+        rows.push(b"").unwrap();
+        let capacity = rows.data.capacity();
+        assert_eq!(rows.charge.bytes(), capacity);
+        rows.clear();
+        assert_eq!(rows.len(), 0);
+        assert_eq!(rows.iter().count(), 0);
+        assert_eq!(rows.data.capacity(), capacity);
+        assert_eq!(rows.charge.bytes(), capacity);
+        rows.push(b"next").unwrap();
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![b"next".as_slice()]);
+        assert_eq!(rows.charge.bytes(), capacity);
     }
 
     #[test]
@@ -13460,6 +14094,65 @@ mod tests {
         // Close the client so the session loop exits cleanly.
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    }
+
+    #[tokio::test]
+    async fn synchronous_stream_staging_preserves_codecs_sequences_and_connection_kill() {
+        for compressed in [false, true] {
+            let registry = SessionRegistry::new();
+            let handle = registry.register(7, "root".into(), "localhost".into(), "test".into());
+            let mut wire = Vec::new();
+            let mut codec = PacketCodec::plain();
+            if compressed {
+                codec.enable_zlib_compression();
+            }
+            let wide = vec![42; 70000];
+            {
+                let mut batch = codec.batch_writer(&mut wire);
+                assert_eq!(
+                    try_stage_stream_packet(&mut batch, 254, b"one", Some(&handle)).unwrap(),
+                    Some(255)
+                );
+                assert_eq!(
+                    try_stage_stream_packet(&mut batch, 255, b"", None).unwrap(),
+                    Some(0)
+                );
+                assert!(try_stage_stream_packet(&mut batch, 0, &wide, Some(&handle))
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    write_cancellable_stream_packet(&mut batch, 0, &wide, &handle)
+                        .await
+                        .unwrap(),
+                    1
+                );
+                registry.kill_connection(7).unwrap();
+                assert_eq!(
+                    try_stage_stream_packet(&mut batch, 1, b"must not stage", Some(&handle))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::ConnectionAborted
+                );
+                batch.finish().await.unwrap();
+            }
+            let mut reader = wire.as_slice();
+            let mut decoder = PacketCodec::plain();
+            if compressed {
+                decoder.enable_zlib_compression();
+            }
+            for (sequence, payload) in [
+                (254, b"one".as_slice()),
+                (255, b"".as_slice()),
+                (0, wide.as_slice()),
+            ] {
+                let packet = decoder.read_packet(&mut reader).await.unwrap().unwrap();
+                assert_eq!(
+                    (packet.sequence_id, packet.payload.as_slice()),
+                    (sequence, payload)
+                );
+            }
+            assert!(decoder.read_packet(&mut reader).await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

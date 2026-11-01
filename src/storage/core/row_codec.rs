@@ -770,6 +770,7 @@ fn write_mvcc_header(out: &mut Vec<u8>, header: RowHeader, has_external: bool) {
 /// but returns `Option<...>` for the corrupt-bytes case so the raw
 /// payload scan loop can skip rather than abort. Used by
 /// `HeapFile::scan_mvcc_payloads_range_until_with_policy`.
+#[inline(always)]
 pub(crate) fn peek_mvcc_header(input: &[u8]) -> Option<(RowHeader, usize, bool)> {
     read_mvcc_header(input).ok()
 }
@@ -777,6 +778,7 @@ pub(crate) fn peek_mvcc_header(input: &[u8]) -> Option<(RowHeader, usize, bool)>
 /// Public alias for the codec's internal `read_varint`, exposed so the
 /// raw-payload scan path can decode the layout-id varint without
 /// re-routing through a full payload decoder.
+#[inline(always)]
 pub(crate) fn read_varint_at(input: &[u8], pos: &mut usize) -> Result<u64, QueryError> {
     read_varint(input, pos)
 }
@@ -3258,6 +3260,8 @@ pub(crate) const OP_VAR_GEOMETRY: u8 = 30;
 pub(crate) const OP_VAR_VECTOR: u8 = 31;
 pub(crate) const OP_VAR_DECIMAL_WIDE: u8 = 32;
 pub(crate) const OP_TIMESTAMP: u8 = 33;
+pub(crate) const OP_TIME: u8 = 34;
+pub(crate) const OP_DATETIME: u8 = 35;
 
 /// Row-decode sink. Hot-path callers feed a `RowDecodeSink` to
 /// [`decode_row_into_sink_for_layout`] which dispatches per-column
@@ -3304,9 +3308,7 @@ pub trait RowDecodeSink {
     fn put_decimal_wide(&mut self, col: usize, magnitude: i128, scale: u8);
     fn put_date(&mut self, col: usize, days: i32);
     fn put_year(&mut self, col: usize, year: u8);
-    #[allow(dead_code)] // Reserved for codecs that preserve TIME as a typed lane.
     fn put_time(&mut self, col: usize, micros: i64);
-    #[allow(dead_code)] // Reserved for codecs that preserve DATETIME as a typed lane.
     fn put_datetime(&mut self, col: usize, micros: i64);
     fn put_timestamp(&mut self, col: usize, micros: i64) {
         self.put_value(col, Value::Timestamp(micros));
@@ -3835,7 +3837,9 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
             }
             let layout_col = &stored_columns[null_idx];
             let op = step.op_tag;
-            if op != OP_FALLBACK && (op < OP_VAR_DECIMAL || op == OP_TIMESTAMP) {
+            if op != OP_FALLBACK
+                && (op < OP_VAR_DECIMAL || matches!(op, OP_TIMESTAMP | OP_TIME | OP_DATETIME))
+            {
                 let fixed_off = layout.fixed_offsets[null_idx]
                     .expect("fixed fast-decode column must have an offset");
                 let width = step.src_width as usize;
@@ -3846,7 +3850,7 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
                     step.scale_or_fsp,
                     &input
                         [section.fixed_start + fixed_off..section.fixed_start + fixed_off + width],
-                );
+                )?;
                 continue;
             }
             if op >= OP_VAR_DECIMAL {
@@ -3931,11 +3935,13 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
         }
         let op = step.op_tag;
         // Fast fixed-width lane.
-        if op != OP_FALLBACK && (op < OP_VAR_DECIMAL || op == OP_TIMESTAMP) {
+        if op != OP_FALLBACK
+            && (op < OP_VAR_DECIMAL || matches!(op, OP_TIMESTAMP | OP_TIME | OP_DATETIME))
+        {
             let off = section.fixed_start + step.src_loc as usize;
             let w = step.src_width as usize;
             let bytes = &input[off..off + w];
-            put_fixed_through_sink(sink, dest, op, step.scale_or_fsp, bytes);
+            put_fixed_through_sink(sink, dest, op, step.scale_or_fsp, bytes)?;
             continue;
         }
         // Variable-length lane.
@@ -3965,7 +3971,7 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
         }
         // OP_FALLBACK: route through the legacy per-kind decoder and
         // hand the materialised `Value` to the sink. Used by
-        // Time/DateTime (FSP-dependent widths) and Enum/Set.
+        // Enum/Set and other legacy column kinds.
         let row_layout = row_layout.expect("fallback steps resolve their compiled layout");
         let stored_columns = &row_layout.columns;
         let layout = &row_layout.value_layout;
@@ -4000,14 +4006,14 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
     Ok(true)
 }
 
-#[inline]
+#[inline(always)]
 fn put_fixed_through_sink<S: RowDecodeSink>(
     sink: &mut S,
     dest: usize,
     op: u8,
     scale: u8,
     bytes: &[u8],
-) {
+) -> Result<(), QueryError> {
     match op {
         OP_INT_S1 => sink.put_i64(dest, bytes[0] as i8 as i64),
         OP_INT_S2 => sink.put_i64(
@@ -4090,6 +4096,8 @@ fn put_fixed_through_sink<S: RowDecodeSink>(
             sink.put_date(dest, days);
         }
         OP_YEAR => sink.put_year(dest, bytes[0]),
+        OP_TIME => sink.put_time(dest, read_signed_le_width(bytes)? * temporal_quantum(scale)),
+        OP_DATETIME => sink.put_datetime(dest, decode_datetime_micros(bytes, scale)?),
         OP_TIMESTAMP => {
             let width = bytes.len();
             let mut buf = [0u8; 8];
@@ -4111,6 +4119,7 @@ fn put_fixed_through_sink<S: RowDecodeSink>(
         OP_VECTOR_FIXED => sink.put_vector(dest, bytes),
         _ => sink.put_null(dest),
     }
+    Ok(())
 }
 
 #[inline(always)]
@@ -4208,16 +4217,17 @@ fn fast_op_for_kind(kind: &ColumnKind) -> (u8, u8, u8) {
                 (OP_VECTOR_FIXED, total as u8, 0)
             }
         }
-        ColumnKind::Timestamp { fsp } => {
+        ColumnKind::Time { fsp } | ColumnKind::DateTime { fsp } | ColumnKind::Timestamp { fsp } => {
             let Some(width) = fixed_width_for_kind(kind) else {
                 return (OP_FALLBACK, 0, 0);
             };
-            (OP_TIMESTAMP, width as u8, *fsp)
+            let op = match kind {
+                ColumnKind::Time { .. } => OP_TIME,
+                ColumnKind::DateTime { .. } => OP_DATETIME,
+                _ => OP_TIMESTAMP,
+            };
+            (op, width as u8, *fsp)
         }
-        // Time / DateTime have variable width depending on FSP; the fast
-        // loop expects a fixed width for non-zero op_tag. Push them
-        // through the fallback so correctness is unchanged.
-        ColumnKind::Time { .. } | ColumnKind::DateTime { .. } => (OP_FALLBACK, 0, 0),
         ColumnKind::Enum { .. } | ColumnKind::Set { .. } => (OP_FALLBACK, 0, 0),
         ColumnKind::Decimal { scale } => (OP_VAR_DECIMAL, 0, *scale),
         ColumnKind::DecimalWide { scale } => (OP_VAR_DECIMAL_WIDE, 0, *scale),
@@ -4744,6 +4754,26 @@ fn encode_fixed_for_kind(
     Ok(())
 }
 
+#[inline]
+fn decode_datetime_micros(input: &[u8], fsp: u8) -> Result<i64, QueryError> {
+    let stored = read_signed_le_width(input)?;
+    Ok(if stored == signed_min_for_width(input.len()) {
+        ZERO_DATETIME_SENTINEL
+    } else if let Some(parts) = decode_tagged_datetime_for_width(stored, fsp, input.len()) {
+        crate::types::encode_tagged_datetime(
+            parts.0, parts.1, parts.2, parts.3, parts.4, parts.5, parts.6,
+        )
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "invalid tagged datetime payload",
+            )
+        })?
+    } else {
+        stored * temporal_quantum(fsp)
+    })
+}
+
 fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, QueryError> {
     let mut pos = 0usize;
     match kind {
@@ -4766,28 +4796,7 @@ fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, Query
         ColumnKind::Time { fsp } => Ok(Value::Time(
             read_signed_le_width(input)? * temporal_quantum(*fsp),
         )),
-        ColumnKind::DateTime { fsp } => {
-            let stored = read_signed_le_width(input)?;
-            Ok(Value::DateTime(
-                if stored == signed_min_for_width(input.len()) {
-                    ZERO_DATETIME_SENTINEL
-                } else if let Some(parts) =
-                    decode_tagged_datetime_for_width(stored, *fsp, input.len())
-                {
-                    crate::types::encode_tagged_datetime(
-                        parts.0, parts.1, parts.2, parts.3, parts.4, parts.5, parts.6,
-                    )
-                    .ok_or_else(|| {
-                        error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "invalid tagged datetime payload",
-                        )
-                    })?
-                } else {
-                    stored * temporal_quantum(*fsp)
-                },
-            ))
-        }
+        ColumnKind::DateTime { fsp } => Ok(Value::DateTime(decode_datetime_micros(input, *fsp)?)),
         ColumnKind::Timestamp { fsp } => {
             let stored = read_signed_le_width(input)?;
             Ok(Value::Timestamp(
@@ -6819,6 +6828,55 @@ mod row_codec_tests {
         assert_eq!(skip, buf.len());
         let decoded = decode_row(&buf).unwrap();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn temporal_fixed_sinks_preserve_every_fsp_zero_and_tagged_components() {
+        for fsp in 0..=6 {
+            for kind in [
+                ColumnKind::Time { fsp },
+                ColumnKind::DateTime { fsp },
+                ColumnKind::Timestamp { fsp },
+            ] {
+                let values = match kind {
+                    ColumnKind::Time { .. } => vec![
+                        Value::Time(0),
+                        Value::Time(-1),
+                        Value::Time(3_020_399_999_999),
+                        Value::Time(-3_020_399_999_999),
+                    ],
+                    ColumnKind::DateTime { .. } => vec![
+                        Value::DateTime(ZERO_DATETIME_SENTINEL),
+                        Value::DateTime(-1),
+                        Value::DateTime(1_704_067_200_123_456),
+                        Value::DateTime(
+                            crate::types::encode_tagged_datetime(2014, 2, 31, 23, 59, 59, 123456)
+                                .unwrap(),
+                        ),
+                        Value::DateTime(
+                            crate::types::encode_tagged_datetime(2024, 0, 0, 0, 0, 0, 0).unwrap(),
+                        ),
+                    ],
+                    _ => vec![
+                        Value::Timestamp(ZERO_DATETIME_SENTINEL),
+                        Value::Timestamp(-1),
+                        Value::Timestamp(1_704_067_200_123_456),
+                    ],
+                };
+                let (op, width, scale) = fast_op_for_kind(&kind);
+                assert!(matches!(op, OP_TIME | OP_DATETIME | OP_TIMESTAMP));
+                assert_eq!(width as usize, fixed_width_for_kind(&kind).unwrap());
+                for value in values {
+                    let mut encoded = vec![0; width as usize];
+                    encode_fixed_for_kind(&kind, &value, &mut encoded).unwrap();
+                    let expected = decode_fixed_for_kind(&kind, &encoded).unwrap();
+                    let mut output = vec![Value::Null];
+                    put_fixed_through_sink(&mut ValueVecSink(&mut output), 0, op, scale, &encoded)
+                        .unwrap();
+                    assert_eq!(output[0], expected, "{kind:?}: {value:?}");
+                }
+            }
+        }
     }
 
     #[test]

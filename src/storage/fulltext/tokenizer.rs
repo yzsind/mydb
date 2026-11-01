@@ -79,12 +79,36 @@ fn parse_env_usize(key: &str, default: usize) -> usize {
 pub trait Tokenizer: Send + Sync {
     /// Split a piece of text into normalized tokens (duplicates included, order preserved).
     fn tokenize(&self, text: &str) -> Vec<String>;
-    /// Visit normalized tokens without allocating a token vector. Implementations
-    /// may borrow unchanged text; the default preserves the tokenization oracle.
-    fn visit_tokens<'a>(&self, text: &'a str, visit: &mut dyn FnMut(std::borrow::Cow<'a, str>)) {
-        for token in self.tokenize(text) {
-            visit(std::borrow::Cow::Owned(token));
+    /// Unfiltered words for exact phrase verification. Ngram tokenizers retain
+    /// their established token adjacency semantics.
+    fn raw_tokens(&self, text: &str) -> Vec<String> {
+        self.tokenize(text)
+    }
+    /// Raw word offsets must survive stopword and length filtering.
+    fn positioned_tokens(&self, text: &str) -> (Vec<(String, u64)>, u64) {
+        let tokens = self.tokenize(text);
+        let extent = tokens.len() as u64;
+        (
+            tokens
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (t, i as u64))
+                .collect(),
+            extent,
+        )
+    }
+    /// Visit indexed terms with their original word offsets. The returned
+    /// extent includes filtered words and keeps multi-column offsets stable.
+    fn visit_positioned_tokens<'a>(
+        &self,
+        text: &'a str,
+        visit: &mut dyn FnMut(std::borrow::Cow<'a, str>, u64),
+    ) -> u64 {
+        let (tokens, extent) = self.positioned_tokens(text);
+        for (token, position) in tokens {
+            visit(std::borrow::Cow::Owned(token), position);
         }
+        extent
     }
     /// MySQL `WITH PARSER` name: `""` for the default tokenizer (not displayed), `"ngram"` for ngram.
     /// SHOW CREATE TABLE / catalog use the persisted `FulltextMeta.parser` (no tokenizer rebuild
@@ -194,28 +218,6 @@ impl DefaultTokenizer {
 }
 
 impl Tokenizer for DefaultTokenizer {
-    fn visit_tokens<'a>(&self, text: &'a str, visit: &mut dyn FnMut(std::borrow::Cow<'a, str>)) {
-        if !text.is_ascii() {
-            for token in self.tokenize(text) {
-                visit(std::borrow::Cow::Owned(token));
-            }
-            return;
-        }
-        for word in text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
-            if word.len() < self.cfg.min_token_size || word.len() > self.cfg.max_token_size {
-                continue;
-            }
-            let token = if word.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                std::borrow::Cow::Owned(word.to_ascii_lowercase())
-            } else {
-                std::borrow::Cow::Borrowed(word)
-            };
-            if !is_stopword(&self.cfg, &token) {
-                visit(token);
-            }
-        }
-    }
-
     fn tokenize(&self, text: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
@@ -229,6 +231,60 @@ impl Tokenizer for DefaultTokenizer {
         }
         self.flush(&mut cur, &mut out);
         out
+    }
+
+    fn raw_tokens(&self, text: &str) -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    fn positioned_tokens(&self, text: &str) -> (Vec<(String, u64)>, u64) {
+        let mut tokens = Vec::new();
+        let extent = self.visit_positioned_tokens(text, &mut |token, position| {
+            tokens.push((token.into_owned(), position))
+        });
+        (tokens, extent)
+    }
+    fn visit_positioned_tokens<'a>(
+        &self,
+        text: &'a str,
+        visit: &mut dyn FnMut(std::borrow::Cow<'a, str>, u64),
+    ) -> u64 {
+        use std::borrow::Cow;
+        let mut extent = 0;
+        for word in text
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+        {
+            let position = extent;
+            extent += 1;
+            let token = if word.is_ascii() {
+                if word.len() < self.cfg.min_token_size || word.len() > self.cfg.max_token_size {
+                    continue;
+                }
+                if word.bytes().any(|b| b.is_ascii_uppercase()) {
+                    Cow::Owned(word.to_ascii_lowercase())
+                } else {
+                    Cow::Borrowed(word)
+                }
+            } else {
+                Cow::Owned(word.to_lowercase())
+            };
+            let len = if token.is_ascii() {
+                token.len()
+            } else {
+                token.chars().count()
+            };
+            if len >= self.cfg.min_token_size
+                && len <= self.cfg.max_token_size
+                && !is_stopword(&self.cfg, &token)
+            {
+                visit(token, position);
+            }
+        }
+        extent
     }
 
     fn parser_name(&self) -> &'static str {

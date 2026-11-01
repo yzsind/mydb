@@ -7,6 +7,7 @@ pub(crate) use eval::aggregate_function_result_type;
 mod explain;
 pub(super) mod external_sort;
 pub(in crate::engine::executor) mod fulltext_context;
+pub(crate) mod fulltext_row;
 pub(crate) mod grace;
 pub(crate) mod hybrid;
 pub(crate) mod join_stream;

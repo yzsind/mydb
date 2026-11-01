@@ -242,6 +242,16 @@ impl<'a> RegexpRead<'a> {
                 crate::engine::expr::mysql_regex_for_operand(pattern, flags.as_ref(), false).ok()
             })
         })?;
+        let input_bytes = match input {
+            ColumnVector::Utf8 { data, .. } => data.as_slice(),
+            _ => &[],
+        };
+        let line_free = regex.line_free(input_bytes);
+        let _memory = if line_free {
+            None
+        } else {
+            regex.search_scope_bytes(input_bytes).ok()?
+        };
         let mut numbers = Vec::new();
         let mut data = Vec::new();
         let mut offsets = Vec::new();
@@ -260,14 +270,27 @@ impl<'a> RegexpRead<'a> {
             if !input.is_null(row) {
                 let text = std::str::from_utf8(bytes_at(input, row)?).ok()?;
                 if matches!(self.kind, Kind::Like) {
-                    number = i64::from(regex.is_match(text));
+                    number = i64::from(if line_free {
+                        regex.is_match_line_free(text)
+                    } else {
+                        regex.is_match(text)
+                    });
                 } else {
                     let start = if self.pos == 1 {
                         0
                     } else {
-                        crate::engine::expr::regexp_start_byte(text, self.pos).ok()?
+                        if matches!(self.kind, Kind::Substr) {
+                            crate::engine::expr::regexp_start_byte_allow_end(text, self.pos).ok()?
+                        } else {
+                            crate::engine::expr::regexp_start_byte(text, self.pos).ok()?
+                        }
                     };
-                    let found = if self.occurrence == 1 {
+                    let found = if matches!(self.kind, Kind::Substr) {
+                        regex
+                            .find_iter(text)
+                            .filter(|m| m.start() >= start)
+                            .nth(self.occurrence - 1)
+                    } else if self.occurrence == 1 {
                         regex.find(&text[start..])
                     } else {
                         regex.find_iter(&text[start..]).nth(self.occurrence - 1)

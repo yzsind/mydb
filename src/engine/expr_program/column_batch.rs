@@ -6,12 +6,15 @@ mod crypto_read;
 mod format_read;
 mod integer_string;
 mod json;
+mod lookup_read;
 mod numeric_read;
 mod producer;
 mod regexp_read;
+mod session_read;
 mod string_read;
 mod temporal_read;
 mod temporal_shift;
+mod temporal_value;
 mod unsigned_read;
 use super::*;
 use crate::engine::executor::vec::expr_batch::{
@@ -31,12 +34,15 @@ use crypto_read::CryptoRead;
 use format_read::FormatRead;
 use integer_string::IntegerString;
 use json::JsonRead;
+use lookup_read::LookupRead;
 use numeric_read::NumericRead;
 use producer::Producer;
 use regexp_read::RegexpRead;
+use session_read::SessionRead;
 use string_read::StringRead;
 use temporal_read::TemporalRead;
 use temporal_shift::TemporalShift;
+use temporal_value::TemporalValue;
 use unsigned_read::UnsignedRead;
 
 #[derive(Clone, Copy)]
@@ -61,6 +67,66 @@ thread_local! {
     static CONTRACT_BIND_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A workspace proof is tied to the immutable program and batch it sizes.
+/// Projection admission can reuse it instead of traversing variable values twice.
+pub(crate) struct ColumnEvaluation<'a> {
+    program: &'a ExprProgram,
+    batch: &'a Batch,
+    payload: usize,
+    work: usize,
+    generation: u64,
+    session_dependent: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl ColumnEvaluation<'_> {
+    pub(crate) fn retained_bound(&self) -> Option<usize> {
+        self.payload.checked_mul(2)
+    }
+    pub(crate) fn output_bound(&self) -> Option<usize> {
+        let capacity = self.retained_bound()?;
+        (capacity <= crate::engine::executor::vec::evaluated_batch::byte_target().saturating_mul(2))
+            .then_some(capacity)
+    }
+    pub(crate) fn evaluate(self) -> Option<ColumnVector> {
+        if self.generation != crate::engine::params::current_params_generation() {
+            return None;
+        }
+        let (payload, work) = if self.session_dependent {
+            let sized = workspace(&self.program.root, self.batch)?;
+            if sized.0 > self.payload {
+                return None;
+            }
+            sized
+        } else {
+            (self.payload, self.work)
+        };
+        let work = if matches!(self.program.root, ExprNode::Column(_)) {
+            payload
+        } else {
+            work
+        };
+        let column = if work
+            > crate::engine::executor::vec::evaluated_batch::byte_target().saturating_mul(2)
+        {
+            evaluate_in_chunks(
+                &self.program.root,
+                self.batch,
+                self.program.referenced_columns(),
+                payload,
+                work,
+            )?
+        } else {
+            let mut scratch = self.batch.memory_charge();
+            if !scratch.add_within(work.checked_mul(2)?, usize::MAX) {
+                return None;
+            }
+            evaluate(&self.program.root, self.batch)?
+        };
+        record_column_eval_rows(self.batch.visible_rows() as u64);
+        Some(column)
+    }
+}
+
 impl ExprProgram {
     /// Value-only kernels retain the same scalar fallback and diagnostic order.
     pub(crate) fn has_column_contract(&self, schema: &BatchSchema) -> bool {
@@ -83,31 +149,116 @@ impl ExprProgram {
         let capacity = payload.checked_mul(2)?;
         (capacity <= limit).then_some(capacity)
     }
+    pub(crate) fn prepare_column<'a>(&'a self, batch: &'a Batch) -> Option<ColumnEvaluation<'a>> {
+        if batch.selection().is_some() {
+            return None;
+        }
+        let proof = contract(&self.root, batch.schema())?;
+        let (payload, work) = workspace(&self.root, batch)?;
+        Some(ColumnEvaluation {
+            program: self,
+            batch,
+            payload,
+            work,
+            generation: crate::engine::params::current_params_generation(),
+            session_dependent: !proof.parallel,
+            _thread: std::marker::PhantomData,
+        })
+    }
     pub(crate) fn try_eval_column(&self, batch: &Batch) -> Option<ColumnVector> {
+        if batch.selection().is_none() {
+            let mut prepared = self.prepare_column(batch)?;
+            // No execution binding can change within this synchronous call.
+            prepared.session_dependent = false;
+            return prepared.evaluate();
+        }
         contract(&self.root, batch.schema())?;
-        let column = if batch.selection().is_some() {
-            evaluate_selected(&self.root, batch)?
-        } else {
-            let (payload, work) = workspace(&self.root, batch)?;
-            let work = if matches!(self.root, ExprNode::Column(_)) {
-                payload
-            } else {
-                work
-            };
-            if work > crate::engine::executor::vec::evaluated_batch::byte_target().saturating_mul(2)
-            {
-                evaluate_in_chunks(&self.root, batch, self.referenced_columns(), payload, work)?
-            } else {
-                let mut scratch = batch.memory_charge();
-                if !scratch.add_within(work.checked_mul(2)?, usize::MAX) {
-                    return None;
-                }
-                evaluate(&self.root, batch)?
-            }
-        };
-        let rows = batch.visible_rows() as u64;
-        record_column_eval_rows(rows);
+        let column = evaluate_selected(&self.root, batch)?;
+        record_column_eval_rows(batch.visible_rows() as u64);
         Some(column)
+    }
+}
+
+/// Escaped lazy calls may bind syntax without executing their constant
+/// functions. Only a primitive integer sign is folded at this boundary.
+fn fold_bound_integer_sign(node: ExprNode) -> ExprNode {
+    if matches!(&node,ExprNode::Unary {expr,..} if matches!(expr.as_ref(),ExprNode::Const(Value::Int(..)|Value::UInt(..))))
+    {
+        fold_constants(node)
+    } else {
+        node
+    }
+}
+fn bounded_bound_literals(args: &[Expr]) -> bool {
+    use crate::engine::executor::memory_footprint::AllocatedBytes;
+    !args.iter().any(|arg| {
+        crate::parser::visit::any_expr(arg, |node| match node {
+            Expr::Literal(Literal::String(text) | Literal::Decimal(text)) => text.len() > 4096,
+            Expr::Literal(Literal::HexBytes(bytes) | Literal::BitBytes(bytes)) => {
+                bytes.len() > 4096
+            }
+            Expr::BoundValue(value) => value.allocated_bytes() > 4096,
+            _ => false,
+        })
+    })
+}
+fn cheap_time_operand(node: &ExprNode, schema: &BatchSchema) -> bool {
+    match node {
+        ExprNode::Const(
+            Value::Null
+            | Value::Int(..)
+            | Value::UInt(..)
+            | Value::Float(..)
+            | Value::Double(..)
+            | Value::Decimal(..)
+            | Value::DecimalWide(..)
+            | Value::DecimalCompact(..)
+            | Value::Decimal128(..),
+        ) => true,
+        ExprNode::Placeholder(index) => {
+            crate::engine::params::with_current_param(*index, |value| {
+                matches!(
+                    value,
+                    Some(
+                        Value::Null
+                            | Value::Int(..)
+                            | Value::UInt(..)
+                            | Value::Float(..)
+                            | Value::Double(..)
+                            | Value::Decimal(..)
+                            | Value::DecimalWide(..)
+                            | Value::DecimalCompact(..)
+                            | Value::Decimal128(..)
+                    )
+                )
+            })
+        }
+        ExprNode::Column(_) => contract(node, schema).is_some_and(|proof| {
+            matches!(
+                proof.domain,
+                Domain::Integer(..)
+                    | Domain::Unsigned
+                    | Domain::Exact
+                    | Domain::Approximate
+                    | Domain::Null
+            )
+        }),
+        ExprNode::Binary { left, right, .. } => {
+            cheap_time_operand(left, schema)
+                && cheap_time_operand(right, schema)
+                && contract(node, schema).is_some_and(|proof| {
+                    proof.parallel
+                        && matches!(
+                            proof.domain,
+                            Domain::Integer(..)
+                                | Domain::Unsigned
+                                | Domain::Exact
+                                | Domain::Approximate
+                                | Domain::Null
+                        )
+                })
+        }
+        _ => false,
     }
 }
 
@@ -243,6 +394,17 @@ fn string_bound(node: &ExprNode, schema: &BatchSchema) -> Option<u64> {
 }
 
 fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
+    if let Some(read) = LookupRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = SessionRead::bind(node) {
+        return Some(read.contract());
+    }
+
+    if let Some(read) = TemporalValue::bind(node, schema) {
+        return Some(read.contract());
+    }
+
     #[cfg(test)]
     CONTRACT_BIND_VISITS.with(|visits| visits.set(visits.get() + 1));
     if let Some(read) = NumericRead::bind(node, schema) {
@@ -704,6 +866,17 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
 /// Bound speculative owned buffers from actual lanes, including intermediate
 /// columns. A small numeric result must not admit an enormous string child.
 fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
+    if let Some(read) = LookupRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+    if let Some(read) = SessionRead::bind(node) {
+        return read.workspace(batch);
+    }
+
+    if let Some(read) = TemporalValue::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+
     if let Some(read) = NumericRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
@@ -1138,6 +1311,18 @@ fn operand<'a>(node: &ExprNode, batch: &'a Batch) -> Option<std::borrow::Cow<'a,
 }
 
 fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
+    if let Some(read) = LookupRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+
+    if let Some(read) = SessionRead::bind(node) {
+        return read.evaluate(batch);
+    }
+
+    if let Some(read) = TemporalValue::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+
     if let Some(read) = NumericRead::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }
@@ -1568,22 +1753,29 @@ fn slice(column: &ColumnVector, start: i64, len: Option<i64>) -> Option<ColumnVe
                 }
             } else {
                 let value = std::str::from_utf8(bytes).ok()?;
-                let n = value.chars().count() as i128;
-                let pos = if start > 0 {
-                    i128::from(start) - 1
+                let begin = if start > 0 {
+                    usize::try_from(start - 1)
+                        .ok()
+                        .and_then(|n| value.char_indices().nth(n).map(|(i, _)| i))
                 } else if start < 0 {
-                    n + i128::from(start)
+                    usize::try_from(start.unsigned_abs() - 1)
+                        .ok()
+                        .and_then(|n| value.char_indices().rev().nth(n).map(|(i, _)| i))
                 } else {
-                    n
+                    None
                 };
-                if pos >= 0 && pos < n {
-                    let take = len.map_or(usize::MAX, |l| {
-                        usize::try_from(l.max(0)).unwrap_or(usize::MAX)
-                    });
-                    for ch in value.chars().skip(pos as usize).take(take) {
-                        let mut buffer = [0; 4];
-                        output.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
-                    }
+                if let Some(begin) = begin {
+                    let end = match len {
+                        None => value.len(),
+                        Some(n) if n <= 0 => begin,
+                        Some(n) => usize::try_from(n)
+                            .ok()
+                            .and_then(|n| {
+                                value[begin..].char_indices().nth(n).map(|(i, _)| begin + i)
+                            })
+                            .unwrap_or(value.len()),
+                    };
+                    output.extend_from_slice(&bytes[begin..end]);
                 }
             }
         }

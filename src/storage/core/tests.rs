@@ -5772,6 +5772,10 @@ fn buffer_pool_dirty_oldest_heap_stays_bounded_under_reflush() {
     let mut lsn = 1_u64;
     for _cycle in 0..CYCLES {
         for page_id in 0..PAGES {
+            pool.log
+                .lock()
+                .append(0, WalPayload::CheckpointBegin)
+                .unwrap();
             pool.store_page(
                 PageKey {
                     file: file.clone(),
@@ -5917,6 +5921,12 @@ fn buffer_pool_evicts_dirty_page_when_no_clean_victim_exists() {
         1,
         0,
     );
+    for _ in 0..128 {
+        pool.log
+            .lock()
+            .append(0, WalPayload::CheckpointBegin)
+            .unwrap();
+    }
     let file = Arc::new(BufferPool::heap_file_key(
         t_path(dir.path(), "t", 1, "heap"),
         1,
@@ -5989,6 +5999,12 @@ fn background_flush_panic_mode_targets_30pct() {
     // Only the explicit ticks below may consume dirty pages. A pressure wake
     // can otherwise race the initial 100%-dirty assertion before the timer.
     pool.shutdown_flusher();
+    for _ in 0..128 {
+        pool.log
+            .lock()
+            .append(0, WalPayload::CheckpointBegin)
+            .unwrap();
+    }
     let file = Arc::new(BufferPool::heap_file_key(
         t_path(dir.path(), "t", 1, "heap"),
         1,
@@ -6449,6 +6465,12 @@ fn flush_data_cache_compacts_each_shard_clock_in_one_pass() {
         0,
     );
     pool.shutdown_flusher();
+    for _ in 0..128 {
+        pool.log
+            .lock()
+            .append(0, WalPayload::CheckpointBegin)
+            .unwrap();
+    }
     let file = Arc::new(BufferPool::heap_file_key(
         t_path(dir.path(), "t", 1, "heap"),
         1,
@@ -6494,6 +6516,12 @@ fn sync_cached_file_handle_skips_when_no_writes_since_last_sync() {
         1,
         0,
     );
+    for _ in 0..128 {
+        pool.log
+            .lock()
+            .append(0, WalPayload::CheckpointBegin)
+            .unwrap();
+    }
     let file_key = Arc::new(BufferPool::heap_file_key(
         t_path(dir.path(), "t", 1, "heap"),
         1,

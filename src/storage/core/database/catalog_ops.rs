@@ -889,6 +889,7 @@ impl Database {
         if_exists: bool,
     ) -> Result<(), QueryError> {
         let mut changed = Vec::new();
+        let mut missing = Vec::new();
         {
             let mut catalog = self.catalog_write()?;
             let mut targets = std::collections::HashSet::new();
@@ -901,11 +902,14 @@ impl Database {
                         format!("'{database}.{view_name}' is not VIEW"),
                     ));
                 }
-                if !catalog.views.contains_key(&key) && !if_exists {
-                    return Err(error(
-                        crate::error::catalog::ER_BAD_TABLE_ERROR,
-                        format!("unknown view '{name}'"),
-                    ));
+                if !catalog.views.contains_key(&key) {
+                    if !if_exists {
+                        return Err(error(
+                            crate::error::catalog::ER_BAD_TABLE_ERROR,
+                            format!("unknown view '{name}'"),
+                        ));
+                    }
+                    missing.push(format!("{database}.{view_name}"));
                 }
                 if !targets.insert((normalize_name(&database), normalize_name(&view_name))) {
                     return Err(error(
@@ -947,6 +951,13 @@ impl Database {
         }
         if !changed.is_empty() {
             self.commit_ddl_catalog_txn()?;
+        }
+        for name in missing {
+            crate::engine::api::push_statement_warning(
+                crate::error::ConditionLevel::Note,
+                crate::error::catalog::ER_BAD_TABLE_ERROR,
+                format!("Unknown table '{name}'"),
+            );
         }
         Ok(())
     }

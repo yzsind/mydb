@@ -2695,6 +2695,14 @@ pub fn batch_schema_to_input(schema: &BatchSchema) -> InputSchema {
 /// single `ColumnVector`. Picks a typed lane when all results agree on a
 /// kind, otherwise emits `Generic`.
 pub fn eval_to_column(program: &ExprProgram, batch: &Batch) -> Result<ColumnVector, QueryError> {
+    eval_to_column_prepared(program, batch, None)
+}
+
+pub(crate) fn eval_to_column_prepared<'a>(
+    program: &'a ExprProgram,
+    batch: &'a Batch,
+    prepared: Option<crate::engine::expr_program::ColumnEvaluation<'a>>,
+) -> Result<ColumnVector, QueryError> {
     if batch.selection().is_some()
         && !matches!(
             crate::engine::executor::vec::config::effective_mode(),
@@ -2860,9 +2868,13 @@ pub fn eval_to_column(program: &ExprProgram, batch: &Batch) -> Result<ColumnVect
         }
     }
     // Preserve established direct-column kernels before lowering composition.
-    // This expression-major boundary owns the complete evaluation order.
+    // Reuse a caller's workspace proof only at the composed-column boundary.
     if !matches!(super::config::effective_mode(), super::config::VecMode::Off) {
-        if let Some(column) = program.try_eval_column(batch) {
+        let column = match prepared {
+            Some(prepared) => prepared.evaluate(),
+            None => program.try_eval_column(batch),
+        };
+        if let Some(column) = column {
             return Ok(column);
         }
     }
@@ -3008,7 +3020,7 @@ pub(crate) fn transform_utf8_column(
 }
 
 fn regexp_replace_utf8_column(
-    regex: &regex::Regex,
+    regex: &crate::engine::mysql_regex::Regex,
     replacement: &str,
     offsets: &[u32],
     input: &[u8],
@@ -3023,6 +3035,7 @@ fn regexp_replace_utf8_column(
     // SAFETY: the Utf8 lane invariant guarantees valid UTF-8 and every stored
     // offset is produced at an original value boundary.
     let input = unsafe { std::str::from_utf8_unchecked(input) };
+    let _memory = regex.search_scope(input).ok()?;
     let mut validity = nulls.clone().unwrap_or_else(|| Bitmap::new_all_valid(rows));
     let mut retain_nulls = nulls.is_some();
     if let Some(selection) = selection {

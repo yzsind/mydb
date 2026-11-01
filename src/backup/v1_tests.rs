@@ -616,6 +616,277 @@ fn wal_pressure_rejects_writes_but_archive_and_budget_management_work() {
 }
 
 #[test]
+fn release_audit_wal_pressure_preserves_admitted_commit_rollback_and_savepoint() {
+    for ending in ["COMMIT", "ROLLBACK", "ROLLBACK TO SAVEPOINT s"] {
+        let root = root();
+        let source = engine(&root.path().join("source"));
+        source
+            .execute("CREATE TABLE t(id INT PRIMARY KEY,v LONGBLOB,k INT DEFAULT 0,INDEX ik(k))")
+            .unwrap();
+        let c = Coordinator::get(source.db_handle()).unwrap();
+        let path = root.path().join("repo");
+        c.configure(&path, Policy::Manual, false, None).unwrap();
+        job(&c, c.backup(&path).unwrap());
+        let mut session = crate::engine::SessionContext::default();
+        source.execute_with_session(&mut session, "BEGIN").unwrap();
+        source
+            .execute_with_session(&mut session, "SAVEPOINT s")
+            .unwrap();
+        source
+            .execute_with_session(
+                &mut session,
+                "INSERT INTO t(id,v) VALUES(1,REPEAT('x',6000))",
+            )
+            .unwrap();
+        // Simulate archive pressure arriving after DML admission but before
+        // its deferred redo is drained. No physical I/O has failed.
+        c.configure(&path, Policy::Manual, false, Some(1)).unwrap();
+        assert!(source
+            .execute_with_session(&mut session, "INSERT INTO t(id,v) VALUES(99,'blocked')")
+            .is_err());
+        source.execute_with_session(&mut session, ending).unwrap();
+        if ending.starts_with("ROLLBACK TO") {
+            source.execute_with_session(&mut session, "COMMIT").unwrap();
+        }
+        assert_eq!(
+            rows(&source, "SELECT COUNT(*) FROM t")[0][0],
+            Value::Int(i64::from(ending == "COMMIT"))
+        );
+        assert!(source
+            .execute("INSERT INTO t(id,v) VALUES(2,'blocked')")
+            .is_err());
+        job(&c, c.backup_wal(&path).unwrap());
+        let restored = root.path().join("restored");
+        super::restore::restore(&path, None, None, Target::Latest, &restored, None, false).unwrap();
+        let image = engine(&restored);
+        assert_eq!(
+            rows(&image, "SELECT COUNT(*) FROM t FORCE INDEX(ik) WHERE k=0")[0][0],
+            Value::Int(i64::from(ending == "COMMIT"))
+        );
+        image.shutdown().unwrap();
+        c.configure(&path, Policy::Manual, false, Some(64 << 20))
+            .unwrap();
+        source
+            .execute("INSERT INTO t(id,v) VALUES(2,'available')")
+            .unwrap();
+        source.shutdown().unwrap();
+        drop(c);
+        drop(source);
+        let reopened = engine(&root.path().join("source"));
+        assert_eq!(
+            rows(&reopened, "SELECT COUNT(*) FROM t")[0][0],
+            Value::Int(1 + i64::from(ending == "COMMIT"))
+        );
+        reopened.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn release_audit_wal_pressure_rollback_restores_updates_deletes_indexes_and_lobs() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source
+        .execute("CREATE TABLE t(id INT PRIMARY KEY,k INT,v LONGBLOB,INDEX ik(k))")
+        .unwrap();
+    source
+        .execute("INSERT INTO t VALUES(1,10,REPEAT('a',20000)),(2,20,REPEAT('b',20000))")
+        .unwrap();
+    let query = "SELECT id,k,LENGTH(v),MD5(v) FROM t FORCE INDEX(ik) WHERE k>=0 ORDER BY id";
+    let expected = rows(&source, query);
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let path = root.path().join("repo");
+    c.configure(&path, Policy::Manual, false, None).unwrap();
+    job(&c, c.backup(&path).unwrap());
+    let mut session = crate::engine::SessionContext::default();
+    for sql in [
+        "BEGIN",
+        "UPDATE t SET k=11,v=REPEAT('c',30000) WHERE id=1",
+        "DELETE FROM t WHERE id=2",
+        "INSERT INTO t VALUES(3,30,REPEAT('d',40000))",
+    ] {
+        source.execute_with_session(&mut session, sql).unwrap();
+    }
+    c.configure(&path, Policy::Manual, false, Some(1)).unwrap();
+    source
+        .execute_with_session(&mut session, "ROLLBACK")
+        .unwrap();
+    assert_eq!(rows(&source, query), expected);
+    assert!(source.execute("UPDATE t SET k=99 WHERE id=1").is_err());
+    job(&c, c.backup_wal(&path).unwrap());
+    let restored = root.path().join("restored");
+    super::restore::restore(&path, None, None, Target::Latest, &restored, None, false).unwrap();
+    let image = engine(&restored);
+    assert_eq!(rows(&image, query), expected);
+    image.shutdown().unwrap();
+    c.configure(&path, Policy::Manual, false, Some(64 << 20))
+        .unwrap();
+    source.shutdown().unwrap();
+    drop(c);
+    drop(source);
+    let reopened = engine(&root.path().join("source"));
+    assert_eq!(rows(&reopened, query), expected);
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn release_audit_pending_base_recovers_after_repository_returns() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source
+        .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+        .unwrap();
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let path = fs::canonicalize(root.path()).unwrap().join("repo");
+    let offline = root.path().join("offline");
+    c.configure(&path, Policy::Manual, false, None).unwrap();
+    let from = path.clone();
+    let to = offline.clone();
+    super::faults::install(
+        "base_before_verify",
+        source.db_handle().data_dir(),
+        move || {
+            fs::rename(from, to).unwrap();
+            Err(backup_err("injected repository outage after capture"))
+        },
+    );
+    let request = c.backup(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if c.jobs()
+            .iter()
+            .any(|j| j.id == request.id && j.state == "FAILED")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(c
+        .control
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .pending
+        .is_some());
+    assert!(source.db_handle().capture.leases().contains_key("archive"));
+    fs::rename(&offline, &path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if c.control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pending
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending base was never reconciled after repository recovery"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!source.db_handle().capture.leases().contains_key("archive"));
+    job(&c, c.backup(&path).unwrap());
+    discard_source(source, c);
+}
+
+#[test]
+fn release_audit_capture_floor_survives_checkpoint_before_durable_lease() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source
+        .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+        .unwrap();
+    source.execute("INSERT INTO t VALUES(1)").unwrap();
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let db = source.db_handle().clone();
+    super::faults::install(
+        "capture_before_durable_lease",
+        db.data_dir().to_path_buf().as_path(),
+        {
+            let db = db.clone();
+            move || {
+                let before = db.wal_log().lock().min_available_lsn();
+                db.checkpoint()?;
+                let after = db.wal_log().lock().min_available_lsn();
+                if after > before {
+                    return Err(backup_err(
+                        "checkpoint deleted the initial capture WAL floor",
+                    ));
+                }
+                Ok(())
+            }
+        },
+    );
+    job(&c, c.backup(&root.path().join("repo")).unwrap());
+    discard_source(source, c);
+}
+
+#[test]
+fn release_audit_failed_lease_publication_cleans_its_temporary_file() {
+    let root = root();
+    let capture = crate::storage::capture::CaptureState::open(root.path(), false).unwrap();
+    super::faults::fail("wal_lease_before_rename", &root.path().join("system"));
+    let lease = crate::storage::capture::WalLease {
+        floor: 1,
+        history_retention_ms: 0,
+        proof: "test".into(),
+    };
+    assert!(capture.set_lease("test", Some(lease.clone())).is_err());
+    let leftovers = fs::read_dir(root.path().join("system"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".leases-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+    assert!(capture.leases().is_empty());
+    capture.set_lease("test", Some(lease)).unwrap();
+    assert!(
+        crate::storage::capture::CaptureState::open(root.path(), false)
+            .unwrap()
+            .leases()
+            .contains_key("test")
+    );
+}
+
+#[test]
+fn release_audit_completed_publication_rejects_late_cancellation() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let (entered, ready) = mpsc::sync_channel(0);
+    let (release, wait) = mpsc::sync_channel(0);
+    super::faults::install(
+        "base_query_ready",
+        source.db_handle().data_dir(),
+        move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(30)).unwrap();
+            Ok(())
+        },
+    );
+    let request = c.backup(&root.path().join("repo")).unwrap();
+    ready.recv_timeout(Duration::from_secs(30)).unwrap();
+    let cancel = c.cancel(&request.id);
+    release.send(()).unwrap();
+    assert!(
+        cancel.is_err(),
+        "cancellation was accepted after immutable publication completed"
+    );
+    job(&c, request);
+    discard_source(source, c);
+}
+
+#[test]
 fn idle_fences_are_bounded_and_export_import_is_self_contained() {
     let root = root();
     let source = engine(&root.path().join("source"));

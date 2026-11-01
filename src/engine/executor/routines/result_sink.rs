@@ -9,6 +9,37 @@ pub(crate) type ResultSink =
 
 thread_local! {
     static SINK: RefCell<Option<ResultSink>> = const { RefCell::new(None) };
+    static DISCARDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn is_discarding() -> bool {
+    DISCARDING.with(|flag| flag.get())
+}
+
+pub(crate) fn discard(response: QueryResponse) -> Result<(), QueryError> {
+    match response {
+        QueryResponse::StreamingResultSet(mut result) => {
+            while result.cursor.next_row()?.is_some() {}
+        }
+        QueryResponse::MultiResult(results) => {
+            for result in results {
+                discard(result)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn with_discard_sink<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DISCARDING.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(DISCARDING.with(|flag| flag.replace(true)));
+    with_sink(Some(Box::new(|_, response| discard(response))), work)
 }
 
 pub(crate) fn with_sink<T>(sink: Option<ResultSink>, work: impl FnOnce() -> T) -> T {

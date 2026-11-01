@@ -86,7 +86,9 @@ impl<'a> FtSearchSource<'a> {
             crate::parser::FtMode::Boolean => {
                 for clause in parse_boolean_query(query, tokenizer)? {
                     match clause.matcher {
-                        Matcher::Term(terms) | Matcher::Phrase(terms) => tokens.extend(terms),
+                        Matcher::Term(terms)
+                        | Matcher::Phrase(terms)
+                        | Matcher::FilteredPhrase { terms, .. } => tokens.extend(terms),
                         Matcher::Prefix(prefix) => prefixes.push(prefix),
                     }
                 }

@@ -143,6 +143,18 @@ pub(crate) fn uvarint_len(mut v: u64) -> usize {
 /// Read an unsigned LEB128 varint at `*pos`, advancing `*pos` past it.
 #[inline]
 pub(crate) fn read_uvarint(b: &[u8], pos: &mut usize) -> Result<u64, QueryError> {
+    if let Some(&byte) = b.get(*pos) {
+        if byte < 0x80 {
+            *pos += 1;
+            return Ok(u64::from(byte));
+        }
+    }
+    read_uvarint_slow(b, pos)
+}
+
+// Keep the checked multi-byte/error path out of the single-byte caller.
+#[inline(never)]
+fn read_uvarint_slow(b: &[u8], pos: &mut usize) -> Result<u64, QueryError> {
     let mut shift = 0u32;
     let mut out = 0u64;
     loop {

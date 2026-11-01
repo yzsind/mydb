@@ -9,6 +9,11 @@ pub(crate) struct TimedRecord {
 }
 
 impl TimedRecord {
+    pub(crate) fn for_admitted_drain(mut self) -> Self {
+        self.record.admitted_drain = true;
+        self
+    }
+
     #[inline]
     pub(crate) fn new(record: PreEncodedRecord) -> Result<Self, QueryError> {
         let offset = match &record.payload {

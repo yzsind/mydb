@@ -20,6 +20,8 @@ mydb is still developing its first product release. Rehearse recovery in the tar
 
 A full base contains the catalog, table and LOB data, undo, indexes, sequences, temporal history, and persistent system-object state needed for recovery and queries. Save server startup configuration, TLS files, runtime logs, and external keys separately. An independently restored instance does not inherit the source's node identity, replication role, or archive binding.
 
+Sequences retain their durable reservation high-water marks. With SQL `CACHE 1`, recovery may skip up to `MYDB_SEQUENCE_WAL_BATCH` additional values (32 by default). Larger session caches can cause further gaps. The WAL look-ahead is separate from SQL `CACHE`; sequence numbering is not gapless.
+
 Native images and their state pointers have separate format versions; earlier development formats are incompatible. Promotion of a restored image commits through a single state pointer replacement, leaving the completed manifest immutable. See [storage format versions](storage-format-versions.md) for the authoritative version list.
 
 **Completing a full backup does not automatically enable WAL archiving.** A full backup alone supports recovery to its base position. To recover subsequent business changes, first establish an archive policy and ensure that the required WAL has been archived successfully.
@@ -309,6 +311,8 @@ After connecting, check the database and object lists, critical table row counts
 
 Recovery can retain unresolved prepared XA transactions, whose data remains invisible. PITR can apply subsequent source decisions from the archive; after making an independent instance writable, an administrator can also make local decisions using external transaction coordination information.
 
+On the source, prepared XA commit and rollback decisions attempted during a backup capture freeze fail immediately rather than waiting. Retry the decision after the freeze ends.
+
 ## 7. Use a Recovery Image for Writable Workloads
 
 If writes are already required when creating the recovery image, add `--writable` directly:
@@ -508,6 +512,10 @@ ALTER MYDB BACKUP TO 'file:///tmp/mydb/repository'
 ```
 
 The budget counts actual WAL frame bytes. Under pressure, new business writes fail, while reads, archiving, policy administration, and rollback retain a management path. The system neither silently discards WAL nor automatically disables protection. Writes are also subject to filesystem space admission; increasing the WAL budget does not replace adding real capacity.
+
+Deferred redo for already accepted changes, commit decisions, and physical rollback compensation retain an emergency append path. They still count toward pending WAL and require physical disk space, so the budget is an admission threshold rather than a hard byte ceiling for in-flight transactions. A failed initial base whose repository is unavailable retains its recovery pin; the coordinator retries reconciliation after repository availability returns, including in manual archive mode.
+
+Invalid durable backup control or job-history metadata prevents normal server startup. Preserve the files and diagnose the corruption rather than deleting the control state or WAL leases to bypass validation.
 
 First restore repository availability, resolve archive errors, or submit and await `BACKUP WAL` in manual mode. Use the explicit discard operation in Section 4.4 only if unarchived data must be abandoned.
 

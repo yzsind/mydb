@@ -52,7 +52,36 @@ impl std::fmt::Debug for WalBudget {
             .finish()
     }
 }
+
+thread_local! {
+    static ROLLBACK_WAL_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct RollbackBudgetScope<'a> {
+    previous: usize,
+    _budget: std::marker::PhantomData<&'a WalBudget>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for RollbackBudgetScope<'_> {
+    fn drop(&mut self) {
+        ROLLBACK_WAL_BUDGET.with(|budget| budget.set(self.previous));
+    }
+}
+
 impl WalBudget {
+    /// Physical compensation emits ordinary heap/index/LOB redo as well as
+    /// CLRs. Permit it only on this thread and for this database's budget.
+    pub(crate) fn rollback_scope(&self) -> RollbackBudgetScope<'_> {
+        RollbackBudgetScope {
+            previous: ROLLBACK_WAL_BUDGET
+                .with(|budget| budget.replace(self as *const Self as usize)),
+            _budget: std::marker::PhantomData,
+            _thread: std::marker::PhantomData,
+        }
+    }
+    fn rolling_back(&self) -> bool {
+        ROLLBACK_WAL_BUDGET.with(|budget| budget.get() == self as *const Self as usize)
+    }
     pub(crate) fn reserve_disk(
         &self,
         bytes: u64,
@@ -67,7 +96,7 @@ impl WalBudget {
                 &self.root,
             )?);
         }
-        let reserve = if administrative {
+        let reserve = if administrative || self.rolling_back() {
             bytes
         } else {
             bytes
@@ -86,6 +115,7 @@ impl WalBudget {
                 .load(Ordering::Acquire)
                 .checked_add(bytes)
                 .is_none_or(|n| n > self.limit.load(Ordering::Acquire))
+            && !self.rolling_back()
         {
             return Err(err("pending WAL budget exhausted; archive WAL, increase MAX_PENDING_WAL_BYTES, or explicitly stop protection"));
         }
@@ -269,6 +299,15 @@ impl CaptureState {
         let parent = self.path.parent().unwrap();
         std::fs::create_dir_all(parent).map_err(|e| err(e.to_string()))?;
         let temp = parent.join(format!(".leases-{:032x}", rand::random::<u128>()));
+        struct TemporaryLease(Option<PathBuf>);
+        impl Drop for TemporaryLease {
+            fn drop(&mut self) {
+                if let Some(path) = &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let mut cleanup = TemporaryLease(Some(temp.clone()));
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -282,7 +321,10 @@ impl CaptureState {
                 })
                 .map_err(|e| err(e.to_string()))?;
         }
+        #[cfg(test)]
+        crate::backup::faults::hit("wal_lease_before_rename", self.path.parent().unwrap())?;
         std::fs::rename(&temp, &self.path).map_err(|e| err(e.to_string()))?;
+        cleanup.0 = None;
         crate::platform::fs::sync_path(parent).map_err(|e| err(e.to_string()))?;
         let marker = parent.join("wal-retention.id");
         if !marker.exists() {

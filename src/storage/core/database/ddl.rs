@@ -1,3 +1,13 @@
+fn validate_add_index_backend(table: &TableSchema, index: &IndexSchema) -> Result<(), QueryError> {
+    if table.partitioning.is_some() && index.is_spatial() {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "ADD SPATIAL INDEX on a partitioned table is not supported; define the index in CREATE TABLE",
+        ));
+    }
+    Ok(())
+}
+
 fn set_column_default_in_candidate(
     table: &mut TableSchema,
     idx: usize,
@@ -830,8 +840,12 @@ fn prepare_create_table_schema(
         directions.truncate(index.columns.len());
 
         // Expression positions contain canonical SQL, not identifiers.
-        let parser_key_expressions = index.key_expressions;
-        let parser_key_expression_multi_valued = index.key_expression_multi_valued;
+        let mut parser_key_expressions = index.key_expressions;
+        parser_key_expressions.resize(index.columns.len(),None);
+        parser_key_expressions.truncate(index.columns.len());
+        let mut parser_key_expression_multi_valued = index.key_expression_multi_valued;
+        parser_key_expression_multi_valued.resize(index.columns.len(),false);
+        parser_key_expression_multi_valued.truncate(index.columns.len());
         let columns = index
             .columns
             .into_iter()
@@ -4147,6 +4161,7 @@ impl Database {
         index: &IndexSchema,
     ) -> Result<(), QueryError> {
         let table = self.table(table_name)?;
+        validate_add_index_backend(&table, index)?;
         if index.primary && !index.unique {
             enforce_existing_primary_key_not_null(self, &table, &index.columns)?;
         }
@@ -4444,8 +4459,10 @@ impl Database {
         // Cache eviction leaves a lightweight object header in the
         // compatibility catalog. Materialize the immutable descriptor before
         // phase 1 validates columns and index metadata under the table MDL.
-        self.table_by_key(&key)
+        let table = self.table_by_key(&key)
             .ok_or_else(|| ddl_table_not_found(&table_name))?;
+        validate_add_index_backend(&table, &index)?;
+        drop(table);
         let existing_table = {
             let catalog = self.catalog_read()?;
             let table = catalog

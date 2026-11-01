@@ -3140,11 +3140,23 @@ pub(super) fn precompute_read_only_projection(
             if !read_only && !program.column_parallel_safe(batch.schema()) {
                 return None;
             }
-            let reservation = program.column_output_bound(batch)?;
+            let prepared = if batch.selection().is_none() {
+                Some(program.prepare_column(batch)?)
+            } else {
+                None
+            };
+            let reservation = match &prepared {
+                Some(prepared) => prepared.output_bound()?,
+                None => program.column_output_bound(batch)?,
+            };
             if !retained.add_within(reservation, cap) {
                 return None;
             }
-            if let Some(column) = program.try_eval_column(batch) {
+            let column = match prepared {
+                Some(prepared) => prepared.evaluate(),
+                None => program.try_eval_column(batch),
+            };
+            if let Some(column) = column {
                 let bytes = column.memory_bytes();
                 if bytes <= reservation {
                     retained.release_bytes(reservation - bytes);

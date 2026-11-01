@@ -60,6 +60,60 @@ impl DateFormatPlan {
         self.max_bytes
     }
 
+    /// TIME formats use a zero date and allow extended signed hours.
+    /// Calendar-dependent specifiers are rejected before rendering.
+    pub(crate) fn supports_time(&self) -> bool {
+        !self
+            .tokens
+            .iter()
+            .any(|token| matches!(token, Token::Spec(spec) if "jUuVvXxMWabwD".contains(*spec)))
+    }
+
+    pub(crate) fn append_time(&self, micros: i64, out: &mut String) {
+        let magnitude = micros.unsigned_abs();
+        let hour = (magnitude / 3_600_000_000) as u32;
+        let minute = (magnitude / 60_000_000 % 60) as u32;
+        let second = (magnitude / 1_000_000 % 60) as u32;
+        let h12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+        if micros < 0 {
+            out.push('-');
+        }
+        for token in &self.tokens {
+            let spec = match token {
+                Token::Literal(text) => {
+                    out.push_str(text);
+                    continue;
+                }
+                Token::Spec(spec) => *spec,
+            };
+            match spec {
+                'H' => number(out, hour, 2),
+                'k' => number(out, hour, 0),
+                'h' | 'I' => number(out, h12, 2),
+                'l' => number(out, h12, 0),
+                'i' => number(out, minute, 2),
+                's' | 'S' => number(out, second, 2),
+                'f' => number(out, (magnitude % 1_000_000) as u32, 6),
+                'r' | 'T' => {
+                    number(out, if spec == 'r' { h12 } else { hour }, 2);
+                    out.push(':');
+                    number(out, minute, 2);
+                    out.push(':');
+                    number(out, second, 2);
+                    if spec == 'r' {
+                        out.push_str(if hour < 12 { " AM" } else { " PM" });
+                    }
+                }
+                'p' => out.push_str(if hour % 24 < 12 { "AM" } else { "PM" }),
+                'Y' => out.push_str("0000"),
+                'y' | 'm' | 'd' => out.push_str("00"),
+                'c' | 'e' => out.push('0'),
+                '%' => out.push('%'),
+                other => out.push(other),
+            }
+        }
+    }
+
     pub(crate) fn append(&self, dt: NaiveDateTime, locale: &TimeLocale, out: &mut String) {
         let (year, month, day) = (dt.year(), dt.month(), dt.day());
         let (hour, minute, second) = (dt.hour(), dt.minute(), dt.second());

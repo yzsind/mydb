@@ -2347,6 +2347,7 @@ pub fn estimate_row_bytes(values: &[crate::types::Value]) -> usize {
 /// no `&MemBudget` handy but want scope-bounded accounting. Callers
 /// can incrementally `add` more charges; all accumulated bytes are
 /// released together when the guard is dropped.
+#[derive(Debug)]
 pub struct ScopedCharge {
     budget: Option<Arc<MemBudget>>,
     bytes: usize,

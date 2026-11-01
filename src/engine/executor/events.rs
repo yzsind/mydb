@@ -452,6 +452,8 @@ fn run_scheduler(inner: Arc<EventSchedulerInner>) {
 
 async fn scheduler_loop(inner: Arc<EventSchedulerInner>, workers: &EventWorkerPool) {
     let mut last_fired_prune_ms = 0_u64;
+    let mut pressure_retry_ms = 10_u64;
+    let mut last_pressure_log_ms = 0_u64;
     loop {
         if inner.shutdown.load(Ordering::Acquire) {
             return;
@@ -484,6 +486,7 @@ async fn scheduler_loop(inner: Arc<EventSchedulerInner>, workers: &EventWorkerPo
             last_fired_prune_ms = now;
         }
         let events = inner.db.all_events();
+        let mut pressured = false;
         let mut next_fire_ms: Option<u64> = None;
         let mut sleep_for_no_events = true;
         for event in events {
@@ -531,7 +534,12 @@ async fn scheduler_loop(inner: Arc<EventSchedulerInner>, workers: &EventWorkerPo
                     // Bounded queue or memory pressure: retry this due tick
                     // shortly instead of skipping it and jumping to the next
                     // recurrence.
-                    let retry = now.saturating_add(10);
+                    pressured = true;
+                    if now.saturating_sub(last_pressure_log_ms) >= 30_000 {
+                        crate::util::logging::log_message(format_args!("event scheduler admission is saturated; retrying in {pressure_retry_ms}ms"));
+                        last_pressure_log_ms = now;
+                    }
+                    let retry = now.saturating_add(pressure_retry_ms);
                     next_fire_ms = Some(next_fire_ms.map_or(retry, |m| m.min(retry)));
                     continue;
                 }
@@ -548,6 +556,11 @@ async fn scheduler_loop(inner: Arc<EventSchedulerInner>, workers: &EventWorkerPo
             next_fire_ms = Some(next_fire_ms.map_or(next_due, |m| m.min(next_due)));
         }
 
+        pressure_retry_ms = if pressured {
+            (pressure_retry_ms * 2).min(1000)
+        } else {
+            10
+        };
         if let Some(next) = next_fire_ms {
             let wait_ms = next.saturating_sub(now).min(60_000);
             let sleep = tokio::time::sleep(Duration::from_millis(wait_ms.max(1)));
@@ -705,7 +718,8 @@ fn run_event_body_with_tracking(
     // numeric mode bits so strict-mode behaviour follows the snapshot.
     session.sql_mode = event.sql_mode.clone();
     session.temporal_sql_mode_bits =
-        crate::engine::api::parse_temporal_sql_mode_bits(&event.sql_mode);
+        crate::engine::api::parse_temporal_sql_mode_bits(&event.sql_mode)
+            | crate::engine::api::TEMPORAL_MODE_EXPLICIT;
     session.character_set_client = event.character_set_client.clone();
     session.collation_connection = event.collation_connection.clone();
     // Run the body under the event's recorded time zone so NOW() / date
@@ -717,27 +731,36 @@ fn run_event_body_with_tracking(
 
     // Keep the ordinary SQL path lightweight. Stored-program statements
     // (BEGIN blocks, IF, WHILE, ...) use the compiled routine executor.
+    super::reset_statement_expression_state();
     let _cancel_scope = crate::engine::cancel::install_session_cancel_context(&session);
     let session_ptr = std::ptr::NonNull::from(&session);
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the event owns this pinned session on one worker. Every
-        // result is drained before the scope ends; nested security/session
-        // changes must be visible to expression evaluation on that worker.
-        unsafe {
-            crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
-                if let Ok(statements) = parse_statements(&event.body_sql) {
-                    for statement in statements {
-                        crate::mysql::connection_manager::record_internal_query();
-                        super::authorize_statement(db, &session, &statement)?;
-                        super::dispatch_execute_statement(db, &mut session, statement, registry)?
-                            .materialize()?;
+        super::routines::result_sink::with_discard_sink(|| {
+            // SAFETY: the event owns this pinned session on one worker. Every
+            // result is drained before the scope ends; nested security/session
+            // changes must be visible to expression evaluation on that worker.
+            unsafe {
+                crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
+                    if let Ok(statements) = parse_statements(&event.body_sql) {
+                        for statement in statements {
+                            crate::mysql::connection_manager::record_internal_query();
+                            super::authorize_statement(db, &session, &statement)?;
+                            super::routines::result_sink::discard(
+                                super::dispatch_execute_statement(
+                                    db,
+                                    &mut session,
+                                    statement,
+                                    registry,
+                                )?,
+                            )?;
+                        }
+                        Ok(())
+                    } else {
+                        super::routines::execute_event_body(db, &mut session, event, registry)
                     }
-                    Ok(())
-                } else {
-                    super::routines::execute_event_body(db, &mut session, event, registry)
-                }
-            })
-        }
+                })
+            }
+        })
     }));
     // The background session is not a protocol Session and therefore has no
     // connection Drop guard. Release its transaction and locks on success,
@@ -1767,6 +1790,41 @@ pub fn format_ms_as_datetime(ms: u64) -> String {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn audit_event_invocations_refresh_clock_and_restore_explicit_empty_mode() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = super::super::StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE clocks(v DATETIME(6))")
+            .unwrap();
+        engine.execute("CREATE TABLE modes(v VARCHAR(2))").unwrap();
+        engine.execute("CREATE EVENT clock_e ON SCHEDULE EVERY 1 SECOND DISABLE DO INSERT INTO clocks VALUES(NOW(6))").unwrap();
+        let event = engine.db.event_definition("test", "clock_e").unwrap();
+        let registry = crate::engine::SessionRegistry::new();
+        run_event_body_with_tracking(&engine.db, &registry, &event, None).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        run_event_body_with_tracking(&engine.db, &registry, &event, None).unwrap();
+        let QueryResponse::ResultSet(result) =
+            engine.execute("SELECT v FROM clocks ORDER BY v").unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_ne!(result.rows[0][0], result.rows[1][0]);
+        let mut session = SessionContext::default();
+        engine
+            .execute_with_session(&mut session, "SET sql_mode=''")
+            .unwrap();
+        engine.execute_with_session(&mut session,"CREATE EVENT mode_e ON SCHEDULE EVERY 1 SECOND DISABLE DO INSERT INTO modes VALUES('toolong')").unwrap();
+        let event = engine.db.event_definition("test", "mode_e").unwrap();
+        run_event_body_with_tracking(&engine.db, &registry, &event, None).unwrap();
+        let QueryResponse::ResultSet(result) = engine.execute("SELECT v FROM modes").unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows, vec![vec![Value::String("to".into())]]);
+        engine.shutdown().unwrap();
+    }
 
     #[test]
     fn scheduler_wakeup_is_retained_until_worker_waits() {

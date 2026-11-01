@@ -1,7 +1,13 @@
+mod compression;
 pub(crate) mod date_format;
 pub(crate) mod digest;
+#[cfg(test)]
+mod formatting_tests;
+#[cfg(test)]
+mod gtid_tests;
 pub(crate) mod math;
 pub(crate) mod network;
+mod regexp_binary;
 crate::engine::builtin_catalog::declare_retains_ast!();
 mod string_kernels;
 pub(crate) mod string_search;
@@ -24,7 +30,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fs::File,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     ptr::NonNull,
     time::Duration,
@@ -5360,17 +5366,21 @@ where
             let value = eval_one(name, args, &mut eval_arg)?;
             eval_reverse_value(value)
         }
+        "__MATCH_AGAINST" => {
+            let expr = Expr::Function {
+                name: crate::parser::FT_MATCH_FUNCTION.to_owned(),
+                args: args.to_vec(),
+                distinct: false,
+            };
+            crate::engine::executor::select::fulltext_row::current_score(&expr).ok_or_else(|| {
+                crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("MATCH requires a FULLTEXT score provider in this query block")
+            })
+        }
         "REGEXP_LIKE" => {
             expect_arg_range(name, args, 2, 3)?;
             let values = eval_args(args, &mut eval_arg)?;
-            null_if_any(values, |values| {
-                let text = string_value(&values[0]);
-                let pattern = string_value(&values[1]);
-                let binary =
-                    matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
-                let re = mysql_regex_for_operand(&pattern, values.get(2), binary)?;
-                Ok(Value::Int(if re.is_match(&text) { 1 } else { 0 }))
-            })
+            null_if_any(values, |values| eval_regexp_like_values(&values))
         }
         "LOCATE" => {
             // String search is directional: MySQL coerces the needle into
@@ -7013,7 +7023,14 @@ where
                     );
                     return Ok(Value::Null);
                 }
-                Ok(Value::String(date.format("%Y-%m-%d").to_string()))
+                Ok(Value::String({
+                    let mut buffer = [0; 32];
+                    let days = date.num_days_from_ce() - 719_163;
+                    String::from_utf8(
+                        crate::types::write_date_canonical(days, &mut buffer).to_vec(),
+                    )
+                    .expect("canonical calendar date is ASCII")
+                }))
             })
         }
         "TIME" => {
@@ -7070,7 +7087,14 @@ where
                         &Value::String(format!("{year}, {day}")),
                     ));
                 };
-                Ok(Value::String(date.format("%Y-%m-%d").to_string()))
+                Ok(Value::String({
+                    let mut buffer = [0; 32];
+                    let days = date.num_days_from_ce() - 719_163;
+                    String::from_utf8(
+                        crate::types::write_date_canonical(days, &mut buffer).to_vec(),
+                    )
+                    .expect("canonical calendar date is ASCII")
+                }))
             })
         }
         "MAKETIME" => {
@@ -7159,7 +7183,10 @@ where
                     if let Value::Time(t) = v {
                         return Ok(*t);
                     }
-                    let s = string_value(v);
+                    if matches!(v, Value::Date(_) | Value::DateTime(_)) {
+                        return parse_datetime(v).map(|dt| dt.and_utc().timestamp_micros());
+                    }
+                    let s = str_value(v);
                     let bytes = s.as_bytes();
                     let looks_datetime = bytes.contains(&b' ')
                         || bytes.contains(&b'T')
@@ -7367,8 +7394,7 @@ where
                 } else {
                     fsp
                 };
-                let (neg2, h2, m2, s2, us2) = match parse_time_components(&string_value(&values[1]))
-                {
+                let (neg2, h2, m2, s2, us2) = match parse_time_components(&str_value(&values[1])) {
                     Ok(parts) => parts,
                     Err(err) if !strict_dml_expression() => {
                         return Ok(warn_invalid_temporal_function("time", &values[1], err));
@@ -8169,10 +8195,14 @@ where
             expect_arg_range(name, args, 2, 6)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
+                if regexp_binary::binary_operands(&values, 2)? {
+                    return regexp_binary::evaluate("REGEXP_INSTR", &values);
+                }
                 let expr = string_value(&values[0]);
                 let binary =
                     matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
                 let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(5), binary)?;
+                let _memory = re.search_scope(&expr)?;
                 let pos = values.get(2).map(int_value).transpose()?.unwrap_or(1);
                 if pos < 1 {
                     return Err(error(
@@ -8220,10 +8250,14 @@ where
             expect_arg_range(name, args, 2, 5)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
+                if regexp_binary::binary_operands(&values, 2)? {
+                    return regexp_binary::evaluate("REGEXP_SUBSTR", &values);
+                }
                 let expr = string_value(&values[0]);
                 let binary =
                     matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
                 let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(4), binary)?;
+                let _memory = re.search_scope(&expr)?;
                 let pos = values.get(2).map(int_value).transpose()?.unwrap_or(1);
                 if pos < 1 {
                     return Err(crate::error::catalog::ER_WRONG_PARAMETERS_TO_NATIVE_FCT
@@ -8236,8 +8270,12 @@ where
                     .transpose()?
                     .unwrap_or(1)
                     .max(1);
-                let start_byte = regexp_start_byte(&expr, pos)?;
-                for (idx, mat) in re.find_iter(&expr[start_byte..]).enumerate() {
+                let start_byte = regexp_start_byte_allow_end(&expr, pos)?;
+                for (idx, mat) in re
+                    .find_iter(&expr)
+                    .filter(|m| m.start() >= start_byte)
+                    .enumerate()
+                {
                     if idx as i64 + 1 == occurrence {
                         return Ok(Value::String(mat.as_str().to_string()));
                     }
@@ -8400,10 +8438,9 @@ where
             expect_arg_count(name, args, 3)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let (Ok(dt), Ok(from), Ok(to)) = (
+                let (Ok(dt), Ok(zones)) = (
                     parse_datetime(&values[0]),
-                    resolve_tz_spec(&string_value(&values[1])),
-                    resolve_tz_spec(&string_value(&values[2])),
+                    TimeZonePair::resolve(&string_value(&values[1]), &string_value(&values[2])),
                 ) else {
                     return Ok(Value::Null);
                 };
@@ -8411,7 +8448,7 @@ where
                 // untouched (zone offsets are whole minutes).
                 let micros = dt.and_utc().timestamp_subsec_micros();
                 let local_epoch = dt.and_utc().timestamp();
-                let utc_epoch = from.utc_from_local(local_epoch);
+                let utc_epoch = zones.utc_from_local(local_epoch);
                 // Preserve pre-epoch behavior, but extend future conversion
                 // through mydb's full TIMESTAMP domain.
                 if utc_epoch < 0 {
@@ -8420,7 +8457,7 @@ where
                 if utc_epoch > crate::types::MAX_TIMESTAMP_SECONDS {
                     return Ok(Value::Null);
                 }
-                let out_epoch = utc_epoch + to.offset_at_utc(utc_epoch) as i64;
+                let out_epoch = zones.target_from_utc(utc_epoch);
                 let out = chrono::DateTime::from_timestamp(out_epoch, micros * 1_000)
                     .ok_or_else(|| {
                         error(
@@ -9184,12 +9221,13 @@ where
             let value = eval_one(name, args, eval_arg)?;
             null_or(value, |value| {
                 let sql = digest_input_string(&value)?;
-                validate_digest_sql(&sql)?;
+                let charset =
+                    (upper == "STATEMENT_DIGEST").then(|| digest_argument_charset(&args[0]));
+                let digest = validated_statement_digest(&sql, charset)?;
                 if upper == "STATEMENT_DIGEST" {
-                    let source_charset = digest_argument_charset(&args[0]);
-                    Ok(Value::String(statement_digest_hash(&sql, &source_charset)))
+                    Ok(Value::String(digest))
                 } else {
-                    Ok(statement_digest_text_result(statement_digest_text(&sql)))
+                    Ok(statement_digest_text_result(digest))
                 }
             })
         }
@@ -13181,7 +13219,7 @@ pub(crate) fn mysql_date_format(dt: &NaiveDateTime, format: &str) -> String {
     out
 }
 
-fn interval_unit_from_arg(expr: &Expr) -> String {
+pub(crate) fn interval_unit_from_arg(expr: &Expr) -> String {
     let unit = match expr {
         Expr::Identifier(name) => name.to_ascii_uppercase(),
         Expr::Literal(Literal::String(s)) => s.to_ascii_uppercase(),
@@ -14422,6 +14460,17 @@ impl NumberStyle {
 }
 
 fn format_datetime_fsp(dt: NaiveDateTime, fsp: usize) -> String {
+    if (0..=9999).contains(&dt.year()) && dt.nanosecond() < 1_000_000_000 && fsp <= 6 {
+        let mut buffer = [0; 32];
+        let bytes = crate::types::write_datetime_canonical_with_fsp(
+            dt.and_utc().timestamp_micros(),
+            Some(fsp as u8),
+            &mut buffer,
+        );
+        return std::str::from_utf8(bytes)
+            .expect("canonical datetime is ASCII")
+            .to_owned();
+    }
     let mut out = String::with_capacity(26);
     use std::fmt::Write;
     let _ = write!(
@@ -14463,8 +14512,19 @@ fn write_frac_into(out: &mut String, micros: u32, fsp: usize) {
 /// textual form (`'12:00:00.250'` → 3, `'.5'` → 1, none → 0, cap 6).
 /// MySQL temporal functions echo this declared precision in their
 /// result — `TIMESTAMP('… .500','… .250')` prints `.750`, not `.75`.
-fn text_fsp(value: &Value) -> usize {
-    let text = string_value(value);
+pub(crate) fn text_fsp(value: &Value) -> usize {
+    let mut buffer = [0; 32];
+    // TIMESTAMP retains session-aware conversion and its diagnostic behavior.
+    let text = if !matches!(value, Value::Timestamp(_)) {
+        value
+            .canonical_cmp_bytes(&mut buffer)
+            .map(|bytes| {
+                std::borrow::Cow::Borrowed(std::str::from_utf8(bytes).expect("canonical UTF-8"))
+            })
+            .unwrap_or_else(|| str_value(value))
+    } else {
+        str_value(value)
+    };
     match text.rsplit_once('.') {
         Some((_, frac)) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
             frac.len().min(6)
@@ -14578,7 +14638,7 @@ fn generate_uuid_v1() -> String {
     crate::util::uuid::format(&bytes)
 }
 
-fn checked_period_to_ym(period: i64, function: &str) -> Result<(i32, u32), QueryError> {
+pub(crate) fn checked_period_to_ym(period: i64, function: &str) -> Result<(i32, u32), QueryError> {
     if period == 0 {
         return Ok((0, 1));
     }
@@ -14839,6 +14899,25 @@ fn function_arg_with_table_octets(
     crate::charset::encode_string(charset, &text).map(Value::Bytes)
 }
 
+pub(crate) fn eval_regexp_like_values(values: &[Value]) -> Result<Value, QueryError> {
+    if regexp_binary::binary_operands(values, 2)? {
+        return regexp_binary::evaluate("REGEXP_LIKE", values);
+    }
+    let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(2), false)?;
+    let text = string_value(&values[0]);
+    let _memory = re.search_scope(&text)?;
+    Ok(Value::Int(re.is_match(&text) as i64))
+}
+
+pub(crate) fn regexp_start_byte_allow_end(subject: &str, pos: usize) -> Result<usize, QueryError> {
+    pos.checked_sub(1)
+        .and_then(|i| char_to_byte_index(subject, i))
+        .ok_or_else(|| {
+            crate::error::catalog::ER_REGEXP_INDEX_OUTOFBOUNDS_ERROR
+                .error("Index out of bounds in regular expression search.")
+        })
+}
+
 pub(crate) fn regexp_start_byte(subject: &str, pos: usize) -> Result<usize, QueryError> {
     let index = pos - 1;
     if (!subject.is_empty() && index >= subject.chars().count())
@@ -14885,7 +14964,10 @@ pub(crate) fn mysql_regex_for_operand(
     pattern: &str,
     match_type: Option<&Value>,
     binary_operand: bool,
-) -> Result<std::sync::Arc<crate::engine::func_cache::Governed<regex::Regex>>, QueryError> {
+) -> Result<
+    std::sync::Arc<crate::engine::func_cache::Governed<crate::engine::mysql_regex::Regex>>,
+    QueryError,
+> {
     if pattern.is_empty() {
         return Err(crate::error::catalog::ER_REGEXP_ILLEGAL_ARGUMENT
             .error("Illegal argument to a regular expression."));
@@ -14916,7 +14998,7 @@ pub(crate) fn mysql_regex_for_operand(
 }
 
 fn mysql_regexp_replacement<'a>(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     replacement: &'a str,
 ) -> Result<std::borrow::Cow<'a, str>, QueryError> {
     if !replacement.contains(['$', '\\']) {
@@ -15038,10 +15120,10 @@ fn mysql_regexp_replacement<'a>(
 /// Append a replace-all result directly to a caller-owned byte lane.
 ///
 /// The common literal-replacement case avoids constructing one temporary
-/// `String` per input row. Replacement strings containing `$` retain the
-/// regex crate's capture-expansion semantics by delegating to `replace_all`.
+/// `String` per input row. Capture expansion appends directly to the same
+/// bounded output lane.
 pub(crate) fn regexp_replace_all_into(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
@@ -15050,7 +15132,7 @@ pub(crate) fn regexp_replace_all_into(
 }
 
 fn regexp_replace_all_bounded(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
@@ -15059,25 +15141,30 @@ fn regexp_replace_all_bounded(
     if base == output.len() && !replacement.contains('$') && regexp_replace_has_single_match(re) {
         return regexp_replace_single_into(re, input, replacement, output);
     }
+    if input.is_empty() {
+        return true;
+    }
     let mut last = 0usize;
-    if replacement.contains('$') {
-        for captures in re.captures_iter(input) {
-            let matched = captures.get(0).expect("capture zero exists");
-            if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
-                || !regexp_expand(&captures, replacement, output, base)
-            {
-                return false;
-            }
-            last = matched.end();
+    let mut search = 0;
+    while let Some(captures) = re.captures_at(input, search) {
+        let matched = captures.get(0).expect("capture zero exists");
+        if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
+            || !(if replacement.contains('$') {
+                regexp_expand(&captures, replacement, output, base)
+            } else {
+                regexp_append(output, base, replacement.as_bytes())
+            })
+        {
+            return false;
         }
-    } else {
-        for matched in re.find_iter(input) {
-            if !regexp_append(output, base, &input.as_bytes()[last..matched.start()])
-                || !regexp_append(output, base, replacement.as_bytes())
-            {
-                return false;
+        last = matched.end();
+        if matched.is_empty() {
+            if last == input.len() {
+                break;
             }
-            last = matched.end();
+            search = last + input[last..].chars().next().unwrap().len_utf8();
+        } else {
+            search = last;
         }
     }
     regexp_append(output, base, &input.as_bytes()[last..])
@@ -15102,7 +15189,7 @@ fn regexp_append(output: &mut Vec<u8>, base: usize, bytes: &[u8]) -> bool {
 // Expand directly into the bounded row lane instead of allocating an unbounded
 // temporary with Captures::expand or Regex::replace_all.
 fn regexp_expand(
-    captures: &regex::Captures<'_>,
+    captures: &crate::engine::mysql_regex::Captures<'_>,
     replacement: &str,
     output: &mut Vec<u8>,
     base: usize,
@@ -15168,7 +15255,7 @@ fn regexp_expand(
 }
 
 #[inline]
-pub(crate) fn regexp_replace_has_single_match(re: &regex::Regex) -> bool {
+pub(crate) fn regexp_replace_has_single_match(re: &crate::engine::mysql_regex::Regex) -> bool {
     let pattern = re.as_str().as_bytes();
     pattern.first() == Some(&b'^')
         && pattern.last() == Some(&b'$')
@@ -15180,13 +15267,21 @@ pub(crate) fn regexp_replace_has_single_match(re: &regex::Regex) -> bool {
 
 #[inline]
 pub(crate) fn regexp_replace_single_into(
-    re: &regex::Regex,
+    re: &crate::engine::mysql_regex::Regex,
     input: &str,
     replacement: &str,
     output: &mut Vec<u8>,
 ) -> bool {
     let base = output.len();
-    if !input.ends_with('\n') {
+    if input.is_empty() {
+        return true;
+    }
+    if !input.chars().any(|c| {
+        matches!(
+            c,
+            '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+    }) {
         return regexp_append(
             output,
             base,
@@ -15210,6 +15305,9 @@ pub(crate) fn regexp_replace_single_into(
 /// and the compiled expression kernel. Arity is checked by the callers.
 pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, QueryError> {
     null_if_any(values, |values| {
+        if regexp_binary::binary_operands(&values, 3)? {
+            return regexp_binary::evaluate("REGEXP_REPLACE", &values);
+        }
         let expr = string_value(&values[0]);
         let pat = string_value(&values[1]);
         let repl = string_value(&values[2]);
@@ -15231,35 +15329,47 @@ pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, Qu
         let occurrence = if occurrence < 0 { 1 } else { occurrence };
         let binary = matches!(values[0], Value::Bytes(_)) || matches!(values[1], Value::Bytes(_));
         let re = mysql_regex_for_operand(&pat, values.get(5), binary)?;
-        let start_byte = regexp_start_byte(&expr, pos)?;
-        let tail = &expr[start_byte..];
-        let repl = if repl.contains(['$', '\\'])
-            && (if occurrence == 0 {
-                re.is_match(tail)
+        let _memory = re.search_scope(&expr)?;
+        let start_byte = regexp_start_byte_allow_end(&expr, pos)?;
+        if expr.is_empty() {
+            return Ok(Value::String(expr));
+        }
+        let mut parsed_replacement = None;
+        let mut bytes = Vec::new();
+        let mut copied = 0;
+        let mut search = start_byte;
+        let mut seen = 0;
+        while let Some(captures) = re.captures_at(&expr, search) {
+            let matched = captures.get(0).unwrap();
+            seen += 1;
+            if occurrence == 0 || seen == occurrence {
+                if parsed_replacement.is_none() {
+                    parsed_replacement = Some(mysql_regexp_replacement(&re, &repl)?);
+                }
+                let replacement = parsed_replacement.as_ref().unwrap();
+                if !regexp_append(&mut bytes, 0, &expr.as_bytes()[copied..matched.start()])
+                    || !regexp_expand(&captures, replacement, &mut bytes, 0)
+                {
+                    return Ok(Value::Null);
+                }
+                copied = matched.end();
+            }
+            if matched.is_empty() {
+                if matched.end() == expr.len() {
+                    break;
+                }
+                search = matched.end() + expr[matched.end()..].chars().next().unwrap().len_utf8();
             } else {
-                re.find_iter(tail).nth((occurrence - 1) as usize).is_some()
-            }) {
-            mysql_regexp_replacement(&re, &repl)?
-        } else {
-            std::borrow::Cow::Borrowed(repl.as_str())
-        };
-        if string_result_exceeds_packet("regexp_replace", start_byte as u64) {
+                search = matched.end();
+            }
+            if occurrence != 0 && seen == occurrence {
+                break;
+            }
+        }
+        if !regexp_append(&mut bytes, 0, &expr.as_bytes()[copied..]) {
             return Ok(Value::Null);
         }
-        let mut bytes = expr[..start_byte].as_bytes().to_vec();
-        let success = if occurrence == 0 {
-            regexp_replace_all_bounded(&re, tail, &repl, &mut bytes, 0)
-        } else if let Some(captures) = re.captures_iter(tail).nth((occurrence - 1) as usize) {
-            let matched = captures.get(0).expect("capture zero exists");
-            regexp_append(&mut bytes, 0, &tail.as_bytes()[..matched.start()])
-                && regexp_expand(&captures, &repl, &mut bytes, 0)
-                && regexp_append(&mut bytes, 0, &tail.as_bytes()[matched.end()..])
-        } else {
-            regexp_append(&mut bytes, 0, tail.as_bytes())
-        };
-        if !success {
-            return Ok(Value::Null);
-        }
+
         Ok(Value::String(
             String::from_utf8(bytes).expect("regexp replacement preserves UTF-8"),
         ))
@@ -15352,6 +15462,34 @@ enum TzSpec {
     Fixed(i32),
     Named(std::sync::Arc<crate::engine::tz::TimeZoneData>),
     System,
+}
+
+/// Bound source/target zones shared by scalar and columnar CONVERT_TZ.
+/// Offsets are still resolved for each instant, including named-zone DST.
+pub(crate) struct TimeZonePair {
+    from: TzSpec,
+    to: TzSpec,
+}
+impl TimeZonePair {
+    pub(crate) fn resolve(from: &str, to: &str) -> Result<Self, QueryError> {
+        let (from, to) = (resolve_tz_spec(from), resolve_tz_spec(to));
+        Ok(Self {
+            from: from?,
+            to: to?,
+        })
+    }
+    pub(crate) fn session_to_utc() -> Result<Self, QueryError> {
+        Ok(Self {
+            from: session_tz_spec()?,
+            to: TzSpec::Fixed(0),
+        })
+    }
+    pub(crate) fn utc_from_local(&self, local_epoch: i64) -> i64 {
+        self.from.utc_from_local(local_epoch)
+    }
+    pub(crate) fn target_from_utc(&self, utc_epoch: i64) -> i64 {
+        utc_epoch + i64::from(self.to.offset_at_utc(utc_epoch))
+    }
 }
 
 /// Query/worker-local TIMESTAMP-to-DATE numeric converter. Resolving the
@@ -16874,22 +17012,11 @@ where
 {
     let value = eval_one(name, args, eval_arg)?;
     null_or(value, |value| {
-        let input = value_bytes(&value);
+        let input = value_bytes_ref(&value);
         if input.is_empty() {
             return Ok(Value::Bytes(Vec::new()));
         }
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder
-            .write_all(&input)
-            .map_err(|e| error(crate::error::catalog::ER_GET_ERRNO, e.to_string()))?;
-        let mut out = (input.len() as u32).to_le_bytes().to_vec();
-        out.extend(
-            encoder
-                .finish()
-                .map_err(|e| error(crate::error::catalog::ER_GET_ERRNO, e.to_string()))?,
-        );
-        Ok(Value::Bytes(out))
+        compression::compress(&input).map(Value::Bytes)
     })
 }
 
@@ -16899,7 +17026,7 @@ where
 {
     let value = eval_one(name, args, eval_arg)?;
     null_or(value, |value| {
-        let bytes = value_bytes(&value);
+        let bytes = value_bytes_ref(&value);
         if bytes.is_empty() {
             return Ok(Value::Bytes(Vec::new()));
         }
@@ -16920,11 +17047,9 @@ where
             );
             return Ok(Value::Null);
         }
-        let mut decoder = flate2::read::ZlibDecoder::new(&bytes[4..]);
-        let mut out = Vec::with_capacity(expected.min(1024 * 1024));
-        match decoder.read_to_end(&mut out) {
-            Ok(_) if out.len() == expected => Ok(Value::Bytes(out)),
-            Ok(_) | Err(_) => {
+        match compression::uncompress(&bytes[4..], expected)? {
+            Some(out) => Ok(Value::Bytes(out)),
+            None => {
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
                     crate::error::catalog::ER_ZLIB_Z_DATA_ERROR,
@@ -16946,7 +17071,7 @@ where
 {
     let value = eval_one(name, args, eval_arg)?;
     null_or(value, |value| {
-        let bytes = value_bytes(&value);
+        let bytes = value_bytes_ref(&value);
         if bytes.is_empty() {
             Ok(Value::UInt(0))
         } else if bytes.len() <= 4 {
@@ -17493,7 +17618,8 @@ where
 /// Parsed GTID set: lowercase server-uuid → sorted, merged, non-empty
 /// interval list (1-based inclusive bounds). Pure string/set arithmetic
 /// for `GTID_SUBSET` / `GTID_SUBTRACT` — no replication state involved.
-pub(crate) type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+pub(crate) type GtidIntervals = smallvec::SmallVec<[(u64, u64); 2]>;
+pub(crate) type GtidSet = std::collections::BTreeMap<[u8; 36], GtidIntervals>;
 
 enum GtidArgument {
     Plain(GtidSet),
@@ -17509,7 +17635,12 @@ impl std::ops::Deref for GtidArgument {
     }
 }
 fn parsed_gtid_argument(expr: &Expr, value: &Value) -> Result<GtidArgument, QueryError> {
-    let text = string_value(value);
+    let text = match value {
+        Value::String(text) | Value::Decimal(text) => std::borrow::Cow::Borrowed(text.as_str()),
+        Value::SmallString(bytes) => String::from_utf8_lossy(bytes),
+        Value::Bytes(bytes) => String::from_utf8_lossy(bytes),
+        _ => std::borrow::Cow::Owned(string_value(value)),
+    };
     // Variable/high-cardinality expressions keep the original no-cache path.
     // Literal and bound-parameter operands are stable within one execution.
     if matches!(expr, Expr::Literal(_) | Expr::Placeholder(_)) {
@@ -17535,10 +17666,15 @@ pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError>
     for uuid_set in trimmed.split(',') {
         let uuid_set = uuid_set.trim();
         let mut parts = uuid_set.split(':');
-        let uuid = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-        if !is_valid_gtid_uuid(&uuid) {
+        let uuid = parts.next().unwrap_or("").trim();
+        if !is_valid_gtid_uuid(uuid) {
             return Err(malformed_gtid_set(text));
         }
+        let uuid: [u8; 36] = uuid
+            .as_bytes()
+            .try_into()
+            .expect("validated GTID UUID length");
+        let uuid = uuid.map(|byte| byte.to_ascii_lowercase());
         let intervals = set.entry(uuid).or_default();
         let mut saw_interval = false;
         for interval in parts {
@@ -17564,15 +17700,21 @@ pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError>
     }
     // Normalise: sort and merge overlapping / adjacent intervals.
     for intervals in set.values_mut() {
+        if intervals.len() <= 1 {
+            continue;
+        }
         intervals.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
-        for &(s, e) in intervals.iter() {
-            match merged.last_mut() {
-                Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
+        let mut written = 0;
+        for read in 0..intervals.len() {
+            let (s, e) = intervals[read];
+            if written > 0 && s <= intervals[written - 1].1.saturating_add(1) {
+                intervals[written - 1].1 = intervals[written - 1].1.max(e);
+            } else {
+                intervals[written] = (s, e);
+                written += 1;
             }
         }
-        *intervals = merged;
+        intervals.truncate(written);
     }
     Ok(set)
 }
@@ -17604,10 +17746,10 @@ fn gtid_set_is_subset(sub: &GtidSet, sup: &GtidSet) -> bool {
 fn gtid_set_subtract(base: &GtidSet, minus: &GtidSet) -> GtidSet {
     let mut out = GtidSet::new();
     for (uuid, intervals) in base {
-        let mut remaining: Vec<(u64, u64)> = intervals.clone();
+        let mut remaining = intervals.clone();
         if let Some(minus_intervals) = minus.get(uuid) {
             for &(ms, me) in minus_intervals {
-                let mut next: Vec<(u64, u64)> = Vec::with_capacity(remaining.len() + 1);
+                let mut next = GtidIntervals::new();
                 for &(s, e) in &remaining {
                     if me < s || ms > e {
                         next.push((s, e));
@@ -17624,27 +17766,36 @@ fn gtid_set_subtract(base: &GtidSet, minus: &GtidSet) -> GtidSet {
             }
         }
         if !remaining.is_empty() {
-            out.insert(uuid.clone(), remaining);
+            out.insert(*uuid, remaining);
         }
     }
     out
 }
 
 fn format_gtid_set(set: &GtidSet) -> String {
-    let mut out = String::new();
+    if set.is_empty() {
+        return String::new();
+    }
+    let capacity = set
+        .values()
+        .fold(set.len().saturating_mul(38), |bytes, intervals| {
+            bytes.saturating_add(intervals.len().saturating_mul(42))
+        });
+    let mut out = String::with_capacity(capacity);
+    let mut integer = itoa::Buffer::new();
     for (uuid, intervals) in set {
         if !out.is_empty() {
             // MySQL renders multi-uuid GTID sets with ",\n" between
             // uuid-sets (matches GTID_SUBTRACT output byte-for-byte).
             out.push_str(",\n");
         }
-        out.push_str(uuid);
+        out.push_str(std::str::from_utf8(uuid).expect("validated ASCII GTID UUID"));
         for &(s, e) in intervals {
             out.push(':');
-            if s == e {
-                out.push_str(&s.to_string());
-            } else {
-                out.push_str(&format!("{s}-{e}"));
+            out.push_str(integer.format(s));
+            if s != e {
+                out.push('-');
+                out.push_str(integer.format(e));
             }
         }
     }
@@ -21567,33 +21718,28 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
             }
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
-                if upper == "REGEXP_LIKE"
-                    && !args.iter().take(2).any(|arg| {
-                        matches!(
-                            arg,
-                            Expr::Literal(Literal::Null) | Expr::BoundValue(Value::Null)
-                        )
-                    })
-                    && args.iter().any(|arg| {
-                        matches!(
-                            arg,
-                            Expr::Function {
-                                name,
-                                args,
-                                ..
-                            } if name.eq_ignore_ascii_case("CAST")
-                                && matches!(
-                                    args.get(1),
-                                    Some(Expr::Literal(Literal::String(kind)))
-                                        if kind.to_ascii_uppercase().starts_with("BINARY")
-                                )
-                        )
-                    })
-                {
-                    return Err(error(
-                        crate::error::catalog::ER_CHARACTER_SET_MISMATCH,
-                        "Character set 'binary' cannot be used in conjunction with 'regexp_like'.",
-                    ));
+                if matches!(
+                    upper.as_str(),
+                    "REGEXP_LIKE" | "REGEXP_INSTR" | "REGEXP_SUBSTR" | "REGEXP_REPLACE"
+                ) {
+                    let operands = if upper == "REGEXP_REPLACE" { 3 } else { 2 };
+                    let classes = args
+                        .iter()
+                        .take(operands)
+                        .map(|arg| expr_type_descriptor(arg, table).class)
+                        .collect::<Vec<_>>();
+                    if !classes
+                        .iter()
+                        .any(|c| matches!(c, ExprTypeClass::Null | ExprTypeClass::Unknown))
+                    {
+                        let binary = classes
+                            .iter()
+                            .filter(|c| matches!(c, ExprTypeClass::BinaryString))
+                            .count();
+                        if binary != 0 && binary != operands {
+                            return Err(crate::error::catalog::ER_CHARACTER_SET_MISMATCH.error("Character set 'binary' cannot be used with text regular expression operands"));
+                        }
+                    }
                 }
                 // Resolve deterministic charset failures in nested locator
                 // calls before the enclosing function is bound. A standalone
@@ -24828,8 +24974,12 @@ pub(crate) fn compare_values(left: &Value, right: &Value) -> Result<Ordering, Qu
     // `DISTINCT` / `GROUP BY` / `=` on a vector column are well-defined.
     // Similarity ordering is expressed via `DISTANCE()`, not raw comparison.
     if matches!(left, Value::Vector(_)) || matches!(right, Value::Vector(_)) {
-        let lb = vector_bytes_for_compare(left);
-        let rb = vector_bytes_for_compare(right);
+        let datatype = match (left, right) {
+            (Value::Vector(v), _) | (_, Value::Vector(v)) => v.datatype,
+            _ => unreachable!(),
+        };
+        let lb = crate::engine::vector::codec::coerce_comparison_value(left, datatype)?;
+        let rb = crate::engine::vector::codec::coerce_comparison_value(right, datatype)?;
         return Ok(crate::engine::vector::compare(&lb, &rb));
     }
     // Temporal/string coercion has precedence over the generic numeric
@@ -25049,20 +25199,6 @@ fn geometry_bytes_for_compare(value: &Value) -> Vec<u8> {
         Value::String(s) => s.as_bytes().to_vec(),
         Value::SmallString(s) => s.as_ref().to_vec(),
         other => other.to_display_string().into_bytes(),
-    }
-}
-
-/// Coerce a value to internal vector bytes for vector comparison. A
-/// `Value::Vector` is used directly; text/bytes are parsed; anything else
-/// falls back to its display bytes (deterministic).
-fn vector_bytes_for_compare(value: &Value) -> crate::vector::VectorValue {
-    match value {
-        Value::Vector(b) => b.clone(),
-        Value::Bytes(b) => crate::engine::vector::coerce_bytes_to_internal(b).unwrap_or_default(),
-        Value::String(s) => {
-            crate::engine::vector::coerce_bytes_to_internal(s.as_bytes()).unwrap_or_default()
-        }
-        other => other.to_display_string().into_bytes().into(),
     }
 }
 
@@ -26963,20 +27099,24 @@ pub(crate) fn parse_time_components(s: &str) -> Result<(bool, u32, u32, u32, u32
         .strip_prefix('-')
         .map_or((false, trimmed), |rest| (true, rest));
     let (main, fraction) = rest.split_once('.').unwrap_or((rest, ""));
-    let micros = crate::util::temporal::parse_time_fraction(fraction).map_err(invalid)?;
-    // A DATETIME also contains `:`. Recognise the full date shape before the
-    // generic HH:MM:SS lane so TIMESTAMP(date, datetime_expression) can use
-    // the expression's time fields instead of trying to parse
-    // `"YYYY-MM-DD HH"` as an hour.
-    if matches!(main, "0000-00-00" | "0000-00-00 00:00:00") {
-        return Ok((neg, 0, 0, 0, micros));
-    }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(main, "%Y-%m-%d %H:%M:%S") {
-        use chrono::Timelike;
-        return Ok((neg, dt.hour(), dt.minute(), dt.second(), micros));
-    }
-    if chrono::NaiveDate::parse_from_str(main, "%Y-%m-%d").is_ok() {
-        return Ok((neg, 0, 0, 0, micros));
+    // Both calendar formats require a literal date separator. Duration text
+    // without one cannot match either format; parse it only once below.
+    if main.as_bytes().contains(&b'-') {
+        let micros = crate::util::temporal::parse_time_fraction(fraction).map_err(invalid)?;
+        // A DATETIME also contains `:`. Recognise the full date shape before the
+        // generic HH:MM:SS lane so TIMESTAMP(date, datetime_expression) can use
+        // the expression's time fields instead of trying to parse
+        // `"YYYY-MM-DD HH"` as an hour.
+        if matches!(main, "0000-00-00" | "0000-00-00 00:00:00") {
+            return Ok((neg, 0, 0, 0, micros));
+        }
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(main, "%Y-%m-%d %H:%M:%S") {
+            use chrono::Timelike;
+            return Ok((neg, dt.hour(), dt.minute(), dt.second(), micros));
+        }
+        if chrono::NaiveDate::parse_from_str(main, "%Y-%m-%d").is_ok() {
+            return Ok((neg, 0, 0, 0, micros));
+        }
     }
 
     let parts = crate::util::temporal::parse_time_duration(s).map_err(invalid)?;
@@ -27090,7 +27230,7 @@ fn parse_time_value_components_inner(
             format!("incorrect TIME value: '{}'", string_value(value)),
         ));
     }
-    let text = string_value(value);
+    let text = str_value(value);
     if matches!(
         value,
         Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
@@ -27124,7 +27264,12 @@ fn parse_time_value_components_inner(
             dt.nanosecond() / 1000,
         ));
     }
-    parse_time_components(&string_value(value))
+    if matches!(value, Value::Timestamp(_)) {
+        // Timestamp text conversion can emit session-timezone diagnostics.
+        parse_time_components(&string_value(value))
+    } else {
+        parse_time_components(&text)
+    }
 }
 
 /// TIME_FORMAT's core formatting logic. Numeric date fields use a zero date;
@@ -27449,10 +27594,21 @@ fn statement_digest_text_result(text: String) -> Value {
 /// latin1 `Å` and UTF-8 `Å` render equivalently but have the same token hash
 /// only when the explicit CONVERT source is respected.
 fn statement_digest_hash(sql: &str, source_charset: &str) -> String {
+    use sqlparser::{dialect::MySqlDialect, tokenizer::Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return String::new();
+    };
+    statement_digest_hash_tokens(tokens.iter(), sql.len(), source_charset)
+}
+
+fn statement_digest_hash_tokens<'a>(
+    tokens: impl IntoIterator<Item = &'a sqlparser::tokenizer::Token>,
+    source_len: usize,
+    source_charset: &str,
+) -> String {
     use sha2::Digest;
-    use sqlparser::dialect::MySqlDialect;
     use sqlparser::keywords::Keyword;
-    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    use sqlparser::tokenizer::{Token, Whitespace};
 
     const TOK_GENERIC_VALUE: u16 = 1100;
     const TOK_IDENT: u16 = 1106;
@@ -27538,9 +27694,6 @@ fn statement_digest_hash(sql: &str, source_charset: &str) -> String {
         token
     }
 
-    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
-        return String::new();
-    };
     let mut pieces: Vec<(String, Vec<u8>)> = Vec::new();
     for token in tokens {
         let piece = match token {
@@ -27631,7 +27784,7 @@ fn statement_digest_hash(sql: &str, source_charset: &str) -> String {
     }
 
     let limit = STATEMENT_DIGEST_TOKEN_LIMIT.with(Cell::get).unwrap_or(1024);
-    let mut token_buffer = Vec::with_capacity(limit.min(sql.len()));
+    let mut token_buffer = Vec::with_capacity(limit.min(source_len));
     for (_, piece) in pieces {
         if token_buffer.len().saturating_add(piece.len()) > limit {
             break;
@@ -27844,9 +27997,21 @@ fn statement_digest_text_tokenized(
     max_bytes: usize,
     max_digest_length: Option<usize>,
 ) -> (String, bool) {
-    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::{dialect::MySqlDialect, tokenizer::Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return (String::new(), false);
+    };
+    statement_digest_text_tokens(tokens.iter(), sql.len(), max_bytes, max_digest_length)
+}
+
+fn statement_digest_text_tokens<'a>(
+    tokens: impl IntoIterator<Item = &'a sqlparser::tokenizer::Token>,
+    source_len: usize,
+    max_bytes: usize,
+    max_digest_length: Option<usize>,
+) -> (String, bool) {
     use sqlparser::keywords::Keyword;
-    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    use sqlparser::tokenizer::{Token, Whitespace};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DigestTokenKind {
@@ -27858,10 +28023,8 @@ fn statement_digest_text_tokenized(
         Other,
     }
 
-    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
-        return (String::new(), false);
-    };
-    let mut normalized: Vec<(String, DigestTokenKind)> = Vec::with_capacity(tokens.len());
+    let tokens = tokens.into_iter();
+    let mut normalized: Vec<(String, DigestTokenKind)> = Vec::with_capacity(tokens.size_hint().0);
     let mut spaced_parens = Vec::new();
     for token in tokens {
         let item = match token {
@@ -27978,7 +28141,7 @@ fn statement_digest_text_tokenized(
         }
     }
 
-    let mut out = String::with_capacity(sql.len().min(max_bytes));
+    let mut out = String::with_capacity(source_len.min(max_bytes));
     let mut previous_kind = None;
     let mut saturated = false;
     // MySQL's `max_digest_length` buffer also stores the terminating token;
@@ -28025,20 +28188,55 @@ fn digest_input_string(value: &Value) -> Result<String, QueryError> {
     }
 }
 
-fn validate_digest_sql(sql: &str) -> Result<(), QueryError> {
+fn validated_statement_digest(
+    sql: &str,
+    source_charset: Option<String>,
+) -> Result<String, QueryError> {
+    let invalid = || {
+        error(
+            crate::error::catalog::ER_PARSE_ERROR_IN_DIGEST_FN,
+            "Statement digest function received invalid SQL text.",
+        )
+    };
     if sql.trim().is_empty() || sql.contains('\0') || sql.contains('?') {
-        return Err(error(
-            crate::error::catalog::ER_PARSE_ERROR_IN_DIGEST_FN,
-            "Statement digest function received invalid SQL text.",
-        ));
+        return Err(invalid());
     }
-    match crate::parser::parse_statements(sql) {
-        Ok(statements) if statements.len() == 1 => Ok(()),
-        _ => Err(error(
-            crate::error::catalog::ER_PARSE_ERROR_IN_DIGEST_FN,
-            "Statement digest function received invalid SQL text.",
-        )),
+    let hash = source_charset.is_some();
+    let renderer = if hash {
+        |tokens: &[sqlparser::tokenizer::TokenWithSpan], source: &str, charset: &str| {
+            statement_digest_hash_tokens(
+                tokens.iter().map(|token| &token.token),
+                source.len(),
+                charset,
+            )
+        }
+    } else {
+        |tokens: &[sqlparser::tokenizer::TokenWithSpan], source: &str, _: &str| {
+            let limit = STATEMENT_DIGEST_TOKEN_LIMIT.with(Cell::get);
+            statement_digest_text_tokens(
+                tokens.iter().map(|token| &token.token),
+                source.len(),
+                1024,
+                limit,
+            )
+            .0
+        }
+    };
+    let (statements, captured, charset) =
+        crate::parser::parse_with_token_output(sql, source_charset.unwrap_or_default(), renderer)
+            .map_err(|_| invalid())?;
+    let valid = statements.len() == 1;
+    drop(statements);
+    if !valid {
+        return Err(invalid());
     }
+    Ok(captured.unwrap_or_else(|| {
+        if hash {
+            statement_digest_hash(sql, &charset)
+        } else {
+            statement_digest_text(sql)
+        }
+    }))
 }
 
 fn digest_expr_failure_must_be_undisclosed(expr: &Expr) -> bool {
@@ -29025,7 +29223,7 @@ fn expr_audit_kernel_throughput() {
             black_box(eval_arithmetic(black_box(&left), BinaryOp::Div, black_box(&right)).unwrap());
         }
         eprintln!("compact_div_ns {}", start.elapsed().as_nanos() / 200_000);
-        let re = regex::Regex::new("^a.*z$").unwrap();
+        let re = crate::engine::func_cache::cached_regex("^a.*z$", "").unwrap();
         let mut out = Vec::with_capacity(128);
         let start = Instant::now();
         for _ in 0..200_000 {

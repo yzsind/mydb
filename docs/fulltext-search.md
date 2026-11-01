@@ -111,7 +111,9 @@ The `MYDB_FT_MIN_TOKEN_SIZE`, `MYDB_FT_MAX_TOKEN_SIZE`, `MYDB_FT_NGRAM_SIZE`,
 `MYDB_FT_STOPWORDS`, `MYDB_FT_POSITIONS`, and `MYDB_FT_POSITION_GAP` process
 defaults are captured in each new index. Later process-default changes do not
 change that index's key encoding or tokenizer. The inter-column position gap
-is at least one. Indexes without stored positions verify phrases against
+is at least one. Filtered stopwords and out-of-range words retain their original
+word offsets. Phrases with internal filtered words also verify the original
+words against the visible heap row; filtering never makes separated words adjacent. Indexes without stored positions verify phrases against
 visible row text. `MYDB_FT_BM25_K1` and `MYDB_FT_BM25_B` configure process-wide
 ranking parameters, defaulting to 1.2 and 0.75.
 
@@ -134,6 +136,10 @@ documents. These paths cost a corpus scan and can require more memory than
 an ordinary inverted-index lookup. `EXPLAIN` identifies the heap oracle path;
 memory admission failures return an explicit error.
 
+Single-table `FOR UPDATE` and `FOR SHARE` reads support MATCH filtering and
+score projection through the same full-text runtime. MATCH in a locking JOIN
+query remains unsupported and returns error 1235.
+
 Online `OPTIMIZE TABLE` for partitioned tables with `FULLTEXT` indexes remains
 unsupported and returns an explicit error. Immutable backup queries support
 filtering and score projection; see [Backup and Recovery](backup-and-recovery.md#51-fulltext-queries).
@@ -149,5 +155,6 @@ Malformed posting payloads return an index corruption error; token, prefix,
 phrase and scoring paths never silently skip malformed entries. Detected
 corruption fences the persistent index and preserves its files for explicit
 repair or restore. A normal open does not silently replace a damaged FULLTEXT
-index with a heap reconstruction. A deliberately scheduled logical redo rebuild
+index with a heap reconstruction. A missing derived index file without a
+corruption fence can be rebuilt from the heap during recovery. A deliberately scheduled logical redo rebuild
 is a separately recorded recovery obligation whose failure prevents opening.

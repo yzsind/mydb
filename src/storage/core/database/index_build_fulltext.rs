@@ -48,15 +48,15 @@ fn fulltext_build_pending(
         if column > 0 {
             next_pos = next_pos.saturating_add(u64::from(cfg.position_gap));
         }
-        let previous_len = doc_len;
-        tokenizer.visit_tokens(text, &mut |token| {
-            positions.entry(token).or_default().push(next_pos as u32);
-            next_pos = next_pos.saturating_add(1);
-            doc_len = doc_len.saturating_add(1);
+        let mut last_position=None;
+        let extent=tokenizer.visit_positioned_tokens(text,&mut |token,offset| {
+            let position=next_pos.saturating_add(offset);
+            positions.entry(token).or_default().push(position as u32);
+            doc_len=doc_len.saturating_add(1);
+            last_position=Some(position);
         });
-        let last_position =
-            (cfg.positions && doc_len != previous_len).then(|| next_pos.saturating_sub(1));
-        crate::storage::fulltext::payload::validate_document_extent(doc_len, last_position)?;
+        crate::storage::fulltext::payload::validate_document_extent(doc_len,if cfg.positions {last_position} else {None})?;
+        next_pos=next_pos.saturating_add(extent);
     }
     let mut payload = Vec::new();
     for (token, positions) in positions {

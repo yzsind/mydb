@@ -224,6 +224,9 @@ fn capture_database(
         ));
     }
     let pin_started = Instant::now();
+    // Exclude checkpoints until the in-memory retention floor is installed.
+    // The durable lease can then be written without holding maintenance locks.
+    let initial_maintenance = db.backup_maintenance_capture_guard()?;
     let pin_floor = {
         let log_handle = db.wal_log();
         let mut log = log_handle.lock();
@@ -233,6 +236,9 @@ fn capture_database(
     db.capture
         .capture_floor
         .store(pin_floor.max(1), Ordering::Release);
+    drop(initial_maintenance);
+    #[cfg(test)]
+    faults::hit("capture_before_durable_lease", db.data_dir())?;
     db.capture.set_lease(
         &_active.lease,
         Some(crate::storage::capture::WalLease {

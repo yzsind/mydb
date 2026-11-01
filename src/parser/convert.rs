@@ -5195,7 +5195,7 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             args.push(Expr::Literal(Literal::String(mode.as_str().to_string())));
             args.push(query);
             for name in columns {
-                args.push(Expr::Identifier(match_against_column(name)?));
+                args.push(match_against_column(name)?);
             }
             Ok(Expr::Function {
                 name: FT_MATCH_FUNCTION.to_string(),
@@ -8091,14 +8091,21 @@ fn parse_vector_type(
     Ok((Some(dim), datatype))
 }
 
-/// Extract the column name from the column reference of `MATCH (cols)`. Phase 1
-/// supports only simple/qualified column identifiers, taking the last segment as the column name (index-side comparison uses the bare column name).
-fn match_against_column(name: &sqlparser::ast::ObjectName) -> Result<String, ParseError> {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.clone())
-        .ok_or_else(|| ParseError::at_zero("MATCH column must be a simple identifier"))
+/// Preserve MATCH qualifiers for ambiguity checks and join binding.
+fn match_against_column(name: &sqlparser::ast::ObjectName) -> Result<Expr, ParseError> {
+    let parts: Option<Vec<_>> = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(|i| i.value.clone()))
+        .collect();
+    let mut parts = parts
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ParseError::at_zero("MATCH column must be a simple identifier"))?;
+    Ok(if parts.len() == 1 {
+        Expr::Identifier(parts.remove(0))
+    } else {
+        Expr::CompoundIdentifier(parts)
+    })
 }
 
 fn truth_test_expr(name: &str, expr: &SqlExpr) -> Result<Expr, ParseError> {

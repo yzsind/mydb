@@ -1,5 +1,6 @@
 use super::plan::{empty_result_columns, execute_plan_stream, ColMeta, PlanRow};
 use super::*;
+use crate::engine::api::{ResultBatch, ResultChunk};
 use crate::planner::RuntimeFilter;
 
 use std::sync::atomic::Ordering;
@@ -358,7 +359,7 @@ pub(super) struct PlanStreamCursor {
     /// once per 64 rows instead of once per row — the row-level shape
     /// became visible as a hotspot on multi-million-row streaming
     /// SELECTs.
-    rx: Option<mpsc::Receiver<Result<Vec<Vec<Value>>, QueryError>>>,
+    rx: Option<mpsc::Receiver<Result<ResultChunk, QueryError>>>,
     worker: Option<crate::util::blocking_pool::BlockingJoinHandle>,
     cancellation: crate::engine::cancel::CancellationSnapshot,
     budget: Arc<crate::engine::executor::mem_budget::MemBudget>,
@@ -366,6 +367,7 @@ pub(super) struct PlanStreamCursor {
     /// popped from here one at a time so `ResultCursor::next_row`
     /// stays row-shaped from the protocol layer's perspective.
     current: std::vec::IntoIter<Vec<Value>>,
+    columnar: Option<(ResultBatch, std::vec::IntoIter<usize>)>,
     warning_sink: crate::engine::api::StatementWarningSink,
     /// Keep a grouping phase active for the complete lazy cursor lifetime.
     /// Creating it on the connection thread avoids a gap before the worker
@@ -392,6 +394,64 @@ impl std::fmt::Debug for PlanStreamCursor {
 /// this exact boundary so response scheduling cannot change SQL values.
 pub(super) struct SelectResultNormalizer {
     adjustments: smallvec::SmallVec<[ResultColumnAdjustment; 4]>,
+}
+
+/// One governed metadata allocation shared by all result batches. The charge
+/// follows the schema even after the producer and its input batch are gone.
+fn result_batch_schema(
+    columns: &[crate::types::Column],
+    mut charge: crate::engine::executor::mem_budget::ScopedCharge,
+) -> Option<Arc<crate::engine::executor::vec::schema::BatchSchema>> {
+    use crate::engine::executor::vec::schema::{BatchField, BatchSchema};
+    let estimate = std::mem::size_of::<BatchSchema>()
+        + 32
+        + columns
+            .iter()
+            .map(|c| {
+                std::mem::size_of::<BatchField>()
+                    + c.name.len()
+                    + c.source.schema.len()
+                    + c.source.table.len()
+                    + c.source.org_table.len()
+                    + c.source.org_name.len()
+            })
+            .sum::<usize>();
+    if !charge.add_within(estimate, usize::MAX) {
+        return None;
+    }
+    let mut schema = BatchSchema::new(
+        columns
+            .iter()
+            .map(|c| BatchField {
+                table: String::new(),
+                alias: None,
+                name: c.name.clone(),
+                column_type: c.column_type,
+                source: c.source.clone(),
+            })
+            .collect(),
+    );
+    let actual = std::mem::size_of::<BatchSchema>() + 32 + schema.heap_capacity_bytes();
+    if actual > estimate && !charge.add_within(actual - estimate, usize::MAX) {
+        return None;
+    }
+    schema.retain_charge(charge);
+    Some(Arc::new(schema))
+}
+
+fn send_columnar_chunk(
+    tx: &mpsc::SyncSender<Result<ResultChunk, QueryError>>,
+    pending_rows: &mut Vec<Vec<Value>>,
+    batch: ResultBatch,
+) -> bool {
+    if !pending_rows.is_empty()
+        && tx
+            .send(Ok(ResultChunk::Rows(std::mem::take(pending_rows))))
+            .is_err()
+    {
+        return false;
+    }
+    tx.send(Ok(ResultChunk::Columnar(batch))).is_ok()
 }
 
 struct ResultColumnAdjustment {
@@ -501,7 +561,7 @@ impl PlanStreamCursor {
         let txn = execution_context.txn();
         let batch_rows = stream_batch_rows();
         let channel_batches = stream_channel_batches();
-        let (tx, rx) = mpsc::sync_channel::<Result<Vec<Vec<Value>>, QueryError>>(channel_batches);
+        let (tx, rx) = mpsc::sync_channel::<Result<ResultChunk, QueryError>>(channel_batches);
         let cancellation = execution_context.cancellation().clone();
         let query_budget = Arc::clone(execution_context.budget());
         let warning_sink = execution_context.warning_sink().clone();
@@ -544,8 +604,27 @@ impl PlanStreamCursor {
                 )? {
                     let mut output: Vec<Vec<Value>> = Vec::with_capacity(batch_rows);
                     let mut scalar_eval_ctx = super::eval::EvalQueryContext::default();
-                    while let Some(batch) = input.stream.next_batch()? {
+                    let identity_projection = normalizer.adjustments.is_empty()
+                        && input.projection.iter().enumerate().all(|(i, p)|
+                            matches!(p, super::vec_bridge::VecResultProjection::Column(c) if *c == i));
+                    let mut output_schema = None;
+                    while let Some(mut batch) = input.stream.next_batch()? {
                         crate::engine::cancel::check_cancelled()?;
+                        if identity_projection && input.projection.len() == batch.columns().len()
+                            && result_columns.iter().zip(batch.schema().fields()).all(|(c, f)| c.column_type == f.column_type)
+                        {
+                            if output_schema.is_none() {
+                                output_schema = result_batch_schema(&result_columns, batch.memory_charge());
+                            }
+                            if let Some(schema) = &output_schema {
+                                batch.schema = Arc::clone(schema);
+                                emitted_rows = emitted_rows.saturating_add(batch.visible_rows());
+                                if !send_columnar_chunk(&tx, &mut output, ResultBatch { batch, charge: None }) {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
                         let (computed, _retained) = if input.row_major_projection {
                             super::vec_bridge::precompute_read_only_projection(
                                 &input.projection,
@@ -586,6 +665,64 @@ impl PlanStreamCursor {
                                         super::vec_bridge::VecResultProjection::Expr(_)
                                     ) && computed.get(index).and_then(Option::as_ref).is_none()
                                 });
+                        if !needs_row && normalizer.adjustments.is_empty() && output_schema.is_none() {
+                            output_schema = result_batch_schema(&result_columns, batch.memory_charge());
+                        }
+                        if let Some(schema) = output_schema.as_ref().filter(|_| !needs_row && normalizer.adjustments.is_empty()) {
+                            use crate::engine::executor::vec::{
+                                batch::{Batch, ColumnVector},
+                            };
+                            let bytes = input
+                                .projection
+                                .iter()
+                                .enumerate()
+                                .map(|(index, projection)| {
+                                    std::mem::size_of::<ColumnVector>()
+                                        + match projection {
+                                            super::vec_bridge::VecResultProjection::Column(
+                                                column,
+                                            ) => batch.columns()[*column].memory_bytes(),
+                                            _ => computed[index]
+                                                .as_ref()
+                                                .expect("computed projection")
+                                                .memory_bytes(),
+                                        }
+                                })
+                                .sum::<usize>()
+                                .saturating_add(128);
+                            let mut charge = batch.memory_charge();
+                            if charge.add_within(bytes, usize::MAX) {
+                                let mut computed = computed;
+                                let columns = input
+                                    .projection
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, projection)| match projection {
+                                        super::vec_bridge::VecResultProjection::Column(column) => {
+                                            batch.columns()[*column].clone()
+                                        }
+                                        _ => computed[index].take().expect("computed projection"),
+                                    })
+                                    .collect();
+                                let projected =
+                                    Batch::with_row_count(Arc::clone(schema), columns, batch.num_rows())
+                                        .with_memory_charge(charge)?;
+                                let projected = match batch.selection() {
+                                    Some(selection) => projected.with_selection(selection.clone()),
+                                    None => projected,
+                                };
+                                emitted_rows =
+                                    emitted_rows.saturating_add(projected.visible_rows());
+                                if !send_columnar_chunk(&tx, &mut output, ResultBatch {
+                                        batch: projected,
+                                        charge: None,
+                                    })
+                                {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
                         let mut row_values = Vec::with_capacity(batch.columns().len());
                         let mut projected_rows = 0usize;
                         // Scalar evaluation may do unbounded work per row;
@@ -674,7 +811,7 @@ impl PlanStreamCursor {
                             if output.len() >= batch_rows {
                                 let chunk =
                                     std::mem::replace(&mut output, Vec::with_capacity(batch_rows));
-                                if tx.send(Ok(chunk)).is_err() {
+                                if tx.send(Ok(ResultChunk::Rows(chunk))).is_err() {
                                     return Ok(false);
                                 }
                             }
@@ -698,7 +835,7 @@ impl PlanStreamCursor {
                         }
                     }
                     if !output.is_empty() {
-                        let _ = tx.send(Ok(output));
+                        let _ = tx.send(Ok(ResultChunk::Rows(output)));
                     }
                     super::plan::cap_limited_group_concat_warnings(
                         warning_checkpoint,
@@ -721,13 +858,13 @@ impl PlanStreamCursor {
                     emitted_rows = emitted_rows.saturating_add(1);
                     if batch.len() >= batch_rows {
                         let chunk = std::mem::replace(&mut batch, Vec::with_capacity(batch_rows));
-                        if tx.send(Ok(chunk)).is_err() {
+                        if tx.send(Ok(ResultChunk::Rows(chunk))).is_err() {
                             return Ok(());
                         }
                     }
                 }
                 if !batch.is_empty() {
-                    let _ = tx.send(Ok(std::mem::take(&mut batch)));
+                    let _ = tx.send(Ok(ResultChunk::Rows(std::mem::take(&mut batch))));
                 }
                 super::plan::cap_limited_group_concat_warnings(
                     warning_checkpoint,
@@ -747,6 +884,7 @@ impl PlanStreamCursor {
             cancellation,
             budget: query_budget,
             current: Vec::new().into_iter(),
+            columnar: None,
             warning_sink,
             _grouping_stage: grouping_stage,
         }
@@ -755,41 +893,75 @@ impl PlanStreamCursor {
 
 impl crate::engine::api::ResultCursor for PlanStreamCursor {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
-        // P3-3: row-level interface, batch-level transport — pop from
-        // the in-progress batch first, only touch the channel when
-        // the batch is exhausted.
         loop {
-            // The producer latches terminal OOM before cancelling its worker
-            // tree. Resolve the primary error only on failure, without adding
-            // a budget/TLS lookup to every successfully streamed row.
-            if let Err(error) = self.cancellation.check() {
-                return Err(self.budget.terminal_oom().unwrap_or(error));
-            }
+            self.cancellation
+                .check()
+                .map_err(|error| self.budget.terminal_oom().unwrap_or(error))?;
             if let Some(row) = self.current.next() {
                 return Ok(Some(row));
             }
-            match self.rx.as_ref().expect("stream receiver present").recv() {
-                Ok(Ok(batch)) => self.current = batch.into_iter(),
-                Ok(Err(err)) => return Err(self.budget.terminal_oom().unwrap_or(err)),
-                Err(_) => {
-                    if let Some(error) = self.budget.terminal_oom() {
-                        return Err(error);
+            if let Some((owned, rows)) = self.columnar.as_mut() {
+                if let Some(index) = rows.next() {
+                    let mut row = owned.batch.row(index);
+                    SelectResultNormalizer {
+                        adjustments: Default::default(),
                     }
-                    if let Some(worker) = self.worker.take() {
-                        match worker.join() {
-                            Ok(()) => {}
-                            Err(crate::util::blocking_pool::BlockingError::Panicked(detail)) => {
-                                return Err(stream_producer_panicked(&detail));
-                            }
-                            Err(crate::util::blocking_pool::BlockingError::Cancelled) => {
-                                return Err(stream_producer_panicked(
-                                    "producer task was cancelled",
-                                ));
-                            }
+                    .apply(&mut row);
+                    return Ok(Some(row));
+                }
+            }
+            self.columnar = None;
+            match self.next_chunk()? {
+                None => return Ok(None),
+                Some(ResultChunk::Row(row)) => return Ok(Some(row)),
+                Some(ResultChunk::Rows(rows)) => self.current = rows.into_iter(),
+                Some(ResultChunk::Columnar(owned)) => {
+                    let rows = owned
+                        .batch
+                        .visible_indices()
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                    self.columnar = Some((owned, rows));
+                }
+            }
+        }
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<ResultChunk>, QueryError> {
+        self.cancellation
+            .check()
+            .map_err(|error| self.budget.terminal_oom().unwrap_or(error))?;
+        if self.current.len() != 0 {
+            return Ok(Some(ResultChunk::Rows(self.current.by_ref().collect())));
+        }
+        if let Some((mut owned, indices)) = self.columnar.take() {
+            let remaining = indices.map(|row| row as u32).collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                owned.batch = owned.batch.with_selection(
+                    crate::engine::executor::vec::batch::Selection::Indices(remaining),
+                );
+                return Ok(Some(ResultChunk::Columnar(owned)));
+            }
+        }
+        match self.rx.as_ref().expect("stream receiver present").recv() {
+            Ok(Ok(chunk)) => return Ok(Some(chunk)),
+            Ok(Err(err)) => return Err(self.budget.terminal_oom().unwrap_or(err)),
+            Err(_) => {
+                if let Some(error) = self.budget.terminal_oom() {
+                    return Err(error);
+                }
+                if let Some(worker) = self.worker.take() {
+                    match worker.join() {
+                        Ok(()) => {}
+                        Err(crate::util::blocking_pool::BlockingError::Panicked(detail)) => {
+                            return Err(stream_producer_panicked(&detail));
+                        }
+                        Err(crate::util::blocking_pool::BlockingError::Cancelled) => {
+                            return Err(stream_producer_panicked("producer task was cancelled"));
                         }
                     }
-                    return Ok(None);
                 }
+                return Ok(None);
             }
         }
     }
@@ -1348,6 +1520,148 @@ mod cursor_terminal_error_tests {
     use crate::engine::executor::mem_budget::MemBudget;
 
     #[test]
+    fn columnar_recovery_flushes_pending_rows_before_selected_batch() {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector, Selection},
+            schema::{BatchField, BatchSchema},
+        };
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "v".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }]));
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![
+                Value::Int(3),
+                Value::Int(4),
+            ])],
+        )
+        .with_selection(Selection::Indices(vec![1, 0, 1]));
+        let (tx, rx) = mpsc::sync_channel(3);
+        let mut pending = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
+        assert!(send_columnar_chunk(
+            &tx,
+            &mut pending,
+            ResultBatch {
+                batch,
+                charge: None
+            }
+        ));
+        drop(tx);
+        let mut actual = Vec::new();
+        for chunk in rx {
+            match chunk.unwrap() {
+                ResultChunk::Rows(rows) => actual.extend(rows),
+                ResultChunk::Columnar(result) => {
+                    for row in result.batch.selection().unwrap().iter() {
+                        actual.push(vec![result.batch.columns()[0].value_at(row)]);
+                    }
+                }
+                ResultChunk::Row(row) => actual.push(row),
+            }
+        }
+        assert_eq!(actual, [1, 2, 4, 3, 4].map(|n| vec![Value::Int(n)]));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn shared_result_schema_retains_budget_and_origin() {
+        use crate::engine::executor::mem_budget::ScopedCharge;
+        let budget = Arc::new(MemBudget::new(1 << 20));
+        let columns = vec![crate::types::Column {
+            name: "alias".into(),
+            column_type: ColumnType::LongLong,
+            source: crate::types::ColumnSource {
+                org_name: "original".into(),
+                ..Default::default()
+            },
+        }];
+        let schema =
+            result_batch_schema(&columns, ScopedCharge::for_budget(Some(budget.clone()))).unwrap();
+        assert!(budget.used() > 0);
+        assert_eq!(schema.fields()[0].name, "alias");
+        assert_eq!(schema.fields()[0].source.org_name, "original");
+        let retained = schema.clone();
+        drop(schema);
+        assert!(budget.used() > 0);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn plan_cursor_preserves_duplicate_selection_when_switching_consumers() {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector, Selection},
+            schema::{BatchField, BatchSchema},
+        };
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "s".into(),
+            column_type: ColumnType::VarString,
+            source: Default::default(),
+        }]));
+        let batch = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![
+                Value::String("first".into()),
+                Value::Null,
+                Value::String("third".into()),
+            ])],
+        )
+        .with_selection(Selection::Indices(vec![2, 0, 2, 1]));
+        let (tx, rx) = mpsc::sync_channel(3);
+        tx.send(Ok(ResultChunk::Columnar(ResultBatch {
+            batch,
+            charge: None,
+        })))
+        .unwrap();
+        tx.send(Ok(ResultChunk::Rows(vec![
+            vec![Value::Int(5)],
+            vec![Value::Int(6)],
+        ])))
+        .unwrap();
+        drop(tx);
+        let mut cursor = PlanStreamCursor {
+            rx: Some(rx),
+            worker: None,
+            cancellation: crate::engine::cancel::CancellationSnapshot::capture(),
+            budget: Arc::new(MemBudget::new(1 << 20)),
+            current: Vec::new().into_iter(),
+            columnar: None,
+            warning_sink: Default::default(),
+            _grouping_stage: None,
+        };
+        assert_eq!(
+            cursor.next_row().unwrap().unwrap(),
+            vec![Value::String("third".into())]
+        );
+        let Some(ResultChunk::Columnar(owned)) = cursor.next_chunk().unwrap() else {
+            panic!("remaining columnar rows");
+        };
+        let rows: Vec<_> = owned
+            .batch
+            .visible_indices()
+            .map(|index| owned.batch.row(index))
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row[0].to_display_string())
+                .collect::<Vec<_>>(),
+            ["first", "third", "NULL"]
+        );
+        assert_eq!(cursor.next_row().unwrap().unwrap(), vec![Value::Int(5)]);
+        let Some(ResultChunk::Rows(rows)) = cursor.next_chunk().unwrap() else {
+            panic!("remaining row batch");
+        };
+        assert_eq!(rows, vec![vec![Value::Int(6)]]);
+        assert!(cursor.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
     fn producer_oom_precedes_worker_cancellation_without_consumer_tls() {
         for oom in [false, true] {
             let budget = Arc::new(MemBudget::new(1024));
@@ -1377,6 +1691,7 @@ mod cursor_terminal_error_tests {
                     cancellation,
                     budget,
                     current: Vec::new().into_iter(),
+                    columnar: None,
                     warning_sink: Default::default(),
                     _grouping_stage: None,
                 };
@@ -1388,8 +1703,8 @@ mod cursor_terminal_error_tests {
         }
     }
 
-    fn one_row_batch() -> Vec<Vec<Value>> {
-        vec![vec![Value::Int(1)]]
+    fn one_row_batch() -> ResultChunk {
+        ResultChunk::Rows(vec![vec![Value::Int(1)]])
     }
 
     #[test]
@@ -1408,6 +1723,7 @@ mod cursor_terminal_error_tests {
                 cancellation: crate::engine::cancel::CancellationSnapshot::capture(),
                 budget: Arc::new(MemBudget::new(1 << 20)),
                 current: Vec::new().into_iter(),
+                columnar: None,
                 warning_sink: Default::default(),
                 _grouping_stage: None,
             };

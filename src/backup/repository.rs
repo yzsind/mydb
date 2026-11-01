@@ -713,6 +713,8 @@ impl Repository {
             return Err(backup_err("base commit/manifest/seal mismatch"));
         }
         let image = if full_hash {
+            #[cfg(test)]
+            super::faults::hit("base_before_full_verify", &path)?;
             native::verify(&path.join("data"))?
         } else {
             native::validate_open(&path.join("data"))?;

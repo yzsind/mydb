@@ -1769,6 +1769,32 @@ fn infer_view_expr_type(
         // nullable for value expressions (MySQL marks most expression columns
         // nullable). To stay safe we mark expression columns nullable.
         _ => {
+            // Reuse the bound string descriptor, including declared widths
+            // and binary domains. Classification
+            // alone discards these bounds and turns every string into TEXT.
+            let mut session = SessionContext::default();
+            session.current_database = current_database.to_string();
+            let mut shape = select.clone();
+            shape.projection = vec![SelectItem::Expr {
+                expr: expr.clone(),
+                alias: None,
+            }];
+            if crate::engine::executor::qualification::qualify_select_tables(
+                db, &session, &mut shape,
+            )
+            .is_ok()
+            {
+                if let Ok(columns) =
+                    crate::engine::executor::select::describe_select_columns(db, &shape)
+                {
+                    if let [column] = columns.as_slice() {
+                        if matches!(column.column_type, ColumnType::VarString | ColumnType::Blob) {
+                            let definition = ctas_column_def(db, &session, column, true);
+                            return Some((definition.data_type.into(), true));
+                        }
+                    }
+                }
+            }
             let resolve = |column_expr: &Expr| {
                 let name = match column_expr {
                     Expr::Identifier(name) => name.as_str(),
