@@ -219,6 +219,7 @@ pub(crate) fn encode_visible_row_payload(
 pub(crate) struct CompiledDirectRowEncoder {
     layout: RowLayoutCodec,
     prefix: Vec<u8>,
+    fixed_widths: Vec<usize>,
     null_bitmap_start: usize,
     fixed_start: usize,
     dir_start: usize,
@@ -249,8 +250,14 @@ impl CompiledDirectRowEncoder {
         prefix.resize(prefix.len() + layout.value_layout.fixed_len, 0);
         let dir_start = prefix.len();
         prefix.resize(prefix.len() + layout.value_layout.var_count * 2, 0);
+        let fixed_widths = layout
+            .columns
+            .iter()
+            .map(|column| fixed_width_for_kind(&column.kind).unwrap_or(0))
+            .collect();
         Some(Self {
             layout: layout.clone(),
+            fixed_widths,
             prefix,
             null_bitmap_start,
             fixed_start,
@@ -316,7 +323,7 @@ impl DirectRowPayloadBuilder<'_> {
                 "direct row encoder expected a fixed-width field",
             )
         })?;
-        let width = fixed_width_for_kind(&column.kind).expect("fixed slot has fixed kind");
+        let width = self.program.fixed_widths[idx];
         self.next_column += 1;
         Ok((
             &column.kind,

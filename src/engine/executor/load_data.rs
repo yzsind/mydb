@@ -5136,14 +5136,22 @@ fn checked_decimal_load_value(
     // integer logarithm for every loaded decimal while preserving the zero,
     // sign and scale rules below. A precision beyond u64's power range
     // necessarily accepts every compact i64 magnitude.
-    let precision_fits = 10u64
-        .checked_pow(u32::from(precision))
-        .map_or(true, |limit| absolute < limit);
+    let precision_fits = compact_decimal_precision_fits(absolute, precision);
     if value_scale == target_scale && (!unsigned || magnitude >= 0) && precision_fits {
         Ok(Value::DecimalCompact(magnitude, value_scale))
     } else {
         Err(load_out_of_range(column))
     }
+}
+
+#[inline]
+fn compact_decimal_precision_fits(absolute: u64, precision: u8) -> bool {
+    // Every compact i64 magnitude fits precision >= 19, including i64::MIN.
+    // Smaller bounds are immutable decimal metadata; do not exponentiate
+    // the same schema precision again for every imported field.
+    crate::util::decimal_pow::POW10_I64
+        .get(usize::from(precision))
+        .is_none_or(|limit| absolute < *limit as u64)
 }
 
 #[inline]
@@ -5155,9 +5163,7 @@ fn validate_decimal_compact_parts(
     unsigned: bool,
     column: &str,
 ) -> Result<(), QueryError> {
-    let precision_fits = 10u64
-        .checked_pow(u32::from(precision))
-        .map_or(true, |limit| magnitude.unsigned_abs() < limit);
+    let precision_fits = compact_decimal_precision_fits(magnitude.unsigned_abs(), precision);
     if value_scale == target_scale && (!unsigned || magnitude >= 0) && precision_fits {
         Ok(())
     } else {
@@ -7124,6 +7130,49 @@ mod tests {
                 "input={:?} scale={scale}",
                 String::from_utf8_lossy(input),
             );
+        }
+    }
+
+    #[test]
+    fn compact_decimal_metadata_matches_arithmetic_for_all_precision_bytes() {
+        for precision in 0..=u8::MAX {
+            for magnitude in [
+                i64::MIN,
+                -1_000_000_000_000_000_000,
+                -1,
+                0,
+                1,
+                999999,
+                1_000_000_000_000_000_000,
+                i64::MAX,
+            ] {
+                let fits = 10u64
+                    .checked_pow(u32::from(precision))
+                    .is_none_or(|limit| magnitude.unsigned_abs() < limit);
+                for unsigned in [false, true] {
+                    for scale in [0, 2, u8::MAX] {
+                        let expected = scale == 2 && (!unsigned || magnitude >= 0) && fits;
+                        assert_eq!(
+                            validate_decimal_compact_parts(
+                                magnitude, scale, precision, 2, unsigned, "d"
+                            )
+                            .is_ok(),
+                            expected
+                        );
+                        assert_eq!(
+                            checked_decimal_load_value(
+                                Value::DecimalCompact(magnitude, scale),
+                                Some(precision),
+                                2,
+                                unsigned,
+                                "d"
+                            )
+                            .is_ok(),
+                            expected
+                        );
+                    }
+                }
+            }
         }
     }
 
