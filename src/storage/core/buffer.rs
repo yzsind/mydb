@@ -7952,17 +7952,32 @@ fn buffered_scan_cache_waits_for_bounded_physical_relief() {
             "ordinary reads must preserve the useful kernel cache"
         );
         let cached = CachedFile::new(file, bytes.len() as u64);
-        assert_eq!(
-            advise_cached_file_headroom(&cached, bytes.len() / 2),
-            bytes.len() / 2
+        // DONTNEED is best effort: transient page references or locks can
+        // prevent eviction even after fsync. Retry the same range so kernel
+        // scheduling cannot fail the fixture or expand its eviction budget.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let after = loop {
+            assert_eq!(
+                advise_cached_file_headroom(&cached, bytes.len() / 2),
+                bytes.len() / 2
+            );
+            let after = resident();
+            if after < before || Instant::now() >= deadline {
+                break after;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            cached.kernel_cache_reclaim_cursor.store(0, Ordering::Relaxed);
+        };
+        assert!(
+            after < before,
+            "lane {lane} did not reclaim clean cache before the deadline: {before} -> {after}"
         );
-        let after = resident();
-        assert!(after < before, "lane {lane} did not reclaim clean cache");
         assert!(
             after >= before / 2,
             "lane {lane} discarded more than requested"
         );
         let cursor = cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed);
+        assert_eq!(cursor, (bytes.len() / 2) as u64);
         assert_eq!(advise_cached_file_headroom(&cached, 0), 0);
         assert_eq!(
             cached.kernel_cache_reclaim_cursor.load(Ordering::Relaxed),
