@@ -1106,7 +1106,10 @@ impl NativeHnsw {
         if self.state.read().csr.is_some() {
             return Ok(());
         }
-        let mut state = self.state.write();
+        // A declined optional cache must leave concurrent searches running.
+        // Upgrade only after its memory reservation succeeds; the upgradable
+        // reader also prevents duplicate reservations and topology changes.
+        let state = self.state.upgradable_read();
         if state.csr.is_some() || state.nodes.is_empty() || state.nodes.len() > u32::MAX as usize {
             return Ok(());
         }
@@ -1151,6 +1154,7 @@ impl NativeHnsw {
         } else {
             return Ok(());
         };
+        let mut state = parking_lot::RwLockUpgradableReadGuard::upgrade(state);
         let reserved = if reserve_payloads { combined } else { bytes };
         let mut payloads = if reserve_payloads {
             let mut payloads = Vec::new();
@@ -1593,6 +1597,29 @@ impl NativeHnsw {
             }
             Ok(found)
         })
+    }
+
+    fn all_group_scores(
+        state: &State,
+        mut score_node: impl FnMut(usize) -> Result<f64, QueryError>,
+    ) -> Result<Vec<Scored<usize>>, QueryError> {
+        let mut found = Vec::new();
+        found
+            .try_reserve_exact(state.groups.len())
+            .map_err(|_| codec::vector_err("native HNSW exhaustive score allocation failed"))?;
+        for (ordinal, group) in state.groups.iter().enumerate() {
+            if ordinal & 63 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            if group.members.iter().any(|&id| !state.nodes[id].deleted) {
+                found.push(Scored {
+                    id: group.representative,
+                    dist: score_node(group.representative)?,
+                });
+            }
+        }
+        found.sort_unstable();
+        Ok(found)
     }
     fn select(
         &self,
@@ -2053,9 +2080,16 @@ impl NativeHnsw {
             }
         }
         let query_code = self.quantizer().map(|q| q.prepare(query)).transpose()?;
-        for layer in (1..=state.nodes[entry].level).rev() {
-            entry = self.greedy(&state, query, entry, layer, query_code.as_ref())?;
+        // Full exploration budgets score every navigation group directly.
+        // This avoids heap/edge traversal overhead and covers components that
+        // heuristic neighbor pruning may disconnect after incremental writes.
+        let scan_all = ef >= state.groups.len();
+        if !scan_all {
+            for layer in (1..=state.nodes[entry].level).rev() {
+                entry = self.greedy(&state, query, entry, layer, query_code.as_ref())?;
+            }
         }
+        let exact = scan_all.then(|| self.prepare_exact_probe(query)).flatten();
         // A dense level-0 adjacency lets this traversal retain one mapping
         // guard, avoiding a contended shared-lock operation for every score.
         // Upper-layer traversal stays outside this guard, so it never takes
@@ -2063,20 +2097,24 @@ impl NativeHnsw {
         let mapped = if state.csr.as_ref().is_some_and(|csr| csr.payloads.is_none()) {
             if let (Some(file), Some(quant)) = (&self.file, self.quantizer()) {
                 file.with_navigation_mapping(|view| {
+                    let score_node = |id: usize| {
+                        quant.score_payload(
+                            view.native_payload(state.nodes[id].vid)?,
+                            self.file.as_ref(),
+                            query,
+                            query_code.as_ref(),
+                        )
+                    };
+                    if scan_all {
+                        return Self::all_group_scores(&state, score_node);
+                    }
                     self.layer_scored(
                         &state,
                         &[entry],
                         ef,
                         0,
                         self.explore_query_ties(query),
-                        |id| {
-                            quant.score_payload(
-                                view.native_payload(state.nodes[id].vid)?,
-                                self.file.as_ref(),
-                                query,
-                                query_code.as_ref(),
-                            )
-                        },
+                        score_node,
                     )
                 })
             } else {
@@ -2087,6 +2125,15 @@ impl NativeHnsw {
         };
         let pool = match mapped {
             Some(result) => result?,
+            None if scan_all => Self::all_group_scores(&state, |id| {
+                self.navigation_score(
+                    &state,
+                    id,
+                    query,
+                    query_code.as_ref(),
+                    exact.as_ref().map(|probe| &probe.distance),
+                )
+            })?,
             None => self.layer(&state, query, &[entry], ef, 0, query_code.as_ref())?,
         };
         let exhausted = ef >= state.groups.len();
@@ -2119,6 +2166,118 @@ impl NativeHnsw {
 #[cfg(test)]
 mod duplicate_regressions {
     use super::*;
+
+    #[test]
+    fn pending_quantization_repeated_coordinates_remain_reachable() {
+        const ROWS: usize = 1537;
+        let values: Vec<_> = (0..ROWS)
+            .map(|row| {
+                codec::from_f32(
+                    &(0..33)
+                        .map(|column| ((row * 17 + column * 13) % 97) as f32 - 48.0)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        for quantization in [
+            crate::storage::vector_config::QuantizationConfig::Sq8,
+            crate::storage::vector_config::QuantizationConfig::Sq4,
+        ] {
+            let mut graph =
+                NativeHnsw::new(VectorDataType::Float32, 33, Metric::L2, 8, 64, None).unwrap();
+            graph.set_quantizer(true, None, 0);
+            let row_id = |row: usize| RowId {
+                page_id: row as u32 + 1,
+                slot_id: 0,
+            };
+            for (row, value) in values[..128].iter().enumerate() {
+                graph.insert(row_id(row), value.clone()).unwrap();
+            }
+            let mut trainer = super::super::quantization::Trainer::new(
+                quantization.clone(),
+                VectorDataType::Float32,
+                33,
+                Metric::L2,
+            )
+            .unwrap();
+            for value in &values[..128] {
+                trainer.observe(value).unwrap();
+            }
+            graph
+                .install_pending_model(trainer.finish().unwrap().unwrap(), 1)
+                .unwrap();
+            for (row, value) in values.iter().enumerate().skip(128) {
+                graph.insert(row_id(row), value.clone()).unwrap();
+            }
+            let request = VectorSearchRequest {
+                candidate_limit: ROWS,
+                rerank_limit: ROWS,
+                effort: super::super::VectorSearchEffort::Hnsw { ef: ROWS },
+            };
+            let result = graph.search(&values[5], request).unwrap();
+            assert_eq!(result.candidates.len(), ROWS, "{quantization:?}");
+            assert_eq!(
+                result
+                    .candidates
+                    .iter()
+                    .map(|x| x.0)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                ROWS
+            );
+            graph.delete(row_id(0)).unwrap();
+            assert_eq!(
+                graph.search(&values[5], request).unwrap().candidates.len(),
+                ROWS - 1
+            );
+            graph.insert(row_id(ROWS), values[0].clone()).unwrap();
+            assert_eq!(
+                graph.search(&values[5], request).unwrap().candidates.len(),
+                ROWS
+            );
+        }
+    }
+
+    #[test]
+    fn declined_csr_cache_does_not_wait_for_active_search_readers() {
+        struct RestoreCacheBudget(Option<std::ffi::OsString>);
+        impl Drop for RestoreCacheBudget {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("MYDB_HNSW_QUERY_CACHE_MB", value),
+                    None => std::env::remove_var("MYDB_HNSW_QUERY_CACHE_MB"),
+                }
+            }
+        }
+        let _restore = RestoreCacheBudget(std::env::var_os("MYDB_HNSW_QUERY_CACHE_MB"));
+        std::env::set_var("MYDB_HNSW_QUERY_CACHE_MB", "0");
+        let graph = NativeHnsw::new(VectorDataType::Float32, 2, Metric::L2, 4, 32, None).unwrap();
+        graph
+            .insert(
+                RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                },
+                codec::parse_text("[1,2]").unwrap(),
+            )
+            .unwrap();
+        let reader = graph.state.read();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let completed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| sender.send(graph.prepare_csr()).unwrap());
+            let completed = receiver.recv_timeout(std::time::Duration::from_secs(2));
+            // Always release and join, including on the failing old path.
+            drop(reader);
+            worker.join().unwrap();
+            completed
+        });
+        assert!(
+            completed.is_ok(),
+            "declining an optional cache must not drain readers"
+        );
+        completed.unwrap().unwrap();
+        assert!(graph.state.read().csr.is_none());
+    }
 
     #[test]
     fn resident_payload_navigation_matches_row_scoring_and_invalidates_on_insert() {

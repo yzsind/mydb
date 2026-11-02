@@ -7948,9 +7948,8 @@ fn topk_max_heap_from_env() -> usize {
 }
 
 /// Planning-time view of a LIMIT / OFFSET count. Literal rows resolve
-/// directly; a `?` placeholder is *peeked* from the active thread-local
-/// parameter context (auto-param and prepared-execute both bind params
-/// before planning), so plan-shape decisions (TopK heap vs full sort,
+/// directly; a `?` placeholder is *peeked* from the planning bindings or
+/// the active execution context, so plan-shape decisions (TopK heap vs full sort,
 /// row goals, vector-KNN k) are made with the real first-execution
 /// value. Cached plans re-resolve at execution via [`LimitBinding`];
 /// the auto-param fingerprint folds a magnitude bucket of the literal
@@ -7959,7 +7958,21 @@ fn limit_usize(value: Option<&LimitValue>) -> Option<usize> {
     match value {
         Some(LimitValue::Rows(value)) => Some(*value),
         Some(LimitValue::Placeholder(idx) | LimitValue::OffsetCommaPlaceholder(idx)) => {
-            crate::engine::params::current_param_usize(*idx)
+            PLANNING_PARAMS.with(|slot| {
+                let params = slot.borrow();
+                let Some(params) = params.as_ref() else {
+                    return crate::engine::params::current_param_usize(*idx);
+                };
+                // Prepared planning intentionally keeps execution parameters
+                // unbound so normalization cannot fold values into cached
+                // expressions. Row goals may inspect the explicit bindings;
+                // LimitBinding still resolves the actual count on execution.
+                match params.get(*idx)? {
+                    Value::Int(n) if *n >= 0 => usize::try_from(*n).ok(),
+                    Value::UInt(n) => usize::try_from(*n).ok(),
+                    _ => None,
+                }
+            })
         }
         None => None,
     }
@@ -9719,6 +9732,59 @@ fn query_vector_binding(
 /// threshold. M5.5 routes a partitioned table through scatter-gather.
 /// `filter` is the table's residual WHERE, re-checked per candidate row by
 /// the executor.
+fn vector_filter_has_exact_index_access(
+    db: &Database,
+    table: &PlanTable,
+    select: &Select,
+    predicate: &Expr,
+    total_rows: f64,
+) -> bool {
+    let table_name = table.alias.as_deref().unwrap_or(&table.schema.name);
+    if query_hint_full_scan(&select.query_hints, table_name, &table.schema.name) {
+        return false;
+    }
+    let hints = ScanHints {
+        index_hints: select
+            .from
+            .first()
+            .map(|source| source.index_hints.as_slice())
+            .unwrap_or_default(),
+        query_hints: &select.query_hints,
+        table_name,
+        ..ScanHints::none()
+    };
+    let width = crate::engine::cbo::operator_cost::estimated_row_width(&table.schema);
+    let pages = if table.schema.stats.heap_page_count > 0 {
+        table.schema.stats.heap_page_count as f64
+    } else {
+        crate::engine::cbo::operator_cost::estimated_heap_pages(total_rows, width)
+    };
+    let Some((access, _)) = best_index_access(
+        &crate::engine::cbo::CboContext::from_db(db),
+        &table.schema,
+        predicate,
+        &hints,
+        total_rows,
+        pages,
+        width,
+    ) else {
+        return false;
+    };
+    match &access.kind {
+        IndexAccessKind::Lookup { key, exact: true } => {
+            index_residual::lookup_covered(predicate, &table.schema, &access.index, key)
+        }
+        IndexAccessKind::Range { low, high } => index_residual::all_covered(
+            predicate,
+            &table.schema,
+            &access.index,
+            low.as_ref(),
+            high.as_ref(),
+        ),
+        _ => false,
+    }
+}
+
 fn try_knn_vector_scan(
     db: &Database,
     table: &PlanTable,
@@ -10024,6 +10090,20 @@ fn try_knn_vector_scan(
             }
         }
     }
+    // Cost only a disposable copy. The scan predicate keeps its placeholders
+    // so cached plans bind the current filter on every execution.
+    let costing_filter = filter.as_ref().map(|predicate| {
+        if expr_has_placeholder(predicate) {
+            let mut bound = predicate.clone();
+            bind_cost_parameters(&mut bound);
+            std::borrow::Cow::Owned(bound)
+        } else {
+            std::borrow::Cow::Borrowed(predicate)
+        }
+    });
+    let filtered_rows = costing_filter.as_deref().map_or(total_rows, |predicate| {
+        estimate_filter_rows(&table.schema, predicate, total_rows)
+    });
     let index_usable = index.is_some_and(|index| {
         if no_vector_index_hint
             || index.vector_meta_for_table(&table.schema).metric_enum() != metric
@@ -10039,11 +10119,8 @@ fn try_knn_vector_scan(
             return false;
         }
         if hint_ef.is_none() && hnsw_cfg.brute_filter_rows > 0 {
-            if let Some(predicate) = filter.as_ref() {
-                let est = estimate_filter_rows(&table.schema, predicate, total_rows);
-                if (est as u64) < hnsw_cfg.brute_filter_rows {
-                    return false;
-                }
+            if filter.is_some() && (filtered_rows as u64) < hnsw_cfg.brute_filter_rows {
+                return false;
             }
         }
         // Cost crossover beyond the fixed row thresholds. Both costs are in
@@ -10062,12 +10139,35 @@ fn try_knn_vector_scan(
                 })
                 .map(|d| d as f64)
                 .unwrap_or_else(|| (query_vector.dimension as usize).max(1) as f64);
-            let scan_rows = filter
-                .as_ref()
-                .map(|p| estimate_filter_rows(&table.schema, p, total_rows))
-                .unwrap_or(total_rows)
-                .max(1.0);
+            let scan_rows = filtered_rows.max(1.0);
             let brute_cost = scan_rows * (dim / 8.0).max(1.0);
+            let survival = (scan_rows / total_rows.max(1.0)).min(1.0);
+            let rerank =
+                crate::engine::vector::session::effective_rerank_mult(&hnsw_cfg, index) as f64;
+            let growth = |pool: f64, iterative: crate::engine::vector::session::IterativeScan| {
+                if filter.is_some()
+                    && iterative != crate::engine::vector::session::IterativeScan::Off
+                {
+                    // Estimate the additional navigation needed to retain k
+                    // rows after the residual filter, independently of its syntax.
+                    let factor = (k as f64 / (pool.max(1.0) * survival)).max(1.0);
+                    // A covered B-tree prefilter can restrict the exact scorer
+                    // to survivors. A residual still pays for its input scan.
+                    if factor > 1.0
+                        && costing_filter.as_deref().is_some_and(|predicate| {
+                            vector_filter_has_exact_index_access(
+                                db, table, select, predicate, total_rows,
+                            )
+                        })
+                    {
+                        factor
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                }
+            };
             let index_cost = match index.vector_algo() {
                 crate::storage::schema::VectorAlgo::Hnsw => {
                     let ef = crate::engine::vector::session::effective_ef_search(
@@ -10076,6 +10176,15 @@ fn try_knn_vector_scan(
                         index.vector_meta().default_ef_search.map(u64::from),
                         k,
                     ) as f64;
+                    let pool = ef.min((k as f64 * rerank).max(32.0)).max(k as f64);
+                    let cap = if hnsw_cfg.max_scan_tuples == 0 {
+                        total_rows.max(1.0)
+                    } else {
+                        (hnsw_cfg.max_scan_tuples as f64)
+                            .max(k as f64)
+                            .min(total_rows.max(1.0))
+                    };
+                    let ef = (ef * growth(pool, hnsw_cfg.iterative_scan)).min(cap);
                     let fanout = index.vector_meta().m as f64 + total_rows.max(2.0).ln();
                     ef * fanout * (dim / 8.0).max(1.0)
                 }
@@ -10091,6 +10200,8 @@ fn try_knn_vector_scan(
                         .map(f64::from)
                         .unwrap_or_else(|| total_rows.max(1.0).sqrt())
                         .max(1.0);
+                    let pool = (k as f64 * rerank).max(32.0).max(k as f64);
+                    let nprobe = (nprobe * growth(pool, hnsw_cfg.ivf_iterative_scan)).min(nlist);
                     total_rows * (nprobe / nlist).min(1.0) * (dim / 8.0).max(1.0)
                 }
             };
@@ -10510,7 +10621,7 @@ fn choose_scan(
     let zone_predicate = filter.clone().and_then(|predicate| {
         let (ordinary, _) = partition_apply_conjuncts(predicate);
         combine_conjuncts(ordinary).map(|mut predicate| {
-            bind_zone_map_cost_parameters(&mut predicate);
+            bind_cost_parameters(&mut predicate);
             predicate
         })
     });
@@ -12769,14 +12880,70 @@ fn apply_like_residual_discount(base: f64, literal_chars: usize) -> f64 {
 /// be shared with a hot value that should use a broad scan/hash join. Powers
 /// of two bound the number of variants without keying the cache by values.
 /// Unique point lookups keep their existing cross-value sharing.
+fn has_vector_cost_dependency(select: &Select) -> bool {
+    #[derive(Default)]
+    struct Dependency {
+        ordered_limit: bool,
+        found: bool,
+    }
+    impl crate::parser::visit::AstVisitor for Dependency {
+        fn enter_select(&mut self, select: &Select) {
+            self.ordered_limit |= select.limit.is_some() && !select.order_by.is_empty();
+        }
+        fn enter_expr(&mut self, expr: &Expr) {
+            if !self.ordered_limit || self.found {
+                return;
+            }
+            if let Expr::Function { name, .. } = expr {
+                self.found = [
+                    "DISTANCE",
+                    "VEC_DISTANCE",
+                    "L2_DISTANCE",
+                    "COSINE_DISTANCE",
+                    "MAX_INNER_PRODUCT_DISTANCE",
+                    "DOT_PRODUCT",
+                    "INNER_PRODUCT",
+                    "HAMMING_DISTANCE",
+                    "JACCARD_DISTANCE",
+                ]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate));
+            }
+        }
+        fn walk_select_children(&self, _: &Select) -> bool {
+            !self.found
+        }
+        fn walk_expr_children(&self, _: &Expr) -> bool {
+            !self.found
+        }
+        fn continue_expr_walk(&self) -> bool {
+            !self.found
+        }
+    }
+    let mut dependency = Dependency::default();
+    crate::parser::visit::visit_select(&mut dependency, select);
+    dependency.found
+}
+
 pub(crate) fn parameter_selectivity_signature(
     db: &Database,
     select: &Select,
     params: &[Value],
 ) -> String {
     use std::fmt::Write as _;
+    let mut signature = String::new();
+    if has_vector_cost_dependency(select) {
+        // Search settings alter the ANN/exact cost crossover even when the
+        // predicate and parameter types stay unchanged. Include nested KNNs.
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &crate::engine::vector::session::current_config(),
+            &mut hasher,
+        );
+        let _ = write!(signature, ":v{:016x}", std::hash::Hasher::finish(&hasher));
+    }
     if params.is_empty() {
-        return String::new();
+        return signature;
     }
     let mut tables = smallvec::SmallVec::<[(&str, Option<&str>, Arc<TableSchema>); 4]>::new();
     for source in select
@@ -12795,7 +12962,6 @@ pub(crate) fn parameter_selectivity_signature(
             }
         }
     }
-    let mut signature = String::new();
     let mut append = |column_expr: &Expr,
                       parameter: &Expr,
                       op: BinaryOp,
@@ -12832,7 +12998,12 @@ pub(crate) fn parameter_selectivity_signature(
         let Some(stats) = schema.stats.columns.get(&column) else {
             return;
         };
-        if stats.top_values.is_empty() {
+        let bounded_range = matches!(
+            op,
+            BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::Lt | BinaryOp::LtEq
+        ) && ((stats.min.is_some() && stats.max.is_some())
+            || !stats.histogram.is_empty());
+        if stats.top_values.is_empty() && !bounded_range {
             return;
         }
         if matches!(op, BinaryOp::Eq | BinaryOp::NullSafeEq)
@@ -14277,10 +14448,9 @@ pub(crate) fn with_planning_params<R>(params: &[Value], f: impl FnOnce() -> R) -
     f()
 }
 
-/// Bind only the disposable Zone Map costing predicate. The scan's own
-/// filter retains placeholders and rebuilds candidates with each execution's
-/// bindings, even when a cached plan was costed with zero surviving pages.
-fn bind_zone_map_cost_parameters(predicate: &mut Expr) {
+/// Bind only disposable costing predicates. The scan's own filter retains
+/// placeholders and rebuilds candidates with each execution's bindings.
+fn bind_cost_parameters(predicate: &mut Expr) {
     PLANNING_PARAMS.with(|slot| {
         let params = slot.borrow();
         let Some(params) = params.as_ref() else {

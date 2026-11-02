@@ -1016,6 +1016,39 @@ impl<'a> ExternalSortBatchOperator<'a> {
                     })
                     .collect::<Result<Vec<_>, QueryError>>()?
             };
+            // A computed fixed-width key has no temporary heap payload.
+            // Reject known losers before reserving their unread row payload;
+            // accepted rows retain the ordinary admission/spill contract.
+            let early_key = if topk.is_some() && !row_major_keys && self.sources.len() == 1 {
+                match &self.sources[0] {
+                    SortKeySource::Column(column) => Some(&batch.columns()[*column]),
+                    SortKeySource::Program { .. } | SortKeySource::UnseededRand(_)
+                        if precomputed =>
+                    {
+                        Some(&batch.columns()[upstream.computed_columns[0].unwrap()])
+                    }
+                    _ => evaluated[0].as_ref(),
+                }
+                .filter(|column| {
+                    matches!(
+                        column,
+                        ColumnVector::Null { .. }
+                            | ColumnVector::Bool { .. }
+                            | ColumnVector::I64 { .. }
+                            | ColumnVector::U64 { .. }
+                            | ColumnVector::F64 { .. }
+                            | ColumnVector::Decimal32 { .. }
+                            | ColumnVector::Decimal64 { .. }
+                            | ColumnVector::Decimal128 { .. }
+                            | ColumnVector::Date32 { .. }
+                            | ColumnVector::Time64 { .. }
+                            | ColumnVector::DateTime64 { .. }
+                            | ColumnVector::Timestamp64 { .. }
+                    )
+                })
+            } else {
+                None
+            };
             for row_index in batch.visible_indices() {
                 let row_ordinal = match self.input_ordinal_column {
                     Some(column) => match batch.columns()[column].value_at(row_index) {
@@ -1028,6 +1061,21 @@ impl<'a> ExternalSortBatchOperator<'a> {
                     },
                     None => ordinal,
                 };
+                let inline_key = if let (Some(heap), Some(column)) = (topk.as_ref(), early_key) {
+                    let key = column.try_value_at(row_index)?;
+                    if !heap.would_accept(std::slice::from_ref(&key)) {
+                        crate::engine::executor::mem_budget::check_terminal_oom()?;
+                        ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                            crate::error::catalog::ER_UNKNOWN_ERROR
+                                .error("sort input ordinal overflow")
+                        })?;
+                        continue;
+                    }
+                    Some(SortKeyValues::One(key))
+                } else {
+                    None
+                };
+                let early_accepted = inline_key.is_some();
                 let value_slot = std::mem::size_of::<Value>();
                 let mut predicted = batch.columns()[..self.output_schema.len()]
                     .iter()
@@ -1104,7 +1152,9 @@ impl<'a> ExternalSortBatchOperator<'a> {
                     generation.admit(predicted)?
                 };
                 let mut prepared_payload = None;
-                let keys = if row_major_keys {
+                let keys = if let Some(key) = inline_key {
+                    key
+                } else if row_major_keys {
                     let payload =
                         copy_payload(&batch.columns()[..self.output_schema.len()], row_index)?;
                     let view = crate::engine::expr_program::RowView::from_values(&payload);
@@ -1145,7 +1195,7 @@ impl<'a> ExternalSortBatchOperator<'a> {
                     ))?
                 };
                 if let Some(heap) = topk.as_mut() {
-                    if heap.would_accept(keys.as_slice()) {
+                    if early_accepted || heap.would_accept(keys.as_slice()) {
                         let payload = match prepared_payload {
                             Some(payload) => payload,
                             None => copy_payload(
@@ -1589,6 +1639,239 @@ mod spill_contract_regressions {
                 }
             })
             .sum()
+    }
+
+    #[test]
+    fn scalar_key_topk_matches_full_sort_for_domains_nulls_ties_and_selection() {
+        use super::super::batch::Selection;
+        use crate::engine::expr_program::{ExprCompiler, InputColumn, InputSchema};
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            for family in 0..10 {
+                let kind = match family {
+                    0 | 9 => ColumnType::LongLong,
+                    1 => ColumnType::Bit { bits: 64 },
+                    2 => ColumnType::Double,
+                    3 => ColumnType::Date,
+                    4 => ColumnType::Time,
+                    5 => ColumnType::DateTime,
+                    6 => ColumnType::Timestamp,
+                    7 => ColumnType::Decimal {
+                        precision: 18,
+                        scale: 2,
+                    },
+                    _ => ColumnType::Decimal {
+                        precision: 38,
+                        scale: 2,
+                    },
+                };
+                let schema = Arc::new(BatchSchema::new(vec![
+                    BatchField {
+                        table: "t".into(),
+                        alias: None,
+                        name: "k".into(),
+                        column_type: kind,
+                        source: Default::default(),
+                    },
+                    BatchField {
+                        table: "t".into(),
+                        alias: None,
+                        name: "payload".into(),
+                        column_type: ColumnType::VarString,
+                        source: Default::default(),
+                    },
+                ]));
+                let keys = (0..33)
+                    .map(|row| {
+                        let value = ((row * 17) % 11 - 5) as i64;
+                        if row % 7 == 0 || family == 9 {
+                            return Value::Null;
+                        }
+                        match family {
+                            0 => Value::Int(value),
+                            1 => Value::UInt((1u64 << 63) + (value + 5) as u64),
+                            2 => Value::Double(value as f64 / 3.0),
+                            3 => Value::Date(value as i32),
+                            4 => Value::Time(value * 1_000_000),
+                            5 => Value::DateTime(value * 1_000_000),
+                            6 => Value::Timestamp(value * 1_000_000),
+                            7 => Value::DecimalCompact(value * 100, 2),
+                            _ => Value::Decimal128(value as i128 * (1i128 << 80), 2),
+                        }
+                    })
+                    .collect();
+                let batch = Batch::new(
+                    schema.clone(),
+                    vec![
+                        ColumnVector::from_values(keys),
+                        ColumnVector::from_values(
+                            (0..33)
+                                .map(|row| Value::String(format!("row-{row:02}")))
+                                .collect(),
+                        ),
+                    ],
+                )
+                .with_selection(Selection::Indices(
+                    (0..33).filter(|row| row % 3 != 2).collect(),
+                ));
+                for computed in [false, true] {
+                    for ascending in [false, true] {
+                        for nulls_first in [false, true] {
+                            let run = |topn: Option<(usize, usize)>| {
+                                let source = if computed {
+                                    let input = InputSchema::new(
+                                        schema
+                                            .fields()
+                                            .iter()
+                                            .map(|field| InputColumn {
+                                                table: field.table.clone(),
+                                                alias: None,
+                                                name: field.name.clone(),
+                                                column_type: field.column_type,
+                                                unsigned: matches!(
+                                                    field.column_type,
+                                                    ColumnType::Bit { .. }
+                                                ),
+                                                collation_id: None,
+                                            })
+                                            .collect(),
+                                    );
+                                    SortKeySource::Program {
+                                        program: Arc::new(
+                                            ExprCompiler::compile(
+                                                &crate::parser::Expr::Identifier("k".into()),
+                                                &input,
+                                            )
+                                            .unwrap(),
+                                        ),
+                                        integer: None,
+                                    }
+                                } else {
+                                    SortKeySource::Column(0)
+                                };
+                                let input = super::super::stream::MaterializedBatchOperator::new(
+                                    schema.clone(),
+                                    vec![batch.clone()],
+                                );
+                                let mut sort = ExternalSortBatchOperator::new(
+                                    None,
+                                    Box::new(input),
+                                    schema.clone(),
+                                    BatchProperties::UNORDERED_SINGLE,
+                                    vec![source],
+                                    vec![crate::engine::executor::sort::SortField {
+                                        ascending,
+                                        nulls_first,
+                                        collation_id: None,
+                                    }],
+                                    root.path(),
+                                );
+                                if let Some((k, offset)) = topn {
+                                    sort = sort.with_topn(k, offset);
+                                }
+                                sort.initialize().unwrap();
+                                let mut rows = Vec::new();
+                                while let Some(row) = sort.next_values().unwrap() {
+                                    rows.push(row);
+                                }
+                                rows
+                            };
+                            let expected = run(None);
+                            for (k, offset) in [(0, 0), (1, 0), (7, 3), (64, 3), (7, 12)] {
+                                let actual = run(Some((k, offset)));
+                                let wanted = expected
+                                    .iter()
+                                    .take(k)
+                                    .skip(offset)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                assert_eq!(actual, wanted, "family={family} computed={computed} asc={ascending} nulls_first={nulls_first} k={k} offset={offset}");
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn topk_rejected_wide_payload_does_not_force_a_spill() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            let schema = Arc::new(BatchSchema::new(vec![
+                BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "k".into(),
+                    column_type: ColumnType::LongLong,
+                    source: Default::default(),
+                },
+                BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "payload".into(),
+                    column_type: ColumnType::VarString,
+                    source: Default::default(),
+                },
+            ]));
+            let batch = Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(vec![Value::Int(0), Value::Int(1)]),
+                    ColumnVector::from_values(vec![
+                        Value::String("winner".into()),
+                        Value::String("x".repeat(65536)),
+                    ]),
+                ],
+            );
+            let input =
+                super::super::stream::MaterializedBatchOperator::new(schema.clone(), vec![batch]);
+            let _tuning = crate::engine::executor::tuning::enter(
+                crate::engine::executor::tuning::ExecutorTuningSnapshot {
+                    stream_batch_rows: 64,
+                    stream_channel_batches: 2,
+                    sort_run_bytes: Some(8192),
+                    sort_merge_fanin: 2,
+                    hash_join_bloom_adaptive: true,
+                    scheduler_parallelism: 1,
+                },
+            );
+            let before = crate::engine::executor::spill_quota::sort_spill_count();
+            let mut sort = ExternalSortBatchOperator::new(
+                None,
+                Box::new(input),
+                schema,
+                BatchProperties::UNORDERED_SINGLE,
+                vec![SortKeySource::Column(0)],
+                vec![crate::engine::executor::sort::SortField {
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }],
+                root.path(),
+            )
+            .with_topn(1, 0);
+            sort.initialize().unwrap();
+            assert_eq!(
+                crate::engine::executor::spill_quota::sort_spill_count(),
+                before,
+                "a known losing key must not spill its unread wide payload"
+            );
+            assert_eq!(
+                sort.next_values().unwrap(),
+                Some(vec![Value::Int(0), Value::String("winner".into())])
+            );
+            assert!(sort.next_values().unwrap().is_none());
+            drop(sort);
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        });
     }
 
     #[test]

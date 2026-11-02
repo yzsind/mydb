@@ -7700,6 +7700,11 @@ impl FunctionKernel {
             | FunctionKernel::Minute
             | FunctionKernel::Second => eval_temporal_part(self, args, row, scratch),
             FunctionKernel::JsonExtract => eval_json_extract(args, row, scratch),
+            FunctionKernel::JsonUnquote => {
+                expect_len("JSON_UNQUOTE", args, 1)?;
+                let value = args[0].eval_ref(row, scratch)?;
+                crate::engine::expr::json_unquote_value(value.as_value())
+            }
             FunctionKernel::LegacyDeterministic(name) => {
                 eval_legacy_by_name(name, args, row, scratch)
             }
@@ -11130,6 +11135,65 @@ mod legacy_escape_tests {
             name: name.into(),
             args,
             distinct: false,
+        }
+    }
+
+    #[test]
+    fn json_unquote_uses_borrowed_native_kernel_and_preserves_values() {
+        let expr = func("JSON_UNQUOTE", vec![Expr::Identifier("doc".into())]);
+        let mut values = vec![
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("plain".into()),
+            Value::SmallString(smallvec::SmallVec::from_slice(b"small")),
+            Value::String(r#""line\n\t\u4e2d""#.into()),
+            Value::String(r#""unterminated\""#.into()),
+            Value::Bytes(Vec::new()),
+            Value::Bytes(vec![0xff]),
+            Value::Int(3),
+            Value::Double(1.25),
+        ];
+        for doc in [
+            "null",
+            "true",
+            "123",
+            "1.5",
+            r#""quoted\ntext""#,
+            r#"[1,"x"]"#,
+            r#"{"n":1}"#,
+        ] {
+            values.push(Value::Json(
+                crate::engine::json::parse_text(doc, 1, "test").unwrap(),
+            ));
+        }
+        for column_type in [ColumnType::Json, ColumnType::VarString, ColumnType::Blob] {
+            for value in &values {
+                let program = assert_parity(&expr, &[("doc", column_type)], vec![value.clone()]);
+                assert!(matches!(
+                    program.root,
+                    ExprNode::Function {
+                        kernel: FunctionKernel::JsonUnquote,
+                        ..
+                    }
+                ));
+                assert!(program.capability().may_error);
+                assert!(!program.capability().legacy_escape);
+            }
+        }
+        assert_eq!(
+            crate::engine::expr::json_unquote_value(&Value::Null).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            crate::engine::expr::json_unquote_value(&Value::String(r#""a\nb""#.into())).unwrap(),
+            Value::String("a\nb".into())
+        );
+        for count in [0usize, 2, 5] {
+            let expr = func(
+                "JSON_UNQUOTE",
+                (0..count).map(|_| Expr::Identifier("doc".into())).collect(),
+            );
+            assert_parity(&expr, &[("doc", ColumnType::Json)], vec![Value::Null]);
         }
     }
 

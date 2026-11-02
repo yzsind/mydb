@@ -136,12 +136,24 @@ fn format_small_units_and_extended_timestamp_range() {
     engine
         .execute("CREATE TABLE future(ts TIMESTAMP(6))")
         .unwrap();
+    // The UTC upper bound must not shift into year 10000 on western hosts.
+    let mut session = SessionContext::default();
     engine
-        .execute("INSERT INTO future VALUES('9999-12-31 23:59:59.123456')")
+        .execute_with_session(&mut session, "SET time_zone='+00:00'")
+        .unwrap();
+    engine
+        .execute_with_session(
+            &mut session,
+            "INSERT INTO future VALUES('9999-12-31 23:59:59.123456')",
+        )
+        .unwrap();
+    let result = engine
+        .execute_with_session(&mut session, "SELECT YEAR(ts),MICROSECOND(ts) FROM future")
+        .and_then(QueryResponse::materialize)
         .unwrap();
     assert_eq!(
-        row(&engine, "SELECT YEAR(ts),MICROSECOND(ts) FROM future"),
-        vec![Value::Int(9999), Value::Int(123456)]
+        super::support::result_rows(result),
+        vec![vec![Value::Int(9999), Value::Int(123456)]]
     );
     assert_eq!(
         row(&engine, "SELECT MD5('abc'),SHA1('abc'),SHA2('abc',256)"),

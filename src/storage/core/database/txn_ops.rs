@@ -222,7 +222,8 @@ impl BufferPool {
 }
 type TxnWalBufferShard = parking_lot::Mutex<HashMap<TxnWalBufferKey, TxnWalBuffer>>;
 
-type ReducedRedoTxnShard = parking_lot::Mutex<HashMap<TxnWalBufferKey, HashSet<String>>>;
+type ReducedRedoTxnShard =
+    parking_lot::Mutex<HashMap<TxnWalBufferKey, HashSet<Arc<BufferPageFileKey>>>>;
 
 fn reduced_redo_txn_shards() -> &'static [ReducedRedoTxnShard] {
     static SHARDS: OnceLock<Box<[ReducedRedoTxnShard]>> = OnceLock::new();
@@ -245,18 +246,18 @@ pub(crate) fn txn_reduced_redo_active(log: &Arc<crate::wal::LogMutex>, txn_id: u
     reduced_redo_txn_shard(key).lock().contains_key(&key)
 }
 
-pub(crate) fn note_reduced_redo_file(
+fn note_reduced_redo_file(
     log: &Arc<crate::wal::LogMutex>,
     txn_id: u64,
-    relative_path: String,
+    file: Arc<BufferPageFileKey>,
 ) {
     let key = txn_wal_buffer_key(log, txn_id);
     if let Some(files) = reduced_redo_txn_shard(key).lock().get_mut(&key) {
-        files.insert(relative_path);
+        files.insert(file);
     }
 }
 
-fn reduced_redo_files(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> Vec<String> {
+fn reduced_redo_files(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> Vec<Arc<BufferPageFileKey>> {
     let key = txn_wal_buffer_key(log, txn_id);
     reduced_redo_txn_shard(key)
         .lock()
@@ -3079,13 +3080,17 @@ impl Database {
         {
             let started = Instant::now();
             let files = reduced_redo_files(&self.log, txn_id);
-            let data_dir = &self.data_dir;
+            let pool = &self.buffer_pool;
             std::thread::scope(|scope| -> Result<(), QueryError> {
                 let handles = files
                     .into_iter()
-                    .map(|relative| {
+                    .map(|file| {
                         scope.spawn(move || {
-                            File::open(data_dir.join(relative))
+                            // fdatasync cannot persist dirty userspace frames.
+                            // Use the original file identity to flush its pages
+                            // before making the omitted row images durable.
+                            pool.flush_file_pages(&file)?;
+                            File::open(&file.path)
                                 .and_then(|file| file.sync_data())
                                 .map_err(io_err)
                         })

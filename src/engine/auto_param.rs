@@ -588,12 +588,22 @@ pub(crate) fn structural_fingerprint<'q>(
     }
     let mut h_lo = rs_lo.build_hasher();
     let mut h_hi = rs_hi.build_hasher();
-    // Two passes is unavoidable: `std::fmt::Debug` doesn't expose a
-    // way to fan one write stream out to multiple sinks, and we
-    // need two independent hash states for the 128-bit output.
-    // Each pass is allocation-free.
-    let _ = write!(HashWriter(&mut h_lo), "{statement:?}");
-    let _ = write!(HashWriter(&mut h_hi), "{statement:?}");
+    struct DualHasher<'a, H: Hasher>(&'a mut H, &'a mut H);
+    impl<H: Hasher> Hasher for DualHasher<'_, H> {
+        fn finish(&self) -> u64 {
+            self.0.finish() ^ self.1.finish().rotate_left(1)
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.write(bytes);
+            self.1.write(bytes);
+        }
+    }
+    // Format once and fan each normalized fragment into independent states.
+    // Retain the exact write boundaries: ahash is not a streaming byte hash.
+    let _ = write!(
+        HashWriter(&mut DualHasher(&mut h_lo, &mut h_hi)),
+        "{statement:?}"
+    );
     let lo = h_lo.finish();
     let hi = h_hi.finish();
     // Pre-size to "ap:" + 32 hex chars. `write!` against a sized
@@ -1171,6 +1181,120 @@ pub(crate) fn scanned_numeric_literal_value(text: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::parser::parse_statement;
+
+    // Independent two-pass oracle preserves the previous cache-key stream.
+    fn legacy_structural_fingerprint<'q>(
+        statement: impl Into<crate::parser::QueryRef<'q>>,
+    ) -> String {
+        let statement = statement.into();
+        use std::fmt::Write as _;
+        use std::hash::{BuildHasher, Hasher};
+
+        static STATE_LO: OnceLock<ahash::RandomState> = OnceLock::new();
+        static STATE_HI: OnceLock<ahash::RandomState> = OnceLock::new();
+        let rs_lo = STATE_LO.get_or_init(|| {
+            ahash::RandomState::with_seeds(
+                0x4D59_4442_4150_4644u64, // "MYDBAPFD"
+                0x6175_746F_7061_726Du64, // "autoparm"
+                0x1A4D_C8B7_3E2F_5901u64,
+                0x9E37_79B9_7F4A_7C15u64,
+            )
+        });
+        let rs_hi = STATE_HI.get_or_init(|| {
+            ahash::RandomState::with_seeds(
+                0xCAFE_BABE_DEAD_BEEFu64,
+                0x0123_4567_89AB_CDEFu64,
+                0xFEDC_BA98_7654_3210u64,
+                0x6A09_E667_F3BC_C908u64,
+            )
+        });
+        struct HashWriter<'a, H: Hasher + ?Sized>(&'a mut H);
+        impl<H: Hasher + ?Sized> std::fmt::Write for HashWriter<'_, H> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                // P2-C1: fold ASCII case while hashing. The parser now preserves
+                // the query's original casing (so unaliased expression columns can
+                // be named the MySQL way, `COUNT(*)` not `count(*)`), which would
+                // otherwise fragment the plan cache — `A.name` vs `a.name`, `Select`
+                // vs `SELECT`. Identifiers/keywords are case-insensitive and string
+                // literals have already been extracted into params, so folding case
+                // here restores the case-insensitive plan sharing `normalize_sql`
+                // used to provide. Most Debug fragments (field names,
+                // punctuation and normalized identifiers) are already lowercase;
+                // feed those to ahash as one slice instead of one virtual hasher
+                // call per byte. Mixed-case enum/type names use a bounded stack
+                // buffer and remain byte-for-byte identical to the old stream.
+                let bytes = s.as_bytes();
+                if !bytes.iter().any(u8::is_ascii_uppercase) {
+                    self.0.write(bytes);
+                } else {
+                    let mut folded = [0u8; 128];
+                    for chunk in bytes.chunks(folded.len()) {
+                        for (dst, &src) in folded.iter_mut().zip(chunk) {
+                            *dst = src.to_ascii_lowercase();
+                        }
+                        self.0.write(&folded[..chunk.len()]);
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut h_lo = rs_lo.build_hasher();
+        let mut h_hi = rs_hi.build_hasher();
+        let _ = write!(HashWriter(&mut h_lo), "{statement:?}");
+        let _ = write!(HashWriter(&mut h_hi), "{statement:?}");
+        let lo = h_lo.finish();
+        let hi = h_hi.finish();
+        // Pre-size to "ap:" + 32 hex chars. `write!` against a sized
+        // `String` does no further reallocations.
+        let mut out = String::with_capacity(35);
+        let _ = write!(out, "ap:{hi:016x}{lo:016x}");
+        debug_assert_eq!(out.len(), 35);
+        out
+    }
+
+    #[test]
+    fn fingerprint_single_format_matches_legacy_sql_and_native_value_streams() {
+        for sql in [
+            "SELECT * FROM t WHERE id=42",
+            "SELECT COUNT(*), SUM(A.V) FROM T A GROUP BY A.K HAVING COUNT(*)>3",
+            "SELECT t.id FROM t JOIN u ON t.id=u.id WHERE t.v IN (1,2,NULL) ORDER BY t.id DESC LIMIT 10 OFFSET 3",
+            "SELECT CASE WHEN v IS NULL THEN 'ÄBC' ELSE 'abc' END FROM t",
+            "SELECT JSON_OBJECT('A', 1, 'b', JSON_ARRAY(2,3)), X'00FF41'",
+            "SELECT ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) FROM t",
+            "SELECT (SELECT MAX(v) FROM u WHERE u.k=t.k) FROM t",
+            "WITH c AS (SELECT 1 AS v) SELECT v FROM c UNION ALL SELECT 2",
+            "INSERT INTO t(a,b) VALUES(1,'A'),(2,'b')",
+            "UPDATE t SET a=a+1,b='ÄBC' WHERE id=3",
+            "DELETE FROM t WHERE id BETWEEN 1 AND 3",
+            "SELECT COSINE_DISTANCE(v, VECTOR_FROM_BINARY(X'0000803F00000000','FLOAT32',2)) FROM t ORDER BY 1 LIMIT 100",
+        ] {
+            let statement = parse_statement(sql).unwrap();
+            assert_eq!(
+                structural_fingerprint(&statement),
+                legacy_structural_fingerprint(&statement),
+                "{sql}"
+            );
+        }
+        for dimension in [1, 3, 17, 128, 768, 1536] {
+            let mut statement = parse_statement("SELECT 1 FROM t").unwrap();
+            let Statement::Select(select) = &mut statement else {
+                unreachable!()
+            };
+            select.projection[0] = crate::parser::SelectItem::Expr {
+                expr: Expr::BoundValue(Value::Vector(crate::engine::vector::codec::from_f32(
+                    &(0..dimension)
+                        .map(|i| (i as f32 - 97.0) * 0.37)
+                        .collect::<Vec<_>>(),
+                ))),
+                alias: Some("VectorPayload".into()),
+            };
+            assert_eq!(
+                structural_fingerprint(&statement),
+                legacy_structural_fingerprint(&statement),
+                "native dimension={dimension}"
+            );
+        }
+    }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

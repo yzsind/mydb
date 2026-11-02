@@ -82,6 +82,7 @@ pub(crate) struct SessionExprInfo {
     block_encryption_mode: String,
     default_week_format: u32,
     lc_time_names: String,
+    vector_search: crate::engine::vector::session::HnswSessionConfig,
     /// True only for an explicit table-materialization boundary such as
     /// CTAS. Strict DML also rejects numeric conversion, but retains the
     /// source expression's 1292 diagnostic instead of CTAS' 1366 field code.
@@ -242,6 +243,7 @@ fn capture_session_expr_info_with_variables(
         block_encryption_mode: session.sysvars.block_encryption_mode.clone(),
         default_week_format: session.sysvars.default_week_format as u32,
         lc_time_names: session.sysvars.lc_time_names.clone(),
+        vector_search: vector_search_config_from_session(session),
         field_numeric_materialization: STRICT_NUMERIC_MATERIALIZATION.with(std::cell::Cell::get),
         strict_numeric_materialization: STRICT_NUMERIC_MATERIALIZATION.with(std::cell::Cell::get)
             || (DML_EXPRESSION_DEPTH.with(|depth| depth.get() != 0) && strict_mode),
@@ -1327,35 +1329,37 @@ impl SessionView<'_> {
     }
 }
 
-/// Snapshot the HNSW-related session knobs (M5.1/M5.2/M5.3). Returns
-/// `None` when no session pointer is installed *and* no owned snapshot is
-/// active — callers should fall back to compiled defaults. Only the
-/// borrowed-session path carries these fields; the cross-thread owned
-/// snapshot is used by parallel workers and the executor reads HNSW knobs
-/// on the connection thread before any worker spawns.
-pub(crate) fn session_hnsw_config() -> Option<crate::engine::vector::session::HnswSessionConfig> {
+fn vector_search_config_from_session(
+    session: &crate::engine::api::SessionContext,
+) -> crate::engine::vector::session::HnswSessionConfig {
     use crate::engine::vector::session::{HnswSessionConfig, IterativeScan};
+    let s = session;
+    HnswSessionConfig {
+        ef_search: s.sysvars.mydb_hnsw_ef_search,
+        ef_search_explicit: s.sysvars.mydb_hnsw_ef_search_explicit,
+        ef_dynamic_factor: s.sysvars.mydb_hnsw_ef_dynamic_factor,
+        iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_hnsw_iterative_scan),
+        max_scan_tuples: s.sysvars.mydb_hnsw_max_scan_tuples,
+        brute_threshold: s.sysvars.mydb_hnsw_brute_threshold,
+        brute_filter_rows: s.sysvars.mydb_hnsw_brute_filter_rows,
+        ivf_nprobe: s.sysvars.mydb_ivf_nprobe,
+        ivf_nprobe_explicit: s.sysvars.mydb_ivf_nprobe_explicit,
+        ivf_rerank_mult: s.sysvars.mydb_ivf_rerank_mult,
+        ivf_rerank_mult_explicit: s.sysvars.mydb_ivf_rerank_mult_explicit,
+        hnsw_rerank_mult: s.sysvars.mydb_hnsw_rerank_mult,
+        hnsw_rerank_mult_explicit: s.sysvars.mydb_hnsw_rerank_mult_explicit,
+        ivf_iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_ivf_iterative_scan),
+        ivf_max_scan_tuples: s.sysvars.mydb_ivf_max_scan_tuples,
+    }
+}
+
+/// Keep vector planning and execution on the same session settings, including
+/// nested workers that can only propagate an owned expression snapshot.
+pub(crate) fn session_hnsw_config() -> Option<crate::engine::vector::session::HnswSessionConfig> {
     with_session_view(|view| match view {
-        Some(SessionView::Borrowed(s)) => Some(HnswSessionConfig {
-            ef_search: s.sysvars.mydb_hnsw_ef_search,
-            ef_search_explicit: s.sysvars.mydb_hnsw_ef_search_explicit,
-            ef_dynamic_factor: s.sysvars.mydb_hnsw_ef_dynamic_factor,
-            iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_hnsw_iterative_scan),
-            max_scan_tuples: s.sysvars.mydb_hnsw_max_scan_tuples,
-            brute_threshold: s.sysvars.mydb_hnsw_brute_threshold,
-            brute_filter_rows: s.sysvars.mydb_hnsw_brute_filter_rows,
-            ivf_nprobe: s.sysvars.mydb_ivf_nprobe,
-            ivf_nprobe_explicit: s.sysvars.mydb_ivf_nprobe_explicit,
-            ivf_rerank_mult: s.sysvars.mydb_ivf_rerank_mult,
-            ivf_rerank_mult_explicit: s.sysvars.mydb_ivf_rerank_mult_explicit,
-            hnsw_rerank_mult: s.sysvars.mydb_hnsw_rerank_mult,
-            hnsw_rerank_mult_explicit: s.sysvars.mydb_hnsw_rerank_mult_explicit,
-            ivf_iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_ivf_iterative_scan),
-            ivf_max_scan_tuples: s.sysvars.mydb_ivf_max_scan_tuples,
-        }),
-        // Owned-snapshot path (parallel workers): not used for HNSW today;
-        // returning None lets callers reach for compiled defaults.
-        _ => None,
+        Some(SessionView::Borrowed(s)) => Some(vector_search_config_from_session(s)),
+        Some(SessionView::Owned(info)) => Some(info.vector_search.clone()),
+        None => None,
     })
 }
 
@@ -5012,6 +5016,39 @@ pub(crate) fn eval_field_values(
     Ok(Value::Int(0))
 }
 
+/// Shared JSON_UNQUOTE semantics for the interpreter and borrowed compiled operands.
+pub(crate) fn json_unquote_value(value: &Value) -> Result<Value, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // A binary JSON value unquotes via the canonical rule; a
+    // bare string is left as-is unless it is a quoted JSON
+    // string literal.
+    if let Value::Json(b) = value {
+        return Ok(Value::String(crate::engine::json::unquote_text(b)));
+    }
+    if !matches!(
+        value,
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+    ) {
+        return Err(crate::error::catalog::ER_INVALID_TYPE_FOR_JSON
+            .error("Invalid data type for JSON data in argument 1 to function json_unquote"));
+    }
+    if matches!(value, Value::Bytes(_)) {
+        return Err(crate::engine::json::binary_charset_error());
+    }
+    let s = string_value(value);
+    if s.starts_with('"') && s.ends_with('"') {
+        let unquoted: String = serde_json::from_str(&s).map_err(|err| {
+            crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM.error(format!(
+                "Invalid JSON text in argument 1 to function json_unquote: {err}"
+            ))
+        })?;
+        return Ok(Value::String(unquoted));
+    }
+    Ok(Value::String(s))
+}
+
 pub(crate) fn eval_function<F>(name: &str, args: &[Expr], eval_arg: F) -> Result<Value, QueryError>
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
@@ -7667,35 +7704,7 @@ where
         }
         "JSON_UNQUOTE" => {
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| {
-                // A binary JSON value unquotes via the canonical rule; a
-                // bare string is left as-is unless it is a quoted JSON
-                // string literal.
-                if let Value::Json(b) = &value {
-                    return Ok(Value::String(crate::engine::json::unquote_text(b)));
-                }
-                if !matches!(
-                    value,
-                    Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
-                ) {
-                    return Err(crate::error::catalog::ER_INVALID_TYPE_FOR_JSON.error(
-                        "Invalid data type for JSON data in argument 1 to function json_unquote",
-                    ));
-                }
-                if matches!(value, Value::Bytes(_)) {
-                    return Err(crate::engine::json::binary_charset_error());
-                }
-                let s = string_value(&value);
-                if s.starts_with('"') && s.ends_with('"') {
-                    let unquoted: String = serde_json::from_str(&s).map_err(|err| {
-                        crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM.error(format!(
-                            "Invalid JSON text in argument 1 to function json_unquote: {err}"
-                        ))
-                    })?;
-                    return Ok(Value::String(unquoted));
-                }
-                Ok(Value::String(s))
-            })
+            json_unquote_value(&value)
         }
         "JSON_VALID" => {
             let value = eval_one(name, args, &mut eval_arg)?;

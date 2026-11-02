@@ -2466,19 +2466,12 @@ pub(super) fn execute_plan_rows_inner(
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
             let (k, _) = binding.resolve_k_offset(*k, *baked_offset);
-            // Re-resolve `ef_search` from the *live* session, not the value
-            // baked at plan time: the plan cache key doesn't include
-            // `mydb_hnsw_ef_search`, so a cached VectorIndexScan would otherwise
-            // pin whatever ef the first execution saw and silently ignore a
-            // later `SET mydb_hnsw_ef_search`. An explicit `/*+ HNSW_EF(n) */`
-            // (baked in `ef_hint`) still wins. Falls back to the baked value if
-            // no session is installed (internal callers).
+            // Resolve live effort for late LIMIT bindings and direct plan
+            // callers. Compiled cache guards also include vector settings
+            // so changes affecting the ANN/exact crossover are re-costed.
+            // Algorithm-specific query hints retain their priority.
             let cfg = crate::engine::vector::session::current_config();
-            let _ = ef_search; // baked planning-time value; superseded by the live re-resolution
-                               // Resolve the algorithm-appropriate search effort from the *live*
-                               // session: an ef candidate-pool size for HNSW, an nprobe cell count
-                               // for IVF. Both flow through the same `ef` argument — the
-                               // backend (`VectorGraph::search`) interprets it per its algorithm.
+            let _ = ef_search;
             let ef = match index.vector_algo() {
                 crate::storage::schema::VectorAlgo::Ivf => {
                     let index_default = index.vector_meta().default_nprobe.map(|v| v as u64);
