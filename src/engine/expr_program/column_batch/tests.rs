@@ -48,6 +48,258 @@ fn parity(sql: &str, kind: ColumnType, values: Vec<Value>) {
     let actual: Vec<_> = (0..batch.num_rows()).map(|r| column.value_at(r)).collect();
     assert_eq!(actual, expected, "{sql}");
 }
+
+#[test]
+fn date_conditionals_keep_native_days_and_scalar_short_circuit_semantics() {
+    let (_, dates) = compile("x", ColumnType::Date);
+    let mut flag = dates.fields()[0].clone();
+    flag.name = "flag".into();
+    flag.column_type = ColumnType::Long;
+    let mut other = dates.fields()[0].clone();
+    other.name = "y".into();
+    let schema = Arc::new(BatchSchema::new(vec![
+        flag,
+        dates.fields()[0].clone(),
+        other,
+    ]));
+    for sql in [
+        "CASE WHEN x IS NOT NULL THEN x ELSE y END",
+        "IF(flag,x,y)",
+        "CASE flag WHEN 1 THEN x WHEN 2 THEN y END",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(vec![
+                    Value::Int(1),
+                    Value::Int(0),
+                    Value::Null,
+                    Value::Int(2),
+                    Value::Int(1),
+                ]),
+                ColumnVector::from_values(vec![
+                    Value::Date(19723),
+                    Value::Null,
+                    Value::Date(-1),
+                    Value::Null,
+                    Value::Date(0),
+                ]),
+                ColumnVector::from_values(vec![
+                    Value::Null,
+                    Value::Date(20000),
+                    Value::Date(1),
+                    Value::Null,
+                    Value::Date(30000),
+                ]),
+            ],
+        );
+    }
+}
+
+#[test]
+fn exact_coalesce_arithmetic_preserves_nulls_scales_and_short_circuit_diagnostics() {
+    for (kind, values) in [
+        (
+            ColumnType::Long,
+            vec![
+                Value::Null,
+                Value::Int(-17),
+                Value::Int(0),
+                Value::Int(i32::MAX as i64),
+            ],
+        ),
+        (
+            ColumnType::Decimal {
+                precision: 7,
+                scale: 2,
+            },
+            vec![
+                Value::Null,
+                Value::DecimalCompact(-12345, 2),
+                Value::DecimalCompact(0, 2),
+                Value::DecimalCompact(9999999, 2),
+            ],
+        ),
+    ] {
+        for sql in [
+            "COALESCE(x,0)",
+            "IFNULL(x,0)",
+            "x-COALESCE(x,0)",
+            "x-COALESCE(NULL,x,0.0)",
+            "COALESCE(x+1,0.00)*2",
+        ] {
+            let (_, schema) = compile("x", kind);
+            checked_legacy_column(
+                sql,
+                schema.clone(),
+                vec![ColumnVector::from_values(values.clone())],
+            );
+            let (program, _) = compile(sql, kind);
+            assert!(
+                program.column_parallel_safe(&schema),
+                "{sql}: {:?}",
+                program.root
+            );
+        }
+    }
+    let (program, schema) = compile("COALESCE(x,1.0e0/0)", ColumnType::Long);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::I64 {
+            data: vec![7, 8],
+            nulls: None,
+        }],
+    );
+    let warnings = crate::engine::api::StatementWarningSink::default();
+    crate::engine::api::with_statement_warning_sink(warnings.clone(), || {
+        assert!(program.try_eval_column(&batch).is_none());
+        assert!(warnings.lock().is_empty());
+        assert_eq!(
+            oracle(&program, &batch).unwrap(),
+            vec![Value::Double(7.0), Value::Double(8.0)]
+        );
+        assert!(warnings.lock().is_empty());
+    });
+}
+
+#[test]
+fn decimal_approximate_arithmetic_keeps_column_execution_and_scalar_bits() {
+    for sql in ["((x - 1.00) + x) * 1.0e0 / 2", "(x - x) * -1.0e0 / 2"] {
+        let (program, schema) = compile(
+            sql,
+            ColumnType::Decimal {
+                precision: 7,
+                scale: 2,
+            },
+        );
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::DecimalCompact(-123456, 2),
+                Value::DecimalCompact(9999999, 2),
+                Value::DecimalCompact(0, 2),
+            ])],
+        );
+        let expected = oracle(&program, &batch).unwrap();
+        assert!(
+            program.column_parallel_safe(&schema),
+            "declared decimal domains must prove finite arithmetic without warning reordering"
+        );
+        let actual = program
+            .try_eval_column(&batch)
+            .expect("mixed exact/approximate arithmetic must retain native lanes");
+        for (row, expected) in expected.into_iter().enumerate() {
+            match (actual.value_at(row), expected) {
+                (Value::Double(actual), Value::Double(expected)) => {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{sql}: row {row}")
+                }
+                (actual, expected) => assert_eq!(actual, expected),
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_arithmetic_preserves_decimal_scales_and_declines_diagnostics() {
+    let values = vec![
+        Value::Null,
+        Value::DecimalCompact(0, 6),
+        Value::DecimalCompact(-1234567, 6),
+        Value::DecimalCompact(999999999999999999, 6),
+    ];
+    for sql in [
+        "x + 1.25",
+        "x - 0.001",
+        "x * 0.25",
+        "-x",
+        "(x * 0.25 + 1.0) * 1.0e0",
+    ] {
+        checked_legacy_column(
+            sql,
+            compile(
+                "x",
+                ColumnType::Decimal {
+                    precision: 18,
+                    scale: 6,
+                },
+            )
+            .1,
+            vec![ColumnVector::from_values(values.clone())],
+        );
+    }
+    let mut session = SessionContext::default();
+    session.sql_mode = "ERROR_FOR_DIVISION_BY_ZERO".into();
+    crate::engine::expr::with_session_expr_info(&session, || {
+        let (program, schema) = compile(
+            "1.0e0 / x",
+            ColumnType::Decimal {
+                precision: 7,
+                scale: 2,
+            },
+        );
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::DecimalCompact(0, 2),
+                Value::DecimalCompact(100, 2),
+                Value::DecimalCompact(200, 2),
+                Value::Null,
+            ])],
+        );
+        assert!(!program.column_parallel_safe(&schema));
+        crate::engine::api::clear_statement_warnings();
+        assert!(program.try_eval_column(&batch).is_none());
+        assert_eq!(crate::engine::api::statement_warning_count(), 0);
+        let selected =
+            batch
+                .clone()
+                .with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+                    vec![1, 2, 1],
+                ));
+        let actual = program.try_eval_column(&selected).unwrap();
+        assert_eq!(actual.value_at(0), Value::Null);
+        assert_eq!(actual.value_at(1), Value::Double(1.0));
+        assert_eq!(actual.value_at(2), Value::Double(0.5));
+        assert_eq!(actual.value_at(3), Value::Null);
+        let _ = oracle(&program, &batch).unwrap();
+        assert!(crate::engine::api::statement_warning_count() > 0);
+        crate::engine::api::clear_statement_warnings();
+    });
+}
+
+#[test]
+fn arithmetic_reads_float_metadata_and_keeps_nonfinite_fallback() {
+    let (program, schema) = compile("x * 1.0e0", ColumnType::Float);
+    assert!(!program.column_parallel_safe(&schema));
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::F64 {
+            data: vec![1.234567890123, -0.0, f64::MAX, f64::NAN],
+            nulls: None,
+        }],
+    );
+    assert!(program.try_eval_column(&batch).is_none());
+    let selected =
+        batch
+            .clone()
+            .with_selection(crate::engine::executor::vec::batch::Selection::Indices(
+                vec![0, 1],
+            ));
+    let actual = program.try_eval_column(&selected).unwrap();
+    let expected = oracle(&program, &batch).unwrap();
+    for row in 0..2 {
+        let (Value::Double(actual), Value::Double(expected)) =
+            (actual.value_at(row), &expected[row])
+        else {
+            panic!("float result")
+        };
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+    assert_eq!(actual.value_at(2), Value::Null);
+    assert_eq!(actual.value_at(3), Value::Null);
+}
 #[test]
 fn composed_string_columns_match_scalar_unicode_binary_and_null_semantics() {
     let values = vec![

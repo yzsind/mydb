@@ -1,6 +1,7 @@
 //! setop execution and preparation.
 
 use super::*;
+mod fixed;
 
 pub(super) struct ChargedMaterializedBatchOperator {
     pub(super) inner: MaterializedBatchOperator,
@@ -35,6 +36,7 @@ pub(super) struct SetOpBatchOperator<'a> {
     pub(super) data_dir: std::path::PathBuf,
     pub(super) left_done: bool,
     pub(super) blocking_output: Option<crate::engine::executor::dispatch::IncrementalSetOutput>,
+    compact_output: Option<std::collections::VecDeque<Batch>>,
     pub(super) started: Option<std::time::Instant>,
     pub(super) io_start: Option<(u64, u64)>,
     pub(super) batches: u64,
@@ -206,8 +208,19 @@ impl SetOpBatchOperator<'_> {
     }
 
     pub(super) fn initialize_blocking(&mut self) -> Result<(), QueryError> {
-        if self.blocking_output.is_some() {
+        if self.blocking_output.is_some() || self.compact_output.is_some() {
             return Ok(());
+        }
+        if !self.all {
+            if let Some(output) = fixed::prepare(
+                &mut self.left,
+                &mut self.right,
+                self.schema.clone(),
+                self.op,
+            )? {
+                self.compact_output = Some(output.into());
+                return Ok(());
+            }
         }
         let schema = self.schema.clone();
         let left_input = self
@@ -356,6 +369,16 @@ impl SetOpBatchOperator<'_> {
             };
         }
         self.initialize_blocking()?;
+        if let Some(output) = self.compact_output.as_mut() {
+            let batch = output.pop_front();
+            if let Some(batch) = &batch {
+                self.batches = self.batches.saturating_add(1);
+                self.output_rows = self.output_rows.saturating_add(batch.visible_rows() as u64);
+            } else {
+                self.record_stats();
+            }
+            return Ok(batch);
+        }
         let output = self
             .blocking_output
             .as_mut()
@@ -453,6 +476,7 @@ fn try_build_setop_batch_checked<'a>(
             data_dir: db.data_dir().to_path_buf(),
             left_done: false,
             blocking_output: None,
+            compact_output: None,
             started: None,
             io_start: None,
             batches: 0,

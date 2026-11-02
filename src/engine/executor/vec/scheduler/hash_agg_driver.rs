@@ -435,14 +435,39 @@ fn take_parallel_worker_partials(
 
 /// Build the finest ROLLUP groups with the production parallel workers.
 /// Empty or unsupported group layouts return `None` for the row executor.
+#[cfg(test)]
 pub fn run_rollup_finest_parallel(
+    stream: &mut dyn BatchOperator,
+    group_columns: Vec<usize>,
+    aggs: Vec<AggregateSpec>,
+    worker_count: usize,
+    budget: Option<Arc<MemBudget>>,
+    data_dir: PathBuf,
+) -> Result<Option<RollupFinestResult>, QueryError> {
+    run_rollup_finest_compact_parallel(
+        stream,
+        group_columns,
+        aggs,
+        worker_count,
+        budget,
+        data_dir,
+        false,
+    )
+}
+
+pub(crate) fn run_rollup_finest_compact_parallel(
     stream: &mut dyn BatchOperator,
     group_columns: Vec<usize>,
     mut aggs: Vec<AggregateSpec>,
     worker_count: usize,
     budget: Option<Arc<MemBudget>>,
     data_dir: PathBuf,
+    allow_compact: bool,
 ) -> Result<Option<RollupFinestResult>, QueryError> {
+    let collations = group_columns
+        .iter()
+        .map(|column| stream.schema().fields()[*column].source.collation_id)
+        .collect::<Vec<_>>();
     vec_hash_agg::bind_aggregate_comparison_domains(&mut aggs, stream.schema());
     let spill_context = budget.map(|budget| {
         parallel_spill_context(
@@ -494,7 +519,11 @@ pub fn run_rollup_finest_parallel(
         return Ok(if buckets.is_empty() {
             None
         } else {
-            Some(RollupFinestResult { buckets, metrics })
+            Some(RollupFinestResult {
+                buckets,
+                metrics,
+                compact: None,
+            })
         });
     }
 
@@ -518,7 +547,7 @@ pub fn run_rollup_finest_parallel(
     if let Some(context) = resident_context.as_mut() {
         context.shared_spill = None;
     }
-    let worker_output = take_parallel_worker_partials(&mut sinks, resident_context.as_ref())?;
+    let mut worker_output = take_parallel_worker_partials(&mut sinks, resident_context.as_ref())?;
     let mut metrics = worker_output.metrics;
     let shared = spill_context
         .as_ref()
@@ -526,6 +555,23 @@ pub fn run_rollup_finest_parallel(
     if let Some(shared) = shared {
         metrics.spill_partitions = shared.written_partition_count() as u64;
         metrics.did_spill |= metrics.spill_partitions > 0;
+    }
+    if crate::util::env::var_os("MYDB_DEBUG_COMPACT_ROLLUP").is_some() {
+        eprintln!(
+            "compact ROLLUP handoff: enabled={allow_compact}, spilled={}",
+            metrics.did_spill
+        );
+    }
+    if allow_compact && !metrics.did_spill {
+        if let Some(compact) =
+            vec_hash_agg::try_compact_rollup(&mut worker_output.partitions, &collations, &aggs)?
+        {
+            return Ok(Some(RollupFinestResult {
+                buckets: Vec::new(),
+                metrics,
+                compact: Some(compact),
+            }));
+        }
     }
     let buckets = merge_rollup_partitions(
         worker_output.partitions,
@@ -536,7 +582,11 @@ pub fn run_rollup_finest_parallel(
     Ok(if buckets.is_empty() {
         None
     } else {
-        Some(RollupFinestResult { buckets, metrics })
+        Some(RollupFinestResult {
+            buckets,
+            metrics,
+            compact: None,
+        })
     })
 }
 
@@ -642,6 +692,7 @@ fn merge_rollup_partitions(
 pub struct RollupFinestResult {
     pub buckets: Vec<vec_hash_agg::GroupBucketSnapshot>,
     pub metrics: AggMetrics,
+    pub(crate) compact: Option<vec_hash_agg::CompactRollupFinest>,
 }
 
 /// Wrap [`run_hash_agg_parallel`] into the same `(BatchOperator,
@@ -1099,10 +1150,12 @@ struct ParallelHashAggOutputStream {
     workers_remaining: usize,
     abort: Arc<AtomicBool>,
     pending: std::collections::VecDeque<Vec<Value>>,
+    pending_batch: Option<Batch>,
 }
 
 enum ParallelFinalizeMessage {
     Rows(Vec<Vec<Value>>),
+    Batch(Batch),
     Error(QueryError),
     Done,
 }
@@ -1157,6 +1210,7 @@ fn parallel_finalize_stream(
     for worker in 0..worker_count {
         let sender = sender.clone();
         let sinks = Arc::clone(&sinks);
+        let schema = schema.clone();
         let shared_spill = shared_spill.clone();
         let budget = budget.clone();
         let final_filter = final_filter.clone();
@@ -1182,6 +1236,9 @@ fn parallel_finalize_stream(
                                 "parallel hash-aggregate finalize lock poisoned",
                             )
                         })?;
+                        if final_filter.is_none() && count_topk.is_none() {
+                            sink.agg.request_columnar_sum_handoff();
+                        }
                         partials.push(vec![sink.agg.take_partition_merged_snapshot(partition)?]);
                     }
                     let compact = match (&shared_spill, count_topk, &final_filter) {
@@ -1195,6 +1252,21 @@ fn parallel_finalize_stream(
                     } else {
                         if let Some(shared) = &shared_spill {
                             partials.push(vec![shared.partition_snapshot(partition)?]);
+                        }
+                        if final_filter.is_none() && count_topk.is_none() {
+                            if let Some(batches) = vec_hash_agg::try_merge_columnar_sum_batches(
+                                &mut partials,
+                                &aggs,
+                                schema.clone(),
+                            )? {
+                                for batch in batches {
+                                    if sender.send(ParallelFinalizeMessage::Batch(batch)).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                continue;
+                            }
+                            vec_hash_agg::restore_legacy_partials(&mut partials);
                         }
                         vec_hash_agg::merge_worker_partition_snapshots_filtered_topk(
                             partials,
@@ -1256,6 +1328,7 @@ fn parallel_finalize_stream(
         workers_remaining: worker_count,
         abort,
         pending: std::collections::VecDeque::new(),
+        pending_batch: None,
     }
 }
 
@@ -1309,7 +1382,16 @@ impl BatchOperator for ParallelHashAggOutputStream {
     }
 
     fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        crate::engine::cancel::check_cancelled()?;
+        if self.pending.is_empty() {
+            if let Some(batch) = self.pending_batch.take() {
+                return Ok(Some(batch));
+            }
+        }
         while self.pending.len() < DEFAULT_BATCH_ROWS && self.workers_remaining > 0 {
+            if self.pending_batch.is_some() {
+                break;
+            }
             crate::engine::cancel::check_cancelled()?;
             let message = self
                 .receiver
@@ -1324,6 +1406,13 @@ impl BatchOperator for ParallelHashAggOutputStream {
                 })?;
             match message {
                 ParallelFinalizeMessage::Rows(rows) => self.pending.extend(rows),
+                ParallelFinalizeMessage::Batch(batch) => {
+                    if self.pending.is_empty() {
+                        return Ok(Some(batch));
+                    }
+                    self.pending_batch = Some(batch);
+                    break;
+                }
                 ParallelFinalizeMessage::Error(error) => return Err(error),
                 ParallelFinalizeMessage::Done => {
                     self.workers_remaining = self.workers_remaining.saturating_sub(1);
@@ -1494,6 +1583,7 @@ pub fn run_hash_agg_parallel_stream_with_count_topk(
                                 pending: std::collections::VecDeque::from([vec![Value::Int(
                                     count as i64,
                                 )]]),
+                                pending_batch: None,
                             }),
                             metrics,
                             false,

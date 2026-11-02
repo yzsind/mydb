@@ -1966,6 +1966,7 @@ pub(in crate::engine::executor::select) struct VecRollupFinest {
     pub collations: Vec<Option<u16>>,
     _direct_charge: Option<mem_budget::ScopedCharge>,
     pub groups: Vec<VecRollupFinestGroup>,
+    pub compact: Option<crate::engine::executor::vec::hash_agg::CompactRollupFinest>,
 }
 
 pub(in crate::engine::executor::select) struct VecRollupFinestGroup {
@@ -1996,6 +1997,7 @@ pub(in crate::engine::executor::select) fn vec_rollup_finest_groups(
     input: &PhysicalPlan,
     group_by: &[Expr],
     slots: &[crate::engine::executor::select::aggregate::AggregateSlot],
+    allow_compact: bool,
 ) -> Result<Option<VecRollupFinest>, QueryError> {
     use crate::engine::executor::vec::hash_agg::{
         self as vec_hash_agg, AggregateKind, AggregateSpec,
@@ -2180,6 +2182,7 @@ pub(in crate::engine::executor::select) fn vec_rollup_finest_groups(
             groups: buckets.into_iter().map(map_bucket).collect(),
             collations: group_cols_for_collation,
             _direct_charge: charge,
+            compact: None,
         }));
     }
     drop(direct);
@@ -2191,28 +2194,35 @@ pub(in crate::engine::executor::select) fn vec_rollup_finest_groups(
     // falls back to a single in-process aggregator below the scheduler row
     // threshold, so small inputs keep the original serial cost profile.
     let worker_count = scheduler_hash_agg_workers();
-    let groups: Vec<VecRollupFinestGroup> =
-        match crate::engine::executor::vec::scheduler::hash_agg_driver::run_rollup_finest_parallel(
+    let compact_consumer =
+        allow_compact && super::super::plan::compact_rollup_topk_applicable(group_by, slots);
+    if crate::util::env::var_os("MYDB_DEBUG_COMPACT_ROLLUP").is_some() {
+        eprintln!("compact ROLLUP consumer: enabled={compact_consumer}");
+    }
+    let (groups, compact): (Vec<VecRollupFinestGroup>, _) =
+        match crate::engine::executor::vec::scheduler::hash_agg_driver::run_rollup_finest_compact_parallel(
             stream.as_mut(),
             group_cols,
             agg_specs,
             worker_count,
             mem_budget::current_budget(),
             db.data_dir().to_path_buf(),
+            compact_consumer,
         )? {
             Some(result) => {
                 record_pending_agg_metrics(result.metrics);
-                result.buckets.into_iter().map(&map_bucket).collect()
+                (result.buckets.into_iter().map(&map_bucket).collect(), result.compact)
             }
             // Capability was established before opening `stream`; `None`
             // here means it was empty, not that execution should restart.
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
     let collations = group_cols_for_collation;
     Ok(Some(VecRollupFinest {
         groups,
         collations,
         _direct_charge: None,
+        compact,
     }))
 }
 

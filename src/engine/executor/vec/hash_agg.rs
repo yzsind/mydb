@@ -32,6 +32,12 @@
 mod spill_layout;
 use spill_layout::{build_spill_schema, SpillLayout};
 
+mod compact_rollup;
+pub(crate) use compact_rollup::{try_compact_rollup, CompactRollupFinest, CompactRollupGroup};
+mod columnar_finalize;
+pub(crate) use columnar_finalize::restore_legacy_partials;
+pub(crate) use columnar_finalize::try_merge_columnar_sum_batches;
+
 mod direct_join;
 use direct_join::DirectJoinState;
 #[cfg(test)]
@@ -1259,16 +1265,35 @@ fn dictionary_primitive_sample_distinct(source: &DictionaryColumnSource, batch: 
 impl DictionaryGroupEncoder {
     #[inline]
     fn try_build(group_columns: &[usize], batch: &Batch) -> Option<Self> {
+        Self::try_build_impl(group_columns, batch, false)
+    }
+
+    fn try_build_numeric(group_columns: &[usize], batch: &Batch) -> Option<Self> {
+        Self::try_build_impl(group_columns, batch, true)
+    }
+
+    fn try_build_impl(group_columns: &[usize], batch: &Batch, numeric: bool) -> Option<Self> {
         if group_columns.is_empty() || group_columns.len() > 8 {
             return None;
         }
+        // One varying text component must not disable compact state when
+        // other components already demonstrate a categorical composite key.
+        // A single near-unique string retains the canonical implementation.
+        let categorical_composite = numeric
+            && group_columns.len() > 1
+            && group_columns.iter().any(|column| {
+                batch.columns().get(*column).is_some_and(|vector| {
+                    matches!(vector, ColumnVector::Utf8 { .. })
+                        && utf8_dictionary_worthwhile(vector, batch)
+                })
+            });
         let mut has_utf8 = false;
         let mut sources = Vec::with_capacity(group_columns.len());
         let mut widths = Vec::with_capacity(group_columns.len());
         for &column in group_columns {
             let (source, width) = match batch.columns().get(column)? {
                 vector @ ColumnVector::Utf8 { .. } => {
-                    if !utf8_dictionary_worthwhile(vector, batch) {
+                    if !categorical_composite && !utf8_dictionary_worthwhile(vector, batch) {
                         return None;
                     }
                     has_utf8 = true;
@@ -1348,7 +1373,13 @@ impl DictionaryGroupEncoder {
             .enumerate()
             .filter(|(_, source)| !matches!(source, DictionaryColumnSource::Utf8 { .. }))
             .fold(0usize, |mask, (index, _)| mask | (1usize << index));
-        let (direct_mask, token_bits) = if direct_primitives {
+        let (direct_mask, token_bits) = if numeric {
+            // Numeric states benefit from dense composite keys even when
+            // one primitive has a large domain. Keep equal token namespaces
+            // with enough space for a complete batch; epochs spill before
+            // any token can overflow.
+            (0, (128 / sources.len() as u32).min(32))
+        } else if direct_primitives {
             (primitive_mask, 32)
         } else {
             let mut best: Option<(usize, u32, u32, usize)> = None;
@@ -2238,8 +2269,8 @@ fn dictionary_i64_token(
 /// Compact grouped COUNT state for mixed fixed-width + dictionary UTF-8 keys.
 /// Each radix partition owns one open-addressing table, so finalization can
 /// move partitions independently to the planned aggregate workers. Keys,
-/// counts and representative-string tokens are flat arrays; no per-group
-/// `Vec` or general-purpose `AggState` allocation is retained.
+/// counts, optional exact SUM states and representative-string tokens are flat
+/// arrays; no per-group `Vec` or general-purpose `AggState` is retained.
 struct DictionaryCountArena {
     partitions: Vec<DictionaryCountPartition>,
     raw_token_width: usize,
@@ -2276,6 +2307,8 @@ struct DictionaryCountPartition {
     // pay eight bytes per slot.
     counts: Vec<u32>,
     overflow_counts: hashbrown::HashMap<usize, u64, ahash::RandomState>,
+    decimal_sum: Option<NarrowDecimalStateColumn>,
+    float_sum: Option<Vec<f64>>,
 }
 
 impl DictionaryCountPartition {
@@ -2293,6 +2326,8 @@ impl DictionaryCountPartition {
             raw_tokens: Vec::with_capacity(seed.saturating_mul(raw_token_width)),
             counts: Vec::with_capacity(seed.saturating_mul(n_aggs)),
             overflow_counts: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+            decimal_sum: None,
+            float_sum: None,
         }
     }
 
@@ -2332,6 +2367,15 @@ impl DictionaryCountPartition {
                 .saturating_mul(raw_token_width)
                 .saturating_sub(self.raw_tokens.len()),
         );
+        if let Some(sum) = self.decimal_sum.as_mut() {
+            sum.magnitudes
+                .reserve_exact(groups.saturating_sub(sum.magnitudes.len()));
+            sum.status
+                .reserve_exact(groups.saturating_sub(sum.status.len()));
+        }
+        if let Some(sum) = self.float_sum.as_mut() {
+            sum.reserve_exact(groups.saturating_sub(sum.len()));
+        }
     }
 
     #[inline]
@@ -2390,6 +2434,67 @@ impl DictionaryCountPartition {
             .saturating_add(self.overflow_counts.capacity().saturating_mul(
                 HASH_ENTRY_OVERHEAD + std::mem::size_of::<usize>() + std::mem::size_of::<u64>(),
             ))
+            .saturating_add(
+                self.decimal_sum
+                    .as_ref()
+                    .map_or(0, NarrowDecimalStateColumn::allocated_bytes),
+            )
+            .saturating_add(
+                self.float_sum
+                    .as_ref()
+                    .map_or(0, |sum| sum.capacity().saturating_mul(8)),
+            )
+    }
+
+    fn update_numeric_sum(
+        &mut self,
+        group: usize,
+        batch: &Batch,
+        column: usize,
+        row: usize,
+    ) -> Result<(), QueryError> {
+        if let Some(sum) = self.decimal_sum.as_mut() {
+            while sum.status.len() <= group {
+                sum.push_group();
+            }
+            if !batch.columns()[column].is_null(row) {
+                sum.update_value(group, &batch.columns()[column].value_at(row))?;
+            }
+        }
+        if self.float_sum.is_some() {
+            let first = self.count(group, 0, 1) == 1;
+            let sum = self.float_sum.as_mut().unwrap();
+            sum.resize(self.keys.len(), 0.0);
+            let input = &batch.columns()[column];
+            if !input.is_null(row) {
+                let ColumnVector::F64 { data, .. } = input else {
+                    return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                        .error("compact approximate aggregate input changed after preflight"));
+                };
+                // Match the scalar accumulator's first-value initialization,
+                // including negative zero, and retain its addition order.
+                if first {
+                    sum[group] = data[row];
+                } else {
+                    sum[group] += data[row];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn numeric_sum_state(&self, group: usize) -> NumericAggState {
+        if let Some(sum) = &self.decimal_sum {
+            sum.state(group)
+        } else if let Some(sum) = &self.float_sum {
+            if self.count(group, 0, 1) == 0 {
+                NumericAggState::Empty
+            } else {
+                NumericAggState::Float(sum[group])
+            }
+        } else {
+            NumericAggState::Empty
+        }
     }
 
     #[inline]
@@ -2447,6 +2552,31 @@ impl DictionaryCountPartition {
 }
 
 impl DictionaryCountArena {
+    fn enable_decimal_sum(&mut self, scale: u8) {
+        for partition in &mut self.partitions {
+            partition.decimal_sum = Some(NarrowDecimalStateColumn::new(
+                scale,
+                partition.keys.capacity(),
+            ));
+        }
+    }
+
+    fn has_decimal_sum(&self) -> bool {
+        self.partitions
+            .iter()
+            .any(|partition| partition.decimal_sum.is_some())
+    }
+
+    fn has_float_sum(&self) -> bool {
+        self.partitions
+            .iter()
+            .any(|partition| partition.float_sum.is_some())
+    }
+
+    fn has_numeric_sum(&self) -> bool {
+        self.has_decimal_sum() || self.has_float_sum()
+    }
+
     fn new(seed: usize, raw_token_width: usize, n_aggs: usize, direct_tokens: bool) -> Self {
         let per_partition = seed.div_ceil(NUM_PARTITIONS).max(1);
         Self {
@@ -2478,6 +2608,7 @@ impl DictionaryCountArena {
         canonical_key: &mut Vec<u8>,
     ) -> Result<(), QueryError> {
         let single_utf8 = encoder.is_single_utf8();
+        let decimal_sum = self.has_numeric_sum();
         if single_utf8
             && aggs
                 .iter()
@@ -2522,12 +2653,26 @@ impl DictionaryCountArena {
                                 );
                             }
                         }
+                        if decimal_sum {
+                            self.partitions[partition].update_numeric_sum(
+                                group,
+                                batch,
+                                aggs[0].input_column,
+                                row,
+                            )?;
+                        }
                         previous = Some((row, partition, group));
                         continue;
                     }
                 }
             }
-            let encoded = if single_utf8 {
+            let encoded = if decimal_sum {
+                // Canonical radix assignment keeps numeric epochs compatible
+                // with generic states if later batches decline this layout.
+                encoder
+                    .encode_row(batch, row, canonical_key)
+                    .map(|(key, _)| (key, super::key_encode::fxhash(canonical_key), None))
+            } else if single_utf8 {
                 encoder
                     .encode_single_utf8_count_row(batch, row, canonical_key, None)
                     .map(|(key, hash, raw_token)| (key, hash, Some(raw_token)))
@@ -2589,6 +2734,14 @@ impl DictionaryCountArena {
                 {
                     self.partitions[partition].increment_count(group, slot, self.n_aggs, 1);
                 }
+            }
+            if decimal_sum {
+                self.partitions[partition].update_numeric_sum(
+                    group,
+                    batch,
+                    aggs[0].input_column,
+                    row,
+                )?;
             }
             previous = Some((row, partition, group));
         }
@@ -3910,6 +4063,31 @@ impl FixedWidthStateArena {
             };
             decimal_column_scales.push(scale);
         }
+        // Complete a mixed exact SUM layout. Retaining one integer slot in
+        // the inline arena otherwise allocates unused general states for all
+        // decimal slots as well. Integer-only dense kernels keep their layout.
+        if decimal_column_scales.iter().any(Option::is_some) {
+            for (spec, scale) in aggs.iter().zip(&mut decimal_column_scales) {
+                if spec.func != AggregateKind::Sum || scale.is_some() {
+                    continue;
+                }
+                let column = batch.columns().get(spec.input_column)?;
+                if matches!(
+                    column,
+                    ColumnVector::I64 { .. } | ColumnVector::U64 { .. } | ColumnVector::Bool { .. }
+                ) || matches!(
+                    batch.schema().fields().get(spec.input_column)?.column_type,
+                    ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                        | ColumnType::Bit { .. }
+                ) {
+                    *scale = Some(0);
+                }
+            }
+        }
         let aggregate = Self::new_with_decimal_columns(
             key_kinds,
             aggs.iter().map(|spec| spec.func).collect(),
@@ -5178,10 +5356,16 @@ pub struct HashAggregateCore {
     /// state layout after input has already been consumed.
     fixed_width_probed: bool,
     fixed_width: Option<FixedWidthStateArena>,
+    frozen_sum_columns: Option<Arc<columnar_finalize::FrozenSumArena>>,
+    columnar_sum_handoff: bool,
     defer_parallel_i64_decimal_dedup: bool,
 }
 
 impl HashAggregateCore {
+    pub(crate) fn request_columnar_sum_handoff(&mut self) {
+        self.columnar_sum_handoff = true;
+    }
+
     pub(crate) fn unspilled_global_distinct_state(
         &self,
     ) -> Option<Option<&crate::engine::executor::hash_aggregate::DistinctState>> {
@@ -5212,7 +5396,9 @@ impl HashAggregateCore {
     pub(crate) fn parallel_dictionary_layout(
         &self,
     ) -> Option<smallvec::SmallVec<[(u8, usize, u32, u32, u32); 8]>> {
-        self.dictionary_count.as_ref()?;
+        if self.dictionary_count.as_ref()?.has_numeric_sum() {
+            return None;
+        }
         let encoder = self.dictionary_encoder.as_ref()?;
         if encoder.columns.len() > 8 || encoder._merge_token_charge.is_some() {
             return None;
@@ -5861,6 +6047,8 @@ impl HashAggregateCore {
             dense_i64_probed: false,
             fixed_width_probed: false,
             fixed_width: None,
+            frozen_sum_columns: None,
+            columnar_sum_handoff: false,
             defer_parallel_i64_decimal_dedup: false,
         }
     }
@@ -6201,6 +6389,17 @@ impl HashAggregateCore {
         }
 
         let visible_rows = batch.visible_rows();
+        if self
+            .dictionary_count
+            .as_ref()
+            .is_some_and(DictionaryCountArena::has_float_sum)
+            && !matches!(
+                batch.columns().get(self.aggs[0].input_column),
+                Some(ColumnVector::F64 { .. } | ColumnVector::Null { .. })
+            )
+        {
+            self.do_spill_dictionary_count()?;
+        }
         // A compact dictionary key may devote fewer than 32 bits to a token
         // when a wide composite GROUP BY is packed into u128. Never let a
         // token overflow happen after part of a batch has already updated the
@@ -6222,25 +6421,75 @@ impl HashAggregateCore {
         // their partition handoff can move the compact state directly to the
         // finalize workers, while serial/no-budget callers retain the common
         // canonical implementation.
+        let decimal_scale = match self.aggs.as_slice() {
+            [spec] if matches!(spec.func, AggregateKind::Sum | AggregateKind::Avg) => {
+                match &batch.columns()[spec.input_column] {
+                    ColumnVector::Generic { values } => {
+                        if let ColumnType::Decimal { scale, .. } =
+                            batch.schema().fields()[spec.input_column].column_type
+                        {
+                            values
+                                .iter()
+                                .all(|value| {
+                                    matches!(
+                                        value,
+                                        Value::Null
+                                            | Value::Int(_)
+                                            | Value::UInt(_)
+                                            | Value::DecimalCompact(..)
+                                            | Value::Decimal128(..)
+                                            | Value::DecimalWide(_)
+                                    )
+                                })
+                                .then_some(scale)
+                        } else {
+                            None
+                        }
+                    }
+                    ColumnVector::DecimalWide { scale, .. } => Some(*scale),
+                    column => column.decimal_scale(),
+                }
+            }
+            _ => None,
+        };
+        let float_sum = matches!(self.aggs.as_slice(), [spec]
+            if matches!(spec.func, AggregateKind::Sum | AggregateKind::Avg)
+                && batch.schema().fields()[spec.input_column].column_type == ColumnType::Double
+                && matches!(batch.columns()[spec.input_column], ColumnVector::F64 { .. } | ColumnVector::Null { .. }));
+        let numeric_sum = decimal_scale.is_some() || float_sum;
         if self.shared_spill.is_some()
             && !self.dictionary_probed
             && visible_rows != 0
-            && self
-                .aggs
-                .iter()
-                .all(|spec| matches!(spec.func, AggregateKind::CountStar | AggregateKind::Count))
+            && (numeric_sum
+                || self.aggs.iter().all(|spec| {
+                    matches!(spec.func, AggregateKind::CountStar | AggregateKind::Count)
+                }))
         {
             self.dictionary_probed = true;
-            self.dictionary_encoder = DictionaryGroupEncoder::try_build(&self.group_columns, batch);
+            self.dictionary_encoder = if numeric_sum {
+                DictionaryGroupEncoder::try_build_numeric(&self.group_columns, batch)
+            } else {
+                DictionaryGroupEncoder::try_build(&self.group_columns, batch)
+            };
             if let Some(encoder) = self.dictionary_encoder.as_ref().filter(|encoder| {
-                encoder.compact_count_eligible && encoder.can_admit_batch(visible_rows)
+                (numeric_sum || encoder.compact_count_eligible)
+                    && encoder.can_admit_batch(visible_rows)
             }) {
-                self.dictionary_count = Some(DictionaryCountArena::new(
+                let mut arena = DictionaryCountArena::new(
                     visible_rows,
                     0,
                     self.aggs.len(),
-                    encoder.is_single_utf8(),
-                ));
+                    !numeric_sum && encoder.is_single_utf8(),
+                );
+                if let Some(scale) = decimal_scale {
+                    arena.enable_decimal_sum(scale);
+                }
+                if float_sum {
+                    for partition in &mut arena.partitions {
+                        partition.float_sum = Some(Vec::with_capacity(partition.keys.capacity()));
+                    }
+                }
+                self.dictionary_count = Some(arena);
             }
         }
         if let Some(arena) = self.dictionary_count.as_mut() {
@@ -6781,7 +7030,7 @@ impl HashAggregateCore {
                         &compact,
                         &encoder,
                         start..end,
-                        arena.n_aggs,
+                        shared.dictionary_schema.len() - self.group_columns.len() - 1,
                     );
                     match crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
                         crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
@@ -6799,7 +7048,7 @@ impl HashAggregateCore {
                     &encoder,
                     Arc::clone(&shared.dictionary_schema),
                     start..end,
-                    arena.n_aggs,
+                    &self.aggs,
                 )?;
                 let (bytes, first_file_write) = shared.append_dictionary(partition, &batch)?;
                 self.spill_bytes_total = self.spill_bytes_total.saturating_add(bytes);
@@ -7568,6 +7817,7 @@ pub struct PartitionPartial {
     fixed_width_decimal: Option<FixedWidthDecimalPartitionPartial>,
     compressed_i64_decimal: Option<CompressedI64DecimalPartial>,
     dictionary_count: Option<DictionaryCountPartitionPartial>,
+    columnar_sums: Option<columnar_finalize::ColumnarSumPartial>,
 }
 
 struct DictionaryCountPartitionPartial {
@@ -7603,6 +7853,9 @@ impl PartitionPartial {
     /// finest grouping (each `GroupBucketSnapshot` carries the group's key
     /// values and per-aggregate state).
     pub fn into_buckets(self) -> Vec<GroupBucketSnapshot> {
+        if let Some(columns) = self.columnar_sums {
+            return columns.into_buckets();
+        }
         if let Some(dictionary_count) = self.dictionary_count {
             return dictionary_count.into_buckets();
         }
@@ -7630,6 +7883,7 @@ impl DictionaryCountPartitionPartial {
             let aggs = (0..self.n_aggs)
                 .map(|slot| AggStateSnapshot {
                     count: self.partition.count(group, slot, self.n_aggs),
+                    sum: self.partition.numeric_sum_state(group),
                     ..AggStateSnapshot::default()
                 })
                 .collect();
@@ -7785,6 +8039,33 @@ impl HashAggregateCore {
         if pidx >= self.partitions.len() {
             return Ok(None);
         }
+        if self.columnar_sum_handoff
+            && self.frozen_sum_columns.is_none()
+            && self.spilled_paths.iter().all(Vec::is_empty)
+            && self
+                .fixed_width
+                .as_ref()
+                .is_some_and(columnar_finalize::eligible)
+        {
+            self.frozen_sum_columns = Some(Arc::new(columnar_finalize::FrozenSumArena {
+                arena: self.fixed_width.take().expect("columnar state checked"),
+                _grant: self.memory_grant.take(),
+            }));
+        }
+        if let Some(owner) = &self.frozen_sum_columns {
+            return Ok((!owner.arena.partition_groups[pidx].is_empty()).then(|| {
+                PartitionPartial {
+                    buckets: Vec::new(),
+                    fixed_width_decimal: None,
+                    compressed_i64_decimal: None,
+                    dictionary_count: None,
+                    columnar_sums: Some(columnar_finalize::ColumnarSumPartial {
+                        owner: owner.clone(),
+                        partition: pidx,
+                    }),
+                }
+            }));
+        }
         if let Some(arena) = self.dictionary_count.as_mut() {
             if self.frozen_dictionary_encoder.is_none() {
                 self.frozen_dictionary_encoder = Some(Arc::new(
@@ -7798,6 +8079,7 @@ impl HashAggregateCore {
             let partition = arena.take_partition(pidx);
             return Ok((!partition.keys.is_empty()).then(|| PartitionPartial {
                 buckets: Vec::new(),
+                columnar_sums: None,
                 fixed_width_decimal: None,
                 compressed_i64_decimal: None,
                 dictionary_count: Some(DictionaryCountPartitionPartial {
@@ -7823,6 +8105,7 @@ impl HashAggregateCore {
                         .expect("compressed DECIMAL runs retain one scale");
                     return Ok(Some(PartitionPartial {
                         buckets: Vec::new(),
+                        columnar_sums: None,
                         fixed_width_decimal: None,
                         compressed_i64_decimal: Some(CompressedI64DecimalPartial { runs, scale }),
                         dictionary_count: None,
@@ -7931,6 +8214,7 @@ fn fixed_width_partition_partial(
             }
             return (!groups.is_empty()).then_some(PartitionPartial {
                 buckets: Vec::new(),
+                columnar_sums: None,
                 fixed_width_decimal: Some(FixedWidthDecimalPartitionPartial {
                     key_kinds: arena.key_kinds.clone(),
                     keys,
@@ -7965,6 +8249,7 @@ fn fixed_width_partition_partial(
     }
     (!buckets.is_empty()).then_some(PartitionPartial {
         buckets,
+        columnar_sums: None,
         fixed_width_decimal: None,
         compressed_i64_decimal: None,
         dictionary_count: None,
@@ -8016,6 +8301,7 @@ fn merge_fixed_width_spill_path(
     }
     Ok((!buckets.is_empty()).then_some(PartitionPartial {
         buckets,
+        columnar_sums: None,
         fixed_width_decimal: None,
         compressed_i64_decimal: None,
         dictionary_count: None,
@@ -8060,6 +8346,7 @@ fn partition_partial_from_buckets(buckets: Vec<GroupBucket>) -> PartitionPartial
         .collect();
     PartitionPartial {
         buckets,
+        columnar_sums: None,
         fixed_width_decimal: None,
         compressed_i64_decimal: None,
         dictionary_count: None,
@@ -9104,9 +9391,10 @@ fn dictionary_count_partition_to_spill_batch(
     encoder: &DictionaryGroupEncoder,
     schema: Arc<BatchSchema>,
     groups: std::ops::Range<usize>,
-    n_aggs: usize,
+    aggs: &[AggregateSpec],
 ) -> Result<Batch, QueryError> {
     let group_count = encoder.columns.len();
+    let layout = SpillLayout::new(group_count + 1, aggs);
     let mut columns: Vec<Vec<Value>> = (0..schema.fields().len())
         .map(|column| {
             if column == 0 {
@@ -9133,9 +9421,13 @@ fn dictionary_count_partition_to_spill_batch(
         for (column, value) in encoder.direct_key_values_iter(key).enumerate() {
             columns[column + 1].push(value);
         }
-        for slot in 0..n_aggs {
-            let count = partition.count(group, slot, n_aggs).min(i64::MAX as u64);
-            columns[1 + group_count + slot].push(Value::Int(count as i64));
+        for (slot, codec) in layout.slots.iter().enumerate() {
+            let mut state = AggState::default();
+            state.count = partition
+                .count(group, slot, aggs.len())
+                .min(i64::MAX as u64);
+            state.sum = partition.numeric_sum_state(group);
+            codec.write(&state, &mut columns);
         }
     }
     let mut vectors = Vec::with_capacity(columns.len());
@@ -9162,6 +9454,11 @@ fn dictionary_spill_scratch_bytes(
         .saturating_add(1);
     let mut payload = rows.saturating_mul(columns.saturating_mul(32));
     for group in groups {
+        if let Some(sum) = partition.decimal_sum.as_ref() {
+            if let Some(promoted) = sum.promoted.get(&(group as u32)) {
+                payload = payload.saturating_add(numeric_state_heap_bytes(promoted));
+            }
+        }
         let key = partition.keys[group];
         for column in &encoder.columns {
             if let DictionaryColumnSource::Utf8 {
@@ -9225,15 +9522,7 @@ fn merge_dictionary_count_spill_path(
     aggs: &[AggregateSpec],
     charger: crate::engine::executor::spill_quota::SpillCharger,
 ) -> Result<(), QueryError> {
-    if !aggs
-        .iter()
-        .all(|spec| matches!(spec.func, AggregateKind::CountStar | AggregateKind::Count))
-    {
-        return Err(crate::storage::error(
-            crate::error::catalog::ER_INTERNAL_ERROR,
-            "dictionary COUNT spill received a non-count aggregate",
-        ));
-    }
+    let layout = SpillLayout::new(group_count + 1, aggs);
     let mut by_key: GroupMap<usize> = GroupMap::default();
     for (index, bucket) in buckets.iter().enumerate() {
         by_key.insert(bucket.key.clone(), index);
@@ -9242,6 +9531,7 @@ fn merge_dictionary_count_spill_path(
     let mut reader =
         crate::engine::executor::spill_quota::TrackedSpillReader::open(path, charger, capacity)?;
     while let Some(batch) = spill::read_owned_batch(&mut reader, schema.clone())? {
+        layout.validate_batch(&batch)?;
         let columns = batch.columns();
         for row in 0..batch.num_rows() {
             let key = match columns[0].value_at(row) {
@@ -9271,12 +9561,13 @@ fn merge_dictionary_count_spill_path(
                 by_key.insert(key, index);
                 index
             };
-            for slot in 0..aggs.len() {
-                if let Value::Int(count) = columns[1 + group_count + slot].value_at(row) {
-                    buckets[entry].aggs[slot].count = buckets[entry].aggs[slot]
-                        .count
-                        .saturating_add(count.max(0) as u64);
-                }
+            for (slot, codec) in layout.slots.iter().enumerate() {
+                codec.merge(
+                    &mut buckets[entry].aggs[slot],
+                    aggs[slot].func,
+                    columns,
+                    row,
+                )?;
             }
         }
     }
@@ -9957,6 +10248,384 @@ pub fn run_hash_agg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_integer_and_decimal_sums_keep_every_state_column_compact() {
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ("k", ColumnType::LongLong),
+                ("quantity", ColumnType::LongLong),
+                (
+                    "price",
+                    ColumnType::Decimal {
+                        precision: 30,
+                        scale: 2,
+                    },
+                ),
+                (
+                    "amount",
+                    ColumnType::Decimal {
+                        precision: 38,
+                        scale: 2,
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let columns = (0..4)
+            .map(|column| {
+                ColumnVector::from_values(
+                    (0..1024i64)
+                        .map(|row| match column {
+                            0 => Value::Int(row % 17),
+                            1 if row % 3 == 0 => Value::Null,
+                            1 => Value::Int(row % 200 - 100),
+                            2 if row % 5 == 0 => Value::Null,
+                            2 => {
+                                Value::DecimalCompact(if row % 7 == 0 { i64::MAX } else { -120 }, 2)
+                            }
+                            _ => Value::Decimal128(i128::MAX / 4, 2),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let batch = Batch::new(schema, columns);
+        let specs = (1..4)
+            .map(|input_column| AggregateSpec {
+                comparison_collation: None,
+                func: AggregateKind::Sum,
+                input_column,
+            })
+            .collect::<Vec<_>>();
+        let mut arena = FixedWidthStateArena::try_new(&[0], &specs, &batch).unwrap();
+        arena.consume_batch(&[0], &specs, &batch).unwrap();
+        assert!(arena.state_chunks.is_empty(), "exact integer SUM must not retain unused general-purpose accumulator chunks beside decimal columns");
+        let mut reference: std::collections::BTreeMap<i64, Vec<AggState>> =
+            std::collections::BTreeMap::new();
+        for row in 0..batch.num_rows() {
+            let Value::Int(key) = batch.columns()[0].value_at(row) else {
+                unreachable!()
+            };
+            let states = reference
+                .entry(key)
+                .or_insert_with(|| vec![AggState::default(); 3]);
+            for slot in 0..3 {
+                states[slot]
+                    .update_ref(AggregateKind::Sum, &batch.columns()[slot + 1].value_at(row))
+                    .unwrap();
+            }
+        }
+        for group in 0..arena.hashes.len() {
+            let Value::Int(key) = arena.group_key_values(group)[0] else {
+                unreachable!()
+            };
+            for slot in 0..3 {
+                assert_eq!(
+                    arena.finalized_value(group, slot),
+                    reference[&key][slot].finalize(AggregateKind::Sum)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_approximate_states_preserve_first_zero_nulls_spill_and_lane_changes() {
+        let root = temp_root();
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ("label", ColumnType::VarString),
+                ("key", ColumnType::LongLong),
+                ("measure", ColumnType::Double),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(
+                    (0..1024)
+                        .map(|row| {
+                            if row % 19 == 0 {
+                                Value::Null
+                            } else {
+                                Value::String(format!("label-{}", row % 13))
+                            }
+                        })
+                        .collect(),
+                ),
+                ColumnVector::from_values((0..1024).map(|row| Value::Int(row % 3)).collect()),
+                ColumnVector::from_values(
+                    (0..1024)
+                        .map(|row| {
+                            if row % 7 == 0 {
+                                Value::Null
+                            } else {
+                                Value::Double(if row % 5 == 0 {
+                                    -0.0
+                                } else {
+                                    (row % 17 - 8) as f64 * 0.25
+                                })
+                            }
+                        })
+                        .collect(),
+                ),
+            ],
+        );
+        for func in [AggregateKind::Sum, AggregateKind::Avg] {
+            for mode in 0..3 {
+                let specs = vec![AggregateSpec {
+                    comparison_collation: None,
+                    func,
+                    input_column: 2,
+                }];
+                let shared = Arc::new(SharedHashAggSpill::new(
+                    root.clone(),
+                    schema.clone(),
+                    &[0, 1],
+                    specs.clone(),
+                ));
+                let mut worker = HashAggregateCore::with_budget(
+                    vec![0, 1],
+                    specs.clone(),
+                    schema.clone(),
+                    Arc::new(MemBudget::new(128 * 1024 * 1024)),
+                    &root,
+                )
+                .with_shared_spill(shared.clone());
+                let mut oracle = HashAggregateCore::new(vec![0, 1], specs.clone());
+                worker.consume_batch(&batch).unwrap();
+                oracle.consume_batch(&batch).unwrap();
+                assert!(
+                    worker.dictionary_count.is_some(),
+                    "approximate states should retain compact dictionary keys"
+                );
+                if mode == 1 {
+                    worker.do_spill_dictionary_count().unwrap();
+                }
+                let mut tail = batch.clone();
+                if mode == 2 {
+                    tail = Batch::new(
+                        schema.clone(),
+                        vec![
+                            batch.columns()[0].clone(),
+                            batch.columns()[1].clone(),
+                            ColumnVector::Generic {
+                                values: (0..1024)
+                                    .map(|row| {
+                                        if row % 7 == 0 {
+                                            Value::Null
+                                        } else {
+                                            Value::Int(row % 17 - 8)
+                                        }
+                                    })
+                                    .collect(),
+                            },
+                        ],
+                    );
+                }
+                worker.consume_batch(&tail).unwrap();
+                oracle.consume_batch(&tail).unwrap();
+                let actual = merge_worker_partition_snapshots(
+                    vec![
+                        (0..NUM_PARTITIONS)
+                            .map(|p| worker.take_partition_merged_snapshot(p).unwrap())
+                            .collect(),
+                        shared.partition_snapshots().unwrap(),
+                    ],
+                    &specs,
+                )
+                .unwrap();
+                let canonical = |rows: Vec<Vec<Value>>| {
+                    let mut rows = rows
+                        .into_iter()
+                        .map(|r| {
+                            r.iter()
+                                .map(crate::storage::value_to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    rows
+                };
+                assert_eq!(
+                    canonical(actual),
+                    canonical(oracle.finalize().unwrap()),
+                    "{func:?} mode={mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_decimal_states_remain_compact_and_replay_exact_sum_and_average() {
+        let root = temp_root();
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ("label", ColumnType::VarString),
+                ("key", ColumnType::LongLong),
+                (
+                    "measure",
+                    ColumnType::Decimal {
+                        precision: 30,
+                        scale: 2,
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(
+                    (0..1024)
+                        .map(|row| {
+                            if row % 19 == 0 {
+                                Value::String("only-null".into())
+                            } else if row % 17 == 0 {
+                                Value::Null
+                            } else {
+                                Value::String(format!("label-{}", row % 13))
+                            }
+                        })
+                        .collect(),
+                ),
+                ColumnVector::from_values((0..1024).map(|row| Value::Int(row % 3)).collect()),
+                ColumnVector::from_values(
+                    (0..1024)
+                        .map(|row| {
+                            if row % 19 == 0 {
+                                Value::Null
+                            } else {
+                                Value::DecimalCompact(
+                                    if row % 7 == 0 { i64::MAX } else { -12345 },
+                                    2,
+                                )
+                            }
+                        })
+                        .collect(),
+                ),
+            ],
+        );
+        for (func, mode) in [AggregateKind::Sum, AggregateKind::Avg]
+            .into_iter()
+            .flat_map(|func| (0..4).map(move |mode| (func, mode)))
+        {
+            let specs = vec![AggregateSpec {
+                comparison_collation: None,
+                func,
+                input_column: 2,
+            }];
+            let mut oracle = HashAggregateCore::new(vec![0, 1], specs.clone());
+            let shared = Arc::new(SharedHashAggSpill::new(
+                root.clone(),
+                schema.clone(),
+                &[0, 1],
+                specs.clone(),
+            ));
+            let mut worker = HashAggregateCore::with_budget(
+                vec![0, 1],
+                specs.clone(),
+                schema.clone(),
+                Arc::new(MemBudget::new(128 * 1024 * 1024)),
+                &root,
+            )
+            .with_shared_spill(shared.clone());
+            let mut tail = batch.clone();
+            if mode == 2 {
+                let columns = vec![
+                    ColumnVector::from_values(
+                        (0..1024)
+                            .map(|row| Value::String(format!("label-{row}")))
+                            .collect(),
+                    ),
+                    batch.columns()[1].clone(),
+                    batch.columns()[2].clone(),
+                ];
+                tail = Batch::new(schema.clone(), columns);
+            } else if mode == 3 {
+                tail = Batch::new(
+                    schema.clone(),
+                    vec![
+                        batch.columns()[0].clone(),
+                        batch.columns()[1].clone(),
+                        ColumnVector::Generic {
+                            values: (0..1024)
+                                .map(|row| {
+                                    if row % 19 == 0 {
+                                        Value::Null
+                                    } else if row % 5 == 0 {
+                                        Value::Int(0)
+                                    } else {
+                                        Value::DecimalCompact(-5123, 3)
+                                    }
+                                })
+                                .collect(),
+                        },
+                    ],
+                );
+            }
+            for (pass, input) in [&batch, &tail].into_iter().enumerate() {
+                oracle.consume_batch(input).unwrap();
+                worker.consume_batch(input).unwrap();
+                assert!(
+                    worker.dictionary_count.is_some() == !(pass == 1 && mode == 2),
+                    "exact numeric states must not allocate general-purpose buckets per group"
+                );
+                if pass == 0 || mode == 1 {
+                    worker.do_spill_dictionary_count().unwrap();
+                }
+            }
+            let actual = merge_worker_partition_snapshots(
+                vec![
+                    (0..NUM_PARTITIONS)
+                        .map(|partition| worker.take_partition_merged_snapshot(partition).unwrap())
+                        .collect(),
+                    shared.partition_snapshots().unwrap(),
+                ],
+                &specs,
+            )
+            .unwrap();
+            let expected = oracle.finalize().unwrap();
+            let canonical = |rows: Vec<Vec<Value>>| {
+                let mut rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(crate::storage::value_to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort();
+                rows
+            };
+            assert_eq!(canonical(actual), canonical(expected));
+        }
+    }
 
     #[test]
     fn direct_build_group_growth_uses_its_existing_capacity_reservation() {
@@ -11696,6 +12365,7 @@ mod tests {
         let compact = arena.take_partition(partition);
         let partial = PartitionPartial {
             buckets: Vec::new(),
+            columnar_sums: None,
             fixed_width_decimal: None,
             compressed_i64_decimal: None,
             dictionary_count: Some(DictionaryCountPartitionPartial {
@@ -12126,7 +12796,7 @@ mod tests {
                 &encoder,
                 shared.dictionary_schema.clone(),
                 0..part.keys.len(),
-                1,
+                &aggs,
             )
             .unwrap();
             // Two disk epochs and the resident tail must be summed before K
@@ -12139,6 +12809,7 @@ mod tests {
         let partial = |partition, encoder| {
             Some(PartitionPartial {
                 buckets: Vec::new(),
+                columnar_sums: None,
                 fixed_width_decimal: None,
                 compressed_i64_decimal: None,
                 dictionary_count: Some(DictionaryCountPartitionPartial {
@@ -12428,6 +13099,7 @@ mod tests {
                         let partition = arena.take_partition(partition);
                         (!partition.keys.is_empty()).then(|| PartitionPartial {
                             buckets: Vec::new(),
+                            columnar_sums: None,
                             fixed_width_decimal: None,
                             compressed_i64_decimal: None,
                             dictionary_count: Some(DictionaryCountPartitionPartial {
@@ -13108,6 +13780,7 @@ mod tests {
                                 aggs: vec![b.into_partial()],
                             },
                         ],
+                        columnar_sums: None,
                         fixed_width_decimal: None,
                         compressed_i64_decimal: None,
                         dictionary_count: None,
@@ -13175,6 +13848,7 @@ mod tests {
                 .collect();
             let partial = PartitionPartial {
                 buckets,
+                columnar_sums: None,
                 fixed_width_decimal: None,
                 compressed_i64_decimal: None,
                 dictionary_count: None,

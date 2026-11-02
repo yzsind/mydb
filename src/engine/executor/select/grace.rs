@@ -1117,14 +1117,6 @@ impl ValueRowReader {
         Ok(Some((row, self.take_decode_charge())))
     }
 
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.reader.remaining_bytes() == 0
-    }
-
-    pub(crate) fn decode_limit(&self) -> usize {
-        self.reader.decode_limit()
-    }
-
     pub(crate) fn take_decode_charge(
         &mut self,
     ) -> crate::engine::executor::mem_budget::ScopedCharge {
@@ -1137,6 +1129,7 @@ impl ValueRowReader {
     /// dropping one intermediate `Vec<Value>` for every spilled row only adds
     /// allocator traffic. Values remain decoded by the canonical spill oracle
     /// and `ColumnVector::from_values` still chooses the physical lane.
+    #[cfg(test)]
     pub(crate) fn read_columns(
         &mut self,
         columns: &mut [Vec<Value>],

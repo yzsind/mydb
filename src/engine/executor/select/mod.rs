@@ -292,7 +292,7 @@ fn execute_select_with_cte_joins_inner(
                     registry,
                 )?
             };
-            let mut current_rows = source_to_plan_rows(&primary_source);
+            let mut current_rows = source_to_plan_rows(&primary_source)?;
             let mut all_sources: Vec<MaterializedSource> = vec![primary_source];
             for join in &stmt.joins {
                 if join.lateral {
@@ -924,16 +924,16 @@ impl ExactSizeIterator for SourceRowsIter<'_> {}
 impl SourceRows {
     /// Iterate the backing rows. Respects `SharedCteSelected`'s selection.
     #[inline]
-    fn iter_rows(&self) -> SourceRowsIter<'_> {
-        match self {
+    fn iter_rows(&self) -> Result<SourceRowsIter<'_>, QueryError> {
+        Ok(match self {
             SourceRows::Owned(v) => SourceRowsIter::Slice(v.iter()),
             SourceRows::SpilledCteCollected { rows, .. } => SourceRowsIter::Slice(rows.iter()),
-            SourceRows::SharedCte(c) => SourceRowsIter::Slice(c.rows().iter()),
+            SourceRows::SharedCte(c) => SourceRowsIter::Slice(c.rows()?.iter()),
             SourceRows::SharedCteSelected { result, indices } => SourceRowsIter::Selected {
-                store_rows: result.rows(),
+                store_rows: result.rows()?,
                 indices: indices.iter(),
             },
-        }
+        })
     }
     #[inline]
     fn is_empty(&self) -> bool {
@@ -1250,7 +1250,7 @@ fn nested_loop_lateral_join(
         } else {
             right_columns = Some(right_source.columns.clone());
         }
-        let right_rows = source_to_plan_rows(&right_source);
+        let right_rows = source_to_plan_rows(&right_source)?;
         let mut left_matched = false;
         for right_row in &right_rows {
             let mut fields = left.fields.clone();
@@ -1348,7 +1348,9 @@ fn intern_source_metas(source: &MaterializedSource, bare_table: &str) -> Vec<pla
         .collect()
 }
 
-fn source_to_plan_rows(source: &MaterializedSource) -> Vec<self::plan::PlanRow> {
+fn source_to_plan_rows(
+    source: &MaterializedSource,
+) -> Result<Vec<self::plan::PlanRow>, QueryError> {
     // Strip a leading database qualifier so the in-memory join can resolve
     // both `t.col` (user-written) and `test.t.col` if needed; PlanField.table
     // for real tables in mydb stores the bare table name.
@@ -1358,9 +1360,9 @@ fn source_to_plan_rows(source: &MaterializedSource) -> Vec<self::plan::PlanRow> 
         .map(|(_, t)| t.to_string())
         .unwrap_or_else(|| source.table_name.clone());
     let metas = intern_source_metas(source, &bare_table);
-    source
+    Ok(source
         .rows
-        .iter_rows()
+        .iter_rows()?
         .map(|row| self::plan::PlanRow {
             fields: metas
                 .iter()
@@ -1374,7 +1376,7 @@ fn source_to_plan_rows(source: &MaterializedSource) -> Vec<self::plan::PlanRow> 
             agg_values: None,
             schema: PlanRow::empty_schema(),
         })
-        .collect()
+        .collect())
 }
 
 fn null_right_fields(right: &MaterializedSource) -> Vec<self::plan::PlanField> {
@@ -1644,13 +1646,13 @@ fn try_hash_join(
         hashbrown::HashMap::with_hasher(ahash::RandomState::new());
 
     if let Some((handle, positions)) = cache_attempt {
-        let store_rows_len = handle.dense_rows().len();
+        let store_rows_len = handle.dense_rows()?.len();
         let handle_for_build = handle.clone();
         let positions_for_build = positions.clone();
         let cached = handle.builds.get_or_init(
             positions,
             || -> Result<crate::engine::executor::cte_store::CachedHashBuild, QueryError> {
-                let store_rows = handle_for_build.dense_rows();
+                let store_rows = handle_for_build.dense_rows()?;
                 let mut b: hashbrown::HashMap<Vec<ValueKey>, Vec<u32>, ahash::RandomState> =
                     hashbrown::HashMap::with_hasher(ahash::RandomState::new());
                 for (i, row) in store_rows.iter().enumerate() {
@@ -1729,7 +1731,11 @@ fn try_hash_join(
         .map(|(_, t)| t.to_string())
         .unwrap_or_else(|| right_source.table_name.clone());
     let right_store_rows: Option<&[Vec<Value>]> = if cached_build.is_some() {
-        right_source.rows.cte_result().map(|r| r.rows())
+        right_source
+            .rows
+            .cte_result()
+            .map(|r| r.rows())
+            .transpose()?
     } else {
         None
     };
@@ -1887,7 +1893,7 @@ fn nested_loop_join(
     condition: Option<&Expr>,
 ) -> Result<Vec<self::plan::PlanRow>, QueryError> {
     use crate::parser::JoinType;
-    let right_rows = source_to_plan_rows(right);
+    let right_rows = source_to_plan_rows(right)?;
     // INNER/LEFT/RIGHT/FULL + decomposable equi-condition: switch to a hash
     // join so we don't pay an O(N×M) PlanField clone per row pair. TPC-H Q15
     // joins supplier (10k rows) to the materialised `revenue` CTE (10k rows)
@@ -2129,7 +2135,7 @@ fn try_greedy_equi_join(
             let metas = intern_source_metas(&sources[i], &bare_table);
             let sample = sources[i]
                 .rows
-                .iter_rows()
+                .iter_rows()?
                 .next()
                 .map(|row| build_right_plan_row_from_store(&metas, row));
             let compiled = sample
@@ -2140,7 +2146,7 @@ fn try_greedy_equi_join(
             // We therefore need to map j back to the underlying store row id.
             let prev_indices = sources[i].rows.cte_selection().cloned();
             let mut kept_idx: Vec<u32> = Vec::with_capacity(sources[i].rows.len());
-            for (j, raw) in sources[i].rows.iter_rows().enumerate() {
+            for (j, raw) in sources[i].rows.iter_rows()?.enumerate() {
                 let pr = build_right_plan_row_from_store(&metas, raw);
                 let keep = match &compiled {
                     Some(compiled) => compiled.eval_bool(&pr),
@@ -2164,12 +2170,12 @@ fn try_greedy_equi_join(
 
         // Non-CTE source (`Owned`) — the deep-copy path is unavoidable
         // since there is nothing shared to index into.
-        let plan_rows = source_to_plan_rows(&sources[i]);
+        let plan_rows = source_to_plan_rows(&sources[i])?;
         let compiled = plan_rows
             .first()
             .map(|row| self::eval::CompiledPlanPredicate::compile_once(e, row));
         let mut kept: Vec<Vec<Value>> = Vec::with_capacity(sources[i].rows.len());
-        for (raw, pr) in sources[i].rows.iter_rows().zip(plan_rows.iter()) {
+        for (raw, pr) in sources[i].rows.iter_rows()?.zip(plan_rows.iter()) {
             let keep = match &compiled {
                 Some(compiled) => compiled.eval_bool(pr),
                 None => self::eval::eval_plan_bool(e, pr),
@@ -2184,7 +2190,7 @@ fn try_greedy_equi_join(
     let full_mask: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
     let mut joined_mask: u64 = 1; // primary = index 0
     let mut order: Vec<usize> = vec![0];
-    let mut current_rows = source_to_plan_rows(&sources[0]);
+    let mut current_rows = source_to_plan_rows(&sources[0])?;
 
     while joined_mask != full_mask {
         // Prefer a source connected to the joined set by an equi-predicate (so

@@ -8,6 +8,7 @@ enum Family {
     Signed,
     Unsigned,
     Text,
+    Date,
 }
 enum Choice<'a> {
     If(&'a ExprNode, &'a ExprNode, &'a ExprNode),
@@ -76,6 +77,9 @@ impl<'a> Conditional<'a> {
                 Domain::Integer(..) => Family::Signed,
                 Domain::Unsigned => Family::Unsigned,
                 Domain::Text => Family::Text,
+                Domain::Temporal if matches!(node, ExprNode::Column(index) if schema.fields().get(*index)?.column_type == ColumnType::Date) => {
+                    Family::Date
+                }
                 _ => return None,
             };
             if family != Family::Null && family != next {
@@ -114,7 +118,7 @@ impl<'a> Conditional<'a> {
             }
         }
         if let Some(coercion) = coercion {
-            use crate::engine::expr_type::{ExprTypeKind, StringKind};
+            use crate::engine::expr_type::{ExprTypeKind, StringKind, TemporalKind};
             let compatible = match family {
                 Family::Null => true,
                 Family::Signed => matches!(
@@ -133,6 +137,13 @@ impl<'a> Conditional<'a> {
                         kind: StringKind::Character | StringKind::Text
                     }
                 ),
+                Family::Date => matches!(
+                    coercion.kind,
+                    ExprTypeKind::Temporal {
+                        kind: TemporalKind::Date,
+                        ..
+                    }
+                ),
             };
             if !compatible {
                 return None;
@@ -147,6 +158,7 @@ impl<'a> Conditional<'a> {
                 Family::Signed => Domain::Integer(i64::MIN, i64::MAX),
                 Family::Unsigned => Domain::Unsigned,
                 Family::Text => Domain::Text,
+                Family::Date => Domain::Temporal,
             },
             parallel: true,
         }
@@ -243,6 +255,7 @@ impl<'a> Conditional<'a> {
         };
         let mut signed = Vec::new();
         let mut unsigned = Vec::new();
+        let mut dates = Vec::new();
         let mut data = Vec::new();
         let mut offsets = Vec::new();
         if self.family == Family::Text {
@@ -293,6 +306,14 @@ impl<'a> Conditional<'a> {
                     }
                     offsets.push(u32::try_from(data.len()).ok()?);
                 }
+                Family::Date => dates.push(if valid {
+                    let ColumnVector::Date32 { data, .. } = result? else {
+                        return None;
+                    };
+                    data[row]
+                } else {
+                    0
+                }),
                 Family::Null => unreachable!(),
             }
         }
@@ -308,6 +329,10 @@ impl<'a> Conditional<'a> {
             Family::Text => ColumnVector::Utf8 {
                 data,
                 offsets,
+                nulls: Some(nulls),
+            },
+            Family::Date => ColumnVector::Date32 {
+                data: dates,
                 nulls: Some(nulls),
             },
             Family::Null => unreachable!(),

@@ -1,5 +1,6 @@
 //! Composable, diagnostic-free column kernels. A decline is side-effect free:
 //! the caller retains the ordered scalar oracle for the complete expression.
+mod arithmetic;
 mod boolean_read;
 mod conditional;
 mod crypto_read;
@@ -27,6 +28,7 @@ use crate::engine::executor::vec::{
 };
 use crate::engine::expr::date_format::DateFormatPlan;
 use crate::engine::expr::network::{self, NetworkFunction};
+use arithmetic::Arithmetic;
 use boolean_read::BooleanRead;
 use chrono::{Datelike, NaiveDate};
 use conditional::Conditional;
@@ -394,6 +396,9 @@ fn string_bound(node: &ExprNode, schema: &BatchSchema) -> Option<u64> {
 }
 
 fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
+    if let Some(arithmetic) = Arithmetic::bind(node, schema) {
+        return Some(arithmetic.contract());
+    }
     if let Some(read) = LookupRead::bind(node, schema) {
         return Some(read.contract());
     }
@@ -932,7 +937,12 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             let value = constant(node)?;
             let bytes = match value.as_ref() {
                 Value::Null => 0,
-                Value::Int(_) | Value::UInt(_) => numeric,
+                Value::Int(_)
+                | Value::UInt(_)
+                | Value::Float(_)
+                | Value::Double(_)
+                | Value::DecimalCompact(..)
+                | Value::Decimal128(..) => numeric,
                 Value::String(s) => s
                     .len()
                     .checked_mul(batch.num_rows())?
@@ -954,12 +964,23 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
             let (_, right) = workspace(right, batch)?;
             Some((numeric, left.checked_add(right)?.checked_add(numeric)?))
         }
+        ExprNode::Unary { expr, .. } if Arithmetic::bind(node, batch.schema()).is_some() => {
+            let (_, work) = workspace(expr, batch)?;
+            Some((numeric, work.checked_add(numeric.checked_mul(2)?)?))
+        }
         ExprNode::SubstringConst { expr, .. } => {
             let (bytes, work) = workspace(expr, batch)?;
             let bytes = bytes.checked_add(offsets)?;
             Some((bytes, work.checked_add(bytes)?))
         }
         ExprNode::Function { kernel, args, .. } => {
+            if Arithmetic::bind(node, batch.schema()).is_some() {
+                let mut work = numeric.checked_mul(2)?.checked_add(256)?;
+                for arg in args {
+                    work = work.checked_add(workspace(arg, batch)?.1)?;
+                }
+                return Some((numeric, work));
+            }
             if matches!(kernel, FunctionKernel::DateAdd | FunctionKernel::DateSub) {
                 return TemporalShift::bind(node, batch.schema())?.workspace(batch);
             }
@@ -1244,6 +1265,7 @@ fn evaluate_selected(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
     match result {
         ColumnVector::I64 { data, .. } => scatter_fixed!(data, I64),
         ColumnVector::U64 { data, .. } => scatter_fixed!(data, U64),
+        ColumnVector::F64 { data, .. } => scatter_fixed!(data, F64),
         ColumnVector::Decimal128 { data, scale, .. } => {
             let data = positions
                 .iter()
@@ -1311,6 +1333,9 @@ fn operand<'a>(node: &ExprNode, batch: &'a Batch) -> Option<std::borrow::Cow<'a,
 }
 
 fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
+    if let Some(arithmetic) = Arithmetic::bind(node, batch.schema()) {
+        return arithmetic.evaluate(batch);
+    }
     if let Some(read) = LookupRead::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }
@@ -1378,6 +1403,24 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
                 },
                 Value::UInt(n) => ColumnVector::U64 {
                     data: vec![*n; rows],
+                    nulls: None,
+                },
+                Value::Float(value) => ColumnVector::F64 {
+                    data: vec![f64::from(*value); rows],
+                    nulls: None,
+                },
+                Value::Double(value) => ColumnVector::F64 {
+                    data: vec![*value; rows],
+                    nulls: None,
+                },
+                Value::DecimalCompact(value, scale) => ColumnVector::Decimal128 {
+                    data: vec![i128::from(*value); rows],
+                    scale: *scale,
+                    nulls: None,
+                },
+                Value::Decimal128(value, scale) => ColumnVector::Decimal128 {
+                    data: vec![*value; rows],
+                    scale: *scale,
                     nulls: None,
                 },
                 Value::Null => ColumnVector::Null { len: rows },

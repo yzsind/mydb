@@ -3,6 +3,7 @@
 //! optional reservation replays the consumed prefix into the spill pipeline.
 
 mod direct;
+mod partition;
 
 use super::*;
 use crate::engine::executor::dispatch::{
@@ -604,6 +605,24 @@ pub(super) fn prepare_with_limit<'a>(
         ahash::RandomState,
     > = hashbrown::HashMap::with_hasher(ahash::RandomState::new());
     let mut partitions: Vec<Vec<(u32, u32)>> = Vec::new();
+    let native_partition = positions.len() == 1
+        && match &positions[0] {
+            PartitionInput::Expression(_) => true,
+            PartitionInput::Column(column) => matches!(
+                template[*column].column_type,
+                ColumnType::Tiny
+                    | ColumnType::Short
+                    | ColumnType::MediumInt
+                    | ColumnType::Long
+                    | ColumnType::LongLong
+                    | ColumnType::Bit { .. }
+                    | ColumnType::Date
+                    | ColumnType::Time
+                    | ColumnType::DateTime
+                    | ColumnType::Timestamp
+            ),
+        };
+    let mut native_lookup = native_partition.then(partition::IntegerPartitions::default);
     let mut declined = false;
     while let Some(batch) = input.next_batch()? {
         crate::engine::cancel::check_cancelled()?;
@@ -685,11 +704,27 @@ pub(super) fn prepare_with_limit<'a>(
         }
         partition_reserved += index_bytes;
         for row in batch.visible_indices() {
-            let key = keys
-                .iter()
-                .map(|column| ValueKey::from(&column.value_at(row)))
-                .collect::<smallvec::SmallVec<[_; 2]>>();
-            let group = if let Some(&group) = lookup.get(&key) {
+            let native_key = if native_lookup.is_some() {
+                let Some(key) = partition::IntegerPartitions::value(&keys[0], row) else {
+                    declined = true;
+                    break;
+                };
+                Some(key)
+            } else {
+                None
+            };
+            let key = native_key.is_none().then(|| {
+                keys.iter()
+                    .map(|column| ValueKey::from(&column.value_at(row)))
+                    .collect::<smallvec::SmallVec<[_; 2]>>()
+            });
+            let existing = match (native_lookup.as_ref(), native_key) {
+                (Some(lookup), Some(key)) => lookup.get(key),
+                _ => lookup
+                    .get(key.as_ref().expect("general partition key"))
+                    .copied(),
+            };
+            let group = if let Some(group) = existing {
                 group
             } else {
                 // Hash buckets, owned key lanes and the outer partition Vec.
@@ -711,7 +746,17 @@ pub(super) fn prepare_with_limit<'a>(
                 partition_reserved += bytes;
                 let group = partitions.len();
                 partitions.push(Vec::new());
-                lookup.insert(key, group);
+                if let (Some(lookup), Some(key)) = (native_lookup.as_mut(), native_key) {
+                    lookup.insert(key, group);
+                    lookup.maybe_cache(
+                        &mut partition_charge,
+                        &mut partition_reserved,
+                        input_bytes.saturating_add(scratch_bytes),
+                        limit,
+                    );
+                } else {
+                    lookup.insert(key.expect("general partition key"), group);
+                }
                 group
             };
             partitions[group].push((batch_index, row as u32));
@@ -723,6 +768,7 @@ pub(super) fn prepare_with_limit<'a>(
         }
     }
     drop(lookup);
+    drop(native_lookup);
     if declined {
         trace_layout(
             "input_budget_or_lane",

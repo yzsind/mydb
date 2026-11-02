@@ -4038,7 +4038,7 @@ fn open_cte_scan_stream(plan: &PhysicalPlan) -> Result<Box<dyn PlanStream>, Quer
         .and_then(|expr| compile_cte_row_predicate(expr, columns));
     let row_schema = RowSchema::from_fields(&templates);
     let reader = if let Some(spill) = &cte.spill {
-        let reader = super::grace::ValueRowReader::open(&spill.path, spill._dir.charger())?;
+        let reader = spill.open_reader()?;
         if reader.is_none() && spill.row_count != 0 {
             return Err(crate::error::catalog::ER_GET_ERRNO
                 .error("materialized CTE spill file is missing or truncated"));
@@ -4068,7 +4068,7 @@ struct CteScanPlanStream {
     filter: Option<Expr>,
     predicate_program: Option<super::eval::CompiledPlanPredicate>,
     row_schema: Arc<RowSchema>,
-    reader: Option<super::grace::ValueRowReader>,
+    reader: Option<crate::engine::executor::cte::spool::Reader>,
     position: usize,
 }
 
@@ -4085,8 +4085,14 @@ impl PlanStream for CteScanPlanStream {
                     return Ok(None);
                 };
                 std::borrow::Cow::Owned(row)
+            } else if self.cte.store.is_native() {
+                let Some(row) = self.cte.store.copy_row(self.position)? else {
+                    return Ok(None);
+                };
+                self.position += 1;
+                std::borrow::Cow::Owned(row)
             } else {
-                let Some(row) = self.cte.rows().get(self.position) else {
+                let Some(row) = self.cte.rows()?.get(self.position) else {
                     return Ok(None);
                 };
                 self.position += 1;

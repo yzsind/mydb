@@ -87,9 +87,14 @@ pub(in crate::engine::executor::select) fn execute_hash_rollup_aggregate(
     // the prefix derivation. Capability discovery completes before the input
     // is opened; once this returns `Some`, including for an empty input, this
     // pipeline owns execution and never restarts through the row path.
-    if let Some(finest) =
-        super::vec_bridge::vec_rollup_finest_groups(db, txn, input, group_by, &slots)?
-    {
+    if let Some(finest) = super::vec_bridge::vec_rollup_finest_groups(
+        db,
+        txn,
+        input,
+        group_by,
+        &slots,
+        having.is_none(),
+    )? {
         return rollup_emit_from_vec_finest(finest, group_by, &slots, having);
     }
     if let Some(stream) =
@@ -125,6 +130,9 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
     slots: &[super::aggregate::AggregateSlot],
     having: Option<&Expr>,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    if let Some(compact) = finest.compact.take() {
+        return emit_compact_rollup_finest(compact, group_by, slots, having);
+    }
     use super::vec_bridge::{VecRollupAggState, VecRollupFinestGroup};
     use crate::engine::expr::ValueKey;
     let group_by_len = group_by.len();
@@ -219,6 +227,30 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
         Ok(())
     };
     let emit = |out: &mut RollupEmitTarget, group: VecRollupFinestGroup, prefix_len| {
+        if having.is_none() {
+            if let RollupEmitTarget::TopK(collector) = out {
+                let values = group
+                    .agg_states
+                    .into_iter()
+                    .zip(&names)
+                    .map(|(state, name)| match name.as_str() {
+                        "COUNT" => Value::Int(state.count as i64),
+                        "SUM" => super::aggregate::numeric_state_to_value(&state.sum),
+                        "AVG" => super::aggregate::finalize_avg_value(&state.sum, state.count),
+                        "MIN" => state.min.unwrap_or(Value::Null),
+                        "MAX" => state.max.unwrap_or(Value::Null),
+                        _ => unreachable!("vector ROLLUP state was capability checked"),
+                    })
+                    .collect();
+                return collector.push_finalized_state(
+                    slots,
+                    group_by_len,
+                    prefix_len,
+                    group.key_values,
+                    values,
+                );
+            }
+        }
         let accumulators = slots
             .iter()
             .zip(group.agg_states)
@@ -251,6 +283,14 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
     let mut live: Vec<Option<VecRollupFinestGroup>> = (0..group_by_len).map(|_| None).collect();
     let mut completed: Vec<Vec<VecRollupFinestGroup>> =
         (0..group_by_len).map(|_| Vec::new()).collect();
+    // RANK and DENSE_RANK depend on complete peer sets, not arrival order.
+    // Their bounded collector can consume an exact subtotal as soon as it
+    // closes. ROW_NUMBER and the full row result retain level-major order.
+    let stream_subtotals = cascade
+        && having.is_none()
+        && matches!(&out,
+        RollupEmitTarget::TopK(collector) if matches!(collector.hint.kind,
+            crate::engine::executor::dispatch::RankKind::Rank | crate::engine::executor::dispatch::RankKind::DenseRank));
     let mut previous: Option<Vec<Value>> = None;
     // Feed only the immediate parent. When a prefix closes, merge its
     // completed subtotal into the next parent once. Updating every live
@@ -288,7 +328,11 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
                 if cascade {
                     fold_parent(&mut live, &state, prefix - 1)?;
                 }
-                completed[prefix].push(state);
+                if stream_subtotals {
+                    emit(&mut out, state, prefix)?;
+                } else {
+                    completed[prefix].push(state);
+                }
             }
         }
         if cascade {
@@ -317,7 +361,11 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
             if cascade && prefix > 0 {
                 fold_parent(&mut live, &state, prefix - 1)?;
             }
-            completed[prefix].push(state);
+            if stream_subtotals {
+                emit(&mut out, state, prefix)?;
+            } else {
+                completed[prefix].push(state);
+            }
         }
         for group in std::mem::take(&mut completed[prefix]) {
             emit(&mut out, group, prefix)?;
@@ -411,7 +459,156 @@ struct RollupTopKCollector {
     partitions: hashbrown::HashMap<Vec<ValueKey>, RollupTopKBucket, ahash::RandomState>,
 }
 
+pub(in crate::engine::executor::select) fn compact_rollup_topk_applicable(
+    group_by: &[Expr],
+    slots: &[super::aggregate::AggregateSlot],
+) -> bool {
+    let Some(hint) = current_rollup_window_topk_hint() else {
+        return false;
+    };
+    if hint.k == 0
+        || hint.order_by.is_empty()
+        || slots.len() != 1
+        || !slots[0].name.eq_ignore_ascii_case("SUM")
+        || !matches!(
+            hint.kind,
+            crate::engine::executor::dispatch::RankKind::Rank
+                | crate::engine::executor::dispatch::RankKind::DenseRank
+        )
+    {
+        return false;
+    }
+    let collector = RollupTopKCollector::new(hint, group_by, group_by.len(), slots);
+    let supported = |keys: &Option<Vec<CompactRollupKey>>| {
+        keys.as_ref().is_some_and(|keys| {
+            keys.iter().all(|key| match key {
+                CompactRollupKey::Group(index) => *index < group_by.len(),
+                CompactRollupKey::Aggregate(index) => *index == 0,
+            })
+        })
+    };
+    supported(&collector.partition_keys) && supported(&collector.order_keys)
+}
+
+fn emit_compact_rollup_finest(
+    compact: crate::engine::executor::vec::hash_agg::CompactRollupFinest,
+    group_by: &[Expr],
+    slots: &[super::aggregate::AggregateSlot],
+    having: Option<&Expr>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    use crate::engine::executor::vec::hash_agg::{CompactRollupFinest, CompactRollupGroup};
+    if having.is_some() || !compact_rollup_topk_applicable(group_by, slots) {
+        return Err(crate::error::catalog::ER_INTERNAL_ERROR
+            .error("compact ROLLUP consumer contract changed"));
+    }
+    let hint = current_rollup_window_topk_hint().expect("compact rank contract checked");
+    let mut collector = RollupTopKCollector::new(hint, group_by, group_by.len(), slots);
+    let mut live: Vec<Option<CompactRollupGroup>> = vec![None; group_by.len()];
+    let mut previous = None;
+    let fold = |live: &mut [Option<CompactRollupGroup>],
+                source: CompactRollupGroup,
+                prefix: usize|
+     -> Result<(), QueryError> {
+        if let Some(target) = live[prefix].as_mut() {
+            CompactRollupFinest::merge(target, source)
+        } else {
+            live[prefix] = Some(CompactRollupGroup {
+                key: compact.prefix_key(source.key, prefix),
+                ..source
+            });
+            Ok(())
+        }
+    };
+    for index in 0..compact.len() {
+        if index % 4096 == 0 {
+            crate::engine::cancel::check_cancelled()?;
+        }
+        let group = compact.group(index);
+        let common = previous.map_or(0, |key| compact.common_prefix(key, group.key));
+        for prefix in ((common + 1)..group_by.len()).rev() {
+            if let Some(state) = live[prefix].take() {
+                fold(&mut live, state, prefix - 1)?;
+                collector.push_packed_state(&compact, state, prefix)?;
+            }
+        }
+        fold(&mut live, group, group_by.len() - 1)?;
+        collector.push_packed_state(&compact, group, group_by.len())?;
+        previous = Some(group.key);
+    }
+    for prefix in (0..group_by.len()).rev() {
+        if let Some(state) = live[prefix].take() {
+            if prefix != 0 {
+                fold(&mut live, state, prefix - 1)?;
+            }
+            collector.push_packed_state(&compact, state, prefix)?;
+        }
+    }
+    Ok(collector.into_rows())
+}
+
 impl RollupTopKCollector {
+    fn push_packed_state(
+        &mut self,
+        compact: &crate::engine::executor::vec::hash_agg::CompactRollupFinest,
+        group: crate::engine::executor::vec::hash_agg::CompactRollupGroup,
+        prefix_len: usize,
+    ) -> Result<(), QueryError> {
+        let aggregate = compact.sum_value(group);
+        let value = |key: &CompactRollupKey| -> Result<Value, QueryError> {
+            match *key {
+                CompactRollupKey::Group(index) if index < prefix_len => {
+                    compact.key_value(group.key, index)
+                }
+                CompactRollupKey::Group(_) => Ok(Value::Null),
+                CompactRollupKey::Aggregate(0) => Ok(aggregate.clone()),
+                CompactRollupKey::Aggregate(_) => unreachable!("compact aggregate width checked"),
+            }
+        };
+        let partition = self
+            .partition_keys
+            .as_ref()
+            .expect("compact partition checked")
+            .iter()
+            .map(|key| value(key).map(|value| ValueKey::from(&value)))
+            .collect::<Result<smallvec::SmallVec<[_; 2]>, _>>()?;
+        let order = self
+            .order_keys
+            .as_ref()
+            .expect("compact order checked")
+            .iter()
+            .map(value)
+            .collect::<Result<smallvec::SmallVec<[_; 2]>, _>>()?;
+        let bucket = self.partitions.entry_ref(partition.as_slice()).or_default();
+        if bucket.boundary != usize::MAX
+            && crate::engine::executor::sort::compare_sort_keys(
+                &self.sort_fields,
+                &order,
+                &bucket.candidates[bucket.boundary].order_key,
+            ) == std::cmp::Ordering::Greater
+        {
+            return Ok(());
+        }
+        // Most finest groups lose the rank bound. Materialize strings only
+        // after the already-finalized order key has passed that boundary.
+        let mut keys = crate::engine::executor::mem_budget::try_vec_with_capacity(
+            prefix_len,
+            "retained rollup key",
+        )?;
+        for column in 0..prefix_len {
+            keys.push(compact.key_value(group.key, column)?);
+        }
+        self.push_candidate(
+            &partition,
+            order.into_vec(),
+            RollupTopKPayload::Compact {
+                prefix_len,
+                key_values: keys,
+                agg_values: vec![aggregate],
+            },
+        );
+        Ok(())
+    }
+
     fn new(
         hint: RollupWindowTopKHint,
         group_by: &[Expr],
@@ -496,6 +693,17 @@ impl RollupTopKCollector {
         for acc in accumulators {
             agg_values.push(acc.finalize()?);
         }
+        self.push_finalized_state(slots, group_by_len, prefix_len, key_values, agg_values)
+    }
+
+    fn push_finalized_state(
+        &mut self,
+        slots: &[super::aggregate::AggregateSlot],
+        group_by_len: usize,
+        prefix_len: usize,
+        key_values: Vec<Value>,
+        agg_values: Vec<Value>,
+    ) -> Result<(), QueryError> {
         let Some(partition_key) =
             self.eval_compact_partition_key(prefix_len, &key_values, &agg_values)
         else {
@@ -1589,7 +1797,7 @@ pub(in crate::engine::executor::select) fn execute_hash_grouping_sets_aggregate(
     let mut slots: Vec<AggregateSlot> = collect_aggregate_slots(&slot_exprs);
     super::aggregate::bind_slot_comparisons(&mut slots, input);
     if let Some(finest) =
-        super::vec_bridge::vec_rollup_finest_groups(db, txn, input, group_by, &slots)?
+        super::vec_bridge::vec_rollup_finest_groups(db, txn, input, group_by, &slots, false)?
     {
         return grouping_sets_emit_from_vec_finest(
             finest,
@@ -1993,6 +2201,222 @@ pub(in crate::engine::executor::select) fn fixed_scale_approximate_aggregate_req
 mod bounded_rollup_input_tests {
     use super::*;
     use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+
+    #[test]
+    fn vector_rollup_pruning_matches_complete_level_major_peer_sets() {
+        use crate::engine::executor::dispatch::RankKind;
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(root.path()).unwrap());
+        let groups = ["k", "n"]
+            .into_iter()
+            .map(|name| Expr::Identifier(name.into()))
+            .collect::<Vec<_>>();
+        let input = PhysicalPlan::ValuesScan {
+            rows: (0..1024)
+                .map(|row| {
+                    [row % 11, row % 31, row % 5]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(column, value)| {
+                            Expr::Literal(if (row + column as i64) % 17 == 0 {
+                                crate::parser::Literal::Null
+                            } else {
+                                match column {
+                                    0 => crate::parser::Literal::String(format!("group-{value}")),
+                                    2 => crate::parser::Literal::Decimal(format!("{value}.00")),
+                                    _ => crate::parser::Literal::Int(value),
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+            columns: ["k", "n", "v"]
+                .into_iter()
+                .map(|name| crate::types::Column {
+                    name: name.into(),
+                    column_type: match name {
+                        "k" => ColumnType::VarString,
+                        "v" => ColumnType::Decimal {
+                            precision: 18,
+                            scale: 2,
+                        },
+                        _ => ColumnType::LongLong,
+                    },
+                    source: Default::default(),
+                })
+                .collect(),
+            filter: None,
+            estimated_rows: 1024.0,
+            cost: Default::default(),
+        };
+        for names in [
+            &["SUM(v)"][..],
+            &["SUM(v)", "AVG(v)", "COUNT(v)", "MIN(v)", "MAX(v)"][..],
+        ] {
+            let expressions = names
+                .iter()
+                .map(|sql| crate::parser::parse_expr_fragment(sql).unwrap())
+                .collect::<Vec<_>>();
+            let slots = super::super::aggregate::collect_aggregate_slots(
+                &expressions.iter().collect::<Vec<_>>(),
+            );
+            let canonical = |rows: Vec<PlanRow>| {
+                let mut rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        let values = row
+                            .fields
+                            .iter()
+                            .map(|field| field.value.to_display_string())
+                            .collect::<Vec<_>>();
+                        let mut aggregates = row
+                            .agg_values
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|(key, value)| (*key, value.to_display_string()))
+                            .collect::<Vec<_>>();
+                        aggregates.sort();
+                        (values, aggregates)
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort();
+                rows
+            };
+            for kind in [RankKind::RowNumber, RankKind::Rank, RankKind::DenseRank] {
+                for ascending in [true, false] {
+                    for having in [
+                        None,
+                        Some(crate::parser::parse_expr_fragment("SUM(v) > 1").unwrap()),
+                    ] {
+                        let txn =
+                            TxnView::read_only(0, crate::storage::IsolationLevel::ReadCommitted);
+                        let complete = execute_hash_rollup_aggregate(
+                            &db,
+                            txn,
+                            &input,
+                            &groups,
+                            having.as_ref(),
+                            &expressions,
+                        )
+                        .unwrap();
+                        let hint = RollupWindowTopKHint {
+                            partition_by: vec![Expr::GroupKeyRef {
+                                index: 0,
+                                expr: Box::new(groups[0].clone()),
+                            }],
+                            order_by: vec![OrderBy {
+                                expr: expressions[0].clone(),
+                                asc: ascending,
+                                nulls_first: Some(false),
+                            }],
+                            k: 4,
+                            kind,
+                        };
+                        let mut oracle =
+                            RollupTopKCollector::new(hint.clone(), &groups, groups.len(), &slots);
+                        for row in complete {
+                            oracle.push(row).unwrap();
+                        }
+                        let actual = {
+                            let _guard = super::super::set_rollup_window_topk_hint(Some(hint));
+                            if having.is_none()
+                                && names.len() == 1
+                                && !matches!(kind, RankKind::RowNumber)
+                            {
+                                compact_rank_fixture(&input, &groups, &slots, root.path())
+                            } else {
+                                execute_hash_rollup_aggregate(
+                                    &db,
+                                    txn,
+                                    &input,
+                                    &groups,
+                                    having.as_ref(),
+                                    &expressions,
+                                )
+                                .unwrap()
+                            }
+                        };
+                        assert_eq!(canonical(actual), canonical(oracle.into_rows()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn compact_rank_fixture(
+        input: &PhysicalPlan,
+        groups: &[Expr],
+        slots: &[super::super::aggregate::AggregateSlot],
+        root: &std::path::Path,
+    ) -> Vec<PlanRow> {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnAccumulator},
+            hash_agg::{
+                try_compact_rollup, AggregateKind, AggregateSpec, HashAggregateCore,
+                SharedHashAggSpill, NUM_PARTITIONS,
+            },
+            schema::{BatchField, BatchSchema},
+        };
+        let PhysicalPlan::ValuesScan { rows, columns, .. } = input else {
+            unreachable!()
+        };
+        let schema = Arc::new(BatchSchema::new(
+            columns
+                .iter()
+                .map(|column| BatchField {
+                    table: String::new(),
+                    alias: None,
+                    name: column.name.clone(),
+                    column_type: column.column_type,
+                    source: column.source.clone(),
+                })
+                .collect(),
+        ));
+        let mut lanes = columns
+            .iter()
+            .map(|column| ColumnAccumulator::for_type(column.column_type, rows.len()))
+            .collect::<Vec<_>>();
+        for row in rows {
+            for (expression, lane) in row.iter().zip(&mut lanes) {
+                lane.push(&crate::engine::expr::eval_const(expression).unwrap());
+            }
+        }
+        let batch = Batch::new(
+            schema.clone(),
+            lanes.into_iter().map(ColumnAccumulator::finish).collect(),
+        );
+        let specs = vec![AggregateSpec {
+            comparison_collation: None,
+            func: AggregateKind::Sum,
+            input_column: 2,
+        }];
+        let budget = Arc::new(MemBudget::new(128 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            let shared = Arc::new(SharedHashAggSpill::new(
+                root.to_path_buf(),
+                schema.clone(),
+                &[0, 1],
+                specs.clone(),
+            ));
+            let mut worker = HashAggregateCore::with_budget(
+                vec![0, 1],
+                specs.clone(),
+                schema,
+                budget.clone(),
+                root,
+            )
+            .with_shared_spill(shared);
+            worker.consume_batch(&batch).unwrap();
+            let mut parts = vec![(0..NUM_PARTITIONS)
+                .map(|partition| worker.take_partition_merged_snapshot(partition).unwrap())
+                .collect()];
+            let compact = try_compact_rollup(&mut parts, &[None, None], &specs)
+                .unwrap()
+                .expect("fixture must exercise dictionary-code prefix derivation");
+            emit_compact_rollup_finest(compact, groups, slots, None).unwrap()
+        })
+    }
 
     #[test]
     fn rollup_rank_boundaries_match_full_sort_with_large_peer_groups() {
