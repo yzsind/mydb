@@ -3319,6 +3319,33 @@ impl Database {
     /// unpartitioned tables callers pass `table.id`; for partitioned tables
     /// the executor (`execute_vector_index_scan`) calls this once per
     /// partition storage id and merges the results.
+    pub(crate) fn vector_index_open_cursor(
+        &self, table: &TableSchema, index: &IndexSchema, storage_id: u64,
+        query: &crate::vector::VectorValue,
+        selection: Option<Arc<crate::engine::vector::selection::RowSelection>>,
+    ) -> Result<crate::engine::vector::cursor::VectorSearchCursor, QueryError> {
+        let _lease = self.acquire_vector_read(table.id)?;
+        let graph = self.vector_graph_get_or_build_for_partition(table, index, storage_id)?;
+        if self.physical_replica_mode() {
+            if let VectorGraph::Paged(paged) = graph.as_ref() {
+                paged.file().disable_navigation_mapping();
+            }
+        }
+        crate::engine::vector::cursor::VectorSearchCursor::new(graph, query, storage_id, selection)
+    }
+
+    pub(crate) fn vector_index_cursor_next(
+        &self, table: &TableSchema, index: &IndexSchema,
+        cursor: &mut crate::engine::vector::cursor::VectorSearchCursor,
+        effort: usize, limit: usize,
+    ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
+        let _lease = self.acquire_vector_read(table.id)?;
+        let current = self.vector_graph_get_or_build_for_partition(table, index, cursor.sid)?;
+        if !Arc::ptr_eq(&current, &cursor.graph) { return Ok(None); }
+        drop(_lease);
+        cursor.next_batch(effort, limit)
+    }
+
     pub(crate) fn vector_index_search_for_partition(
         &self,
         table: &TableSchema,

@@ -2724,6 +2724,45 @@ pub(crate) fn eval_to_column_prepared<'a>(
             }
         }
     }
+    if let Some((index, plan)) = program.as_xml_const_column() {
+        if let Some(ColumnVector::Utf8 {
+            offsets,
+            data,
+            nulls,
+        }) = batch.columns().get(index)
+        {
+            let rows = offsets.len().saturating_sub(1);
+            let mut validity = nulls.clone().unwrap_or_else(|| Bitmap::new_all_valid(rows));
+            if let Some(selection) = batch.selection() {
+                let mut visible = Bitmap::new_all_invalid(rows);
+                for row in selection.iter() {
+                    visible.set_true(row);
+                }
+                validity = validity.and(&visible);
+            }
+            let mut output = Vec::new();
+            let mut output_offsets = Vec::with_capacity(offsets.len());
+            output_offsets.push(0);
+            for (row, pair) in offsets.windows(2).enumerate() {
+                if validity.get(row) {
+                    match plan.evaluate(&data[pair[0] as usize..pair[1] as usize])? {
+                        Some(value) => output.extend_from_slice(&value),
+                        None => validity.set(row, false),
+                    }
+                }
+                output_offsets.push(u32::try_from(output.len()).map_err(|_| {
+                    crate::error::catalog::ER_OUT_OF_RESOURCES
+                        .error("XML batch output exceeds column capacity")
+                })?);
+            }
+            crate::engine::expr_program::record_column_eval_rows(batch.visible_rows() as u64);
+            return Ok(ColumnVector::Utf8 {
+                offsets: output_offsets,
+                data: output,
+                nulls: Some(validity),
+            });
+        }
+    }
     // REGEXP_REPLACE can preserve physical alignment across a selection by
     // writing empty/null entries for invisible rows. Keep this before the
     // selection-free typed kernels: filtered analytical scans are the common

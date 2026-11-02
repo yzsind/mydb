@@ -317,6 +317,7 @@ pub(super) fn mark_covering_index_recursive_with_extra(
         | PhysicalPlan::FulltextScan { .. }
         | PhysicalPlan::SpatialScan { .. }
         | PhysicalPlan::VectorIndexScan { .. }
+        | PhysicalPlan::FilteredVectorTopK { .. }
         | PhysicalPlan::VectorBruteScan { .. }
         | PhysicalPlan::IndexAggregate { .. }
         | PhysicalPlan::CoveringIndexAggregate { .. }
@@ -441,6 +442,11 @@ pub(super) fn join_prune_walk(
             ..
         }
         | PhysicalPlan::VectorIndexScan {
+            table,
+            projected_columns,
+            ..
+        }
+        | PhysicalPlan::FilteredVectorTopK {
             table,
             projected_columns,
             ..
@@ -772,7 +778,8 @@ pub(super) fn apply_join_output_pruning(plan: &mut PhysicalPlan, select: &Select
 ///   row-id fan-out and CTE reuse paths also benefit.
 fn vector_consumes_sole_order(plan: &PhysicalPlan) -> bool {
     match plan {
-        PhysicalPlan::VectorIndexScan { order_by, .. } => order_by.len() == 1,
+        PhysicalPlan::VectorIndexScan { order_by, .. }
+        | PhysicalPlan::FilteredVectorTopK { order_by, .. } => order_by.len() == 1,
         PhysicalPlan::Projection { input, .. }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Materialize { input, .. }
@@ -972,6 +979,9 @@ impl ColumnPruningRefs {
                 }
             }
             PhysicalPlan::VectorIndexScan {
+                filter, order_by, ..
+            }
+            | PhysicalPlan::FilteredVectorTopK {
                 filter, order_by, ..
             } => {
                 if !skip_scan_filters {
@@ -1547,6 +1557,11 @@ impl ColumnPruningRefs {
                 ..
             }
             | PhysicalPlan::VectorIndexScan {
+                table,
+                projected_columns,
+                ..
+            }
+            | PhysicalPlan::FilteredVectorTopK {
                 table,
                 projected_columns,
                 ..

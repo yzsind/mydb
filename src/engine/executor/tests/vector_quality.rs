@@ -51,7 +51,7 @@ fn vector_filter_cost_fixture(
 }
 
 #[test]
-fn vector_filter_survival_cost_requires_a_covered_prefilter_access() {
+fn vector_filter_survival_cost_accounts_for_scalar_prefilter_access() {
     use crate::engine::api::QueryEngine as _;
     use crate::planner::PhysicalPlan;
     let (_dir, engine, mut session) = vector_filter_cost_fixture("hnsw");
@@ -75,13 +75,34 @@ fn vector_filter_survival_cost_requires_a_covered_prefilter_access() {
             )
         })
         .unwrap();
+        let mut filtered = None;
+        memo.compiled.physical.walk(|p| {
+            if let PhysicalPlan::FilteredVectorTopK {
+                scalar_access,
+                strategy,
+                ..
+            } = p
+            {
+                filtered = Some((scalar_access.as_ref().clone(), *strategy));
+            }
+        });
+        let (access, strategy) = filtered.expect("adaptive filtered vector plan");
         assert_eq!(
-            memo.compiled
-                .physical
-                .any(|p| matches!(p, PhysicalPlan::VectorIndexScan { .. })),
-            !indexed,
-            "do not treat an unindexed residual as a free prefilter"
+            matches!(
+                access,
+                PhysicalPlan::IndexRangeScan { .. } | PhysicalPlan::IndexFastScan { .. }
+            ),
+            indexed
         );
+        if indexed {
+            assert_eq!(strategy, crate::planner::FilteredVectorStrategy::Exact);
+        } else {
+            assert!(matches!(
+                access,
+                PhysicalPlan::SeqScan { .. } | PhysicalPlan::ZoneMapScan { .. }
+            ));
+            assert!(crate::planner::plan_cost(&access).total > 0.0);
+        }
     }
 }
 
@@ -94,7 +115,7 @@ fn vector_prepared_filter_cost_accounts_for_candidate_survival() {
         let sql =
             "SELECT id FROM vector_cost WHERE id>=? ORDER BY L2_DISTANCE(v,TO_VECTOR(?)) LIMIT 10";
         let parsed = engine.prepare_cached(&mut session, sql, 2).unwrap();
-        let strong = if algorithm == "ivf" { 3768 } else { 3584 };
+        let strong = if algorithm == "ivf" { 4080 } else { 3980 };
         for (lower, ann) in [(0, true), (512, true), (strong, false)] {
             let params = vec![Value::Int(lower), Value::String("[17.1,2.1,3.1]".into())];
             let memo = crate::engine::expr::with_session_expr_info(&session, || {
@@ -108,9 +129,15 @@ fn vector_prepared_filter_cost_accounts_for_candidate_survival() {
             })
             .unwrap();
             assert_eq!(
-                memo.compiled
-                    .physical
-                    .any(|p| matches!(p, PhysicalPlan::VectorIndexScan { .. })),
+                memo.compiled.physical.any(|p| matches!(
+                    p,
+                    PhysicalPlan::VectorIndexScan { .. }
+                        | PhysicalPlan::FilteredVectorTopK {
+                            strategy: crate::planner::FilteredVectorStrategy::PrefilterAnn
+                                | crate::planner::FilteredVectorStrategy::IterativeAnn,
+                            ..
+                        }
+                )),
                 ann,
                 "{algorithm} filter lower={lower} must cost surviving candidates"
             );
@@ -147,9 +174,15 @@ fn vector_prepared_filter_cost_accounts_for_candidate_survival() {
         })
         .unwrap();
         assert!(
-            memo.compiled
-                .physical
-                .any(|p| matches!(p, PhysicalPlan::VectorIndexScan { .. })),
+            memo.compiled.physical.any(|p| matches!(
+                p,
+                PhysicalPlan::VectorIndexScan { .. }
+                    | PhysicalPlan::FilteredVectorTopK {
+                        strategy: crate::planner::FilteredVectorStrategy::PrefilterAnn
+                            | crate::planner::FilteredVectorStrategy::IterativeAnn,
+                        ..
+                    }
+            )),
             "{algorithm} with widening disabled must not pay for additional candidates"
         );
     }
@@ -166,12 +199,13 @@ fn vector_prepared_cost_replans_when_session_effort_changes() {
         let params = vec![Value::String("[17.1,2.1,3.1]".into())];
         let mut state = PreparedSelectMemoState::default();
         let mut plans = Vec::new();
+        let mut costs = Vec::new();
         let (variable, low, high) = if algorithm == "ivf" {
             ("mydb_ivf_nprobe", 4, 64)
         } else {
-            ("mydb_hnsw_ef_search", 16, 512)
+            ("mydb_hnsw_ef_search", 16, 4096)
         };
-        for (effort, ann) in [(low, true), (high, false), (low, true)] {
+        for effort in [low, high, low] {
             engine
                 .execute_with_session(&mut session, &format!("SET SESSION {variable}={effort}"))
                 .unwrap();
@@ -184,15 +218,24 @@ fn vector_prepared_cost_replans_when_session_effort_changes() {
             let PreparedSelectMemoState::Ready(memo) = &state else {
                 panic!("memo required")
             };
+            let mut baked = None;
+            memo.compiled.physical.walk(|node| {
+                if let PhysicalPlan::FilteredVectorTopK { ef_search, .. } = node {
+                    baked = Some(*ef_search);
+                }
+            });
             assert_eq!(
-                memo.compiled
-                    .physical
-                    .any(|p| matches!(p, PhysicalPlan::VectorIndexScan { .. })),
-                ann,
-                "{algorithm} effort={effort} must re-evaluate the cost crossover"
+                baked,
+                Some(effort as usize),
+                "{algorithm} effort must be rebound"
             );
+            costs.push(crate::planner::plan_cost(&memo.compiled.physical).total);
             plans.push(memo.compiled.clone());
         }
+        assert!(
+            costs[1] > costs[0],
+            "{algorithm} increased effort must cost more: {costs:?}"
+        );
         assert!(!Arc::ptr_eq(&plans[0], &plans[1]));
         assert!(Arc::ptr_eq(&plans[0], &plans[2]));
     }
@@ -247,10 +290,15 @@ fn vector_prepared_filter_selectivity_switches_between_ann_and_exact() {
         })
         .unwrap();
         assert!(
-            !memo
-                .compiled
-                .physical
-                .any(|p| matches!(p, PhysicalPlan::VectorIndexScan { .. })),
+            !memo.compiled.physical.any(|p| matches!(
+                p,
+                PhysicalPlan::VectorIndexScan { .. }
+                    | PhysicalPlan::FilteredVectorTopK {
+                        strategy: crate::planner::FilteredVectorStrategy::PrefilterAnn
+                            | crate::planner::FilteredVectorStrategy::IterativeAnn,
+                        ..
+                    }
+            )),
             "selective {algorithm} must retain the exact scan"
         );
         let mut state = PreparedSelectMemoState::default();
@@ -276,9 +324,15 @@ fn vector_prepared_filter_selectivity_switches_between_ann_and_exact() {
                 panic!("memo required")
             };
             assert_eq!(
-                memo.compiled
-                    .physical
-                    .any(|p| matches!(p, PhysicalPlan::VectorIndexScan { .. })),
+                memo.compiled.physical.any(|p| matches!(
+                    p,
+                    PhysicalPlan::VectorIndexScan { .. }
+                        | PhysicalPlan::FilteredVectorTopK {
+                            strategy: crate::planner::FilteredVectorStrategy::PrefilterAnn
+                                | crate::planner::FilteredVectorStrategy::IterativeAnn,
+                            ..
+                        }
+                )),
                 lower == 0,
                 "{algorithm} lower={lower}"
             );

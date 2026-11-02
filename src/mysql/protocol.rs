@@ -2931,7 +2931,10 @@ pub fn column_definition_packet_full_into_with_fallback(
             default_length
         }
     });
-    let wire_length = if source.wire_type == Some(MYSQL_TYPE_BLOB) && collation != BINARY_COLLATION
+    let wire_length = if matches!(
+        source.wire_type,
+        Some(MYSQL_TYPE_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB)
+    ) && collation != BINARY_COLLATION
     {
         let width = crate::charset::resolve_collation_id(collation)
             .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
@@ -2984,6 +2987,8 @@ pub fn column_definition_packet_full_into_with_fallback(
             Some(MYSQL_TYPE_STRING | MYSQL_TYPE_VAR_STRING)
         ) {
             default_flags & !BLOB_FLAG
+        } else if source.wire_type == Some(MYSQL_TYPE_DOUBLE) && source.org_table.is_empty() {
+            default_flags & !NUM_FLAG
         } else {
             default_flags
         };

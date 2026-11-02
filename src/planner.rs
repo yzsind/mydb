@@ -44,9 +44,12 @@ use index_bounds::{target_for_index_column, ColumnRange, ConstraintValue as Plan
 mod access;
 pub(crate) mod boolean_range;
 pub(crate) mod explain_access;
+mod filtered_vector;
 pub(crate) mod index_residual;
 mod tuple_access;
 mod visit;
+pub(crate) use filtered_vector::filtered_vector_remaining_cost;
+pub use filtered_vector::FilteredVectorStrategy;
 pub(crate) use visit::{plan_children, plan_children_mut, PlanChildren, PlanChildrenMut};
 
 use crate::engine::executor::select::bloom::{BloomFilter, ExactIntKeySet};
@@ -662,6 +665,32 @@ pub enum PhysicalPlan {
         cost: crate::engine::cbo::Cost,
         possible_keys: Vec<String>,
         hint_note: Option<String>,
+        projected_columns: Option<Arc<Vec<usize>>>,
+    },
+    /// Query-local adaptive scalar filtering and native vector ranking.
+    FilteredVectorTopK {
+        table: PlanTable,
+        column_index: usize,
+        index: Option<IndexSchema>,
+        scalar_access: Box<PhysicalPlan>,
+        strategy: FilteredVectorStrategy,
+        parallel_degree: usize,
+        exact_cost: f64,
+        predicate_cost: f64,
+        query_vector: crate::vector::VectorValue,
+        query_vector_expr: Option<Expr>,
+        metric: String,
+        k: usize,
+        baked_offset: usize,
+        binding: LimitBinding,
+        ef_search: usize,
+        ef_hint: Option<u64>,
+        order_by: Vec<OrderBy>,
+        filter: Option<Expr>,
+        estimated_rows: f64,
+        access_rows: f64,
+        cost: crate::engine::cbo::Cost,
+        possible_keys: Vec<String>,
         projected_columns: Option<Arc<Vec<usize>>>,
     },
     /// Brute-force **exact** KNN over a fixed-dim `VECTOR(n)` column with no
@@ -2172,7 +2201,8 @@ fn collect_fulltext_match_fingerprints_in_plan(
         | PhysicalPlan::ParallelIndexFastScan { filter, .. }
         | PhysicalPlan::ParallelIndexRangeScan { filter, .. }
         | PhysicalPlan::SpatialScan { filter, .. }
-        | PhysicalPlan::VectorIndexScan { filter, .. } => {
+        | PhysicalPlan::VectorIndexScan { filter, .. }
+        | PhysicalPlan::FilteredVectorTopK { filter, .. } => {
             if let Some(f) = filter {
                 collect_match_fingerprints_in_expr(f, out);
             }
@@ -2252,6 +2282,7 @@ fn lower_remaining_subquery_filters_to_apply(plan: &mut PhysicalPlan) {
         | PhysicalPlan::FulltextScan { filter, .. }
         | PhysicalPlan::SpatialScan { filter, .. }
         | PhysicalPlan::VectorIndexScan { filter, .. }
+        | PhysicalPlan::FilteredVectorTopK { filter, .. }
         | PhysicalPlan::IndexInLookup { filter, .. }
         | PhysicalPlan::CteScan { filter, .. }
         | PhysicalPlan::GenerateSeries { filter, .. }
@@ -4665,6 +4696,11 @@ pub(crate) fn plan_output_width(plan: &PhysicalPlan) -> f64 {
             table,
             projected_columns,
             ..
+        }
+        | PhysicalPlan::FilteredVectorTopK {
+            table,
+            projected_columns,
+            ..
         } => projected_row_width(table, projected_columns.as_deref().map(|v| v.as_slice())),
         // VectorBruteScan re-materialises full winner rows (no projection
         // pushdown), so its row width is the table's full projected width.
@@ -4847,6 +4883,7 @@ define_plan_metadata! {
     SpatialScan,
     VectorIndexScan,
     VectorBruteScan,
+    FilteredVectorTopK,
     IndexInLookup,
     NestedLoopJoin,
     IndexNestedLoopJoin,
@@ -7444,7 +7481,7 @@ mod sequence_force_serial_tests {
     }
 }
 
-fn cpu_bound_parallel_degree(degree: u32) -> u32 {
+pub(crate) fn cpu_bound_parallel_degree(degree: u32) -> u32 {
     let config = parallel_planner_config();
     if config.use_all_cores {
         return degree.max(1);
@@ -8057,6 +8094,7 @@ fn provided_order_prefix_len(plan: &PhysicalPlan, order_by: &[OrderBy]) -> usize
         | PhysicalPlan::VectorIndexScan {
             order_by: existing, ..
         }
+        | PhysicalPlan::FilteredVectorTopK { order_by: existing, .. }
         // A VectorBruteScan likewise returns rows pre-sorted ascending by the
         // exact KNN distance, so it satisfies that ORDER BY directly.
         | PhysicalPlan::VectorBruteScan {
@@ -10104,6 +10142,31 @@ fn try_knn_vector_scan(
     let filtered_rows = costing_filter.as_deref().map_or(total_rows, |predicate| {
         estimate_filter_rows(&table.schema, predicate, total_rows)
     });
+    if filter
+        .as_ref()
+        .is_some_and(|p| !expr_is_deterministic(p) || expr_has_volatile_evaluation(p))
+    {
+        return None;
+    }
+    if filter.is_some() && select.order_by.len() == 1 {
+        return filtered_vector::plan_filtered_vector(
+            db,
+            table,
+            select,
+            filter,
+            possible_keys,
+            col,
+            query_vector,
+            query_vector_expr,
+            metric,
+            k,
+            offset,
+            total_rows,
+            filtered_rows,
+            index.filter(|_| !no_vector_index_hint),
+            hint_ef,
+        );
+    }
     let index_usable = index.is_some_and(|index| {
         if no_vector_index_hint
             || index.vector_meta_for_table(&table.schema).metric_enum() != metric
@@ -18747,6 +18810,7 @@ fn collect_physical_plan_tables_into(plan: &PhysicalPlan, tables: &mut Vec<PlanT
         | PhysicalPlan::FulltextScan { table, .. }
         | PhysicalPlan::SpatialScan { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::VectorBruteScan { table, .. }
         | PhysicalPlan::IndexInLookup { table, .. }
         | PhysicalPlan::CoveringIndexAggregate { table, .. }
@@ -19910,6 +19974,7 @@ pub(crate) fn plan_rel_estimate(plan: &PhysicalPlan) -> crate::engine::cbo::RelE
         | PhysicalPlan::FulltextScan { table, .. }
         | PhysicalPlan::SpatialScan { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::VectorBruteScan { table, .. }
         | PhysicalPlan::IndexInLookup { table, .. }
         | PhysicalPlan::IndexAggregate { table, .. }
@@ -19982,6 +20047,7 @@ pub(crate) fn plan_physical_properties(
         | PhysicalPlan::ParallelTopK { order_by, .. }
         | PhysicalPlan::ParallelSort { order_by, .. }
         | PhysicalPlan::VectorIndexScan { order_by, .. }
+        | PhysicalPlan::FilteredVectorTopK { order_by, .. }
         | PhysicalPlan::VectorBruteScan { order_by, .. } => order_by
             .iter()
             .map(|item| expr_to_explain_string(&item.expr))
@@ -20008,6 +20074,9 @@ pub(crate) fn plan_physical_properties(
         | PhysicalPlan::ParallelGroupingSetsAggregate { degree, .. }
         | PhysicalPlan::ParallelTopK { degree, .. }
         | PhysicalPlan::ParallelSort { degree, .. } => *degree,
+        PhysicalPlan::FilteredVectorTopK {
+            parallel_degree, ..
+        } => *parallel_degree as u32,
         _ => 1,
     };
     let streaming_join_depth = match plan {
@@ -20352,6 +20421,7 @@ fn count_plan_column_matches(
         | PhysicalPlan::FulltextScan { table, .. }
         | PhysicalPlan::SpatialScan { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::VectorBruteScan { table, .. }
         | PhysicalPlan::IndexInLookup { table, .. }
         | PhysicalPlan::CoveringIndexAggregate { table, .. }
@@ -24677,6 +24747,7 @@ fn collect_scan_targets(
         | PhysicalPlan::IndexMultiLookup { table, .. }
         | PhysicalPlan::IndexInLookup { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::FulltextScan { table, .. } => push_if_new(out, table),
         PhysicalPlan::IndexNestedLoopJoin {
             left, right_table, ..

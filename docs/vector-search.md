@@ -266,6 +266,38 @@ ORDER BY distance
 LIMIT 2;
 ```
 
+Eligible single-table filtered KNN queries use `FilteredVectorTopK`. Its
+cost model chooses among three strategies:
+
+| Strategy | Execution |
+| --- | --- |
+| `exact` | Read scalar filter columns through the selected relational access path, score surviving RowIds directly from visible heap vectors, and materialize only winners |
+| `prefilter_ann` | Build a statement-local row selection, pass it into HNSW or IVF, then re-rank retained candidates |
+| `iterative_ann` | Resume an ANN cursor, evaluate scalar conditions on candidate batches, and score retained visible rows |
+
+HNSW can navigate through excluded nodes; excluded rows never enter its result
+queue. IVF checks row membership before vector scoring. Cursors reuse prior
+navigation or list scans and release backend read guards between bounded work
+slices. Expensive deterministic filters may start with a
+bounded candidate pilot; observed survival and remaining cost determine whether
+to continue or complete exactly. Actual prefilter cardinality can also select
+exact scoring after planning. These choices do not imply global exact ANN
+recall.
+
+A selective HNSW filter can require additional navigation to establish the
+candidate distance boundary. The optimizer includes that work when comparing
+ANN with exact scoring.
+
+Row selections and cursor workspace use the query memory budget. If an optional
+selection cannot fit, execution can complete through streaming exact scoring.
+In the default iterative mode, an exhausted candidate budget or graph frontier
+also requires exact completion when the re-ranking pool is incomplete.
+
+`EXPLAIN` reports the planned strategy. `EXPLAIN ANALYZE` reports predicate
+evaluations, navigation work, heap re-ranks, materialized winners, batches, and
+exact fallbacks. Non-repeatable predicates and relational shapes outside this
+optimization retain their ordinary execution paths.
+
 The executor checks heap MVCC visibility and residual filters before returning
 results. Inserts, updates, and deletes participate in transactions, including
 commit and rollback. A selective filter can remove many ANN candidates; the

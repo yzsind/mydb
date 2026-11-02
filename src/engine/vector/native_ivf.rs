@@ -31,6 +31,7 @@ struct Entry {
 }
 #[derive(Debug)]
 struct State {
+    cursor_epoch: u64,
     exceptions: usize,
     incremental_exceptions: usize,
     entries: Vec<Entry>,
@@ -77,6 +78,7 @@ impl NativeIvf {
             params,
             file,
             state: RwLock::new(State {
+                cursor_epoch: 0,
                 exceptions: 0,
                 incremental_exceptions: 0,
                 entries: Vec::new(),
@@ -283,6 +285,7 @@ impl NativeIvf {
         generation: u64,
     ) -> Result<(), QueryError> {
         let mut state = self.state.write();
+        state.cursor_epoch = state.cursor_epoch.wrapping_add(1);
         if self.quantizer().is_some() {
             if self.generation.load(Ordering::Acquire) >= generation {
                 return Ok(());
@@ -700,6 +703,7 @@ impl NativeIvf {
             return Err(codec::vector_err("IVF datatype/dimension mismatch"));
         }
         let mut state = self.state.write();
+        state.cursor_epoch = state.cursor_epoch.wrapping_add(1);
         if let Some(&old) = state.rows.get(&row) {
             self.delete_locked(&mut state, old)?;
         }
@@ -774,6 +778,7 @@ impl NativeIvf {
     }
     pub(crate) fn delete(&self, row: RowId) -> Result<u32, QueryError> {
         let mut state = self.state.write();
+        state.cursor_epoch = state.cursor_epoch.wrapping_add(1);
         if let Some(&id) = state.rows.get(&row) {
             self.delete_locked(&mut state, id)?;
             return Ok(1);
@@ -801,6 +806,7 @@ impl NativeIvf {
         let mut trained = trainer.state.write();
         let centers = std::mem::take(&mut trained.centers);
         let mut state = self.state.write();
+        state.cursor_epoch = state.cursor_epoch.wrapping_add(1);
         state
             .charge
             .try_grow_recoverable(centers.iter().map(|v| v.len() + 96).sum())?;
@@ -954,6 +960,7 @@ impl NativeIvf {
     }
     pub(crate) fn train(&self) -> Result<(), QueryError> {
         let mut state = self.state.write();
+        state.cursor_epoch = state.cursor_epoch.wrapping_add(1);
         let live: Vec<usize> = state
             .entries
             .iter()
@@ -1000,6 +1007,85 @@ impl NativeIvf {
         state.lists = lists;
 
         Ok(())
+    }
+    pub(crate) fn advance_cursor(
+        &self,
+        cursor: &mut super::cursor::VectorSearchCursor,
+        effort: usize,
+    ) -> Result<bool, QueryError> {
+        let state = self.state.read();
+        if cursor.initialized && cursor.epoch != state.cursor_epoch {
+            return Ok(false);
+        }
+        if !cursor.initialized {
+            cursor.epoch = state.cursor_epoch;
+            cursor.prepared = self
+                .quantizer()
+                .map(|q| q.prepare(&cursor.query))
+                .transpose()?;
+            if let Some(prepared) = &cursor.prepared {
+                cursor
+                    .hnsw
+                    .charge
+                    .try_grow_recoverable(prepared.allocated_bytes())?;
+            }
+            cursor
+                .hnsw
+                .charge
+                .try_grow_recoverable(state.centers.len().saturating_mul(48))?;
+            let mut probes = state
+                .centers
+                .iter()
+                .enumerate()
+                .map(|(id, value)| {
+                    Ok(Scored {
+                        id,
+                        dist: typed_ordering_distance(&cursor.query, value, self.metric)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            probes.sort_unstable();
+            cursor.probes = probes.into_iter().map(|p| p.id).collect();
+            if cursor.probes.is_empty() {
+                cursor.probes.push(0);
+            }
+            cursor.work.distances += state.centers.len() as u64;
+            cursor.initialized = true;
+        }
+        let mut scanned = 0;
+        while cursor.probe_position < effort.max(1).min(cursor.probes.len()) {
+            crate::engine::cancel::check_cancelled()?;
+            let list = &state.lists[cursor.probes[cursor.probe_position]];
+            while cursor.probe_offset < list.len() {
+                if scanned == 1024 {
+                    cursor.resume_work = true;
+                    return Ok(true);
+                }
+                let id = list[cursor.probe_offset];
+                cursor.probe_offset += 1;
+                scanned += 1;
+                let entry = &state.entries[id];
+                cursor.work.visited += 1;
+                if entry.deleted
+                    || cursor
+                        .selection
+                        .as_deref()
+                        .is_some_and(|s| !s.contains(cursor.sid, entry.row))
+                {
+                    continue;
+                }
+                let distance = self.score(&state, id, &cursor.query, cursor.prepared.as_ref())?;
+                cursor.work.distances += 1;
+                cursor.hnsw.charge.try_grow_recoverable(48)?;
+                cursor.hnsw.pending.push(std::cmp::Reverse(Scored {
+                    id: entry.row,
+                    dist: distance,
+                }));
+            }
+            cursor.probe_position += 1;
+            cursor.probe_offset = 0;
+        }
+        Ok(true)
     }
     pub(crate) fn search(
         &self,

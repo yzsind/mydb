@@ -4681,6 +4681,160 @@ impl PagedHnsw {
     /// k-NN search. Returns up to `k` `(row_id, exact_distance)` for live
     /// (non-tombstoned) nodes, ascending by distance. MVCC visibility of the
     /// row is the caller's responsibility.
+    pub(crate) fn advance_cursor(
+        &self,
+        cursor: &mut super::cursor::VectorSearchCursor,
+        effort: usize,
+    ) -> Result<bool, QueryError> {
+        let _gate = self.navigation_gate.read();
+        let retired = self.restored_retirements.read();
+        let epoch = self.query_nav_epoch.load(Ordering::Acquire);
+        if cursor.initialized && cursor.epoch != epoch {
+            return Ok(false);
+        }
+        if !cursor.initialized {
+            cursor.epoch = epoch;
+            cursor.initialized = true;
+            if let Some((mut entry, level)) = self.file.entry_with_level() {
+                for layer in (1..=level as usize).rev() {
+                    loop {
+                        let Some((_, _, mut distance)) = self.file.read_vector_meta_distance(
+                            entry,
+                            &cursor.decoded,
+                            self.metric,
+                        )?
+                        else {
+                            return Ok(false);
+                        };
+                        let mut best = entry;
+                        let mut neighbors = Vec::new();
+                        self.file
+                            .read_neighbors_into(entry, layer, &mut neighbors)?;
+                        for n in neighbors {
+                            if let Some((_, _, d)) = self.file.read_vector_meta_distance(
+                                n,
+                                &cursor.decoded,
+                                self.metric,
+                            )? {
+                                if d < distance {
+                                    distance = d;
+                                    best = n;
+                                }
+                            }
+                        }
+                        if best == entry {
+                            break;
+                        }
+                        entry = best;
+                    }
+                }
+                if let Some((row, deleted, distance)) =
+                    self.file
+                        .read_vector_meta_distance(entry, &cursor.decoded, self.metric)?
+                {
+                    let rows = if deleted || retired.0.contains(&entry) {
+                        Vec::new()
+                    } else {
+                        vec![row]
+                    };
+                    cursor.hnsw.discover(
+                        entry,
+                        distance,
+                        rows.iter().copied(),
+                        cursor.sid,
+                        cursor.selection.as_deref(),
+                    )?;
+                    cursor.work.distances += 1;
+                }
+            }
+        }
+        if effort >= self.node_count() as usize {
+            if cursor.scan_ids.is_empty() {
+                cursor
+                    .hnsw
+                    .charge
+                    .try_grow_recoverable(self.node_count() as usize * 16)?;
+                self.file.for_each_node(|id, _, _| {
+                    cursor.scan_ids.push(id);
+                })?;
+            }
+            let end = cursor
+                .scan_position
+                .saturating_add(1024)
+                .min(cursor.scan_ids.len());
+            for position in cursor.scan_position..end {
+                let id = cursor.scan_ids[position];
+                if cursor.hnsw.visited.contains(&id) {
+                    continue;
+                }
+                if let Some((row, deleted, distance)) =
+                    self.file
+                        .read_vector_meta_distance(id, &cursor.decoded, self.metric)?
+                {
+                    let rows = if deleted || retired.0.contains(&id) {
+                        Vec::new()
+                    } else {
+                        vec![row]
+                    };
+                    cursor.hnsw.discover(
+                        id,
+                        distance,
+                        rows.iter().copied(),
+                        cursor.sid,
+                        cursor.selection.as_deref(),
+                    )?;
+                    cursor.work.distances += 1;
+                    cursor.work.visited += 1;
+                }
+                crate::engine::cancel::check_cancelled()?;
+            }
+            cursor.scan_position = end;
+            if end < cursor.scan_ids.len() {
+                cursor.resume_work = true;
+                return Ok(epoch == self.query_nav_epoch.load(Ordering::Acquire));
+            }
+            cursor.hnsw.frontier.clear();
+            cursor.hnsw.expanded = self.node_count() as usize;
+            return Ok(epoch == self.query_nav_epoch.load(Ordering::Acquire));
+        }
+        let mut neighbors = Vec::new();
+        let end = cursor.hnsw.expanded.saturating_add(1024).min(effort);
+        while cursor.hnsw.expanded < end {
+            crate::engine::cancel::check_cancelled()?;
+            let Some(Reverse(candidate)) = cursor.hnsw.frontier.pop() else {
+                break;
+            };
+            cursor.hnsw.expanded += 1;
+            cursor.work.visited += 1;
+            self.file
+                .read_neighbors_into(candidate.id, 0, &mut neighbors)?;
+            for &id in &neighbors {
+                if cursor.hnsw.visited.contains(&id) {
+                    continue;
+                }
+                if let Some((row, deleted, distance)) =
+                    self.file
+                        .read_vector_meta_distance(id, &cursor.decoded, self.metric)?
+                {
+                    let rows = if deleted || retired.0.contains(&id) {
+                        Vec::new()
+                    } else {
+                        vec![row]
+                    };
+                    cursor.hnsw.discover(
+                        id,
+                        distance,
+                        rows.iter().copied(),
+                        cursor.sid,
+                        cursor.selection.as_deref(),
+                    )?;
+                    cursor.work.distances += 1;
+                }
+            }
+        }
+        cursor.resume_work = cursor.hnsw.expanded < effort && !cursor.hnsw.frontier.is_empty();
+        Ok(epoch == self.query_nav_epoch.load(Ordering::Acquire))
+    }
     pub(crate) fn search(
         &self,
         query: &[f32],

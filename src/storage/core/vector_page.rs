@@ -5502,7 +5502,8 @@ mod vector_page_tests {
 
 #[cfg(test)]
 pub(crate) fn source_audit_vector_file() -> (tempfile::TempDir, Arc<VectorIndexFile>) {
-    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let log = Arc::new(parking_lot::Mutex::new(
         LogManager::open(dir.path()).unwrap(),
     ));

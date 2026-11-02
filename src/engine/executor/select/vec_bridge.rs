@@ -1078,6 +1078,14 @@ fn try_build_row_storage_batch<'a>(
             query_vector_expr,
             metric,
             ..
+        }
+        | PhysicalPlan::FilteredVectorTopK {
+            table,
+            column_index,
+            query_vector,
+            query_vector_expr,
+            metric,
+            ..
         } => {
             let query = super::plan::resolve_knn_query_vector(
                 table,
@@ -1148,6 +1156,14 @@ pub(super) fn preflight_runtime_parameters(plan: &PhysicalPlan) -> Result<(), Qu
                     )
                 }),
             PhysicalPlan::VectorBruteScan {
+                table,
+                column_index,
+                query_vector,
+                query_vector_expr,
+                metric,
+                ..
+            }
+            | PhysicalPlan::FilteredVectorTopK {
                 table,
                 column_index,
                 query_vector,
@@ -2093,6 +2109,7 @@ pub(crate) fn should_route_result_to_batch(plan: &PhysicalPlan, projection: &[Se
             | PhysicalPlan::FulltextScan { .. }
             | PhysicalPlan::SpatialScan { .. }
             | PhysicalPlan::VectorIndexScan { .. }
+            | PhysicalPlan::FilteredVectorTopK { .. }
             | PhysicalPlan::VectorBruteScan { .. }
             | PhysicalPlan::IndexInLookup { .. }
             | PhysicalPlan::AdaptiveJoin { .. }
@@ -2242,6 +2259,7 @@ impl NativeVecCompiler {
             | PhysicalPlan::FulltextScan { .. }
             | PhysicalPlan::SpatialScan { .. }
             | PhysicalPlan::VectorIndexScan { .. }
+            | PhysicalPlan::FilteredVectorTopK { .. }
             | PhysicalPlan::VectorBruteScan { .. }
             | PhysicalPlan::AdaptiveJoin { .. } => try_build_row_storage_batch(db, txn, plan)?,
             PhysicalPlan::IndexInLookup { .. } => try_build_parallel_index_in_batch(db, txn, plan)?,

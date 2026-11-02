@@ -143,6 +143,12 @@ pub fn auto_parameterized_active() -> bool {
     AUTO_PARAMETERIZED.with(Cell::get)
 }
 
+/// Identity of the currently installed execution binding.
+#[inline]
+pub(crate) fn current_binding_identity() -> usize {
+    PARAMS.with(|params| params.get().ptr as usize)
+}
+
 /// Look up the parameter at `idx` as a row count (LIMIT / OFFSET use).
 /// Returns `None` when there is no context, the index is out of range,
 /// or the value is not a non-negative integer — callers fall back to

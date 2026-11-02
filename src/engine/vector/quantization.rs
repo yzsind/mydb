@@ -406,6 +406,11 @@ pub(crate) struct QuantQuery {
     sq_weights: Vec<f64>,
     _charge: ControlledMemoryCharge,
 }
+impl QuantQuery {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self._charge.bytes()
+    }
+}
 /// Independent reductions allow LLVM to vectorize byte-to-f64 scoring on
 /// NEON/AVX without reassociating a serial IEEE sum or narrowing native values.
 fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {

@@ -22,6 +22,9 @@ pub(super) use window::*;
 mod fulltext_source;
 mod fulltext_stream;
 pub(super) use fulltext_stream::FULLTEXT_BATCH_ROWS;
+mod filtered_vector;
+#[cfg(test)]
+mod filtered_vector_tests;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;
@@ -1824,6 +1827,7 @@ fn scan_node_has_partitions(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::FulltextScan { table, .. }
         | PhysicalPlan::SpatialScan { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::VectorBruteScan { table, .. }
         | PhysicalPlan::ParallelSeqScan { table, .. }
         | PhysicalPlan::ParallelIndexFastScan { table, .. }
@@ -2447,6 +2451,9 @@ pub(super) fn execute_plan_rows_inner(
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
             execute_spatial_scan(db, txn, table, index, query_probe, filter)
+        }
+        PhysicalPlan::FilteredVectorTopK { .. } => {
+            filtered_vector::execute_filtered_vector_topk(db, txn, plan)
         }
         PhysicalPlan::VectorIndexScan {
             table,

@@ -1184,7 +1184,9 @@ fn physical_properties(plan: &PhysicalPlan) -> PhysicalProperties {
         | PhysicalPlan::ParallelIndexRangeScan { degree, .. } => {
             properties.parallel_degree = *degree;
         }
-        PhysicalPlan::VectorIndexScan { .. } | PhysicalPlan::VectorBruteScan { .. } => {
+        PhysicalPlan::VectorIndexScan { .. }
+        | PhysicalPlan::FilteredVectorTopK { .. }
+        | PhysicalPlan::VectorBruteScan { .. } => {
             properties.execution_mode = ExecutionMode::Vectorized;
         }
         _ => {}

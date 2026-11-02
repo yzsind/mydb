@@ -210,6 +210,12 @@ macro_rules! scalar_catalog {
 
 scalar_catalog! {
     native {
+        XmlExtract => (false, |_arity| true) {
+            [("EXTRACTVALUE", "extractvalue")] => (RegexOrComplex, Blob, (XmlExtract, 2, 2, Stable, fixed_xml_result()), false);
+        }
+        XmlUpdate => (false, |_arity| true) {
+            [("UPDATEXML", "updatexml")] => (RegexOrComplex, Blob, (XmlUpdate, 3, 3, Stable, fixed_xml_result()), false);
+        }
         If => (true, |arity| arity != 3) {
             [("IF", "if")] => (Unknown, VarString, None, true);
         }

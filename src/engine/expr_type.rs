@@ -153,6 +153,8 @@ pub(crate) struct BuiltinSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BuiltinId {
+    XmlExtract,
+    XmlUpdate,
     HttpRead,
     HttpWrite,
     AiGenerate,
@@ -229,6 +231,14 @@ pub(crate) fn fixed_integer_result(
 
 pub(crate) fn fixed_temporal_result(kind: TemporalKind, nullable: bool) -> ExprType {
     ExprType::new(ExprTypeKind::Temporal { kind, fsp: 0 }, nullable)
+}
+
+pub(crate) fn fixed_xml_result() -> ExprType {
+    let mut result = fixed_string_result(Some(16_777_216), true);
+    result.kind = ExprTypeKind::String {
+        kind: StringKind::Text,
+    };
+    result
 }
 
 pub(crate) fn fixed_string_result(max_octets: Option<u32>, nullable: bool) -> ExprType {
@@ -562,6 +572,18 @@ impl ExprType {
                 kind: StringKind::Binary | StringKind::Blob,
             } => {
                 source.flags |= BINARY_FLAG;
+            }
+            ExprTypeKind::String { .. } => {
+                if let Some(collation) = self
+                    .collation_id
+                    .and_then(crate::charset::resolve_collation_id)
+                {
+                    if collation.binary {
+                        source.flags |= BINARY_FLAG;
+                    } else {
+                        source.flags &= !BINARY_FLAG;
+                    }
+                }
             }
             _ => {}
         }
@@ -1107,8 +1129,9 @@ pub(crate) fn current_parameter_type_fingerprint() -> u64 {
         let no_column = |_: &Expr| None;
         let no_placeholder = |_: usize| None;
         let context = TypeContext::context_free(&no_column, &no_placeholder);
-        for value in params {
+        for (index, value) in params.iter().enumerate() {
             bound_value_type(value, &context).hash(&mut hasher);
+            crate::engine::expr::xml_parameter_type(index).hash(&mut hasher);
             let shape = match value {
                 Value::String(s) => crate::vector::text_parameter_shape(s.as_bytes()),
                 Value::Bytes(b) => crate::vector::text_parameter_shape(b),
@@ -1535,14 +1558,18 @@ pub(crate) fn aggregate_result_type(
                     },
                     true,
                 ),
-                _ => ExprType::new(
-                    ExprTypeKind::Float {
-                        single: false,
-                        precision: None,
-                        scale: None,
-                    },
-                    true,
-                ),
+                _ => {
+                    let mut result = ExprType::new(
+                        ExprTypeKind::Float {
+                            single: false,
+                            precision: None,
+                            scale: None,
+                        },
+                        true,
+                    );
+                    result.max_octets = Some(23);
+                    result
+                }
             }
         }
         "STD" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => {
@@ -1906,6 +1933,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     );
                     descriptor.collation_id =
                         crate::engine::expr::expression_metadata_collation_id(expr);
+                    descriptor.coercibility =
+                        if matches!(args.get(2), Some(Expr::Literal(Literal::Bool(true)))) {
+                            4
+                        } else {
+                            2
+                        };
                     descriptor
                 }
                 "__TEMPORAL_COMPARISON_KEY" if args.len() == 1 => ExprType::new(
@@ -1999,6 +2032,60 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         true,
                     );
                     result.collation_id = Some(crate::charset::BINARY_COLLATION_ID);
+                    result
+                }
+                "EXTRACTVALUE" | "UPDATEXML" => {
+                    let operand_type = |arg: &Expr| {
+                        let mut ty = infer_expr_type(arg, context);
+                        if let Expr::Placeholder(index) = arg {
+                            if !crate::engine::params::auto_parameterized_active() {
+                                if let Some(hint) = crate::engine::expr::xml_parameter_type(*index)
+                                {
+                                    ty = hint.descriptor();
+                                } else if matches!(ty.kind, Null | Unknown) {
+                                    ty = crate::engine::expr::xml::ParameterType::Text(
+                                        context.connection_collation_id,
+                                    )
+                                    .descriptor();
+                                }
+                            }
+                        }
+                        ty
+                    };
+                    let collation = args
+                        .iter()
+                        .map(operand_type)
+                        .filter(|arg| matches!(arg.kind, String { .. }))
+                        .reduce(|a, b| {
+                            checked_branch_types(a, b)
+                                .unwrap_or_else(|_| aggregate_branch_types(a, b))
+                        });
+                    let has_nonnull = args
+                        .iter()
+                        .any(|arg| !matches!(operand_type(arg).kind, Null));
+                    let id = collation
+                        .and_then(|c| c.collation_id)
+                        .unwrap_or(if has_nonnull {
+                            context.connection_collation_id
+                        } else {
+                            crate::charset::BINARY_COLLATION_ID
+                        });
+                    let width = if collation.is_some() {
+                        crate::charset::resolve_collation_id(id)
+                            .and_then(|c| crate::charset::resolve_charset(c.charset).ok())
+                            .map_or(1, |c| u32::from(c.max_len))
+                    } else {
+                        1
+                    };
+                    let mut result = fixed_xml_result();
+                    result.max_octets = Some(16_777_216u32.saturating_mul(width));
+                    result.collation_id = Some(id);
+                    result.coercibility = collation.map_or(4, |c| c.coercibility);
+                    if id == crate::charset::BINARY_COLLATION_ID {
+                        result.kind = String {
+                            kind: StringKind::Blob,
+                        };
+                    }
                     result
                 }
                 "EXPORT_SET" => {
@@ -2131,6 +2218,26 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     result.max_octets = display_octet_bound(&input)
                         .zip(display_octet_bound(&replacement))
                         .map(|(input, replacement)| input.saturating_mul(replacement.max(1)));
+                    if let Some(width) = result.max_octets {
+                        let mb = input
+                            .collation_id
+                            .and_then(crate::charset::resolve_collation_id)
+                            .and_then(|c| crate::charset::resolve_charset(c.charset).ok())
+                            .map_or(1, |c| u32::from(c.max_len));
+                        let capped = width.min(16_777_216) / mb * mb;
+                        result.max_octets = Some(capped);
+                        if capped > 65_535 {
+                            result.kind = String {
+                                kind: if input.collation_id
+                                    == Some(crate::charset::BINARY_COLLATION_ID)
+                                {
+                                    StringKind::Blob
+                                } else {
+                                    StringKind::Text
+                                },
+                            };
+                        }
+                    }
                     result
                 }
                 "DATE_FORMAT" | "TIME_FORMAT" => {

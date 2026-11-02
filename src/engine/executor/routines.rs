@@ -3580,6 +3580,11 @@ fn exec_stmt(
                 .insert_sql_prepared_statement(
                     key,
                     crate::engine::api::SessionSqlPreparedStatement {
+                        xml_parameter_types: crate::engine::expr::xml::parameter_history(
+                            &sql,
+                            next_placeholder,
+                            &session.collation_connection,
+                        ),
                         pfs: crate::engine::session_registry::PreparedStatementSnapshot::sql(
                             name.clone(),
                             Arc::from(sql.as_str()),
@@ -3632,6 +3637,13 @@ fn exec_stmt(
                 )
                 .into());
             }
+            let saved_xml_types = session.xml_parameter_types.take();
+            let saved_xml_binding = session.xml_parameter_binding;
+            crate::engine::expr::xml::bind_parameter_history(
+                session,
+                &prepared.xml_parameter_types,
+                &params,
+            );
             let saved_database =
                 std::mem::replace(&mut session.current_database, prepared.database);
             let overflow_context = routine_overflow_context(&prepared.statement);
@@ -3653,6 +3665,8 @@ fn exec_stmt(
                 None => execute(),
             };
             session.current_database = saved_database;
+            session.xml_parameter_types = saved_xml_types;
+            session.xml_parameter_binding = saved_xml_binding;
             session.record_sql_prepared_execute(name, execute_started.elapsed(), response.is_err());
             let response = response?;
             collect_routine_response(session, frame, response)?;
@@ -3947,6 +3961,8 @@ fn execute_sql_in_routine(
     forbid_transaction_control: bool,
     trigger_table: Option<&str>,
 ) -> Result<QueryResponse, RoutineExecError> {
+    let _xml_locals = crate::engine::expr::xml::mentions_xml(sql)
+        .then(|| crate::engine::expr::xml::enter_locals(Some(Arc::new(locals.clone()))));
     let mut bound_params = params.to_vec();
     let mut used_parameterized_template = false;
     let source_overflow_context = static_statements
@@ -4953,6 +4969,8 @@ fn eval_routine_expr(
     locals: &HashMap<String, Value>,
     expr: &Expr,
 ) -> Result<Value, QueryError> {
+    let _xml_locals = crate::engine::expr::xml::expression_mentions_xml(expr)
+        .then(|| crate::engine::expr::xml::enter_locals(Some(Arc::new(locals.clone()))));
     // Keep the ordinary expression engine as the semantic oracle. Routine
     // locals are the only extra namespace: bind them once, then reuse the
     // shared evaluator for every expression that does not require the

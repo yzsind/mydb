@@ -555,6 +555,7 @@ compatibility for every input shape.** Category overview
 | Strings | Full common set, collation-aware case handling |
 | Math | Common math functions; exact fixed-point arithmetic with half-away rounding |
 | Date and time | fsp 0-6 included; named-time-zone `CONVERT_TZ` (uses host zoneinfo); `WEEK` modes 0-7 + `default_week_format` |
+| XML | `EXTRACTVALUE` / `UPDATEXML`, MySQL XPath dialect, variables, collations and diagnostics; see [XML functions](xml-functions.md) |
 | JSON | 28+ (including `JSON_SCHEMA_VALID` / `JSON_SCHEMA_VALIDATION_REPORT`); binary JSONB storage |
 | GIS | ◑ 111 official entry points registered; core constructors, accessors, measurements, predicates, aggregates, and spatial indexes work, but full compatibility acceptance has not been reached |
 | Vector | L2/COSINE/DOT distances + `VECTOR_NORM`/`L2_NORMALIZE`/`SUBVECTOR`/`MAX_INNER_PRODUCT_DISTANCE` |
@@ -571,6 +572,9 @@ compatibility for every input shape.** Category overview
 
 The following function names are available in mydb. See the individual function
 pages for supported arguments, return types, and limitations.
+
+**XML**
+`EXTRACTVALUE` `UPDATEXML` — see [XML functions](xml-functions.md).
 
 **Strings**
 `ASCII` `BIN` `BIT_LENGTH` `CHAR` `CHAR_LENGTH`/`CHARACTER_LENGTH` `CONCAT` `CONCAT_WS` `CONV` `ELT` `EXPORT_SET` `FIELD` `FIND_IN_SET` `FORMAT` `HEX` `INSERT` `INSTR` `LCASE`/`LOWER` `LEFT` `LENGTH` `LOAD_FILE` `LOCATE` `LPAD` `LTRIM` `MAKE_SET` `MID` `OCT` `OCTET_LENGTH` `ORD` `POSITION` `QUOTE` `QUOTE_IDENTIFIER` `REPEAT` `REPLACE` `REVERSE` `RIGHT` `RPAD` `RTRIM` `SOUNDEX` `SPACE` `STRCMP` `SUBSTR`/`SUBSTRING` `SUBSTRING_INDEX` `TRIM` `UCASE`/`UPPER` `UNHEX` `WEIGHT_STRING` `TO_BASE64` `FROM_BASE64` `REGEXP_LIKE` `REGEXP_INSTR` `REGEXP_REPLACE` `REGEXP_SUBSTR` `CHARSET` `COLLATION` `COERCIBILITY`
