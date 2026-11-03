@@ -255,6 +255,7 @@ pub struct QueryError {
     message: String,
     spec: Option<ErrorSpec>,
     diagnostic: Option<InternalDiagnostic>,
+    followup_errors: Option<std::sync::Arc<Vec<QueryError>>>,
     internal_kind: Option<InternalErrorKind>,
     condition_information: Option<std::sync::Arc<std::collections::BTreeMap<&'static str, String>>>,
 }
@@ -267,6 +268,7 @@ impl QueryError {
             message: message.into(),
             spec: Some(spec),
             diagnostic: None,
+            followup_errors: None,
             internal_kind: None,
             condition_information: None,
         }
@@ -290,6 +292,7 @@ impl QueryError {
             message: message.into(),
             spec: None,
             diagnostic: None,
+            followup_errors: None,
             internal_kind: None,
             condition_information: None,
         })
@@ -309,6 +312,17 @@ impl QueryError {
             .as_deref()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Additional server conditions reported after the primary failure.
+    pub(crate) fn with_followup_error(mut self, error: QueryError) -> Self {
+        std::sync::Arc::make_mut(self.followup_errors.get_or_insert_with(Default::default))
+            .push(error);
+        self
+    }
+
+    pub(crate) fn followup_errors(&self) -> &[QueryError] {
+        self.followup_errors.as_deref().map_or(&[], Vec::as_slice)
     }
 
     pub fn with_diagnostic(mut self, id: &'static str, detail: impl Into<String>) -> Self {
@@ -462,7 +476,14 @@ impl SqlCondition {
             code: ErrorNumber::new_const(error.code()),
             sql_state: error.sql_state(),
             symbol: error.symbol(),
-            message: std::borrow::Cow::Owned(error.message().to_string()),
+            message: std::borrow::Cow::Owned(
+                error
+                    .condition_information
+                    .as_ref()
+                    .and_then(|items| items.get("MESSAGE_TEXT"))
+                    .cloned()
+                    .unwrap_or_else(|| error.message().to_string()),
+            ),
             condition_information: error.condition_information.clone(),
         }
     }

@@ -64,6 +64,7 @@ macro_rules! define_children {
                 | PhysicalPlan::FulltextScan { .. }
                 | PhysicalPlan::SpatialScan { .. }
                 | PhysicalPlan::VectorIndexScan { .. }
+                | PhysicalPlan::FilteredVectorTopK { .. }
                 | PhysicalPlan::VectorBruteScan { .. }
                 | PhysicalPlan::CteScan { .. }
                 | PhysicalPlan::GenerateSeries { .. }

@@ -155,7 +155,7 @@ on all distance evaluations or physical page reads.
 | `mydb_hnsw_iterative_scan`, `mydb_ivf_iterative_scan` | strict_order | `off`, `relaxed_order`, or `strict_order`; controls candidate widening after filters or visibility checks remove rows |
 | `mydb_hnsw_max_scan_tuples`, `mydb_ivf_max_scan_tuples` | 20000 | Iterative candidate budget; 0 disables this configured cap |
 | `mydb_hnsw_brute_threshold` | 10000 | Small-table threshold for automatic exact scanning |
-| `mydb_hnsw_brute_filter_rows` | 1000 | Estimated filtered-row threshold for automatic exact scanning |
+| `mydb_hnsw_brute_filter_rows` | 1000 | Legacy filtered ANN row threshold; eligible `FilteredVectorTopK` queries use the adaptive cost model |
 
 Here `k` includes LIMIT plus OFFSET. Candidate retention also has minimum
 pool sizes and memory limits, so `rerank_mult*k` alone does not describe the

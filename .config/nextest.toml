@@ -58,3 +58,10 @@ threads-required = 2
 [[profile.default.overrides]]
 filter = 'test(/(^(storage|backup|repl)::|engine::executor::(load_data::tests|tests::(online_ddl|optimize_online|ddl_hardening|partitioning|vector_type|metadata_audit|xa))::)/)'
 test-group = 'persistence'
+
+# Wall-clock performance assertions need uncontended nextest process slots.
+# Preserve the speedup threshold while avoiding a vector/row timing comparison
+# across different bursts of internally parallel fixtures.
+[[profile.default.overrides]]
+filter = 'test(b14_vec_like_kernel_beats_row_oracle_release)'
+threads-required = "num-test-threads"

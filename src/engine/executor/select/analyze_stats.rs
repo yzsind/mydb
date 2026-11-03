@@ -14,6 +14,43 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FilteredVectorStats {
+    pub ann_candidates: u64,
+    pub quality_rounds: u64,
+    pub topk_updates: u64,
+    pub predicate_evaluations: u64,
+    pub navigation_visits: u64,
+    pub navigation_distances: u64,
+    pub reranks: u64,
+    pub materialized: u64,
+    pub batches: u64,
+    pub fallbacks: u64,
+}
+
+pub(super) fn add_filtered_vector_stats(plan: &PhysicalPlan, work: FilteredVectorStats) {
+    let Some(key) = plan_key(plan) else {
+        return;
+    };
+    STATS_COLLECTOR.with(|cell| {
+        if let Some(collector) = cell.borrow().as_ref() {
+            if let Ok(mut map) = collector.stats.lock() {
+                let entry = &mut map.entry(key).or_default().filtered_vector;
+                entry.ann_candidates += work.ann_candidates;
+                entry.quality_rounds += work.quality_rounds;
+                entry.topk_updates += work.topk_updates;
+                entry.predicate_evaluations += work.predicate_evaluations;
+                entry.navigation_visits += work.navigation_visits;
+                entry.navigation_distances += work.navigation_distances;
+                entry.reranks += work.reranks;
+                entry.materialized += work.materialized;
+                entry.batches += work.batches;
+                entry.fallbacks += work.fallbacks;
+            }
+        }
+    });
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VectorRequestedMode {
     #[default]
@@ -94,6 +131,7 @@ pub(crate) struct NodeStats {
     pub rowid_duplicates_removed: u64,
     pub rowid_misses: u64,
     pub rowid_rows_fetched: u64,
+    pub filtered_vector: FilteredVectorStats,
     pub rrf_branches: u8,
     pub rrf_input_rows: [u64; 8],
     pub rrf_unique_rows: [u64; 8],
@@ -1648,6 +1686,34 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
             if let Ok(mut map) = collector.stats.lock() {
                 if let Some(stats) = map.get(&from_key).copied() {
                     let entry = map.entry(to_key).or_default();
+                    entry.filtered_vector.predicate_evaluations = entry
+                        .filtered_vector
+                        .predicate_evaluations
+                        .saturating_add(stats.filtered_vector.predicate_evaluations);
+                    entry.filtered_vector.navigation_visits = entry
+                        .filtered_vector
+                        .navigation_visits
+                        .saturating_add(stats.filtered_vector.navigation_visits);
+                    entry.filtered_vector.navigation_distances = entry
+                        .filtered_vector
+                        .navigation_distances
+                        .saturating_add(stats.filtered_vector.navigation_distances);
+                    entry.filtered_vector.reranks = entry
+                        .filtered_vector
+                        .reranks
+                        .saturating_add(stats.filtered_vector.reranks);
+                    entry.filtered_vector.materialized = entry
+                        .filtered_vector
+                        .materialized
+                        .saturating_add(stats.filtered_vector.materialized);
+                    entry.filtered_vector.batches = entry
+                        .filtered_vector
+                        .batches
+                        .saturating_add(stats.filtered_vector.batches);
+                    entry.filtered_vector.fallbacks = entry
+                        .filtered_vector
+                        .fallbacks
+                        .saturating_add(stats.filtered_vector.fallbacks);
                     entry.source = StatsSource::Mirrored;
                     entry.first_row_ns = entry.first_row_ns.saturating_add(stats.first_row_ns);
                     entry.time_ns = entry.time_ns.saturating_add(stats.time_ns);
@@ -1960,6 +2026,25 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                 suffix.push_str(&format!(" match_rows={}", s.match_rows));
             }
             for (name, value) in [
+                (
+                    "vector_predicate_evaluations",
+                    s.filtered_vector.predicate_evaluations,
+                ),
+                (
+                    "vector_navigation_visits",
+                    s.filtered_vector.navigation_visits,
+                ),
+                (
+                    "vector_navigation_distances",
+                    s.filtered_vector.navigation_distances,
+                ),
+                ("vector_heap_reranks", s.filtered_vector.reranks),
+                ("vector_ann_candidates", s.filtered_vector.ann_candidates),
+                ("vector_quality_rounds", s.filtered_vector.quality_rounds),
+                ("vector_topk_updates", s.filtered_vector.topk_updates),
+                ("vector_materialized", s.filtered_vector.materialized),
+                ("vector_batches", s.filtered_vector.batches),
+                ("vector_exact_fallbacks", s.filtered_vector.fallbacks),
                 ("mrr_windows", s.mrr_windows),
                 ("mrr_rids", s.mrr_rids),
                 ("mrr_unique_pages", s.mrr_unique_pages),

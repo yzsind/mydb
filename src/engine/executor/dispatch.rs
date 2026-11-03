@@ -7375,11 +7375,24 @@ fn execute_sql_prepare(
                     // The new statement's placeholders must not see parameters
                     // belonging to the surrounding PREPARE command.
                     crate::engine::params::with_params(Vec::new(), || {
-                        super::select::describe_statement_columns(
+                        let mut columns = super::select::describe_statement_columns(
                             db,
                             session,
                             &validation_statement,
-                        )
+                        )?;
+                        if let Statement::Select(select) = &validation_statement {
+                            if select.projection.len() == columns.len() {
+                                for (item, column) in select.projection.iter().zip(&mut columns) {
+                                    if let crate::parser::SelectItem::Expr { expr, .. } = item {
+                                        column.source.dynamic_parameter |=
+                                            crate::engine::expr::xml::parameter_dependent_result(
+                                                expr,
+                                            );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(columns)
                     })
                 })
             },
@@ -7416,6 +7429,11 @@ fn execute_sql_prepare(
     session.insert_sql_prepared_statement(
         key,
         crate::engine::api::SessionSqlPreparedStatement {
+            xml_parameter_types: crate::engine::expr::xml::parameter_history(
+                &sql,
+                parameter_count,
+                &session.collation_connection,
+            ),
             pfs,
             original_sql: Arc::from(sql.as_str()),
             parser_sql_mode_bits: session.temporal_sql_mode_bits,
@@ -7464,6 +7482,13 @@ fn execute_sql_prepared(
         .iter()
         .map(|name| session.user_variable(name).cloned().unwrap_or(Value::Null))
         .collect::<Vec<_>>();
+    let saved_xml_types = session.xml_parameter_types.take();
+    let saved_xml_binding = session.xml_parameter_binding;
+    crate::engine::expr::xml::bind_parameter_history(
+        session,
+        &prepared.xml_parameter_types,
+        &params,
+    );
     super::warn_statement_digest_charset_conversion(&prepared.original_sql);
     let saved_database =
         std::mem::replace(&mut session.current_database, prepared.database.clone());
@@ -7489,6 +7514,8 @@ fn execute_sql_prepared(
         }
     });
     session.current_database = saved_database;
+    session.xml_parameter_types = saved_xml_types;
+    session.xml_parameter_binding = saved_xml_binding;
     if let Ok(result) = &mut response {
         if !prepared.routine_result_metadata {
             apply_sql_prepared_result_columns(result, &prepared.result_columns);

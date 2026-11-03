@@ -16,6 +16,8 @@ MYSQL_SOURCE = (
 # Workloads are deliberately explicit where an argument has a restricted domain.
 # Aliases inherit the same argument workload, but remain separate coverage items.
 EXPRESSIONS = {
+    "EXTRACTVALUE": "EXTRACTVALUE(CONCAT('<a><b>',CAST(n AS CHAR),'</b></a>'),'/a/b')",
+    "UPDATEXML": "UPDATEXML(CONCAT('<a><b>',CAST(n AS CHAR),'</b></a>'),'/a/b','<r/>')",
     "ABS": "ABS(n)",
     "ACOS": "ACOS(f/1000)",
     "ASIN": "ASIN(f/1000)",

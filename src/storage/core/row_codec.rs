@@ -3342,6 +3342,17 @@ pub trait RowDecodeSink {
     fn put_json(&mut self, col: usize, bytes: &[u8]);
     fn put_geometry(&mut self, col: usize, bytes: &[u8]);
     fn put_vector(&mut self, col: usize, bytes: &[u8]);
+    /// Borrow a native fixed VECTOR lane; ordinary sinks retain owned values.
+    fn put_vector_ref(&mut self, col: usize, value: crate::vector::VectorRef<'_>) {
+        self.put_value(
+            col,
+            Value::Vector(crate::vector::VectorValue::new(
+                value.datatype,
+                value.dimension,
+                value.payload.to_vec(),
+            )),
+        );
+    }
     /// Pre-formatted `Value` envelope. Fallback for paths that
     /// haven't yet been carved into a typed putter (Enum/Set,
     /// LOB-materialised externals, format conversions).
@@ -3837,13 +3848,18 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
             has_external,
         );
 
-        if codec.defaults_all_null() {
-            for dest in 0..plan.out_len {
-                sink.put_null(dest);
+        // Sinks may append rather than overwrite. Emit defaults only for
+        // absent columns so each stored row contributes one cell per lane.
+        let null_defaults = codec.defaults_all_null();
+        for step in &fast.steps {
+            if (step.null_idx as usize) < count {
+                continue;
             }
-        } else {
-            for (dest, column) in plan.columns.iter().enumerate() {
-                sink.put_value(dest, codec.default_for_column(*column));
+            let dest = step.dest as usize;
+            if null_defaults {
+                sink.put_null(dest);
+            } else {
+                sink.put_value(dest, codec.default_for_column(plan.columns[dest]));
             }
         }
 
@@ -3900,14 +3916,13 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
             }
             if let Some(fixed_off) = layout.fixed_offsets[null_idx] {
                 let width = fixed_width_for_kind(&layout_col.kind).unwrap();
-                sink.put_value(
+                put_fixed_kind_through_sink(
+                    sink,
                     dest,
-                    decode_fixed_for_kind(
-                        &layout_col.kind,
-                        &input[section.fixed_start + fixed_off
-                            ..section.fixed_start + fixed_off + width],
-                    )?,
-                );
+                    &layout_col.kind,
+                    &input
+                        [section.fixed_start + fixed_off..section.fixed_start + fixed_off + width],
+                )?;
             } else if let Some(var_ord) = layout.var_ords[null_idx] {
                 let (offset, len) =
                     read_dir_entry(input, section.dir_start, section.payload_start, var_ord)?;
@@ -4000,11 +4015,12 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
         let layout_col = &stored_columns[null_idx];
         if let Some(fixed_off) = layout.fixed_offsets[null_idx] {
             let width = fixed_width_for_kind(&layout_col.kind).unwrap();
-            let value = decode_fixed_for_kind(
+            put_fixed_kind_through_sink(
+                sink,
+                dest,
                 &layout_col.kind,
                 &input[section.fixed_start + fixed_off..section.fixed_start + fixed_off + width],
             )?;
-            sink.put_value(dest, value);
         } else if let Some(var_ord) = layout.var_ords[null_idx] {
             let (offset, len) =
                 read_dir_entry(input, section.dir_start, section.payload_start, var_ord)?;
@@ -4026,6 +4042,28 @@ pub(crate) fn decode_row_into_sink_fast<S: RowDecodeSink>(
         }
     }
     Ok(true)
+}
+
+#[inline(always)]
+fn put_fixed_kind_through_sink<S: RowDecodeSink>(
+    sink: &mut S,
+    dest: usize,
+    kind: &ColumnKind,
+    bytes: &[u8],
+) -> Result<(), QueryError> {
+    if let ColumnKind::VectorFixed { dim, datatype } = kind {
+        sink.put_vector_ref(
+            dest,
+            crate::vector::VectorRef {
+                datatype: *datatype,
+                dimension: *dim,
+                payload: bytes,
+            },
+        );
+    } else {
+        sink.put_value(dest, decode_fixed_for_kind(kind, bytes)?);
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -7122,6 +7160,194 @@ mod row_codec_tests {
         assert!(plan
             .fast_for_layout(2)
             .is_some_and(|fast| fast.covers_full_projection));
+    }
+
+    #[test]
+    fn native_vector_sink_matches_owned_decoder_across_domains_and_layouts() {
+        use crate::engine::executor::vec::batch::{BatchAccumSink, ColumnAccumulator};
+        use crate::types::ColumnType;
+        use crate::vector::VectorDataType;
+        for datatype in [
+            VectorDataType::Float32,
+            VectorDataType::Float16,
+            VectorDataType::BFloat16,
+            VectorDataType::Int8,
+            VectorDataType::Binary,
+        ] {
+            for dimension in [3, 65, 768, 4097] {
+                let text = format!(
+                    "[{}]",
+                    (0..dimension)
+                        .map(|i| {
+                            if datatype == VectorDataType::Binary {
+                                (i % 2).to_string()
+                            } else {
+                                (i % 17 - 8).to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                let vector =
+                    crate::engine::vector::codec::parse_typed_text(&text, datatype).unwrap();
+                for declared in [Some(dimension as u32), None] {
+                    let mut codec = test_row_codec_from_columns(vec![
+                        ColumnCodec {
+                            kind: ColumnKind::Int {
+                                width: 8,
+                                signed: true,
+                            },
+                        },
+                        ColumnCodec {
+                            kind: vector_column_kind(declared, datatype),
+                        },
+                        ColumnCodec {
+                            kind: ColumnKind::Int {
+                                width: 8,
+                                signed: true,
+                            },
+                        },
+                    ]);
+                    let mut historical = codec.layouts[0].clone();
+                    historical.layout_id = 2;
+                    codec.layouts.push(historical);
+                    codec.active_layout_id = 2;
+                    let plan = RowDecodePlan::compile_with_codec(&[1, 0, 2], &codec);
+                    for layout in [1, 2] {
+                        let mut accumulators = [
+                            ColumnAccumulator::for_type(ColumnType::Vector, 1),
+                            ColumnAccumulator::for_type(ColumnType::LongLong, 1),
+                            ColumnAccumulator::for_type(ColumnType::LongLong, 1),
+                        ];
+                        let mapping = [0, 2, 1];
+                        for value in [
+                            Value::Null,
+                            Value::Vector(vector.clone()),
+                            Value::Null,
+                            Value::Vector(vector.clone()),
+                        ] {
+                            let values = [Value::Int(7), value.clone(), Value::Int(11)];
+                            let mut encoded = Vec::new();
+                            encode_row_schema_into(&values, &codec, &mut encoded).unwrap();
+                            let mut oracle = vec![Value::Null; 3];
+                            decode_row_schema_columns_into_with_plan_ext_for_layout(
+                                &encoded,
+                                &codec,
+                                layout,
+                                &plan,
+                                &mut oracle,
+                                false,
+                            )
+                            .unwrap();
+                            assert_eq!(oracle, [value, Value::Int(7), Value::Int(11)]);
+                            assert!(decode_row_into_sink_fast(
+                                &encoded,
+                                &codec,
+                                layout,
+                                &plan,
+                                &mut BatchAccumSink::mapped(&mut accumulators, &mapping),
+                                false
+                            )
+                            .unwrap());
+                        }
+                        let [vectors, tags, ids] = accumulators.map(ColumnAccumulator::finish);
+                        assert_eq!(vectors.len(), 4);
+                        assert_eq!(vectors.value_at(0), Value::Null);
+                        assert_eq!(vectors.value_at(1), Value::Vector(vector.clone()));
+                        assert_eq!(vectors.value_at(2), Value::Null);
+                        assert_eq!(vectors.value_at(3), Value::Vector(vector.clone()));
+                        for i in 0..4 {
+                            assert_eq!(tags.value_at(i), Value::Int(11));
+                            assert_eq!(ids.value_at(i), Value::Int(7));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_row_sink_emits_one_cell_per_projected_column() {
+        use crate::engine::executor::vec::batch::{BatchAccumSink, ColumnAccumulator};
+        use crate::types::ColumnType;
+        let codec = test_row_codec_from_columns(vec![
+            ColumnCodec {
+                kind: ColumnKind::Int {
+                    width: 8,
+                    signed: true,
+                },
+            },
+            ColumnCodec {
+                kind: ColumnKind::VectorFixed {
+                    dim: 3,
+                    datatype: crate::vector::VectorDataType::Float32,
+                },
+            },
+            ColumnCodec {
+                kind: ColumnKind::Int {
+                    width: 8,
+                    signed: true,
+                },
+            },
+        ]);
+        let values = [
+            Value::Int(7),
+            Value::Vector(crate::engine::vector::codec::from_f32(&[1., 2., 3.])),
+            Value::Int(11),
+        ];
+        for null_defaults in [true, false] {
+            let mut codec = codec.clone();
+            if !null_defaults {
+                codec.defaults = vec![Value::Int(17), values[1].clone(), Value::Int(19)];
+            }
+            let plan = RowDecodePlan::compile_with_codec(&[1, 0, 2], &codec);
+            for count in 0..=3 {
+                let prefix_codec = test_row_codec_from_columns(codec.columns[..count].to_vec());
+                let mut encoded = Vec::new();
+                encode_row_schema_into(&values[..count], &prefix_codec, &mut encoded).unwrap();
+                assert_eq!(
+                    encoded[0] as usize, count,
+                    "fixture must store the exact column prefix"
+                );
+                let mut oracle = Vec::new();
+                decode_row_schema_columns_into_with_plan_ext_for_layout(
+                    &encoded,
+                    &codec,
+                    codec.active_layout_id,
+                    &plan,
+                    &mut oracle,
+                    false,
+                )
+                .unwrap();
+                let mut accumulators = [
+                    ColumnAccumulator::for_type(ColumnType::Vector, 1),
+                    ColumnAccumulator::for_type(ColumnType::LongLong, 1),
+                    ColumnAccumulator::for_type(ColumnType::LongLong, 1),
+                ];
+                assert!(decode_row_into_sink_fast(
+                    &encoded,
+                    &codec,
+                    codec.active_layout_id,
+                    &plan,
+                    &mut BatchAccumSink::new(&mut accumulators),
+                    false
+                )
+                .unwrap());
+                let columns = accumulators.map(ColumnAccumulator::finish);
+                for (column, expected) in columns.iter().zip(oracle) {
+                    assert_eq!(
+                        column.len(),
+                        1,
+                        "one physical row must append one cell per column"
+                    );
+                    assert_eq!(
+                        column.value_at(0),
+                        expected,
+                        "prefix {count}, null defaults {null_defaults}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

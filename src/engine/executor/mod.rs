@@ -403,7 +403,7 @@ pub(crate) fn warn_successful_source_syntax_with_mode(sql: &str, parser_mode_bit
 
     if !first_word_is("CREATE") && !first_word_is("ALTER") {
         if !first_word_is("SET") {
-            for token in &tokens {
+            for (index, token) in tokens.iter().enumerate() {
                 let Token::Word(value) = token else {
                     continue;
                 };
@@ -417,6 +417,14 @@ pub(crate) fn warn_successful_source_syntax_with_mode(sql: &str, parser_mode_bit
                         crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
                         "'utf8mb3' is deprecated; use utf8mb4 instead",
                     );
+                } else if matches!(value.value.to_ascii_uppercase().as_str(), "UTF8" | "_UTF8")
+                    && (value.value.starts_with('_')
+                        || index
+                            .checked_sub(1)
+                            .is_some_and(|i| word(&tokens[i], "USING")))
+                {
+                    crate::engine::api::push_statement_warning(crate::error::ConditionLevel::Warning,crate::error::catalog::ER_DEPRECATED_UTF8_ALIAS,
+                        "'utf8' is currently an alias for the character set UTF8MB3, but will be an alias for UTF8MB4 in a future release. Please consider using UTF8MB4 in order to be unambiguous.");
                 } else if value.value.eq_ignore_ascii_case("macce") {
                     crate::engine::api::push_statement_warning(
                         crate::error::ConditionLevel::Warning,
@@ -533,8 +541,19 @@ pub(crate) fn warn_successful_source_syntax_with_mode(sql: &str, parser_mode_bit
             warning_3720_count += 1;
             continue;
         }
-        if type_name == "UTF8" {
-            warning_3719_count += 1;
+        if matches!(type_name.as_str(), "UTF8" | "_UTF8") {
+            let charset_context = type_name.starts_with('_')
+                || index.checked_sub(1).is_some_and(|i| {
+                    ["USING", "NAMES", "SET"]
+                        .iter()
+                        .any(|name| word(&tokens[i], name))
+                })
+                || index
+                    .checked_sub(2)
+                    .is_some_and(|i| word(&tokens[i], "CHARSET") || word(&tokens[i], "SET"));
+            if charset_context {
+                warning_3719_count += 1;
+            }
             continue;
         }
         let clause_end = matching_type_clause_end(&tokens, index);
@@ -630,7 +649,7 @@ pub(crate) fn warn_successful_source_syntax_with_mode(sql: &str, parser_mode_bit
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_DEPRECATED_UTF8_ALIAS,
-            "The utf8 alias currently denotes utf8mb3; use utf8mb4 explicitly",
+            "'utf8' is currently an alias for the character set UTF8MB3, but will be an alias for UTF8MB4 in a future release. Please consider using UTF8MB4 in order to be unambiguous.",
         );
     }
 }
@@ -700,6 +719,7 @@ pub(crate) fn source_syntax_warning_scan_required(sql: &str, parser_mode_bits: u
             b'b' | b'B' | b'u' | b'U' | b'm' | b'M'
                 if word_at(index, b"BINARY")
                     || word_at(index, b"UTF8MB3")
+                    || word_at(index, b"UTF8")
                     || word_at(index, b"MACCE") =>
             {
                 return true;
@@ -784,6 +804,12 @@ fn finish_statement_diagnostics(
                 crate::error::ConditionLevel::Error,
                 err,
             ));
+            conditions.extend(err.followup_errors().iter().map(|condition| {
+                crate::engine::api::SqlWarning::from_error(
+                    crate::error::ConditionLevel::Error,
+                    condition,
+                )
+            }));
         }
         session.set_warnings(conditions);
     }

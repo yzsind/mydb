@@ -406,9 +406,19 @@ pub(crate) struct QuantQuery {
     sq_weights: Vec<f64>,
     _charge: ControlledMemoryCharge,
 }
+impl QuantQuery {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self._charge.bytes()
+    }
+}
 /// Independent reductions allow LLVM to vectorize byte-to-f64 scoring on
 /// NEON/AVX without reassociating a serial IEEE sum or narrowing native values.
 fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if weights.len() >= 8 && code.len() == weights.len() && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: dispatch enables AVX2 and equal lengths bound every load.
+        return unsafe { sq8_weighted_dot_avx2(code, weights) };
+    }
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { sq8_weighted_dot_neon(code, weights) }
@@ -417,6 +427,40 @@ fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
     {
         sq8_weighted_dot_portable(code, weights)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq8_weighted_dot_avx2(code: &[u8], weights: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_pd(); 2];
+    let mut i = 0;
+    while i + 8 <= weights.len() {
+        let packed = _mm_cvtsi64_si128(std::ptr::read_unaligned(code.as_ptr().add(i).cast()));
+        let codes = _mm256_cvtepu8_epi32(packed);
+        let low = _mm256_cvtepi32_pd(_mm256_castsi256_si128(codes));
+        let high = _mm256_cvtepi32_pd(_mm256_extracti128_si256(codes, 1));
+        // Separate multiply/add retains the portable eight-lane IEEE order.
+        sums[0] = _mm256_add_pd(
+            sums[0],
+            _mm256_mul_pd(low, _mm256_loadu_pd(weights.as_ptr().add(i))),
+        );
+        sums[1] = _mm256_add_pd(
+            sums[1],
+            _mm256_mul_pd(high, _mm256_loadu_pd(weights.as_ptr().add(i + 4))),
+        );
+        i += 8;
+    }
+    let mut lanes = [0.0; 8];
+    _mm256_storeu_pd(lanes.as_mut_ptr(), sums[0]);
+    _mm256_storeu_pd(lanes.as_mut_ptr().add(4), sums[1]);
+    // The portable tail is reduced separately before its final addition.
+    let tail = code[i..]
+        .iter()
+        .zip(&weights[i..])
+        .map(|(&c, &w)| c as f64 * w)
+        .sum::<f64>();
+    lanes.into_iter().sum::<f64>() + tail
 }
 
 fn sq4_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
@@ -1480,6 +1524,43 @@ mod tests {
                     .sum::<f64>();
                 let actual = sq8_weighted_dot(&code, &weights);
                 assert!((actual - reference).abs() <= 1e-12 * magnitude * dimension as f64 * 255.0);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sq8_avx2_preserves_portable_bits_with_unaligned_codes_and_tails() {
+        for dimension in [
+            0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 127, 768, 769, 1536,
+        ] {
+            for prefix in 0..32 {
+                let mut bytes = vec![0; prefix + dimension];
+                for (index, value) in bytes[prefix..].iter_mut().enumerate() {
+                    *value = (index * 71 + prefix * 13) as u8;
+                }
+                let code = &bytes[prefix..];
+                for magnitude in [0.0, -0.0, f64::MIN_POSITIVE, 1e-200, 1.0, 1e100] {
+                    let weights = (0..dimension)
+                        .map(|i| ((i * 7919 % 997) as f64 - 498.0) / 997.0 * magnitude)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        sq8_weighted_dot(code, &weights).to_bits(),
+                        sq8_weighted_dot_portable(code, &weights).to_bits(),
+                        "dimension={dimension} prefix={prefix} magnitude={magnitude}"
+                    );
+                }
+            }
+        }
+        // Invalid internal shape retains the established bounded fallback.
+        for code_len in [0, 1, 7, 8, 9, 17] {
+            for weight_len in [0, 1, 7, 8, 9, 17] {
+                let code = vec![255; code_len];
+                let weights = vec![0.37; weight_len];
+                assert_eq!(
+                    sq8_weighted_dot(&code, &weights).to_bits(),
+                    sq8_weighted_dot_portable(&code, &weights).to_bits()
+                );
             }
         }
     }

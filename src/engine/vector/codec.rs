@@ -77,6 +77,12 @@ pub(crate) fn validate_internal<T: VectorInput + ?Sized>(value: &T) -> Result<()
 /// SIMD checks preserve the exact IEEE exponent-bit predicate and accept
 /// unaligned borrowed heap payloads. Byte loads avoid alignment assumptions.
 fn finite_float32_payload(bytes: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime dispatch enables AVX2; the kernel uses bounded,
+        // unaligned byte loads and retains the scalar exponent-bit predicate.
+        return unsafe { finite_float32_avx2(bytes) };
+    }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     unsafe {
         use std::arch::aarch64::*;
@@ -113,6 +119,11 @@ fn finite_float32_scalar(bytes: &[u8]) -> bool {
         .all(|c| u32::from_le_bytes(c.try_into().unwrap()) & 0x7f80_0000 != 0x7f80_0000)
 }
 fn finite_float16_payload<const MASK: u16>(bytes: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime dispatch enables AVX2 and every load is bounded.
+        return unsafe { finite_float16_avx2::<MASK>(bytes) };
+    }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     unsafe {
         use std::arch::aarch64::*;
@@ -141,6 +152,68 @@ fn finite_float16_scalar<const MASK: u16>(bytes: &[u8]) -> bool {
     bytes
         .chunks_exact(2)
         .all(|c| u16::from_le_bytes(c.try_into().unwrap()) & MASK != MASK)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn finite_float32_avx2(bytes: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let mask = _mm256_set1_epi32(0x7f80_0000);
+    let mut i = 0;
+    while i + 128 <= bytes.len() {
+        let mut invalid = _mm256_setzero_si256();
+        for offset in [0, 32, 64, 96] {
+            let value = _mm256_loadu_si256(bytes.as_ptr().add(i + offset).cast());
+            invalid = _mm256_or_si256(
+                invalid,
+                _mm256_cmpeq_epi32(_mm256_and_si256(value, mask), mask),
+            );
+        }
+        if _mm256_testz_si256(invalid, invalid) == 0 {
+            return false;
+        }
+        i += 128;
+    }
+    while i + 32 <= bytes.len() {
+        let value = _mm256_loadu_si256(bytes.as_ptr().add(i).cast());
+        let invalid = _mm256_cmpeq_epi32(_mm256_and_si256(value, mask), mask);
+        if _mm256_testz_si256(invalid, invalid) == 0 {
+            return false;
+        }
+        i += 32;
+    }
+    finite_float32_scalar(&bytes[i..])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn finite_float16_avx2<const MASK: u16>(bytes: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let mask = _mm256_set1_epi16(MASK as i16);
+    let mut i = 0;
+    while i + 128 <= bytes.len() {
+        let mut invalid = _mm256_setzero_si256();
+        for offset in [0, 32, 64, 96] {
+            let value = _mm256_loadu_si256(bytes.as_ptr().add(i + offset).cast());
+            invalid = _mm256_or_si256(
+                invalid,
+                _mm256_cmpeq_epi16(_mm256_and_si256(value, mask), mask),
+            );
+        }
+        if _mm256_testz_si256(invalid, invalid) == 0 {
+            return false;
+        }
+        i += 128;
+    }
+    while i + 32 <= bytes.len() {
+        let value = _mm256_loadu_si256(bytes.as_ptr().add(i).cast());
+        let invalid = _mm256_cmpeq_epi16(_mm256_and_si256(value, mask), mask);
+        if _mm256_testz_si256(invalid, invalid) == 0 {
+            return false;
+        }
+        i += 32;
+    }
+    finite_float16_scalar::<MASK>(&bytes[i..])
 }
 
 pub(crate) fn normalize_internal<T: VectorInput + ?Sized>(
@@ -1460,6 +1533,77 @@ mod quality_tests {
             } else {
                 assert!(actual.is_err(), "{token}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod finite_payload_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn finite_payload_dispatch_matches_scalar_for_unaligned_lanes_and_tails() {
+        for width in [2, 4] {
+            for dim in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 129] {
+                for prefix in 0..32 {
+                    let mut payload = vec![0; prefix + width * dim];
+                    let bytes = &mut payload[prefix..];
+                    let value = if width == 4 {
+                        1.0f32.to_le_bytes().to_vec()
+                    } else {
+                        1u16.to_le_bytes().to_vec()
+                    };
+                    for cell in bytes.chunks_exact_mut(width) {
+                        cell.copy_from_slice(&value);
+                    }
+                    for lane in 0..dim {
+                        for invalid in [0x7f80_0000u32, 0xff80_0000, 0x7fc0_0001] {
+                            let bits = if width == 4 {
+                                invalid.to_le_bytes().to_vec()
+                            } else {
+                                ((invalid >> 16) as u16).to_le_bytes().to_vec()
+                            };
+                            let original = bytes[lane * width..(lane + 1) * width].to_vec();
+                            bytes[lane * width..(lane + 1) * width].copy_from_slice(&bits);
+                            if width == 4 {
+                                assert_eq!(
+                                    finite_float32_payload(bytes),
+                                    finite_float32_scalar(bytes)
+                                );
+                            } else {
+                                assert_eq!(
+                                    finite_float16_payload::<0x7c00>(bytes),
+                                    finite_float16_scalar::<0x7c00>(bytes)
+                                );
+                                assert_eq!(
+                                    finite_float16_payload::<0x7f80>(bytes),
+                                    finite_float16_scalar::<0x7f80>(bytes)
+                                );
+                            }
+                            bytes[lane * width..(lane + 1) * width].copy_from_slice(&original);
+                        }
+                    }
+                    assert!(if width == 4 {
+                        finite_float32_payload(bytes)
+                    } else {
+                        finite_float16_payload::<0x7c00>(bytes)
+                            && finite_float16_payload::<0x7f80>(bytes)
+                    });
+                }
+            }
+        }
+        let bits = (0..=u16::MAX)
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        for bytes in bits.chunks(128) {
+            assert_eq!(
+                finite_float16_payload::<0x7c00>(bytes),
+                finite_float16_scalar::<0x7c00>(bytes)
+            );
+            assert_eq!(
+                finite_float16_payload::<0x7f80>(bytes),
+                finite_float16_scalar::<0x7f80>(bytes)
+            );
         }
     }
 }

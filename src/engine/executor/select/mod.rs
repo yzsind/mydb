@@ -192,6 +192,34 @@ fn expression_column_source_for_expr(
         });
         source.decimals = Some(31);
     }
+    if matches!(expr, Expr::Function { name, .. } if crate::engine::expr::xml::is_xml(name)) {
+        source.wire_type = Some(251);
+        if descriptor
+            .collation_id
+            .and_then(crate::charset::resolve_collation_id)
+            .is_some_and(|c| c.binary)
+        {
+            source.flags |= crate::mysql::protocol::BINARY_FLAG;
+        }
+    }
+    if matches!(expr, Expr::Function{name,..} if name.eq_ignore_ascii_case("REPLACE"))
+        && descriptor.column_type() == ColumnType::Blob
+    {
+        source.wire_type = Some(if descriptor.max_octets.is_some_and(|n| n <= 16_777_215) {
+            250
+        } else {
+            251
+        });
+    }
+    if matches!(expr, Expr::Function{name,..} if matches!(name.to_ascii_uppercase().as_str(),"SUM"|"AVG"))
+        && descriptor.max_octets == Some(23)
+        && matches!(
+            descriptor.kind,
+            crate::engine::expr_type::ExprTypeKind::Float { .. }
+        )
+    {
+        source.wire_type = Some(5);
+    }
     source.dynamic_parameter = descriptor.dynamic_parameter;
     if !matches!(
         descriptor.kind,
@@ -200,7 +228,28 @@ fn expression_column_source_for_expr(
         descriptor.max_octets = descriptor.max_octets.or(source.length);
         descriptor.collation_id = descriptor.collation_id.or(source.collation_id);
         descriptor.apply_to_source(&mut source);
+        if matches!(
+            descriptor.kind,
+            crate::engine::expr_type::ExprTypeKind::String {
+                kind: crate::engine::expr_type::StringKind::Text
+                    | crate::engine::expr_type::StringKind::Blob
+            }
+        ) && source.wire_type.is_none()
+        {
+            if let Some(bytes) = descriptor.max_octets {
+                source.wire_type = Some(if bytes <= 255 {
+                    249
+                } else if bytes <= 65_535 {
+                    252
+                } else if bytes <= 16_777_215 {
+                    250
+                } else {
+                    251
+                });
+            }
+        }
     }
+    source.dynamic_parameter |= crate::engine::expr::xml::parameter_dependent_result(expr);
     source
 }
 
@@ -4466,6 +4515,7 @@ fn walk_plan_tables<F: FnMut(&PlanTable)>(plan: &PhysicalPlan, f: &mut F) {
         | PhysicalPlan::FulltextScan { table, .. }
         | PhysicalPlan::SpatialScan { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::VectorBruteScan { table, .. }
         | PhysicalPlan::ParallelSeqScan { table, .. }
         | PhysicalPlan::ParallelZoneMapScan { table, .. }

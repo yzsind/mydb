@@ -272,10 +272,17 @@ fn hnsw_end_to_end_bench() {
         .unwrap_or_else(|_| "base,filter,delete,rebuild,update,pending,checkpoint".into());
     let section = |name: &str| sections.split(',').any(|s| s.trim() == name);
     let k = 10;
+    let force_ann = env_or("VB_FORCE_ANN", 1u8) != 0;
     let _env = [
         ("MYDB_VECTOR_STORAGE", backend.as_str()),
-        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
-        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        (
+            "MYDB_HNSW_BRUTE_THRESHOLD",
+            if force_ann { "0" } else { "10000" },
+        ),
+        (
+            "MYDB_HNSW_BRUTE_FILTER_ROWS",
+            if force_ann { "0" } else { "1000" },
+        ),
     ]
     .map(|(k, v)| {
         std::env::set_var(k, v);
@@ -422,7 +429,12 @@ fn hnsw_end_to_end_bench() {
                 .take(limit)
                 .map(|q| knn_sql(&ds, q, k, None, Some(filter)))
                 .collect();
-            report(label, &measure(&engine, &sqls, &truths, k));
+            let measured = measure(&engine, &sqls, &truths, k);
+            assert!(
+                measured.recall >= env_or("VB_MIN_RECALL", 0.0),
+                "{label}: recall below calibration target"
+            );
+            report(label, &measured);
         }
     }
 

@@ -1,6 +1,74 @@
 use super::*;
 
 #[test]
+fn vector_cost_signatures_cover_nested_literals_and_output_aliases() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut first = crate::engine::api::SessionContext::default();
+    first.sysvars.mydb_hnsw_ef_search = 16;
+    first.sysvars.mydb_hnsw_ef_search_explicit = true;
+    let mut second = first.clone();
+    second.sysvars.mydb_hnsw_ef_search = 512;
+    for sql in [
+        "SELECT id,L2_DISTANCE(v,TO_VECTOR('[1,2,3]')) AS d FROM t ORDER BY d LIMIT 10",
+        "SELECT (SELECT id FROM t ORDER BY COSINE_DISTANCE(v,TO_VECTOR('[1,2,3]')) LIMIT 1)",
+        "SELECT id FROM (WITH q AS (SELECT id FROM t ORDER BY MAX_INNER_PRODUCT_DISTANCE(v,TO_VECTOR('[1,2,3]')) LIMIT 10) SELECT id FROM q) AS s",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u ORDER BY HAMMING_DISTANCE(v,TO_VECTOR('[1,0]','BINARY')) LIMIT 1)",
+    ] {
+        let crate::parser::Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+            panic!("SELECT required")
+        };
+        let a = crate::engine::expr::with_session_expr_info(&first, || {
+            parameter_selectivity_signature(engine.db_for_tests(), &select, &[])
+        });
+        let b = crate::engine::expr::with_session_expr_info(&second, || {
+            parameter_selectivity_signature(engine.db_for_tests(), &select, &[])
+        });
+        assert!(!a.is_empty(), "{sql}");
+        assert_ne!(a, b, "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM t WHERE id=7",
+        "SELECT id FROM t ORDER BY LOWER(label) LIMIT 10",
+    ] {
+        let crate::parser::Statement::Select(select) = crate::parser::parse_statement(sql).unwrap()
+        else {
+            panic!("SELECT required")
+        };
+        for session in [&first, &second] {
+            assert!(
+                crate::engine::expr::with_session_expr_info(session, || {
+                    parameter_selectivity_signature(engine.db_for_tests(), &select, &[])
+                })
+                .is_empty(),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn planning_row_goals_use_explicit_bindings_without_exposing_execution_values() {
+    let limit = LimitValue::Placeholder(0);
+    let offset_comma = LimitValue::OffsetCommaPlaceholder(0);
+    assert_eq!(limit_usize(Some(&limit)), None);
+    crate::engine::params::with_params_slice(&[Value::Int(99)], || {
+        assert_eq!(limit_usize(Some(&limit)), Some(99));
+        with_planning_params(&[Value::UInt(7)], || {
+            assert_eq!(limit_usize(Some(&limit)), Some(7));
+            assert_eq!(limit_usize(Some(&offset_comma)), Some(7));
+            assert_eq!(crate::engine::params::current_param_usize(0), Some(99));
+            for invalid in [Value::Int(-1), Value::Null, Value::Double(3.0)] {
+                with_planning_params(&[invalid], || assert_eq!(limit_usize(Some(&limit)), None));
+            }
+            assert_eq!(limit_usize(Some(&limit)), Some(7));
+        });
+        assert_eq!(limit_usize(Some(&limit)), Some(99));
+    });
+    assert_eq!(limit_usize(Some(&limit)), None);
+}
+
+#[test]
 fn vector_audit_folded_query_values_preserve_text_and_binary_domains() {
     for text in ["abcd", "abcdefghijklmnop", "1,2,3,4", "[1,nan]"] {
         for value in [

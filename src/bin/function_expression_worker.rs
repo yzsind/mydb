@@ -17,7 +17,9 @@ struct Request {
     #[serde(default)]
     prepared: bool,
     #[serde(default)]
-    params: Vec<i64>,
+    params: Vec<Json>,
+    #[serde(default)]
+    capture_prepared_metadata: bool,
     #[serde(default = "sample_limit")]
     sample_limit: usize,
 }
@@ -53,6 +55,7 @@ fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Er
     let mut bytes = 0_u64;
     let mut sample = Vec::new();
     let mut columns = Vec::new();
+    let mut prepared_columns = None;
     let start = Instant::now();
     // Both branches use the same drain/capture logic. Prepared statements are
     // reserved for the explicit parameter-expression cases.
@@ -86,7 +89,32 @@ fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Er
         }};
     }
     if request.prepared {
-        consume!(conn.exec_iter(&request.sql, request.params)?);
+        if request.capture_prepared_metadata {
+            let statement = conn.prep(&request.sql)?;
+            prepared_columns = Some(statement.columns().iter().map(|c|json!({
+                "name":c.name_str(),"type":format!("{:?}",c.column_type()),
+                "flags":c.flags().bits(),"charset":c.character_set(),"decimals":c.decimals(),"length":c.column_length(),
+            })).collect::<Vec<_>>());
+        }
+        let params = request
+            .params
+            .into_iter()
+            .map(|value| -> Result<Value, &'static str> {
+                match value {
+                    Json::Null => Ok(Value::NULL),
+                    Json::Bool(value) => Ok(Value::Int(value as i64)),
+                    Json::String(value) => Ok(Value::Bytes(value.into_bytes())),
+                    Json::Number(value) => value
+                        .as_i64()
+                        .map(Value::Int)
+                        .or_else(|| value.as_u64().map(Value::UInt))
+                        .or_else(|| value.as_f64().map(Value::Double))
+                        .ok_or("invalid numeric parameter"),
+                    _ => Err("parameters must be scalar JSON values"),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        consume!(conn.exec_iter(&request.sql, params)?);
     } else {
         consume!(conn.query_iter(&request.sql)?);
     }
@@ -95,7 +123,7 @@ fn run(conn: &mut Conn, request: Request) -> Result<Json, Box<dyn std::error::Er
         writer.flush()?;
     }
     Ok(json!({"status":"ok", "elapsed_ms":elapsed_ms, "rows":rows,
-        "first_column_bytes":bytes, "sample":sample, "columns":columns}))
+        "first_column_bytes":bytes, "sample":sample, "columns":columns,"prepared_columns":prepared_columns}))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -27716,6 +27716,17 @@ fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
     use crate::engine::api::QueryResponse;
     use crate::engine::api::SessionContext;
     use crate::engine::StorageQueryEngine;
+    // Keep this manually driven WAL schedule deterministic. Background
+    // source purge can legitimately backpressure replay of catalog tombstones
+    // while the replica reader is open. That path is covered separately by
+    // physical_replica_slot_reclaim_waits_for_old_snapshot_and_retries.
+    fn open_manual(path: &Path) -> StorageQueryEngine {
+        StorageQueryEngine::open_with_storage_config_without_background_workers(
+            path,
+            StorageConfig::from_env(),
+        )
+        .unwrap()
+    }
     fn copy_tree(source: &Path, target: &Path) {
         fs::create_dir_all(target).unwrap();
         for entry in fs::read_dir(source).unwrap() {
@@ -27738,7 +27749,7 @@ fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
     fs::create_dir_all("/tmp/mydb").unwrap();
     let master_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let replica_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-    let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+    let master = open_manual(master_dir.path());
     let source = master.database_for_replication();
     master.execute("CREATE TABLE spatial_repl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
     master
@@ -27749,7 +27760,7 @@ fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
     let mut role = crate::repl::role::RoleState::new_standalone();
     role.role = crate::repl::role::Role::Replica;
     crate::repl::role::save(replica_dir.path(), &role).unwrap();
-    let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+    let replica = open_manual(replica_dir.path());
     let target = replica.database_for_replication().clone();
     let mut reader_session = SessionContext::system_default();
     replica
@@ -27828,7 +27839,7 @@ fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
     drop(replica);
     role.promote_to_master_at(fork_lsn);
     crate::repl::role::save(replica_dir.path(), &role).unwrap();
-    let reopened = StorageQueryEngine::open(replica_dir.path()).unwrap();
+    let reopened = open_manual(replica_dir.path());
     assert_eq!(count(&reopened, &mut SessionContext::system_default()), "0");
     let QueryResponse::ResultSet(rs)=reopened.execute("SELECT id FROM spatial_repl_ddl FORCE INDEX(sp) WHERE MBRIntersects(g,ST_GeomFromText('POINT(1 1)'))").unwrap().materialize().unwrap() else {panic!("rows")};
     assert_eq!(

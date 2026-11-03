@@ -2314,6 +2314,8 @@ pub struct SessionContext {
     pub x509_subject: Option<String>,
     pub x509_issuer: Option<String>,
     pub user_variables: HashMap<String, Value>,
+    pub(crate) xml_parameter_binding: usize,
+    pub(crate) xml_parameter_types: Option<Arc<Vec<crate::engine::expr::xml::ParameterType>>>,
     /// Cached performance_schema variable rows only need rebuilding after a
     /// session-visible mutation (or a process-wide GLOBAL sysvar write).
     /// Keeping this local avoids a full sysvar-registry snapshot after every
@@ -2927,6 +2929,8 @@ pub(crate) struct SessionTempTable {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionSqlPreparedStatement {
+    pub(crate) xml_parameter_types:
+        Option<Arc<parking_lot::Mutex<Vec<crate::engine::expr::xml::ParameterType>>>>,
     pub(crate) pfs: crate::engine::session_registry::PreparedStatementSnapshot,
     /// Retained source text for diagnostics/reprepare and exact capacity
     /// accounting (`Arc<str>` has no spare capacity).
@@ -3237,6 +3241,8 @@ impl SessionContext {
             x509_subject: None,
             x509_issuer: None,
             user_variables: HashMap::new(),
+            xml_parameter_binding: 0,
+            xml_parameter_types: None,
             pfs_variables_dirty: true,
             pfs_variable_dirty_name: None,
             pfs_global_variable_epoch: 0,
