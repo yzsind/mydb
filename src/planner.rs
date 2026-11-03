@@ -3526,6 +3526,9 @@ fn validate_query_hints(db: &Database, select: &Select) -> Vec<String> {
 /// other rewrites).
 fn plan_has_parallel_node(plan: &PhysicalPlan) -> bool {
     match plan {
+        PhysicalPlan::FilteredVectorTopK {
+            parallel_degree, ..
+        } => *parallel_degree > 1,
         PhysicalPlan::Exchange { .. }
         | PhysicalPlan::ParallelSeqScan { .. }
         | PhysicalPlan::ParallelZoneMapScan { .. }

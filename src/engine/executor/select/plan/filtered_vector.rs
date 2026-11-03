@@ -4,6 +4,28 @@ use crate::engine::vector::hnsw_core::Scored;
 use crate::engine::vector::workspace::VectorQueryCharge;
 use std::collections::BinaryHeap;
 
+mod fused;
+
+struct FilteredPredicate {
+    columns: Vec<usize>,
+    compiled: Option<CompiledPredicate>,
+    eval_ctx: EvalQueryContext,
+}
+impl FilteredPredicate {
+    fn new(table: &PlanTable, filter: &Option<Expr>) -> Result<Self, QueryError> {
+        let columns = predicate_column_indices(filter, &table.schema)?;
+        let schema = projected_schema_view(&table.schema, &columns);
+        let compiled = filter
+            .as_ref()
+            .and_then(|expr| CompiledPredicate::compile(expr, &schema));
+        Ok(Self {
+            columns,
+            compiled,
+            eval_ctx: EvalQueryContext::default(),
+        })
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static AFTER_SNAPSHOT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -47,6 +69,9 @@ pub(super) fn execute_filtered_vector_topk(
     if k == 0 {
         return Ok(Vec::new());
     }
+    let parallel_degree = (*parallel_degree)
+        .min(crate::engine::executor::tuning::current_or_capture().scheduler_parallelism)
+        .max(1);
     let mut stats = super::super::analyze_stats::FilteredVectorStats::default();
     let mut charge = VectorQueryCharge::try_new(0)?;
     let mut best: BinaryHeap<Scored<(u64, RowId)>> = BinaryHeap::new();
@@ -74,8 +99,29 @@ pub(super) fn execute_filtered_vector_topk(
         scalar_access.as_ref()
     };
     let mut force_exact = *strategy == FilteredVectorStrategy::Exact || heap_required;
-    if (!force_exact && *strategy == FilteredVectorStrategy::PrefilterAnn)
-        || (*strategy == FilteredVectorStrategy::Exact && *parallel_degree > 1)
+    let mut predicate = FilteredPredicate::new(table, filter)?;
+    let fused = !heap_required
+        && *strategy == FilteredVectorStrategy::Exact
+        && fused::try_score(
+            db,
+            txn,
+            plan,
+            table,
+            scalar_access,
+            filter,
+            &predicate,
+            *column_index,
+            &query,
+            metric,
+            k,
+            parallel_degree,
+            &mut best,
+            &mut charge,
+            &mut stats,
+        )?;
+    if !fused
+        && ((!force_exact && *strategy == FilteredVectorStrategy::PrefilterAnn)
+            || (*strategy == FilteredVectorStrategy::Exact && parallel_degree > 1))
     {
         let attempt = (|| {
             let mut rows = crate::engine::vector::selection::RowSelection::new()?;
@@ -85,6 +131,7 @@ pub(super) fn execute_filtered_vector_topk(
                 table,
                 scalar_access,
                 filter,
+                &mut predicate,
                 &mut stats,
                 |sid, ids| rows.append(sid, ids),
             )?;
@@ -149,6 +196,7 @@ pub(super) fn execute_filtered_vector_topk(
                 k,
                 effort,
                 filter,
+                &mut predicate,
                 *exact_cost,
                 *predicate_cost,
                 selection.clone(),
@@ -165,7 +213,7 @@ pub(super) fn execute_filtered_vector_topk(
             })?;
         }
     }
-    if exact {
+    if exact && !fused {
         if *strategy != FilteredVectorStrategy::Exact {
             stats.fallbacks = stats.fallbacks.max(1);
         }
@@ -186,7 +234,13 @@ pub(super) fn execute_filtered_vector_topk(
             )
         };
         if let Some(rows) = selection.as_ref() {
-            if *parallel_degree > 1 && rows.len() > k {
+            if parallel_degree > 1 && rows.len() > k {
+                super::super::analyze_stats::add_vector_runtime(
+                    plan,
+                    0,
+                    0,
+                    (parallel_degree).min(rows.len().div_ceil(256)).max(1) as u32,
+                );
                 stats.reranks += rows.len() as u64;
                 best = score_selection_parallel(
                     db,
@@ -197,7 +251,7 @@ pub(super) fn execute_filtered_vector_topk(
                     &query,
                     metric,
                     k,
-                    *parallel_degree,
+                    parallel_degree,
                     &mut charge,
                 )?;
             } else {
@@ -216,6 +270,7 @@ pub(super) fn execute_filtered_vector_topk(
                 table,
                 scalar_access,
                 filter,
+                &mut predicate,
                 &mut source_stats,
                 |sid, ids| {
                     stats.reranks += ids.len() as u64;
@@ -235,6 +290,7 @@ pub(super) fn execute_filtered_vector_topk(
                         table,
                         &heap_access,
                         filter,
+                        &mut predicate,
                         &mut source_stats,
                         |sid, ids| {
                             stats.reranks += ids.len() as u64;
@@ -274,6 +330,7 @@ pub(super) fn execute_filtered_vector_topk(
             table,
             &heap_access,
             filter,
+            &mut predicate,
             &mut fallback_stats,
             |sid, ids| {
                 stats.reranks += ids.len() as u64;
@@ -328,6 +385,7 @@ pub(super) fn execute_filtered_vector_topk(
         }
     }
     stats.materialized += out.len() as u64;
+    super::super::analyze_stats::add_vector_runtime(plan, 0, 0, 1);
     super::super::analyze_stats::add_filtered_vector_stats(plan, stats);
     Ok(out)
 }
@@ -394,6 +452,7 @@ fn search_filtered_ann(
     k: usize,
     base_effort: usize,
     filter: &Option<Expr>,
+    predicate: &mut FilteredPredicate,
     exact_cost: f64,
     predicate_cost: f64,
     selection: Option<Arc<crate::engine::vector::selection::RowSelection>>,
@@ -426,15 +485,12 @@ fn search_filtered_ann(
     let mut seen = std::collections::HashSet::new();
     let mut seen_charge = VectorQueryCharge::try_new_recoverable(0)?;
     let predicate_columns = if selection.is_none() {
-        predicate_column_indices(filter, &table.schema)?
+        predicate.columns.as_slice()
     } else {
-        Vec::new()
+        &[]
     };
-    let schema = projected_schema_view(&table.schema, &predicate_columns);
-    let compiled = filter
-        .as_ref()
-        .and_then(|e| CompiledPredicate::compile(e, &schema));
-    let mut eval_ctx = EvalQueryContext::default();
+    let compiled = &predicate.compiled;
+    let eval_ctx = &mut predicate.eval_ctx;
     let mut all_complete = true;
     for sid in db.scan_storage_ids(&table.schema) {
         let target = selection
@@ -469,8 +525,8 @@ fn search_filtered_ann(
                 .min(remaining),
             )?
             else {
-                // A changed index is a safety fallback even when iterative
-                // widening is disabled; it is not a permitted short result.
+                // Invalidation or a backend's request for heap completion is
+                // a safety fallback even when iterative widening is disabled.
                 stats.navigation_visits += cursor.work.visited;
                 stats.navigation_distances += cursor.work.distances;
                 return Ok(false);
@@ -505,7 +561,7 @@ fn search_filtered_ann(
                         (Some(expr), None) => {
                             let row =
                                 projected_values_to_plan_row(table, &predicate_columns, values)?;
-                            eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?
+                            eval_plan_bool_with_db(db, txn, expr, &row, eval_ctx)?
                         }
                     };
                     if keep {
@@ -580,15 +636,16 @@ fn visit_filtered_row_ids(
     table: &PlanTable,
     access: &PhysicalPlan,
     filter: &Option<Expr>,
+    predicate: &mut FilteredPredicate,
     stats: &mut super::super::analyze_stats::FilteredVectorStats,
     visit: impl FnMut(u64, &[RowId]) -> Result<(), QueryError>,
 ) -> Result<(), QueryError> {
-    let columns = predicate_column_indices(filter, &table.schema)?;
-    let projected_schema = projected_schema_view(&table.schema, &columns);
-    let compiled = filter
+    let columns = &predicate.columns;
+    let compiled = &predicate.compiled;
+    let eval_ctx = &mut predicate.eval_ctx;
+    let storage_compiled = compiled
         .as_ref()
-        .and_then(|expr| CompiledPredicate::compile(expr, &projected_schema));
-    let mut eval_ctx = EvalQueryContext::default();
+        .filter(|predicate| predicate.page_latch_safe());
     let visit = std::cell::RefCell::new(visit);
     let evaluated = std::cell::Cell::new(0u64);
     let result = run_plan_scan_with_partition_pruning(table, filter, || {
@@ -610,7 +667,7 @@ fn visit_filtered_row_ids(
                             (_, Some(compiled)) => compiled.eval(&values)?,
                             (Some(expr), None) => {
                                 let row = projected_values_to_plan_row(table, &columns, values)?;
-                                eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?
+                                eval_plan_bool_with_db(db, txn, expr, &row, eval_ctx)?
                             }
                         };
                         if keep {
@@ -623,14 +680,25 @@ fn visit_filtered_row_ids(
                 let mut seen = std::collections::HashSet::new();
                 let mut seen_charge = VectorQueryCharge::try_new_recoverable(0)?;
                 let mut candidates = |ids: &[RowId]| -> Result<(), QueryError> {
+                    let Some(first) = ids.iter().position(|id| !seen.contains(id)) else {
+                        return Ok(());
+                    };
+                    let ids = &ids[first..];
+                    let _scratch_charge = VectorQueryCharge::try_new_recoverable(
+                        ids.len().saturating_mul(std::mem::size_of::<RowId>()),
+                    )?;
                     let mut fresh = Vec::with_capacity(ids.len());
                     for &id in ids {
                         if !seen.contains(&id) {
-                            seen_charge.try_grow_recoverable(64)?;
-                            seen.insert(id);
                             fresh.push(id);
                         }
                     }
+                    // Charge once per bounded batch, before growing the set.
+                    // Physical ordering also keeps heap page probes together.
+                    fresh.sort_unstable();
+                    fresh.dedup();
+                    seen_charge.try_grow_recoverable(fresh.len().saturating_mul(64))?;
+                    seen.extend(fresh.iter().copied());
                     let rows = db.read_row_columns_many_with_handle(
                         &heap,
                         &table.schema,
@@ -641,65 +709,8 @@ fn visit_filtered_row_ids(
                     filter_rows(rows)
                 };
                 match access {
-                    PhysicalPlan::IndexLookup { index, key, .. } => {
-                        let bound = Some(IndexBound {
-                            key: key.clone(),
-                            inclusive: true,
-                        });
-                        visit_scalar_index_cursor(
-                            db,
-                            txn,
-                            table,
-                            index,
-                            bound.clone(),
-                            bound,
-                            &mut candidates,
-                        )?;
-                    }
-                    PhysicalPlan::IndexMultiLookup { index, keys, .. } => {
-                        for key in super::scan::runtime_ordered_multi_lookup_keys(keys)?.as_ref() {
-                            let bound = Some(IndexBound {
-                                key: key.clone(),
-                                inclusive: true,
-                            });
-                            visit_scalar_index_cursor(
-                                db,
-                                txn,
-                                table,
-                                index,
-                                bound.clone(),
-                                bound,
-                                &mut candidates,
-                            )?;
-                        }
-                    }
-                    PhysicalPlan::IndexRangeScan {
-                        index, low, high, ..
-                    }
-                    | PhysicalPlan::IndexFastScan {
-                        index, low, high, ..
-                    } => {
-                        let (mut low, mut high) = (low.clone(), high.clone());
-                        crate::planner::boolean_range::refine_runtime(
-                            &table.schema,
-                            index,
-                            filter.as_ref(),
-                            &mut low,
-                            &mut high,
-                        );
-                        let mut cursor =
-                            db.range_index_snapshot_cursor(&table.schema, index, low, high, txn)?;
-                        loop {
-                            crate::engine::cancel::check_cancelled()?;
-                            let ids = cursor.next_chunk_row_ids(256)?;
-                            if ids.is_empty() {
-                                break;
-                            }
-                            candidates(&ids)?;
-                        }
-                    }
-                    PhysicalPlan::IndexMerge { root, .. } => {
-                        visit_scalar_merge_candidates(db, txn, table, root, &mut candidates)?;
+                    access if scalar_index_access(access) => {
+                        visit_scalar_access_ids(db, txn, table, access, filter, &mut candidates)?;
                     }
                     _ => {
                         let ranges = if matches!(access, PhysicalPlan::ZoneMapScan { .. }) {
@@ -727,7 +738,7 @@ fn visit_filtered_row_ids(
                                 crate::engine::cancel::check_cancelled()?;
                                 let mut ids = Vec::new();
                                 let mut scratch = VectorQueryCharge::try_new_recoverable(0)?;
-                                let scan_columns = if compiled.is_some() {
+                                let scan_columns = if storage_compiled.is_some() {
                                     columns.as_slice()
                                 } else {
                                     &[]
@@ -740,7 +751,7 @@ fn visit_filtered_row_ids(
                                     page,
                                     page + 1,
                                     |id, values| {
-                                        if let Some(predicate) = &compiled {
+                                        if let Some(predicate) = storage_compiled {
                                             evaluated.set(evaluated.get().saturating_add(1));
                                             if !predicate.eval(values)? {
                                                 return Ok(());
@@ -753,7 +764,7 @@ fn visit_filtered_row_ids(
                                         Ok(())
                                     },
                                 )?;
-                                if compiled.is_some() {
+                                if storage_compiled.is_some() {
                                     (visit.borrow_mut())(sid, &ids)?;
                                 } else {
                                     for window in ids.chunks(64) {
@@ -891,6 +902,74 @@ fn charge_predicate_rows(rows: &[(RowId, Vec<Value>)]) -> Result<VectorQueryChar
             .map(|(_, values)| crate::engine::executor::mem_budget::estimate_row_bytes(values) + 64)
             .sum(),
     )
+}
+
+fn scalar_index_access(access: &PhysicalPlan) -> bool {
+    matches!(
+        access,
+        PhysicalPlan::IndexLookup { .. }
+            | PhysicalPlan::IndexMultiLookup { .. }
+            | PhysicalPlan::IndexRangeScan { .. }
+            | PhysicalPlan::IndexFastScan { .. }
+            | PhysicalPlan::IndexMerge { .. }
+    )
+}
+
+fn visit_scalar_access_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    access: &PhysicalPlan,
+    filter: &Option<Expr>,
+    visit: &mut dyn FnMut(&[RowId]) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
+    match access {
+        PhysicalPlan::IndexLookup { index, key, .. } => {
+            let bound = Some(IndexBound {
+                key: key.clone(),
+                inclusive: true,
+            });
+            visit_scalar_index_cursor(db, txn, table, index, bound.clone(), bound, visit)
+        }
+        PhysicalPlan::IndexMultiLookup { index, keys, .. } => {
+            for key in super::scan::runtime_ordered_multi_lookup_keys(keys)?.as_ref() {
+                let bound = Some(IndexBound {
+                    key: key.clone(),
+                    inclusive: true,
+                });
+                visit_scalar_index_cursor(
+                    db,
+                    txn,
+                    table,
+                    index,
+                    bound.clone(),
+                    bound,
+                    &mut *visit,
+                )?;
+            }
+            Ok(())
+        }
+        PhysicalPlan::IndexRangeScan {
+            index, low, high, ..
+        }
+        | PhysicalPlan::IndexFastScan {
+            index, low, high, ..
+        } => {
+            let (mut low, mut high) = (low.clone(), high.clone());
+            crate::planner::boolean_range::refine_runtime(
+                &table.schema,
+                index,
+                filter.as_ref(),
+                &mut low,
+                &mut high,
+            );
+            visit_scalar_index_cursor(db, txn, table, index, low, high, visit)
+        }
+        PhysicalPlan::IndexMerge { root, .. } => {
+            visit_scalar_merge_candidates(db, txn, table, root, visit)
+        }
+        _ => unreachable!("scalar identity access checked by caller"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

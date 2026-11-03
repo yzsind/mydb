@@ -57,10 +57,20 @@ impl RowSelection {
             if bitmap_bytes < ids.capacity() * std::mem::size_of::<RowId>() {
                 self.charge.try_grow_recoverable(bitmap_bytes)?;
                 let mut pages = BTreeMap::new();
-                for id in ids.iter() {
-                    let words = pages.entry(id.page_id).or_insert_with(Vec::new);
-                    words.resize(words.len().max(id.slot_id as usize / 64 + 1), 0);
-                    words[id.slot_id as usize / 64] |= 1u64 << (id.slot_id % 64);
+                let mut start = 0;
+                while start < ids.len() {
+                    let end =
+                        start + ids[start..].partition_point(|r| r.page_id == ids[start].page_id);
+                    let count = ids[end - 1].slot_id as usize / 64 + 1;
+                    // Allocate once so actual capacity matches the representation
+                    // estimate instead of Vec's geometric/minimum growth policy.
+                    let mut words = Vec::with_capacity(count);
+                    words.resize(count, 0);
+                    for id in &ids[start..end] {
+                        words[id.slot_id as usize / 64] |= 1u64 << (id.slot_id % 64);
+                    }
+                    pages.insert(ids[start].page_id, words);
+                    start = end;
                 }
                 *rows = PartitionRows::Bitmap(pages);
             }
@@ -150,6 +160,17 @@ impl RowSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filtered_vector_selection_uses_actual_bitmap_capacity() {
+        let mut rows = RowSelection::new().unwrap();
+        let ids: Vec<_> = (0..32).map(|i| RowId::new(4, i * 41)).collect();
+        rows.append(7, &ids).unwrap();
+        rows.seal().unwrap();
+        assert!(matches!(rows.partitions[&7], PartitionRows::Bitmap(_)));
+        assert!(rows.charge.bytes() <= 128 + ids.len() * std::mem::size_of::<RowId>());
+        assert_eq!(rows.len(), ids.len());
+        assert!(ids.iter().all(|&id| rows.contains(7, id)));
+    }
     #[test]
     fn filtered_vector_selection_preserves_sparse_dense_and_partition_identity() {
         let mut rows = RowSelection::new().unwrap();

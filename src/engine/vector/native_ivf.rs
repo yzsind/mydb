@@ -1076,11 +1076,7 @@ impl NativeIvf {
                 }
                 let distance = self.score(&state, id, &cursor.query, cursor.prepared.as_ref())?;
                 cursor.work.distances += 1;
-                cursor.hnsw.charge.try_grow_recoverable(48)?;
-                cursor.hnsw.pending.push(std::cmp::Reverse(Scored {
-                    id: entry.row,
-                    dist: distance,
-                }));
+                cursor.hnsw.push_pending(entry.row, distance)?;
             }
             cursor.probe_position += 1;
             cursor.probe_offset = 0;

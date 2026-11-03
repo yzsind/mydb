@@ -352,6 +352,63 @@ fn filtered_vector_budget_and_frontier_exhaustion_complete_reranking_exactly() {
 }
 
 #[test]
+fn filtered_vector_incomplete_navigation_keeps_off_mode_budget_semantics() {
+    let (_dir, engine) = open();
+    setup(&engine, "FLOAT32", "HNSW");
+    let sql =
+        "SELECT id FROM items WHERE id=451 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+    let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+        unreachable!()
+    };
+    let plan = crate::planner::plan_select(engine.db_for_tests(), &select)
+        .unwrap()
+        .physical;
+    let mut leaf = None;
+    plan.walk(|node| {
+        if matches!(node, PhysicalPlan::FilteredVectorTopK { .. }) {
+            leaf = Some(node.clone());
+        }
+    });
+    let mut leaf = leaf.unwrap();
+    if let PhysicalPlan::FilteredVectorTopK {
+        strategy,
+        ef_hint,
+        projected_columns,
+        ..
+    } = &mut leaf
+    {
+        *strategy = crate::planner::FilteredVectorStrategy::PrefilterAnn;
+        *ef_hint = Some(1);
+        *projected_columns = Some(Arc::new(vec![0]));
+    }
+    let txn = engine.db_for_tests().begin_read_only_txn().unwrap();
+    for mode in ["strict_order", "off"] {
+        let mut session = crate::engine::api::SessionContext::default();
+        session.sysvars.mydb_hnsw_iterative_scan = mode.into();
+        session.sysvars.mydb_hnsw_max_scan_tuples = 7;
+        let (stats, actual) = crate::engine::expr::with_session_expr_info(&session, || {
+            super::super::analyze_stats::with_collector(|| {
+                filtered_vector::execute_filtered_vector_topk(engine.db_for_tests(), txn, &leaf)
+            })
+        });
+        let actual = actual.unwrap();
+        assert!(actual
+            .iter()
+            .all(|row| row.fields[0].value == Value::Int(451)));
+        let fallbacks = stats.get_for_plan(&leaf).unwrap().filtered_vector.fallbacks;
+        if mode == "off" {
+            assert_eq!(fallbacks, 0, "off must preserve bounded ANN completion");
+        } else {
+            assert_eq!(actual.len(), 1);
+            assert!(
+                fallbacks > 0,
+                "default mode must complete an unfinished navigation radius"
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "local filtered vector performance experiment"]
 fn filtered_vector_execution_bench() {
     let (_dir, engine) = open();
@@ -861,4 +918,293 @@ fn filtered_vector_optional_selection_respects_small_query_budgets() {
         assert!(budget.peak_used() > 0);
         assert!(budget.peak_used() <= budget.limit());
     }
+}
+
+#[test]
+fn filtered_vector_fused_index_pipeline_scores_safe_residuals_in_parallel() {
+    let (_dir, engine) = open();
+    setup(&engine, "FLOAT32", "HNSW");
+    let sql = "SELECT /*+ NO_VECTOR_INDEX */ id FROM items FORCE INDEX(PRIMARY) WHERE id>=20 AND ABS(tenant-7)<3 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 11 OFFSET 2";
+    let oracle = sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE");
+    assert_eq!(rows(&engine, sql), rows(&engine, &oracle));
+    let plan = rows(&engine, &format!("EXPLAIN ANALYZE FORMAT=JSON {sql}"));
+    let json: serde_json::Value = serde_json::from_str(&plan[0][0].to_display_string()).unwrap();
+    fn work(node: &serde_json::Value) -> Option<&serde_json::Value> {
+        if let Some(value) = node.get("filtered_vector_work") {
+            return Some(value);
+        }
+        match node {
+            serde_json::Value::Object(values) => values.values().find_map(work),
+            serde_json::Value::Array(values) => values.iter().find_map(work),
+            _ => None,
+        }
+    }
+    let counters = work(&json).expect("filtered exact work");
+    assert!(counters["batches"].as_u64().unwrap() > 0, "{json}");
+    assert!(
+        counters["predicate_evaluations"].as_u64().unwrap() >= 492,
+        "{json}"
+    );
+    assert!(counters["heap_reranks"].as_u64().unwrap() < 492, "{json}");
+    assert_eq!(counters["materialized"].as_u64().unwrap(), 13);
+}
+
+#[test]
+fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
+    let (_dir, engine) = open();
+    engine
+        .execute("CREATE TABLE retry_score(id INT PRIMARY KEY,v VECTOR(3) NOT NULL)")
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO retry_score VALUES(0,'[1,2,3]'),(1,'[2,3,4]'),(2,'[3,4,5]'),(3,'[4,5,6]')",
+        )
+        .unwrap();
+    engine
+        .execute("ALTER TABLE retry_score ADD COLUMN extra INT DEFAULT 7")
+        .unwrap();
+    engine
+        .execute("UPDATE retry_score SET extra=8 WHERE id<3")
+        .unwrap();
+    let db = engine.db_for_tests();
+    let schema = db.table("retry_score").unwrap();
+    let index = schema
+        .indexes
+        .iter()
+        .find(|index| index.name.eq_ignore_ascii_case("PRIMARY"))
+        .unwrap();
+    let txn = db.begin_read_only_txn().unwrap();
+    let mut cursor = db
+        .range_index_snapshot_cursor(&schema, index, None, None, txn)
+        .unwrap();
+    let mut ids = Vec::new();
+    loop {
+        let batch = cursor.next_chunk_row_ids(64).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        ids.extend(batch);
+    }
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 4);
+    let _scratch = crate::engine::vector::workspace::VectorQueryCharge::try_new(64 * 1024).unwrap();
+    let mut counts = [0; 4];
+    let query = crate::engine::vector::codec::from_f32(&[0.0, 1.0, 2.0]);
+    crate::engine::api::clear_statement_warnings();
+    let scores = db
+        .score_filtered_vector_rows_many_with_handle(
+            &db.cached_heap_handle(schema.id).unwrap(),
+            &schema,
+            &ids,
+            txn,
+            schema.column_index("v").unwrap(),
+            &query,
+            crate::engine::vector::Metric::L2,
+            None,
+            None,
+            &[schema.column_index("id").unwrap()],
+            |values| {
+                let Value::Int(id) = values[0] else {
+                    panic!("integer id")
+                };
+                counts[id as usize] += 1;
+                crate::engine::api::push_statement_warning(
+                    crate::error::ConditionLevel::Warning,
+                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                    format!("row {id}"),
+                );
+                Ok(id != 1)
+            },
+        )
+        .unwrap();
+    assert_eq!(counts, [1, 1, 1, 1]);
+    assert_eq!(crate::engine::api::take_statement_warnings().len(), 4);
+    assert_eq!(scores.len(), 3);
+    // Scoring errors must be deferred until after the predicate accepts a
+    // row, including when an old-layout window uses the general reader.
+    let heap = db.cached_heap_handle(schema.id).unwrap();
+    let column = schema.column_index("v").unwrap();
+    let columns = [schema.column_index("id").unwrap()];
+    let decoded = [0.0, 1.0, 2.0];
+    let cosine = crate::engine::vector::distance::PreparedF32Distance::new(
+        &decoded,
+        crate::engine::vector::Metric::Cosine,
+    );
+    let mut counts = [0; 4];
+    let actual = db
+        .score_filtered_vector_rows_many_with_handle(
+            &heap,
+            &schema,
+            &ids,
+            txn,
+            column,
+            &query,
+            crate::engine::vector::Metric::Cosine,
+            None,
+            Some(&cosine),
+            &columns,
+            |values| {
+                let Value::Int(id) = values[0] else {
+                    panic!("integer id")
+                };
+                counts[id as usize] += 1;
+                Ok(id != 1)
+            },
+        )
+        .unwrap();
+    assert_eq!(counts, [1, 1, 1, 1]);
+    assert_eq!(actual.len(), 3);
+    let survivors = actual.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let expected = db
+        .score_vector_rows_many_with_handle(
+            &heap,
+            &schema,
+            &survivors,
+            txn,
+            column,
+            &query,
+            crate::engine::vector::Metric::Cosine,
+            None,
+        )
+        .unwrap();
+    for ((id, score), (expected_id, expected_score, _)) in actual.iter().zip(expected) {
+        assert_eq!(*id, expected_id);
+        assert_eq!(score.to_bits(), expected_score.to_bits());
+    }
+    assert!(db
+        .score_filtered_vector_rows_many_with_handle(
+            &heap,
+            &schema,
+            &ids,
+            txn,
+            column,
+            &query,
+            crate::engine::vector::Metric::Hamming,
+            None,
+            None,
+            &columns,
+            |_| Ok(false),
+        )
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .score_filtered_vector_rows_many_with_handle(
+            &heap,
+            &schema,
+            &ids,
+            txn,
+            column,
+            &query,
+            crate::engine::vector::Metric::Hamming,
+            None,
+            None,
+            &columns,
+            |_| Ok(true),
+        )
+        .is_err());
+}
+
+#[test]
+fn filtered_vector_exact_respects_session_workers_in_fused_and_budget_fallback() {
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    use crate::engine::executor::tuning::{enter, ExecutorTuningSnapshot};
+    let (_dir, engine) = open();
+    setup(&engine, "FLOAT32", "HNSW");
+    let sql = "SELECT /*+ NO_VECTOR_INDEX */ id FROM items FORCE INDEX(PRIMARY) WHERE id>=20 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+    let expected = rows(&engine, sql);
+    let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+        unreachable!()
+    };
+    let db = engine.db_for_tests();
+    let plan = crate::planner::plan_select(db, &select).unwrap().physical;
+    let mut leaf = None;
+    plan.walk(|node| {
+        if matches!(node, PhysicalPlan::FilteredVectorTopK { .. }) {
+            leaf = Some(node.clone());
+        }
+    });
+    let mut leaf = leaf.unwrap();
+    if let PhysicalPlan::FilteredVectorTopK {
+        parallel_degree,
+        projected_columns,
+        ..
+    } = &mut leaf
+    {
+        // A cached plan can request more workers than the current session.
+        *parallel_degree = 4;
+        *projected_columns = Some(Arc::new(vec![0]));
+    }
+    let txn = db.begin_read_only_txn().unwrap();
+    for limit in [8 * 1024 * 1024, 128 * 1024] {
+        for cap in [4, 1, 2] {
+            let budget = Arc::new(MemBudget::new(limit));
+            let _tuning = enter(ExecutorTuningSnapshot::capture_for_session(cap));
+            let (measurements, result) = with_query_budget(budget.clone(), || {
+                super::super::analyze_stats::with_collector(|| {
+                    filtered_vector::execute_filtered_vector_topk(db, txn, &leaf)
+                })
+            });
+            let actual = result
+                .unwrap()
+                .iter()
+                .map(|row| vec![row.fields[0].value.clone()])
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            let workers = measurements.get_for_plan(&leaf).unwrap().workers;
+            assert_eq!(workers, cap.min(2) as u32, "limit={limit} cap={cap}");
+            assert_eq!(budget.used(), 0);
+            assert!(budget.peak_used() <= limit);
+        }
+    }
+}
+
+#[test]
+fn filtered_vector_exact_parallel_hints_and_disable_are_honored() {
+    struct RestoreCost(f64);
+    impl Drop for RestoreCost {
+        fn drop(&mut self) {
+            crate::engine::cbo::consts::set_variable("cbo_parallel_setup_cost", self.0).unwrap();
+        }
+    }
+    let _restore = RestoreCost(crate::engine::cbo::cbo_consts().parallel_setup_cost());
+    crate::engine::cbo::consts::set_variable("cbo_parallel_setup_cost", 0.0).unwrap();
+    crate::util::env::with_vars(
+        &[
+            ("MYDB_PARALLEL_DEGREE", Some("4")),
+            ("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4")),
+            ("MYDB_PARALLEL_DISABLE", Some("0")),
+        ],
+        || {
+            let (_dir, engine) = open();
+            setup(&engine, "FLOAT32", "HNSW");
+            let degree = |extra: &str| {
+                let sql = format!("SELECT /*+ NO_VECTOR_INDEX {extra} */ id FROM items FORCE INDEX(PRIMARY) WHERE id>=20 ORDER BY L2_DISTANCE(v,'[3,1,1,2]') LIMIT 7");
+                let Statement::Select(select) = crate::parser::parse_statement(&sql).unwrap()
+                else {
+                    unreachable!()
+                };
+                let plan = crate::planner::plan_select(engine.db_for_tests(), &select)
+                    .unwrap()
+                    .physical;
+                let mut degree = None;
+                plan.walk(|node| {
+                    if let PhysicalPlan::FilteredVectorTopK {
+                        parallel_degree, ..
+                    } = node
+                    {
+                        degree = Some(*parallel_degree);
+                    }
+                });
+                degree.expect("filtered vector plan")
+            };
+            assert_eq!(degree(""), 4);
+            assert_eq!(degree("NO_PARALLEL"), 1);
+            assert_eq!(degree("PARALLEL(2)"), 2);
+            assert_eq!(degree("PARALLEL(4) NO_PARALLEL"), 1);
+            crate::util::env::with_vars(&[("MYDB_PARALLEL_DISABLE", Some("1"))], || {
+                assert_eq!(degree(""), 1);
+                assert_eq!(degree("PARALLEL(4)"), 1);
+            });
+        },
+    );
 }

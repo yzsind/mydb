@@ -329,11 +329,36 @@ pub(super) fn plan_filtered_vector(
         } else {
             pool as f64 * 64.0
         };
-    let degree = cpu_bound_parallel_degree(default_parallel_degree()).max(1) as usize;
+    let requested = select
+        .query_hints
+        .iter()
+        .filter_map(|hint| match hint {
+            crate::parser::QueryHint::Parallel { degree } => Some(*degree),
+            _ => None,
+        })
+        .last();
+    let suppressed = parallel_planner_config().disabled
+        || parallelism_force_disabled()
+        || select
+            .query_hints
+            .iter()
+            .any(|hint| matches!(hint, crate::parser::QueryHint::NoParallel));
+    let degree = if suppressed {
+        1
+    } else {
+        cpu_bound_parallel_degree(
+            requested
+                .filter(|degree| *degree > 0)
+                .unwrap_or_else(default_parallel_degree),
+        )
+        .max(1) as usize
+    };
     let score_work = exact_work;
     let parallel_degree = if strategy == FilteredVectorStrategy::Exact
         && degree > 1
-        && score_work / degree as f64 + degree as f64 * consts.parallel_setup_cost() < score_work
+        && (requested.is_some()
+            || score_work / degree as f64 + degree as f64 * consts.parallel_setup_cost()
+                < score_work)
     {
         degree
     } else {

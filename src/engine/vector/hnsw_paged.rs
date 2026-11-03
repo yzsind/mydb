@@ -184,6 +184,16 @@ struct QueryNavArena {
     _charge: ControlledMemoryCharge,
 }
 
+/// Prepared SQ8 state for one graph generation. Compact images are pinned by
+/// Arc; mappings are borrowed only for each bounded work slice.
+pub(crate) struct PagedCursorNavigation {
+    arena: Option<Arc<QueryNavArena>>,
+    mapped: bool,
+    mapping_revision: u64,
+    qcodes: Vec<i8>,
+    qnorm: i32,
+}
+
 #[derive(Debug)]
 enum QueryNavCodes {
     Resident(Vec<i8>),
@@ -2550,7 +2560,8 @@ impl PagedHnsw {
         let Some(mut arena) = self.query_nav.try_write() else {
             return;
         };
-        if arena.take().is_some() {
+        let evicted = arena.take().is_some();
+        if self.file.evict_navigation_mapping() || evicted {
             self.query_nav_rebuild_requested
                 .store(true, Ordering::Release);
         }
@@ -4678,44 +4689,91 @@ impl PagedHnsw {
         ))
     }
 
-    /// k-NN search. Returns up to `k` `(row_id, exact_distance)` for live
-    /// (non-tombstoned) nodes, ascending by distance. MVCC visibility of the
-    /// row is the caller's responsibility.
+    /// Advance a bounded navigation slice. Candidate distances may be SQ8
+    /// estimates; visible heap scoring remains the executor's responsibility.
     pub(crate) fn advance_cursor(
         &self,
         cursor: &mut super::cursor::VectorSearchCursor,
         effort: usize,
     ) -> Result<bool, QueryError> {
+        if self.query_nav_rebuild_requested.load(Ordering::Acquire) {
+            self.start_query_navigation_build();
+        }
         let _gate = self.navigation_gate.read();
+        self.file
+            .with_navigation_mapping(|mapping| {
+                self.advance_cursor_with_mapping(cursor, effort, Some(mapping))
+            })
+            .unwrap_or_else(|| self.advance_cursor_with_mapping(cursor, effort, None))
+    }
+
+    fn advance_cursor_with_mapping(
+        &self,
+        cursor: &mut super::cursor::VectorSearchCursor,
+        effort: usize,
+        mapping: Option<&crate::storage::MappedVectorNavigation>,
+    ) -> Result<bool, QueryError> {
         let retired = self.restored_retirements.read();
         let epoch = self.query_nav_epoch.load(Ordering::Acquire);
-        if cursor.initialized && cursor.epoch != epoch {
+        if cursor.initialized
+            && (cursor.epoch != epoch
+                || cursor.paged_navigation.as_ref().is_some_and(|nav| {
+                    nav.mapped
+                        && mapping.map(|view| view.source_revision()) != Some(nav.mapping_revision)
+                }))
+        {
             return Ok(false);
         }
         if !cursor.initialized {
             cursor.epoch = epoch;
             cursor.initialized = true;
+            cursor
+                .hnsw
+                .charge
+                .try_grow_recoverable(std::mem::size_of::<PagedCursorNavigation>() + self.m0 * 8)?;
+            let use_navigation = effort < self.node_count() as usize;
+            #[cfg(test)]
+            let use_navigation = use_navigation && !cursor.raw_navigation;
+            if use_navigation {
+                let arena = self.query_nav.read().clone().filter(|arena| {
+                    arena.epoch == epoch
+                        && arena.vids.len() == self.node_count() as usize
+                        && arena.dim == cursor.decoded.len()
+                });
+                let mapped = mapping.is_some_and(|mapping| {
+                    mapping.sq8_cursor_geometry() == Some((cursor.decoded.len(), self.node_count()))
+                });
+                if arena.is_some() || mapped {
+                    let mut scratch = Scratch::default();
+                    self.configure_persisted_query(&cursor.decoded, &mut scratch);
+                    if !scratch.qcodes.is_empty() {
+                        // The cursor's query reservation includes decoded and
+                        // quantized query storage; the shared arena owns its charge.
+                        cursor.paged_navigation = Some(PagedCursorNavigation {
+                            arena: if mapped { None } else { arena },
+                            mapped,
+                            mapping_revision: mapping.map_or(0, |view| view.source_revision()),
+                            qcodes: scratch.qcodes,
+                            qnorm: scratch.qnorm,
+                        });
+                    }
+                }
+            }
             if let Some((mut entry, level)) = self.file.entry_with_level() {
                 for layer in (1..=level as usize).rev() {
                     loop {
-                        let Some((_, _, mut distance)) = self.file.read_vector_meta_distance(
-                            entry,
-                            &cursor.decoded,
-                            self.metric,
-                        )?
+                        let Some((_, _, mut distance)) =
+                            self.cursor_node_distance(cursor, entry, mapping)?
                         else {
                             return Ok(false);
                         };
                         let mut best = entry;
                         let mut neighbors = Vec::new();
-                        self.file
-                            .read_neighbors_into(entry, layer, &mut neighbors)?;
+                        self.cursor_neighbors_into(cursor, entry, layer, mapping, &mut neighbors)?;
                         for n in neighbors {
-                            if let Some((_, _, d)) = self.file.read_vector_meta_distance(
-                                n,
-                                &cursor.decoded,
-                                self.metric,
-                            )? {
+                            if let Some((_, _, d)) =
+                                self.cursor_node_distance(cursor, n, mapping)?
+                            {
                                 if d < distance {
                                     distance = d;
                                     best = n;
@@ -4729,18 +4787,13 @@ impl PagedHnsw {
                     }
                 }
                 if let Some((row, deleted, distance)) =
-                    self.file
-                        .read_vector_meta_distance(entry, &cursor.decoded, self.metric)?
+                    self.cursor_node_distance(cursor, entry, mapping)?
                 {
-                    let rows = if deleted || retired.0.contains(&entry) {
-                        Vec::new()
-                    } else {
-                        vec![row]
-                    };
+                    let rows = (!deleted && !retired.0.contains(&entry)).then_some(row);
                     cursor.hnsw.discover(
                         entry,
                         distance,
-                        rows.iter().copied(),
+                        rows,
                         cursor.sid,
                         cursor.selection.as_deref(),
                     )?;
@@ -4749,6 +4802,13 @@ impl PagedHnsw {
             }
         }
         if effort >= self.node_count() as usize {
+            if cursor.paged_navigation.is_some() {
+                // Exhaustive completion uses exact heap scores. Do not mix a
+                // partially emitted SQ8 ordering with exact index distances,
+                // whose scale can differ (notably for cosine).
+                cursor.navigation_incomplete = true;
+                return Ok(true);
+            }
             if cursor.scan_ids.is_empty() {
                 cursor
                     .hnsw
@@ -4771,15 +4831,11 @@ impl PagedHnsw {
                     self.file
                         .read_vector_meta_distance(id, &cursor.decoded, self.metric)?
                 {
-                    let rows = if deleted || retired.0.contains(&id) {
-                        Vec::new()
-                    } else {
-                        vec![row]
-                    };
+                    let rows = (!deleted && !retired.0.contains(&id)).then_some(row);
                     cursor.hnsw.discover(
                         id,
                         distance,
-                        rows.iter().copied(),
+                        rows,
                         cursor.sid,
                         cursor.selection.as_deref(),
                     )?;
@@ -4806,34 +4862,101 @@ impl PagedHnsw {
             };
             cursor.hnsw.expanded += 1;
             cursor.work.visited += 1;
-            self.file
-                .read_neighbors_into(candidate.id, 0, &mut neighbors)?;
-            for &id in &neighbors {
-                if cursor.hnsw.visited.contains(&id) {
-                    continue;
-                }
-                if let Some((row, deleted, distance)) =
-                    self.file
-                        .read_vector_meta_distance(id, &cursor.decoded, self.metric)?
+            self.cursor_neighbors_into(cursor, candidate.id, 0, mapping, &mut neighbors)?;
+            // Expose a bounded amount of independent mmap I/O before scalar
+            // scoring. Keep discovery order, duplicate checks and errors on
+            // the original path; prefetching has no observable validation.
+            for block in neighbors.chunks(8) {
+                if cursor
+                    .paged_navigation
+                    .as_ref()
+                    .is_some_and(|nav| nav.mapped)
                 {
-                    let rows = if deleted || retired.0.contains(&id) {
-                        Vec::new()
-                    } else {
-                        vec![row]
-                    };
-                    cursor.hnsw.discover(
-                        id,
-                        distance,
-                        rows.iter().copied(),
-                        cursor.sid,
-                        cursor.selection.as_deref(),
-                    )?;
-                    cursor.work.distances += 1;
+                    if let Some(mapping) = mapping {
+                        for &id in block {
+                            if !cursor.hnsw.visited.contains(&id) {
+                                mapping.prefetch_navigation_node(id);
+                            }
+                        }
+                    }
+                }
+                for &id in block {
+                    if cursor.hnsw.visited.contains(&id) {
+                        continue;
+                    }
+                    if let Some((row, deleted, distance)) =
+                        self.cursor_node_distance(cursor, id, mapping)?
+                    {
+                        let rows = (!deleted && !retired.0.contains(&id)).then_some(row);
+                        cursor.hnsw.discover(
+                            id,
+                            distance,
+                            rows,
+                            cursor.sid,
+                            cursor.selection.as_deref(),
+                        )?;
+                        cursor.work.distances += 1;
+                    }
                 }
             }
         }
         cursor.resume_work = cursor.hnsw.expanded < effort && !cursor.hnsw.frontier.is_empty();
         Ok(epoch == self.query_nav_epoch.load(Ordering::Acquire))
+    }
+
+    fn cursor_node_distance(
+        &self,
+        cursor: &super::cursor::VectorSearchCursor,
+        vid: VecId,
+        mapping: Option<&crate::storage::MappedVectorNavigation>,
+    ) -> Result<Option<(RowId, bool, f64)>, QueryError> {
+        if let Some(nav) = &cursor.paged_navigation {
+            if nav.mapped {
+                return mapping.map_or(Ok(None), |mapping| {
+                    mapping.navigation_node(vid, &nav.qcodes, nav.qnorm)
+                });
+            }
+            let arena = nav.arena.as_ref().expect("compact cursor owns its arena");
+            return Ok(arena.ordinal(vid).map(|ordinal| {
+                (
+                    arena.rows[ordinal],
+                    arena.deleted[ordinal],
+                    arena.distance(&nav.qcodes, nav.qnorm, ordinal),
+                )
+            }));
+        }
+        self.file
+            .read_vector_meta_distance(vid, &cursor.decoded, self.metric)
+    }
+
+    fn cursor_neighbors_into(
+        &self,
+        cursor: &super::cursor::VectorSearchCursor,
+        vid: VecId,
+        level: usize,
+        mapping: Option<&crate::storage::MappedVectorNavigation>,
+        out: &mut Vec<VecId>,
+    ) -> Result<(), QueryError> {
+        if let Some(nav) = &cursor.paged_navigation {
+            if nav.mapped {
+                return mapping.map_or(Ok(()), |mapping| mapping.neighbors(vid, level, out));
+            }
+            if level != 0 {
+                return self.file.read_neighbors_into(vid, level, out).map(|_| ());
+            }
+            let arena = nav.arena.as_ref().expect("compact cursor owns its arena");
+            out.clear();
+            if let Some(ordinal) = arena.ordinal(vid) {
+                for &neighbor in arena.neighbors(ordinal) {
+                    out.push(match &arena.neighbors {
+                        QueryNavEdges::Resident(_) => arena.vids[neighbor as usize],
+                        QueryNavEdges::Spilled(_) => self.file.vid_from_node_id(neighbor),
+                    });
+                }
+            }
+            return Ok(());
+        }
+        self.file.read_neighbors_into(vid, level, out).map(|_| ())
     }
     pub(crate) fn search(
         &self,
@@ -5586,6 +5709,254 @@ mod query_nav_allocation_tests {
 #[cfg(test)]
 mod source_audit_tests {
     use super::*;
+    #[test]
+    fn filtered_cursor_reuses_mapping_and_completes_after_revocation() {
+        use super::super::{cursor::VectorSearchCursor, graph::VectorGraph};
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        let paged = PagedHnsw::new(file);
+        paged.begin_bulk_build();
+        for i in 0..512 {
+            paged
+                .insert_ddl(
+                    row(i),
+                    &[
+                        ((i * 7919) % 997) as f32 / 100.0,
+                        ((i * 3571) % 991) as f32 / 100.0,
+                    ],
+                )
+                .unwrap();
+        }
+        paged.finalize_bulk_build().unwrap();
+        paged.refresh_query_navigation().unwrap();
+        assert!(paged.file.with_navigation_mapping(|_| ()).is_some());
+        paged
+            .query_nav_rebuild_requested
+            .store(false, Ordering::Release);
+        let graph = Arc::new(VectorGraph::Paged(paged));
+        let VectorGraph::Paged(paged) = graph.as_ref() else {
+            unreachable!()
+        };
+        let query = super::super::codec::from_f32(&[3.123, 4.567]);
+        let mut cursor = VectorSearchCursor::new(Arc::clone(&graph), &query, 7, None).unwrap();
+        let first = cursor.next_batch(32, 16).unwrap().unwrap();
+        assert!(cursor.paged_navigation.as_ref().unwrap().mapped);
+        let qcodes = cursor.paged_navigation.as_ref().unwrap().qcodes.clone();
+        let second = cursor.next_batch(32, 16).unwrap().unwrap();
+        assert_eq!(cursor.paged_navigation.as_ref().unwrap().qcodes, qcodes);
+        assert!(first
+            .iter()
+            .all(|(id, _)| second.iter().all(|(other, _)| id != other)));
+        // A recreated view is not necessarily the same source generation.
+        // Low-level page writers revoke the mapping without changing this
+        // PagedHnsw wrapper's epoch, so pin the view's source revision too.
+        let entry = paged.file.entry_with_level().unwrap().0;
+        paged.file.write_vector(0, entry, &[3.0, 4.0]).unwrap();
+        assert!(paged.file.prepare_navigation_mapping().unwrap());
+        assert!(cursor.next_batch(32, 16).unwrap().is_none());
+        // Revocation and writes must complete while an idle cursor exists.
+        paged.file.disable_navigation_mapping();
+        assert!(cursor.next_batch(32, 16).unwrap().is_none());
+        paged.mark_deleted_by_row_id(row(0)).unwrap();
+    }
+
+    #[test]
+    fn filtered_cursor_pins_navigation_and_preserves_completion_boundaries() {
+        use super::super::{
+            cursor::VectorSearchCursor, graph::VectorGraph, selection::RowSelection,
+        };
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        // Exercise the compact image explicitly; finalized files otherwise
+        // prefer the independent mmap navigator.
+        file.disable_navigation_mapping();
+        let paged = PagedHnsw::new(file);
+        paged.begin_bulk_build();
+        for i in 0..1024 {
+            paged
+                .insert_ddl(
+                    row(i),
+                    &[
+                        ((i * 7919) % 997) as f32 / 100.0,
+                        ((i * 3571) % 991) as f32 / 100.0,
+                    ],
+                )
+                .unwrap();
+        }
+        paged.finalize_bulk_build().unwrap();
+        paged.refresh_query_navigation().unwrap();
+        paged
+            .query_nav_rebuild_requested
+            .store(false, Ordering::Release);
+        let graph = Arc::new(VectorGraph::Paged(paged));
+        let VectorGraph::Paged(paged) = graph.as_ref() else {
+            unreachable!()
+        };
+        let query = super::super::codec::from_f32(&[3.123, 4.567]);
+        let mut selection = RowSelection::new().unwrap();
+        selection
+            .append(
+                7,
+                &(0..1024)
+                    .filter(|i| i % 4 != 0)
+                    .map(row)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        selection.seal().unwrap();
+        let selection = Arc::new(selection);
+        let mut cursor =
+            VectorSearchCursor::new(Arc::clone(&graph), &query, 7, Some(Arc::clone(&selection)))
+                .unwrap();
+        let first = cursor.next_batch(32, 16).unwrap().unwrap();
+        let nav = cursor
+            .paged_navigation
+            .as_ref()
+            .expect("ready navigation must be reused");
+        let held = Arc::clone(nav.arena.as_ref().unwrap());
+        let qcodes = nav.qcodes.clone();
+        paged.evict_query_navigation();
+        paged
+            .query_nav_rebuild_requested
+            .store(false, Ordering::Release);
+        let second = cursor.next_batch(32, 16).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            cursor
+                .paged_navigation
+                .as_ref()
+                .unwrap()
+                .arena
+                .as_ref()
+                .unwrap(),
+            &held
+        ));
+        assert_eq!(cursor.paged_navigation.as_ref().unwrap().qcodes, qcodes);
+        assert!(first
+            .iter()
+            .chain(&second)
+            .all(|(id, _)| selection.contains(7, *id)));
+        assert!(first
+            .iter()
+            .all(|(id, _)| second.iter().all(|(other, _)| id != other)));
+        // Exhaustive effort asks the executor to complete on visible heap
+        // vectors, rather than mixing exact and SQ8 distance scales.
+        assert!(cursor.next_batch(1024, 16).unwrap().is_some());
+        assert!(cursor.navigation_incomplete);
+        *paged.query_nav.write() = Some(held);
+        let outside = super::super::codec::from_f32(&[1e8, 1e8]);
+        let mut exact_nav = VectorSearchCursor::new(Arc::clone(&graph), &outside, 7, None).unwrap();
+        assert!(!exact_nav.next_batch(32, 16).unwrap().unwrap().is_empty());
+        assert!(
+            exact_nav.paged_navigation.is_none(),
+            "unrepresentable queries need exact navigation"
+        );
+        let mut full = VectorSearchCursor::new(Arc::clone(&graph), &query, 7, None).unwrap();
+        assert_eq!(full.next_batch(1024, 1024).unwrap().unwrap().len(), 1024);
+        assert!(full.paged_navigation.is_none());
+        paged.mark_deleted_by_row_id(row(0)).unwrap();
+        assert!(cursor.next_batch(32, 16).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "local paged filtered cursor performance and recall comparison"]
+    fn filtered_cursor_navigation_bench() {
+        use super::super::{
+            cursor::VectorSearchCursor, graph::VectorGraph, selection::RowSelection,
+        };
+        for mapped in [false, true] {
+            let (_dir, file) = crate::storage::source_audit_vector_file();
+            if !mapped {
+                file.disable_navigation_mapping();
+            }
+            let paged = PagedHnsw::new(file);
+            paged.begin_bulk_build();
+            let vectors: Vec<_> = (0..2048u32)
+                .map(|i| {
+                    [
+                        ((i * 7919) % 997) as f32 / 100.0,
+                        ((i * 3571) % 991) as f32 / 100.0,
+                    ]
+                })
+                .collect();
+            for (i, vector) in vectors.iter().enumerate() {
+                paged.insert_ddl(row(i as u32), vector).unwrap();
+            }
+            paged.finalize_bulk_build().unwrap();
+            paged.refresh_query_navigation().unwrap();
+            assert_eq!(paged.file.with_navigation_mapping(|_| ()).is_some(), mapped);
+            assert_eq!(paged.query_nav.read().is_some(), !mapped);
+            let graph = Arc::new(VectorGraph::Paged(paged));
+            let VectorGraph::Paged(paged) = graph.as_ref() else {
+                unreachable!()
+            };
+            paged
+                .query_nav_rebuild_requested
+                .store(false, Ordering::Release);
+            for pass in [10, 90, 99] {
+                let mut selection = RowSelection::new().unwrap();
+                let ids: Vec<_> = (0..vectors.len() as u32)
+                    .filter(|i| i % 100 < pass)
+                    .map(row)
+                    .collect();
+                selection.append(7, &ids).unwrap();
+                selection.seal().unwrap();
+                let selection = Arc::new(selection);
+                for round in 0..5 {
+                    for accelerated in if round % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        let start = std::time::Instant::now();
+                        let mut hits = 0;
+                        for q in 0..64 {
+                            let query = [0.11 + q as f32 * 0.149, 0.17 + q as f32 * 0.137];
+                            let mut oracle: Vec<_> = ids
+                                .iter()
+                                .map(|&id| {
+                                    (
+                                        id,
+                                        ordering_distance(
+                                            &query,
+                                            &vectors[id.page_id as usize],
+                                            Metric::L2,
+                                        ),
+                                    )
+                                })
+                                .collect();
+                            oracle.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                            let mut cursor = VectorSearchCursor::new(
+                                Arc::clone(&graph),
+                                &super::super::codec::from_f32(&query),
+                                7,
+                                Some(Arc::clone(&selection)),
+                            )
+                            .unwrap();
+                            cursor.raw_navigation = !accelerated;
+                            let mut found = cursor.next_batch(128, 80).unwrap().unwrap();
+                            // Production reranks this candidate pool on visible heap vectors.
+                            for (id, distance) in &mut found {
+                                *distance = ordering_distance(
+                                    &query,
+                                    &vectors[id.page_id as usize],
+                                    Metric::L2,
+                                );
+                            }
+                            found.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                            hits += found
+                                .iter()
+                                .take(10)
+                                .filter(|(id, _)| {
+                                    oracle[..10].iter().any(|(expected, _)| id == expected)
+                                })
+                                .count();
+                        }
+                        let micros = start.elapsed().as_secs_f64() * 1e6 / 64.0;
+                        eprintln!("PAGED_FILTERED_CURSOR mapped={mapped} pass={pass} round={round} accelerated={accelerated} us={micros:.2} hits={hits}/640");
+                        assert!(hits as f64 / 640.0 >= 0.99);
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn vector_audit_fallback_breaks_distance_ties_by_row_id() {
         let (_dir, file) = crate::storage::source_audit_vector_file();

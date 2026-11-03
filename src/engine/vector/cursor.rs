@@ -1,12 +1,9 @@
 //! Resumable ANN state. No heap visibility or SQL semantics live in this layer.
 use super::{graph::VectorGraph, hnsw_core::Scored, selection::RowSelection};
 use crate::engine::vector::workspace::VectorQueryCharge;
+use crate::util::fast_hash::{ah_hash_set, AhHashSet};
 use crate::{storage::RowId, types::QueryError, vector::VectorValue};
-use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
-    sync::Arc,
-};
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
 pub(crate) struct CursorWork {
     pub(crate) visited: u64,
@@ -14,20 +11,51 @@ pub(crate) struct CursorWork {
 }
 pub(crate) struct HnswCursorState {
     pub(crate) frontier: BinaryHeap<Reverse<Scored<u64>>>,
-    pub(crate) visited: HashSet<u64>,
+    pub(crate) visited: AhHashSet<u64>,
     pub(crate) pending: BinaryHeap<Reverse<Scored<RowId>>>,
     pub(crate) expanded: usize,
     pub(crate) charge: VectorQueryCharge,
+    allocation_credit: usize,
 }
 impl HnswCursorState {
     fn new() -> Result<Self, QueryError> {
         Ok(Self {
             frontier: BinaryHeap::new(),
-            visited: HashSet::new(),
+            visited: ah_hash_set(),
             pending: BinaryHeap::new(),
             expanded: 0,
             charge: VectorQueryCharge::try_new_recoverable(0)?,
+            allocation_credit: 0,
         })
+    }
+    /// Book bounded scratch slabs before mutation, amortizing the shared
+    /// query/process ledger across discoveries. Tight budgets can still admit
+    /// the minimum required allocation instead of paying for unused credit.
+    fn charge_allocation(&mut self, bytes: usize) -> Result<(), QueryError> {
+        if self.allocation_credit < bytes {
+            let required = bytes - self.allocation_credit;
+            let reservation = required.max(16 * 1024);
+            match self.charge.try_grow_recoverable(reservation) {
+                Ok(()) => self.allocation_credit += reservation,
+                Err(err)
+                    if reservation > required && err.is(crate::error::catalog::ER_OUTOFMEMORY) =>
+                {
+                    self.charge.try_grow_recoverable(required)?;
+                    self.allocation_credit += required;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.allocation_credit -= bytes;
+        Ok(())
+    }
+    pub(crate) fn push_pending(&mut self, row: RowId, distance: f64) -> Result<(), QueryError> {
+        self.charge_allocation(48)?;
+        self.pending.push(Reverse(Scored {
+            id: row,
+            dist: distance,
+        }));
+        Ok(())
     }
     pub(crate) fn discover(
         &mut self,
@@ -37,16 +65,12 @@ impl HnswCursorState {
         sid: u64,
         selection: Option<&RowSelection>,
     ) -> Result<(), QueryError> {
-        self.charge.try_grow_recoverable(160)?;
+        self.charge_allocation(160)?;
         self.visited.insert(id);
         self.frontier.push(Reverse(Scored { id, dist: distance }));
         for row in rows {
             if selection.is_none_or(|s| s.contains(sid, row)) {
-                self.charge.try_grow_recoverable(48)?;
-                self.pending.push(Reverse(Scored {
-                    id: row,
-                    dist: distance,
-                }));
+                self.push_pending(row, distance)?;
             }
         }
         Ok(())
@@ -69,6 +93,9 @@ pub(crate) struct VectorSearchCursor {
     pub(crate) decoded: Vec<f32>,
     pub(crate) prepared: Option<super::quantization::QuantQuery>,
     pub(crate) native_prepared: Option<super::distance::PreparedNativeDistance>,
+    pub(crate) paged_navigation: Option<super::hnsw_paged::PagedCursorNavigation>,
+    #[cfg(test)]
+    pub(crate) raw_navigation: bool,
     pub(crate) hnsw: HnswCursorState,
     pub(crate) probes: Vec<usize>,
     pub(crate) probe_position: usize,
@@ -118,6 +145,9 @@ impl VectorSearchCursor {
             decoded,
             prepared: None,
             native_prepared: None,
+            paged_navigation: None,
+            #[cfg(test)]
+            raw_navigation: false,
             hnsw,
             probes: Vec::new(),
             probe_position: 0,
@@ -137,7 +167,7 @@ impl VectorSearchCursor {
             },
         })
     }
-    /// None means the pinned graph changed; the executor completes on the heap.
+    /// None requests heap completion, including a change to the pinned graph.
     pub(crate) fn next_batch(
         &mut self,
         effort: usize,
@@ -158,6 +188,9 @@ impl VectorSearchCursor {
             };
             if !valid {
                 break valid;
+            }
+            if self.navigation_incomplete {
+                break true;
             }
             if !self.resume_work {
                 if matches!(graph.as_ref(), VectorGraph::NativeIvf(_))
@@ -226,6 +259,56 @@ mod tests {
     use crate::engine::vector::{
         hnsw::HnswIndex, ivf::IvfParams, native_hnsw::NativeHnsw, native_ivf::NativeIvf, Metric,
     };
+    #[test]
+    fn filtered_vector_cursor_reservations_preserve_tight_budgets_and_release() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        let budget = Arc::new(MemBudget::new(450));
+        with_query_budget(budget.clone(), || {
+            let mut state = HnswCursorState::new().unwrap();
+            for id in 0..2 {
+                state
+                    .discover(id, id as f64, [RowId::new(id as u32, 0)], 1, None)
+                    .unwrap();
+            }
+            // Optional unused credit must not reject an otherwise admissible
+            // discovery. A genuine limit miss must precede state mutation.
+            let err = state
+                .discover(2, 2.0, [RowId::new(2, 0)], 1, None)
+                .unwrap_err();
+            assert!(err.is(crate::error::catalog::ER_OUTOFMEMORY));
+            assert_eq!(state.visited.len(), 2);
+            assert_eq!(state.frontier.len(), 2);
+            assert_eq!(
+                state.take(3),
+                vec![(RowId::new(0, 0), 0.0), (RowId::new(1, 0), 1.0)]
+            );
+            assert!(budget.used() > 0);
+            assert!(budget.peak_used() <= 450);
+        });
+        assert_eq!(budget.used(), 0);
+
+        let budget = Arc::new(MemBudget::new(256 * 1024));
+        with_query_budget(budget.clone(), || {
+            let mut state = HnswCursorState::new().unwrap();
+            for id in (0..1000).rev() {
+                state
+                    .discover(id, id as f64, [RowId::new(id as u32, 0)], 1, None)
+                    .unwrap();
+            }
+            let first = state.take(400);
+            let second = state.take(1000);
+            assert_eq!(first.len(), 400);
+            assert_eq!(second.len(), 600);
+            assert!(first
+                .into_iter()
+                .chain(second)
+                .enumerate()
+                .all(|(i, row)| { row == (RowId::new(i as u32, 0), i as f64) }));
+            assert!(budget.used() > 0);
+            assert!(budget.peak_used() <= 256 * 1024);
+        });
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn filtered_vector_cursor_resumes_without_repeating_work_and_detects_mutations() {
         const ROWS: u32 = 1152;
@@ -309,9 +392,22 @@ mod tests {
                 .all(|(id, _)| second.iter().all(|(other, _)| id != other)));
             let mut narrow =
                 VectorSearchCursor::new(graph.clone(), &query, 7, Some(selection.clone())).unwrap();
-            let nearest = narrow.next_batch(1, 3).unwrap().unwrap();
+            let nearest = narrow.next_batch(1, 32).unwrap().unwrap();
+            let mut reranked = nearest.clone();
+            for (id, distance) in &mut reranked {
+                *distance = super::super::distance::ordering_distance(
+                    &[35.125, 1.0],
+                    &[id.page_id as f32, 1.0],
+                    Metric::L2,
+                );
+            }
+            reranked.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
             assert_eq!(
-                nearest.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                reranked
+                    .iter()
+                    .take(3)
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>(),
                 vec![RowId::new(36, 0), RowId::new(33, 0), RowId::new(39, 0)]
             );
             if kind != 2 {
