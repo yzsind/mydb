@@ -351,6 +351,7 @@ Closing the loop on MySQL 8.0 semantics:
 - **`CLIENT_FOUND_ROWS`**: the OK packet returns matched/changed per the bit + `Rows matched: N Changed: M Warnings: W`.
 - **CTE-driven DML**, **`SELECT ... INTO @var`**, **`DO expr`**: ✅
 - ➕ **`INSERT / UPDATE / DELETE ... RETURNING`**: a PostgreSQL 18-style extension returning NEW/NEW/OLD respectively by default, with explicit `OLD`/`NEW` references and `WITH (OLD AS ..., NEW AS ...)` aliases. Supports plain, ODKU, single-target JOIN DML, prepared statements, and updatable views; UPDATE/DELETE RETURNING that genuinely modifies multiple target tables returns 1235.
+- ➕ **[SQL ROWID](rowid.md)**: a read-only, table-scoped `BIGINT UNSIGNED` heap address with stable partition-leaf tags. Explicit projection, direct equality/IN access, DML predicates, and RETURNING are supported. Real `rowid` columns take precedence; addresses may be reused after deletion or physical DDL.
 - ❌ **`HANDLER`**: explicitly 1235.
 
 ---

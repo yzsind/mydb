@@ -2190,6 +2190,12 @@ impl NativeVecCompiler {
         txn: TxnView,
         plan: &'a PhysicalPlan,
     ) -> Result<NativeCompileOutcome<'a>, QueryError> {
+        if super::plan::is_sql_rowid_direct_scan(db, plan)? {
+            return Ok(NativeCompileOutcome::Native(
+                try_build_row_storage_batch(db, txn, plan)?
+                    .expect("ROWID scan has a row-to-batch adapter"),
+            ));
+        }
         let mut compiled = match plan {
             PhysicalPlan::NullExtend { .. } => try_build_null_extend_input(db, txn, plan)?,
             PhysicalPlan::Projection {

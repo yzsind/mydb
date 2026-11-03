@@ -111,6 +111,19 @@ impl Database {
     where
         F: FnMut(&[Value]) -> Result<(), QueryError>,
     {
+        self.scan_rows_ordered_streaming_with_refs(table_name, txn, |_, values| visit(values))
+    }
+
+    /// Ordered visible rows with the exact owning heap and root slot.
+    pub(crate) fn scan_rows_ordered_streaming_with_refs<F>(
+        &self,
+        table_name: &str,
+        txn: TxnView,
+        mut visit: F,
+    ) -> Result<(), QueryError>
+    where
+        F: FnMut(crate::storage::DmlRowRef, &[Value]) -> Result<(), QueryError>,
+    {
         const BATCH_PAGES: u64 = 64;
         let table = self
             .table_by_key(table_name)
@@ -136,6 +149,7 @@ impl Database {
                     )
                 })?;
                 for row in batch.drain(..) {
+                    let row_id = row.row_id;
                     let mut values =
                         if self.row_version_visible_cached(&mut vis_cache, row.header, txn)? {
                             if row.header.is_deleted() {
@@ -149,7 +163,7 @@ impl Database {
                             visible.values
                         };
                     Self::pad_full_row_to_schema(&mut values, &table);
-                    visit(&values)?;
+                    visit(crate::storage::DmlRowRef { storage_id, row_id }, &values)?;
                     examined += 1;
                 }
             }
@@ -388,6 +402,67 @@ impl Database {
     }
 
     pub(crate) fn scan_rows_columns_storage_streaming_range_with_ids_impl<F>(
+        &self,
+        table: &TableSchema,
+        storage_id: u64,
+        txn: TxnView,
+        columns: &[usize],
+        page_lo: u64,
+        page_hi: u64,
+        validate_generation: bool,
+        mut visit: F,
+    ) -> Result<(), QueryError>
+    where
+        F: FnMut(RowId, &[Value]) -> Result<(), QueryError>,
+    {
+        if let Some(index) = crate::storage::rowid::query_column_index(table) {
+            if columns.contains(&index) {
+                let physical: Vec<_> = columns
+                    .iter()
+                    .copied()
+                    .filter(|col| *col != index)
+                    .collect();
+                let mut output = Vec::with_capacity(columns.len());
+                return self.scan_rows_columns_storage_streaming_range_with_ids_physical(
+                    table,
+                    storage_id,
+                    txn,
+                    &physical,
+                    page_lo,
+                    page_hi,
+                    validate_generation,
+                    |row_id, values| {
+                        output.clear();
+                        let mut values = values.iter();
+                        let address = crate::storage::rowid::for_row(
+                            table,
+                            crate::storage::DmlRowRef { storage_id, row_id },
+                        )?;
+                        for &column in columns {
+                            output.push(if column == index {
+                                Value::UInt(address)
+                            } else {
+                                values.next().cloned().unwrap_or(Value::Null)
+                            });
+                        }
+                        visit(row_id, &output)
+                    },
+                );
+            }
+        }
+        self.scan_rows_columns_storage_streaming_range_with_ids_physical(
+            table,
+            storage_id,
+            txn,
+            columns,
+            page_lo,
+            page_hi,
+            validate_generation,
+            visit,
+        )
+    }
+
+    pub(crate) fn scan_rows_columns_storage_streaming_range_with_ids_physical<F>(
         &self,
         table: &TableSchema,
         storage_id: u64,

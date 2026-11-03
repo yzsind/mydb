@@ -7601,6 +7601,7 @@ pub(super) fn execute_qualified_statement(
     mut statement: Statement,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    let _rowid_demand = crate::storage::rowid::DemandScope::enter(&statement);
     authorize_statement(db, session, &statement)?;
     if crate::binlog::enabled() {
         let kind = match &statement {

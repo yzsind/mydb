@@ -416,6 +416,7 @@ mod rc_concurrency;
 mod read_compatible_ddl;
 mod rollup;
 mod routines;
+mod rowid;
 mod scalar_decorrelate;
 mod select;
 mod select_audit;

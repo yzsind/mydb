@@ -5443,6 +5443,9 @@ fn inner_select_columns(db: &Arc<Database>, select: &Select) -> HashSet<String> 
                 cols.insert(col.name.to_ascii_lowercase());
             }
         } else if let Ok(schema) = db.table(name) {
+            if !schema.system {
+                cols.insert("rowid".into());
+            }
             for col in &schema.columns {
                 cols.insert(col.name.to_ascii_lowercase());
             }

@@ -1326,6 +1326,10 @@ impl TableSchema {
     /// Idempotent: subsequent calls observe the already-populated fields
     /// and only refresh the lookup maps.
     pub fn build_column_index(&mut self) {
+        if let Some(partitioning) = &mut self.partitioning {
+            // DDL validation rejects duplicate tags and exhausted tag space.
+            let _ = partitioning.assign_rowid_tags();
+        }
         if self.object_id == 0 {
             self.object_id = self.id;
         }
@@ -4173,6 +4177,15 @@ pub struct DmlRowRef {
 pub struct DmlStoredRow {
     pub row_ref: DmlRowRef,
     pub values: Vec<Value>,
+}
+
+/// Full logical images and their physical identities captured by one mutation.
+#[derive(Debug, Clone)]
+pub(crate) struct DmlRowImages {
+    pub old_values: Vec<Value>,
+    pub new_values: Vec<Value>,
+    pub old_ref: DmlRowRef,
+    pub new_ref: DmlRowRef,
 }
 
 thread_local! {

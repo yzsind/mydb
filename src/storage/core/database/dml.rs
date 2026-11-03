@@ -1664,6 +1664,13 @@ impl Database {
             let rows = self.dml_candidate_rows(&table, txn, candidates)?;
             let mut count = 0;
             for row in rows {
+                let _rowid_scope = crate::storage::rowid::RowScope::enter(
+                    &table,
+                    crate::storage::DmlRowRef {
+                        storage_id: table.id,
+                        row_id: row.row_id,
+                    },
+                )?;
                 crate::engine::cancel::check_cancelled()?;
                 if !predicate(&row.values)? {
                     continue;
@@ -1742,6 +1749,13 @@ impl Database {
                 .map(|_| Default::default())
                 .collect();
             for row in rows {
+                let _rowid_scope = crate::storage::rowid::RowScope::enter(
+                    &table,
+                    crate::storage::DmlRowRef {
+                        storage_id: table.id,
+                        row_id: row.row_id,
+                    },
+                )?;
                 crate::engine::cancel::check_cancelled()?;
                 if !predicate(&row.values)? {
                     continue;
@@ -1777,6 +1791,7 @@ impl Database {
                 if !predicate(&current.values)? {
                     continue;
                 }
+
                 let base_values = &current.values;
                 let mut new_values = apply_updates(base_values)?;
                 coerce_updated_row(&table, &mut new_values, changed_columns)?;
@@ -2196,6 +2211,13 @@ impl Database {
             let rows = self.dml_candidate_rows(&table, txn, candidates)?;
             let mut count = 0;
             for row in rows {
+                let _rowid_scope = crate::storage::rowid::RowScope::enter(
+                    &table,
+                    crate::storage::DmlRowRef {
+                        storage_id: table.id,
+                        row_id: row.row_id,
+                    },
+                )?;
                 crate::engine::cancel::check_cancelled()?;
                 if !predicate(&row.values)? {
                     continue;
@@ -2224,6 +2246,13 @@ impl Database {
         let rows = self.dml_candidate_rows(&table, txn, candidates)?;
         let mut deletes = Vec::new();
         for row in rows {
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(
+                &table,
+                crate::storage::DmlRowRef {
+                    storage_id: table.id,
+                    row_id: row.row_id,
+                },
+            )?;
             crate::engine::cancel::check_cancelled()?;
             if !predicate(&row.values)? {
                 continue;
@@ -2386,6 +2415,10 @@ impl Database {
         }
         let mut predicate_values = current.values.clone();
         Self::pad_full_row_to_schema(&mut predicate_values, table);
+        let _rowid_scope = crate::storage::rowid::RowScope::enter(
+            table,
+            crate::storage::DmlRowRef { storage_id, row_id },
+        )?;
         if !predicate(&predicate_values)? {
             if txn.txn_id != 0 && !held_before {
                 self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
@@ -2701,7 +2734,7 @@ impl Database {
         changed_columns: Option<&[usize]>,
         noop_compare_columns: Option<&[usize]>,
         apply: F,
-    ) -> Result<(bool, Option<(Vec<Value>, Vec<Value>)>), QueryError>
+    ) -> Result<(bool, Option<crate::storage::DmlRowImages>), QueryError>
     where
         F: FnMut(&[Value]) -> Result<Vec<Value>, QueryError>,
     {
@@ -2719,6 +2752,44 @@ impl Database {
                 Some(&mut images),
             )?;
         Ok((changed, images))
+    }
+
+    pub(crate) fn update_row_with_optional_images_at<F>(
+        &self,
+        txn: TxnView,
+        table: &TableSchema,
+        storage_id: Option<u64>,
+        row_id: RowId,
+        changed_columns: Option<&[usize]>,
+        noop_compare_columns: Option<&[usize]>,
+        capture_images: bool,
+        apply: F,
+    ) -> Result<(bool, Option<crate::storage::DmlRowImages>), QueryError>
+    where
+        F: FnMut(&[Value]) -> Result<Vec<Value>, QueryError>,
+    {
+        if capture_images {
+            self.update_row_with_images_at(
+                txn,
+                table,
+                storage_id,
+                row_id,
+                changed_columns,
+                noop_compare_columns,
+                apply,
+            )
+        } else {
+            self.update_row_by_id_with_changed_columns_noop_at(
+                txn,
+                table,
+                storage_id,
+                row_id,
+                changed_columns,
+                noop_compare_columns,
+                apply,
+            )
+            .map(|changed| (changed, None))
+        }
     }
 
     /// Prepared exact-point UPDATE variant. `affected_index_positions` was
@@ -2905,6 +2976,10 @@ impl Database {
             }
         }
 
+        let _rowid_scope = crate::storage::rowid::RowScope::enter(
+            table,
+            crate::storage::DmlRowRef { storage_id, row_id },
+        )?;
         if let Some(predicate) = predicate.as_mut() {
             if !predicate(&current_values)? {
                 if txn.txn_id != 0 && !held_before {
@@ -3032,7 +3107,7 @@ impl Database {
         noop_compare_columns: Option<&[usize]>,
         affected_index_positions: Option<&[usize]>,
         mut apply_updates: F,
-        mut images: Option<&mut Option<(Vec<Value>, Vec<Value>)>>,
+        mut images: Option<&mut Option<crate::storage::DmlRowImages>>,
     ) -> Result<bool, QueryError>
     where
         F: FnMut(&[Value]) -> Result<Vec<Value>, QueryError>,
@@ -3072,6 +3147,10 @@ impl Database {
             // it to the UPDATE expression callback — see the matching
             // comment in `update_rows_with_changed_columns` for why.
             Self::pad_full_row_to_schema(&mut current.values, table);
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(
+                table,
+                crate::storage::DmlRowRef { storage_id, row_id },
+            )?;
             let base_values = &current.values;
             let mut new_values = apply_updates(base_values)?;
             coerce_updated_row(table, &mut new_values, changed_columns)?;
@@ -3084,7 +3163,12 @@ impl Database {
                 if row_unchanged_on(base_values, &new_values, cols) {
                     if CAPTURE_IMAGES {
                         *images.as_deref_mut().expect("image capture requested") =
-                            Some((base_values.to_vec(), base_values.to_vec()));
+                            Some(crate::storage::DmlRowImages {
+                                old_values: base_values.to_vec(),
+                                new_values: base_values.to_vec(),
+                                old_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                                new_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                            });
                     }
                     return Ok(false);
                 }
@@ -3118,14 +3202,28 @@ impl Database {
                     // duration of the migration.
                     if CAPTURE_IMAGES {
                         *images.as_deref_mut().expect("image capture requested") =
-                            Some((base_values.to_vec(), new_values.clone()));
+                            Some(crate::storage::DmlRowImages {
+                                old_values: base_values.to_vec(),
+                                new_values: new_values.clone(),
+                                old_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                                new_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                            });
                     }
                     let before_image = base_values.to_vec();
                     let after_image = new_values.clone();
                     {
                         let _suppress = crate::binlog::SessionSqlLogBinGuard::new(false);
                         self.delete_row_at(txn, table, storage_id, row_id, base_values)?;
-                        self.insert_one_row_at(txn, table, target_sid, new_values)?;
+                        let new_row_id =
+                            self.insert_one_row_at(txn, table, target_sid, new_values)?;
+                        if CAPTURE_IMAGES {
+                            if let Some(image) = images.as_deref_mut().and_then(Option::as_mut) {
+                                image.new_ref = crate::storage::DmlRowRef {
+                                    storage_id: target_sid,
+                                    row_id: new_row_id,
+                                };
+                            }
+                        }
                     }
                     self.cache_auto_increment_from_updated_values(
                         table,
@@ -3382,7 +3480,12 @@ impl Database {
             self.record_non_temp_table_modifications(txn.txn_id, table, 1, 0)?;
             if CAPTURE_IMAGES {
                 *images.as_deref_mut().expect("image capture requested") =
-                    Some((base_values.to_vec(), new_values.clone()));
+                    Some(crate::storage::DmlRowImages {
+                        old_values: base_values.to_vec(),
+                        new_values: new_values.clone(),
+                        old_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                        new_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                    });
             }
             if crate::binlog::should_record_table_rows(table) {
                 crate::binlog::record_update_rows(
@@ -3450,6 +3553,7 @@ impl Database {
                 .collect::<Vec<_>>();
             let mut migrations: Vec<(u64, RowId, Vec<Value>, Vec<Value>)> = Vec::new();
             for row in rows {
+                let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
                 crate::engine::cancel::check_cancelled()?;
                 if !predicate(&row.values)? {
                     continue;
@@ -3609,6 +3713,7 @@ impl Database {
         let mut rows = self.dml_candidate_rows_with_origin_for_write(table, txn, candidates)?;
         rows.sort_unstable_by_key(|row| row.row_ref);
         for row in rows {
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
             crate::engine::cancel::check_cancelled()?;
             if !predicate(&row.values)? {
                 continue;

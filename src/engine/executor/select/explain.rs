@@ -3943,7 +3943,10 @@ fn format_plan_tree_nodes(
             ..
         } => {
             let name = table_display_name(table);
-            let scan_kind = "Table scan";
+            let scan_kind = hint_note
+                .as_deref()
+                .filter(|kind| matches!(*kind, "RowIdLookup" | "RowIdBatchLookup"))
+                .unwrap_or("Table scan");
             let mut line = format!(
                 "{indent}{arrow}{scan_kind} on {name} (cost={cost:.2} rows={estimated_rows:.0})"
             );
@@ -5224,6 +5227,10 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
                 s.index_merge_duplicates_removed
             ));
         }
+        if s.rowid_access {
+            extra.push_str(&format!(", \"rowid_candidates\": {}, \"rowid_unique_candidates\": {}, \"rowid_duplicates_removed\": {}, \"rowid_misses\": {}, \"rowid_rows_fetched\": {}",
+                s.rowid_candidates, s.rowid_unique_candidates, s.rowid_duplicates_removed, s.rowid_misses, s.rowid_rows_fetched));
+        }
         if s.runtime_filter_rejected > 0 {
             extra.push_str(&format!(
                 ", \"runtime_filter_rejected\": {}",
@@ -5581,10 +5588,16 @@ fn format_plan_json_node(
             filter,
             access_rows,
             possible_keys,
+            hint_note,
             ..
         } => {
             let name = table_display_name(table);
-            json_table_header(out, &indent, "table", &name, table, filter.as_ref(), "ALL");
+            let (kind, access) = match hint_note.as_deref() {
+                Some("RowIdLookup") => ("rowid_lookup", "ROWID"),
+                Some("RowIdBatchLookup") => ("rowid_batch_lookup", "ROWID"),
+                _ => ("table", "ALL"),
+            };
+            json_table_header(out, &indent, kind, &name, table, filter.as_ref(), access);
             json_possible_keys(out, possible_keys, &indent);
             json_scan_estimates(out, &indent, table, filter, *access_rows, *estimated_rows);
             json_scan_footer(out, &indent, plan, filter.as_ref(), stats);

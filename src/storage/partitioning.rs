@@ -168,6 +168,9 @@ impl PartitionPhysicalOptions {
 /// One persisted partition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Partition {
+    /// Stable table-local SQL ROWID tag; zero only for nonphysical parents.
+    #[serde(default)]
+    pub rowid_tag: u16,
     pub name: String,
     /// Physical heap id for an ordinary leaf partition. Catalog v42 stores
     /// `0` for a logical parent that owns subpartitions; its physical ids live
@@ -191,6 +194,9 @@ pub struct Partition {
 /// then HASH/KEY chooses one leaf storage id below it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subpartition {
+    /// Stable table-local SQL ROWID tag of this physical leaf.
+    #[serde(default)]
+    pub rowid_tag: u16,
     pub name: String,
     pub storage_id: u64,
     #[serde(default)]
@@ -204,6 +210,7 @@ pub struct Subpartition {
 /// This is the only partition-level object that may carry a storage id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionLeaf {
+    pub rowid_tag: u16,
     /// Ordinal of the logical parent in `PartitionInfo::partitions`.
     pub parent_ordinal: usize,
     /// Present for two-level partitioning; `None` means the parent itself is
@@ -319,6 +326,8 @@ pub(crate) struct PartitionRuntime {
 /// row schema.
 #[derive(Debug)]
 pub(crate) struct PartitionMetadataRuntime {
+    rowid_to_storage: HashMap<u16, u64>,
+    storage_to_rowid: HashMap<u64, u16>,
     name_to_storage_ids: HashMap<String, Vec<u64>>,
     storage_to_parent: HashMap<u64, usize>,
     _reservation: crate::engine::executor::mem_budget::ControlledMemoryCharge,
@@ -372,6 +381,102 @@ pub struct PartitionInfo {
 }
 
 impl PartitionInfo {
+    /// Assign tags to newly constructed leaves without renumbering survivors.
+    pub(crate) fn assign_rowid_tags(&mut self) -> Result<(), crate::types::QueryError> {
+        let mut used = std::collections::HashSet::new();
+        for partition in &self.partitions {
+            if partition.subpartitions.is_empty() {
+                if partition.rowid_tag != 0 && !used.insert(partition.rowid_tag) {
+                    return Err(super::rowid::invalid_metadata());
+                }
+            } else {
+                if partition.rowid_tag != 0 {
+                    return Err(super::rowid::invalid_metadata());
+                }
+                for leaf in &partition.subpartitions {
+                    if leaf.rowid_tag != 0 && !used.insert(leaf.rowid_tag) {
+                        return Err(super::rowid::invalid_metadata());
+                    }
+                }
+            }
+        }
+        let mut next = 1u32;
+        let mut assign = |tag: &mut u16| -> Result<(), crate::types::QueryError> {
+            if *tag == 0 {
+                while next <= u16::MAX as u32 && used.contains(&(next as u16)) {
+                    next += 1;
+                }
+                if next > u16::MAX as u32 {
+                    return Err(super::rowid::invalid_metadata());
+                }
+                *tag = next as u16;
+                used.insert(*tag);
+                next += 1;
+            }
+            Ok(())
+        };
+        for partition in &mut self.partitions {
+            if partition.subpartitions.is_empty() {
+                assign(&mut partition.rowid_tag)?;
+            } else {
+                for leaf in &mut partition.subpartitions {
+                    assign(&mut leaf.rowid_tag)?;
+                }
+            }
+        }
+        self.metadata_runtime = OnceLock::new();
+        Ok(())
+    }
+
+    pub(crate) fn validate_rowid_tags(&self) -> Result<(), crate::types::QueryError> {
+        let mut tags = std::collections::HashSet::new();
+        let mut storages = std::collections::HashSet::new();
+        for partition in &self.partitions {
+            if !partition.subpartitions.is_empty() && partition.rowid_tag != 0 {
+                return Err(super::rowid::invalid_metadata());
+            }
+            let leaves: Box<dyn Iterator<Item = (u16, u64)> + '_> =
+                if partition.subpartitions.is_empty() {
+                    Box::new(std::iter::once((partition.rowid_tag, partition.storage_id)))
+                } else {
+                    Box::new(
+                        partition
+                            .subpartitions
+                            .iter()
+                            .map(|s| (s.rowid_tag, s.storage_id)),
+                    )
+                };
+            for (tag, storage) in leaves {
+                if tag == 0 || storage == 0 || !tags.insert(tag) || !storages.insert(storage) {
+                    return Err(super::rowid::invalid_metadata());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rowid_tag(&self, storage_id: u64) -> Result<u16, crate::types::QueryError> {
+        self.rowid_metadata()?
+            .storage_to_rowid
+            .get(&storage_id)
+            .copied()
+            .filter(|tag| *tag != 0)
+            .ok_or_else(super::rowid::invalid_metadata)
+    }
+
+    pub fn rowid_storage(&self, tag: u16) -> Result<Option<u64>, crate::types::QueryError> {
+        Ok(self.rowid_metadata()?.rowid_to_storage.get(&tag).copied())
+    }
+
+    fn rowid_metadata(&self) -> Result<&PartitionMetadataRuntime, crate::types::QueryError> {
+        self.metadata_runtime().ok_or_else(|| {
+            super::error(
+                crate::error::catalog::ER_OUT_OF_RESOURCES,
+                "insufficient memory for partition ROWID metadata",
+            )
+        })
+    }
+
     #[cfg(test)]
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
@@ -399,6 +504,7 @@ impl PartitionInfo {
         for (parent_ordinal, partition) in self.partitions.iter().enumerate() {
             if partition.subpartitions.is_empty() {
                 leaves.push(PartitionLeaf {
+                    rowid_tag: partition.rowid_tag,
                     parent_ordinal,
                     subpartition_name: None,
                     storage_id: partition.storage_id,
@@ -409,6 +515,7 @@ impl PartitionInfo {
                         .subpartitions
                         .iter()
                         .map(|subpartition| PartitionLeaf {
+                            rowid_tag: subpartition.rowid_tag,
                             parent_ordinal,
                             subpartition_name: Some(subpartition.name.clone()),
                             storage_id: subpartition.storage_id,
@@ -530,6 +637,7 @@ impl PartitionInfo {
                 leaf_count.saturating_mul(std::mem::size_of::<(u64, usize)>().saturating_mul(2)),
             )
             .saturating_add(name_bytes)
+            .saturating_add(leaf_count.saturating_mul(64))
             .saturating_add(4096);
         let mut reservation =
             crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
@@ -538,7 +646,18 @@ impl PartitionInfo {
             )?;
         let mut names = HashMap::with_capacity(name_count);
         let mut storage_to_parent = HashMap::with_capacity(leaf_count);
+        let mut rowid_to_storage = HashMap::with_capacity(leaf_count);
+        let mut storage_to_rowid = HashMap::with_capacity(leaf_count);
         for (parent_ordinal, partition) in self.partitions.iter().enumerate() {
+            if partition.subpartitions.is_empty() {
+                rowid_to_storage.insert(partition.rowid_tag, partition.storage_id);
+                storage_to_rowid.insert(partition.storage_id, partition.rowid_tag);
+            } else {
+                for leaf in &partition.subpartitions {
+                    rowid_to_storage.insert(leaf.rowid_tag, leaf.storage_id);
+                    storage_to_rowid.insert(leaf.storage_id, leaf.rowid_tag);
+                }
+            }
             let storage_ids = if partition.subpartitions.is_empty() {
                 vec![partition.storage_id]
             } else {
@@ -559,19 +678,23 @@ impl PartitionInfo {
                 );
             }
         }
-        let retained = names
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(String, Vec<u64>)>().saturating_mul(2))
+        let retained = (rowid_to_storage.capacity() + storage_to_rowid.capacity())
+            .saturating_mul(32)
             .saturating_add(
                 names
-                    .iter()
-                    .map(|(name, ids)| name.capacity().saturating_add(ids.capacity() * 8))
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                storage_to_parent
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(u64, usize)>().saturating_mul(2)),
+                    .saturating_mul(std::mem::size_of::<(String, Vec<u64>)>().saturating_mul(2))
+                    .saturating_add(
+                        names
+                            .iter()
+                            .map(|(name, ids)| name.capacity().saturating_add(ids.capacity() * 8))
+                            .sum::<usize>(),
+                    )
+                    .saturating_add(
+                        storage_to_parent
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(u64, usize)>().saturating_mul(2)),
+                    ),
             );
         if retained > reservation.bytes()
             && reservation
@@ -581,6 +704,8 @@ impl PartitionInfo {
             return None;
         }
         Some(Arc::new(PartitionMetadataRuntime {
+            rowid_to_storage,
+            storage_to_rowid,
             name_to_storage_ids: names,
             storage_to_parent,
             _reservation: reservation,
@@ -620,6 +745,7 @@ mod tests {
             key_algorithm: None,
             partitions: vec![
                 Partition {
+                    rowid_tag: 0,
                     name: "p0".to_string(),
                     storage_id: 10,
                     bounds: PartitionBounds::RangeLessThan(vec![PartitionLiteral::Value(
@@ -629,12 +755,14 @@ mod tests {
                     options: PartitionPhysicalOptions::default(),
                     subpartitions: vec![
                         Subpartition {
+                            rowid_tag: 0,
                             name: "p0sp0".to_string(),
                             storage_id: 101,
                             comment: String::new(),
                             options: PartitionPhysicalOptions::default(),
                         },
                         Subpartition {
+                            rowid_tag: 0,
                             name: "p0sp1".to_string(),
                             storage_id: 102,
                             comment: String::new(),
@@ -643,12 +771,14 @@ mod tests {
                     ],
                 },
                 Partition {
+                    rowid_tag: 0,
                     name: "p1".to_string(),
                     storage_id: 20,
                     bounds: PartitionBounds::RangeLessThan(vec![PartitionLiteral::MaxValue]),
                     comment: String::new(),
                     options: PartitionPhysicalOptions::default(),
                     subpartitions: vec![Subpartition {
+                        rowid_tag: 0,
                         name: "p1sp0".to_string(),
                         storage_id: 201,
                         comment: String::new(),
@@ -676,16 +806,19 @@ mod tests {
             info.leaves(),
             vec![
                 PartitionLeaf {
+                    rowid_tag: 0,
                     parent_ordinal: 0,
                     subpartition_name: Some("p0sp0".to_string()),
                     storage_id: 101,
                 },
                 PartitionLeaf {
+                    rowid_tag: 0,
                     parent_ordinal: 0,
                     subpartition_name: Some("p0sp1".to_string()),
                     storage_id: 102,
                 },
                 PartitionLeaf {
+                    rowid_tag: 0,
                     parent_ordinal: 1,
                     subpartition_name: Some("p1sp0".to_string()),
                     storage_id: 201,

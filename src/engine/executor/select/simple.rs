@@ -2078,6 +2078,19 @@ pub(in crate::engine::executor) fn single_table_result_columns(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Result<Vec<Column>, QueryError> {
+    let expanded;
+    let table = if crate::storage::rowid::query_column_index(table).is_none()
+        && stmt.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => crate::parser::visit::any_expr(expr, |node| {
+                crate::engine::executor::rowid::is_pseudo(table, node)
+            }),
+            _ => false,
+        }) {
+        expanded = crate::storage::rowid::query_schema(table);
+        &expanded
+    } else {
+        table
+    };
     let mut columns = Vec::new();
     for item in &stmt.projection {
         match item {
@@ -2346,6 +2359,9 @@ pub(super) fn simple_scan_source(
             simple_scan_source(db, txn, input)
         }
         PhysicalPlan::SeqScan { table, filter, .. } => {
+            if crate::storage::rowid::query_column_index(&table.schema).is_some() {
+                return Ok(None);
+            }
             Ok(Some((table.clone(), None, filter.clone())))
         }
         // Zone Map scans need page-range candidates rather than an optional

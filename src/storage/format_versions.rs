@@ -28,7 +28,8 @@
 /// v65: encrypted AI Secret, Connection and Model catalog metadata.
 /// v67: object-scoped, typed binary optimizer statistics.
 /// v68: functional-index result collations and corrected numeric key domains.
-pub const CATALOG_VERSION: u32 = 68;
+/// v69: stable table-local SQL ROWID tags on physical partition leaves.
+pub const CATALOG_VERSION: u32 = 69;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.

@@ -88,6 +88,12 @@ impl StatsSource {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct NodeStats {
+    pub rowid_access: bool,
+    pub rowid_candidates: u64,
+    pub rowid_unique_candidates: u64,
+    pub rowid_duplicates_removed: u64,
+    pub rowid_misses: u64,
+    pub rowid_rows_fetched: u64,
     pub rrf_branches: u8,
     pub rrf_input_rows: [u64; 8],
     pub rrf_unique_rows: [u64; 8],
@@ -813,6 +819,29 @@ pub(crate) fn add_index_merge_work(branches: u64, candidates: u64, duplicates: u
                 entry.index_merge_duplicates_removed = entry
                     .index_merge_duplicates_removed
                     .saturating_add(duplicates);
+            }
+        }
+    });
+}
+
+pub(crate) fn add_rowid_work(
+    key: Option<PlanNodeId>,
+    work: crate::engine::executor::rowid::AccessStats,
+) {
+    let Some(key) = key else { return };
+    STATS_COLLECTOR.with(|cell| {
+        if let Some(collector) = cell.borrow().as_ref().cloned() {
+            if let Ok(mut map) = collector.stats.lock() {
+                let entry = map.entry(key).or_default();
+                entry.rowid_access = true;
+                entry.rowid_candidates = entry.rowid_candidates.saturating_add(work.candidates);
+                entry.rowid_unique_candidates =
+                    entry.rowid_unique_candidates.saturating_add(work.unique);
+                entry.rowid_duplicates_removed = entry
+                    .rowid_duplicates_removed
+                    .saturating_add(work.duplicates_removed);
+                entry.rowid_misses = entry.rowid_misses.saturating_add(work.misses);
+                entry.rowid_rows_fetched = entry.rowid_rows_fetched.saturating_add(work.fetched);
             }
         }
     });
@@ -1629,6 +1658,20 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
                     entry.physical_reads =
                         entry.physical_reads.saturating_add(stats.physical_reads);
                     entry.io_is_self |= stats.io_is_self;
+                    entry.rowid_access |= stats.rowid_access;
+                    entry.rowid_candidates = entry
+                        .rowid_candidates
+                        .saturating_add(stats.rowid_candidates);
+                    entry.rowid_unique_candidates = entry
+                        .rowid_unique_candidates
+                        .saturating_add(stats.rowid_unique_candidates);
+                    entry.rowid_duplicates_removed = entry
+                        .rowid_duplicates_removed
+                        .saturating_add(stats.rowid_duplicates_removed);
+                    entry.rowid_misses = entry.rowid_misses.saturating_add(stats.rowid_misses);
+                    entry.rowid_rows_fetched = entry
+                        .rowid_rows_fetched
+                        .saturating_add(stats.rowid_rows_fetched);
                     entry.runtime_filter_rejected = entry
                         .runtime_filter_rejected
                         .saturating_add(stats.runtime_filter_rejected);
@@ -1882,6 +1925,10 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                     " index_entries_examined={}",
                     s.index_entries_examined
                 ));
+            }
+            if s.rowid_access {
+                suffix.push_str(&format!(" rowid_candidates={} rowid_unique_candidates={} rowid_duplicates_removed={} rowid_misses={} rowid_rows_fetched={}",
+                    s.rowid_candidates, s.rowid_unique_candidates, s.rowid_duplicates_removed, s.rowid_misses, s.rowid_rows_fetched));
             }
             if s.index_merge_branches > 0 {
                 suffix.push_str(&format!(

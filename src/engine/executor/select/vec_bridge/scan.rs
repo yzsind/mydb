@@ -273,6 +273,27 @@ impl BatchOperator for StorageBatchStream {
                 crate::engine::executor::partition_router::record_partition_visit();
             }
             let mut output = ScanBatchBuilder::new(self.schema.clone(), batch_rows);
+            if crate::storage::rowid::query_column_index(&self.table.schema)
+                .is_some_and(|index| self.schema_cols.contains(&index))
+            {
+                self.db.scan_rows_columns_storage_streaming_range_with_ids(
+                    &self.table.schema,
+                    task.storage_id,
+                    self.txn,
+                    &self.schema_cols,
+                    task.page_lo,
+                    task.page_hi,
+                    |_, values| {
+                        for (column, value) in output.columns.iter_mut().zip(values) {
+                            column.push(value);
+                        }
+                        output.finish_row()?;
+                        Ok(())
+                    },
+                )?;
+                self.pending.extend(output.finish()?);
+                continue;
+            }
             let mut fallback_values = Vec::with_capacity(self.schema_cols.len());
             let mut consume = |hit: crate::storage::PayloadStreamHit<'_>| {
                 match hit {
@@ -660,6 +681,52 @@ impl BatchOperator for FilteredStorageBatchStream {
             let mut output = ScanBatchBuilder::new(self.schema.clone(), batch_rows);
             let mut evaluated_rows = 0u64;
             let mut runtime_filter_rejections = vec![0u64; self.runtime_probes.len()];
+            if crate::storage::rowid::query_column_index(&self.table.schema).is_some_and(|index| {
+                self.predicate_columns.contains(&index) || self.all_cols.contains(&index)
+            }) {
+                let mut ids = Vec::new();
+                let mut id_charge = mem_budget::ScopedCharge::new(0);
+                self.db.scan_rows_columns_storage_streaming_range_with_ids(
+                    &self.table.schema, task.storage_id, self.txn, &self.predicate_columns, task.page_lo, task.page_hi,
+                    |row_id, values| {
+                        evaluated_rows += 1;
+                        if self.compiled.as_ref().map_or(Ok(true), |compiled| compiled.eval(values))?
+                            && crate::engine::executor::select::plan::runtime_filters_admit_values_indexed_deferred(
+                                &self.runtime_probes, values, &mut runtime_filter_rejections)
+                        {
+                            id_charge.add_force(2 * std::mem::size_of::<crate::storage::RowId>())?;
+                            ids.push(row_id);
+                        }
+                        Ok(())
+                    },
+                )?;
+                let heap = self.db.cached_heap_handle(task.storage_id)?;
+                let rows = self.db.read_row_columns_many_with_handle(
+                    &heap,
+                    &self.table.schema,
+                    &ids,
+                    self.txn,
+                    &self.all_cols,
+                )?;
+                let _rows_charge = mem_budget::force_charge_scoped(
+                    rows.iter().fold(0usize, |bytes, (_, row)| {
+                        bytes.saturating_add(mem_budget::estimate_row_bytes(row))
+                    }),
+                )?;
+                for (_, values) in rows {
+                    for (column, value) in output.columns.iter_mut().zip(&values) {
+                        column.push(value);
+                    }
+                    output.finish_row()?;
+                }
+                crate::engine::executor::select::plan::flush_runtime_filter_rejections(
+                    &self.runtime_probes,
+                    &mut runtime_filter_rejections,
+                );
+                analyze_stats::add_pending_expression_rows(evaluated_rows, 0);
+                self.pending.extend(output.finish()?);
+                continue;
+            }
             let mut missing_columns = Vec::new();
             let mut missing_output_slots = Vec::new();
             let mut predicate_output_slots = Vec::new();
@@ -1749,6 +1816,9 @@ pub(super) fn try_build_direct_batch_scan<'a>(
     txn: TxnView,
     plan: &'a PhysicalPlan,
 ) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    if super::super::plan::is_sql_rowid_direct_scan(db, plan)? {
+        return super::try_build_row_storage_batch(db, txn, plan);
+    }
     let inner = peel_projection(plan);
     let (
         table,

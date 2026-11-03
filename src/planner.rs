@@ -1393,6 +1393,7 @@ pub struct PlanTable {
 impl PlanTable {
     /// Construct a `PlanTable` with a fresh empty meta cache.
     pub(crate) fn new(table_id: u64, schema: Arc<TableSchema>, alias: Option<String>) -> Self {
+        let schema = crate::storage::rowid::planning_schema(schema, alias.as_deref());
         Self {
             table_id,
             schema,
@@ -1454,6 +1455,7 @@ impl PlanTable {
         sidecar_delta: u64,
         live_row_delta: i64,
     ) -> Self {
+        let schema = crate::storage::rowid::planning_schema(schema, alias.as_deref());
         Self {
             table_id,
             schema,
@@ -1560,6 +1562,7 @@ pub(crate) fn decorrelate_enabled_external() -> bool {
 }
 
 pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, QueryError> {
+    let _rowid_scope = crate::storage::rowid::PlanningScope::enter(select);
     crate::engine::params::validate_limit(select.limit.as_ref())?;
     crate::engine::params::validate_limit(select.offset.as_ref())?;
     let _optimizing = crate::engine::cancel::enter_process_stage(
@@ -4388,13 +4391,21 @@ fn scope_table_for_ref(
         return Err(error);
     }
     let schema = db.table(&table.name)?;
+    let mut addressable: Vec<_> = schema
+        .iter_visible_columns()
+        .map(|(_, column)| column.name.clone())
+        .collect();
+    if !schema.system
+        && !addressable
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("rowid"))
+    {
+        addressable.push("ROWID".into());
+    }
     Ok(ScopeTable {
         name: schema.name.clone(),
         alias: table.alias.clone(),
-        columns: schema
-            .iter_visible_columns()
-            .map(|(_, column)| column.name.clone())
-            .collect(),
+        columns: addressable,
         wildcard_columns: schema
             .iter_select_columns()
             .map(|(_, column)| column.name.clone())
@@ -4887,6 +4898,7 @@ define_plan_metadata! {
 }
 
 fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, QueryError> {
+    let _rowid_scope = crate::storage::rowid::PlanningScope::enter(select);
     let cbo_ctx = crate::engine::cbo::CboContext::from_db(db);
     if select.table.is_none()
         && select.from.is_empty()
@@ -10324,6 +10336,158 @@ fn choose_scan(
     filter: Option<Expr>,
     hints: &ScanHints<'_>,
 ) -> Result<PhysicalPlan, QueryError> {
+    if crate::storage::rowid::query_column_index(&table.schema).is_some() {
+        let address_access = filter
+            .as_ref()
+            .map(|expr| {
+                crate::engine::executor::rowid::candidates_for(
+                    &table.schema,
+                    table.alias.as_deref(),
+                    expr,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(addresses) = &address_access {
+            let (cost, prefer) = crate::engine::executor::rowid::lookup_cost(db, table, addresses)?;
+            if prefer {
+                let batch = addresses.len() > 1 || filter.as_ref().is_some_and(|expr| {
+                    crate::parser::visit::any_expr(expr, |node| {
+                        matches!(node, Expr::InList { expr, negated: false, .. }
+                            if crate::engine::executor::rowid::is_reference(&table.schema, table.alias.as_deref(), expr))
+                    })
+                });
+                return Ok(PhysicalPlan::SeqScan {
+                    table: table.clone(),
+                    filter,
+                    estimated_rows: addresses.len() as f64,
+                    access_rows: addresses.len() as f64,
+                    cost,
+                    possible_keys: Vec::new(),
+                    hint_note: Some(
+                        if batch {
+                            "RowIdBatchLookup"
+                        } else {
+                            "RowIdLookup"
+                        }
+                        .into(),
+                    ),
+                    runtime_filters: Vec::new(),
+                    projected_columns: None,
+                });
+            }
+        }
+        let mut physical = table.clone();
+        let mut schema = (*table.schema).clone();
+        schema.columns.pop();
+        schema.column_name_map.remove("rowid");
+        physical.schema = Arc::new(schema);
+        physical.column_metas = Arc::new(OnceLock::new());
+        physical.row_schema = Arc::new(OnceLock::new());
+        let mut plan = choose_scan(db, &physical, filter, hints)?;
+        walk_plan_mut(&mut plan, &mut |node| match node {
+            PhysicalPlan::SeqScan { table: source, .. }
+            | PhysicalPlan::ZoneMapScan { table: source, .. }
+            | PhysicalPlan::IndexLookup { table: source, .. }
+            | PhysicalPlan::IndexMultiLookup { table: source, .. }
+            | PhysicalPlan::IndexRangeScan { table: source, .. }
+            | PhysicalPlan::IndexFastScan { table: source, .. }
+            | PhysicalPlan::IndexMerge { table: source, .. }
+            | PhysicalPlan::IndexInLookup { table: source, .. }
+            | PhysicalPlan::FulltextScan { table: source, .. }
+            | PhysicalPlan::SpatialScan { table: source, .. }
+            | PhysicalPlan::VectorIndexScan { table: source, .. }
+            | PhysicalPlan::VectorBruteScan { table: source, .. }
+            | PhysicalPlan::ParallelSeqScan { table: source, .. }
+            | PhysicalPlan::ParallelZoneMapScan { table: source, .. }
+            | PhysicalPlan::ParallelIndexRangeScan { table: source, .. }
+            | PhysicalPlan::ParallelIndexFastScan { table: source, .. }
+                if source.table_id == table.table_id =>
+            {
+                source.schema = Arc::clone(&table.schema);
+                source.column_metas = Arc::new(OnceLock::new());
+                source.row_schema = Arc::new(OnceLock::new());
+            }
+            _ => {}
+        });
+        walk_plan_mut(&mut plan, &mut |node| match node {
+            PhysicalPlan::IndexLookup {
+                table, covering, ..
+            }
+            | PhysicalPlan::IndexMultiLookup {
+                table, covering, ..
+            }
+            | PhysicalPlan::IndexRangeScan {
+                table, covering, ..
+            }
+            | PhysicalPlan::IndexInLookup {
+                table, covering, ..
+            } if crate::storage::rowid::query_column_index(&table.schema).is_some() => {
+                *covering = false;
+            }
+            PhysicalPlan::IndexFastScan {
+                table,
+                index,
+                low,
+                high,
+                filter,
+                estimated_rows,
+                access_rows,
+                cost,
+                possible_keys,
+                reverse,
+                hint_note,
+                projected_columns,
+            } if crate::storage::rowid::query_column_index(&table.schema).is_some() => {
+                *node = PhysicalPlan::IndexRangeScan {
+                    table: table.clone(),
+                    index: index.clone(),
+                    low: low.clone(),
+                    high: high.clone(),
+                    filter: filter.clone(),
+                    estimated_rows: *estimated_rows,
+                    access_rows: *access_rows,
+                    cost: *cost,
+                    possible_keys: possible_keys.clone(),
+                    reverse: *reverse,
+                    hint_note: hint_note.clone(),
+                    projected_columns: projected_columns.clone(),
+                    covering: false,
+                };
+            }
+            PhysicalPlan::ParallelIndexFastScan {
+                table,
+                index,
+                low,
+                high,
+                filter,
+                estimated_rows,
+                access_rows,
+                cost,
+                possible_keys,
+                hint_note,
+                projected_columns,
+                degree,
+            } if crate::storage::rowid::query_column_index(&table.schema).is_some() => {
+                *node = PhysicalPlan::ParallelIndexRangeScan {
+                    table: table.clone(),
+                    index: index.clone(),
+                    low: low.clone(),
+                    high: high.clone(),
+                    filter: filter.clone(),
+                    estimated_rows: *estimated_rows,
+                    access_rows: *access_rows,
+                    cost: *cost,
+                    possible_keys: possible_keys.clone(),
+                    hint_note: hint_note.clone(),
+                    projected_columns: projected_columns.clone(),
+                    degree: *degree,
+                };
+            }
+            _ => {}
+        });
+        return Ok(plan);
+    }
     use crate::engine::cbo::operator_cost;
     let partition_pruning = build_partition_pruning_plan(&table.schema, filter.as_ref());
     // Non-partitioned tables (and predicates that retain the existing plan)

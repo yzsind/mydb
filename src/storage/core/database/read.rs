@@ -38,6 +38,14 @@ impl Database {
         // values for INSTANT-added columns even when the underlying
         // heap row pre-dates the ADD COLUMN.
         Self::pad_full_row_to_schema(&mut visible.values, table);
+        crate::storage::rowid::append_value(
+            table,
+            crate::storage::DmlRowRef {
+                storage_id: storage_id,
+                row_id,
+            },
+            &mut visible.values,
+        )?;
         crate::engine::perf_events::record_rows_examined(1);
         Ok(Some(visible))
     }
@@ -104,6 +112,14 @@ impl Database {
             return Ok(None);
         };
         Self::pad_full_row_to_schema(&mut visible.values, table);
+        crate::storage::rowid::append_value(
+            table,
+            crate::storage::DmlRowRef {
+                storage_id: heap.read().table_id,
+                row_id,
+            },
+            &mut visible.values,
+        )?;
         Ok(Some(visible))
     }
 
@@ -116,6 +132,12 @@ impl Database {
         columns: &[usize],
     ) -> Result<Option<Vec<Value>>, QueryError> {
         self.check_primary_read_view(table, txn)?;
+        if crate::storage::rowid::query_column_index(table)
+            .is_some_and(|index| columns.contains(&index))
+        {
+            let storage_id = heap.read().table_id;
+            return self.read_row_columns_at(storage_id, table, row_id, txn, columns);
+        }
         let projected_plan = ProjectedReadPlan::new(columns, table);
         let projected = {
             let heap_read = heap.read();
@@ -207,6 +229,12 @@ impl Database {
         let mut vis_cache = ScanVisibilityCache::new();
         let mut rows = 0usize;
         let heap_read = heap.read();
+        if columns
+            .iter()
+            .any(|column| *column >= heap_read.codec.columns.len())
+        {
+            return Ok(None);
+        }
         let complete = heap_read.with_lob(|| {
             heap_read.visit_mvcc_payloads_many_cached_with_plan(row_ids, columns, |row| {
                 if !self.row_version_visible_cached(&mut vis_cache, row.header, txn)? {
@@ -246,6 +274,39 @@ impl Database {
         projected_plan: &ProjectedReadPlan,
     ) -> Result<Vec<(RowId, Vec<Value>)>, QueryError> {
         self.check_primary_read_view(table, txn)?;
+        if let Some(index) =
+            crate::storage::rowid::query_column_index(table).filter(|index| columns.contains(index))
+        {
+            let storage_id = heap.read().table_id;
+            let physical: Vec<_> = columns
+                .iter()
+                .copied()
+                .filter(|column| *column != index)
+                .collect();
+            let physical_plan = ProjectedReadPlan::new(&physical, table);
+            let mut rows = self.read_row_columns_many_with_handle_and_plan(
+                heap,
+                table,
+                row_ids,
+                txn,
+                &physical,
+                None,
+                &physical_plan,
+            )?;
+            let tag = match &table.partitioning {
+                Some(partitioning) => partitioning.rowid_tag(storage_id)?,
+                None => 0,
+            };
+            for (row_id, values) in &mut rows {
+                let address = Value::UInt(crate::storage::rowid::encode(tag, *row_id));
+                for (position, column) in columns.iter().enumerate() {
+                    if *column == index {
+                        values.insert(position, address.clone());
+                    }
+                }
+            }
+            return Ok(rows);
+        }
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -409,6 +470,27 @@ impl Database {
         P: FnMut(&[Value]) -> Result<bool, QueryError>,
     {
         self.check_primary_read_view(table, txn)?;
+        if crate::storage::rowid::query_column_index(table).is_some_and(|index| {
+            predicate_columns.contains(&index) || output_columns.contains(&index)
+        }) {
+            let storage_id = heap.read().table_id;
+            let mut output = Vec::new();
+            for &row_id in row_ids {
+                let Some(values) =
+                    self.read_row_columns_at(storage_id, table, row_id, txn, predicate_columns)?
+                else {
+                    continue;
+                };
+                if predicate(&values)? {
+                    if let Some(values) =
+                        self.read_row_columns_at(storage_id, table, row_id, txn, output_columns)?
+                    {
+                        output.push((row_id, values));
+                    }
+                }
+            }
+            return Ok(output);
+        }
         let examined = crate::engine::perf_events::RowsExaminedBatch::new_index();
         if row_ids.is_empty() {
             return Ok(Vec::new());
@@ -527,6 +609,11 @@ impl Database {
         P: for<'a> FnMut(crate::storage::PayloadStreamHit<'a>) -> Result<Option<bool>, QueryError>,
     {
         self.check_primary_read_view(table, txn)?;
+        if crate::storage::rowid::query_column_index(table).is_some_and(|index| {
+            predicate_columns.contains(&index) || output_columns.contains(&index)
+        }) {
+            return Ok(None);
+        }
         if row_ids.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -1230,6 +1317,38 @@ impl Database {
         projected_plan: Option<&ProjectedReadPlan>,
     ) -> Result<Option<Vec<Value>>, QueryError> {
         self.check_primary_read_view(table, txn)?;
+        if let Some(index) = crate::storage::rowid::query_column_index(table) {
+            if columns.contains(&index) {
+                let physical: Vec<_> = columns
+                    .iter()
+                    .copied()
+                    .filter(|col| *col != index)
+                    .collect();
+                let Some(values) = self.read_row_columns_at_with_plan(
+                    storage_id, table, row_id, txn, &physical, None, None,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let address = crate::storage::rowid::for_row(
+                    table,
+                    crate::storage::DmlRowRef { storage_id, row_id },
+                )?;
+                let mut values = values.into_iter();
+                return Ok(Some(
+                    columns
+                        .iter()
+                        .map(|col| {
+                            if *col == index {
+                                Value::UInt(address)
+                            } else {
+                                values.next().unwrap_or(Value::Null)
+                            }
+                        })
+                        .collect(),
+                ));
+            }
+        }
         let Some((header, mut values, stored_count)) =
             self.read_mvcc_row_columns_with_plan(storage_id, row_id, columns, decode_plan)?
         else {

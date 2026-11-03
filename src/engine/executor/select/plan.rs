@@ -23,6 +23,8 @@ mod fulltext_source;
 mod fulltext_stream;
 pub(super) use fulltext_stream::FULLTEXT_BATCH_ROWS;
 mod scan;
+mod sql_rowid;
+pub(super) use sql_rowid::is_direct as is_sql_rowid_direct_scan;
 #[cfg(test)]
 mod scan_routing_tests;
 #[cfg(test)]
@@ -1451,6 +1453,10 @@ fn execute_physical_select_inner(
 /// Unbounded scans/ranges and aggregates therefore stay streaming.
 pub(super) fn bounded_result_plan(plan: &PhysicalPlan) -> bool {
     match plan {
+        PhysicalPlan::SeqScan {
+            hint_note: Some(access),
+            ..
+        } if access == "RowIdLookup" => true,
         PhysicalPlan::Projection { input, .. }
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Sort { input, .. }
@@ -1973,6 +1979,13 @@ pub(super) fn execute_plan_rows_inner(
     txn: TxnView,
     plan: &PhysicalPlan,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    if let Some(mut stream) = sql_rowid::open(db, txn, plan)? {
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next()? {
+            rows.push(row);
+        }
+        return Ok(rows);
+    }
     crate::engine::cancel::check_cancelled()?;
     // Partition fan-out: run a partitioned B-tree index scan once per
     // in-scope partition with a single-`storage_id` prune context
@@ -4144,6 +4157,9 @@ fn execute_plan_stream_inner(
     txn: TxnView,
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
+    if let Some(stream) = sql_rowid::open(db, txn, plan)? {
+        return Ok(stream);
+    }
     match plan {
         PhysicalPlan::FulltextScan { .. } => fulltext_stream::open(db, txn, plan),
         PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),

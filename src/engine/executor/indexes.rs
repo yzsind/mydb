@@ -195,6 +195,23 @@ pub(super) fn candidate_row_ids_for_write(
     table: &TableSchema,
     selection: Option<&Expr>,
 ) -> Result<Option<Vec<RowId>>, QueryError> {
+    if let Some(candidates) = selection
+        .map(|expr| super::rowid::candidates(table, expr))
+        .transpose()?
+        .flatten()
+    {
+        let allowed = super::partition_router::in_scope_storage_ids(table);
+        if table.is_partitioned() && allowed.len() != 1 {
+            return Ok(None);
+        }
+        return Ok(Some(
+            candidates
+                .into_iter()
+                .filter(|row| allowed.contains(&row.storage_id))
+                .map(|row| row.row_id)
+                .collect(),
+        ));
+    }
     let Some(access) = selection.and_then(|expr| plan_write_candidates(table, expr)) else {
         return Ok(None);
     };
@@ -370,6 +387,23 @@ pub(super) fn candidate_row_refs_for_write(
     table: &TableSchema,
     selection: Option<&Expr>,
 ) -> Result<Option<Vec<crate::storage::DmlRowRef>>, QueryError> {
+    if let Some(candidates) = selection
+        .map(|expr| super::rowid::candidates(table, expr))
+        .transpose()?
+        .flatten()
+    {
+        let allowed = super::partition_router::current_pruned_partitions();
+        return Ok(Some(
+            candidates
+                .into_iter()
+                .filter(|row| {
+                    allowed
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&row.storage_id))
+                })
+                .collect(),
+        ));
+    }
     let _partition_scope = super::partition_router::push_filter_partition_scope(table, selection);
     if !table.is_partitioned() {
         return candidate_row_ids_for_write(db, txn, table, selection).map(|candidates| {

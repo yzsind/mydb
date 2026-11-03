@@ -497,6 +497,7 @@ pub(super) fn execute_prepared_dml_plan(
     dp: &PreparedDmlPlan,
     connection_id: u64,
 ) -> Result<QueryResponse, QueryError> {
+    let _rowid_demand = crate::storage::rowid::DemandScope::enter(&dp.statement);
     authorize_prepared_dml(db, session, dp)?;
     let mdl_guard = acquire_prepared_statement_mdl(db, session, &dp.statement, &dp.mdl_requests)?;
     // The optimistic cache validation ran before MDL acquisition. A DDL may

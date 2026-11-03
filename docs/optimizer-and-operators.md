@@ -297,6 +297,7 @@ cost is higher.
 | `CteScan` | Materialized CTE/derived results | Supports filter and column pruning; reuses the CTE registry |
 | `GenerateSeries` | Integer, fixed-point numeric, and timestamp series | Can carry ordinality and a residual filter |
 | `SeqScan` | Sequential heap scan | Baseline for MVCC, predicates, runtime filters, partition and column pruning |
+| `RowIdLookup` / `RowIdBatchLookup` | Direct SQL ROWID heap access | Decodes the table-local partition tag and page/slot, preserves MVCC and residual predicates, and requires no B-tree probe; see [SQL ROWID](rowid.md) |
 | `ZoneMapScan` | Zone Map candidate pages + heap scan | The Zone Map prunes pages only; the original predicate must be rechecked row by row; falls back safely when metadata is unavailable |
 | `IndexLookup` | Single-key point lookup | `exact` distinguishes exact semantics; can be covering or fetch back to the heap |
 | `IndexMultiLookup` | Multi-key/IN point lookups | Deduplication, ordering, and residual semantics are kept correct by the executor |

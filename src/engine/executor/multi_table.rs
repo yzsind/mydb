@@ -942,13 +942,15 @@ pub(super) fn execute_multi_update(
             // in the SET list keep the latest committed values instead of
             // being clobbered by our build-context snapshot. Mirrors the
             // FK-cascade `move |old| {...}` pattern.
-            let updated = match db.update_row_by_id_with_changed_columns_noop_at(
+            let mut returned_images = None;
+            let updated = match db.update_row_with_optional_images_at(
                 txn,
                 &schema,
                 Some(storage_id),
                 row_id,
                 Some(&trigger_changed),
                 Some(update.user_columns.as_slice()),
+                returning_target == Some(p_idx),
                 |current| {
                     Ok(patch_changed_columns(
                         current,
@@ -957,7 +959,10 @@ pub(super) fn execute_multi_update(
                     ))
                 },
             ) {
-                Ok(updated) => updated,
+                Ok((updated, images)) => {
+                    returned_images = images;
+                    updated
+                }
                 Err(err) if stmt.ignore && crate::storage::ignorable_update_error(&err) => {
                     crate::engine::api::push_statement_condition(
                         crate::error::ConditionLevel::Warning,
@@ -967,7 +972,7 @@ pub(super) fn execute_multi_update(
                 }
                 Err(err) => return Err(err),
             };
-            if updated {
+            if updated || returned_images.is_some() {
                 fire_after_update(
                     db,
                     session,
@@ -976,22 +981,37 @@ pub(super) fn execute_multi_update(
                     new_values.clone(),
                     registry,
                 )?;
-                affected_rows += 1;
+                affected_rows += u64::from(updated);
                 if returning_target == Some(p_idx) {
                     if let Some(collector) = &mut returning {
-                        collector.push(Some(&old_values), Some(&new_values))?;
+                        if let Some(crate::storage::DmlRowImages {
+                            old_values: old,
+                            new_values: new,
+                            old_ref,
+                            new_ref,
+                        }) = &returned_images
+                        {
+                            collector.push_with_refs(
+                                Some(old),
+                                Some(new),
+                                Some(*old_ref),
+                                Some(*new_ref),
+                            )?;
+                        }
                     }
                 }
             }
             continue;
         }
-        let updated = match db.update_row_by_id_with_changed_columns_noop_at(
+        let mut returned_images = None;
+        let updated = match db.update_row_with_optional_images_at(
             txn,
             &schema,
             Some(storage_id),
             row_id,
             changed,
             Some(update.user_columns.as_slice()),
+            returning_target == Some(p_idx),
             |current| {
                 Ok(match changed {
                     Some(cols) => patch_changed_columns(current, &new_values, cols),
@@ -999,7 +1019,10 @@ pub(super) fn execute_multi_update(
                 })
             },
         ) {
-            Ok(updated) => updated,
+            Ok((updated, images)) => {
+                returned_images = images;
+                updated
+            }
             Err(err) if stmt.ignore && crate::storage::ignorable_update_error(&err) => {
                 crate::engine::api::push_statement_condition(
                     crate::error::ConditionLevel::Warning,
@@ -1009,11 +1032,24 @@ pub(super) fn execute_multi_update(
             }
             Err(err) => return Err(err),
         };
-        if updated {
-            affected_rows += 1;
+        if updated || returned_images.is_some() {
+            affected_rows += u64::from(updated);
             if returning_target == Some(p_idx) {
                 if let Some(collector) = &mut returning {
-                    collector.push(Some(&old_values), Some(&new_values))?;
+                    if let Some(crate::storage::DmlRowImages {
+                        old_values: old,
+                        new_values: new,
+                        old_ref,
+                        new_ref,
+                    }) = &returned_images
+                    {
+                        collector.push_with_refs(
+                            Some(old),
+                            Some(new),
+                            Some(*old_ref),
+                            Some(*new_ref),
+                        )?;
+                    }
                 }
             }
         }
@@ -1228,7 +1264,12 @@ pub(super) fn execute_multi_delete(
                     }
                     if returning_target == Some(p_idx) {
                         if let Some(collector) = &mut returning {
-                            collector.push(Some(&old_values), None)?;
+                            collector.push_with_refs(
+                                Some(&old_values),
+                                None,
+                                Some(crate::storage::DmlRowRef { storage_id, row_id }),
+                                None,
+                            )?;
                         }
                     }
                 }

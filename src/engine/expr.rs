@@ -4124,8 +4124,14 @@ fn eval_expr_legacy_inner(
     values: &[Value],
 ) -> Result<Value, QueryError> {
     match expr {
-        Expr::Identifier(name) => Ok(values[table.column_index(name)?].clone()),
+        Expr::Identifier(name) => match crate::storage::rowid::current(table, name) {
+            Some(value) => Ok(value),
+            None => Ok(values[table.column_index(name)?].clone()),
+        },
         Expr::CompoundIdentifier(parts) => {
+            if let Some(value) = crate::storage::rowid::current_qualified(table, parts) {
+                return Ok(value);
+            }
             Ok(values[table.column_index(parts.last().unwrap())?].clone())
         }
         Expr::UserVariable(name) => Ok(session_user_variable(name).unwrap_or(Value::Null)),

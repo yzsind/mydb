@@ -498,7 +498,11 @@ pub(super) fn collect_explain_rows(
             let mut row = explain_scan_row(
                 rows.len() + 1,
                 table,
-                "ALL",
+                if matches!(extra, "RowIdLookup" | "RowIdBatchLookup") {
+                    "ROWID"
+                } else {
+                    "ALL"
+                },
                 possible_keys,
                 "",
                 None,

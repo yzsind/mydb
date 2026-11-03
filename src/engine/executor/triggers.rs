@@ -263,6 +263,7 @@ fn fire_row_triggers(
     new_writable: bool,
     registry: &SessionRegistry,
 ) -> Result<Option<Vec<Value>>, QueryError> {
+    let _rowid_scope = crate::storage::rowid::RowScope::suspend();
     let before = timing == TriggerTimingSchema::Before;
     let triggers = db.triggers_for_table_event(&table.qualified_name(), event, timing);
     for trigger in triggers {
