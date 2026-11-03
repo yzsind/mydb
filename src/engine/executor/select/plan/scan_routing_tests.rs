@@ -3,6 +3,70 @@ use crate::engine::executor::partition_router;
 use crate::storage::{IsolationLevel, PartitionPruningPlan};
 
 #[test]
+fn native_hash_join_construction_keeps_build_open_for_parent_filters() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+        dir.path(),
+        crate::engine::executor::tests::memory_test_storage_config(),
+    )
+    .unwrap();
+    engine.execute("CREATE TABLE lazy_build (k INT)").unwrap();
+    engine.execute("CREATE TABLE lazy_probe (k INT)").unwrap();
+    engine
+        .execute("INSERT INTO lazy_build VALUES (1),(2),(2),(NULL)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO lazy_probe VALUES (1),(2),(2),(3),(NULL)")
+        .unwrap();
+    let db = engine.db_for_tests();
+    let scan = |name: &str| PhysicalPlan::SeqScan {
+        table: table(db, name),
+        filter: None,
+        estimated_rows: 4.0,
+        access_rows: 4.0,
+        cost: crate::engine::cbo::Cost::scalar(1.0),
+        possible_keys: Vec::new(),
+        hint_note: None,
+        runtime_filters: Vec::new(),
+        projected_columns: None,
+    };
+    let build_key = crate::parser::parse_expr_fragment("lazy_build.k").unwrap();
+    let plan = PhysicalPlan::HashJoin {
+        left: Box::new(scan("lazy_build")),
+        right: Box::new(scan("lazy_probe")),
+        join_type: crate::parser::JoinType::Inner,
+        left_keys: vec![build_key.clone()],
+        right_keys: vec![crate::parser::parse_expr_fragment("lazy_probe.k").unwrap()],
+        null_safe: vec![false],
+        build_side: crate::planner::BuildSide::Left,
+        residual: None,
+        output_projection: None,
+        estimated_rows: 5.0,
+        cost: crate::engine::cbo::Cost::scalar(3.0),
+    };
+    let txn = TxnView::read_only(db.visible_scn(), IsolationLevel::ReadCommitted);
+    let mut input = super::super::vec_bridge::try_native_vec_input_stream(db, txn, &plan)
+        .unwrap()
+        .unwrap();
+    let mut keys = super::super::bloom::ExactIntKeySetBuilder::with_capacity(1).unwrap();
+    keys.insert(2);
+    assert!(input
+        .stream
+        .install_runtime_filter(RuntimeFilter::ExactIntKey {
+            keys: vec![build_key],
+            null_safe: vec![false],
+            filter: Arc::new(keys.finish().unwrap()),
+            rejected: Arc::new(std::sync::OnceLock::new()),
+        }));
+    let mut rows = Vec::new();
+    while let Some(batch) = input.stream.next_batch().unwrap() {
+        rows.extend(batch.visible_indices().map(|row| batch.row(row)));
+    }
+    assert_eq!(rows, vec![vec![Value::Int(2), Value::Int(2)]; 4]);
+}
+
+#[test]
 fn unordered_exchange_over_apply_does_not_evaluate_future_rows() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();

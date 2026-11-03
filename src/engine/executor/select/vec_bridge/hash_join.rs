@@ -2491,7 +2491,15 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
     let input_contains_inlj = build_plan
         .any(|node| matches!(node, PhysicalPlan::IndexNestedLoopJoin { .. }))
         || probe_plan.any(|node| matches!(node, PhysicalPlan::IndexNestedLoopJoin { .. }));
-    let defer_build = scalar_residual.is_some()
+    // Delay cache-sized builds so ancestor filters can reach their unopened
+    // sources. Large builds retain bottom-up work-area admission: reserving
+    // every ancestor before a large descendant consumes its input can force
+    // that descendant to spill or reclaim otherwise useful storage pages.
+    let small_build =
+        crate::planner::estimated_rows(build_plan) * (build_plan.output_width() + 64.0) * 1.25
+            <= super::super::plan::hash_join_parallel_probe_max_build_bytes() as f64;
+    let defer_build = small_build
+        || scalar_residual.is_some()
         || residual_program.is_some()
         || null_safe.iter().any(|value| *value)
         || preserved_build
@@ -2545,7 +2553,6 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         pushed_exact_runtime_rejected: None,
         pushed_runtime_rejected_reported: 0,
     };
-    // Preserve build-before-parent-open behavior of ordinary equality joins.
     if !defer_build {
         operator.initialize()?;
     }

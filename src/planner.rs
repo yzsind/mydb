@@ -16698,8 +16698,9 @@ fn exprs_equivalent_in_plan(plan: &PhysicalPlan, left: &Expr, right: &Expr) -> b
     false
 }
 
-/// Prove that `prefiltered.key = unique.key` cannot remove rows from the
-/// prefiltered side because its keyset came from the same unique-key relation.
+/// Estimate one match per prefiltered row when its keyset came from the same
+/// unique-key relation. Uniqueness may be declared or estimated from ANALYZE;
+/// this is a costing rule, never a proof for removing a predicate or join.
 ///
 /// SIP produces exactly this shape:
 ///
@@ -16707,11 +16708,11 @@ fn exprs_equivalent_in_plan(plan: &PhysicalPlan, left: &Expr, right: &Expr) -> b
 ///   customer.nation_key = nation.key
 ///
 /// Charging the nation-domain selectivity again makes the propagated filter a
-/// liability in the cost model. The proof is deliberately narrow: the
+/// liability in the cost model. The source match is deliberately narrow: the
 /// subquery must project the joined column from the unique relation, and any
 /// filter retained on that relation must be present in (or be a one-hop SIP
 /// restatement of) the keyset subquery.
-fn keyset_prefilter_guarantees_unique_join(
+fn keyset_join_estimates_one_match(
     prefiltered_plan: &PhysicalPlan,
     unique_plan: &PhysicalPlan,
     prefiltered_key: &Expr,
@@ -16720,17 +16721,14 @@ fn keyset_prefilter_guarantees_unique_join(
     let Some(subquery) = keyset_subquery_for_plan_key(prefiltered_plan, prefiltered_key) else {
         return false;
     };
-    let Some((unique_table, unique_filter)) = unique_scan_for_key(unique_plan, unique_key) else {
+    let Some((unique_table, unique_filter)) = keyset_unique_source_for_key(unique_plan, unique_key)
+    else {
         return false;
     };
     let Some(unique_column) = expr_column_name(unique_key) else {
         return false;
     };
-    if !unique_table.schema.iter_queryable_indexes().any(|index| {
-        index.unique
-            && index.columns.len() == 1
-            && normalize_expr_column(&index.columns[0]) == normalize_expr_column(unique_column)
-    }) {
+    if !keyset_source_key_is_estimated_unique(unique_table, unique_column) {
         return false;
     }
     let projects_unique_key = matches!(
@@ -16852,7 +16850,32 @@ fn keyset_subquery_for_plan_key<'a>(plan: &'a PhysicalPlan, key: &Expr) -> Optio
     }
 }
 
-fn unique_scan_for_key<'a>(
+fn keyset_source_key_is_estimated_unique(table: &PlanTable, column: &str) -> bool {
+    let column = normalize_expr_column(column);
+    table.schema.iter_queryable_indexes().any(|index| {
+        index.unique
+            && index.columns.len() == 1
+            && normalize_expr_column(&index.columns[0]) == column
+    }) || table
+        .schema
+        .stats
+        .columns
+        .get(&column)
+        .is_some_and(|stats| {
+            // A sampled NDV near the row count cannot establish this signal.
+            // Require a complete population frequency summary, with no NULLs or
+            // repeated values. Stale statistics still affect cost only.
+            let rows = table.schema.stats.row_count;
+            rows > 0
+                && stats.frequency.source == crate::storage::FrequencySource::Exact
+                && stats.frequency.complete
+                && stats.frequency.sample_rows == rows
+                && stats.null_count == 0
+                && stats.distinct_count == rows
+        })
+}
+
+fn keyset_unique_source_for_key<'a>(
     plan: &'a PhysicalPlan,
     key: &Expr,
 ) -> Option<(&'a PlanTable, Option<&'a Expr>)> {
@@ -16863,11 +16886,7 @@ fn unique_scan_for_key<'a>(
         let normalized = normalize_expr_column(column);
         table.schema.column_index(&normalized).is_ok()
             && expr_matches_table_column(key, table, column)
-            && table.schema.iter_queryable_indexes().any(|index| {
-                index.unique
-                    && index.columns.len() == 1
-                    && normalize_expr_column(&index.columns[0]) == normalized
-            })
+            && keyset_source_key_is_estimated_unique(table, &normalized)
     }
 
     match plan {
@@ -16894,16 +16913,16 @@ fn unique_scan_for_key<'a>(
             right_keys,
             ..
         } => {
-            if let Some(source) = unique_scan_for_key(left, key) {
-                let right_is_key_preserving =
-                    right_keys.len() == 1 && unique_scan_for_key(right, &right_keys[0]).is_some();
+            if let Some(source) = keyset_unique_source_for_key(left, key) {
+                let right_is_key_preserving = right_keys.len() == 1
+                    && keyset_unique_source_for_key(right, &right_keys[0]).is_some();
                 if right_is_key_preserving {
                     return Some(source);
                 }
             }
-            if let Some(source) = unique_scan_for_key(right, key) {
-                let left_is_key_preserving =
-                    left_keys.len() == 1 && unique_scan_for_key(left, &left_keys[0]).is_some();
+            if let Some(source) = keyset_unique_source_for_key(right, key) {
+                let left_is_key_preserving = left_keys.len() == 1
+                    && keyset_unique_source_for_key(left, &left_keys[0]).is_some();
                 if left_is_key_preserving {
                     return Some(source);
                 }
@@ -16917,7 +16936,7 @@ fn unique_scan_for_key<'a>(
         | PhysicalPlan::TopWindow { input, .. }
         | PhysicalPlan::ParallelTopK { input, .. }
         | PhysicalPlan::Limit { input, .. }
-        | PhysicalPlan::Exchange { input, .. } => unique_scan_for_key(input, key),
+        | PhysicalPlan::Exchange { input, .. } => keyset_unique_source_for_key(input, key),
         _ => None,
     }
 }
@@ -17775,7 +17794,7 @@ fn apply_inlj_right_only_residual_selectivity(
     // from this same unique inner relation.  Reapplying that relation's
     // right-only predicate after a unique lookup is a correctness recheck, not
     // another cardinality reduction.  Hash-join costing has the equivalent
-    // proof in `keyset_prefilter_guarantees_unique_join`; mirror it for INLJ
+    // rule in `keyset_join_estimates_one_match`; mirror it for INLJ
     // so the physical algorithm does not change the logical row estimate.
     if matches!(join_type, JoinType::Inner | JoinType::Left)
         && keyset_prefilter_guarantees_unique_inlj(left_plan, right_table, condition, &combined)
