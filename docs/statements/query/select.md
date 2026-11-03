@@ -63,6 +63,54 @@ COMMIT;
 
 The first example returns one row; the recursive example returns 1 through 5; the locking read skips candidate rows already locked by other transactions.
 
+## Table Sampling
+
+Ordinary user tables and partitioned tables accept sampling after the table alias:
+
+```ebnf
+<table-sample> ::= 'TABLESAMPLE' [ 'SYSTEM' | 'BERNOULLI' | 'BLOCK' | 'ROW' ]
+                   '(' <amount> [ 'PERCENT' | 'ROWS' ] ')'
+                   [ 'REPEATABLE' '(' <seed> ')' ]
+```
+
+`SYSTEM` is the default method and `PERCENT` is the default unit. `BLOCK` is an alias for `SYSTEM`; `ROW` is an alias for `BERNOULLI`.
+
+| Method and unit | Behavior |
+| --- | --- |
+| `SYSTEM (p PERCENT)` | Selects each physical heap page with probability `p / 100`, returning its visible rows. |
+| `BERNOULLI (p PERCENT)` | Selects each visible row independently with probability `p / 100`. |
+| `SYSTEM (n ROWS)` | Visits pages in a random order until `n` visible rows have been selected; the last page can be truncated. |
+| `BERNOULLI (n ROWS)` | Selects exactly `n` visible rows by random priority, scanning the complete population. |
+
+Both `ROWS` methods return the complete visible population when fewer than `n` rows exist. Percentage samples have variable sizes. Page sampling can exhibit clustering when neighboring rows have related values. Exact row sampling scans all visible row identities and can spill candidates to temporary storage under memory pressure.
+
+Sampling happens before WHERE, joins, aggregation, ordering, and LIMIT. A WHERE condition can therefore leave fewer than `n` output rows. An explicit `PARTITION (...)` clause defines the sampling population; predicate-derived partition pruning does not reduce that population. Sampling follows the query's MVCC read view, including transaction-local writes and supported historical reads.
+
+Amounts and seeds accept numeric literals, constant arithmetic, numeric CAST expressions, and prepared-statement `?` parameters. They are resolved for each execution. Percentages must be finite values in `[0,100]`; row counts must be nonnegative integers within the unsigned 64-bit range. Seeds must be finite, non-NULL numeric values. Strings require an explicit numeric CAST. Invalid arguments produce errors, including when LIMIT is zero.
+
+`REPEATABLE` selects the same sample when the seed, arguments, visible data, physical layout, and execution method remain unchanged. Changing parallel degree or execution mode is outside this guarantee. Physical reorganization or data changes can change a sample. Omitted seeds produce fresh samples on each statement execution. Plan caching never freezes a generated seed or stores a sample. Use ORDER BY when output order matters.
+
+The optimizer can use parallel sampling, including within a single partition. Existing `PARALLEL(n)` and `NO_PARALLEL` hints control eligibility. Workers share the read view, memory budget, and cancellation state. EXPLAIN TREE, JSON, and traditional output identify the sampling method and arguments; parallel plans show their degree.
+
+```sql
+-- Approximately 1% of the table, selected by physical page.
+SELECT * FROM events TABLESAMPLE (1);
+
+-- Repeatable row sample, followed by an ordinary predicate.
+SELECT * FROM events AS e
+TABLESAMPLE BERNOULLI (100 ROWS) REPEATABLE (42)
+WHERE e.amount > 0;
+
+-- Parallel sampling within an explicitly selected partition.
+SELECT /*+ PARALLEL(4) */ COUNT(*)
+FROM events PARTITION (p0)
+TABLESAMPLE SYSTEM (10 PERCENT) REPEATABLE (42);
+```
+
+Direct sampling of views, CTE references, derived tables, table functions, and system tables is rejected. Base tables inside those query bodies can use TABLESAMPLE. Sampling cannot qualify an UPDATE/DELETE target. Index hints on sampled sources and forced index/Zone Map access hints are rejected. Unsupported `SAMPLE`, `SEED`, bucket, and sampling-offset forms also produce explicit errors.
+
+The method names and REPEATABLE clause follow SQL-standard sampling conventions. Exact `ROWS` sampling, method aliases, and omitted-method defaults are mydb extensions. MySQL 8.0 does not provide this TABLESAMPLE syntax.
+
 ## Related Statements
 
 - [SELECT INTO variables](select-into-variables.md)

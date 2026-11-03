@@ -10,6 +10,7 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub(super) enum Extension {
+    SampleSeed(Box<SqlExpr>),
     EmptyRow,
     Rrf(std::sync::Arc<adapter::rrf::ParsedRrf>),
     QueryTail,

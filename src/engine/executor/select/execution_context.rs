@@ -17,6 +17,7 @@ pub(in crate::engine::executor) struct ExecutionContext {
     #[cfg(test)]
     rrf_branch_hook: Option<super::hybrid::BranchHook>,
     temporal: Option<Arc<crate::engine::executor::temporal::TemporalReadContext>>,
+    sampling: Option<super::sampling::Bindings>,
     cancellation: CancellationSnapshot,
     params: Option<crate::engine::params::ParamContextSnapshot>,
     budget: Arc<MemBudget>,
@@ -249,6 +250,7 @@ impl ExecutionContext {
             #[cfg(test)]
             rrf_branch_hook: super::hybrid::branch_hook(),
             temporal: crate::engine::executor::temporal::capture(),
+            sampling: super::sampling::capture(),
             cancellation: CancellationSnapshot::capture(),
             params: crate::engine::params::snapshot_current_context(),
             budget,
@@ -393,6 +395,7 @@ impl ExecutionContext {
         let _zone_map_scope =
             crate::storage::schema::ZoneMapOptimizerScope::install(self.zone_map_optimizer_enabled);
         let _temporal_scope = crate::engine::executor::temporal::enter(self.temporal.clone());
+        let _sample_scope = super::sampling::enter(self.sampling.clone());
         let _cancel_scope = self.cancellation.enter();
         let _rows_examined_scope =
             crate::engine::perf_events::enter_rows_examined_counter(self.rows_examined.clone());

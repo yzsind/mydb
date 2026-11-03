@@ -485,6 +485,43 @@ pub(super) fn collect_explain_rows(
             "Batch system scan".to_string(),
             Some(node_id),
         )),
+        PhysicalPlan::SampleScan {
+            table,
+            estimated_rows,
+            access_rows,
+            possible_keys,
+            ..
+        }
+        | PhysicalPlan::ParallelSampleScan {
+            table,
+            estimated_rows,
+            access_rows,
+            possible_keys,
+            ..
+        } => {
+            let mut extra = crate::engine::executor::select::sampling::describe(table);
+            if let PhysicalPlan::ParallelSampleScan { degree, .. } = plan {
+                append_extra(
+                    &mut extra,
+                    &format!("Parallel sample scan; workers={degree}"),
+                );
+            }
+            let mut row = explain_scan_row(
+                rows.len() + 1,
+                table,
+                "ALL",
+                possible_keys,
+                "",
+                None,
+                "",
+                *estimated_rows,
+                *access_rows,
+                None,
+                &extra,
+            );
+            row.plan_id = Some(node_id);
+            rows.push(row);
+        }
         PhysicalPlan::SeqScan {
             table,
             filter,

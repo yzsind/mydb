@@ -53,6 +53,8 @@ macro_rules! define_children {
                 | PhysicalPlan::JsonTableScan { .. }
                 | PhysicalPlan::SystemScan { .. }
                 | PhysicalPlan::SeqScan { .. }
+                  | PhysicalPlan::SampleScan { .. }
+                  | PhysicalPlan::ParallelSampleScan { .. }
                 | PhysicalPlan::ZoneMapScan { .. }
                 | PhysicalPlan::IndexMerge { .. }
                 | PhysicalPlan::IndexLookup { .. }

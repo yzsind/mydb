@@ -1741,11 +1741,10 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
         // Binding assignment is an extra full-AST traversal. Keep it completely
         // off the ordinary SQL parse path: apart from avoiding needless work,
         // this also preserves the stack headroom of expression-heavy statements.
-        if sql
-            .as_bytes()
-            .windows(b"SYSTEM_TIME".len())
-            .any(|window| window.eq_ignore_ascii_case(b"SYSTEM_TIME"))
-        {
+        if sql.as_bytes().windows(b"SYSTEM_TIME".len()).any(|window| {
+            window.eq_ignore_ascii_case(b"SYSTEM_TIME")
+                || window.eq_ignore_ascii_case(b"TABLESAMPLE")
+        }) {
             visit::assign_system_time_bindings(&mut statement);
         }
         post_parse.apply(&mut statement, &sql)?;

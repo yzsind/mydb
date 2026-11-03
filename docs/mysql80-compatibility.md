@@ -56,6 +56,8 @@ production-grade MySQL replacement.
 | MySQL operations ecosystem | ◑/❌ | Common configuration/logging/privilege surfaces work; no Group Replication, Router, Shell/X, or plugin ABI |
 | mydb extensions | ➕ | VECTOR/HNSW/IVF, Zone Map, time travel, sequences, DML RETURNING, physical replication, and more |
 
+**➕ Table sampling:** `TABLESAMPLE` supports row/page sampling by percentage or exact row count, execution-time parameters, `REPEATABLE`, and parallel scans over user base tables and partitions. The default is `SYSTEM` percentage sampling. MySQL 8.0.46 has no equivalent TABLESAMPLE clause; see [SELECT table sampling](statements/query/select.md#table-sampling) for semantics and restrictions.
+
 ---
 
 ## 1. Client Protocol and Connections

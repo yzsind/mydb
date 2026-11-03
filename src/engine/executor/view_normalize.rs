@@ -278,6 +278,10 @@ fn render_table_ref(default_database: &str, t: &TableRef, out: &mut String) {
             out.push_str(&q(alias));
         }
     }
+    if let Some(sample) = &t.sample {
+        out.push(' ');
+        out.push_str(&sample.to_sql());
+    }
 }
 
 fn render_join(

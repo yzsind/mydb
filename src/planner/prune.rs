@@ -310,6 +310,8 @@ pub(super) fn mark_covering_index_recursive_with_extra(
         | PhysicalPlan::JsonTableScan { .. }
         | PhysicalPlan::SystemScan { .. }
         | PhysicalPlan::SeqScan { .. }
+        | PhysicalPlan::SampleScan { .. }
+        | PhysicalPlan::ParallelSampleScan { .. }
         | PhysicalPlan::ZoneMapScan { .. }
         | PhysicalPlan::IndexMerge { .. }
         | PhysicalPlan::CteScan { .. }
@@ -391,6 +393,16 @@ pub(super) fn join_prune_walk(
 ) -> Option<Vec<JoinPruneField>> {
     match plan {
         PhysicalPlan::SeqScan {
+            table,
+            projected_columns,
+            ..
+        }
+        | PhysicalPlan::SampleScan {
+            table,
+            projected_columns,
+            ..
+        }
+        | PhysicalPlan::ParallelSampleScan {
             table,
             projected_columns,
             ..
@@ -949,6 +961,8 @@ impl ColumnPruningRefs {
                 ..
             } => {}
             PhysicalPlan::SeqScan { filter, .. }
+            | PhysicalPlan::SampleScan { filter, .. }
+            | PhysicalPlan::ParallelSampleScan { filter, .. }
             | PhysicalPlan::ZoneMapScan { filter, .. }
             | PhysicalPlan::ParallelSeqScan { filter, .. }
             | PhysicalPlan::ParallelZoneMapScan { filter, .. }
@@ -1492,6 +1506,16 @@ impl ColumnPruningRefs {
         };
         match plan {
             PhysicalPlan::SeqScan {
+                table,
+                projected_columns,
+                ..
+            }
+            | PhysicalPlan::SampleScan {
+                table,
+                projected_columns,
+                ..
+            }
+            | PhysicalPlan::ParallelSampleScan {
                 table,
                 projected_columns,
                 ..

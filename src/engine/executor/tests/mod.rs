@@ -15,6 +15,7 @@ mod sql_execution_fixes;
 mod support;
 mod table_ddl_audit_1012;
 mod table_ddl_audit_1027;
+mod tablesample;
 mod temporal_comparison_consistency;
 
 use super::*;

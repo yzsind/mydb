@@ -7,6 +7,7 @@ pub(in crate::engine::executor) fn expand_views(
     statement: &mut Statement,
     depth: usize,
 ) -> Result<(), QueryError> {
+    let _sample_bindings = ViewSampleScope::enter();
     let mut trail = ViewTrail::new();
     expand_views_in_statement(db, session, statement, depth, &mut trail)
 }
@@ -118,6 +119,41 @@ thread_local! {
     // identity remains a runtime expression for INVOKER views, so cached
     // plans cannot capture the first caller's CURRENT_USER().
     static VIEW_CURRENT_USER: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static VIEW_SAMPLE_BINDING: std::cell::Cell<u32> = const { std::cell::Cell::new(1 << 31) };
+}
+
+struct ViewSampleScope(u32);
+impl ViewSampleScope {
+    fn enter() -> Self {
+        Self(VIEW_SAMPLE_BINDING.with(|slot| slot.replace(1 << 31)))
+    }
+}
+impl Drop for ViewSampleScope {
+    fn drop(&mut self) {
+        VIEW_SAMPLE_BINDING.with(|slot| slot.set(self.0));
+    }
+}
+
+fn bind_view_samples(select: &mut Select) {
+    struct Bind;
+    impl crate::parser::visit::AstVisitorMut for Bind {
+        fn enter_select(&mut self, select: &mut Select) {
+            for table in select
+                .from
+                .iter_mut()
+                .chain(select.joins.iter_mut().map(|j| &mut j.table))
+            {
+                if let Some(sample) = &mut table.sample {
+                    sample.binding_id = VIEW_SAMPLE_BINDING.with(|slot| {
+                        let id = slot.get();
+                        slot.set(id + 1);
+                        id
+                    });
+                }
+            }
+        }
+    }
+    crate::parser::visit::visit_select_mut(&mut Bind, select);
 }
 
 struct ViewCurrentUserScope(Option<String>);
@@ -164,6 +200,7 @@ fn expand_view_body(
     trail: &mut ViewTrail,
 ) -> Result<Select, QueryError> {
     let mut expanded = stored_view_query(view)?;
+    bind_view_samples(&mut expanded);
     push_trail(trail, view, source)?;
     let _scope = ViewCurrentUserScope::enter(view);
     VIEW_CURRENT_USER.with(|current| {
@@ -190,6 +227,16 @@ fn expand_views_in_select(
     depth: usize,
     trail: &mut ViewTrail,
 ) -> Result<(), QueryError> {
+    for source in stmt
+        .from
+        .iter()
+        .chain(stmt.joins.iter().map(|join| &join.table))
+    {
+        if source.sample.is_some() && lookup_view_definition(db, session, &source.name)?.is_some() {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "TABLESAMPLE cannot qualify a view; place it on base tables inside the view definition"));
+        }
+    }
     if depth > MAX_VIEW_DEPTH {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -344,6 +391,7 @@ fn expand_views_in_select(
                 name: alias.clone(),
                 alias: Some(alias),
                 system_time: None,
+                sample: None,
                 index_hints: vec![],
                 partitions: vec![],
                 column_aliases: Vec::new(),
@@ -381,6 +429,7 @@ fn expand_views_in_select(
                                 name: alias.clone(),
                                 alias: Some(alias),
                                 system_time: None,
+                                sample: None,
                                 index_hints: vec![],
                                 partitions: vec![],
                                 column_aliases: Vec::new(),
@@ -444,6 +493,7 @@ fn expand_views_in_select(
                 name: alias.clone(),
                 alias: Some(alias),
                 system_time: None,
+                sample: None,
                 index_hints: vec![],
                 partitions: vec![],
                 column_aliases: Vec::new(),
@@ -713,6 +763,7 @@ fn wrap_view_query(query: crate::parser::QueryExpr) -> Select {
             name: "__view_query".to_owned(),
             alias: None,
             system_time: None,
+            sample: None,
             index_hints: vec![],
             partitions: vec![],
             column_aliases: Vec::new(),

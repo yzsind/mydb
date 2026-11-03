@@ -7867,6 +7867,7 @@ fn placeholder_table_ref(alias: String) -> TableRef {
         name: alias.clone(),
         alias: Some(alias),
         system_time: None,
+        sample: None,
         index_hints: vec![],
         partitions: vec![],
         column_aliases: Vec::new(),
@@ -7920,10 +7921,15 @@ fn function_is_nondeterministic(name: &str) -> bool {
 }
 
 fn select_has_nondeterministic(s: &Select) -> bool {
-    s.projection.iter().any(|item| match item {
-        SelectItem::Expr { expr, .. } => expr_is_nondeterministic(expr),
-        _ => false,
-    }) || s.selection.as_ref().is_some_and(expr_is_nondeterministic)
+    s.from
+        .iter()
+        .chain(s.joins.iter().map(|join| &join.table))
+        .any(|table| table.sample.is_some())
+        || s.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => expr_is_nondeterministic(expr),
+            _ => false,
+        })
+        || s.selection.as_ref().is_some_and(expr_is_nondeterministic)
         || s.having.as_ref().is_some_and(expr_is_nondeterministic)
         || s.group_by.iter().any(expr_is_nondeterministic)
         || s.order_by.iter().any(|o| expr_is_nondeterministic(&o.expr))

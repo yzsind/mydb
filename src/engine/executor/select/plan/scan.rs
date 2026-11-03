@@ -6635,7 +6635,7 @@ pub(in crate::engine::executor::select) fn stored_row_to_plan_row_projected(
     })
 }
 
-pub(super) fn projected_values_to_plan_row(
+pub(in crate::engine::executor::select) fn projected_values_to_plan_row(
     table: &PlanTable,
     projection: &[usize],
     values: Vec<Value>,

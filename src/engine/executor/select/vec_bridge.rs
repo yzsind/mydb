@@ -2069,7 +2069,9 @@ pub(crate) fn should_route_result_to_batch(plan: &PhysicalPlan, projection: &[Se
                     && supported_scan_spine(input)
             }
             PhysicalPlan::WindowAgg { input, .. } => supported_scan_spine(input),
-            PhysicalPlan::SeqScan { .. }
+            PhysicalPlan::SampleScan { .. }
+            | PhysicalPlan::ParallelSampleScan { .. }
+            | PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::ZoneMapScan { .. }
             | PhysicalPlan::ParallelSeqScan { .. }
             | PhysicalPlan::ParallelZoneMapScan { .. } => true,
@@ -2239,6 +2241,28 @@ impl NativeVecCompiler {
                 try_build_vec_filter_input(db, txn, plan)?
             }
             PhysicalPlan::WindowAgg { .. } => try_build_window_batch(db, txn, plan)?,
+            PhysicalPlan::SampleScan { .. } | PhysicalPlan::ParallelSampleScan { .. } => {
+                let (table, projected_columns) = match plan {
+                    PhysicalPlan::SampleScan {
+                        table,
+                        projected_columns,
+                        ..
+                    }
+                    | PhysicalPlan::ParallelSampleScan {
+                        table,
+                        projected_columns,
+                        ..
+                    } => (table, projected_columns),
+                    _ => unreachable!(),
+                };
+                Some(VecBatchInput {
+                    template: scan::build_scan_template(
+                        table,
+                        projected_columns.as_deref().map(|v| v.as_slice()),
+                    ),
+                    stream: Box::new(super::sampling::SampleBatchStream::new(db, txn, plan)),
+                })
+            }
             PhysicalPlan::GenerateSeries { .. } => try_build_generate_series_batch(plan)?,
             PhysicalPlan::ValuesScan { .. } => try_build_values_batch(db, txn, plan)?,
             PhysicalPlan::JsonTableScan { .. } => try_build_json_table_batch(plan)?,
@@ -2375,6 +2399,7 @@ impl AnalyzedBatchOperator<'_> {
             conversion_rows,
             match self.plan {
                 PhysicalPlan::Exchange { degree, .. }
+                | PhysicalPlan::ParallelSampleScan { degree, .. }
                 | PhysicalPlan::ParallelSeqScan { degree, .. }
                 | PhysicalPlan::ParallelZoneMapScan { degree, .. }
                 | PhysicalPlan::ParallelIndexRangeScan { degree, .. }

@@ -4690,6 +4690,7 @@ fn authorization_table_ref(name: &str, alias: Option<&str>) -> TableRef {
         name: name.to_string(),
         alias: alias.map(str::to_string),
         system_time: None,
+        sample: None,
         index_hints: Vec::new(),
         partitions: Vec::new(),
         column_aliases: Vec::new(),
@@ -7646,6 +7647,8 @@ pub(super) fn execute_qualified_statement(
     // MDL is held and before any branch can return a row. Leaf SELECT
     // executors see this context and therefore neither re-evaluate AS OF
     // expressions nor register snapshots independently.
+    let sample_context = super::select::sampling::preflight_statement(db, &statement)?;
+    let _sample_scope = sample_context.map(|context| super::select::sampling::enter(Some(context)));
     let temporal_context = super::temporal::preflight_statement(db, &statement)?;
     let _temporal_scope = temporal_context.map(|context| super::temporal::enter(Some(context)));
     match statement {

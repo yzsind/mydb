@@ -58,6 +58,7 @@ pub(in crate::parser) fn parse_sql(
     validate_complexity(&tokens)?;
     super::locks::expand_lists(&mut tokens);
     super::parameters::assign(&mut tokens)?;
+    super::sampling::lower(dialect, sql, &mut tokens)?;
     super::rrf::lower(dialect, sql, &mut tokens)?;
     Parser::new(dialect)
         .with_recursion_limit(UPSTREAM_RECURSION_LIMIT)
@@ -80,6 +81,7 @@ fn parse_ordinary_sql(
     validate_complexity(&tokens)?;
     super::locks::expand_lists(&mut tokens);
     super::parameters::assign(&mut tokens)?;
+    super::sampling::lower(dialect, sql, &mut tokens)?;
     super::rrf::lower(dialect, sql, &mut tokens)?;
     Parser::new(dialect)
         .with_recursion_limit(UPSTREAM_RECURSION_LIMIT)

@@ -57,7 +57,8 @@ pub(super) fn lock_select_rows_for_update(
     // candidate read+filter step entirely — the post-lock re-read in
     // `execute_locked_single_table_select` already reads the row at the fresh
     // snapshot, so reading it twice is wasteful.
-    if stmt.order_by.is_empty()
+    if stmt.from[0].sample.is_none()
+        && stmt.order_by.is_empty()
         && stmt.limit.is_none()
         && !stmt.distinct
         && stmt.group_by.is_empty()
@@ -74,21 +75,30 @@ pub(super) fn lock_select_rows_for_update(
             return Ok(Some(locked));
         }
     }
-    if fulltext.is_empty() {
+    if fulltext.is_empty() && stmt.from[0].sample.is_none() {
         if let Some(row_ids) = ordered_select_for_update_candidates(db, txn, &table, stmt)? {
             return apply_lock_clause(db, txn, &table, &row_ids, lock_clause).map(Some);
         }
     }
-    let candidates = candidate_row_refs_for_write(
-        db,
-        txn,
-        &table,
-        if fulltext.is_empty() {
-            stmt.selection.as_ref()
-        } else {
-            None
-        },
-    )?;
+    let mut sampled = stmt.from[0]
+        .sample
+        .as_ref()
+        .map(|_| super::select::sampling::selected_refs(db, txn, &stmt.from[0]))
+        .transpose()?;
+    let candidates = if let Some((rows, _charge)) = &mut sampled {
+        Some(std::mem::take(rows))
+    } else {
+        candidate_row_refs_for_write(
+            db,
+            txn,
+            &table,
+            if fulltext.is_empty() {
+                stmt.selection.as_ref()
+            } else {
+                None
+            },
+        )?
+    };
     let rows = db.dml_candidate_rows_with_origin_for_write(&table, txn, candidates)?;
     let mut matched = Vec::new();
     for row in rows {

@@ -396,6 +396,25 @@ pub enum PhysicalPlan {
         estimated_rows: f64,
         cost: crate::engine::cbo::Cost,
     },
+    /// Heap sample selection before SQL predicates, using the table-reference spec.
+    SampleScan {
+        table: PlanTable,
+        filter: Option<Expr>,
+        estimated_rows: f64,
+        access_rows: f64,
+        cost: crate::engine::cbo::Cost,
+        possible_keys: Vec<String>,
+        runtime_filters: Vec<RuntimeFilter>,
+        hint_note: Option<String>,
+        /// Column indices to materialise when streaming rows out. `None`
+        /// keeps every column (default for single-table queries and CTEs).
+        /// Filled in by `apply_column_pruning` for multi-table joins so
+        /// downstream hash join build/probe sides only carry columns that
+        /// some upper plan node references — avoiding the spill that
+        /// happens when wide unused columns inflate the build over the
+        /// hash-join memory threshold.
+        projected_columns: Option<Arc<Vec<usize>>>,
+    },
     SeqScan {
         table: PlanTable,
         filter: Option<Expr>,
@@ -1046,13 +1065,21 @@ pub enum PhysicalPlan {
         estimated_rows: f64,
         cost: crate::engine::cbo::Cost,
     },
-    /// Parallel sequential scan. Each of `degree` workers scans a
-    /// disjoint contiguous heap-page range `[lo, hi)` computed at
-    /// runtime as `page_count / degree`. Filter, runtime filters,
-    /// and column pruning apply per-worker exactly as in `SeqScan`.
-    /// Must always sit underneath a `Exchange` (the planner enforces
-    /// this — direct execution of a `ParallelSeqScan` without a
-    /// surrounding Exchange is a planner bug).
+    /// Parallel heap sampling under Exchange. Ordered page consumption keeps
+    /// exact block row limits independent of worker completion order.
+    ParallelSampleScan {
+        table: PlanTable,
+        filter: Option<Expr>,
+        estimated_rows: f64,
+        access_rows: f64,
+        cost: crate::engine::cbo::Cost,
+        possible_keys: Vec<String>,
+        runtime_filters: Vec<RuntimeFilter>,
+        hint_note: Option<String>,
+        projected_columns: Option<Arc<Vec<usize>>>,
+        output_columns_in_projection: Option<Arc<Vec<usize>>>,
+        degree: u32,
+    },
     ParallelSeqScan {
         table: PlanTable,
         filter: Option<Expr>,
@@ -1363,6 +1390,7 @@ pub struct PlanTable {
     pub schema: Arc<TableSchema>,
     pub alias: Option<String>,
     pub system_time: Option<crate::parser::SystemTimeAsOf>,
+    pub sample: Option<Box<crate::parser::TableSampleSpec>>,
     /// Lazily-populated shared ColMeta handle for every schema
     /// column (indexed by schema column index). Shared across `PlanTable`
     /// clones via the inner `Arc`, so the cache populates once per
@@ -1399,6 +1427,7 @@ impl PlanTable {
             schema,
             alias,
             system_time: None,
+            sample: None,
             column_metas: Arc::new(OnceLock::new()),
             row_schema: Arc::new(OnceLock::new()),
             stats_sidecar_delta: 0,
@@ -1461,6 +1490,7 @@ impl PlanTable {
             schema,
             alias,
             system_time: None,
+            sample: None,
             column_metas: Arc::new(OnceLock::new()),
             row_schema: Arc::new(OnceLock::new()),
             stats_sidecar_delta: sidecar_delta,
@@ -3500,6 +3530,7 @@ fn validate_query_hints(db: &Database, select: &Select) -> Vec<String> {
 fn plan_has_parallel_node(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::Exchange { .. }
+        | PhysicalPlan::ParallelSampleScan { .. }
         | PhysicalPlan::ParallelSeqScan { .. }
         | PhysicalPlan::ParallelZoneMapScan { .. }
         | PhysicalPlan::ParallelIndexFastScan { .. }
@@ -4623,6 +4654,16 @@ pub(crate) fn plan_output_width(plan: &PhysicalPlan) -> f64 {
             projected_columns,
             ..
         }
+        | PhysicalPlan::SampleScan {
+            table,
+            projected_columns,
+            ..
+        }
+        | PhysicalPlan::ParallelSampleScan {
+            table,
+            projected_columns,
+            ..
+        }
         | PhysicalPlan::ZoneMapScan {
             table,
             projected_columns,
@@ -4849,6 +4890,8 @@ define_plan_metadata! {
     Materialize,
     RecursiveUnion,
     SeqScan,
+    SampleScan,
+    ParallelSampleScan,
     ZoneMapScan,
     IndexMerge,
     IndexLookup,
@@ -4996,6 +5039,9 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
     // CteScan-rooted plan with optional filter/sort/limit/projection on top.
     // CTE-with-JOIN currently goes through the dedicated in-memory join path
     // outside the planner.
+    if base.sample.is_some() {
+        plan_table(db, base)?;
+    }
     if select.joins.is_empty() {
         if let Some(spec) = base.generate_series.as_deref() {
             let mut scan = plan_generate_series(base, spec)?;
@@ -6103,7 +6149,13 @@ fn finish_plan(
     // S2: join-level output projection pruning — intermediates of multi-level joins carry only the
     // columns still referenced above, so leaf columns along a K-level chain are no longer cloned K times.
     apply_join_output_pruning(&mut plan, select);
-    if select.group_by_modifier == GroupByModifier::None {
+    if select.group_by_modifier == GroupByModifier::None
+        && !select
+            .from
+            .iter()
+            .chain(select.joins.iter().map(|j| &j.table))
+            .any(|t| t.sample.is_some())
+    {
         if let Some(pushed) = try_covering_index_aggregate_pushdown(ctx, select, &plan) {
             plan = pushed;
             plan = apply_parallel_hints(plan, select);
@@ -7137,6 +7189,7 @@ fn parallelize_hash_aggregate_inner(plan: &mut PhysicalPlan, degree: u32, mode: 
 pub(crate) fn plan_contains_parallel(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::Exchange { .. }
+        | PhysicalPlan::ParallelSampleScan { .. }
         | PhysicalPlan::ParallelSeqScan { .. }
         | PhysicalPlan::ParallelIndexFastScan { .. }
         | PhysicalPlan::ParallelIndexRangeScan { .. }
@@ -7506,6 +7559,56 @@ fn parallelize_seq_scans(
 ) {
     let fast_scan = matches!(plan, PhysicalPlan::IndexFastScan { .. });
     match plan {
+        PhysicalPlan::SampleScan {
+            table,
+            filter,
+            estimated_rows,
+            access_rows,
+            cost,
+            possible_keys,
+            runtime_filters,
+            hint_note,
+            projected_columns,
+        } => {
+            if order_sensitive
+                || (mode == ParallelMode::CostBased
+                    && !cbo_wants_parallel_for_seqscan(
+                        *estimated_rows,
+                        *access_rows,
+                        &table.schema,
+                        *cost,
+                        degree,
+                    ))
+            {
+                return;
+            }
+            let degree = cpu_bound_parallel_degree(degree);
+            if degree <= 1 {
+                return;
+            }
+            let parallel_cost = parallel_cost_from_serial(*cost, degree);
+            let input = PhysicalPlan::ParallelSampleScan {
+                table: table.clone(),
+                filter: filter.clone(),
+                estimated_rows: *estimated_rows,
+                access_rows: *access_rows,
+                cost: parallel_cost,
+                possible_keys: possible_keys.clone(),
+                runtime_filters: runtime_filters.clone(),
+                hint_note: hint_note.clone(),
+                projected_columns: projected_columns.clone(),
+                output_columns_in_projection: None,
+                degree,
+            };
+            *plan = PhysicalPlan::Exchange {
+                input: Box::new(input),
+                degree,
+                output_order: ExchangeOrder::Unordered,
+                merge_keys: Vec::new(),
+                estimated_rows: *estimated_rows,
+                cost: parallel_cost,
+            };
+        }
         PhysicalPlan::SeqScan {
             table,
             filter,
@@ -8536,6 +8639,22 @@ fn index_order_covers_order_by(
 }
 
 fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> {
+    if table.sample.is_some()
+        && (table.generate_series.is_some()
+            || try_plan_cte_scan(table).is_some()
+            || db.table(&table.name).map_or(true, |schema| schema.system))
+    {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "TABLESAMPLE requires a user base table",
+        ));
+    }
+    if table.sample.is_some() && !table.index_hints.is_empty() {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "index hints cannot qualify a TABLESAMPLE source",
+        ));
+    }
     if let Some(spec) = table.generate_series.as_deref() {
         if table.system_time.is_some() {
             return Err(error(
@@ -8567,6 +8686,7 @@ fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> 
     }
     if let Some(plan_table) = plan_table_for_ref_if_resolved(db, table) {
         let mut plan_table = plan_table.with_system_time(table.system_time.clone());
+        plan_table.sample = table.sample.clone();
         plan_table.explicit_partition_storage_ids =
             crate::engine::executor::partition_clause::resolve_partition_clause(
                 db,
@@ -10330,12 +10450,117 @@ fn choose_scan_for_source(
     choose_scan(db, table, filter, hints)
 }
 
+fn sample_scan_plan(
+    db: &Database,
+    table: &PlanTable,
+    filter: Option<Expr>,
+) -> Result<PhysicalPlan, QueryError> {
+    use crate::parser::{SampleMethod, SampleUnit};
+    let spec = table
+        .sample
+        .as_ref()
+        .expect("sampling plan requires a spec");
+    let total = table_row_estimate(db, table)?.max(1.0);
+    let amount = crate::engine::executor::select::sampling::planning_amount(spec);
+    let rows = match spec.unit {
+        SampleUnit::Percent => total * amount.unwrap_or(10.0).clamp(0.0, 100.0) / 100.0,
+        SampleUnit::Rows => total.min(amount.unwrap_or(1000.0).max(0.0)),
+    };
+    let access_rows = if rows == 0.0 {
+        0.0
+    } else if spec.method == SampleMethod::System {
+        rows
+    } else {
+        total
+    };
+    let ctx = crate::engine::cbo::CboContext::from_db(db);
+    let storage_ids = table
+        .explicit_partition_storage_ids
+        .clone()
+        .unwrap_or_else(|| table.schema.storage_ids());
+    let total_pages = storage_ids.into_iter().try_fold(0u64, |sum, storage_id| {
+        db.heap_page_count_for_storage(storage_id)
+            .map(|pages| sum.saturating_add(pages))
+    })? as f64;
+    let pages = if rows == 0.0 {
+        0.0
+    } else if spec.method == SampleMethod::System {
+        let expected = total_pages * (rows / total).clamp(0.0, 1.0);
+        if spec.unit == SampleUnit::Rows {
+            (expected.ceil() + 1.0).min(total_pages)
+        } else {
+            expected
+        }
+    } else {
+        total_pages
+    };
+    let width = crate::engine::cbo::operator_cost::estimated_row_width(&table.schema);
+    let qual_cost = ctx.model.cpu_operator_cost
+        * if spec.method == SampleMethod::Bernoulli && spec.unit == SampleUnit::Rows {
+            rows.max(2.0).log2()
+        } else {
+            1.0
+        };
+    let cost = crate::engine::cbo::operator_cost::seq_scan(
+        &ctx,
+        pages,
+        access_rows,
+        rows,
+        width,
+        qual_cost,
+    );
+    let scan = PhysicalPlan::SampleScan {
+        table: table.clone(),
+        filter: None,
+        estimated_rows: rows,
+        access_rows,
+        cost,
+        possible_keys: Vec::new(),
+        runtime_filters: Vec::new(),
+        hint_note: None,
+        projected_columns: None,
+    };
+    Ok(if let Some(predicate) = filter {
+        PhysicalPlan::Filter {
+            input: Box::new(scan),
+            predicate,
+            estimated_rows: rows * 0.25,
+            cost: cost.with_added_total(rows * ctx.model.cpu_operator_cost),
+        }
+    } else {
+        scan
+    })
+}
+
 fn choose_scan(
     db: &Database,
     table: &PlanTable,
     filter: Option<Expr>,
     hints: &ScanHints<'_>,
 ) -> Result<PhysicalPlan, QueryError> {
+    if table.sample.is_some() {
+        let index_hint = hints.query_hints.iter().any(|hint| {
+            let target = match hint {
+                QueryHint::UseIndex { table, .. }
+                | QueryHint::NoIndex { table, .. }
+                | QueryHint::IndexMerge { table, .. }
+                | QueryHint::NoIndexMerge { table, .. }
+                | QueryHint::IndexFfs { table, .. }
+                | QueryHint::ZoneMap { table } => Some(table),
+                _ => None,
+            };
+            target.is_some_and(|target| {
+                matches_table(target, &table.schema.name, table.alias.as_deref())
+            })
+        });
+        if index_hint {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "index and Zone Map access hints cannot qualify a TABLESAMPLE source",
+            ));
+        }
+        return sample_scan_plan(db, table, filter);
+    }
     if crate::storage::rowid::query_column_index(&table.schema).is_some() {
         let address_access = filter
             .as_ref()
@@ -16724,6 +16949,8 @@ pub(crate) fn choose_join_with_hints(
 fn plan_table_stats(plan: &PhysicalPlan) -> Option<&Arc<TableSchema>> {
     match plan {
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexLookup { table, .. }
         | PhysicalPlan::IndexRangeScan { table, .. }
@@ -18752,6 +18979,8 @@ fn collect_physical_plan_tables_into(plan: &PhysicalPlan, tables: &mut Vec<PlanT
         }
 
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexMerge { table, .. }
         | PhysicalPlan::IndexLookup { table, .. }
@@ -19916,6 +20145,8 @@ pub(crate) fn plan_rel_estimate(plan: &PhysicalPlan) -> crate::engine::cbo::RelE
 
     let table = match plan {
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexLookup { table, .. }
         | PhysicalPlan::IndexMultiLookup { table, .. }
@@ -20012,6 +20243,7 @@ pub(crate) fn plan_physical_properties(
     };
     let parallel_degree = match plan {
         PhysicalPlan::Exchange { degree, .. }
+        | PhysicalPlan::ParallelSampleScan { degree, .. }
         | PhysicalPlan::ParallelSeqScan { degree, .. }
         | PhysicalPlan::ParallelZoneMapScan { degree, .. }
         | PhysicalPlan::ParallelIndexFastScan { degree, .. }
@@ -20357,6 +20589,8 @@ fn count_plan_column_matches(
             }
         }
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexMerge { table, .. }
         | PhysicalPlan::IndexLookup { table, .. }
@@ -24680,6 +24914,8 @@ fn collect_scan_targets(
             }
         }
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexRangeScan { table, .. }
         | PhysicalPlan::IndexFastScan { table, .. }

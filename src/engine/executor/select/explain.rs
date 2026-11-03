@@ -2727,6 +2727,14 @@ fn subquery_select_type(tag: &str, subquery: &Select, dependent: bool) -> &'stat
 /// `RAND()` or reads/writes a user variable. MySQL labels these `UNCACHEABLE
 /// SUBQUERY` because it cannot memoise a single result.
 pub(super) fn select_is_uncacheable(select: &Select) -> bool {
+    if select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table))
+        .any(|table| table.sample.is_some())
+    {
+        return true;
+    }
     if select.for_update || select.lock_clause.is_some() {
         return true;
     }
@@ -3933,6 +3941,25 @@ fn format_plan_tree_nodes(
             if let Some(filter) = filter {
                 append_tree_details(&mut line, vec![("filter", explain_expr(filter))]);
             }
+            line.push_str(&suffix(plan));
+            line
+        }
+        planner::PhysicalPlan::SampleScan { table, .. }
+        | planner::PhysicalPlan::ParallelSampleScan { table, .. } => {
+            let name = table_display_name(table);
+            let label = match plan {
+                planner::PhysicalPlan::ParallelSampleScan { degree, .. } => {
+                    format!("Parallel sample scan (workers={degree})")
+                }
+                _ => "Sample scan".into(),
+            };
+            let mut line = format!(
+                "{indent}{arrow}{label} on {name} (cost={cost:.2} rows={estimated_rows:.0})"
+            );
+            append_tree_details(
+                &mut line,
+                vec![("sampling", super::sampling::describe(table))],
+            );
             line.push_str(&suffix(plan));
             line
         }
@@ -5582,6 +5609,21 @@ fn format_plan_json_node(
                 estimated_rows.ceil() as u64
             ));
             json_scan_footer(out, &indent, plan, filter.as_ref(), stats);
+        }
+        planner::PhysicalPlan::SampleScan {
+            table, access_rows, ..
+        }
+        | planner::PhysicalPlan::ParallelSampleScan {
+            table, access_rows, ..
+        } => {
+            let name = table_display_name(table);
+            json_table_header(out, &indent, "sample_scan", &name, table, None, "ALL");
+            json_string_field(out, &indent, "sampling", &super::sampling::describe(table));
+            if let planner::PhysicalPlan::ParallelSampleScan { degree, .. } = plan {
+                out.push_str(&format!("{indent}  \"workers\": {degree},\n"));
+            }
+            json_scan_estimates(out, &indent, table, &None, *access_rows, *estimated_rows);
+            json_scan_footer(out, &indent, plan, None, stats);
         }
         planner::PhysicalPlan::SeqScan {
             table,
@@ -7681,6 +7723,7 @@ fn dml_to_explain_select(
         name: table.to_owned(),
         alias: primary_alias.to_owned(),
         system_time: None,
+        sample: None,
         index_hints: Vec::new(),
         partitions: Vec::new(),
         column_aliases: Vec::new(),

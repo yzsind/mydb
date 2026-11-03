@@ -3,6 +3,7 @@ pub(super) mod analyze_stats;
 pub(crate) mod bloom;
 pub(crate) mod eval;
 pub(in crate::engine::executor) mod execution_context;
+pub(crate) mod sampling;
 pub(crate) use eval::aggregate_function_result_type;
 mod explain;
 pub(super) mod external_sort;
@@ -1090,13 +1091,8 @@ fn materialize_join_source_with_derived(
         projection: vec![SelectItem::Wildcard],
         table: Some(table_ref.name.clone()),
         from: vec![TableRef {
-            name: table_ref.name.clone(),
             alias: None,
-            system_time: None,
-            index_hints: vec![],
-            partitions: vec![],
-            column_aliases: Vec::new(),
-            generate_series: None,
+            ..table_ref.clone()
         }],
         ..Select::default()
     };
@@ -3435,6 +3431,8 @@ fn execute_select_inner(
     } else {
         None
     };
+    let sample_context = self::sampling::preflight(db, &stmt)?;
+    let _sample_scope = sample_context.map(|context| self::sampling::enter(Some(context)));
     let temporal_context = super::temporal::preflight(db, &stmt)?;
     let _temporal_scope = temporal_context.map(|context| super::temporal::enter(Some(context)));
     // Normalize WHERE / HAVING / JOIN-ON before planning and execution so
@@ -4458,6 +4456,8 @@ fn select_clauses_have_subquery(select: &Select) -> bool {
 fn walk_plan_tables<F: FnMut(&PlanTable)>(plan: &PhysicalPlan, f: &mut F) {
     plan.walk(|node| match node {
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexLookup { table, .. }
         | PhysicalPlan::IndexMultiLookup { table, .. }
@@ -4862,6 +4862,7 @@ pub(super) fn describe_select_columns(
             name: "derived".to_string(),
             alias: Some("derived".to_string()),
             system_time: None,
+            sample: None,
             index_hints: vec![],
             partitions: vec![],
             column_aliases: Vec::new(),
@@ -6040,6 +6041,7 @@ fn execute_derived_select(
             name: alias.clone(),
             alias: Some(alias.clone()),
             system_time: None,
+            sample: None,
             index_hints: Vec::new(),
             partitions: Vec::new(),
             column_aliases: Vec::new(),

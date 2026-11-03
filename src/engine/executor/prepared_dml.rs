@@ -146,7 +146,7 @@ fn eligible_locking_select(stmt: &Select) -> Option<&str> {
         return None;
     }
     let primary = stmt.from.first()?;
-    if !primary.partitions.is_empty() {
+    if !primary.partitions.is_empty() || primary.sample.is_some() {
         return None;
     }
     if stmt
