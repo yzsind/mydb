@@ -284,6 +284,18 @@ to continue or complete exactly. Actual prefilter cardinality can also select
 exact scoring after planning. These choices do not imply global exact ANN
 recall.
 
+With iterative scanning enabled and the default re-ranking multiplier, filtered
+search sizes each candidate batch from the observed neighborhood pass rate.
+After filling Top-K, it validates further batches against the exact heap scores;
+continued Top-K replacements increase the validation allowance. Two completed
+validation rounds without replacements can finish the approximate search.
+Candidate count is therefore query-dependent rather than a fixed `4 * k` cutoff.
+This stability check is a work heuristic, not a recall certificate. Search
+effort still applies, and an incomplete validation or invalidated cursor requires
+exact completion in the default iterative mode. Explicit session re-ranking
+multipliers, non-default index multipliers, and disabled iterative scanning
+retain their configured pool behavior.
+
 A selective HNSW filter can require additional navigation to establish the
 candidate distance boundary. The optimizer includes that work when comparing
 ANN with exact scoring.
@@ -295,7 +307,9 @@ also requires exact completion when the re-ranking pool is incomplete.
 
 `EXPLAIN` reports the planned strategy. `EXPLAIN ANALYZE` reports predicate
 evaluations, navigation work, heap re-ranks, materialized winners, batches, and
-exact fallbacks. Non-repeatable predicates and relational shapes outside this
+exact fallbacks. Candidate rows, validation rounds, and Top-K replacements are
+also reported as `ann_candidates`, `quality_rounds`, and `topk_updates`.
+Non-repeatable predicates and relational shapes outside this
 optimization retain their ordinary execution paths.
 
 The executor checks heap MVCC visibility and residual filters before returning

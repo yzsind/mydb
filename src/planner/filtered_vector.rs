@@ -17,6 +17,60 @@ impl FilteredVectorStrategy {
     }
 }
 
+/// Unique traversal work shared by all batches of a retained cursor. A
+/// larger scalar candidate demand may widen exploration, but never repeats
+/// the whole base traversal once per rejected candidate.
+fn retained_navigation_rows(
+    index: &IndexSchema,
+    population: f64,
+    effort: usize,
+    pool: f64,
+    survival: f64,
+) -> f64 {
+    match index.vector_algo() {
+        crate::storage::schema::VectorAlgo::Hnsw => {
+            let effort = (effort as f64).max(pool / survival);
+            (effort * (index.vector_meta().m as f64 + population.max(2.0).ln())).min(population)
+        }
+        crate::storage::schema::VectorAlgo::Ivf => {
+            let lists = index
+                .vector_meta()
+                .nlist
+                .map(f64::from)
+                .unwrap_or_else(|| population.sqrt())
+                .max(1.0);
+            let needed = pool / (population / lists * survival).max(1.0 / population);
+            lists + population * ((effort as f64).max(needed) / lists).min(1.0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_cursor_cost_tests {
+    use super::*;
+
+    #[test]
+    fn filtering_does_not_repeat_an_already_sufficient_cursor_traversal() {
+        let mut index: IndexSchema = serde_json::from_value(serde_json::json!({
+            "name": "vx", "columns": ["v"], "unique": false,
+            "primary": false, "index_type": "HNSW"
+        }))
+        .unwrap();
+        for algorithm in ["HNSW", "IVF"] {
+            index.index_type = algorithm.into();
+            let all = retained_navigation_rows(&index, 100_000.0, 256, 80.0, 1.0);
+            let half = retained_navigation_rows(&index, 100_000.0, 256, 80.0, 0.5);
+            assert_eq!(all, half, "a retained {algorithm} cursor shares base work");
+            let sparse = retained_navigation_rows(&index, 100_000.0, 256, 80.0, 0.0001);
+            assert!(
+                sparse > half,
+                "insufficient expected matches require more work"
+            );
+            assert!(sparse.is_finite());
+        }
+    }
+}
+
 /// Remaining work after scalar filtering, in the ordinary CBO cost units.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filtered_vector_remaining_cost(
@@ -45,21 +99,18 @@ pub(crate) fn filtered_vector_remaining_cost(
     let heap_work = |rows| {
         operator_cost::index_lookup(&context, 0.0, rows, heap_pages, 0.0).total + rows * distance
     };
-    let navigation_rows = match index.vector_algo() {
-        crate::storage::schema::VectorAlgo::Hnsw => (effort as f64
-            * (index.vector_meta().m as f64 + population.max(2.0).ln())
-            / (survivors / population).clamp(1.0 / population, 1.0))
-        .min(population),
-        crate::storage::schema::VectorAlgo::Ivf => {
-            let lists = index
-                .vector_meta()
-                .nlist
-                .map(f64::from)
-                .unwrap_or_else(|| population.sqrt())
-                .max(1.0);
-            lists + population * (effort as f64 / lists).min(1.0)
-        }
-    };
+    let cfg = crate::engine::vector::session::current_config();
+    let pool = k
+        .saturating_mul(crate::engine::vector::session::effective_rerank_mult(&cfg, index) as usize)
+        .max(32)
+        .min(survivors as usize) as f64;
+    let navigation_rows = retained_navigation_rows(
+        index,
+        population,
+        effort,
+        pool,
+        (survivors / population).clamp(1.0 / population, 1.0),
+    );
     let column = table.schema.column_index(&index.columns[0])?;
     let payload = match table.schema.columns[column].data_type {
         crate::storage::DataTypeKind::Vector {
@@ -75,11 +126,6 @@ pub(crate) fn filtered_vector_remaining_cost(
     let navigation = operator_cost::index_lookup(&context, 0.0, navigation_rows, graph_pages, 0.0)
         .total
         + navigation_rows * distance;
-    let cfg = crate::engine::vector::session::current_config();
-    let pool = k
-        .saturating_mul(crate::engine::vector::session::effective_rerank_mult(&cfg, index) as usize)
-        .max(32)
-        .min(survivors as usize) as f64;
     Ok((heap_work(survivors), navigation + heap_work(pool)))
 }
 
@@ -194,19 +240,21 @@ pub(super) fn plan_filtered_vector(
             .max(32)
     });
     let survival = (survivors / total_rows.max(1.0)).clamp(1.0 / total_rows.max(1.0), 1.0);
-    let navigation_rows = index.map_or(0.0, |idx| match idx.vector_algo() {
-        crate::storage::schema::VectorAlgo::Hnsw => {
-            (ef as f64 * (idx.vector_meta().m as f64 + total_rows.max(2.0).ln())).min(total_rows)
+    let widening = index.is_none_or(|idx| {
+        if idx.vector_algo() == crate::storage::schema::VectorAlgo::Ivf {
+            cfg.ivf_iterative_scan != crate::engine::vector::session::IterativeScan::Off
+        } else {
+            cfg.iterative_scan != crate::engine::vector::session::IterativeScan::Off
         }
-        crate::storage::schema::VectorAlgo::Ivf => {
-            let lists = idx
-                .vector_meta()
-                .nlist
-                .map(f64::from)
-                .unwrap_or_else(|| total_rows.max(1.0).sqrt())
-                .max(1.0);
-            lists + total_rows * (ef as f64 / lists).min(1.0)
-        }
+    });
+    let navigation_rows = index.map_or(0.0, |idx| {
+        retained_navigation_rows(
+            idx,
+            total_rows.max(1.0),
+            ef,
+            pool as f64,
+            if widening { survival } else { 1.0 },
+        )
     });
     let node_width = table.schema.columns[column_index].data_type.clone();
     let payload = match node_width {
@@ -232,12 +280,9 @@ pub(super) fn plan_filtered_vector(
     } else {
         navigation_fetch.total + navigation_rows * distance
     };
-    let prefilter_navigation_rows =
-        if index.is_some_and(|idx| idx.vector_algo() == crate::storage::schema::VectorAlgo::Hnsw) {
-            (navigation_rows / survival).min(total_rows)
-        } else {
-            navigation_rows
-        };
+    let prefilter_navigation_rows = index.map_or(0.0, |idx| {
+        retained_navigation_rows(idx, total_rows.max(1.0), ef, pool as f64, survival)
+    });
     let prefilter_navigation_fetch = crate::engine::cbo::operator_cost::index_lookup(
         &context,
         0.0,
@@ -254,20 +299,10 @@ pub(super) fn plan_filtered_vector(
     let pool_fetch = heap_fetch(pool_rows);
     let pool_work = pool_fetch.total + pool_rows * distance;
     let prefilter = scalar.total + prefilter_navigation + pool_work;
-    let widening = index.is_none_or(|idx| {
-        if idx.vector_algo() == crate::storage::schema::VectorAlgo::Ivf {
-            cfg.ivf_iterative_scan != crate::engine::vector::session::IterativeScan::Off
-        } else {
-            cfg.iterative_scan != crate::engine::vector::session::IterativeScan::Off
-        }
-    });
     let candidates = (pool as f64 / if widening { survival } else { 1.0 }).min(total_rows);
     let candidate_fetch = heap_fetch(candidates);
-    let growth = (candidates / (pool as f64).max(1.0)).max(1.0);
-    let iterative = navigation * growth
-        + candidate_fetch.total
-        + candidates * qual_cost_per_row(predicate)
-        + pool_work;
+    let iterative =
+        navigation + candidate_fetch.total + candidates * qual_cost_per_row(predicate) + pool_work;
     // Complex residuals have weak selectivity estimates. Price a bounded
     // vector-first pilot as well; execution observes its survival before
     // spending more work or completing through the scalar source.
@@ -310,14 +345,13 @@ pub(super) fn plan_filtered_vector(
             prefilter_navigation_fetch.io_rnd_pages + pool_fetch.io_rnd_pages,
         ),
         FilteredVectorStrategy::IterativeAnn => (
-            (navigation_fetch.cpu_units + navigation_rows * distance) * growth
+            navigation_fetch.cpu_units
+                + navigation_rows * distance
                 + candidate_fetch.cpu_units
                 + candidates * qual_cost_per_row(predicate)
                 + pool_fetch.cpu_units
                 + pool_rows * distance,
-            navigation_fetch.io_rnd_pages * growth
-                + candidate_fetch.io_rnd_pages
-                + pool_fetch.io_rnd_pages,
+            navigation_fetch.io_rnd_pages + candidate_fetch.io_rnd_pages + pool_fetch.io_rnd_pages,
         ),
     };
     cost.cpu_units += cpu;

@@ -47,6 +47,68 @@ fn setup(engine: &StorageQueryEngine, datatype: &str, algo: &str) {
 }
 
 #[test]
+fn filtered_vector_adaptive_rounds_preserve_results_and_explicit_pool_settings() {
+    let (_dir, engine) = open();
+    setup(&engine, "FLOAT32", "HNSW");
+    let sql =
+        "SELECT id FROM items WHERE tenant>=8 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+    let expected = rows(
+        &engine,
+        &sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE"),
+    );
+    let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+        unreachable!()
+    };
+    let plan = crate::planner::plan_select(engine.db_for_tests(), &select)
+        .unwrap()
+        .physical;
+    let mut leaf = None;
+    plan.walk(|node| {
+        if matches!(node, PhysicalPlan::FilteredVectorTopK { .. }) {
+            leaf = Some(node.clone());
+        }
+    });
+    let mut leaf = leaf.unwrap();
+    if let PhysicalPlan::FilteredVectorTopK {
+        strategy,
+        ef_hint,
+        projected_columns,
+        ..
+    } = &mut leaf
+    {
+        *strategy = crate::planner::FilteredVectorStrategy::IterativeAnn;
+        *ef_hint = Some(128);
+        *projected_columns = Some(Arc::new(vec![0]));
+    }
+    for explicit in [false, true] {
+        let mut session = crate::engine::api::SessionContext::default();
+        session.sysvars.mydb_hnsw_rerank_mult = 4;
+        session.sysvars.mydb_hnsw_rerank_mult_explicit = explicit;
+        let txn = engine.db_for_tests().begin_read_only_txn().unwrap();
+        let (measured, actual) = crate::engine::expr::with_session_expr_info(&session, || {
+            super::super::analyze_stats::with_collector(|| {
+                filtered_vector::execute_filtered_vector_topk(engine.db_for_tests(), txn, &leaf)
+            })
+        });
+        let actual: Vec<_> = actual
+            .unwrap()
+            .into_iter()
+            .map(|r| vec![r.fields[0].value.clone()])
+            .collect();
+        assert_eq!(actual, expected);
+        let work = measured.get_for_plan(&leaf).unwrap().filtered_vector;
+        let checks = work.quality_rounds;
+        let fallbacks = work.fallbacks;
+        assert_eq!(fallbacks, 0);
+        if explicit {
+            assert_eq!(checks, 0);
+        } else {
+            assert!(checks >= 2);
+        }
+    }
+}
+
+#[test]
 fn filtered_vector_exact_matches_relational_oracle_and_materializes_only_winners() {
     let (_dir, engine) = open();
     setup(&engine, "FLOAT32", "HNSW");

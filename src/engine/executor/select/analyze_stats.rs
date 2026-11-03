@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct FilteredVectorStats {
+    pub ann_candidates: u64,
+    pub quality_rounds: u64,
+    pub topk_updates: u64,
     pub predicate_evaluations: u64,
     pub navigation_visits: u64,
     pub navigation_distances: u64,
@@ -33,6 +36,9 @@ pub(super) fn add_filtered_vector_stats(plan: &PhysicalPlan, work: FilteredVecto
         if let Some(collector) = cell.borrow().as_ref() {
             if let Ok(mut map) = collector.stats.lock() {
                 let entry = &mut map.entry(key).or_default().filtered_vector;
+                entry.ann_candidates += work.ann_candidates;
+                entry.quality_rounds += work.quality_rounds;
+                entry.topk_updates += work.topk_updates;
                 entry.predicate_evaluations += work.predicate_evaluations;
                 entry.navigation_visits += work.navigation_visits;
                 entry.navigation_distances += work.navigation_distances;
@@ -1986,6 +1992,9 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                     s.filtered_vector.navigation_distances,
                 ),
                 ("vector_heap_reranks", s.filtered_vector.reranks),
+                ("vector_ann_candidates", s.filtered_vector.ann_candidates),
+                ("vector_quality_rounds", s.filtered_vector.quality_rounds),
+                ("vector_topk_updates", s.filtered_vector.topk_updates),
                 ("vector_materialized", s.filtered_vector.materialized),
                 ("vector_batches", s.filtered_vector.batches),
                 ("vector_exact_fallbacks", s.filtered_vector.fallbacks),

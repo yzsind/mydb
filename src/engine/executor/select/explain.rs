@@ -5165,7 +5165,7 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
             || s.filtered_vector.predicate_evaluations > 0
         {
             let w = s.filtered_vector;
-            let work = serde_json::json!({"predicate_evaluations": w.predicate_evaluations, "navigation_visits": w.navigation_visits, "navigation_distances": w.navigation_distances, "heap_reranks": w.reranks, "materialized": w.materialized, "batches": w.batches, "exact_fallbacks": w.fallbacks});
+            let work = serde_json::json!({"ann_candidates": w.ann_candidates, "quality_rounds": w.quality_rounds, "topk_updates": w.topk_updates, "predicate_evaluations": w.predicate_evaluations, "navigation_visits": w.navigation_visits, "navigation_distances": w.navigation_distances, "heap_reranks": w.reranks, "materialized": w.materialized, "batches": w.batches, "exact_fallbacks": w.fallbacks});
             extra.push_str(&format!(", \"filtered_vector_work\": {work}"));
         }
         if s.rrf_branches > 0 {

@@ -4,6 +4,7 @@ use crate::engine::vector::hnsw_core::Scored;
 use crate::engine::vector::workspace::VectorQueryCharge;
 use std::collections::BinaryHeap;
 
+mod adaptive;
 mod fused;
 
 struct FilteredPredicate {
@@ -404,6 +405,26 @@ fn score_filtered_ids(
     best: &mut BinaryHeap<Scored<(u64, RowId)>>,
     charge: &mut VectorQueryCharge,
 ) -> Result<usize, QueryError> {
+    score_filtered_ids_progress(
+        db, txn, table, sid, ids, column, query, metric, k, best, charge,
+    )
+    .map(|(count, _)| count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_filtered_ids_progress(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    sid: u64,
+    ids: &[RowId],
+    column: usize,
+    query: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+    k: usize,
+    best: &mut BinaryHeap<Scored<(u64, RowId)>>,
+    charge: &mut VectorQueryCharge,
+) -> Result<(usize, usize), QueryError> {
     let heap = db.cached_heap_handle(sid)?;
     let scores = db.score_vector_rows_many_with_handle(
         &heap,
@@ -416,6 +437,7 @@ fn score_filtered_ids(
         None,
     )?;
     let count = scores.len();
+    let mut changes = 0;
     for (row, distance, _) in scores {
         let item = Scored {
             dist: distance,
@@ -435,9 +457,10 @@ fn score_filtered_ids(
             best.push(item);
         } else if best.peek().is_some_and(|worst| item < *worst) {
             *best.peek_mut().unwrap() = item;
+            changes += 1;
         }
     }
-    Ok(count)
+    Ok((count, changes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,10 +501,13 @@ fn search_filtered_ann(
     } else {
         (max_scan as usize).max(k)
     };
-    let target = k
-        .saturating_mul(effective_rerank_mult(&cfg, index) as usize)
-        .max(32)
-        .max(k);
+    let multiplier = effective_rerank_mult(&cfg, index) as usize;
+    let explicit_pool = multiplier != 4
+        || if is_ivf {
+            cfg.ivf_rerank_mult_explicit
+        } else {
+            cfg.hnsw_rerank_mult_explicit
+        };
     let mut seen = std::collections::HashSet::new();
     let mut seen_charge = VectorQueryCharge::try_new_recoverable(0)?;
     let predicate_columns = if selection.is_none() {
@@ -493,17 +519,19 @@ fn search_filtered_ann(
     let eval_ctx = &mut predicate.eval_ctx;
     let mut all_complete = true;
     for sid in db.scan_storage_ids(&table.schema) {
-        let target = selection
-            .as_ref()
-            .map_or(target, |rows| target.min(rows.partition_len(sid)));
-        if target == 0 {
+        let mut budget = adaptive::CandidateBudget::new(
+            k,
+            multiplier,
+            mode == IterativeScan::Off || explicit_pool,
+            selection.as_ref().map(|rows| rows.partition_len(sid)),
+        );
+        if budget.done() {
             continue;
         }
         let mut cursor =
             db.vector_index_open_cursor(&table.schema, index, sid, query, selection.clone())?;
         cursor.max_navigation = max_scan;
         let mut effort = base_effort;
-        let mut accepted = 0;
         loop {
             crate::engine::cancel::check_cancelled()?;
             let remaining = max_scan.saturating_sub(seen.len());
@@ -516,13 +544,7 @@ fn search_filtered_ann(
                 index,
                 &mut cursor,
                 effort.min(max_scan),
-                (if mode == IterativeScan::Off {
-                    target
-                } else {
-                    target.min(256)
-                })
-                .max(1)
-                .min(remaining),
+                budget.next_batch(remaining, mode == IterativeScan::Off),
             )?
             else {
                 // Invalidation or a backend's request for heap completion is
@@ -532,6 +554,7 @@ fn search_filtered_ann(
                 return Ok(false);
             };
             stats.batches += 1;
+            let examined = batch.len();
             let mut ids = Vec::with_capacity(batch.len());
             for (id, _) in batch {
                 if !seen.contains(&(sid, id)) {
@@ -540,6 +563,7 @@ fn search_filtered_ann(
                     ids.push(id);
                 }
             }
+            stats.ann_candidates += ids.len() as u64;
             let ids = if selection.is_some() {
                 ids
             } else {
@@ -571,14 +595,18 @@ fn search_filtered_ann(
                 kept
             };
             stats.reranks += ids.len() as u64;
-            accepted += score_filtered_ids(
+            let (accepted, changes) = score_filtered_ids_progress(
                 db, txn, table, sid, &ids, column, query, metric, k, best, charge,
             )?;
+            let checks = budget.checks();
+            budget.observe(examined, accepted, changes);
+            stats.quality_rounds += budget.checks() - checks;
+            stats.topk_updates += changes as u64;
             if cursor.navigation_incomplete {
                 all_complete = false;
                 break;
             }
-            if accepted >= target {
+            if budget.done() {
                 break;
             }
             if mode == IterativeScan::Off {
@@ -598,8 +626,7 @@ fn search_filtered_ann(
                 effort = effort.saturating_mul(2).max(1);
             }
             if selection.is_none() && seen.len() >= 64 {
-                let survival = (accepted as f64 + 2.0) / (seen.len() as f64 + 16.0);
-                let remaining = (target.saturating_sub(accepted) as f64 / survival).ceil();
+                let remaining = budget.next_batch(remaining, false) as f64;
                 let constants = crate::engine::cbo::cbo_consts();
                 let distance =
                     (query.dimension as f64 / 8.0).max(1.0) * constants.cpu_operator_cost();
@@ -612,7 +639,7 @@ fn search_filtered_ann(
                 };
                 let continuation = remaining * (predicate_cost + decode)
                     + navigation
-                    + target.saturating_sub(accepted) as f64 * (distance + decode);
+                    + budget.remaining_qualified() as f64 * (distance + decode);
                 if continuation > exact_cost {
                     all_complete = false;
                     break;
