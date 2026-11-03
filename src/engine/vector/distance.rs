@@ -615,8 +615,32 @@ impl<'a> PreparedF32Distance<'a> {
         self.query.len()
     }
 
+    /// A finite, normal sum of squares proves that every row coordinate is
+    /// finite. Reuse that proof for the common cosine domain instead of
+    /// traversing the borrowed payload twice. Exceptional domains still use
+    /// the codec validator and established wide reduction, with identical
+    /// error and rounding behavior.
+    pub(crate) fn score_checked_bytes(&self, row: &[u8]) -> Result<f64, crate::types::QueryError> {
+        use crate::vector::{VectorDataType, VectorRef};
+        let valid_shape = !self.query.is_empty()
+            && self.query.len() <= VectorDataType::Float32.max_dimension() as usize
+            && row.len() == self.query.len() * 4;
+        if valid_shape {
+            if let Some(score) = self.cosine_fast_score(row) {
+                return Ok(score);
+            }
+        }
+        let vector = VectorRef {
+            datatype: VectorDataType::Float32,
+            dimension: self.query.len().try_into().unwrap_or(u32::MAX),
+            payload: row,
+        };
+        super::validate_internal(&vector)?;
+        Ok(self.score_bytes(row))
+    }
+
     #[inline]
-    pub(crate) fn score_bytes(&self, row: &[u8]) -> f64 {
+    fn cosine_fast_score(&self, row: &[u8]) -> Option<f64> {
         #[cfg(target_endian = "little")]
         if row.len() / 4 == self.query.len() {
             if let Some((query_squared, query_norm)) = self.cosine {
@@ -630,17 +654,28 @@ impl<'a> PreparedF32Distance<'a> {
                     } else {
                         (dot / (query_norm * row_squared.sqrt())).clamp(-1.0, 1.0)
                     };
-                    return (1.0 - similarity) as f64;
+                    return Some((1.0 - similarity) as f64);
                 }
-                return unsafe {
-                    wide_ordering_distance_ptr(
-                        self.query.as_ptr(),
-                        row.as_ptr().cast(),
-                        self.query.len(),
-                        Metric::Cosine,
-                    )
-                };
             }
+        }
+        None
+    }
+
+    #[inline]
+    pub(crate) fn score_bytes(&self, row: &[u8]) -> f64 {
+        if let Some(score) = self.cosine_fast_score(row) {
+            return score;
+        }
+        #[cfg(target_endian = "little")]
+        if row.len() / 4 == self.query.len() && self.cosine.is_some() {
+            return unsafe {
+                wide_ordering_distance_ptr(
+                    self.query.as_ptr(),
+                    row.as_ptr().cast(),
+                    self.query.len(),
+                    Metric::Cosine,
+                )
+            };
         }
         ordering_distance_f32_bytes(self.query, row, self.metric)
     }
@@ -1869,6 +1904,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn checked_prepared_f32_preserves_sql_values_errors_and_reduction_bits() {
+        use crate::vector::{VectorDataType, VectorRef};
+        for n in [1, 3, 7, 8, 31, 32, 33, 127, 128, 768, 769, 1536] {
+            for query in [pseudo(n, 17), vec![0.0; n], vec![f32::MIN_POSITIVE; n]] {
+                for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                    let scorer = PreparedF32Distance::new(&query, metric);
+                    for row in [
+                        pseudo(n, 41),
+                        query.clone(),
+                        vec![0.0; n],
+                        vec![-0.0; n],
+                        vec![f32::from_bits(1); n],
+                        vec![f32::MAX; n],
+                        vec![f32::MIN_POSITIVE; n],
+                    ] {
+                        for offset in [0, 1, 3] {
+                            let mut bytes = vec![0; offset];
+                            bytes.extend_from_slice(&to_bytes(&row));
+                            let bytes = &bytes[offset..];
+                            let actual = scorer.score_checked_bytes(bytes).unwrap();
+                            assert_eq!(
+                                actual.to_bits(),
+                                ordering_distance_f32_bytes(&query, bytes, metric).to_bits(),
+                                "n={n} offset={offset} metric={metric:?}"
+                            );
+                        }
+                    }
+                    for position in [0, n / 2, n - 1] {
+                        for invalid in [
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                            f32::NAN,
+                            f32::from_bits(0x7f800001),
+                        ] {
+                            let mut row = pseudo(n, 71);
+                            row[position] = invalid;
+                            let bytes = to_bytes(&row);
+                            let vector = VectorRef {
+                                datatype: VectorDataType::Float32,
+                                dimension: n as u32,
+                                payload: &bytes,
+                            };
+                            let expected = super::super::validate_internal(&vector).unwrap_err();
+                            let actual = scorer.score_checked_bytes(&bytes).unwrap_err();
+                            assert_eq!(actual.code(), expected.code());
+                            assert_eq!(actual.message(), expected.message());
+                        }
+                    }
+                    let mut malformed = to_bytes(&query);
+                    malformed.push(0);
+                    assert!(scorer.score_checked_bytes(&malformed).is_err());
+                    assert!(scorer.score_checked_bytes(&malformed[..n * 4 - 1]).is_err());
+                }
+            }
+        }
+        assert!(PreparedF32Distance::new(&[], Metric::Cosine)
+            .score_checked_bytes(&[])
+            .is_err());
     }
 
     #[test]

@@ -796,6 +796,46 @@ pub(super) fn collect_explain_rows(
             row.plan_id = Some(node_id);
             rows.push(row);
         }
+        PhysicalPlan::FilteredVectorTopK {
+            table,
+            strategy,
+            index,
+            metric,
+            k,
+            filter,
+            estimated_rows,
+            access_rows,
+            possible_keys,
+            ..
+        } => {
+            let algorithm = if *strategy == FilteredVectorStrategy::Exact {
+                "BRUTE"
+            } else {
+                index.as_ref().map_or("BRUTE", |i| {
+                    if i.vector_algo() == crate::storage::schema::VectorAlgo::Ivf {
+                        "IVF"
+                    } else {
+                        "HNSW"
+                    }
+                })
+            };
+            let extra = format!("Filtered vector Top-K ({algorithm}); strategy={} metric={metric} k={k}; late materialization", strategy.as_str());
+            let mut row = explain_scan_row(
+                rows.len() + 1,
+                table,
+                "ALL",
+                possible_keys,
+                "",
+                None,
+                "",
+                *estimated_rows,
+                *access_rows,
+                filter.as_ref(),
+                &extra,
+            );
+            row.plan_id = Some(node_id);
+            rows.push(row);
+        }
         PhysicalPlan::VectorBruteScan {
             table,
             metric,

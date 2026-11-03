@@ -22,6 +22,9 @@ pub(super) use window::*;
 mod fulltext_source;
 mod fulltext_stream;
 pub(super) use fulltext_stream::FULLTEXT_BATCH_ROWS;
+mod filtered_vector;
+#[cfg(test)]
+mod filtered_vector_tests;
 mod scan;
 #[cfg(test)]
 mod scan_routing_tests;
@@ -1824,6 +1827,7 @@ fn scan_node_has_partitions(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::FulltextScan { table, .. }
         | PhysicalPlan::SpatialScan { table, .. }
         | PhysicalPlan::VectorIndexScan { table, .. }
+        | PhysicalPlan::FilteredVectorTopK { table, .. }
         | PhysicalPlan::VectorBruteScan { table, .. }
         | PhysicalPlan::ParallelSeqScan { table, .. }
         | PhysicalPlan::ParallelIndexFastScan { table, .. }
@@ -2448,6 +2452,9 @@ pub(super) fn execute_plan_rows_inner(
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
             execute_spatial_scan(db, txn, table, index, query_probe, filter)
         }
+        PhysicalPlan::FilteredVectorTopK { .. } => {
+            filtered_vector::execute_filtered_vector_topk(db, txn, plan)
+        }
         PhysicalPlan::VectorIndexScan {
             table,
             index,
@@ -2466,19 +2473,12 @@ pub(super) fn execute_plan_rows_inner(
         } => {
             let txn = crate::engine::executor::temporal::txn_for_table(txn, table);
             let (k, _) = binding.resolve_k_offset(*k, *baked_offset);
-            // Re-resolve `ef_search` from the *live* session, not the value
-            // baked at plan time: the plan cache key doesn't include
-            // `mydb_hnsw_ef_search`, so a cached VectorIndexScan would otherwise
-            // pin whatever ef the first execution saw and silently ignore a
-            // later `SET mydb_hnsw_ef_search`. An explicit `/*+ HNSW_EF(n) */`
-            // (baked in `ef_hint`) still wins. Falls back to the baked value if
-            // no session is installed (internal callers).
+            // Resolve live effort for late LIMIT bindings and direct plan
+            // callers. Compiled cache guards also include vector settings
+            // so changes affecting the ANN/exact crossover are re-costed.
+            // Algorithm-specific query hints retain their priority.
             let cfg = crate::engine::vector::session::current_config();
-            let _ = ef_search; // baked planning-time value; superseded by the live re-resolution
-                               // Resolve the algorithm-appropriate search effort from the *live*
-                               // session: an ef candidate-pool size for HNSW, an nprobe cell count
-                               // for IVF. Both flow through the same `ef` argument — the
-                               // backend (`VectorGraph::search`) interprets it per its algorithm.
+            let _ = ef_search;
             let ef = match index.vector_algo() {
                 crate::storage::schema::VectorAlgo::Ivf => {
                     let index_default = index.vector_meta().default_nprobe.map(|v| v as u64);

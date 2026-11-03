@@ -16,6 +16,7 @@ mod temporal_read;
 mod temporal_shift;
 mod temporal_value;
 mod unsigned_read;
+mod vector_read;
 use super::*;
 use crate::engine::executor::vec::expr_batch::{
     transform_utf8_column, try_temporal_extract_column,
@@ -44,6 +45,7 @@ use temporal_read::TemporalRead;
 use temporal_shift::TemporalShift;
 use temporal_value::TemporalValue;
 use unsigned_read::UnsignedRead;
+use vector_read::VectorRead;
 
 #[derive(Clone, Copy)]
 enum Domain {
@@ -394,6 +396,10 @@ fn string_bound(node: &ExprNode, schema: &BatchSchema) -> Option<u64> {
 }
 
 fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
+    if let Some(read) = VectorRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+
     if let Some(read) = LookupRead::bind(node, schema) {
         return Some(read.contract());
     }
@@ -639,9 +645,9 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
             if matches!(
                 kernel,
                 FunctionKernel::JsonExtract
+                    | FunctionKernel::JsonUnquote
                     | FunctionKernel::LegacyDeterministic(
-                        "JSON_UNQUOTE"
-                            | "JSON_PRETTY"
+                        "JSON_PRETTY"
                             | "JSON_SEARCH"
                             | "JSON_TYPE"
                             | "JSON_LENGTH"
@@ -866,6 +872,10 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
 /// Bound speculative owned buffers from actual lanes, including intermediate
 /// columns. A small numeric result must not admit an enormous string child.
 fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
+    if let Some(read) = VectorRead::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
+
     if let Some(read) = LookupRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
@@ -1181,6 +1191,14 @@ fn evaluate_in_chunks(
 
 /// Compact only visible rows; invisible values never enter speculative kernels.
 fn evaluate_selected(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
+    if let Some(read) = VectorRead::bind(node, batch.schema()) {
+        let (_, work) = read.workspace(batch)?;
+        let mut charge = batch.memory_charge();
+        if !charge.add_within(work.checked_mul(2)?, usize::MAX) {
+            return None;
+        }
+        return read.evaluate(batch);
+    }
     let rows = batch.num_rows();
     let input_bytes = batch.visible_indices().try_fold(0usize, |bytes, row| {
         batch.columns().iter().try_fold(bytes, |bytes, column| {
@@ -1311,6 +1329,10 @@ fn operand<'a>(node: &ExprNode, batch: &'a Batch) -> Option<std::borrow::Cow<'a,
 }
 
 fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
+    if let Some(read) = VectorRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+
     if let Some(read) = LookupRead::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }

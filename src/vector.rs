@@ -35,6 +35,47 @@ pub struct VectorRef<'a> {
     pub dimension: u32,
     pub payload: &'a [u8],
 }
+impl<'a> VectorRef<'a> {
+    /// Append the standalone encoding directly to a caller-owned buffer.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(12 + self.payload.len());
+        out.extend_from_slice(&[
+            crate::storage::format_versions::NATIVE_VECTOR_VALUE_VERSION,
+            self.datatype as u8,
+            0,
+            0,
+        ]);
+        out.extend_from_slice(&self.dimension.to_le_bytes());
+        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.payload);
+    }
+
+    /// Borrow a structurally valid standalone encoding without copying its payload.
+    /// Coordinate validation remains the codec's responsibility.
+    pub fn decode(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < 12
+            || bytes[0] != crate::storage::format_versions::NATIVE_VECTOR_VALUE_VERSION
+            || bytes[2..4] != [0, 0]
+        {
+            return None;
+        }
+        let datatype = VectorDataType::from_tag(bytes[1])?;
+        let dimension = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+        let length = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+        if dimension == 0
+            || dimension > datatype.max_dimension()
+            || length != datatype.payload_len(dimension)
+            || bytes.len() - 12 != length
+        {
+            return None;
+        }
+        Some(Self {
+            datatype,
+            dimension,
+            payload: &bytes[12..],
+        })
+    }
+}
 impl VectorInput for VectorRef<'_> {
     fn datatype(&self) -> VectorDataType {
         self.datatype
@@ -203,36 +244,26 @@ impl VectorValue {
     /// Standalone values carry type information; fixed heap lanes use only payload.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(12 + self.payload.len());
-        out.extend_from_slice(&[
-            crate::storage::format_versions::NATIVE_VECTOR_VALUE_VERSION,
-            self.datatype as u8,
-            0,
-            0,
-        ]);
-        out.extend_from_slice(&self.dimension.to_le_bytes());
-        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.payload);
+        self.encode_into(&mut out);
         out
     }
 
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        VectorRef {
+            datatype: self.datatype,
+            dimension: self.dimension,
+            payload: &self.payload,
+        }
+        .encode_into(out);
+    }
+
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 12
-            || bytes[0] != crate::storage::format_versions::NATIVE_VECTOR_VALUE_VERSION
-            || bytes[2..4] != [0, 0]
-        {
-            return None;
-        }
-        let datatype = VectorDataType::from_tag(bytes[1])?;
-        let dimension = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        let length = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
-        if dimension == 0
-            || dimension > datatype.max_dimension()
-            || length != datatype.payload_len(dimension)
-            || bytes.len() - 12 != length
-        {
-            return None;
-        }
-        Some(Self::new(datatype, dimension, bytes[12..].to_vec()))
+        let value = VectorRef::decode(bytes)?;
+        Some(Self::new(
+            value.datatype,
+            value.dimension,
+            value.payload.to_vec(),
+        ))
     }
 }
 

@@ -171,9 +171,7 @@ impl JsonRead {
                 }
                 let output = match kernel {
                     FunctionKernel::JsonExtract if args.len() == 2 => Output::Binary,
-                    FunctionKernel::LegacyDeterministic("JSON_UNQUOTE") if args.len() == 1 => {
-                        Output::Unquoted
-                    }
+                    FunctionKernel::JsonUnquote if args.len() == 1 => Output::Unquoted,
                     FunctionKernel::LegacyDeterministic("JSON_PRETTY") if args.len() == 1 => {
                         Output::Pretty
                     }

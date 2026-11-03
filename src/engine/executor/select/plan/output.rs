@@ -964,6 +964,11 @@ pub(in crate::engine::executor::select) fn collect_plan_fields(
             table,
             projected_columns,
             ..
+        }
+        | PhysicalPlan::FilteredVectorTopK {
+            table,
+            projected_columns,
+            ..
         } => {
             push_table_fields(
                 out,

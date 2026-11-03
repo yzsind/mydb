@@ -1252,7 +1252,7 @@ impl HeapFile {
         };
         let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
         let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
-        note_reduced_redo_file(&self.log, txn_id, relative_path);
+        note_reduced_redo_file(&self.log, txn_id, Arc::clone(&self.file_key));
         Ok(Some(lsn))
     }
 

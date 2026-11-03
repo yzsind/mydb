@@ -1248,6 +1248,48 @@ impl ExprProgram {
         Some((kind, *index))
     }
 
+    pub(crate) fn as_xml_const_column(
+        &self,
+    ) -> Option<(usize, crate::engine::expr::xml::ColumnPlan)> {
+        let ExprNode::Function {
+            kernel,
+            args,
+            collation_id,
+            ..
+        } = &self.root
+        else {
+            return None;
+        };
+        let name = match kernel {
+            FunctionKernel::XmlExtract => "EXTRACTVALUE",
+            FunctionKernel::XmlUpdate => "UPDATEXML",
+            _ => return None,
+        };
+        let ExprNode::Column(index) = args.first()? else {
+            return None;
+        };
+        // Resolve execution parameters when opening the batch, never while
+        // caching the expression program. Rebinding must use the new values.
+        let bound_value = |node: &ExprNode| match node {
+            ExprNode::Const(value) => Some(value.clone()),
+            ExprNode::Placeholder(index) => crate::engine::params::current_param(*index),
+            _ => None,
+        };
+        let path = bound_value(args.get(1)?)?;
+        let replacement = if name.eq_ignore_ascii_case("UPDATEXML") {
+            Some(bound_value(args.get(2)?)?)
+        } else {
+            None
+        };
+        let plan = crate::engine::expr::xml::ColumnPlan::new(
+            &path,
+            replacement.as_ref(),
+            collation_id.unwrap_or_else(crate::engine::expr::connection_collation_id),
+        )
+        .ok()??;
+        Some((*index, plan))
+    }
+
     /// Recognize the common three-argument REGEXP_REPLACE shape over one
     /// UTF-8 column. The pattern is compiled once through the governed regex
     /// cache; batch execution can then write all results into one contiguous
@@ -5989,6 +6031,8 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     ) == crate::engine::expr::FieldComparisonDomain::Strings)
             {
                 aggregate_input_collation(args, schema, "comparison")?
+            } else if crate::engine::expr::xml::is_xml(name) {
+                aggregate_input_collation(args, schema, name)?
             } else if crate::engine::expr::is_regexp_function(name) {
                 aggregate_input_collation(&args[..args.len().min(2)], schema, "regexp")?
             } else if name.eq_ignore_ascii_case("__DISTINCT_COLLATION_KEY") {
@@ -7699,7 +7743,46 @@ impl FunctionKernel {
             | FunctionKernel::Hour
             | FunctionKernel::Minute
             | FunctionKernel::Second => eval_temporal_part(self, args, row, scratch),
+            FunctionKernel::XmlExtract | FunctionKernel::XmlUpdate => {
+                let name = if matches!(self, FunctionKernel::XmlExtract) {
+                    "EXTRACTVALUE"
+                } else {
+                    "UPDATEXML"
+                };
+                expect_len(
+                    name,
+                    args,
+                    if matches!(self, FunctionKernel::XmlExtract) {
+                        2
+                    } else {
+                        3
+                    },
+                )?;
+                let path = args[1].eval_ref(row, scratch)?;
+                let collation = crate::engine::expr::current_compare_collation_id()
+                    .unwrap_or_else(crate::engine::expr::connection_collation_id);
+                let Some(call) =
+                    crate::engine::expr::xml::PreparedCall::new(path.as_value(), collation)?
+                else {
+                    return Ok(Value::Null);
+                };
+                let xml = args[0].eval_ref(row, scratch)?;
+                if xml.is_null() {
+                    return Ok(Value::Null);
+                }
+                let replacement = if args.len() == 3 {
+                    Some(args[2].eval_ref(row, scratch)?)
+                } else {
+                    None
+                };
+                call.execute(xml.as_value(), replacement.as_ref().map(ValueRef::as_value))
+            }
             FunctionKernel::JsonExtract => eval_json_extract(args, row, scratch),
+            FunctionKernel::JsonUnquote => {
+                expect_len("JSON_UNQUOTE", args, 1)?;
+                let value = args[0].eval_ref(row, scratch)?;
+                crate::engine::expr::json_unquote_value(value.as_value())
+            }
             FunctionKernel::LegacyDeterministic(name) => {
                 eval_legacy_by_name(name, args, row, scratch)
             }
@@ -11130,6 +11213,65 @@ mod legacy_escape_tests {
             name: name.into(),
             args,
             distinct: false,
+        }
+    }
+
+    #[test]
+    fn json_unquote_uses_borrowed_native_kernel_and_preserves_values() {
+        let expr = func("JSON_UNQUOTE", vec![Expr::Identifier("doc".into())]);
+        let mut values = vec![
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("plain".into()),
+            Value::SmallString(smallvec::SmallVec::from_slice(b"small")),
+            Value::String(r#""line\n\t\u4e2d""#.into()),
+            Value::String(r#""unterminated\""#.into()),
+            Value::Bytes(Vec::new()),
+            Value::Bytes(vec![0xff]),
+            Value::Int(3),
+            Value::Double(1.25),
+        ];
+        for doc in [
+            "null",
+            "true",
+            "123",
+            "1.5",
+            r#""quoted\ntext""#,
+            r#"[1,"x"]"#,
+            r#"{"n":1}"#,
+        ] {
+            values.push(Value::Json(
+                crate::engine::json::parse_text(doc, 1, "test").unwrap(),
+            ));
+        }
+        for column_type in [ColumnType::Json, ColumnType::VarString, ColumnType::Blob] {
+            for value in &values {
+                let program = assert_parity(&expr, &[("doc", column_type)], vec![value.clone()]);
+                assert!(matches!(
+                    program.root,
+                    ExprNode::Function {
+                        kernel: FunctionKernel::JsonUnquote,
+                        ..
+                    }
+                ));
+                assert!(program.capability().may_error);
+                assert!(!program.capability().legacy_escape);
+            }
+        }
+        assert_eq!(
+            crate::engine::expr::json_unquote_value(&Value::Null).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            crate::engine::expr::json_unquote_value(&Value::String(r#""a\nb""#.into())).unwrap(),
+            Value::String("a\nb".into())
+        );
+        for count in [0usize, 2, 5] {
+            let expr = func(
+                "JSON_UNQUOTE",
+                (0..count).map(|_| Expr::Identifier("doc".into())).collect(),
+            );
+            assert_parity(&expr, &[("doc", ColumnType::Json)], vec![Value::Null]);
         }
     }
 

@@ -3356,6 +3356,127 @@ impl HnswIndex {
     /// k-nearest-neighbour search. Returns up to `k` `(row_id, ordering_dist)`
     /// pairs ascending by distance, skipping tombstoned nodes. `ef_search` is
     /// the dynamic candidate-list size at layer 0 (clamped to ≥ k).
+    pub(crate) fn advance_cursor(
+        &self,
+        cursor: &mut super::cursor::VectorSearchCursor,
+        effort: usize,
+    ) -> Result<bool, QueryError> {
+        let _guard = self.structural.read();
+        let epoch = self.mutation_epoch.load(Ordering::Acquire);
+        if cursor.initialized && cursor.epoch != epoch {
+            return Ok(false);
+        }
+        let score = |id: u32| {
+            self.with_node_vector(id, |v| ordering_distance(&cursor.decoded, v, self.metric))
+        };
+        if !cursor.initialized {
+            cursor.epoch = epoch;
+            cursor.initialized = true;
+            let topology = self.topology.lock();
+            if let Some(mut entry) = topology.entry_point {
+                for level in (1..=topology.max_level).rev() {
+                    loop {
+                        let mut best = entry;
+                        let mut best_distance = score(entry);
+                        let mut neighbors = Vec::new();
+                        self.neighbors_into(entry, level, &mut neighbors);
+                        for n in neighbors {
+                            let d = score(n);
+                            if d < best_distance {
+                                best = n;
+                                best_distance = d;
+                            }
+                        }
+                        if best == entry {
+                            break;
+                        }
+                        entry = best;
+                    }
+                }
+                let node = self.nodes.get(entry);
+                let rows = if node.deleted.load(Ordering::Acquire) {
+                    Vec::new()
+                } else {
+                    vec![node.row_id]
+                };
+                cursor.hnsw.discover(
+                    entry as u64,
+                    score(entry),
+                    rows.iter().copied(),
+                    cursor.sid,
+                    cursor.selection.as_deref(),
+                )?;
+                cursor.work.distances += 1;
+            }
+        }
+        if effort >= self.nodes.len() {
+            let end = cursor
+                .scan_position
+                .saturating_add(1024)
+                .min(self.nodes.len());
+            for id in cursor.scan_position as u32..end as u32 {
+                if cursor.hnsw.visited.contains(&(id as u64)) {
+                    continue;
+                }
+                let node = self.nodes.get(id);
+                let rows = if node.deleted.load(Ordering::Acquire) {
+                    Vec::new()
+                } else {
+                    vec![node.row_id]
+                };
+                cursor.hnsw.discover(
+                    id as u64,
+                    score(id),
+                    rows.iter().copied(),
+                    cursor.sid,
+                    cursor.selection.as_deref(),
+                )?;
+                cursor.work.distances += 1;
+                cursor.work.visited += 1;
+                crate::engine::cancel::check_cancelled()?;
+            }
+            cursor.scan_position = end;
+            if end < self.nodes.len() {
+                cursor.resume_work = true;
+                return Ok(epoch == self.mutation_epoch.load(Ordering::Acquire));
+            }
+            cursor.hnsw.frontier.clear();
+            cursor.hnsw.expanded = self.nodes.len();
+            return Ok(epoch == self.mutation_epoch.load(Ordering::Acquire));
+        }
+        let mut neighbors = Vec::new();
+        let end = cursor.hnsw.expanded.saturating_add(1024).min(effort);
+        while cursor.hnsw.expanded < end {
+            crate::engine::cancel::check_cancelled()?;
+            let Some(Reverse(candidate)) = cursor.hnsw.frontier.pop() else {
+                break;
+            };
+            cursor.hnsw.expanded += 1;
+            cursor.work.visited += 1;
+            self.neighbors_into(candidate.id as u32, 0, &mut neighbors);
+            for &id in &neighbors {
+                if cursor.hnsw.visited.contains(&(id as u64)) {
+                    continue;
+                }
+                let node = self.nodes.get(id);
+                let rows = if node.deleted.load(Ordering::Acquire) {
+                    Vec::new()
+                } else {
+                    vec![node.row_id]
+                };
+                cursor.hnsw.discover(
+                    id as u64,
+                    score(id),
+                    rows.iter().copied(),
+                    cursor.sid,
+                    cursor.selection.as_deref(),
+                )?;
+                cursor.work.distances += 1;
+            }
+        }
+        cursor.resume_work = cursor.hnsw.expanded < effort && !cursor.hnsw.frontier.is_empty();
+        Ok(epoch == self.mutation_epoch.load(Ordering::Acquire))
+    }
     pub(crate) fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(RowId, f64)> {
         if k == 0 {
             return Vec::new();

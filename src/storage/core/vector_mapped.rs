@@ -1,6 +1,7 @@
 // Direct read-only navigation over the authoritative .hvec image. No derived
-// codes/edges file, dense directory, or startup scan is required. Writers revoke
-// the view before publishing a page mutation; existing readers drain first.
+// codes/edges file or startup scan is required. A bounded optional location
+// memo is filled only by validated accesses. Writers revoke the view before
+// publishing a page mutation; existing readers drain first.
 
 #[derive(Debug)]
 pub(crate) struct MappedVectorNavigation {
@@ -8,9 +9,92 @@ pub(crate) struct MappedVectorNavigation {
     address: *mut libc::c_void,
     len: usize,
     meta: VectorMeta,
+    source_revision: u64,
     verified: Vec<AtomicU64>,
+    records: Option<MappedRecordCache>,
     cache: crate::engine::vector::hnsw_paged::QueryNavCache,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+/// A mapping-generation-local memo of validated record locations. Zero is
+/// not a valid record offset, so untouched slots need no separate bitmap.
+/// Admission is optional and never scans the index or validates other rows.
+#[derive(Debug)]
+struct MappedRecordCache {
+    slots_per_page: usize,
+    offsets: Vec<std::sync::atomic::AtomicU16>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl MappedRecordCache {
+    fn try_new(pages: usize, record_bytes: usize, limit: usize) -> Option<Self> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let slots_per_page = ((PAGE_SIZE - NODE_OFF_DIRECTORY) / record_bytes.checked_add(2)?)
+            .min(usize::from(NODE_ID_SLOTS_PER_PAGE));
+        if slots_per_page == 0 {
+            return None;
+        }
+        let count = pages.checked_mul(slots_per_page)?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<std::sync::atomic::AtomicU16>())?
+            .checked_add(std::mem::size_of::<Self>())?;
+        if bytes > limit {
+            return None;
+        }
+        // Do not reclaim caches here: preparation holds the mapping write
+        // guard, and reclamation could re-enter the same index.
+        let mut charge = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::DerivedCache,
+            bytes,
+        )?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(count).ok()?;
+        let allocated = offsets
+            .capacity()
+            .checked_mul(std::mem::size_of::<std::sync::atomic::AtomicU16>())?
+            .checked_add(std::mem::size_of::<Self>())?;
+        if allocated > bytes && (allocated > limit || !charge.try_grow_optional(allocated - bytes))
+        {
+            return None;
+        }
+        offsets.extend((0..count).map(|_| std::sync::atomic::AtomicU16::new(0)));
+        Some(Self {
+            slots_per_page,
+            offsets,
+            _charge: charge,
+        })
+    }
+
+    #[inline]
+    fn slot(&self, vid: VecId) -> Option<&std::sync::atomic::AtomicU16> {
+        let slot = usize::from(vid_slot(vid));
+        if slot >= self.slots_per_page {
+            return None;
+        }
+        let index = usize::try_from(vid_page(vid))
+            .ok()?
+            .checked_mul(self.slots_per_page)?
+            .checked_add(slot)?;
+        self.offsets.get(index)
+    }
+
+    #[inline]
+    fn get(&self, vid: VecId) -> Option<usize> {
+        let offset = self.slot(vid)?.load(Ordering::Acquire);
+        (offset != 0).then_some(usize::from(offset))
+    }
+
+    #[inline]
+    fn remember(&self, vid: VecId, offset: usize) {
+        debug_assert!(vid_page(vid) != 0 && offset != 0 && offset < PAGE_SIZE);
+        if let Some(slot) = self.slot(vid) {
+            // The complete page and record validation precedes publication.
+            // Racing readers publish the same immutable record location.
+            slot.store(offset as u16, Ordering::Release);
+        }
+    }
 }
 
 // SAFETY: readers borrow this object under VectorIndexFile::mapped_navigation's
@@ -28,6 +112,12 @@ impl Drop for VectorNavigationWrite<'_> {
 }
 
 impl VectorIndexFile {
+    /// Optional cache reclamation must not wait for a reader that may itself
+    /// be requesting memory admission while holding the mapping read guard.
+    pub(crate) fn evict_navigation_mapping(&self) -> bool {
+        self.mapped_navigation.try_write().is_some_and(|mut view| view.take().is_some())
+    }
+
     fn navigation_write(&self) -> VectorNavigationWrite<'_> {
         self.navigation_writers.fetch_add(1, Ordering::AcqRel);
         self.navigation_revision.fetch_add(1, Ordering::AcqRel);
@@ -140,12 +230,20 @@ impl VectorIndexFile {
                 Ok(image) => image,
                 Err(_) => return Ok(false),
             };
+        let records = MappedRecordCache::try_new(
+            meta.node_next_page_id as usize,
+            node_record_size(0, meta.dim as usize, meta.m as usize, meta.m0 as usize),
+            (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
+                .min(64 * 1024 * 1024),
+        );
         let mapping = MappedVectorNavigation {
             address: image.as_ptr().cast(),
             _mapping: image,
             len,
             meta,
+            source_revision: revision,
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            records,
             cache: crate::engine::vector::hnsw_paged::QueryNavCache::new(),
             _charge: charge,
         };
@@ -160,6 +258,75 @@ impl VectorIndexFile {
 }
 
 impl MappedVectorNavigation {
+    pub(crate) fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    pub(crate) fn sq8_cursor_geometry(&self) -> Option<(usize, u64)> {
+        (self.meta.nav_quant_valid
+            && self.meta.nav_exact_nodes == 0
+            && native_geometry(self.meta.dim as usize).is_none())
+        .then_some((self.meta.dim as usize, self.meta.node_count))
+    }
+
+    /// Speculative reads must not validate an unrequested node or dereference
+    /// an unchecked directory offset. Cache hits already prove these bounds;
+    /// a miss only prefetches the in-file page header for ordinary validation.
+    #[inline]
+    pub(crate) fn prefetch_navigation_node(&self, vid: VecId) {
+        use crate::engine::vector::distance::prefetch_read;
+        let page = vid_page(vid) as usize;
+        if page == 0 || page >= self.len / PAGE_SIZE {
+            return;
+        }
+        // SAFETY: the file bounds above cover the complete page. A remembered
+        // record belongs to this immutable mapping and was fully validated.
+        unsafe {
+            let address = self.address.cast::<i8>().add(page * PAGE_SIZE);
+            if let Some(offset) = self.records.as_ref().and_then(|cache| cache.get(vid)) {
+                prefetch_read(address.add(offset));
+                if self.sq8_cursor_geometry().is_some() {
+                    let dimension = self.meta.dim as usize;
+                    let codes = offset + 10 + dimension * 4;
+                    for position in (0..dimension).step_by(256) {
+                        prefetch_read(address.add(codes + position));
+                    }
+                    prefetch_read(address.add(codes + dimension));
+                }
+            } else {
+                prefetch_read(address);
+            }
+        }
+    }
+
+    /// Called only while VectorIndexFile retains the mapping read guard.
+    pub(crate) fn navigation_node(
+        &self,
+        vid: VecId,
+        query_codes: &[i8],
+        query_norm: i32,
+    ) -> Result<Option<(RowId, bool, f64)>, QueryError> {
+        let (page, offset) = self.record(vid)?;
+        if page[offset] & REC_FLAG_INITIALIZED == 0 {
+            return Ok(None);
+        }
+        let Some((codes, norm)) = self.codes_in_record(page, offset) else {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "inconsistent mapped SQ8 navigation metadata",
+            ));
+        };
+        let distance = (query_norm + norm
+            - 2 * crate::engine::vector::distance::dot_i8(query_codes, codes))
+            as f64
+            * (self.meta.nav_dist_mul as f64);
+        Ok(Some((
+            vec_unpack_row(read_u64(page, offset + 2)),
+            page[offset] & REC_FLAG_TOMBSTONE != 0,
+            distance,
+        )))
+    }
+
     fn page(&self, vid: VecId) -> Result<&[u8], QueryError> {
         let page_id = vid_page(vid) as usize;
         if page_id == 0 || page_id >= self.meta.node_next_page_id as usize {
@@ -194,6 +361,18 @@ impl MappedVectorNavigation {
     }
 
     fn record(&self, vid: VecId) -> Result<(&[u8], usize), QueryError> {
+        if let Some(offset) = self.records.as_ref().and_then(|cache| cache.get(vid)) {
+            // SAFETY: this location was published only after page/slot/record
+            // bounds validation on this immutable mapping. Its source cannot
+            // change until all mapping readers drain and the memo is retired.
+            let page = unsafe {
+                std::slice::from_raw_parts(
+                    self.address.cast::<u8>().add(vid_page(vid) as usize * PAGE_SIZE),
+                    PAGE_SIZE,
+                )
+            };
+            return Ok((page, offset));
+        }
         let page = self.page(vid)?;
         let offset = node_record_offset(page, vid_slot(vid))?;
         let level = page[offset + 1] as usize;
@@ -212,6 +391,9 @@ impl MappedVectorNavigation {
                 "corrupt mapped vector record",
             ));
         }
+        if let Some(cache) = &self.records {
+            cache.remember(vid, offset);
+        }
         Ok((page, offset))
     }
 
@@ -224,7 +406,8 @@ impl MappedVectorNavigation {
         Ok(&page[start..start + datatype.payload_len(dimension)])
     }
 
-    fn neighbors(&self, vid: VecId, level: usize, out: &mut Vec<VecId>) -> Result<(), QueryError> {
+    #[inline]
+    pub(crate) fn neighbors(&self, vid: VecId, level: usize, out: &mut Vec<VecId>) -> Result<(), QueryError> {
         let (page, offset) = self.record(vid)?;
         out.clear();
         if page[offset] & REC_FLAG_INITIALIZED == 0 || level > page[offset + 1] as usize {
@@ -286,15 +469,20 @@ impl MappedVectorNavigation {
     #[inline]
     fn codes(&self, vid: VecId) -> Result<Option<(&[i8], i32)>, QueryError> {
         let (page, offset) = self.record(vid)?;
+        Ok(self.codes_in_record(page, offset))
+    }
+
+    #[inline]
+    fn codes_in_record<'a>(&self, page: &'a [u8], offset: usize) -> Option<(&'a [i8], i32)> {
         if page[offset] & REC_FLAG_INITIALIZED == 0 || page[offset] & REC_FLAG_EXACT_NAV != 0 {
-            return Ok(None);
+            return None;
         }
         let dim = self.meta.dim as usize;
         let start = offset + 10 + dim * 4;
         let bytes = &page[start..start + dim];
         // SAFETY: i8/u8 have identical layout and the borrow is bounded by the view.
         let codes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), dim) };
-        Ok(Some((codes, read_u32(page, start + dim) as i32)))
+        Some((codes, read_u32(page, start + dim) as i32))
     }
 
     #[inline]

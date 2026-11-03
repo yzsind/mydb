@@ -1466,6 +1466,93 @@ fn reduced_redo_bulk_append_skips_heap_payload_and_survives_crash_reopen() {
 }
 
 #[test]
+fn reduced_redo_vector_bulk_forces_all_touched_heaps_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let read = |engine: &StorageQueryEngine, sql: &str| {
+        let QueryResponse::ResultSet(result) = engine
+            .execute(sql)
+            .and_then(QueryResponse::materialize)
+            .unwrap()
+        else {
+            panic!("expected materialized vector rows")
+        };
+        result.rows
+    };
+    let expected;
+    let expected_other;
+    {
+        let engine = open_strict_test_engine(dir.path());
+        engine.execute("CREATE TABLE reduced_vectors(id INT PRIMARY KEY, f VECTOR(9), h VECTOR(9,FLOAT16), bf VECTOR(9,BFLOAT16), i VECTOR(9,INT8), b VECTOR(9,BINARY))").unwrap();
+        engine
+            .execute("CREATE TABLE reduced_other(id INT PRIMARY KEY, v VECTOR(17))")
+            .unwrap();
+        let mut session = SessionContext::default();
+        engine
+            .execute_with_session(&mut session, "SET SESSION mydb_redo_enabled=OFF")
+            .unwrap();
+        engine
+            .execute_with_session(&mut session, "START TRANSACTION")
+            .unwrap();
+        let rows = (0..513)
+            .map(|id| {
+                let numeric = (0..9)
+                    .map(|axis| (((id + axis) % 17) - 8).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let binary = (0..9)
+                    .map(|axis| ((id + axis) % 2).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "({id},'[{numeric}]','[{numeric}]','[{numeric}]','[{numeric}]','[{binary}]')"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("INSERT INTO reduced_vectors VALUES {rows}"),
+            )
+            .unwrap();
+        let rows = (0..257)
+            .map(|id| {
+                let values = (0..17)
+                    .map(|axis| ((id + axis) % 11).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("({id},'[{values}]')")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("INSERT INTO reduced_other VALUES {rows}"),
+            )
+            .unwrap();
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+        expected = read(&engine, "SELECT * FROM reduced_vectors ORDER BY id");
+        expected_other = read(&engine, "SELECT * FROM reduced_other ORDER BY id");
+        assert_eq!(expected.len(), 513);
+        assert_eq!(expected_other.len(), 257);
+        // Drop without a checkpoint or background writeback: commit itself
+        // must have persisted the rows omitted from the WAL.
+    }
+    let reopened = open_strict_test_engine(dir.path());
+    assert_eq!(
+        read(&reopened, "SELECT * FROM reduced_vectors ORDER BY id"),
+        expected
+    );
+    assert_eq!(
+        read(&reopened, "SELECT * FROM reduced_other ORDER BY id"),
+        expected_other
+    );
+    reopened.execute("CHECK TABLE reduced_vectors").unwrap();
+    reopened.execute("CHECK TABLE reduced_other").unwrap();
+}
+
+#[test]
 fn reduced_redo_crash_loser_truncates_uncommitted_extent() {
     let dir = tempfile::tempdir().unwrap();
     {

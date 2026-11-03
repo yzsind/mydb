@@ -8,6 +8,7 @@ mod gtid_tests;
 pub(crate) mod math;
 pub(crate) mod network;
 mod regexp_binary;
+pub(crate) mod xml;
 crate::engine::builtin_catalog::declare_retains_ast!();
 mod string_kernels;
 pub(crate) mod string_search;
@@ -70,6 +71,9 @@ pub(crate) struct SessionExprInfo {
     character_set_connection: String,
     collation_connection: String,
     user_variables: HashMap<String, Value>,
+    xml_locals: Option<xml::Locals>,
+    xml_parameter_binding: usize,
+    xml_parameter_types: Option<std::sync::Arc<Vec<xml::ParameterType>>>,
     query_attributes: std::collections::BTreeMap<String, Value>,
     sql_mode: String,
     temporal_sql_mode_bits: u16,
@@ -82,6 +86,7 @@ pub(crate) struct SessionExprInfo {
     block_encryption_mode: String,
     default_week_format: u32,
     lc_time_names: String,
+    vector_search: crate::engine::vector::session::HnswSessionConfig,
     /// True only for an explicit table-materialization boundary such as
     /// CTAS. Strict DML also rejects numeric conversion, but retains the
     /// source expression's 1292 diagnostic instead of CTAS' 1366 field code.
@@ -219,6 +224,9 @@ fn capture_session_expr_info_with_variables(
         character_set_connection: session.character_set_connection.clone(),
         collation_connection: session.collation_connection.clone(),
         user_variables,
+        xml_locals: xml::current_locals(),
+        xml_parameter_binding: session.xml_parameter_binding,
+        xml_parameter_types: session.xml_parameter_types.clone(),
         query_attributes: session.statement_query_attributes.clone(),
         sql_mode: session.sql_mode.clone(),
         temporal_sql_mode_bits: session.temporal_sql_mode_bits,
@@ -242,6 +250,7 @@ fn capture_session_expr_info_with_variables(
         block_encryption_mode: session.sysvars.block_encryption_mode.clone(),
         default_week_format: session.sysvars.default_week_format as u32,
         lc_time_names: session.sysvars.lc_time_names.clone(),
+        vector_search: vector_search_config_from_session(session),
         field_numeric_materialization: STRICT_NUMERIC_MATERIALIZATION.with(std::cell::Cell::get),
         strict_numeric_materialization: STRICT_NUMERIC_MATERIALIZATION.with(std::cell::Cell::get)
             || (DML_EXPRESSION_DEPTH.with(|depth| depth.get() != 0) && strict_mode),
@@ -306,6 +315,7 @@ pub(crate) fn with_session_expr_info_snapshot<R>(
     info: SessionExprInfo,
     f: impl FnOnce() -> R,
 ) -> R {
+    let _xml_locals = xml::enter_locals(info.xml_locals.clone());
     let _statement_now = crate::engine::api::StatementNowScope::enter(info.statement_now_micros);
     struct SnapshotGuard {
         prev_ptr: Option<NonNull<crate::engine::api::SessionContext>>,
@@ -1327,35 +1337,37 @@ impl SessionView<'_> {
     }
 }
 
-/// Snapshot the HNSW-related session knobs (M5.1/M5.2/M5.3). Returns
-/// `None` when no session pointer is installed *and* no owned snapshot is
-/// active — callers should fall back to compiled defaults. Only the
-/// borrowed-session path carries these fields; the cross-thread owned
-/// snapshot is used by parallel workers and the executor reads HNSW knobs
-/// on the connection thread before any worker spawns.
-pub(crate) fn session_hnsw_config() -> Option<crate::engine::vector::session::HnswSessionConfig> {
+fn vector_search_config_from_session(
+    session: &crate::engine::api::SessionContext,
+) -> crate::engine::vector::session::HnswSessionConfig {
     use crate::engine::vector::session::{HnswSessionConfig, IterativeScan};
+    let s = session;
+    HnswSessionConfig {
+        ef_search: s.sysvars.mydb_hnsw_ef_search,
+        ef_search_explicit: s.sysvars.mydb_hnsw_ef_search_explicit,
+        ef_dynamic_factor: s.sysvars.mydb_hnsw_ef_dynamic_factor,
+        iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_hnsw_iterative_scan),
+        max_scan_tuples: s.sysvars.mydb_hnsw_max_scan_tuples,
+        brute_threshold: s.sysvars.mydb_hnsw_brute_threshold,
+        brute_filter_rows: s.sysvars.mydb_hnsw_brute_filter_rows,
+        ivf_nprobe: s.sysvars.mydb_ivf_nprobe,
+        ivf_nprobe_explicit: s.sysvars.mydb_ivf_nprobe_explicit,
+        ivf_rerank_mult: s.sysvars.mydb_ivf_rerank_mult,
+        ivf_rerank_mult_explicit: s.sysvars.mydb_ivf_rerank_mult_explicit,
+        hnsw_rerank_mult: s.sysvars.mydb_hnsw_rerank_mult,
+        hnsw_rerank_mult_explicit: s.sysvars.mydb_hnsw_rerank_mult_explicit,
+        ivf_iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_ivf_iterative_scan),
+        ivf_max_scan_tuples: s.sysvars.mydb_ivf_max_scan_tuples,
+    }
+}
+
+/// Keep vector planning and execution on the same session settings, including
+/// nested workers that can only propagate an owned expression snapshot.
+pub(crate) fn session_hnsw_config() -> Option<crate::engine::vector::session::HnswSessionConfig> {
     with_session_view(|view| match view {
-        Some(SessionView::Borrowed(s)) => Some(HnswSessionConfig {
-            ef_search: s.sysvars.mydb_hnsw_ef_search,
-            ef_search_explicit: s.sysvars.mydb_hnsw_ef_search_explicit,
-            ef_dynamic_factor: s.sysvars.mydb_hnsw_ef_dynamic_factor,
-            iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_hnsw_iterative_scan),
-            max_scan_tuples: s.sysvars.mydb_hnsw_max_scan_tuples,
-            brute_threshold: s.sysvars.mydb_hnsw_brute_threshold,
-            brute_filter_rows: s.sysvars.mydb_hnsw_brute_filter_rows,
-            ivf_nprobe: s.sysvars.mydb_ivf_nprobe,
-            ivf_nprobe_explicit: s.sysvars.mydb_ivf_nprobe_explicit,
-            ivf_rerank_mult: s.sysvars.mydb_ivf_rerank_mult,
-            ivf_rerank_mult_explicit: s.sysvars.mydb_ivf_rerank_mult_explicit,
-            hnsw_rerank_mult: s.sysvars.mydb_hnsw_rerank_mult,
-            hnsw_rerank_mult_explicit: s.sysvars.mydb_hnsw_rerank_mult_explicit,
-            ivf_iterative_scan: IterativeScan::from_str(&s.sysvars.mydb_ivf_iterative_scan),
-            ivf_max_scan_tuples: s.sysvars.mydb_ivf_max_scan_tuples,
-        }),
-        // Owned-snapshot path (parallel workers): not used for HNSW today;
-        // returning None lets callers reach for compiled defaults.
-        _ => None,
+        Some(SessionView::Borrowed(s)) => Some(vector_search_config_from_session(s)),
+        Some(SessionView::Owned(info)) => Some(info.vector_search.clone()),
+        None => None,
     })
 }
 
@@ -1964,6 +1976,31 @@ pub(crate) fn current_session_context_snapshot() -> Option<crate::engine::api::S
             // statement scope, and cloning completes before that scope exits.
             unsafe { ptr.as_ref().clone() }
         })
+    })
+}
+
+pub(crate) fn xml_parameter_type(index: usize) -> Option<xml::ParameterType> {
+    if crate::engine::params::auto_parameterized_active() {
+        return None;
+    }
+    with_session_view(|view| match view {
+        Some(SessionView::Borrowed(session))
+            if session.xml_parameter_binding
+                == crate::engine::params::current_binding_identity() =>
+        {
+            session
+                .xml_parameter_types
+                .as_ref()
+                .and_then(|types| types.get(index).copied())
+        }
+        Some(SessionView::Owned(info))
+            if info.xml_parameter_binding == crate::engine::params::current_binding_identity() =>
+        {
+            info.xml_parameter_types
+                .as_ref()
+                .and_then(|types| types.get(index).copied())
+        }
+        _ => None,
     })
 }
 
@@ -4372,6 +4409,8 @@ fn eval_expr_legacy_inner(
                 aggregate_expr_collations(args.iter(), table, "least")?
             } else if name.eq_ignore_ascii_case("STRCMP") {
                 aggregate_expr_collations(args.iter(), table, "comparison")?
+            } else if xml::is_xml(name) {
+                aggregate_expr_collations(args.iter(), table, name)?
             } else {
                 None
             };
@@ -5012,6 +5051,39 @@ pub(crate) fn eval_field_values(
     Ok(Value::Int(0))
 }
 
+/// Shared JSON_UNQUOTE semantics for the interpreter and borrowed compiled operands.
+pub(crate) fn json_unquote_value(value: &Value) -> Result<Value, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // A binary JSON value unquotes via the canonical rule; a
+    // bare string is left as-is unless it is a quoted JSON
+    // string literal.
+    if let Value::Json(b) = value {
+        return Ok(Value::String(crate::engine::json::unquote_text(b)));
+    }
+    if !matches!(
+        value,
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+    ) {
+        return Err(crate::error::catalog::ER_INVALID_TYPE_FOR_JSON
+            .error("Invalid data type for JSON data in argument 1 to function json_unquote"));
+    }
+    if matches!(value, Value::Bytes(_)) {
+        return Err(crate::engine::json::binary_charset_error());
+    }
+    let s = string_value(value);
+    if s.starts_with('"') && s.ends_with('"') {
+        let unquoted: String = serde_json::from_str(&s).map_err(|err| {
+            crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM.error(format!(
+                "Invalid JSON text in argument 1 to function json_unquote: {err}"
+            ))
+        })?;
+        return Ok(Value::String(unquoted));
+    }
+    Ok(Value::String(s))
+}
+
 pub(crate) fn eval_function<F>(name: &str, args: &[Expr], eval_arg: F) -> Result<Value, QueryError>
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
@@ -5052,6 +5124,9 @@ where
     if crate::engine::ai::is_function(name) {
         let values = eval_args(args, &mut eval_arg)?;
         return crate::engine::ai::call(name, &values);
+    }
+    if xml::is_xml(name) {
+        return xml::call(name, args, eval_arg);
     }
     let upper_name = crate::engine::sys_schema::NormalizedFuncName::new(name);
     let upper = upper_name.as_str();
@@ -5533,9 +5608,16 @@ where
             // binary, the chosen value is exposed in the binary domain too;
             // otherwise rows taking the text branch would sort under a
             // different collation from rows taking the binary branch.
-            let binary_result = args[1..]
-                .iter()
-                .any(|branch| expr_result_type(branch) == ColumnType::Blob);
+            let binary_result = args[1..].iter().any(|branch| {
+                matches!(
+                    crate::engine::expr_type::infer_expr_type_in_table(branch, empty_expr_schema())
+                        .kind,
+                    crate::engine::expr_type::ExprTypeKind::String {
+                        kind: crate::engine::expr_type::StringKind::Binary
+                            | crate::engine::expr_type::StringKind::Blob
+                    }
+                )
+            });
             if binary_result && !matches!(result, Value::Null | Value::Bytes(_)) {
                 result = Value::Bytes(value_bytes(&result));
             }
@@ -7667,35 +7749,7 @@ where
         }
         "JSON_UNQUOTE" => {
             let value = eval_one(name, args, &mut eval_arg)?;
-            null_or(value, |value| {
-                // A binary JSON value unquotes via the canonical rule; a
-                // bare string is left as-is unless it is a quoted JSON
-                // string literal.
-                if let Value::Json(b) = &value {
-                    return Ok(Value::String(crate::engine::json::unquote_text(b)));
-                }
-                if !matches!(
-                    value,
-                    Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
-                ) {
-                    return Err(crate::error::catalog::ER_INVALID_TYPE_FOR_JSON.error(
-                        "Invalid data type for JSON data in argument 1 to function json_unquote",
-                    ));
-                }
-                if matches!(value, Value::Bytes(_)) {
-                    return Err(crate::engine::json::binary_charset_error());
-                }
-                let s = string_value(&value);
-                if s.starts_with('"') && s.ends_with('"') {
-                    let unquoted: String = serde_json::from_str(&s).map_err(|err| {
-                        crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM.error(format!(
-                            "Invalid JSON text in argument 1 to function json_unquote: {err}"
-                        ))
-                    })?;
-                    return Ok(Value::String(unquoted));
-                }
-                Ok(Value::String(s))
-            })
+            json_unquote_value(&value)
         }
         "JSON_VALID" => {
             let value = eval_one(name, args, &mut eval_arg)?;
@@ -18600,6 +18654,11 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
                 coercibility: 3,
             });
         }
+        if xml::is_xml(name) {
+            return aggregate_expr_collation_details(args.iter(), table, name)
+                .ok()
+                .flatten();
+        }
         if function_result_type(name) == ColumnType::Blob {
             let info = crate::charset::resolve_collation("binary").ok()?;
             return Some(ExprCollation {
@@ -20042,6 +20101,9 @@ pub(crate) fn expr_is_constant(expr: &Expr) -> bool {
 }
 
 fn function_is_runtime_dependent(upper: &str) -> bool {
+    if xml::is_xml(upper) {
+        return true;
+    }
     if crate::engine::http::is_function(upper) {
         return true;
     }
@@ -20773,15 +20835,8 @@ pub(crate) fn validate_expr_numeric_operands(
         match expr {
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
-                // UPDATEXML's XPath is a prepare-time constant by contract.
-                // Validate this before planning/EXPLAIN so an empty input
-                // table cannot hide the deterministic 1105 diagnostic.
-                if upper == "UPDATEXML" && args.get(1).is_some_and(|xpath| !expr_is_constant(xpath))
-                {
-                    return Err(error(
-                        crate::error::catalog::ER_UNKNOWN_ERROR,
-                        "Only constant XPATH queries are supported",
-                    ));
+                if xml::is_xml(&upper) {
+                    xml::validate(name, args, table)?;
                 }
                 let requires_scalar_numeric = matches!(
                     upper.as_str(),
@@ -24478,6 +24533,10 @@ pub(crate) fn with_numeric_comparison_context_from_provenance<T>(
 
 /// Scope one bound aggregate's comparator without changing other expressions.
 #[inline]
+pub(crate) fn current_compare_collation_id() -> Option<u16> {
+    COMPARE_COLLATION_ID.with(Cell::get)
+}
+
 pub(crate) fn with_optional_compare_collation<T>(id: Option<u16>, f: impl FnOnce() -> T) -> T {
     match id {
         Some(_) => with_compare_collation(id, f),

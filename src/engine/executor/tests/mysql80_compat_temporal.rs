@@ -3053,6 +3053,9 @@ fn numeric_zero_and_typed_time_follow_mysql_temporal_conversion() {
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
     engine
+        .execute_with_session(&mut session, "SET time_zone='+00:00'")
+        .unwrap();
+    engine
         .execute_with_session(&mut session, "SET sql_mode=''")
         .unwrap();
     engine

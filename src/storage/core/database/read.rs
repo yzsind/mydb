@@ -745,6 +745,120 @@ impl Database {
         Ok(out)
     }
 
+    /// Evaluate a latch-safe residual before scoring its fixed VECTOR in the
+    /// same resident payload. Historical, cold and old-layout windows retain
+    /// the ordinary undo-aware predicate-first reader.
+    pub(crate) fn score_filtered_vector_rows_many_with_handle<P>(
+        &self,
+        heap: &HeapHandle,
+        table: &TableSchema,
+        row_ids: &[RowId],
+        txn: TxnView,
+        column: usize,
+        query: &crate::vector::VectorValue,
+        metric: crate::engine::vector::Metric,
+        prepared: Option<&crate::engine::vector::distance::PreparedNativeDistance>,
+        float_prepared: Option<&crate::engine::vector::distance::PreparedF32Distance<'_>>,
+        predicate_columns: &[usize],
+        mut predicate: P,
+    ) -> Result<Vec<(RowId, f64)>, QueryError>
+    where
+        P: FnMut(&[Value]) -> Result<bool, QueryError>,
+    {
+        self.check_primary_read_view(table, txn)?;
+        debug_assert!(row_ids.windows(2).all(|pair| pair[0] <= pair[1]));
+        let DataTypeKind::Vector {
+            datatype,
+            dim: Some(dimension),
+        } = table.columns[column].data_type
+        else {
+            return Err(crate::engine::vector::vector_err(
+                "candidate scoring requires a fixed VECTOR column",
+            ));
+        };
+        // The caller admits a bounded window's predicate, vector fallback,
+        // result and diagnostic scratch before any expression evaluation.
+        let adjustment = ProjectedReadPlan::new(predicate_columns, table);
+        let mut values = Vec::with_capacity(predicate_columns.len());
+        let mut output = Vec::with_capacity(row_ids.len());
+        let mut visibility = ScanVisibilityCache::new();
+        for window in row_ids.chunks(64) {
+            crate::engine::cancel::check_cancelled()?;
+            // A cold page or historical version can interrupt a resident
+            // visit after earlier rows already evaluated SQL predicates.
+            // Retain those results and retry only untouched rows so warnings
+            // and other expression diagnostics are never published twice.
+            let mut handled = Vec::with_capacity(window.len());
+            let mut examined = 0u64;
+            let complete = {
+                let reader = heap.read();
+                reader.with_lob(|| reader.visit_mvcc_payloads_many_cached_with_plan(window, predicate_columns, |row| {
+                    if row.layout_id != table.active_layout_id || !self.row_version_visible_cached(&mut visibility, row.header, txn)? {
+                        return Ok(false);
+                    }
+                    if row.header.is_deleted() { handled.push(row.row_id); return Ok(true) }
+                    let body = &row.payload[row.body_offset..];
+                    let Some(range) = fixed_column_byte_range_in_body(body,row.codec,row.layout_id,row.has_external,column)? else { return Ok(false) };
+                    if range.width != datatype.payload_len(dimension) { return Ok(false) }
+                    examined += 1;
+                    values.clear();
+                    let count = crate::storage::decode_row_schema_columns_into_with_plan_ext_for_layout(
+                        body, row.codec, row.layout_id, row.plan, &mut values, row.has_external,
+                    )?;
+                    if adjustment.needs_adjustment(&values,count) {
+                        adjustment.apply(&mut values,predicate_columns,count,table);
+                    }
+                    if !predicate(&values)? { handled.push(row.row_id); return Ok(true) }
+                    let vector = crate::vector::VectorRef {
+                        datatype,dimension,payload: &body[range.offset_in_payload..range.offset_in_payload+range.width],
+                    };
+                    let score = if let Some(float)=float_prepared {
+                        float.score_checked_bytes(vector.payload)?
+                    } else {
+                        crate::engine::vector::validate_internal(&vector)?;
+                        if let Some(prepared)=prepared {prepared.score(&vector)?} else {
+                            crate::engine::vector::distance::typed_ordering_distance(query,&vector,metric)?
+                        }
+                    };
+                    output.push((row.row_id,score));
+                    handled.push(row.row_id);
+                    Ok(true)
+                }))?
+            };
+            if complete {
+                crate::engine::perf_events::record_rows_examined(examined);
+                continue;
+            }
+            crate::engine::perf_events::record_rows_examined(examined);
+            let remaining = window
+                .iter()
+                .copied()
+                .filter(|id| handled.binary_search(id).is_err())
+                .collect::<Vec<_>>();
+            for (id, values) in self.read_row_columns_many_predicate_first_with_handle(
+                heap,
+                table,
+                &remaining,
+                txn,
+                predicate_columns,
+                &[column],
+                &mut predicate,
+            )? {
+                if let Some(Value::Vector(vector)) = values.first() {
+                    let score = if let Some(prepared) = prepared {
+                        prepared.score(vector)?
+                    } else {
+                        crate::engine::vector::distance::typed_ordering_distance(
+                            query, vector, metric,
+                        )?
+                    };
+                    output.push((id, score));
+                }
+            }
+        }
+        Ok(output)
+    }
+
     /// Batch full-row counterpart of `read_row_with_handle`. Keeps the
     /// same page-local fast path and visibility semantics, but returns
     /// schema-aligned `StoredRow`s so callers that need the whole row

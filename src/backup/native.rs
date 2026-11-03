@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn native_staging_is_fail_closed_and_publication_never_overwrites() {
         fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir_in(fs::canonicalize("/tmp/mydb").unwrap()).unwrap();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
         let target = root.path().join("target");
@@ -1109,7 +1109,7 @@ mod tests {
     #[test]
     fn native_snapshot_round_trip_is_immutable_and_promotes() {
         fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir_in(fs::canonicalize("/tmp/mydb").unwrap()).unwrap();
         let source = StorageQueryEngine::open(root.path().join("source")).unwrap();
         source.execute("CREATE SEQUENCE snapshot_seq").unwrap();
         source

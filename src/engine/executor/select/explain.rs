@@ -3617,6 +3617,7 @@ impl PipelineDisplayScope {
             matches!(
                 plan,
                 planner::PhysicalPlan::Sort { .. }
+                    | planner::PhysicalPlan::FilteredVectorTopK { .. }
                     | planner::PhysicalPlan::IncrementalSort { .. }
                     | planner::PhysicalPlan::ParallelSort { .. }
                     | planner::PhysicalPlan::TopK { .. }
@@ -4164,6 +4165,27 @@ fn format_plan_tree_nodes(
             ));
             push_partition_tree_detail(&mut details, table, filter.as_ref());
             push_scan_filter_and_hint(&mut details, filter.as_ref(), hint_note.as_deref());
+            append_tree_details(&mut line, details);
+            line.push_str(&suffix(plan));
+            line
+        }
+        planner::PhysicalPlan::FilteredVectorTopK {
+            table,
+            strategy,
+            metric,
+            k,
+            filter,
+            ..
+        } => {
+            let name = table_display_name(table);
+            let mut line = format!("{indent}{arrow}Filtered vector Top-K on {name} (cost={cost:.2} rows={estimated_rows:.0})");
+            let mut details = vec![
+                ("strategy", strategy.as_str().to_string()),
+                ("metric", metric.clone()),
+                ("k", k.to_string()),
+            ];
+            push_partition_tree_detail(&mut details, table, filter.as_ref());
+            push_scan_filter_and_hint(&mut details, filter.as_ref(), None);
             append_tree_details(&mut line, details);
             line.push_str(&suffix(plan));
             line
@@ -5138,6 +5160,14 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
             s.cache_reads as f64 * 100.0 / total_reads as f64
         };
         let mut extra = String::new();
+        if s.filtered_vector.reranks > 0
+            || s.filtered_vector.batches > 0
+            || s.filtered_vector.predicate_evaluations > 0
+        {
+            let w = s.filtered_vector;
+            let work = serde_json::json!({"ann_candidates": w.ann_candidates, "quality_rounds": w.quality_rounds, "topk_updates": w.topk_updates, "predicate_evaluations": w.predicate_evaluations, "navigation_visits": w.navigation_visits, "navigation_distances": w.navigation_distances, "heap_reranks": w.reranks, "materialized": w.materialized, "batches": w.batches, "exact_fallbacks": w.fallbacks});
+            extra.push_str(&format!(", \"filtered_vector_work\": {work}"));
+        }
         if s.rrf_branches > 0 {
             let n = usize::from(s.rrf_branches);
             let work = serde_json::json!({"input_rows": &s.rrf_input_rows[..n], "unique_rows": &s.rrf_unique_rows[..n], "union_rows": s.rrf_union_rows, "overlap_rows": s.rrf_overlap_rows, "fusion_ms": s.rrf_fusion_ns as f64 / 1_000_000.0});
@@ -5711,6 +5741,25 @@ fn format_plan_json_node(
             out.push_str(&format!(
                 "{indent}  \"vector_scan\": {{\"algo\": \"{algo}\", \"metric\": \"{metric}\", \"k\": {k}, \"{effort_key}\": {ef_search}, \"quantization\": \"{quant}\", \"rerank_pool\": {rerank}}},\n"
             ));
+            json_cost_info(out, &indent, plan, *cost);
+            json_close_node(out, &indent, stats, plan);
+        }
+        planner::PhysicalPlan::FilteredVectorTopK {
+            table,
+            strategy,
+            metric,
+            k,
+            filter,
+            access_rows,
+            possible_keys,
+            ..
+        } => {
+            let name = table_display_name(table);
+            json_table_header(out, &indent, "table", &name, table, filter.as_ref(), "ALL");
+            json_possible_keys(out, possible_keys, &indent);
+            json_scan_estimates(out, &indent, table, filter, *access_rows, *estimated_rows);
+            json_attached_condition(out, &indent, filter.as_ref());
+            out.push_str(&format!("{indent}  \"filtered_vector_top_k\": {{\"strategy\": \"{}\", \"metric\": \"{metric}\", \"k\": {k}}},\n", strategy.as_str()));
             json_cost_info(out, &indent, plan, *cost);
             json_close_node(out, &indent, stats, plan);
         }

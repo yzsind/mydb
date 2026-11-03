@@ -1738,7 +1738,7 @@ fn build_semantic_bytes(values: Vec<Value>, kind: SemanticBytesKind) -> ColumnVe
                 data.extend_from_slice(bytes)
             }
             Value::Vector(bytes) if matches!(kind, SemanticBytesKind::Vector) => {
-                data.extend_from_slice(&bytes.encode())
+                bytes.encode_into(&mut data)
             }
             _ => unreachable!(),
         }
@@ -2581,15 +2581,8 @@ impl ColumnAccumulator {
                 nulls: Bitmap::new_all_valid(capacity),
                 any_null: false,
             },
-            // VECTOR / GEOMETRY must keep their typed `Value` variant
-            // (`Value::Vector` / `Value::Geometry`) so downstream operators
-            // see exactly what the row pipeline does. The byte-backed `Bytes`
-            // lane is type-erased: its `value_at` always yields `Value::Bytes`,
-            // and — worse — its `push(&Value)` only recognises `Value::Bytes`,
-            // silently dropping a `Value::Vector` to a zero-length entry (which
-            // then fails VECTOR validation downstream). The `Generic` lane
-            // round-trips the value losslessly; the byte-direct `put_vector` /
-            // `put_geometry` fast paths fall through to its `other =>` arm.
+            // Semantic byte lanes preserve the typed Value variant when
+            // materialized, unlike the type-erased Bytes accumulator.
             ColumnType::Geometry => Self::semantic_bytes(SemanticBytesKind::Geometry, capacity),
             ColumnType::Vector => Self::semantic_bytes(SemanticBytesKind::Vector, capacity),
             // BIT is numeric but *unsigned* up to 64 bits: the I64 lane's
@@ -2941,7 +2934,7 @@ impl ColumnAccumulator {
                     }
                     Value::Json(bytes) | Value::Geometry(bytes) => Some(bytes.as_slice()),
                     Value::Vector(bytes) => {
-                        data.extend_from_slice(&bytes.encode());
+                        bytes.encode_into(data);
                         offsets.push(data.len() as u32);
                         return;
                     }
@@ -3308,7 +3301,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::U64 {
@@ -3318,7 +3311,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::F64 {
@@ -3328,7 +3321,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0.0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Date32 {
@@ -3338,7 +3331,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Time64 {
@@ -3348,7 +3341,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::DateTime64 {
@@ -3358,7 +3351,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Timestamp64 {
@@ -3368,7 +3361,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Decimal32 {
@@ -3379,7 +3372,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Decimal64 {
@@ -3390,7 +3383,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Decimal128 {
@@ -3401,7 +3394,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
             } => {
                 let idx = data.len();
                 data.push(0);
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
             }
             ColumnAccumulator::Utf8 {
@@ -3411,7 +3404,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
                 any_null,
             } => {
                 let idx = offsets.len() - 1;
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
                 offsets.push(data.len() as u32);
             }
@@ -3422,7 +3415,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
                 any_null,
             } => {
                 let idx = offsets.len() - 1;
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
                 offsets.push(data.len() as u32);
             }
@@ -3445,7 +3438,7 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
                 any_null,
             } => {
                 let idx = offsets.len() - 1;
-                nulls.set(idx, false);
+                nulls.set_null_growing(idx);
                 *any_null = true;
                 offsets.push(data.len() as u32);
             }
@@ -3699,7 +3692,28 @@ impl<'a> crate::storage::RowDecodeSink for BatchAccumSink<'a> {
     }
     #[inline]
     fn put_vector(&mut self, col: usize, bytes: &[u8]) {
-        self.put_value(col, Value::Vector(bytes.to_vec().into()));
+        self.put_vector_ref(
+            col,
+            crate::vector::VectorRef {
+                datatype: crate::vector::VectorDataType::Float32,
+                dimension: (bytes.len() / 4) as u32,
+                payload: bytes,
+            },
+        );
+    }
+    #[inline]
+    fn put_vector_ref(&mut self, col: usize, value: crate::vector::VectorRef<'_>) {
+        match self.accumulator(col) {
+            ColumnAccumulator::Vector { offsets, data, .. } => {
+                value.encode_into(data);
+                offsets.push(data.len() as u32);
+            }
+            other => other.push(&Value::Vector(crate::vector::VectorValue::new(
+                value.datatype,
+                value.dimension,
+                value.payload.to_vec(),
+            ))),
+        }
     }
     #[inline]
     fn put_value(&mut self, col: usize, value: Value) {
@@ -3740,6 +3754,70 @@ mod tests {
                     assert_eq!(column.is_null(row), null_at(row), "row {row}");
                 }
                 assert_eq!(validity.count_ones(), rows - 8);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_sink_nulls_grow_across_validity_words_for_every_typed_lane() {
+        use crate::storage::RowDecodeSink;
+        let vector = Value::Vector(crate::engine::vector::codec::from_f32(&[1., 2., 3.]));
+        for (column_type, value) in [
+            (ColumnType::LongLong, Value::Int(7)),
+            (ColumnType::Bit { bits: 64 }, Value::UInt(u64::MAX)),
+            (ColumnType::Double, Value::Double(1.25)),
+            (ColumnType::Date, Value::Date(7)),
+            (ColumnType::Time, Value::Time(1_000_000)),
+            (ColumnType::DateTime, Value::DateTime(1_000_000)),
+            (ColumnType::Timestamp, Value::Timestamp(1_000_000)),
+            (
+                ColumnType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+                Value::DecimalCompact(123, 2),
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+                Value::DecimalCompact(123, 2),
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                Value::DecimalCompact(123, 2),
+            ),
+            (ColumnType::VarString, Value::String("valid".into())),
+            (ColumnType::Blob, Value::Bytes(vec![1, 2, 3])),
+            (ColumnType::Json, Value::Json(b"{}".to_vec())),
+            (ColumnType::Geometry, Value::Geometry(vec![1, 2, 3])),
+            (ColumnType::Vector, vector),
+        ] {
+            let mut accumulators = [ColumnAccumulator::for_type(column_type, 1)];
+            let null_at = |row| row % 17 == 0 || row == 64 || row == 128;
+            {
+                let mut sink = BatchAccumSink::new(&mut accumulators);
+                for row in 0..257 {
+                    if null_at(row) {
+                        sink.put_null(0);
+                    } else {
+                        sink.put_value(0, value.clone());
+                    }
+                }
+            }
+            let [column] = accumulators.map(ColumnAccumulator::finish);
+            assert_eq!(column.len(), 257);
+            assert_eq!(column.nulls().unwrap().len(), 257);
+            for row in 0..257 {
+                assert_eq!(
+                    column.is_null(row),
+                    null_at(row),
+                    "{column_type:?} row {row}"
+                );
             }
         }
     }

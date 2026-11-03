@@ -210,6 +210,12 @@ macro_rules! scalar_catalog {
 
 scalar_catalog! {
     native {
+        XmlExtract => (false, |_arity| true) {
+            [("EXTRACTVALUE", "extractvalue")] => (RegexOrComplex, Blob, (XmlExtract, 2, 2, Stable, fixed_xml_result()), false);
+        }
+        XmlUpdate => (false, |_arity| true) {
+            [("UPDATEXML", "updatexml")] => (RegexOrComplex, Blob, (XmlUpdate, 3, 3, Stable, fixed_xml_result()), false);
+        }
         If => (true, |arity| arity != 3) {
             [("IF", "if")] => (Unknown, VarString, None, true);
         }
@@ -275,6 +281,9 @@ scalar_catalog! {
         }
         Second => (true, |_arity| true) {
             [("SECOND", "second")] => (DateTimeImmutable, LongLong, None, false);
+        }
+        JsonUnquote => (true, |_arity| true) {
+            [("JSON_UNQUOTE", "json_unquote")] => (RegexOrComplex, VarString, None, false);
         }
         JsonExtract => (true, |_arity| true) {
             [("JSON_EXTRACT", "json_extract")] => (RegexOrComplex, Json, None, false);
@@ -492,7 +501,7 @@ scalar_catalog! {
             [("STR_TO_DATE", "str_to_date")] => (DateTimeImmutable, Date, (Temporal, 2, 2, Immutable, fixed_temporal_result(Date, true)), true);
             [("FROM_DAYS", "from_days")] => (DateTimeImmutable, Date, (Temporal, 1, 2, Immutable, fixed_temporal_result(Date, true)), false);
             [("SEC_TO_TIME", "sec_to_time")] => (DateTimeImmutable, VarString, (Temporal, 1, 2, Immutable, fixed_temporal_result(Time, true)), true);
-            [("JSON_UNQUOTE", "json_unquote"), ("JSON_PRETTY", "json_pretty"), ("SOUNDEX", "soundex"), ("TO_BASE64", "to_base64"), ("EXPORT_SET", "export_set")] => (RegexOrComplex, VarString, None, false);
+            [("JSON_PRETTY", "json_pretty"), ("SOUNDEX", "soundex"), ("TO_BASE64", "to_base64"), ("EXPORT_SET", "export_set")] => (RegexOrComplex, VarString, None, false);
             [("JSON_VALID", "json_valid"), ("JSON_LENGTH", "json_length"), ("JSON_CONTAINS", "json_contains"), ("JSON_CONTAINS_PATH", "json_contains_path"), ("JSON_DEPTH", "json_depth"), ("JSON_OVERLAPS", "json_overlaps")] => (RegexOrComplex, LongLong, None, false);
             [("JSON_TYPE", "json_type")] => (RegexOrComplex, VarString, ( JsonType, 1, 1, Immutable, fixed_string_result(Some(17 * 4), true)), false);
             [("JSON_KEYS", "json_keys"), ("JSON_OBJECT", "json_object"), ("JSON_ARRAY", "json_array"), ("JSON_MERGE_PATCH", "json_merge_patch"), ("JSON_MERGE_PRESERVE", "json_merge_preserve"), ("JSON_QUOTE", "json_quote")] => (RegexOrComplex, Json, None, false);

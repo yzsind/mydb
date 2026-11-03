@@ -3611,6 +3611,87 @@ mod vector_page_tests {
     }
 
     #[test]
+    fn mapped_navigation_record_cache_bounds_budget_and_native_geometries() {
+        for datatype in [crate::vector::VectorDataType::Float32,
+            crate::vector::VectorDataType::Float16, crate::vector::VectorDataType::BFloat16,
+            crate::vector::VectorDataType::Int8, crate::vector::VectorDataType::Binary] {
+            let geometry = if datatype == crate::vector::VectorDataType::Float32 { 16 }
+                else { native_vector_geometry(datatype, 16) as usize };
+            let bytes = node_record_size(0, geometry, 8, 16);
+            assert!(MappedRecordCache::try_new(4, bytes, 0).is_none());
+            assert!(MappedRecordCache::try_new(usize::MAX, bytes, usize::MAX).is_none());
+            let cache = MappedRecordCache::try_new(4, bytes, 1024 * 1024).unwrap();
+            assert!(cache.slots_per_page <= usize::from(NODE_ID_SLOTS_PER_PAGE));
+            let first = vid_make(1, 0);
+            assert_eq!(cache.get(first), None);
+            cache.remember(first, 100);
+            assert_eq!(cache.get(first), Some(100));
+            // A slot outside this page's geometric bound must not alias the
+            // next page in the flat array, even for a malformed VecId.
+            let invalid = vid_make(1, cache.slots_per_page as u16);
+            assert!(cache.slot(invalid).is_none());
+            assert_eq!(cache.get(vid_make(2, 0)), None);
+            assert_eq!(cache.get(vid_make(4, 0)), None);
+        }
+    }
+
+    #[test]
+    fn mapped_navigation_record_cache_keeps_lazy_errors_and_concurrent_publication() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let vectors = gen_vectors(16, 8, 1987);
+        let (graph, vids) = build_paged_with_wal_mode(dir.path(), "mapped", 8, 0, &vectors, true);
+        let good = vids[0];
+        let bad = *vids.iter().rev().find(|&&id| vid_page(id) == vid_page(good) && id != good).unwrap();
+        graph.file().flush().unwrap();
+        graph.file().mapped_navigation.write().take();
+        let mut raw = std::fs::OpenOptions::new().read(true).write(true)
+            .open(dir.path().join("vec__1__mapped.hvec")).unwrap();
+        let mut page = vec![0u8; PAGE_SIZE];
+        raw.seek(SeekFrom::Start(vid_page(bad) * PAGE_SIZE as u64)).unwrap();
+        raw.read_exact(&mut page).unwrap();
+        let offset = node_record_offset(&page, vid_slot(bad)).unwrap();
+        page[offset + 1] = 17;
+        let checksum = page_checksum(&page, 16);
+        write_u32(&mut page, 16, checksum);
+        raw.seek(SeekFrom::Start(vid_page(bad) * PAGE_SIZE as u64)).unwrap();
+        raw.write_all(&page).unwrap();
+        assert!(graph.file().prepare_navigation_mapping().unwrap());
+        graph.file().with_navigation_mapping(|view| {
+            let cache = view.records.as_ref().expect("small optional location cache");
+            assert_eq!(cache.get(good), None);
+            assert_eq!(cache.get(bad), None);
+            for id in [good, bad, vid_make(0, 0), vid_make(u32::MAX as u64, 255)] {
+                view.prefetch_navigation_node(id);
+            }
+            assert_eq!(cache.get(good), None);
+            assert_eq!(cache.get(bad), None);
+            std::thread::scope(|scope| {
+                let mut readers = Vec::new();
+                for _ in 0..8 {
+                    readers.push(scope.spawn(|| {
+                        let mut expected = None;
+                        for _ in 0..100 {
+                            let (_, offset) = view.record(good).unwrap();
+                            assert_eq!(*expected.get_or_insert(offset), offset);
+                        }
+                    }));
+                }
+                for reader in readers { reader.join().unwrap(); }
+            });
+            assert!(cache.get(good).is_some());
+            view.prefetch_navigation_node(good);
+            view.prefetch_navigation_node(bad);
+            assert_eq!(cache.get(bad), None);
+            // Validating one requested record must not validate another
+            // record early merely because they share a checksummed page.
+            assert!(view.record(bad).is_err());
+            assert_eq!(cache.get(bad), None);
+            assert!(view.record(good).is_ok());
+        }).unwrap();
+    }
+
+    #[test]
     fn mapped_navigation_matches_paged_and_revokes_on_realtime_dml() {
         for metric in [0, 1, 2] {
             let dir = tempfile::Builder::new()
@@ -3625,6 +3706,20 @@ mod vector_page_tests {
             assert!(graph.file().prepare_navigation_mapping().unwrap());
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             // Exercise an exact-query memo hit before revoking the view.
+            assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
+            graph.file().with_navigation_mapping(|view| {
+                // Reclamation during an active read must be nonblocking.
+                let _ = view.record(vids[17]).unwrap();
+                graph.evict_query_navigation();
+                assert!(view.records.as_ref().is_none_or(|cache| cache.get(vids[17]).is_some()));
+            }).unwrap();
+            assert!(graph.file().with_navigation_mapping(|_| ()).is_some());
+            graph.evict_query_navigation();
+            assert!(graph.file().with_navigation_mapping(|_| ()).is_none());
+            assert!(graph.file().prepare_navigation_mapping().unwrap());
+            graph.file().with_navigation_mapping(|view| {
+                assert!(view.records.as_ref().is_none_or(|cache| cache.get(vids[17]).is_none()));
+            }).unwrap();
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             graph
                 .mark_deleted_by_row_id(RowId {
@@ -5502,7 +5597,8 @@ mod vector_page_tests {
 
 #[cfg(test)]
 pub(crate) fn source_audit_vector_file() -> (tempfile::TempDir, Arc<VectorIndexFile>) {
-    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let log = Arc::new(parking_lot::Mutex::new(
         LogManager::open(dir.path()).unwrap(),
     ));

@@ -10,7 +10,7 @@ use crate::engine::expr;
 
 /// Resolution policy for `iterative_scan` — controls how the executor widens
 /// the candidate pool when filter/MVCC drops results below `k`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum IterativeScan {
     /// Single pass; accept short results.
     Off,
@@ -22,16 +22,19 @@ pub(crate) enum IterativeScan {
 
 impl IterativeScan {
     pub(crate) fn from_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "off" => IterativeScan::Off,
-            "relaxed_order" => IterativeScan::RelaxedOrder,
-            _ => IterativeScan::StrictOrder,
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("off") {
+            IterativeScan::Off
+        } else if s.eq_ignore_ascii_case("relaxed_order") {
+            IterativeScan::RelaxedOrder
+        } else {
+            IterativeScan::StrictOrder
         }
     }
 }
 
 /// HNSW knobs resolved from the current session (or defaults if none).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct HnswSessionConfig {
     pub ef_search: u64,
     pub ef_search_explicit: bool,
@@ -145,6 +148,62 @@ pub(crate) fn effective_nprobe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_settings_follow_owned_workers_and_restore_nested_scopes() {
+        use crate::engine::{api::SessionContext, expr};
+        let capture = |value: u64| {
+            let mut session = SessionContext::default();
+            let vars = &mut session.sysvars;
+            vars.mydb_hnsw_ef_search = value;
+            vars.mydb_hnsw_ef_search_explicit = true;
+            vars.mydb_hnsw_ef_dynamic_factor = value + 1;
+            vars.mydb_hnsw_iterative_scan = "off".into();
+            vars.mydb_hnsw_max_scan_tuples = value + 2;
+            vars.mydb_hnsw_brute_threshold = value + 3;
+            vars.mydb_hnsw_brute_filter_rows = value + 4;
+            vars.mydb_hnsw_rerank_mult = value + 5;
+            vars.mydb_hnsw_rerank_mult_explicit = true;
+            vars.mydb_ivf_nprobe = value + 6;
+            vars.mydb_ivf_nprobe_explicit = true;
+            vars.mydb_ivf_rerank_mult = value + 7;
+            vars.mydb_ivf_rerank_mult_explicit = true;
+            vars.mydb_ivf_iterative_scan = "relaxed_order".into();
+            vars.mydb_ivf_max_scan_tuples = value + 8;
+            expr::with_session_expr_info(&session, || {
+                (expr::current_session_expr_info().unwrap(), current_config())
+            })
+        };
+        let (first, expected_first) = capture(37);
+        let (second, expected_second) = capture(73);
+        std::thread::spawn(move || {
+            let default = current_config();
+            for _ in 0..3 {
+                expr::with_session_expr_info_snapshot(first.clone(), || {
+                    assert_eq!(current_config(), expected_first);
+                    expr::with_session_expr_info_snapshot(second.clone(), || {
+                        assert_eq!(current_config(), expected_second);
+                        let propagated = expr::current_session_expr_info().unwrap();
+                        expr::with_session_expr_info_snapshot(propagated, || {
+                            assert_eq!(current_config(), expected_second);
+                        });
+                    });
+                    assert_eq!(current_config(), expected_first);
+                });
+                assert_eq!(current_config(), default);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                expr::with_session_expr_info_snapshot(first, || {
+                    assert_eq!(current_config(), expected_first);
+                    panic!("restore vector session scope");
+                });
+            }));
+            assert!(result.is_err());
+            assert_eq!(current_config(), default);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn explicit_default_ef_search_overrides_index_comment() {

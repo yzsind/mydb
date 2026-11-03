@@ -636,6 +636,7 @@ struct PreparedStatement {
     parser_sql_mode_bits: u16,
     param_count: usize,
     param_types: Option<Vec<StmtParamType>>,
+    xml_parameter_types: Option<Arc<Vec<crate::engine::expr::xml::ParameterType>>>,
     /// Reusable late-bound Value vector. Capacity is reserved and charged at
     /// PREPARE time, borrowed for one EXECUTE, then cleared and returned on
     /// every compiled SELECT/DML fast path.
@@ -709,6 +710,10 @@ impl PreparedStatement {
                     .map(|types| (types.capacity() * std::mem::size_of::<StmtParamType>()) as u64)
                     .unwrap_or(0),
             )
+            .saturating_add(self.xml_parameter_types.as_ref().map_or(0, |types| {
+                (types.capacity() * std::mem::size_of::<crate::engine::expr::xml::ParameterType>()
+                    + 32) as u64
+            }))
             .saturating_add(
                 (self.value_scratch.capacity() * std::mem::size_of::<crate::types::Value>()) as u64,
             )
@@ -3475,6 +3480,7 @@ where
     }
 
     async fn handle_query(&mut self, sql_bytes: &[u8]) -> io::Result<()> {
+        self.context.xml_parameter_types = None;
         let sql = match decode_session_sql(&self.context, sql_bytes) {
             Ok(sql) => sql,
             Err(err) => return self.write_query_response(Err(err)).await,
@@ -4741,6 +4747,15 @@ where
             parser_sql_mode_bits: mode_bits,
             param_count,
             param_types: None,
+            xml_parameter_types: crate::engine::expr::xml::mentions_xml(&sql).then(|| {
+                Arc::new(vec![
+                    crate::engine::expr::xml::ParameterType::Text(
+                        crate::charset::resolve_collation(&self.context.collation_connection)
+                            .map_or(255, |c| c.id)
+                    );
+                    param_count
+                ])
+            }),
             value_scratch: Vec::with_capacity(param_count),
             computed_ordering: parsed
                 .as_deref()
@@ -4889,6 +4904,7 @@ where
     }
 
     async fn handle_stmt_execute(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.context.xml_parameter_types = None;
         if let Some(err) = self.context.cancelled_error() {
             return self.write_stmt_execute_response(Err(err)).await;
         }
@@ -5090,6 +5106,21 @@ where
                             .await?;
                         return Ok(());
                     }
+                }
+            }
+
+            if let Some(entry) = self.prepared.get_mut(&statement_id) {
+                if let Some(types) = entry.xml_parameter_types.as_mut() {
+                    let collation =
+                        crate::charset::resolve_collation(&self.context.collation_connection)
+                            .map_or(255, |c| c.id);
+                    for (index, value) in values.iter().enumerate() {
+                        if let Some(slot) = Arc::make_mut(types).get_mut(index) {
+                            slot.bind(value, collation);
+                        }
+                    }
+                    self.context.xml_parameter_binding = values.as_ptr() as usize;
+                    self.context.xml_parameter_types = Some(Arc::clone(types));
                 }
             }
 
@@ -11059,6 +11090,7 @@ mod tests {
             parser_sql_mode_bits: 0,
             param_count: 1,
             param_types: None,
+            xml_parameter_types: None,
             value_scratch: Vec::with_capacity(1),
             parsed: None,
             computed_ordering: false,

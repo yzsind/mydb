@@ -4,6 +4,7 @@
 
 pub(crate) mod bulk_hnsw;
 pub(crate) mod codec;
+pub(crate) mod cursor;
 pub(crate) mod distance;
 pub(crate) mod graph;
 pub(crate) mod hnsw;
@@ -13,9 +14,11 @@ pub(crate) mod ivf;
 pub(crate) mod native_hnsw;
 pub(crate) mod native_ivf;
 pub(crate) mod persistence;
+pub(crate) mod selection;
 pub(crate) mod session;
 pub(crate) mod spill_rows;
 pub(crate) mod sql;
+pub(crate) mod workspace;
 
 #[cfg(test)]
 mod hnsw_bug_audit_tests;
