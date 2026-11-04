@@ -883,6 +883,8 @@ fn build_union_pushdown_subquery(candidate: &UnionPushdownCandidate) -> Select {
         candidate.source_column.clone(),
     ]);
     Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Expr {
             expr: projection_expr,
             alias: None,
@@ -1136,6 +1138,8 @@ mod tests {
 
     fn empty_select() -> Select {
         Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             distinct: false,
             projection: vec![],
             from: vec![TableRef {

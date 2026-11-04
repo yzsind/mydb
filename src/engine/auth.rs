@@ -27,6 +27,47 @@ static AUTHORIZATION_GENERATION: std::sync::atomic::AtomicU64 =
 pub fn authorization_generation() -> u64 {
     AUTHORIZATION_GENERATION.load(Ordering::Acquire)
 }
+
+/// Immutable authorization settings inherited by all evaluations of a statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PolicySnapshot {
+    mandatory_roles: Option<Arc<str>>,
+    partial_revokes: bool,
+    activate_all_roles: bool,
+    role_generation: u64,
+}
+thread_local! {
+    static STATEMENT_POLICY: std::cell::RefCell<Option<PolicySnapshot>> = const { std::cell::RefCell::new(None) };
+}
+impl PolicySnapshot {
+    pub(crate) fn capture() -> Self {
+        if let Some(snapshot) = STATEMENT_POLICY.with(|slot| slot.borrow().clone()) {
+            return snapshot;
+        }
+        let mandatory_roles = if MANDATORY_ROLES_EMPTY.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(Arc::from(mandatory_roles_raw()))
+        };
+        Self {
+            mandatory_roles,
+            partial_revokes: PARTIAL_REVOKES.load(Ordering::Acquire),
+            activate_all_roles: ACTIVATE_ALL_ROLES_ON_LOGIN.load(Ordering::Acquire),
+            role_generation: ROLE_POLICY_GENERATION.load(Ordering::Acquire),
+        }
+    }
+}
+pub(crate) struct PolicySnapshotScope(Option<PolicySnapshot>);
+impl PolicySnapshotScope {
+    pub(crate) fn enter(snapshot: &PolicySnapshot) -> Self {
+        Self(STATEMENT_POLICY.with(|slot| slot.borrow_mut().replace(snapshot.clone())))
+    }
+}
+impl Drop for PolicySnapshotScope {
+    fn drop(&mut self) {
+        STATEMENT_POLICY.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
 pub(crate) fn invalidate_authorization_cache() {
     AUTHORIZATION_GENERATION.fetch_add(1, Ordering::Release);
 }
@@ -38,7 +79,8 @@ pub(crate) fn invalidate_authorization_cache() {
 static PARTIAL_REVOKES: AtomicBool = AtomicBool::new(false);
 
 pub fn partial_revokes_enabled() -> bool {
-    PARTIAL_REVOKES.load(Ordering::Relaxed)
+    STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.partial_revokes))
+        .unwrap_or_else(|| PARTIAL_REVOKES.load(Ordering::Relaxed))
 }
 
 pub fn set_partial_revokes(value: bool) {
@@ -53,7 +95,8 @@ pub fn set_partial_revokes(value: bool) {
 static ACTIVATE_ALL_ROLES_ON_LOGIN: AtomicBool = AtomicBool::new(false);
 
 pub fn activate_all_roles_on_login() -> bool {
-    ACTIVATE_ALL_ROLES_ON_LOGIN.load(Ordering::Relaxed)
+    STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.activate_all_roles))
+        .unwrap_or_else(|| ACTIVATE_ALL_ROLES_ON_LOGIN.load(Ordering::Relaxed))
 }
 
 pub fn set_activate_all_roles_on_login(value: bool) {
@@ -70,6 +113,9 @@ static MANDATORY_ROLES_RAW: Mutex<String> = Mutex::new(String::new());
 static MANDATORY_ROLES_EMPTY: AtomicBool = AtomicBool::new(true);
 
 pub fn mandatory_roles_raw() -> String {
+    if let Some(raw) = STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.mandatory_roles.as_deref().unwrap_or_default().to_string())) {
+        return raw;
+    }
     MANDATORY_ROLES_RAW
         .lock()
         .map(|g| g.clone())
@@ -2003,7 +2049,9 @@ impl AuthCatalog {
     pub fn mandatory_role_keys(&self) -> BTreeSet<AccountKey> {
         // The usual empty setting must not serialize all role checks on a
         // process-wide mutex. The setter publishes this flag under its lock.
-        if MANDATORY_ROLES_EMPTY.load(Ordering::Acquire) {
+        let empty = STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.mandatory_roles.as_deref().is_none_or(str::is_empty)))
+            .unwrap_or_else(|| MANDATORY_ROLES_EMPTY.load(Ordering::Acquire));
+        if empty {
             return BTreeSet::new();
         }
         parse_mandatory_roles(&mandatory_roles_raw())
@@ -3422,6 +3470,7 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
     static SET: std::sync::OnceLock<Vec<Privilege>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         [
+            "ROW_SECURITY_ADMIN", "BYPASS_RLS", "RLS_CONTEXT_ADMIN",
             "HTTP_ADMIN",
             "HTTP_USE",
             "AI_ADMIN",

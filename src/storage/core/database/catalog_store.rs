@@ -1,5 +1,6 @@
 #[derive(Debug)]
 pub(super) struct CatalogManager {
+    row_security: crate::engine::rls::CatalogStore,
     live: RwLock<Catalog>,
     /// Stable object/storage id -> normalized table key.  This is the small
     /// startup-resident object-header index; child descriptors remain lazy.
@@ -74,6 +75,7 @@ struct DescriptorCacheEntry {
 
 impl CatalogManager {
     fn new(mut catalog: Catalog) -> Result<Self, QueryError> {
+        let row_security = crate::engine::rls::CatalogStore::new(catalog.tables.values())?;
         let memory_target = crate::engine::executor::mem_budget::memory_target_bytes();
         let default_pct = if memory_target <= 1024 * 1024 * 1024 {
             2
@@ -115,6 +117,7 @@ impl CatalogManager {
             resident_bytes,
         )?;
         Ok(Self {
+            row_security,
             live: RwLock::new(catalog),
             table_keys_by_id: RwLock::new(table_keys_by_id),
             table_headers: RwLock::new(table_headers),
@@ -145,6 +148,9 @@ impl CatalogManager {
         header.pending_primary_key = None;
         header.indexes = Vec::new();
         header.check_constraints = Vec::new();
+        if !header.row_security.policies.is_empty() {
+            header.row_security = Arc::new(crate::engine::rls::RowSecurity { enabled: header.row_security.enabled, version: header.row_security.version, policies: Vec::new() });
+        }
         header.foreign_keys = Vec::new();
         header.fk_referenced_by = Vec::new();
         header.stats = crate::storage::TableStats::empty();
@@ -169,6 +175,7 @@ impl CatalogManager {
             .saturating_add(table.foreign_keys.capacity().saturating_mul(768))
             .saturating_add(table.row_layouts.capacity().saturating_mul(256))
             .saturating_add(table.stats.allocated_bytes())
+            .saturating_add(table.row_security.allocated_bytes())
     }
 
     fn catalog_header_bytes(catalog: &Catalog) -> usize {
@@ -238,6 +245,7 @@ impl CatalogManager {
     }
 
     fn replace_live(&self, catalog: Catalog) -> Result<(), QueryError> {
+        self.row_security.reset(catalog.tables.values())?;
         let resident_bytes = Self::catalog_header_bytes(&catalog);
         {
             let mut charge = self.resident_charge.lock().map_err(|_| {
@@ -717,6 +725,12 @@ impl<'a> CatalogTxn<'a> {
                 );
             }
         }
+        // The deferred candidate path reserves its publication before taking
+        // the live-catalog latch. Other DDL prepares here, before DD shards,
+        // to preserve the policy-publication -> DD-shard lock order.
+        let security_publication = if self.defer_table_publication { None } else {
+            self.db.prepare_row_security_replacements(&self.replacements)?
+        };
         self.replacements
             .sort_by_key(|replacement| replacement.dd_table_id);
         // Independent table descriptors touch disjoint primary-key families
@@ -834,6 +848,16 @@ impl<'a> CatalogTxn<'a> {
         let mut mutation_rows = 0u64;
         let mut locator_updates = Vec::new();
         let result = (|| -> Result<(), QueryError> {
+            // Replicas must pin old descriptors before DD index entries are
+            // replaced. After physical row replay, even a pre-commit MVCC
+            // read may no longer find an old primary key through the index.
+            self.db.append_wal(
+                txn.txn_id,
+                WalPayload::CatalogDelta {
+                    object_ids: self.delta_object_ids.clone(),
+                    invalidate_all: self.delta_invalidate_all,
+                },
+            )?;
             for replacement in &self.replacements {
                 let (changed, inserted) =
                     self.db.apply_catalog_row_replacement(txn, replacement)?;
@@ -875,13 +899,6 @@ impl<'a> CatalogTxn<'a> {
             if self.ai_mutation {
                 crate::engine::ai::catalog_faults::hit("after_dd_rows")?;
             }
-            self.db.append_wal(
-                txn.txn_id,
-                WalPayload::CatalogDelta {
-                    object_ids: self.delta_object_ids.clone(),
-                    invalidate_all: self.delta_invalidate_all,
-                },
-            )?;
             if stage_ddl_binlog {
                 crate::binlog::stage_current_ddl_transaction(txn.txn_id)?;
             }
@@ -921,6 +938,7 @@ impl<'a> CatalogTxn<'a> {
         if !self.defer_table_publication {
             self.db.catalog.publish_table_deltas(&self.delta_object_ids);
         }
+        if let Some(publication) = security_publication { publication.publish(); }
         Ok(())
     }
 }
@@ -1414,7 +1432,7 @@ impl Database {
         use crate::storage::data_dictionary::{
             dd_row_for_event, dd_row_for_routine, dd_row_for_schema, dd_row_for_sequence,
             dd_row_for_trigger, dd_row_for_view, dd_rows_for_auth, dd_rows_for_table,
-            DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS, DD_COLUMN_STATS,
+            DD_CHECK_CONSTRAINTS, DD_ROW_SECURITY_POLICIES, DD_ROW_SECURITY_DEPENDENCIES, DD_COLUMNS, DD_COLUMN_HISTOGRAMS, DD_COLUMN_STATS,
             DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
             DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
             DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
@@ -1523,6 +1541,8 @@ impl Database {
                         (DD_INDEXES, rows.indexes),
                         (DD_INDEX_COLUMN_USAGE, rows.index_column_usage),
                         (DD_CHECK_CONSTRAINTS, rows.check_constraints),
+                        (DD_ROW_SECURITY_POLICIES, rows.row_security_policies),
+                        (DD_ROW_SECURITY_DEPENDENCIES, rows.row_security_dependencies),
                         (DD_FOREIGN_KEYS, rows.foreign_keys),
                         (DD_FOREIGN_KEY_COLUMN_USAGE, rows.foreign_key_column_usage),
                         (DD_TABLE_STATS, rows.table_stats),
@@ -1716,6 +1736,15 @@ impl Database {
         let _candidate_charge = crate::engine::executor::mem_budget::force_charge_scoped(
             CatalogManager::descriptor_bytes(&candidate),
         )?;
+        let security_publication = if candidate.row_security.version != expected.row_security.version {
+            self.catalog.row_security.prepare(
+                vec![(candidate.object_id, Some((candidate.id, candidate.row_security.clone())))],
+                |id, version| {
+                    if expected.id == id && expected.row_security.version == version { Ok(expected.row_security.clone()) }
+                    else { self.load_row_security_snapshot(id, version) }
+                },
+            )?
+        } else { None };
         let key = expected.qualified_name();
         let mut catalog = self.catalog_write()?;
         if skip_online && self.catalog.online_pinned_ids.read().contains(&expected.id) {
@@ -1748,6 +1777,12 @@ impl Database {
             CatalogRowSelector::PrimaryValues(vec![Value::UInt(expected.id)]),
             rows.tables.clone(),
         );
+        for (id, values) in [
+            (crate::storage::data_dictionary::DD_ROW_SECURITY_POLICIES, &rows.row_security_policies),
+            (crate::storage::data_dictionary::DD_ROW_SECURITY_DEPENDENCIES, &rows.row_security_dependencies),
+        ] {
+            txn.replace(id, CatalogRowSelector::PrefixValues(vec![Value::UInt(expected.id)]), values.clone());
+        }
         for ((id, values), (_, old_values)) in
             rows.per_table().into_iter().zip(previous.per_table())
         {
@@ -1797,7 +1832,7 @@ impl Database {
                 }
             }
         }
-        txn.commit()?;
+        if candidate.row_security.version != expected.row_security.version { txn.commit_ddl()?; } else { txn.commit()?; }
         #[cfg(test)]
         if STATS_CRASH_POINT.with(|p| p.get()) == 2 {
             std::process::exit(0);
@@ -1817,6 +1852,7 @@ impl Database {
             }
         }
         catalog.tables.insert(key.clone(), Arc::new(candidate));
+        if let Some(publication) = security_publication { publication.publish(); }
         drop(catalog);
         self.catalog.publish_table_deltas(&[expected.id]);
         // Commit maintenance may resolve table descriptors, so run it only
@@ -1981,7 +2017,7 @@ impl Database {
         keep_building: bool,
     ) -> Result<Option<Arc<TableSchema>>, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_schema_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS,
+            catalog_schema_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_ROW_SECURITY_POLICIES, DD_ROW_SECURITY_DEPENDENCIES, DD_COLUMNS,
             DD_COLUMN_HISTOGRAMS, DD_COLUMN_STATS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
             DD_FOREIGN_KEY_COLUMN_USAGE, DD_INDEXES, DD_INDEX_COLUMN_USAGE, DD_INDEX_STATS,
             DD_TABLES, DD_TABLE_STATS,
@@ -2013,6 +2049,8 @@ impl Database {
                 prefix(),
                 snapshot.txn,
             )?,
+            row_security_policies: self.catalog_rows_for_selector_at(DD_ROW_SECURITY_POLICIES, prefix(), snapshot.txn)?,
+            row_security_dependencies: self.catalog_rows_for_selector_at(DD_ROW_SECURITY_DEPENDENCIES, prefix(), snapshot.txn)?,
             check_constraints: self.catalog_rows_for_selector_at(
                 DD_CHECK_CONSTRAINTS,
                 prefix(),
@@ -2308,8 +2346,16 @@ struct CatalogApplyDelta {
     dd_touched: bool,
     invalidate_all: bool,
     object_ids: HashSet<u64>,
+    /// Full, governed descriptor leases captured before physical DD replay.
+    old_tables: Vec<CatalogApplyTableLease>,
     /// Recovery-only XA files share the existing apply transaction lifetime.
     has_binlog_intent: bool,
+}
+
+#[derive(Debug)]
+struct CatalogApplyTableLease {
+    table: Arc<TableSchema>,
+    _memory: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
 thread_local! {

@@ -626,7 +626,10 @@ impl Database {
             }
             prepared_rows.push(values);
         }
-        self.check_not_null_constraints_batch(&table, &prepared_rows)?;
+        if crate::engine::rls::might_require_binding(self, &table) {
+                for values in &prepared_rows { crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Insert, true, values)?; }
+            }
+            self.check_not_null_constraints_batch(&table, &prepared_rows)?;
         self.check_check_constraints_batch(&table, &prepared_rows)?;
         Ok(PreparedInsertBatch {
             table_id: table.id,
@@ -776,6 +779,9 @@ impl Database {
             // be per-row (coerce, generated columns, unique-key
             // build). Error order matches the legacy path: row N
             // is rejected before row N+1 for the same reason.
+            if crate::engine::rls::might_require_binding(self, &table) {
+                for values in &prepared_rows { crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Insert, true, values)?; }
+            }
             self.check_not_null_constraints_batch(&table, &prepared_rows)?;
             self.check_check_constraints_batch(&table, &prepared_rows)?;
             // Hold the unique-key locks before probing: a committed competitor
@@ -1048,6 +1054,9 @@ impl Database {
             // and the per-partition heap writes. Same error ordering
             // as the row-by-row path the partition phase used to do
             // inline.
+            if crate::engine::rls::might_require_binding(self, &table) {
+                for values in &snapshot_values { crate::engine::rls::check_row(self, txn, table, crate::parser::rls::Command::Insert, true, values)?; }
+            }
             self.check_not_null_constraints_batch(table, &snapshot_values)?;
             self.check_check_constraints_batch(table, &snapshot_values)?;
             if let Some(batch_unique_keys) = batch_unique_keys.as_ref() {
@@ -1326,7 +1335,10 @@ impl Database {
                 }
                 // M4.B6 — batch NOT NULL / CHECK; see canonical
                 // INSERT path for rationale.
-                self.check_not_null_constraints_batch(&table, &prepared_rows)?;
+                if crate::engine::rls::might_require_binding(self, &table) {
+                for values in &prepared_rows { crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Insert, true, values)?; }
+            }
+            self.check_not_null_constraints_batch(&table, &prepared_rows)?;
                 self.check_check_constraints_batch(&table, &prepared_rows)?;
                 self.lock_unique_keys_for_rows(txn.txn_id, &table, &prepared_rows)?;
                 self.check_batch_unique_constraints(
@@ -1343,7 +1355,10 @@ impl Database {
                 }
                 // M4.B6 — skip_unique_check still needs NOT NULL /
                 // CHECK enforcement on the prepared rows.
-                self.check_not_null_constraints_batch(&table, &prepared_rows)?;
+                if crate::engine::rls::might_require_binding(self, &table) {
+                for values in &prepared_rows { crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Insert, true, values)?; }
+            }
+            self.check_not_null_constraints_batch(&table, &prepared_rows)?;
                 self.check_check_constraints_batch(&table, &prepared_rows)?;
             }
             let row_headers = vec![RowHeader::visible(txn.txn_id); prepared_rows.len()];
@@ -1443,6 +1458,12 @@ impl Database {
                 "pre-encoded heap-only inserts are not supported while binary logging is enabled; use the value-based path",
             ));
         }
+        if crate::engine::rls::binding(self, &table, crate::parser::rls::Command::Insert, true)?.is_some() {
+            for payload in &payloads {
+                let values = decode_row_schema_ext_for_layout(payload, &table.row_codec, table.row_codec.active_layout_id, false)?;
+                crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Insert, true, &values)?;
+            }
+        }
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         let result = (|| {
             self.preflight_insert_undo_admission(table.id, payloads.len())?;
@@ -1526,6 +1547,9 @@ impl Database {
             }
             // M4.B6 — heap-only LOAD DATA fast path still owes the
             // user a NOT NULL / CHECK guarantee; do it in batch.
+            if crate::engine::rls::might_require_binding(self, &table) {
+                for values in &prepared_rows { crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Insert, true, values)?; }
+            }
             self.check_not_null_constraints_batch(&table, &prepared_rows)?;
             self.check_check_constraints_batch(&table, &prepared_rows)?;
 
@@ -1792,10 +1816,12 @@ impl Database {
                     continue;
                 }
 
+                if !self.row_security_old(txn, &table, crate::parser::rls::Command::Update, &current.values)? { continue; }
                 let base_values = &current.values;
                 let mut new_values = apply_updates(base_values)?;
                 coerce_updated_row(&table, &mut new_values, changed_columns)?;
                 materialize_generated_columns(&table, &mut new_values, effective_changed_columns)?;
+                crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Update, true, &new_values)?;
                 // MySQL no-op detection: matched but unchanged rows are
                 // skipped (no write, no ON UPDATE refresh) — see
                 // `update_row_by_id_with_changed_columns_noop`.
@@ -2271,6 +2297,7 @@ impl Database {
             if !predicate(&current.values)? {
                 continue;
             }
+            if !self.row_security_old(txn, &table, crate::parser::rls::Command::Delete, &current.values)? { continue; }
             deletes.push(DmlDelete {
                 row_id: row.row_id,
                 header: current.header,
@@ -2419,6 +2446,7 @@ impl Database {
             table,
             crate::storage::DmlRowRef { storage_id, row_id },
         )?;
+        if !self.row_security_old(txn, table, crate::parser::rls::Command::Delete, &predicate_values)? { return Ok(false); }
         if !predicate(&predicate_values)? {
             if txn.txn_id != 0 && !held_before {
                 self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
@@ -2918,6 +2946,30 @@ impl Database {
         {
             return Ok(None);
         }
+        // Bind and compile outside row/page latches. Diagnostic-free policies
+        // can use the same sparse decoder; relational/volatile policies keep
+        // the full-row writer and its normal evaluation contract.
+        let mut security_columns = smallvec::SmallVec::<[usize; 24]>::new();
+        for check in [false, true] {
+            if let Some(bound) = crate::engine::rls::binding(self, table, crate::parser::rls::Command::Update, check)? {
+                let Some(columns) = bound.sparse_columns(table) else { return Ok(None); };
+                security_columns.extend(columns.iter().copied());
+            }
+        }
+        let mut sparse_columns = smallvec::SmallVec::<[usize; 24]>::new();
+        let required_columns = if security_columns.is_empty() { required_columns } else {
+            sparse_columns.extend_from_slice(required_columns);
+            sparse_columns.extend(security_columns);
+            sparse_columns.sort_unstable();
+            sparse_columns.dedup();
+            sparse_columns.as_slice()
+        };
+        let _security_column_memory = (sparse_columns.spilled()).then(||
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                sparse_columns.capacity() * std::mem::size_of::<usize>(),
+            )).transpose()?;
+        let decode_plan = if sparse_columns.is_empty() { decode_plan } else { None };
         if Self::fk_parent_update_may_affect_references(table, Some(effective_changed_columns))
             || self.row_has_externalizable_changes(
                 &table.row_codec,
@@ -2980,6 +3032,12 @@ impl Database {
             table,
             crate::storage::DmlRowRef { storage_id, row_id },
         )?;
+        if !self.row_security_old(txn, table, crate::parser::rls::Command::Update, &current_values)? {
+            if txn.txn_id != 0 && !held_before {
+                self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
+            }
+            return Ok(Some(false));
+        }
         if let Some(predicate) = predicate.as_mut() {
             if !predicate(&current_values)? {
                 if txn.txn_id != 0 && !held_before {
@@ -2998,6 +3056,7 @@ impl Database {
         apply_updates(&mut current_values)?;
         coerce_updated_row(table, &mut current_values, changed_columns)?;
         materialize_generated_columns(table, &mut current_values, Some(effective_changed_columns))?;
+        crate::engine::rls::check_row(self, txn, table, crate::parser::rls::Command::Update, true, &current_values)?;
 
         if let Some(cols) = noop_compare_columns {
             let unchanged = cols.iter().all(|col| {
@@ -3151,10 +3210,12 @@ impl Database {
                 table,
                 crate::storage::DmlRowRef { storage_id, row_id },
             )?;
+            if !self.row_security_old(txn, table, crate::parser::rls::Command::Update, &current.values)? { return Ok(false); }
             let base_values = &current.values;
             let mut new_values = apply_updates(base_values)?;
             coerce_updated_row(table, &mut new_values, changed_columns)?;
             materialize_generated_columns(table, &mut new_values, effective_changed_columns)?;
+            crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Update, true, &new_values)?;
             // MySQL no-op detection: a row whose user-set columns all
             // coerce to their stored values is "matched but not changed"
             // — skip the write entirely (no heap/undo/index/binlog churn,
@@ -3577,9 +3638,11 @@ impl Database {
                 if !predicate(&current.values)? {
                     continue;
                 }
+                if !self.row_security_old(txn, table, crate::parser::rls::Command::Update, &current.values)? { continue; }
                 let mut new_values = apply_updates(&current.values)?;
                 coerce_row(table, &mut new_values)?;
                 materialize_generated_columns(table, &mut new_values, None)?;
+                crate::engine::rls::check_row(self, txn, &table, crate::parser::rls::Command::Update, true, &new_values)?;
                 // MySQL no-op detection: skip matched-but-unchanged
                 // rows (no write, no ON UPDATE refresh).
                 if let Some(cols) = noop_compare_columns {

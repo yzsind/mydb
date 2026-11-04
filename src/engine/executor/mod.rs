@@ -60,6 +60,7 @@ use super::system::{
 #[macro_use]
 mod row_decode_macros;
 mod auth_recipe;
+pub(crate) mod rls;
 mod compiled_select;
 pub(crate) mod cte;
 pub(crate) mod cte_store;
@@ -1814,8 +1815,9 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
     typed_predicate(update.selection.as_ref().expect("checked above"), &table)
 }
 
-pub(super) fn plan_semantics(session: &SessionContext) -> crate::engine::cache::PlanSemantics {
+pub(super) fn plan_semantics(db: &Database, session: &SessionContext) -> crate::engine::cache::PlanSemantics {
     crate::engine::cache::PlanSemantics {
+        rls_authorization: Some(crate::engine::rls::session_signature(db, session)),
         sql_mode_fingerprint: crate::binlog::sql_mode_str_to_bits(&session.sql_mode),
         optimizer_switch_fingerprint: crate::engine::cache::optimizer_switch_fingerprint(
             &session.sysvars.optimizer_switch,
@@ -4023,6 +4025,7 @@ impl QueryEngine for StorageQueryEngine {
         session: &mut SessionContext,
         statement: Statement,
     ) -> Result<QueryResponse, QueryError> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         session.check_cancelled()?;
         let _fk_checks_guard = crate::storage::FkChecksGuard::new(session.foreign_key_checks);
@@ -4066,6 +4069,7 @@ impl QueryEngine for StorageQueryEngine {
         statement: Statement,
         reader: Box<dyn std::io::Read + Send>,
     ) -> Result<QueryResponse, QueryError> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         session.check_cancelled()?;
         let _fk_checks_guard = crate::storage::FkChecksGuard::new(session.foreign_key_checks);
@@ -4163,6 +4167,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Arc<Statement>,
     ) -> Result<QueryResponse, QueryError> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
@@ -4312,6 +4317,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Statement,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
@@ -4344,7 +4350,7 @@ impl QueryEngine for StorageQueryEngine {
         let full_routine_dispatch = matches!(statement, Statement::Call(_))
             || routines::statement_references_stored_function(
                 &self.db,
-                &session.current_database,
+                session,
                 &statement,
             );
         // Routine statements re-enter the full dispatcher, which charges the
@@ -4401,7 +4407,7 @@ impl QueryEngine for StorageQueryEngine {
             let hint = crate::engine::cache::QueryHint {
                 normalized_sql,
                 database,
-                semantics: plan_semantics(session),
+                semantics: plan_semantics(&self.db, session),
                 parameterized: true,
                 plan_cache: Arc::downgrade(&self.plan_cache),
             };
@@ -4433,6 +4439,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         if !matches!(parsed.as_ref(), Statement::Select(_)) {
             return None;
         }
@@ -4588,7 +4595,13 @@ impl QueryEngine for StorageQueryEngine {
         // Trait-method shim → inherent impl (kept inherent so the
         // engine can call into the fast path without a trait-object
         // hop in tests / inner helpers).
-        self.execute_prepared_dml_impl(session, state, parsed, sql, params)
+        // Type proofs and memo identity must see this execution's parameter
+        // domains before compilation/reuse, while retaining text provenance.
+        crate::engine::params::with_params_slice_and_provenance(
+            params,
+            crate::engine::params::auto_parameterized_active(),
+            || self.execute_prepared_dml_impl(session, state, parsed, sql, params),
+        )
     }
 
     fn execute_large_text_dml_inline(
@@ -4632,8 +4645,42 @@ impl QueryEngine for StorageQueryEngine {
             return None;
         }
         let parser_mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
-        let (key, params) = text_shape_key_and_params(sql, parser_mode_bits)?;
-        let statement = self.statement_cache.get(&key)?;
+        let shaped = text_shape_key_and_params(sql, parser_mode_bits)
+            .and_then(|(key, params)| self.statement_cache.get(&key).map(|statement| (key, statement, params)));
+        let (key, statement, params) = if let Some(shaped) = shaped {
+            shaped
+        } else {
+            // An exact parser-cache entry is also an authoritative zero-bind
+            // template. Literal-free reads must not pay the generic dispatch
+            // cost just because their selective quals came from a policy.
+            if sql.contains("/*+") || sql.contains("/*!")
+                || source_syntax_warning_scan_required(sql, parser_mode_bits) {
+                return None;
+            }
+            let key = crate::engine::cache::ParsedStatementKey::new(sql, parser_mode_bits);
+            let statement = self.statement_cache.get(&key)?;
+            let Statement::Select(select) = statement.as_ref() else { return None; };
+            if select.from.len() != 1 || select.table.is_none()
+                || crate::engine::cache::SelectExecutionClass::from_select(select)
+                != crate::engine::cache::SelectExecutionClass::ReadOnlyNonBlocking
+                || !crate::mysql::session::statement_is_lock_safe_read(statement.as_ref()) {
+                return None;
+            }
+            struct UnsafeTemplate(bool);
+            impl crate::parser::visit::AstVisitor for UnsafeTemplate {
+                fn enter_expr(&mut self, expr: &Expr) {
+                    self.0 |= matches!(expr, Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
+                        | Expr::UserVariable(_) | Expr::SystemVariable { .. } | Expr::WindowFunction { .. });
+                }
+                fn enter_limit(&mut self, _: &crate::parser::LimitValue) { self.0 = true; }
+            }
+            let mut unsafe_template = UnsafeTemplate(false);
+            crate::parser::visit::visit_statement(&mut unsafe_template, statement.as_ref());
+            if unsafe_template.0 {
+                return None;
+            }
+            (key, statement, Vec::new())
+        };
         if !matches!(
             statement.as_ref(),
             Statement::Select(_)
@@ -4655,6 +4702,7 @@ impl QueryEngine for StorageQueryEngine {
         params: Vec<Value>,
         shape_sql: Arc<str>,
     ) -> Result<QueryResponse, QueryError> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
@@ -4908,6 +4956,7 @@ impl StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         if crate::engine::http::may_call(&self.db, sql) {
             return None;
         }
@@ -5010,6 +5059,9 @@ impl StorageQueryEngine {
                 (result.map_err(mem_budget::terminal_oom), waits)
             });
         }
+        // One immutable root spans retries of this logical statement. A
+        // multi-statement packet calls this entry separately for each child.
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         if let Err(err) = session.check_cancelled() {
             return (Err(err), LockWaitStats::default());
         }
@@ -5120,7 +5172,7 @@ impl StorageQueryEngine {
                         crate::engine::params::with_params_slice(params, || {
                             self.execute_statement_with_lock_wait_mode(
                                 session,
-                                dp.statement.as_ref().clone(),
+                                dp.original_statement.as_ref().clone(),
                                 true,
                                 None,
                             )
@@ -5159,6 +5211,7 @@ impl StorageQueryEngine {
         shape: String,
         scanned_params: Vec<Value>,
     ) -> ScannedTextDmlProbe {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         if !self.plan_cache_enabled
             || !prepared_dml_cache_enabled()
             || !can_use_prepared_dml(session)
@@ -5168,11 +5221,11 @@ impl StorageQueryEngine {
         let key = crate::engine::cache::StatementKey {
             sql: Arc::<str>::from(shape),
             database: Arc::<str>::from(session.current_database.as_str()),
-            semantics: plan_semantics(session),
+            semantics: crate::engine::params::with_auto_params_slice(&scanned_params, || plan_semantics(&self.db, session)),
         };
         let current_epoch = self.prepared_dml_cache.current_epoch();
         let dp = if let Some(plan) = self.prepared_dml_cache.get(&key, |plan| {
-            prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch)
+            crate::engine::params::with_auto_params_slice(&scanned_params, || prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch))
                 && should_use_shared_plan_cache(self.plan_cache_enabled, session, &plan.statement)
         }) {
             plan
@@ -5226,7 +5279,7 @@ impl StorageQueryEngine {
             }
             let parsed = Arc::new(statement);
             let Some(plan) =
-                prepared_dml::compile_prepared_dml(&self.db, session, &parsed, current_epoch)
+                crate::engine::params::with_auto_params_slice(&scanned_params, || prepared_dml::compile_prepared_dml(&self.db, session, &parsed, current_epoch))
             else {
                 return ScannedTextDmlProbe::Parsed(fallback_statement);
             };
@@ -5273,7 +5326,7 @@ impl StorageQueryEngine {
             return None;
         }
 
-        let dp = self.get_or_compile_text_prepared_dml(session, statement, fingerprint)?;
+        let dp = self.get_or_compile_text_prepared_dml(session, statement, fingerprint, params)?;
 
         if let Err(err) = self.enforce_prepared_dml_global_gates(&dp.statement, session) {
             return Some((Err(err), LockWaitStats::default()));
@@ -5293,11 +5346,22 @@ impl StorageQueryEngine {
         session: &SessionContext,
         statement: &Statement,
         fingerprint: &str,
+        params: &[Value],
+    ) -> Option<Arc<crate::engine::api::PreparedDmlPlan>> {
+        crate::engine::params::with_auto_params_slice(params, ||
+            self.get_or_compile_text_prepared_dml_in_context(session, statement, fingerprint))
+    }
+
+    fn get_or_compile_text_prepared_dml_in_context(
+        &self,
+        session: &SessionContext,
+        statement: &Statement,
+        fingerprint: &str,
     ) -> Option<Arc<crate::engine::api::PreparedDmlPlan>> {
         let key = crate::engine::cache::StatementKey {
             sql: Arc::<str>::from(fingerprint),
             database: Arc::<str>::from(session.current_database.as_str()),
-            semantics: plan_semantics(session),
+            semantics: plan_semantics(&self.db, session),
         };
         let current_epoch = self.prepared_dml_cache.current_epoch();
         let dp = if let Some(plan) = self.prepared_dml_cache.get(&key, |plan| {
@@ -5332,12 +5396,15 @@ impl StorageQueryEngine {
         let key = crate::engine::cache::StatementKey {
             sql: Arc::<str>::from(shape),
             database: Arc::<str>::from(session.current_database.as_str()),
-            semantics: plan_semantics(session),
+            semantics: crate::engine::params::with_auto_params_slice(scanned_params, || plan_semantics(&self.db, session)),
         };
         let current_epoch = self.prepared_dml_batch_cache.current_epoch();
         let batch = if let Some(batch) = self.prepared_dml_batch_cache.get(&key, |batch| {
-            batch.plans.iter().all(|plan| {
-                prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch)
+            let mut offset = 0usize;
+            batch.plans.iter().zip(batch.param_counts.iter().copied()).all(|(plan, count)| {
+                let Some(params) = scanned_params.get(offset..offset.saturating_add(count)) else { return false; };
+                offset += count;
+                crate::engine::params::with_auto_params_slice(params, || prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch))
                     && should_use_shared_plan_cache(
                         self.plan_cache_enabled,
                         session,
@@ -5379,7 +5446,7 @@ impl StorageQueryEngine {
                     return None;
                 }
                 let plan =
-                    self.get_or_compile_text_prepared_dml(session, &statement, fingerprint)?;
+                    self.get_or_compile_text_prepared_dml(session, &statement, fingerprint, &auto_result.params)?;
                 param_counts.push(auto_result.params.len());
                 flat_params.extend(auto_result.params);
                 plans.push(plan);
@@ -6027,6 +6094,7 @@ impl StorageQueryEngine {
         auto_result: crate::engine::auto_param::AutoParamResult,
         reparse_when_cache_hint_is_unsafe: bool,
     ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata) {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let is_ddl = is_ddl_statement(&statement);
         let wake_purge = is_ddl
             || matches!(
@@ -6056,7 +6124,7 @@ impl StorageQueryEngine {
             Some(crate::engine::cache::QueryHint {
                 normalized_sql: cache_sql,
                 database: Arc::<str>::from(session.current_database.as_str()),
-                semantics: plan_semantics(session),
+                semantics: plan_semantics(&self.db, session),
                 parameterized: auto_result.fingerprint.is_some(),
                 plan_cache: Arc::downgrade(&self.plan_cache),
             })
@@ -6224,6 +6292,7 @@ impl StorageQueryEngine {
         already_qualified: bool,
         retry_sql: Option<&str>,
     ) -> (Result<QueryResponse, QueryError>, LockWaitStats) {
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
         crate::engine::cancel::set_process_base_state(process_state_for_statement(&statement));
         if let Some(result) = self.execute_alter_system_statement(session, &statement) {

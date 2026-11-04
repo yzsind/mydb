@@ -47,6 +47,7 @@ pub(crate) mod boolean_range;
 pub(crate) mod explain_access;
 mod filtered_vector;
 pub(crate) mod index_residual;
+mod row_security;
 mod tuple_access;
 mod visit;
 pub(crate) use filtered_vector::filtered_vector_remaining_cost;
@@ -1621,6 +1622,16 @@ pub(crate) fn decorrelate_enabled_external() -> bool {
 }
 
 pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, QueryError> {
+    if let Some(settings) = &select.rls_expression_settings {
+        if !settings.matches_current() {
+            return crate::engine::expr::with_policy_query_settings(settings, || plan_select(db, select));
+        }
+    }
+    if let Some(context) = &select.rls_security_context {
+        let mut select = select.clone();
+        select.rls_security_context = None;
+        return crate::engine::expr::with_row_security_identity(context, || plan_select(db, &select));
+    }
     let _rowid_scope = crate::storage::rowid::PlanningScope::enter(select);
     crate::engine::params::validate_limit(select.limit.as_ref())?;
     crate::engine::params::validate_limit(select.offset.as_ref())?;
@@ -1659,6 +1670,7 @@ pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, Quer
     let mut physical = physical_res?;
     index_residual::prune(&mut physical);
     lower_remaining_subquery_filters_to_apply(&mut physical);
+    finish_row_security_plan(db, &select_owned, &mut physical)?;
     mark_fulltext_score_needs(&mut physical);
     crate::engine::cbo::trace::finish(&physical);
     let mut hint_warnings = select.hint_warnings.clone();
@@ -1874,11 +1886,24 @@ pub(crate) fn plan_prepared_physical_select(
     db: &Database,
     select: &Select,
 ) -> Result<PhysicalPlan, QueryError> {
+    if let Some(settings) = &select.rls_expression_settings {
+        if !settings.matches_current() {
+            return crate::engine::expr::with_policy_query_settings(settings, || plan_prepared_physical_select(db, select));
+        }
+    }
+    if let Some(context) = &select.rls_security_context {
+        let mut select = select.clone();
+        select.rls_security_context = None;
+        return crate::engine::expr::with_row_security_identity(context, || {
+            plan_prepared_physical_select(db, &select)
+        });
+    }
     fn build(db: &Database, select: &Select) -> Result<PhysicalPlan, QueryError> {
         let (physical, _warnings) = with_hint_warning_collector(|| build_physical_plan(db, select));
         let mut physical = physical?;
         index_residual::prune(&mut physical);
         lower_remaining_subquery_filters_to_apply(&mut physical);
+        finish_row_security_plan(db, select, &mut physical)?;
         mark_fulltext_score_needs(&mut physical);
         crate::engine::cbo::trace::finish(&physical);
         Ok(physical)
@@ -1891,6 +1916,22 @@ pub(crate) fn plan_prepared_physical_select(
         propagate_sideways_dimension_filters(db, &mut planner_owned);
         build(db, &planner_owned)
     }
+}
+
+/// Both EXPLAIN and executable/prepared planning must apply the same security
+/// lowering. Applying this only to the display plan hides execution regressions.
+fn finish_row_security_plan(
+    db: &Database,
+    select: &Select,
+    physical: &mut PhysicalPlan,
+) -> Result<(), QueryError> {
+    if row_security::lower_authorization_joins(db, physical)? {
+        // Apply conservatively retained every policy-subquery column. Once
+        // relational lowering succeeds, retain the actual keys/consumers.
+        apply_column_pruning(physical, select);
+        apply_output_column_pruning_pass(physical, select);
+    }
+    Ok(())
 }
 
 /// Walk `plan` collecting every FULLTEXT `match_fingerprint` referenced
@@ -5208,6 +5249,12 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         );
     }
 
+    for ((table, predicate), reference) in tables.iter().zip(base_predicates.iter_mut()).zip(source_refs.iter()) {
+        let locked = select.for_update && select.lock_clause.as_ref().is_none_or(|clause|
+            clause.for_reference(reference).is_some());
+        *predicate = crate::engine::rls::scan_filter(db, &table.schema, table.alias.as_deref(), locked, predicate.take())?;
+    }
+
     // Order-preserving + LIMIT bonus only applies when there's a single
     // base table; multi-table joins (HashJoin / NLJ) generally do not
     // preserve a child scan's index order at the top of the plan tree,
@@ -5246,7 +5293,10 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         // sort-key memory) even for `ORDER BY PRIMARY KEY LIMIT ...`.
         let limit_with_offset = ordered_limit_row_goal(select);
         let row_goal = plain_limit_row_goal(select);
-        let required = collect_required_columns(select, &tables[0]);
+        let mut required = collect_required_columns(select, &tables[0]);
+        // Security quals are bound after user-AST normalization. Covering
+        // access must include their columns even when no user clause reads them.
+        if let Some(predicate) = &base_predicates[0] { collect_expr_columns(predicate, &mut required); }
         let has_wildcard = select.projection.iter().any(|item| {
             matches!(
                 item,
@@ -14188,7 +14238,7 @@ fn constraint_key_part_for_index(
     // bound, so they pass through unchanged — `resolve_index_key` /
     // `resolve_index_bound` at the storage boundary do the truncation
     // after `KeyPart::resolve_param` materialises the value.
-    if matches!(value, PlanConstraintValue::Param(_)) {
+    if matches!(value, PlanConstraintValue::Param(_) | PlanConstraintValue::Statement(_)) {
         return Some(part);
     }
     Some(index.apply_prefix_to_key_part(pos, part))
@@ -14205,6 +14255,9 @@ fn plan_constraint_is_null_literal(value: &PlanConstraintValue) -> bool {
 }
 
 fn expr_to_plan_constraint(expr: &Expr) -> Option<PlanConstraintValue> {
+    if let Some(value) = crate::storage::schema::StatementValue::for_expression(expr) {
+        return Some(PlanConstraintValue::Statement(value));
+    }
     match expr {
         Expr::Literal(_) | Expr::BoundValue(_) => {
             expr_literal_value(expr).map(PlanConstraintValue::Concrete)
@@ -14970,6 +15023,7 @@ fn index_in_lookup_preserves_comparison(
                 crate::engine::expr::eval_const(&Expr::Placeholder(*i))
                     .is_ok_and(|v| KeyPart::for_target(v, target).is_ok())
             }
+            PlanConstraintValue::Statement(_) => false,
         });
     }
     let character_target = matches!(
@@ -14997,6 +15051,7 @@ fn index_in_lookup_preserves_comparison(
                 PlanConstraintValue::Param(index) => {
                     !index_comparison_param_is_string_domain(*index)
                 }
+                PlanConstraintValue::Statement(_) => false,
             });
         }
         if matches!(
@@ -15005,6 +15060,7 @@ fn index_in_lookup_preserves_comparison(
         ) {
             return values.iter().all(|v| match v {
                 PlanConstraintValue::Param(i) => index_comparison_param_is_integer_domain(*i),
+                PlanConstraintValue::Statement(_) => true,
                 PlanConstraintValue::Concrete(v) => {
                     // Integer ranges cannot truncate fractional comparison bounds.
                     if !matches!(
@@ -15049,6 +15105,7 @@ fn index_in_lookup_preserves_comparison(
             Value::String(_) | Value::SmallString(_) | Value::Bytes(_) | Value::Null
         ),
         PlanConstraintValue::Param(index) => index_comparison_param_is_string_domain(*index),
+        PlanConstraintValue::Statement(_) => false,
     })
 }
 
@@ -15077,6 +15134,7 @@ fn publish_collapsed_numeric_in_diagnostics(
         let runtime = match value {
             PlanConstraintValue::Concrete(value) => Some(value.clone()),
             PlanConstraintValue::Param(index) => crate::engine::params::current_param(*index),
+            PlanConstraintValue::Statement(_) => None,
         };
         let Some(text) = runtime.as_ref().and_then(|value| match value {
             Value::String(text) | Value::Decimal(text) => Some(text.clone()),
@@ -15161,6 +15219,7 @@ fn multi_valued_index_access(
                 let target = table.multi_valued_index_param_target(index)?;
                 KeyPart::Param { idx: *idx, target }
             }
+            PlanConstraintValue::Statement(_) => return None,
         };
         let mut parts = prefix.clone();
         parts.push(part);
@@ -15276,7 +15335,7 @@ fn concrete_key_part_value(
     data_type: &crate::storage::DataTypeKind,
 ) -> Option<Value> {
     match part {
-        KeyPart::Param { .. } => part
+        KeyPart::Param { .. } | KeyPart::Statement { .. } => part
             .resolve_param()
             .ok()
             .and_then(|resolved| concrete_key_part_value(&resolved, data_type)),
@@ -15992,6 +16051,7 @@ fn write_in_lookup_preserves_comparison(
                 };
                 value
             }
+            PlanConstraintValue::Statement(_) => return false,
         };
         if matches!(value, Value::Null) {
             return true;
@@ -23439,6 +23499,7 @@ fn plan_constraint_to_expr(value: &PlanConstraintValue) -> Expr {
     match value {
         PlanConstraintValue::Concrete(v) => Expr::BoundValue(v.clone()),
         PlanConstraintValue::Param(idx) => Expr::Placeholder(*idx),
+        PlanConstraintValue::Statement(value) => value.expression().clone(),
     }
 }
 

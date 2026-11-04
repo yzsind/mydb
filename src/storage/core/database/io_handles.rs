@@ -431,7 +431,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn diagnostic_catalog_snapshot_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
+            catalog_from_dd_rows, DdRowSet, DD_ROW_SECURITY_POLICIES, DD_ROW_SECURITY_DEPENDENCIES, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
             DD_COLUMN_STATS, DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
             DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
             DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
@@ -445,6 +445,8 @@ impl Database {
             indexes: load(DD_INDEXES)?,
             index_column_usage: load(DD_INDEX_COLUMN_USAGE)?,
             check_constraints: load(DD_CHECK_CONSTRAINTS)?,
+            row_security_policies: load(DD_ROW_SECURITY_POLICIES)?,
+            row_security_dependencies: load(DD_ROW_SECURITY_DEPENDENCIES)?,
             foreign_keys: load(DD_FOREIGN_KEYS)?,
             foreign_key_column_usage: load(DD_FOREIGN_KEY_COLUMN_USAGE)?,
             views: load(DD_VIEWS)?,

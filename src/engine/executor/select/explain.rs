@@ -157,6 +157,70 @@ pub(in crate::engine::executor) fn execute_explain(
     analyze: bool,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    let _security = crate::engine::rls::EvaluationScope::enter();
+    let auth = crate::engine::rls::authorization_snapshot(db);
+    let details_allowed = crate::engine::rls::trusted_internal()
+        || crate::engine::rls::has_global(&auth, &session.authorization_context(),
+            crate::engine::auth::Privilege::Dynamic("ROW_SECURITY_ADMIN".into()));
+    // Resolve before planning as well: a cached artifact may not bind again,
+    // and concurrent policy publication must not expose an older expression.
+    let protected = !details_allowed && explain_references_row_security(db, session, &target);
+    let response = execute_explain_inner(db, session, target, format, analyze, registry)?;
+    if details_allowed || !(protected || crate::engine::rls::policy_access_observed()) {
+        return Ok(response);
+    }
+    // Preserve validation/execution errors from the ordinary implementation.
+    // Ordinary users receive a logical security overview; every expression,
+    // dependency, access estimate and actual counter remains administrator-only.
+    let QueryResponse::ResultSet(mut result) = response.materialize()? else {
+        return Err(crate::engine::rls::violation("Invalid protected EXPLAIN response"));
+    };
+    let description = "Row security boundary: base-table access, before user expressions, joins, ranking and LIMIT; detailed plan requires ROW_SECURITY_ADMIN";
+    if result.columns.len() == 1 {
+        let value = if format == ExplainFormat::Json {
+            serde_json::json!({"query_block": {"row_security": {
+                "placement": "base_table_access_before_user_evaluation",
+                "details_require": "ROW_SECURITY_ADMIN"
+            }}}).to_string()
+        } else { description.to_string() };
+        result.rows = vec![vec![Value::String(value)]];
+    } else {
+        result.rows = vec![result.columns.iter().map(|column| match column.name.as_str() {
+            "id" => Value::Int(1),
+            "select_type" => Value::String("SECURITY OVERVIEW".into()),
+            "table" => Value::String("<row security>".into()),
+            "type" => Value::String("security".into()),
+            "Extra" => Value::String(description.into()),
+            _ => Value::Null,
+        }).collect()];
+    }
+    Ok(QueryResponse::ResultSet(result))
+}
+
+fn explain_references_row_security(db: &Database, session: &SessionContext, statement: &Statement) -> bool {
+    let mut pending = super::super::dispatch::collect_statement_table_uses(statement)
+        .into_iter().map(|usage| crate::storage::split_table_name(&session.current_database, &usage.table))
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::HashSet::new();
+    while let Some((database, name)) = pending.pop() {
+        let key = format!("{database}.{name}");
+        if !seen.insert(key.clone()) { continue; }
+        if db.table(&key).is_ok_and(|table| crate::engine::rls::statement_security_enabled(db, &table).unwrap_or(true)) { return true; }
+        if let Some(view) = db.view_definition(&database, &name) {
+            pending.extend(view.dependencies.into_iter().map(|dependency| (dependency.database, dependency.name)));
+        }
+    }
+    false
+}
+
+fn execute_explain_inner(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    target: Statement,
+    format: ExplainFormat,
+    analyze: bool,
+    registry: &SessionRegistry,
+) -> Result<QueryResponse, QueryError> {
     let target = match target {
         Statement::Select(select)
             if session.effective_isolation() != crate::storage::IsolationLevel::ReadUncommitted =>
@@ -1928,6 +1992,8 @@ fn plan_leaf_for_explain(
     }
     // Plan as a real table via a minimal single-table SELECT
     let minimal = Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![crate::parser::SelectItem::Wildcard],
         from: vec![table.clone()],
         table: Some(table.name.clone()),
@@ -3361,6 +3427,8 @@ fn plan_select_with_inline_derived_for_explain(
                     key.clone(),
                     InlineDerivedSelect {
                         select: Select {
+                            rls_security_context: None,
+                            rls_expression_settings: None,
                             projection: vec![SelectItem::Wildcard],
                             ..Select::default()
                         },
@@ -7779,6 +7847,8 @@ fn dml_to_explain_select(
         generate_series: None,
     };
     let mut select = Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Wildcard],
         table: Some(table.to_owned()),
         from: vec![primary],

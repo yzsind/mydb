@@ -89,6 +89,7 @@ fn bind_source(
     sources: &mut Vec<Source>,
     stores: &mut HashMap<String, Arc<crate::engine::api::CteResult>>,
     skipped: &HashSet<(usize, crate::storage::DmlRowRef)>,
+    require_update: bool,
 ) -> Result<String, QueryError> {
     let alias = visible_name(reference);
     if let Some(derived) = derived {
@@ -97,7 +98,7 @@ fn bind_source(
         };
         if inner.from.len() != 1
             || !inner.joins.is_empty()
-            || inner.no_merge
+            || (inner.no_merge && inner.rls_security_context.is_none())
             || inner.distinct
             || !inner.group_by.is_empty()
             || inner.having.is_some()
@@ -119,7 +120,8 @@ fn bind_source(
             return Err(unsupported());
         }
         expand_projection(db, inner)?;
-        let token = bind_source(
+        let context = inner.rls_security_context.clone();
+        let mut bind = || bind_source(
             db,
             txn,
             &mut inner.from[0],
@@ -127,7 +129,12 @@ fn bind_source(
             sources,
             stores,
             skipped,
-        )?;
+            require_update,
+        );
+        let token = match context {
+            Some(context) => crate::engine::expr::with_row_security_identity(&context, bind)?,
+            None => bind()?,
+        };
         inner.table = Some(inner.from[0].name.clone());
         inner.projection.push(SelectItem::Expr {
             expr: Expr::CompoundIdentifier(vec![visible_name(&inner.from[0]), token.clone()]),
@@ -143,6 +150,9 @@ fn bind_source(
         return Err(unsupported());
     }
     let table = db.table(&reference.name)?;
+    let read = crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Select, false)?;
+    let write = if require_update { crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)? } else { None };
+    let enforce = read.is_some() || write.is_some();
     let mut query = source_query(reference, None);
     let indices = table
         .columns
@@ -170,6 +180,10 @@ fn bind_source(
     let mut append =
         |origin: crate::storage::DmlRowRef, values: &[Value]| -> Result<(), QueryError> {
             if skipped.contains(&(sources.len(), origin)) {
+                return Ok(());
+            }
+            if enforce && (!crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Select, false, values)?
+                || (require_update && !crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Update, false, values)?)) {
                 return Ok(());
             }
             let mut values = indices
@@ -359,13 +373,14 @@ pub(super) fn execute(
             &mut sources,
             &mut stores,
             &skipped,
+            clauses[0].is_some(),
         )?;
         query.table = Some(query.from[0].name.clone());
         query.projection.push(SelectItem::Expr {
             expr: Expr::CompoundIdentifier(vec![alias, token.clone()]),
             alias: Some(token),
         });
-        for join in &mut query.joins {
+        for (index, join) in query.joins.iter_mut().enumerate() {
             let alias = visible_name(&join.table);
             let token = bind_source(
                 db,
@@ -375,6 +390,7 @@ pub(super) fn execute(
                 &mut sources,
                 &mut stores,
                 &skipped,
+                clauses[index + 1].is_some(),
             )?;
             query.projection.push(SelectItem::Expr {
                 expr: Expr::CompoundIdentifier(vec![alias, token.clone()]),

@@ -11,7 +11,7 @@ struct Closure {
 struct Entry {
     graph: Weak<()>,
     accounts: Weak<imbl::OrdMap<String, UserAccount>>,
-    policy: u64,
+    policy: PolicySnapshot,
     principal: AccountKey,
     seed: AuthCow<BTreeSet<AccountKey>>,
     closure: Arc<Closure>,
@@ -25,7 +25,7 @@ pub(super) fn with_roles<R>(
     if ctx.active_roles.is_empty() {
         return f(&BTreeSet::new());
     }
-    let policy = ROLE_POLICY_GENERATION.load(Ordering::Acquire);
+    let policy = PolicySnapshot::capture();
     let hit = CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let index = cache.iter().position(|entry| {

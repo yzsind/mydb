@@ -1607,6 +1607,10 @@ pub enum PreparedSelectMemoState {
 ///     trick as `PreparedSelectMemo`).
 #[derive(Debug)]
 pub struct PreparedDmlPlan {
+    /// Preserve the unmodified SQL for security/schema rebinds. Cached
+    /// predicates belong to one captured identity and must never be replayed.
+    pub(crate) original_statement: Arc<Statement>,
+    pub(crate) rls_bound: bool,
     pub(crate) semantics: crate::engine::cache::PlanSemantics,
     pub(crate) optimizer_switch: Arc<str>,
     pub(crate) statement: Arc<Statement>,
@@ -2275,6 +2279,7 @@ impl std::ops::Deref for SqlPreparedStatements {
 
 #[derive(Debug, Clone)]
 pub struct SessionContext {
+    pub rls: super::rls::SessionContext,
     pub autocommit: bool,
     pub isolation: IsolationLevel,
     pub next_txn_isolation: Option<IsolationLevel>,
@@ -3214,6 +3219,7 @@ impl SessionContext {
             parse_temporal_sql_mode_bits(&sql_mode) | TEMPORAL_MODE_EXPLICIT;
         let sysvars = SessionSysVarState::default();
         Self {
+            rls: super::rls::SessionContext::default(),
             autocommit: true,
             isolation: global_transaction_isolation(),
             next_txn_isolation: None,

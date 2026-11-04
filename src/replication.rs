@@ -3909,6 +3909,7 @@ fn apply_ops_to_storage(
     txn: TxnView,
     ops: &[RelayOp],
 ) -> Result<(), QueryError> {
+    let _row_security = crate::engine::rls::TrustedInternalScope::enter();
     for op in ops {
         match op {
             RelayOp::RawRows { .. } => {

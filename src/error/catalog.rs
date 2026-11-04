@@ -402,3 +402,8 @@ pub const ER_HTTP_REPLAY_FORBIDDEN: ErrorSpec = ErrorSpec::new(
 
 pub const ER_HTTP_RATE_LIMITED: ErrorSpec =
     ErrorSpec::new(ErrorDomain::MyDb, 50114, *b"HY000", "ER_HTTP_RATE_LIMITED");
+
+/// Row security violations are never downgraded by IGNORE.
+pub const ER_ROW_SECURITY_VIOLATION: ErrorSpec = ErrorSpec::new(ErrorDomain::MyDb, 50130, *b"42501", "ER_ROW_SECURITY_VIOLATION");
+pub const ER_ROW_SECURITY_POLICY: ErrorSpec = ErrorSpec::new(ErrorDomain::MyDb, 50131, *b"42000", "ER_ROW_SECURITY_POLICY");
+pub const ER_ROW_SECURITY_SNAPSHOT_CONFLICT: ErrorSpec = ErrorSpec::new(ErrorDomain::MyDb, 50132, *b"40001", "ER_ROW_SECURITY_SNAPSHOT_CONFLICT");

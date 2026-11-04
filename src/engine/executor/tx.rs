@@ -334,6 +334,7 @@ pub(super) fn commit_session_txn(
             }
         }
     }
+    session.rls.finish_transaction();
     cleanup_temp_tables_after_commit(db, session);
     session.created_temp_table_not_rollbackable = false;
     session.dropped_temp_table_not_rollbackable = false;
@@ -365,6 +366,7 @@ pub(super) fn rollback_session_txn(
             }
         }
     }
+    session.rls.finish_transaction();
     rollback_temp_journal_to(db, session, 0)?;
     if session.created_temp_table_not_rollbackable {
         crate::engine::api::push_statement_warning(
@@ -743,6 +745,7 @@ where
     let savepoint = (!session.autocommit || session.explicit_txn)
         .then(|| db.statement_savepoint(txn.txn_id))
         .transpose()?;
+    let _security_view = crate::engine::rls::StatementViewScope::enter(db, txn);
     let result = execute(db, session, txn);
     let result = match (result, savepoint) {
         (Err(err), Some(savepoint)) => {

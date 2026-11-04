@@ -25,6 +25,7 @@ mod adapter;
 #[cfg(test)]
 pub(crate) use adapter::max_set_operation_branches;
 mod ast;
+pub mod rls;
 pub(crate) mod boolean;
 mod budget;
 pub(crate) use budget::MAX_SELECT_NESTING;
@@ -70,7 +71,7 @@ use manual::*;
 pub use manual::{parse_routine_body_sql, sql_is_effectively_empty};
 pub use print::{binary_op_sql_pub, literal_to_sql_pub};
 pub(crate) use print::{expr_to_catalog_sql, index_expression_to_catalog_sql};
-pub use print::{expr_to_sql, try_expr_to_sql, SqlEncodeError};
+pub use print::{expr_to_sql, try_expr_to_sql, try_query_expr_to_sql, SqlEncodeError};
 pub(crate) use query_ref::QueryMut;
 pub use query_ref::{QueryRef, WithRef};
 pub(crate) use rewrite::preserve_decoded_projection_labels;

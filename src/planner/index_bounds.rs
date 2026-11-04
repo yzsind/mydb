@@ -10,6 +10,7 @@ use std::collections::HashMap;
 pub(crate) enum ConstraintValue {
     Concrete(Value),
     Param(usize),
+    Statement(crate::storage::schema::StatementValue),
 }
 
 /// Equality is an ordering constant only in the column's comparison domain.
@@ -45,6 +46,7 @@ pub(crate) fn equality_fixes_order_value(
             ConstraintValue::Concrete(value) => matches!(value, Value::Float(_) | Value::Double(_)),
             ConstraintValue::Param(index) => crate::engine::params::current_param(*index)
                 .is_none_or(|value| matches!(value, Value::Float(_) | Value::Double(_))),
+            ConstraintValue::Statement(_) => false,
         };
         if approximate {
             return false;
@@ -62,6 +64,7 @@ impl ConstraintValue {
         match self {
             Self::Concrete(value) => KeyPart::for_target(value, target).ok(),
             Self::Param(idx) => Some(KeyPart::Param { idx, target }),
+            Self::Statement(value) => Some(KeyPart::Statement { value, target }),
         }
     }
     // The read planner retains its existing failed-conversion sentinel. Write

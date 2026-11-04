@@ -72,7 +72,7 @@ impl Evaluation<'_> {
                 user,
                 offset: _,
             } => Ok(Scalar(if *user {
-                super::super::session_user_variable(name).unwrap_or(Value::Null)
+                super::super::checked_session_user_variable(name)?
             } else {
                 super::local_variable(name).unwrap_or(Value::Null)
             })),
