@@ -1038,7 +1038,6 @@ impl Database {
         self.capture.budget.check(1)
     }
 
-
     /// Begin a DML transaction. Identical to [`begin_txn`] except that the
     /// slot is flagged as a writer under the SAME txns write-lock acquisition
     /// (instead of lazily on the first `push_undo_with_flush`). The lazy
@@ -1911,6 +1910,16 @@ impl Database {
         )
     }
 
+    pub(crate) fn lock_diagnostic_scope(&self) -> u64 {
+        &self.row_locks_sharded as *const ShardedRowLocks as usize as u64
+    }
+
+    pub(crate) fn async_row_lock_timing_stats(
+        &self,
+    ) -> crate::engine::api::AsyncRowLockTimingStats {
+        self.row_lock_async_registry.timing_stats()
+    }
+
     /// Try to acquire an exclusive row lock; if blocked, wait inline on the
     /// row's shard condvar until either the lock is granted or the configured
     /// wait timeout elapses. Avoids unwinding the entire statement on every
@@ -2050,6 +2059,7 @@ impl Database {
             .unique_reservations
             .may_reserve_key(txn_id, table_id, index_name, key)
         {
+            crate::util::lock_diagnostics::unique_check_passed(txn_id, table_id, index_name, key);
             return Ok(false);
         }
         if self.lock_manager_read().unique_key_uncontended(
@@ -2059,6 +2069,7 @@ impl Database {
             key,
             &self.lock_owner_status(),
         ) {
+            crate::util::lock_diagnostics::unique_check_passed(txn_id, table_id, index_name, key);
             return Ok(false);
         }
         let started = Instant::now();
@@ -2066,6 +2077,7 @@ impl Database {
         let _park_guard =
             row_lock_direct_wake_enabled().then(|| self.row_lock_parkers.register(txn_id));
         let mut waited = false;
+        let mut _wait_trace = None;
         loop {
             crate::engine::cancel::check_cancelled()?;
             let acquire_result = self.lock_manager().acquire_unique_key_lock(
@@ -2077,8 +2089,22 @@ impl Database {
                 &self.lock_owner_status(),
             );
             match acquire_result {
-                Ok(()) => return Ok(waited),
+                Ok(()) => {
+                    crate::util::lock_diagnostics::unique_check_passed(
+                        txn_id, table_id, index_name, key,
+                    );
+                    return Ok(waited);
+                }
                 Err(err) if is_lock_wait_pending_error(&err) => {
+                    if !waited {
+                        _wait_trace = crate::util::lock_diagnostics::Span::enter(
+                            crate::util::lock_diagnostics::UNIQUE_WAIT,
+                            crate::util::lock_diagnostics::UNIQUE_WAIT_END,
+                            self.lock_diagnostic_scope(),
+                            txn_id,
+                            table_id,
+                        );
+                    }
                     waited = true;
                 }
                 Err(err) => {
@@ -2979,6 +3005,13 @@ impl Database {
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<u64, QueryError> {
+        let _trace = crate::util::lock_diagnostics::Span::enter(
+            crate::util::lock_diagnostics::COMMIT_BEGIN,
+            crate::util::lock_diagnostics::COMMIT_END,
+            self.lock_diagnostic_scope(),
+            txn_id,
+            0,
+        );
         let mut deferred = self.commit_txn_deferred(txn_id)?;
         let commit_scn = deferred.commit_scn;
         self.finish_deferred_commits(&mut [&mut deferred])?;

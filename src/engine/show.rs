@@ -2985,6 +2985,7 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
     let status = db.storage_status();
     let exec_permit = crate::util::exec_permit::status_snapshot();
     let async_row_lock = crate::mysql::session::async_row_lock_retry_stats();
+    let async_row_timing = db.async_row_lock_timing_stats();
     let ddl_copy = db.ddl_copy_perf_snapshot();
     let online_constraint = db.online_constraint_perf_snapshot();
     let load_shadow = db.load_shadow_perf_snapshot();
@@ -3494,6 +3495,12 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         "async_row_lock_retries" => async_row_lock.0.to_string(),
         "async_row_lock_wakeups" => async_row_lock.1.to_string(),
         "async_row_lock_fallbacks" => async_row_lock.2.to_string(),
+        "async_row_lock_wait_count" => async_row_timing.waits.count.to_string(),
+        "async_row_lock_wait_total_us" => async_row_timing.waits.total_us.to_string(),
+        "async_row_lock_wait_max_us" => async_row_timing.waits.max_us.to_string(),
+        "async_row_lock_wake_delay_count" => async_row_timing.wake_delay.count.to_string(),
+        "async_row_lock_wake_delay_total_us" => async_row_timing.wake_delay.total_us.to_string(),
+        "async_row_lock_wake_delay_max_us" => async_row_timing.wake_delay.max_us.to_string(),
         // Compiled-expression-program cache and fallback counters.
         // Lets operators see how often the row-eval hot path stays on
         // the compiled tree versus falling back to the legacy interpreter,

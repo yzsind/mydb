@@ -2,6 +2,28 @@ use super::purge_tests::make_record;
 use super::*;
 
 #[test]
+fn undo_resident_admission_rejection_does_not_wait_for_accounting_owner() {
+    let undo = UndoManager::default();
+    let admission = undo.resident_admission();
+    let held = undo.resident_charge.lock();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result =
+            crate::engine::executor::mem_budget::with_test_effective_memory_limit(1, || {
+                admission.reserve(&make_record(1, 1, 1, None))
+            });
+        sender.send(result.map(|_| ())).unwrap();
+    });
+    let rejected = receiver.recv_timeout(std::time::Duration::from_secs(1));
+    drop(held);
+    worker.join().unwrap();
+    assert!(rejected
+        .expect("memory admission must finish before taking the accounting owner")
+        .is_err());
+    assert_eq!(undo.resident_charge_bytes(), 0);
+}
+
+#[test]
 fn refactor_undo_full_and_metadata_share_headers_lobs_and_reject_truncated_tail() {
     let mut record = make_record(17, 3, 5, Some(11));
     record.kind = UndoKind::Update;

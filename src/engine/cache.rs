@@ -888,6 +888,7 @@ pub struct ProjectedPointLookupOperator {
 #[derive(Debug)]
 pub enum CompiledOperator {
     ProjectedUniquePointLookup(Arc<ProjectedPointLookupOperator>),
+    StreamingIndexPrefixSum,
     ProjectedIndexRangeOrMultiLookup,
     FusedScanFilterProjectLimit,
     OrderedIndexScan,
@@ -904,6 +905,12 @@ impl CompiledOperator {
             )
         {
             return Self::ProjectedUniquePointLookup(Arc::new(operator));
+        }
+
+        // Prefix cardinality estimates can be wrong. This kernel streams
+        // bounded chunks even when a supposedly small prefix is highly skewed.
+        if crate::engine::executor::select::simple::prefer_streaming_prefix_sum(select, plan) {
+            return Self::StreamingIndexPrefixSum;
         }
 
         fn classify(plan: &PhysicalPlan, projected: bool, limited: bool) -> CompiledOperator {

@@ -2212,7 +2212,16 @@ where
             // from `wait_timeout` or `interactive_timeout` per the
             // CLIENT_INTERACTIVE capability.
             let idle_timeout = self.idle_command_timeout();
-            let packet = match self.read_command_packet(idle_timeout).await {
+            let read_span = crate::util::lock_diagnostics::Span::enter(
+                crate::util::lock_diagnostics::READ_BEGIN,
+                crate::util::lock_diagnostics::READ_END,
+                0,
+                self.context.current_txn.unwrap_or(0),
+                self.context.connection_id as u64,
+            );
+            let read_result = self.read_command_packet(idle_timeout).await;
+            drop(read_span);
+            let packet = match read_result {
                 Ok(packet) => packet,
                 Err(err) => {
                     if let Some(limit) = err

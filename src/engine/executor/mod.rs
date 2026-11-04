@@ -135,7 +135,13 @@ use self::select_into_file::*;
 use self::triggers::*;
 use self::tx::*;
 
-fn begin_statement_diagnostics(session: &mut SessionContext, sql: &str) -> bool {
+fn begin_statement_diagnostics(db: &Database, session: &mut SessionContext, sql: &str) -> bool {
+    crate::util::lock_diagnostics::statement_begin(
+        db.lock_diagnostic_scope(),
+        session.current_txn.unwrap_or(0),
+        session.connection_id as u64,
+        sql,
+    );
     let preserve_warnings = preserves_statement_diagnostics(sql);
     crate::engine::perf_events::clear_thread_wait_samples();
     crate::engine::perf_events::start_statement_rows_examined();
@@ -792,6 +798,7 @@ fn capture_dml_statement_result(
 }
 
 fn finish_statement_diagnostics(
+    db: &Database,
     session: &mut SessionContext,
     preserve_warnings: bool,
     result: &Result<QueryResponse, QueryError>,
@@ -842,6 +849,11 @@ fn finish_statement_diagnostics(
     if !preserve_warnings {
         session.diagnostics_row_count = session.last_row_count;
     }
+    crate::util::lock_diagnostics::statement_end(
+        db.lock_diagnostic_scope(),
+        session.current_txn.unwrap_or(0),
+        session.connection_id as u64,
+    );
 }
 
 fn cap_direct_group_concat_limit_warnings(sql: &str, result: &Result<QueryResponse, QueryError>) {
@@ -2979,7 +2991,7 @@ impl StorageQueryEngine {
         let _trace_session =
             crate::engine::cbo::trace::activate(session.connection_id, trace_enabled);
         crate::engine::cbo::trace::begin(sql);
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         if !preserve_warnings {
             session
                 .warnings
@@ -3072,7 +3084,7 @@ impl StorageQueryEngine {
         }
         drop(_cancel_guard);
         if finish_diagnostics {
-            finish_statement_diagnostics(session, preserve_warnings, &result);
+            finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         }
         self.finish_or_observe_query(
             session,
@@ -3749,7 +3761,7 @@ impl QueryEngine for StorageQueryEngine {
             self.execute_text_prepared_dml_batch(session, sql, params, batch, Some(&mut statements))
         });
         if result.is_err() {
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
         }
         Some((statements, result))
     }
@@ -4195,10 +4207,10 @@ impl QueryEngine for StorageQueryEngine {
         session.check_cancelled()?;
         let _fk_checks_guard = crate::storage::FkChecksGuard::new(session.foreign_key_checks);
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
-        begin_statement_diagnostics(session, "LOAD DATA");
+        begin_statement_diagnostics(&self.db, session, "LOAD DATA");
         if let Err(err) = authorize_statement(&self.db, session, &statement) {
             let result = Err(err);
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
             return result;
         }
         if let Statement::LoadData(stmt) = statement {
@@ -4216,14 +4228,14 @@ impl QueryEngine for StorageQueryEngine {
                 })
             };
             drop(_cancel_guard);
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
             result
         } else {
             let err = Err(crate::storage::error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 "expected LOAD DATA statement",
             ));
-            finish_statement_diagnostics(session, false, &err);
+            finish_statement_diagnostics(&self.db, session, false, &err);
             err
         }
     }
@@ -4238,10 +4250,10 @@ impl QueryEngine for StorageQueryEngine {
         session.check_cancelled()?;
         let _fk_checks_guard = crate::storage::FkChecksGuard::new(session.foreign_key_checks);
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
-        begin_statement_diagnostics(session, "LOAD DATA LOCAL");
+        begin_statement_diagnostics(&self.db, session, "LOAD DATA LOCAL");
         if let Err(err) = authorize_statement(&self.db, session, &statement) {
             let result = Err(err);
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
             return result;
         }
         // LOCAL bypasses the ordinary text dispatcher. Its metadata lease
@@ -4254,7 +4266,7 @@ impl QueryEngine for StorageQueryEngine {
             Ok(guard) => guard,
             Err(err) => {
                 let result = Err(err);
-                finish_statement_diagnostics(session, false, &result);
+                finish_statement_diagnostics(&self.db, session, false, &result);
                 return result;
             }
         };
@@ -4301,7 +4313,7 @@ impl QueryEngine for StorageQueryEngine {
             result,
             mdl_scope.outermost(),
         );
-        finish_statement_diagnostics(session, false, &result);
+        finish_statement_diagnostics(&self.db, session, false, &result);
         result
     }
 
@@ -4336,7 +4348,7 @@ impl QueryEngine for StorageQueryEngine {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let started = Instant::now();
         let _http_scope = crate::engine::http::enter(&self.db);
         if _http_dependent {
@@ -4413,7 +4425,7 @@ impl QueryEngine for StorageQueryEngine {
         let result =
             result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(session, sql, started, metadata, result, None)
     }
 
@@ -4534,12 +4546,12 @@ impl QueryEngine for StorageQueryEngine {
                 }
             }
         }
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         if let Some(simple_kind) =
             simple_txn_control_kind(sql.trim_matches(|c: char| c.is_whitespace() || c == ';'))
         {
             let result = dispatch_simple_txn_control(&self.db, session, simple_kind);
-            finish_statement_diagnostics(session, preserve_warnings, &result);
+            finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
             return Some(result);
         }
         if self.plan_cache_enabled {
@@ -4589,7 +4601,7 @@ impl QueryEngine for StorageQueryEngine {
         let result =
             result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         Some(result)
     }
 
@@ -4845,7 +4857,7 @@ impl QueryEngine for StorageQueryEngine {
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         self.db.ensure_operational()?;
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let started = Instant::now();
         let _http_scope = crate::engine::http::enter(&self.db);
         if _http_dependent {
@@ -4894,7 +4906,7 @@ impl QueryEngine for StorageQueryEngine {
         let result =
             result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(session, sql, started, metadata, result, Some(shape_sql))
     }
 }
@@ -4916,7 +4928,7 @@ impl StorageQueryEngine {
         if let Err(err) = session.check_cancelled() {
             return Err(err);
         }
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let started = Instant::now();
         let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
@@ -4949,7 +4961,7 @@ impl StorageQueryEngine {
             self.undo_purge_worker.wake();
         }
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(
             session,
             sql,
@@ -5022,7 +5034,7 @@ impl StorageQueryEngine {
     ) -> Result<QueryResponse, QueryError> {
         session.check_cancelled()?;
         let started = Instant::now();
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         // Pick the read view that matches the eligibility branch — the
         // autocommit path takes a fresh statement view; the lazy
         // in-transaction path threads the transaction's RR pin so
@@ -5064,7 +5076,7 @@ impl StorageQueryEngine {
             // not completed failed SQL statements and must not be logged as such.
             return result;
         }
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(
             session,
             sql,
@@ -5680,7 +5692,7 @@ impl StorageQueryEngine {
         }
         for (plan, count) in batch.plans.iter().zip(batch.param_counts.iter().copied()) {
             if statements.is_some() {
-                begin_statement_diagnostics(session, sql);
+                begin_statement_diagnostics(&self.db, session, sql);
                 if let Some(kind) =
                     crate::engine::status_counters::classify_statement_com(&plan.statement)
                 {
@@ -5710,7 +5722,7 @@ impl StorageQueryEngine {
                 .elapsed
                 .saturating_add(statement_wait_stats.elapsed);
             if let Some(out) = statements.as_deref_mut() {
-                finish_statement_diagnostics(session, false, &result);
+                finish_statement_diagnostics(&self.db, session, false, &result);
                 if let Ok(QueryResponse::OkAffected { affected_rows }) = &result {
                     out.push(capture_dml_statement_result(session, *affected_rows));
                 } else if matches!(result, Ok(QueryResponse::Ok)) {
@@ -5747,7 +5759,7 @@ impl StorageQueryEngine {
             return Err(err);
         }
         let started = Instant::now();
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let metadata = QueryLogMetadata {
             is_ddl: false,
             ..QueryLogMetadata::default()
@@ -5758,7 +5770,7 @@ impl StorageQueryEngine {
         if result.is_ok() {
             self.undo_purge_worker.wake();
         }
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         let metadata = metadata.with_lock_wait_stats(wait_stats);
         self.finish_or_observe_query(session, sql, started, metadata, result, None)
     }

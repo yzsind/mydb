@@ -328,11 +328,13 @@ impl Database {
         txn: TxnView,
         rows: &[Vec<Value>],
         batch_unique_keys: &BTreeMap<String, crate::util::fast_hash::AhHashSet<IndexKey>>,
+        cached_keys: Option<&ScalarInsertKeys>,
     ) -> Result<(), QueryError> {
-        for index in table
+        for (index_position, index) in table
             .indexes
             .iter()
-            .filter(|index| index.enforces_uniqueness())
+            .enumerate()
+            .filter(|(_, index)| index.enforces_uniqueness())
         {
             let Some(keys) = batch_unique_keys.get(&index.name) else {
                 continue;
@@ -360,7 +362,7 @@ impl Database {
                 self.check_unique_constraint_via_merge(table, txn, index, rows)?;
                 continue;
             }
-            for values in rows {
+            for (row, values) in rows.iter().enumerate() {
                 let _partition = if table.is_partitioned() {
                     Some(
                         crate::engine::executor::partition_router::push_pruned_partitions(vec![
@@ -370,7 +372,10 @@ impl Database {
                 } else {
                     None
                 };
-                let key = table.index_key(index, values)?;
+                let key = match cached_keys {
+                    Some(keys) => keys.key(row, index_position).clone(),
+                    None => table.index_key(index, values)?,
+                };
                 if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                     continue;
                 }
@@ -588,12 +593,7 @@ impl Database {
             return Ok(None);
         }
         for key in keys {
-            self.check_unique_key_reservation(
-                txn.txn_id,
-                table.id,
-                &index.name,
-                key,
-            )?;
+            self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, key)?;
         }
         self.with_index_read(table.id, &index.name, |file| {
             file.lookup_entries_many_sorted_keyed_bounded(
@@ -617,12 +617,7 @@ impl Database {
             if earliest.is_some_and(|prior| *ordinal >= prior) {
                 continue;
             }
-            self.check_unique_key_reservation(
-                txn.txn_id,
-                table.id,
-                &index.name,
-                key,
-            )?;
+            self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, key)?;
             for (storage_id, row_id) in
                 self.lookup_index_row_locations(table, index, key.clone())?
             {
@@ -742,12 +737,7 @@ impl Database {
                     // path), then validate the conflict against the
                     // exact row_id the index pointed at — no need to
                     // re-descend the B-tree.
-                    self.check_unique_key_reservation(
-                        txn.txn_id,
-                        table.id,
-                        &index.name,
-                        &idx_key,
-                    )?;
+                    self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, &idx_key)?;
                     // Merge-join only runs for unpartitioned tables (gated in
                     // `check_batch_unique_constraints`), so the owning heap is
                     // `table.id`.
@@ -885,12 +875,7 @@ impl Database {
         key: IndexKey,
         released_rows: Option<&crate::util::fast_hash::AhHashSet<RowId>>,
     ) -> Result<(), QueryError> {
-        self.check_unique_key_reservation(
-            txn.txn_id,
-            table.id,
-            &index.name,
-            &key,
-        )?;
+        self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, &key)?;
         for (storage_id, row_id) in self.lookup_index_row_locations(table, index, key.clone())? {
             // The earlier row is locked and its accepted update releases this
             // old key. Batch-local new-key reservations remain authoritative.

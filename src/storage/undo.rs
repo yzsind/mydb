@@ -1442,7 +1442,13 @@ fn reserve_undo_resident(
     } else {
         usize::try_from(estimate_undo_resident_bytes(record)).unwrap_or(usize::MAX)
     };
-    charge.lock().try_grow(bytes)?;
+    // Admission can sample physical pressure or reclaim other owners. Keep
+    // that work outside this shared accounting latch, so independent undo
+    // reservations and releases can progress. Absorb transfers the same
+    // governed bytes without a release/reacquire gap.
+    let mut admitted =
+        ControlledMemoryCharge::try_new(ControlledMemoryCategory::SystemMetadata, bytes)?;
+    charge.lock().absorb(&mut admitted);
     Ok(UndoResidentReservation {
         charge: Arc::clone(charge),
         bytes,

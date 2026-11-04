@@ -7,6 +7,207 @@
 use super::*;
 use crate::engine::api::{PreparedSelectMemoState, QueryEngine};
 
+#[test]
+fn prepared_prefix_scalar_aggregate_uses_existing_fused_kernel() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE prefix_agg(tenant INT, id INT, amount DECIMAL(18,4), PRIMARY KEY(tenant,id))").unwrap();
+    engine
+        .execute("INSERT INTO prefix_agg VALUES(1,1,1.2500),(1,2,NULL),(1,3,-0.1250),(2,1,NULL)")
+        .unwrap();
+    let sql = "SELECT SUM(amount) FROM prefix_agg WHERE tenant=?";
+    let mut session = SessionContext::default();
+    let parsed = engine.prepare_cached(&mut session, sql, 1).unwrap();
+    let mut state = PreparedSelectMemoState::default();
+    for tenant in [1, 2, 3, 1] {
+        let params = [Value::Int(tenant)];
+        let response = compiled(&engine, &mut session, &mut state, &parsed, sql, &params)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(response, QueryResponse::ResultSet(_)),
+            "small prefix aggregate should finish without a streaming worker"
+        );
+        let expected = crate::engine::executor::vec::config::with_vec_mode(
+            crate::engine::executor::vec::config::VecMode::On,
+            || rows_of(legacy(&engine, &mut session, &parsed, sql, &params).unwrap()),
+        );
+        assert_eq!(rows_of(response), expected);
+        let PreparedSelectMemoState::Ready(memo) = &state else {
+            panic!("expected compiled aggregate");
+        };
+        assert!(
+            matches!(
+                memo.compiled.executable.as_ref(),
+                crate::engine::cache::CompiledOperator::StreamingIndexPrefixSum
+            ),
+            "prefix aggregate did not reuse the fused kernel: {:?}",
+            memo.compiled.executable
+        );
+    }
+}
+
+#[test]
+fn prefix_scalar_aggregate_rechecks_mvcc_keys_and_finalization() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE prefix_versions(tenant INT,id INT,amount DECIMAL(18,4),PRIMARY KEY(tenant,id))").unwrap();
+    engine
+        .execute(
+            "INSERT INTO prefix_versions VALUES(1,1,1.2500),(1,2,NULL),(1,3,-0.1250),(2,1,NULL)",
+        )
+        .unwrap();
+    let mut reader = SessionContext::default();
+    let mut writer = SessionContext::default();
+    engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+    let queries = [
+        "SELECT SUM(amount) FROM prefix_versions WHERE tenant=?",
+        "SELECT AVG(amount) FROM prefix_versions WHERE tenant=? AND id>1",
+        "SELECT COUNT(amount) FROM prefix_versions WHERE tenant=?",
+        "SELECT MIN(amount) FROM prefix_versions WHERE tenant=?",
+        "SELECT MAX(amount) FROM prefix_versions WHERE tenant=?",
+        "SELECT SUM(amount) FROM prefix_versions WHERE tenant=? LIMIT 0",
+        "SELECT SUM(amount) FROM prefix_versions WHERE tenant=? LIMIT 1 OFFSET 1",
+        "SELECT COUNT(DISTINCT amount) FROM prefix_versions WHERE tenant=?",
+    ];
+    let plans = queries
+        .iter()
+        .map(|sql| engine.prepare_cached(&mut reader, sql, 1).unwrap())
+        .collect::<Vec<_>>();
+    let mut states = (0..queries.len())
+        .map(|_| PreparedSelectMemoState::default())
+        .collect::<Vec<_>>();
+    for phase in 0..4 {
+        match phase {
+            1 => {
+                engine.execute_with_session(&mut writer, "BEGIN").unwrap();
+                engine
+                    .execute_with_session(
+                        &mut writer,
+                        "UPDATE prefix_versions SET tenant=9,amount=99 WHERE tenant=1 AND id=1",
+                    )
+                    .unwrap();
+                engine
+                    .execute_with_session(
+                        &mut writer,
+                        "DELETE FROM prefix_versions WHERE tenant=1 AND id=3",
+                    )
+                    .unwrap();
+            }
+            2 => {
+                engine
+                    .execute_with_session(&mut writer, "ROLLBACK")
+                    .unwrap();
+            }
+            3 => {
+                engine
+                    .execute("ALTER TABLE prefix_versions ADD COLUMN extra INT DEFAULT 7")
+                    .unwrap();
+            }
+            _ => {}
+        }
+        for (i, sql) in queries.iter().enumerate() {
+            let params = [Value::Int(1)];
+            let actual = rows_of(
+                compiled(
+                    &engine,
+                    &mut reader,
+                    &mut states[i],
+                    &plans[i],
+                    sql,
+                    &params,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            let expected = crate::engine::executor::vec::config::with_vec_mode(
+                crate::engine::executor::vec::config::VecMode::On,
+                || rows_of(legacy(&engine, &mut reader, &plans[i], sql, &params).unwrap()),
+            );
+            assert_eq!(actual, expected, "phase={phase}, {sql}");
+        }
+        if phase == 2 {
+            engine.execute_with_session(&mut reader, "COMMIT").unwrap();
+        }
+    }
+}
+
+#[test]
+fn prefix_sum_streams_a_growing_prefix_under_an_old_small_plan() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE prefix_growth(tenant INT,id INT,amount DECIMAL(18,4),PRIMARY KEY(tenant,id))").unwrap();
+    engine
+        .execute("INSERT INTO prefix_growth VALUES(1,1,1.0000),(1,2,NULL)")
+        .unwrap();
+    let sql = "SELECT SUM(amount) FROM prefix_growth WHERE tenant=?";
+    let mut session = SessionContext::default();
+    let parsed = engine.prepare_cached(&mut session, sql, 1).unwrap();
+    let mut state = PreparedSelectMemoState::default();
+    compiled(
+        &engine,
+        &mut session,
+        &mut state,
+        &parsed,
+        sql,
+        &[Value::Int(1)],
+    )
+    .unwrap()
+    .unwrap();
+    let PreparedSelectMemoState::Ready(memo) = &state else {
+        panic!("expected memo")
+    };
+    let cached = Arc::clone(&memo.compiled);
+    let select = Arc::clone(&memo.presentation_select);
+    assert!(matches!(
+        cached.executable.as_ref(),
+        crate::engine::cache::CompiledOperator::StreamingIndexPrefixSum
+    ));
+    // Reverse insertion makes the physical RowId order differ from key order
+    // in every chunk. Preserve the old small plan while growing its input.
+    for batch in (0..16).rev() {
+        let values = (0..256)
+            .rev()
+            .map(|n| format!("(1,{},2.0000)", 3 + batch * 256 + n))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO prefix_growth VALUES {values}"))
+            .unwrap();
+    }
+    let db = engine.db_handle();
+    let (txn, _snapshot) =
+        db.read_only_statement_view_with_guard(crate::storage::IsolationLevel::ReadCommitted, None);
+    let before = crate::engine::executor::mem_budget::controlled_memory_snapshot().2[1];
+    let actual = crate::engine::params::with_params(vec![Value::Int(1)], || {
+        crate::engine::executor::select::simple::execute_streaming_prefix_sum(
+            db,
+            txn,
+            &select,
+            &cached.physical,
+        )
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(actual.rows[0][0].to_display_string(), "8193.0000");
+    assert_eq!(
+        crate::engine::executor::mem_budget::controlled_memory_snapshot().2[1],
+        before,
+        "cursor/sort scratch must be released after the operation"
+    );
+    let expected = crate::engine::executor::vec::config::with_vec_mode(
+        crate::engine::executor::vec::config::VecMode::On,
+        || {
+            rows_of(
+                engine
+                    .execute("SELECT SUM(amount) FROM prefix_growth WHERE tenant=1")
+                    .unwrap(),
+            )
+        },
+    );
+    assert_eq!(actual.rows, expected);
+}
+
 fn rows_of(resp: QueryResponse) -> Vec<Vec<Value>> {
     match resp.materialize().expect("compiled SELECT materializes") {
         QueryResponse::ResultSet(rs) => rs.rows,

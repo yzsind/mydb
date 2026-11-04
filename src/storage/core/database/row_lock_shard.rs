@@ -100,6 +100,18 @@ impl std::fmt::Debug for ShardedRowLocks {
 }
 
 impl ShardedRowLocks {
+    #[inline]
+    fn diagnostic_event(&self, kind: u64, txn: u64, key: (u64, RowId), mode: LockMode) {
+        crate::util::lock_diagnostics::event(
+            kind,
+            self as *const Self as usize as u64,
+            txn,
+            key.0,
+            (u64::from(key.1.page_id) << 16) | u64::from(key.1.slot_id),
+            u64::from(mode == LockMode::Exclusive),
+        );
+    }
+
     pub(crate) fn new() -> Self {
         let n = row_lock_shard_count();
         let mut row_shards = Vec::with_capacity(n);
@@ -312,11 +324,13 @@ impl ShardedRowLocks {
             match Self::compat(&shard, key, txn_id, mode) {
                 LockOwnerCheck::SelfHolds => {
                     Self::pop_front_waiter(&mut shard, key, txn_id);
+                    let mut upgraded = false;
                     // Possible S->X upgrade.
                     if mode == LockMode::Exclusive {
                         if let Some(state) = shard.locks.get_mut(&key) {
                             if state.mode == LockMode::Shared && state.sole_owner(txn_id) {
                                 state.mode = LockMode::Exclusive;
+                                upgraded = true;
                             } else if state.mode == LockMode::Shared {
                                 let owners = state.owners.blockers_except(txn_id);
                                 drop(shard);
@@ -328,6 +342,16 @@ impl ShardedRowLocks {
                             }
                         }
                     }
+                    self.diagnostic_event(
+                        if upgraded {
+                            crate::util::lock_diagnostics::GRANT
+                        } else {
+                            crate::util::lock_diagnostics::REENTER
+                        },
+                        txn_id,
+                        key,
+                        mode,
+                    );
                     drop(shard);
                     return RowAcquireOutcome::Acquired {
                         cleared_wait: self.clear_waiting(txn_id, Some(key)),
@@ -347,6 +371,12 @@ impl ShardedRowLocks {
                         }
                         Self::pop_front_waiter(&mut shard, key, txn_id);
                         granted = Some(HeldLock::RowMode(table_id, row_id, mode));
+                        self.diagnostic_event(
+                            crate::util::lock_diagnostics::GRANT,
+                            txn_id,
+                            key,
+                            mode,
+                        );
                     } else {
                         Self::pop_front_waiter(&mut shard, key, txn_id);
                     }
@@ -356,6 +386,12 @@ impl ShardedRowLocks {
                         shard.locks.insert(key, RowLockState::new(mode, txn_id));
                         Self::pop_front_waiter(&mut shard, key, txn_id);
                         granted = Some(HeldLock::RowMode(table_id, row_id, mode));
+                        self.diagnostic_event(
+                            crate::util::lock_diagnostics::GRANT,
+                            txn_id,
+                            key,
+                            mode,
+                        );
                     } else {
                         Self::pop_front_waiter(&mut shard, key, txn_id);
                     }
@@ -421,6 +457,12 @@ impl ShardedRowLocks {
         if let Some(stale) = stale.filter(|stale| Some(*stale) != granted) {
             let mut shard = self.row_shard(stale).lock();
             Self::dequeue_waiter(&mut shard, stale, txn_id);
+            self.diagnostic_event(
+                crate::util::lock_diagnostics::CANCEL_WAIT,
+                txn_id,
+                stale,
+                LockMode::Exclusive,
+            );
         }
     }
 
@@ -448,6 +490,7 @@ impl ShardedRowLocks {
                 Self::dequeue_waiter(&mut shard, prev_key, txn_id);
             }
         }
+        self.diagnostic_event(crate::util::lock_diagnostics::WAIT, txn_id, key, _mode);
         RowAcquireOutcome::Conflict { owners }
     }
 
@@ -458,6 +501,17 @@ impl ShardedRowLocks {
             let shard = self.row_shard(key).lock();
             if let Some(q) = shard.row_waiters.get(&key) {
                 if let Some(front) = q.front() {
+                    if crate::util::lock_diagnostics::tracing(front.txn_id) && !matches!(
+                        Self::compat(&shard, key, front.txn_id, front.mode),
+                        LockOwnerCheck::Conflict(_)
+                    ) {
+                        self.diagnostic_event(
+                            crate::util::lock_diagnostics::ELIGIBLE,
+                            front.txn_id,
+                            key,
+                            front.mode,
+                        );
+                    }
                     out.push(front.txn_id);
                 }
             }
@@ -474,14 +528,10 @@ impl ShardedRowLocks {
             .unwrap_or(0)
     }
 
-
     /// Total number of row-lock + waiter entries held by a single txn batch
     /// pre-size hint; not exact across shards (only used as a reserve hint).
     pub(crate) fn approx_lock_count(&self) -> usize {
-        self.row_shards
-            .iter()
-            .map(|s| s.lock().locks.len())
-            .sum()
+        self.row_shards.iter().map(|s| s.lock().locks.len()).sum()
     }
 
     /// Release every row lock held by `txn_id` (commit / rollback). Returns the
@@ -497,6 +547,12 @@ impl ShardedRowLocks {
         if let Some(key) = entry.waiting_on {
             let mut shard = self.row_shard(key).lock();
             Self::dequeue_waiter(&mut shard, key, txn_id);
+            self.diagnostic_event(
+                crate::util::lock_diagnostics::CANCEL_WAIT,
+                txn_id,
+                key,
+                LockMode::Exclusive,
+            );
             freed.push(key);
         }
         for held in entry.log {
@@ -524,6 +580,12 @@ impl ShardedRowLocks {
         if let Some(key) = waiting_on {
             let mut shard = self.row_shard(key).lock();
             Self::dequeue_waiter(&mut shard, key, txn_id);
+            self.diagnostic_event(
+                crate::util::lock_diagnostics::CANCEL_WAIT,
+                txn_id,
+                key,
+                LockMode::Exclusive,
+            );
         }
         waiting_on
     }
@@ -554,9 +616,7 @@ impl ShardedRowLocks {
         let released: Vec<HeldLock> = {
             let mut map = self.txn_shard(txn_id).lock();
             match map.get_mut(&txn_id) {
-                Some(entry) if entry.log.len() > row_log_len => {
-                    entry.log.split_off(row_log_len)
-                }
+                Some(entry) if entry.log.len() > row_log_len => entry.log.split_off(row_log_len),
                 _ => Vec::new(),
             }
         };
@@ -588,7 +648,11 @@ impl ShardedRowLocks {
         let key = (table_id, row_id);
         let mut shard = self.row_shard(key).lock();
         let mut remove = false;
+        let mut released_mode = None;
         if let Some(state) = shard.locks.get_mut(&key) {
+            if crate::util::lock_diagnostics::tracing(txn_id) && state.holds(txn_id) {
+                released_mode = Some(state.mode);
+            }
             if state.owners.remove(txn_id) {
                 remove = true;
             } else if state.mode == LockMode::Exclusive {
@@ -597,6 +661,9 @@ impl ShardedRowLocks {
         }
         if remove {
             shard.locks.remove(&key);
+        }
+        if let Some(mode) = released_mode {
+            self.diagnostic_event(crate::util::lock_diagnostics::RELEASE, txn_id, key, mode);
         }
     }
 
@@ -618,11 +685,7 @@ impl ShardedRowLocks {
             let key = (table_id, row_id);
             let mut shard = self.row_shard(key).lock();
             // Never jump a non-empty queue.
-            if shard
-                .row_waiters
-                .get(&key)
-                .is_some_and(|q| !q.is_empty())
-            {
+            if shard.row_waiters.get(&key).is_some_and(|q| !q.is_empty()) {
                 deferred.push(row_id);
                 continue;
             }
@@ -630,6 +693,7 @@ impl ShardedRowLocks {
                 LockOwnerCheck::Free => {
                     shard.locks.insert(key, RowLockState::new(mode, txn_id));
                     acquired.push(row_id);
+                    self.diagnostic_event(crate::util::lock_diagnostics::GRANT, txn_id, key, mode);
                 }
                 LockOwnerCheck::CanShare => {
                     if let Some(state) = shard.locks.get_mut(&key) {
@@ -640,6 +704,7 @@ impl ShardedRowLocks {
                         shard.locks.insert(key, RowLockState::new(mode, txn_id));
                     }
                     acquired.push(row_id);
+                    self.diagnostic_event(crate::util::lock_diagnostics::GRANT, txn_id, key, mode);
                 }
                 LockOwnerCheck::SelfHolds | LockOwnerCheck::Conflict(_) => deferred.push(row_id),
             }
@@ -767,12 +832,7 @@ impl ShardedRowLocks {
     /// so retaining the newly acquired lock until transaction end would only
     /// convoy the next waiter. A lock inherited from an earlier statement is
     /// never at risk because callers first record `holds_row`.
-    pub(crate) fn release_last_exact_row(
-        &self,
-        txn_id: u64,
-        table_id: u64,
-        row_id: RowId,
-    ) -> bool {
+    pub(crate) fn release_last_exact_row(&self, txn_id: u64, table_id: u64, row_id: RowId) -> bool {
         let popped = {
             let mut map = self.txn_shard(txn_id).lock();
             let Some(entry) = map.get_mut(&txn_id) else {
@@ -810,20 +870,14 @@ fn row_lock_shard_count() -> usize {
 impl Database {
     pub(crate) fn txn_holds_row_lock(&self, txn_id: u64, table_id: u64, row_id: RowId) -> bool {
         if row_lock_sharding_enabled() {
-            self.row_locks_sharded
-                .holds_row(txn_id, table_id, row_id)
+            self.row_locks_sharded.holds_row(txn_id, table_id, row_id)
         } else {
             self.lock_manager_read()
                 .row_lock_held_by_txn(txn_id, table_id, row_id)
         }
     }
 
-    pub(crate) fn release_new_point_row_lock(
-        &self,
-        txn_id: u64,
-        table_id: u64,
-        row_id: RowId,
-    ) {
+    pub(crate) fn release_new_point_row_lock(&self, txn_id: u64, table_id: u64, row_id: RowId) {
         let released = if row_lock_sharding_enabled() {
             self.row_locks_sharded
                 .release_last_exact_row(txn_id, table_id, row_id)
@@ -848,9 +902,10 @@ impl Database {
         mode: LockMode,
     ) -> Result<bool, QueryError> {
         if row_lock_sharding_enabled() {
-            return match self.row_locks_sharded.try_acquire_without_wait(
-                txn_id, table_id, row_id, mode, true,
-            ) {
+            return match self
+                .row_locks_sharded
+                .try_acquire_without_wait(txn_id, table_id, row_id, mode, true)
+            {
                 RowAcquireOutcome::Acquired { cleared_wait } => {
                     if cleared_wait {
                         self.lock_manager().clear_wait(txn_id);
@@ -1011,7 +1066,8 @@ impl Database {
                 .approx_lock_count()
                 .saturating_add(self.lock_manager_read().unique_key_lock_count());
             if current.saturating_add(row_ids.len()) > max {
-                return Err(error(crate::error::catalog::ER_LOCK_TABLE_FULL,
+                return Err(error(
+                    crate::error::catalog::ER_LOCK_TABLE_FULL,
                     "The total number of locks exceeds the lock table size",
                 ));
             }
@@ -1101,6 +1157,9 @@ mod audit_reinstate_tests {
         assert_eq!(snapshot.len(), 1);
         assert!(snapshot[0].2.contains(&1));
         assert!(snapshot[0].2.contains(&2));
-        assert!(matches!(locks.try_acquire_without_wait(3, 9, row, LockMode::Exclusive, true), RowAcquireOutcome::Conflict { .. }));
+        assert!(matches!(
+            locks.try_acquire_without_wait(3, 9, row, LockMode::Exclusive, true),
+            RowAcquireOutcome::Conflict { .. }
+        ));
     }
 }

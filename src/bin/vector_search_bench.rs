@@ -1,6 +1,6 @@
 //! Multidimensional KNN/L2 benchmark with scalar, SIMD, and matrix paths.
 //!
-//!   1. `scalar`: pure Rust scalar element-wise fma, an auto-vectorization baseline.
+//!   1. `scalar`: ordered scalar subtraction, multiplication, and addition.
 //!   2. `neon`: handwritten AArch64 NEON SIMD with four independent accumulators.
 //!   3. `amx`: Apple Accelerate `cblas_sgemm`. On Apple Silicon,
 //!      Accelerate BLAS dispatches to the AMX matrix coprocessor, representing
@@ -10,6 +10,7 @@
 //!   5. `sme(matrix)`: batch queries with f32 outer products. Database packing is
 //!      timed and shared across queries; potential top-k candidates are rescored
 //!      with direct NEON L2 to avoid cancellation and approximate rankings.
+//!   6. `avx2` / `avx512`: direct L2 with a common 64-lane FMA reduction tree.
 //!
 //! Find L2 top-k neighbors for batches of queries against `DB` vectors of dimension `DIM`.
 //! Each worker processes its own query batch; measure wall-clock throughput with 1/2/4/8/16 threads.
@@ -27,7 +28,7 @@
 //!   VS_THREADS: comma-separated concurrency list (default 1,2,4,8,16).
 //!   VS_SME_BATCH_ROWS: SME batch rows (default 512, matching production).
 //!   VS_DIM_SWEEP=1: additionally sweep {128,384,768,1536} dimensions with one thread.
-//!   VS_METHODS: optional comma-separated scalar,neon,sme,sme-streaming,amx filter.
+//!   VS_METHODS: optional comma-separated scalar,neon,sme,sme-streaming,amx,avx2,avx512 filter.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +36,21 @@ use std::time::Instant;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[path = "vector_search_bench/sme.rs"]
 mod sme;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "vector_search_bench/x86.rs"]
+mod x86;
+
+fn sme_streaming_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        mydb::engine::vec_bench_api::sme_available()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Apple Accelerate (AMX path).
@@ -162,6 +178,7 @@ impl TopK {
             .sum()
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn cutoff(&self) -> f32 {
         if self.buf.len() < self.k {
             f32::INFINITY
@@ -172,7 +189,7 @@ impl TopK {
 }
 
 // ---------------------------------------------------------------------------
-// Three search implementations: query batch against the full database; accumulate a checksum to prevent elimination.
+// Direct and batched searches accumulate a checksum to prevent elimination.
 // ---------------------------------------------------------------------------
 
 fn search_scalar(queries: &[f32], db: &[f32], dim: usize, n: usize, k: usize) -> f64 {
@@ -505,6 +522,8 @@ enum Method {
     Sme,
     SmeMatrix,
     Amx,
+    Avx2,
+    Avx512,
 }
 impl Method {
     fn name(&self) -> &'static str {
@@ -514,6 +533,8 @@ impl Method {
             Method::Sme => "sme(streaming)",
             Method::SmeMatrix => "sme(matrix)",
             Method::Amx => "amx(accelerate)",
+            Method::Avx2 => "avx2(fma)",
+            Method::Avx512 => "avx512(fma)",
         }
     }
 
@@ -524,6 +545,8 @@ impl Method {
             Self::Sme => "sme-streaming",
             Self::SmeMatrix => "sme",
             Self::Amx => "amx",
+            Self::Avx2 => "avx2",
+            Self::Avx512 => "avx512",
         }
     }
 
@@ -531,7 +554,7 @@ impl Method {
         match self {
             Self::Scalar => true,
             Self::Neon => cfg!(target_arch = "aarch64"),
-            Self::Sme => mydb::engine::vec_bench_api::sme_available(),
+            Self::Sme => sme_streaming_available(),
             Self::SmeMatrix => {
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 {
@@ -543,18 +566,40 @@ impl Method {
                 }
             }
             Self::Amx => cfg!(target_os = "macos"),
+            Self::Avx2 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    x86::avx2_available()
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    false
+                }
+            }
+            Self::Avx512 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    x86::avx512_available()
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    false
+                }
+            }
         }
     }
 }
 
 struct Shared {
     db: Vec<f32>,
+    #[cfg(target_os = "macos")]
     xnorm: Vec<f32>,
     queries: Vec<f32>, // All queries needed at maximum concurrency.
     dim: usize,
     n: usize,
     k: usize,
     qpt: usize,
+    #[cfg(target_arch = "aarch64")]
     sme_batch_rows: usize,
 }
 
@@ -572,11 +617,11 @@ fn run_config(sh: &Arc<Shared>, method: Method, threads: usize) -> (f64, f64) {
                 #[cfg(target_arch = "aarch64")]
                 Method::Neon => search_neon(q, &sh.db, sh.dim, sh.n, sh.k),
                 #[cfg(not(target_arch = "aarch64"))]
-                Method::Neon => search_scalar(q, &sh.db, sh.dim, sh.n, sh.k),
+                Method::Neon => unreachable!("NEON is unavailable"),
                 #[cfg(target_arch = "aarch64")]
                 Method::Sme => search_sme(q, &sh.db, sh.dim, sh.n, sh.k, sh.sme_batch_rows),
                 #[cfg(not(target_arch = "aarch64"))]
-                Method::Sme => search_scalar(q, &sh.db, sh.dim, sh.n, sh.k),
+                Method::Sme => unreachable!("SME is unavailable"),
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 Method::SmeMatrix => search_sme_matrix(&sh, q),
                 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
@@ -587,7 +632,13 @@ fn run_config(sh: &Arc<Shared>, method: Method, threads: usize) -> (f64, f64) {
                     search_amx(q, &sh.db, sh.dim, sh.n, sh.k, &sh.xnorm, &mut buf)
                 }
                 #[cfg(not(target_os = "macos"))]
-                Method::Amx => search_scalar(q, &sh.db, sh.dim, sh.n, sh.k),
+                Method::Amx => unreachable!("Accelerate is unavailable"),
+                #[cfg(target_arch = "x86_64")]
+                Method::Avx2 => x86::search_avx2(q, &sh.db, sh.dim, sh.n, sh.k),
+                #[cfg(target_arch = "x86_64")]
+                Method::Avx512 => x86::search_avx512(q, &sh.db, sh.dim, sh.n, sh.k),
+                #[cfg(not(target_arch = "x86_64"))]
+                Method::Avx2 | Method::Avx512 => unreachable!("x86 SIMD is unavailable"),
             }
         }));
     }
@@ -636,6 +687,8 @@ fn main() {
     assert!(n <= u32::MAX as usize, "vector IDs must fit in u32");
     let mut methods = vec![
         Method::Scalar,
+        Method::Avx2,
+        Method::Avx512,
         Method::Neon,
         Method::Sme,
         Method::SmeMatrix,
@@ -672,8 +725,14 @@ fn main() {
     println!("config: DIM={dim} DB={n} queries/thread={qpt} k={k} iters={iters} (median)");
     println!(
         "SME: available={} batch_rows={} (includes production row-pack copy)",
-        mydb::engine::vec_bench_api::sme_available(),
+        sme_streaming_available(),
         sme_batch_rows
+    );
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "x86 SIMD: AVX2/FMA={} AVX-512F/FMA={} (common 64-lane reduction)",
+        x86::avx2_available(),
+        x86::avx512_available()
     );
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     println!(
@@ -686,6 +745,7 @@ fn main() {
     );
 
     let db = gen(n, dim, 0xABCDEF);
+    #[cfg(target_os = "macos")]
     let xnorm: Vec<f32> = (0..n)
         .map(|j| db[j * dim..j * dim + dim].iter().map(|v| v * v).sum())
         .collect();
@@ -693,55 +753,43 @@ fn main() {
 
     let sh = Arc::new(Shared {
         db,
+        #[cfg(target_os = "macos")]
         xnorm,
         queries,
         dim,
         n,
         k,
         qpt,
+        #[cfg(target_arch = "aarch64")]
         sme_batch_rows,
     });
 
     // ---- Cross-check correctness: one thread, same query batch ----
-    println!(
-        "\n[Correctness] All paths should have identical top-k checksums for the same query batch:"
-    );
-    {
-        let q = &sh.queries[0..qpt * dim];
-        let s = search_scalar(q, &sh.db, dim, n, k);
-        #[cfg(target_arch = "aarch64")]
-        let ne = search_neon(q, &sh.db, dim, n, k);
-        #[cfg(not(target_arch = "aarch64"))]
-        let ne = s;
-        #[cfg(target_arch = "aarch64")]
-        let sme = if mydb::engine::vec_bench_api::sme_available() {
-            search_sme(q, &sh.db, dim, n, k, sme_batch_rows)
-        } else {
-            s
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let sme = s;
-        #[cfg(target_os = "macos")]
-        let am = {
-            let mut buf = vec![0.0f32; qpt * n];
-            search_amx(q, &sh.db, dim, n, k, &sh.xnorm, &mut buf)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let am = s;
-        println!("  scalar = {s:.6}");
+    println!("\n[Correctness] Selected paths, first query batch (scalar reduction may round differently):");
+    let q = &sh.queries[..qpt * dim];
+    let scalar_checksum = search_scalar(q, &sh.db, dim, n, k);
+    println!("  scalar reference = {scalar_checksum:.6}");
+    for &method in &methods {
+        if method == Method::Scalar {
+            continue;
+        }
+        let (_, checksum) = run_config(&sh, method, 1);
         println!(
-            "  neon   = {ne:.6}   (Δ vs scalar = {:.2e})",
-            (ne - s).abs()
+            "  {} = {:.6} (delta vs scalar = {:.2e})",
+            method.name(),
+            checksum,
+            (checksum - scalar_checksum).abs()
         );
-        println!(
-            "  sme    = {sme:.6}   (Δ vs scalar = {:.2e})",
-            (sme - s).abs()
+    }
+    #[cfg(target_arch = "x86_64")]
+    if methods.contains(&Method::Avx2) || methods.contains(&Method::Avx512) {
+        x86::validate(
+            &sh.queries,
+            &sh.db,
+            dim,
+            k,
+            methods.contains(&Method::Avx512),
         );
-        println!(
-            "  amx    = {am:.6}   (Δ vs scalar = {:.2e})",
-            (am - s).abs()
-        );
-        println!("  Note: AMX rearranges L2 as squared norms minus 2q*x; small differences from floating-point accumulation order are normal.");
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -833,65 +881,47 @@ fn main() {
         }
     }
 
-    // ---- Optional single-thread dimension sweep ----
     if env_usize("VS_DIM_SWEEP", 0) == 1 {
-        println!("\n[Dimension sweep] One thread, DB={n}, {qpt} queries per dimension:");
-        println!(
-            "{:>8} {:>14} {:>14} {:>14} {:>12} {:>12}",
-            "dim", "scalar us/q", "neon us/q", "amx us/q", "neon×", "amx×"
-        );
-        for &d in &[128usize, 384, 768, 1536] {
-            let dbx = gen(n, d, 0xABCDEF);
-            let xn: Vec<f32> = (0..n)
-                .map(|j| dbx[j * d..j * d + d].iter().map(|v| v * v).sum())
-                .collect();
-            let qx = gen(qpt, d, 0x123456);
-            let us = |secs: f64| secs * 1e6 / qpt as f64;
-            let t_scalar = time_it(iters, || {
-                std::hint::black_box(search_scalar(&qx, &dbx, d, n, k));
-            });
-            #[cfg(target_arch = "aarch64")]
-            let t_neon = time_it(iters, || {
-                std::hint::black_box(search_neon(&qx, &dbx, d, n, k));
-            });
-            #[cfg(not(target_arch = "aarch64"))]
-            let t_neon = t_scalar;
+        println!("\n[Dimension sweep] One thread, DB={n}, {qpt} queries per dimension; us/query:");
+        print!("{:>8}", "dim");
+        for method in &methods {
+            print!(" {:>18}", method.name());
+        }
+        println!();
+        for d in [128usize, 384, 768, 1536] {
+            let db = gen(n, d, 0xABCDEF);
             #[cfg(target_os = "macos")]
-            let t_amx = {
-                let mut buf = vec![0.0f32; qpt * n];
-                time_it(iters, || {
-                    std::hint::black_box(search_amx(&qx, &dbx, d, n, k, &xn, &mut buf));
-                })
-            };
-            #[cfg(not(target_os = "macos"))]
-            let t_amx = {
-                let _ = &xn;
-                t_scalar
-            };
-            println!(
-                "{:>8} {:>14.2} {:>14.2} {:>14.2} {:>11.2}× {:>11.2}×",
-                d,
-                us(t_scalar),
-                us(t_neon),
-                us(t_amx),
-                t_scalar / t_neon,
-                t_scalar / t_amx
-            );
+            let xnorm = db
+                .chunks_exact(d)
+                .map(|r| r.iter().map(|v| v * v).sum())
+                .collect();
+            let sweep = Arc::new(Shared {
+                db,
+                #[cfg(target_os = "macos")]
+                xnorm,
+                queries: gen(qpt, d, 0x123456),
+                dim: d,
+                n,
+                k,
+                qpt,
+                #[cfg(target_arch = "aarch64")]
+                sme_batch_rows,
+            });
+            print!("{d:>8}");
+            for &method in &methods {
+                std::hint::black_box(run_config(&sweep, method, 1));
+                let mut samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let (secs, checksum) = run_config(&sweep, method, 1);
+                    std::hint::black_box(checksum);
+                    samples.push(secs);
+                }
+                print!(" {:>18.2}", median(samples) * 1e6 / qpt as f64);
+            }
+            println!();
         }
     }
-
     println!("\nDone.");
-}
-
-fn time_it(iters: usize, mut f: impl FnMut()) -> f64 {
-    f(); // warmup
-    let mut times = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let s = Instant::now();
-        f();
-        times.push(s.elapsed().as_secs_f64());
-    }
-    median(times)
 }
 
 #[cfg(target_os = "macos")]
@@ -905,7 +935,20 @@ fn machine_brand() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".into())
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn machine_brand() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|info| {
+            info.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == "model name").then(|| value.trim().to_owned())
+            })
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn machine_brand() -> String {
     "unknown".into()
 }

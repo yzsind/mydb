@@ -1742,6 +1742,7 @@ pub enum PreparedDmlState {
 
 pub(crate) use super::async_row_wait::AsyncRowLockRegistry;
 pub use super::async_row_wait::AsyncRowLockSignal;
+pub(crate) use super::async_row_wait::AsyncRowLockTimingStats;
 
 /// Statement-local metadata retained by the compiled text-DML batch executor.
 /// These plans cannot run triggers or change tracked session variables.
@@ -3748,6 +3749,7 @@ impl SessionContext {
     /// `current_txn` directly at transaction begin / commit / rollback.
     pub(crate) fn set_current_txn(&mut self, txn: Option<u64>) {
         if txn != self.current_txn {
+            crate::util::lock_diagnostics::attach(txn.unwrap_or(0), self.connection_id as u64);
             if self.autocommit && !self.explicit_txn && self.xa_branch.is_none() {
                 if let Some(runtime) = self.txn_runtime.take() {
                     self.spare_txn_runtime = Some(runtime);

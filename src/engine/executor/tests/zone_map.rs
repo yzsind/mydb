@@ -1626,6 +1626,8 @@ fn zone_map_dml_and_load_data_effect_benchmark() {
 
 #[test]
 fn parallel_zone_map_scan_schedules_surviving_pages_and_matches_serial() {
+    // This fixture asserts four workers, independent of host performance-core count.
+    let _workers = crate::util::env::scoped_vars(&[("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4"))]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let padding_columns = (0..32)

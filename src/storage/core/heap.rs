@@ -857,6 +857,7 @@ impl HeapFile {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        let mut single_payload = None;
         if rows.len() == 1 && !crate::storage::data_dictionary::is_dd_table_id(self.table_id) {
             let external = externals.first().map(Vec::as_slice).unwrap_or(&[]);
             if let Some(row_id) =
@@ -864,6 +865,49 @@ impl HeapFile {
             {
                 return Ok(vec![row_id]);
             }
+            // A fitting tail insert needs only its page latch. Taking the
+            // file-extension latch here serialized unrelated appenders and
+            // rebuilt an owned 16 KiB Page for one small row. Full/new pages
+            // retain the ordinary extension path below.
+            let payload = encode_mvcc_row(headers[0], &rows[0], &self.codec, external)?;
+            if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
+                return Err(error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                    "row size is larger than one heap page",
+                ));
+            }
+            // Rows larger than half a page usually extend on every call.
+            // Keep their encoded payload for the existing batch path instead
+            // of paying for a predictably unsuccessful tail probe.
+            let page_count = if payload.len() <= (PAGE_SIZE - PAGE_HEADER_SIZE) / 2 {
+                self.page_count()?
+            } else {
+                1
+            };
+            if page_count > 1 {
+                let page_id = page_count - 1;
+                let _page_guard = self.page_latch(page_id).lock().map_err(|_| {
+                    error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned")
+                })?;
+                let plan = self.with_page(page_id, |page| {
+                    HeapPageMut::plan_insert(page.bytes, payload.len(), self.update_reserve_bytes)
+                })?;
+                if let Some(plan) = plan {
+                    let row_id = RowId {
+                        page_id: page_id as u32,
+                        slot_id: plan.slot_id,
+                    };
+                    self.write_heap_insert_raw_logged(
+                        txn_id,
+                        row_id,
+                        payload,
+                        plan,
+                        headers[0].undo_ptr,
+                    )?;
+                    return Ok(vec![row_id]);
+                }
+            }
+            single_payload = Some(payload);
         }
         // Encode batches before taking the heap append latch. Single-row
         // inserts keep their allocation-free descriptor path.
@@ -978,7 +1022,10 @@ impl HeapFile {
             let external = externals.get(idx).map(|m| m.as_slice()).unwrap_or(&[]);
             let payload = match prepared.as_mut() {
                 Some(payloads) => payloads.next().expect("prepared batch length"),
-                None => encode_mvcc_row(header, values, &self.codec, external)?,
+                None => match single_payload.take() {
+                    Some(payload) => payload,
+                    None => encode_mvcc_row(header, values, &self.codec, external)?,
+                },
             };
             if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
                 return Err(error(
@@ -2459,8 +2506,8 @@ impl HeapFile {
             slot_id: row_id.slot_id,
             patches: vec![WalColumnPatch {
                 offset: 1,
-                before: before.to_vec(),
-                after: after.to_vec(),
+                before: smallvec::SmallVec::from_slice(&before),
+                after: smallvec::SmallVec::from_slice(&after),
             }],
             undo_lsn: header.undo_ptr,
         };
@@ -2875,16 +2922,14 @@ impl HeapFile {
             apply_patches.push((*off, after.as_slice()));
         }
 
-        // Build the WAL record. WalColumnPatch owns its before/after
-        // bytes because the frame is deferred-appended at commit; the
-        // patches need to survive the return from this function. This
-        // is where the (unavoidable) Vec<u8> allocations land — one
-        // pair per patch, mostly 4-8 bytes each.
+        // WAL patches retain their own bytes until deferred append. Keep
+        // fixed-width values and the 16-byte MVCC header inline; wider column
+        // bodies spill without changing the serialized record format.
         let mut wal_patches: Vec<WalColumnPatch> = Vec::with_capacity(1 + col_patches.len());
         wal_patches.push(WalColumnPatch {
             offset: 2,
-            before: old_header_bytes.to_vec(),
-            after: new_header_bytes.to_vec(),
+            before: smallvec::SmallVec::from_slice(&old_header_bytes),
+            after: smallvec::SmallVec::from_slice(&new_header_bytes),
         });
         for (off, before, after) in &col_patches {
             let offset = u16::try_from(*off).map_err(|_| {
@@ -2895,8 +2940,8 @@ impl HeapFile {
             })?;
             wal_patches.push(WalColumnPatch {
                 offset,
-                before: before.to_vec(),
-                after: after.to_vec(),
+                before: smallvec::SmallVec::from_slice(before),
+                after: smallvec::SmallVec::from_slice(after),
             });
         }
 
@@ -4803,13 +4848,46 @@ impl HeapFile {
         };
         let mut scratch = plan.compact.then(|| vec![0_u8; PAGE_SIZE]);
         self.maybe_emit_heap_fpi(row_id.page_id)?;
+        if self.durability() != DurabilityMode::Memory
+            && txn_wal_buffering_active(&self.log, txn_id)
+        {
+            let key = self.page_key(row_id.page_id as u64);
+            let record = WalPayload::HeapInsert {
+                path: self.relative_path(),
+                page_id: row_id.page_id,
+                slot_id: row_id.slot_id,
+                payload: payload.clone(),
+                undo_lsn,
+            };
+            let write = |lsn| {
+                self.buffer_pool
+                    .with_raw_page_mut(key.clone(), lsn, |bytes| {
+                        HeapPageMut::new(bytes)?.insert(&payload, plan, scratch.as_deref_mut())
+                    })
+            };
+            // Reclaimed slots use the same WAL-before-data publication fence
+            // as ordinary heap batches. Never leave this already-pinned page
+            // exposed to writeback before its transaction's WAL is appended.
+            return match try_buffer_txn_page_write(
+                &self.log,
+                &self.buffer_pool,
+                txn_id,
+                record,
+                vec![key.clone()],
+                write,
+            ) {
+                Ok(result) => result,
+                Err((record, mut write)) => {
+                    let pre = crate::wal::LogManager::pre_encode_record(txn_id, record)?;
+                    let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                    write(lsn)
+                }
+            };
+        }
         let lsn = if self.durability() == DurabilityMode::Memory {
             0
         } else {
-            let mut log = self.log.lock();
-            let lsn = log.reserve_txn_lsn(txn_id)?;
-            log.append_reserved(
-                lsn,
+            let pre = crate::wal::LogManager::pre_encode_record(
                 txn_id,
                 WalPayload::HeapInsert {
                     path: self.relative_path(),
@@ -4819,7 +4897,7 @@ impl HeapFile {
                     undo_lsn,
                 },
             )?;
-            lsn
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         self.buffer_pool
             .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {

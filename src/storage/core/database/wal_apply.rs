@@ -520,7 +520,7 @@ impl Database {
             } => {
                 let owned_patches: Vec<(usize, Vec<u8>)> = patches
                     .iter()
-                    .map(|patch| (patch.offset as usize, patch.after.clone()))
+                    .map(|patch| (patch.offset as usize, patch.after.to_vec()))
                     .collect();
                 heap_redo.mutate_page(&self.data_dir, path, *page_id as u64, lsn, |page| {
                     if page.read(*slot_id).is_some() {

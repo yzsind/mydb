@@ -3,16 +3,76 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::storage::NonblockingRowWaitTarget;
 
 type WaiterMap = HashMap<u64, tokio::sync::watch::Sender<u64>, ahash::RandomState>;
 
+fn notification_clock_ns() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .clamp(1, u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Default)]
+struct TimingCounters {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TimingSnapshot {
+    pub count: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+}
+
+impl TimingCounters {
+    fn record(&self, elapsed: Duration) {
+        let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> TimingSnapshot {
+        TimingSnapshot {
+            count: self.count.load(Ordering::Relaxed),
+            total_us: self.total_us.load(Ordering::Relaxed),
+            max_us: self.max_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct WaitSample<'a> {
+    counters: &'a TimingCounters,
+    started: Instant,
+}
+
+impl Drop for WaitSample<'_> {
+    fn drop(&mut self) {
+        self.counters.record(self.started.elapsed());
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AsyncRowLockTimingStats {
+    pub waits: TimingSnapshot,
+    pub wake_delay: TimingSnapshot,
+}
+
 #[derive(Debug)]
 pub(crate) struct AsyncRowLockRegistry {
     shards: Box<[parking_lot::Mutex<WaiterMap>]>,
     active: AtomicU64,
+    waits: TimingCounters,
+    wake_delay: TimingCounters,
 }
 
 impl Default for AsyncRowLockRegistry {
@@ -22,6 +82,8 @@ impl Default for AsyncRowLockRegistry {
                 .map(|_| parking_lot::Mutex::new(WaiterMap::default()))
                 .collect(),
             active: AtomicU64::new(0),
+            waits: TimingCounters::default(),
+            wake_delay: TimingCounters::default(),
         }
     }
 }
@@ -54,7 +116,16 @@ impl AsyncRowLockRegistry {
 
     pub(crate) fn notify(&self, txn: u64) {
         if let Some(sender) = self.shard(txn).lock().get(&txn) {
-            sender.send_modify(|generation| *generation = generation.wrapping_add(1));
+            // watch maintains its own generation even when two timestamps
+            // coincide. Keep the existing eight-byte payload and wake policy.
+            sender.send_modify(|notified| *notified = notification_clock_ns());
+        }
+    }
+
+    pub(crate) fn timing_stats(&self) -> AsyncRowLockTimingStats {
+        AsyncRowLockTimingStats {
+            waits: self.waits.snapshot(),
+            wake_delay: self.wake_delay.snapshot(),
         }
     }
 }
@@ -71,7 +142,22 @@ pub struct AsyncRowLockSignal {
 
 impl AsyncRowLockSignal {
     pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
-        self.receiver.changed().await
+        // This wait lives outside synchronous statement instrumentation.
+        // Record cancellation/drop as well as ordinary wake and timeout exits.
+        let _sample = WaitSample {
+            counters: &self.registry.waits,
+            started: Instant::now(),
+        };
+        let result = self.receiver.changed().await;
+        if result.is_ok() {
+            let notified = *self.receiver.borrow();
+            if notified != 0 {
+                self.registry.wake_delay.record(Duration::from_nanos(
+                    notification_clock_ns().saturating_sub(notified),
+                ));
+            }
+        }
+        result
     }
 }
 
@@ -112,5 +198,40 @@ mod tests {
             .unwrap();
         drop(current);
         assert!(!registry.has_waiters());
+        let timings = registry.timing_stats();
+        assert_eq!(timings.waits.count, 1);
+        assert_eq!(timings.wake_delay.count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_wait_records_time_and_keeps_the_next_notification() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let registry = Arc::new(AsyncRowLockRegistry::default());
+        let mut signal = registry.register(NonblockingRowWaitTarget {
+            txn_id: 9,
+            table_id: 1,
+            row_id: crate::storage::RowId::new(1, 0),
+            mode: crate::storage::LockMode::Exclusive,
+        });
+        {
+            let waiting = signal.changed();
+            tokio::pin!(waiting);
+            std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(registry.timing_stats().waits.count, 1);
+        assert_eq!(registry.timing_stats().wake_delay.count, 0);
+        registry.notify(9);
+        tokio::time::timeout(Duration::from_secs(1), signal.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.timing_stats().waits.count, 2);
+        assert_eq!(registry.timing_stats().wake_delay.count, 1);
     }
 }

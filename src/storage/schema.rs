@@ -818,6 +818,11 @@ pub struct DatabaseSchema {
     pub updated_ms: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INDEX_KEY_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: u64,
@@ -4665,6 +4670,8 @@ impl TableSchema {
     }
 
     pub fn index_key(&self, index: &IndexSchema, values: &[Value]) -> Result<IndexKey, QueryError> {
+        #[cfg(test)]
+        INDEX_KEY_BUILD_COUNT.with(|count| count.set(count.get() + 1));
         if index.has_multi_valued_parts() {
             return self
                 .index_keys(index, values)?

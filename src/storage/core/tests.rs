@@ -1443,6 +1443,44 @@ fn live_row_delta_is_signed_and_commit_aware() {
 }
 
 #[test]
+fn resident_single_insert_does_not_wait_for_unrelated_file_extension() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let heap =
+        Arc::new(HeapFile::open(dir.path().join("tail.heap"), 1, test_log(dir.path())).unwrap());
+    heap.set_durability(DurabilityMode::Memory);
+    let first = heap
+        .insert_mvcc(1, RowHeader::visible(1), &[Value::Int(1)])
+        .unwrap();
+    let extending = heap.extend_mutex.lock().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let writer_heap = Arc::clone(&heap);
+    let writer = std::thread::spawn(move || {
+        sender
+            .send(writer_heap.insert_mvcc_batch(
+                2,
+                &[RowHeader::visible(2)],
+                &[vec![Value::Int(2)]],
+                &[],
+            ))
+            .unwrap();
+    });
+    let inserted = receiver.recv_timeout(Duration::from_secs(1));
+    drop(extending);
+    writer.join().unwrap();
+    let inserted = inserted
+        .expect("fitting tail insert must not depend on the file extension latch")
+        .unwrap();
+    assert_eq!(inserted[0].page_id, first.page_id);
+    assert_ne!(inserted[0], first);
+    let mut expected = heap.read_mvcc(first).unwrap().unwrap().values;
+    expected[0] = Value::Int(2);
+    assert_eq!(
+        heap.read_mvcc(inserted[0]).unwrap().unwrap().values,
+        expected
+    );
+}
+
+#[test]
 fn heap_round_trips_rows_and_reuses_slots() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("1.heap");
@@ -20122,8 +20160,21 @@ fn reclaimed_slots_in_older_pages_take_new_rows_before_the_tail() {
 
         let mut inserted = Vec::new();
         for id in 1000..1000 + victims.len() as i64 {
-            let txn = db.begin_txn().unwrap();
+            let txn = db.begin_dml_txn().unwrap();
             inserted.extend(db.insert_rows(txn, "test.t", vec![row(id)]).unwrap());
+            let key = txn_wal_buffer_key(&db.log, txn.txn_id);
+            let buffered = txn_wal_buffer_shard(key)
+                .lock()
+                .get(&key)
+                .is_some_and(|buffer| {
+                    buffer.entries.iter().any(|(record, _)| {
+                        matches!(record, WalPayload::HeapInsert { page_id: 1, .. })
+                    })
+                });
+            assert!(
+                buffered,
+                "reclaimed-slot INSERT must use the transaction WAL buffer"
+            );
             db.commit_txn(txn.txn_id).unwrap();
         }
         assert!(

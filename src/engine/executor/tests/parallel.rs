@@ -641,6 +641,8 @@ fn first_no_parallel_hint_wins_conflict() {
 
 #[test]
 fn parallel_hint_surfaces_in_explain() {
+    // This fixture asserts four workers, independent of host performance-core count.
+    let _workers = crate::util::env::scoped_vars(&[("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4"))]);
     let _lock = auto_parallel_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -1213,6 +1215,8 @@ fn cbo_auto_parallel_is_suppressed_by_small_unordered_limit() {
 
 #[test]
 fn parallel_seq_scan_cost_matches_amdahl_plus_setup() {
+    // This fixture asserts four workers, independent of host performance-core count.
+    let _workers = crate::util::env::scoped_vars(&[("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4"))]);
     // Parallel cost should follow `serial / degree + degree * setup`,
     // matching `cbo::operator_cost::parallel_seq_scan`. The previous
     // "half serial cost" approximation ignored degree and setup tax,
@@ -1331,6 +1335,8 @@ fn cbo_auto_parallel_correctness_matches_serial() {
 
 #[test]
 fn parallel_metrics_increment_on_parallel_query() {
+    // This fixture asserts four workers, independent of host performance-core count.
+    let _workers = crate::util::env::scoped_vars(&[("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4"))]);
     let _lock = auto_parallel_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -2745,6 +2751,8 @@ fn parallel_disable_env_short_circuits_parallel_hint() {
 
 #[test]
 fn parallel_hint_pushes_through_hash_join() {
+    // This fixture asserts four workers, independent of host performance-core count.
+    let _workers = crate::util::env::scoped_vars(&[("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4"))]);
     // PARALLEL(n) must reach SeqScans on both sides of a HashJoin, not
     // stop at the join node. Otherwise large-table joins (TPC-H Q3 etc.)
     // stay fully serial despite the hint.
@@ -3405,6 +3413,8 @@ fn populate_covering_agg_table(engine: &StorageQueryEngine, n: i64) {
 
 #[test]
 fn parallel_covering_index_aggregate_explain_and_count() {
+    // This fixture asserts four workers, independent of host performance-core count.
+    let _workers = crate::util::env::scoped_vars(&[("MYDB_PARALLEL_CPU_BOUND_WORKERS", Some("4"))]);
     let _lock = auto_parallel_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

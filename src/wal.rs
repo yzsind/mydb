@@ -811,8 +811,10 @@ pub struct WalHeapInsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalColumnPatch {
     pub offset: u16,
-    pub before: Vec<u8>,
-    pub after: Vec<u8>,
+    /// Integer, decimal, temporal and MVCC-header patches need no allocation.
+    /// Variable-width bodies retain the ordinary owned spill path.
+    pub before: smallvec::SmallVec<[u8; 16]>,
+    pub after: smallvec::SmallVec<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6835,8 +6837,8 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
                 let after = read_bytes(input, &mut offset)?;
                 patches.push(WalColumnPatch {
                     offset: off,
-                    before,
-                    after,
+                    before: before.into(),
+                    after: after.into(),
                 });
             }
             let undo_lsn = read_u64_checked(input, &mut offset)?;
@@ -10398,6 +10400,55 @@ mod tests {
     }
 
     #[test]
+    fn heap_update_patch_inline_and_spilled_bytes_keep_wire_format() {
+        for len in [0usize, 1, 8, 16, 17, 4096] {
+            let before: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let after: Vec<u8> = before.iter().map(|b| !b).collect();
+            let patch = WalColumnPatch {
+                offset: 18,
+                before: smallvec::SmallVec::from_slice(&before),
+                after: smallvec::SmallVec::from_slice(&after),
+            };
+            assert_eq!(patch.before.spilled(), len > 16);
+            assert_eq!(patch.after.spilled(), len > 16);
+            let record = WalRecord {
+                source_time_us: 0,
+                lsn: 42,
+                prev_txn_lsn: 30,
+                txn_id: 7,
+                payload: WalPayload::HeapUpdateLogical {
+                    path: "row.heap".into(),
+                    page_id: 5,
+                    slot_id: 2,
+                    patches: vec![patch],
+                    undo_lsn: Some(11),
+                },
+            };
+            // Independently assemble the existing length-prefixed payload.
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&8u32.to_le_bytes());
+            expected.extend_from_slice(b"row.heap");
+            expected.extend_from_slice(&5u32.to_le_bytes());
+            expected.extend_from_slice(&2u16.to_le_bytes());
+            expected.extend_from_slice(&1u32.to_le_bytes());
+            expected.extend_from_slice(&18u16.to_le_bytes());
+            expected.extend_from_slice(&(len as u32).to_le_bytes());
+            expected.extend_from_slice(&before);
+            expected.extend_from_slice(&(len as u32).to_le_bytes());
+            expected.extend_from_slice(&after);
+            expected.extend_from_slice(&11u64.to_le_bytes());
+            let encoded = encode_record(&record).unwrap();
+            assert_eq!(&encoded[WAL_FRAME_HEADER_LEN..], expected.as_slice());
+            let decoded = decode_payload(WalRecordType::HeapUpdateLogical, &expected).unwrap();
+            let WalPayload::HeapUpdateLogical { patches, .. } = decoded else {
+                panic!("logical patch expected")
+            };
+            assert_eq!(patches[0].before.as_slice(), before.as_slice());
+            assert_eq!(patches[0].after.as_slice(), after.as_slice());
+        }
+    }
+
+    #[test]
     fn heap_update_logical_round_trips_multiple_patches() {
         let record = WalRecord {
             source_time_us: 0,
@@ -10411,13 +10462,13 @@ mod tests {
                 patches: vec![
                     WalColumnPatch {
                         offset: 8,
-                        before: vec![1, 0, 0, 0, 0, 0, 0, 0],
-                        after: vec![2, 0, 0, 0, 0, 0, 0, 0],
+                        before: smallvec::smallvec![1, 0, 0, 0, 0, 0, 0, 0],
+                        after: smallvec::smallvec![2, 0, 0, 0, 0, 0, 0, 0],
                     },
                     WalColumnPatch {
                         offset: 24,
-                        before: vec![10, 0],
-                        after: vec![20, 0],
+                        before: smallvec::smallvec![10, 0],
+                        after: smallvec::smallvec![20, 0],
                     },
                 ],
                 undo_lsn: Some(11),
@@ -10439,11 +10490,11 @@ mod tests {
                 assert_eq!(path, "schemas/test/tables/bench__99__data.heap");
                 assert_eq!(patches.len(), 2);
                 assert_eq!(patches[0].offset, 8);
-                assert_eq!(patches[0].before, vec![1, 0, 0, 0, 0, 0, 0, 0]);
-                assert_eq!(patches[0].after, vec![2, 0, 0, 0, 0, 0, 0, 0]);
+                assert_eq!(patches[0].before.as_slice(), &[1, 0, 0, 0, 0, 0, 0, 0]);
+                assert_eq!(patches[0].after.as_slice(), &[2, 0, 0, 0, 0, 0, 0, 0]);
                 assert_eq!(patches[1].offset, 24);
-                assert_eq!(patches[1].before, vec![10, 0]);
-                assert_eq!(patches[1].after, vec![20, 0]);
+                assert_eq!(patches[1].before.as_slice(), &[10, 0]);
+                assert_eq!(patches[1].after.as_slice(), &[20, 0]);
                 assert_eq!(undo_lsn, Some(11));
             }
             _ => panic!("expected HeapUpdateLogical"),
@@ -10485,8 +10536,8 @@ mod tests {
                 slot_id: 0,
                 patches: vec![WalColumnPatch {
                     offset: 16,
-                    before: vec![0u8; 8],
-                    after: vec![1u8; 8],
+                    before: smallvec::smallvec![0u8; 8],
+                    after: smallvec::smallvec![1u8; 8],
                 }],
                 undo_lsn: None,
             },

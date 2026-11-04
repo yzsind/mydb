@@ -995,6 +995,17 @@ pub(crate) fn execute_compiled_select(
         compiled.native_output_supported,
     );
 
+    if !force_batch && matches!(operator, CompiledOperator::StreamingIndexPrefixSum) {
+        if let Some(result) = run_compiled_select_kernel(db, txn, stmt, &compiled.physical, || {
+            super::simple::execute_streaming_prefix_sum(db, txn, stmt, &compiled.physical)
+        })? {
+            return Ok(QueryResponse::ResultSet(result));
+        }
+        // Unsupported runtime predicates and historical reads decline before
+        // opening the cursor; preserve the complete general execution path.
+        return execute_physical_select(db, txn, stmt, &compiled.physical);
+    }
+
     // A unique point probe is already a complete, allocation-light result
     // kernel: parameter binding, one B-tree lookup and a projected heap
     // decode.  Sending it through the generic BatchOperator boundary first
