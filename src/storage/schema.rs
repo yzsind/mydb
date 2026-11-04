@@ -1156,6 +1156,7 @@ impl TableSchema {
             }
             "views" | "triggers" | "events" => vec!["schema_name", "name"],
             "routines" => vec!["schema_name", "routine_type", "name"],
+            "api_keys" => vec!["key_id"],
             "users" => vec!["user", "host"],
             "grants" => vec!["grant_key"],
             "role_edges" => vec!["edge_key"],

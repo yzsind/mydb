@@ -620,6 +620,11 @@ fn execute_statement_inner(
                 .map_err(crate::engine::executor::mem_budget::terminal_oom)
         });
     }
+    if let Some(identity) = &session.rest_identity {
+        if !crate::engine::access_keys::is_valid(db, &identity.key_id, &identity.owner) {
+            return Err(crate::error::catalog::ER_ACCESS_DENIED_ERROR.error("API key or owning account is unavailable"));
+        }
+    }
     ai::validate(session, &statement)?;
     super::rls::enforce_statement(db, session, &statement)?;
     publish_optimizer_hint_diagnostics(&statement);
@@ -3483,6 +3488,7 @@ fn auth_required_privileges(
     };
     match statement {
         Statement::RowSecurity(_) => Vec::new(),
+        Statement::ApiKey(_) => Vec::new(),
         Statement::Ai(_) => Vec::new(),
         Statement::AlterSystemReloadHttpConfig | Statement::ShowHttpStatus => {
             vec![global(Privilege::Dynamic("HTTP_ADMIN".into()))]
@@ -7641,6 +7647,9 @@ pub(super) fn execute_qualified_statement(
             Statement::Revoke(r) => Some(&r.kind),
             _ => None,
         };
+        if session.sql_log_bin && kind.is_some_and(|kind| matches!(kind, GrantKind::Privileges { privileges, .. } if privileges.iter().any(|p| p.name.eq_ignore_ascii_case("API_KEY_ADMIN")))) {
+            return Err(crate::mysql::errors::unsupported("API_KEY_ADMIN in MySQL logical binlog; grant local privileges with sql_log_bin=OFF"));
+        }
         if session.sql_log_bin && kind.is_some_and(|kind| matches!(kind, GrantKind::Privileges { privileges, .. } if privileges.iter().any(|p| p.name.to_ascii_uppercase().starts_with("HTTP_")))) {
             return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP privileges cannot be written to MySQL binlog"));
         }
@@ -7710,6 +7719,11 @@ pub(super) fn execute_qualified_statement(
             }))
         }
         Statement::RowSecurity(command) => super::rls::execute(db, session, command),
+        Statement::ApiKey(command) => {
+            crate::engine::access_keys::authorize(db, session, &command)?;
+            if !command.is_read() { implicit_commit_for_ddl(db, session)?; }
+            crate::engine::access_keys::execute(db, session, command)
+        },
         Statement::Ai(command) => ai::admin(db, session, command, registry),
         Statement::Begin {
             read_only,
@@ -9897,6 +9911,8 @@ pub(super) fn execute_qualified_statement(
                             format!("Operation RENAME USER failed for {}", from.display()),
                         ));
                     };
+                    let moved: Vec<_> = auth.api_keys_for(&from).cloned().collect();
+                    for mut key in moved { key.owner = to.clone(); auth.api_keys.insert(key.id.clone(), key); }
                     account.key = to.clone();
                     auth.accounts.insert(account_id(&to), account);
                     auth.grants.for_each_mut(|grant| {

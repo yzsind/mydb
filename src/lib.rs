@@ -30,6 +30,7 @@ pub mod error;
 pub mod fuzzing;
 mod gtid;
 pub mod mysql;
+pub mod rest;
 pub mod parser;
 pub mod parser_partition;
 pub mod planner;

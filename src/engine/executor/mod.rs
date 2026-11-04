@@ -2991,7 +2991,7 @@ fn require_secure_transport() -> bool {
     })
 }
 
-fn enforce_tls_requirement(
+pub(crate) fn enforce_tls_requirement(
     requirement: &SslRequirement,
     request: &AuthRequest<'_>,
 ) -> Result<(), QueryError> {
@@ -3882,6 +3882,16 @@ impl QueryEngine for StorageQueryEngine {
             .unwrap_or(false)
     }
 
+    fn authenticate_api_key(
+        &self,
+        token: &str,
+        request: &AuthRequest<'_>,
+    ) -> Result<(String, AuthOutcome), QueryError> {
+        crate::engine::access_keys::verify(&self.db, token, request)
+    }
+    fn api_key_is_valid(&self, id: &str, owner: &AccountKey) -> bool {
+        crate::engine::access_keys::is_valid(&self.db, id, owner)
+    }
     fn authenticate_request(&self, request: AuthRequest<'_>) -> Result<AuthOutcome, QueryError> {
         let login = login::LoginAccount::load(&self.db, request.username, request.host)?;
         let account = &login.account;

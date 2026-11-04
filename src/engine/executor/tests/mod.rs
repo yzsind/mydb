@@ -1,3 +1,4 @@
+mod rest_access_keys;
 mod rls;
 mod ai;
 mod collated_constant_in;

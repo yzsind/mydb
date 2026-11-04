@@ -3,6 +3,8 @@ pub mod api;
 mod async_row_wait;
 pub mod audit_log;
 pub mod auth;
+pub mod access_keys;
+pub(crate) mod credential_crypto;
 pub mod rls;
 pub mod auto_analyze;
 pub mod auto_param;

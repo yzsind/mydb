@@ -51,7 +51,7 @@ use crate::types::{Column, QueryError};
 use crate::util::logging::log_message;
 
 mod routine_results;
-mod tls_names;
+pub(crate) mod tls_names;
 
 async fn local_infile_cancelled(
     handle: Option<&SessionHandle>,
@@ -1958,6 +1958,7 @@ where
         context.account_locked = outcome.account_locked;
         context.auth_sandbox = outcome.password_expired;
         context.auth_factors_done = 1;
+        context.mysql_authenticated = true;
         context.account_limits = outcome.resource_limits;
         context.current_user_is_system = outcome.current_user_is_system;
     }
