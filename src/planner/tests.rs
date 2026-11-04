@@ -1,6 +1,467 @@
 use super::*;
 
 #[test]
+fn hash_join_cost_prices_exact_runtime_integer_suffix_probes() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE key_build (id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE key_probe (tenant INT, id INT, value INT, PRIMARY KEY(tenant,id))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO key_build VALUES(1),(2)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO key_probe VALUES(1,1,10),(1,2,20)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE key_build").unwrap();
+    engine.execute("ANALYZE TABLE key_probe").unwrap();
+    let db = engine.db_for_tests();
+    let mut build_schema = db.table("key_build").unwrap();
+    let stats = &mut Arc::make_mut(&mut build_schema).stats;
+    stats.row_count = 128;
+    let column = stats.columns.get_mut("id").unwrap();
+    column.distinct_count = 128;
+    column.min = Some(Value::Int(1));
+    column.max = Some(Value::Int(128));
+    column.top_values.clear();
+    column.histogram.clear();
+    column.frequency = Default::default();
+    stats
+        .indexes
+        .values_mut()
+        .for_each(|index| index.prefix_distinct_counts = vec![128]);
+    let left = PhysicalPlan::SeqScan {
+        table: PlanTable::new(build_schema.id, build_schema, None),
+        filter: None,
+        estimated_rows: 128.0,
+        access_rows: 128.0,
+        cost: crate::engine::cbo::Cost::scalar(5.0),
+        possible_keys: vec![],
+        runtime_filters: vec![],
+        hint_note: None,
+        projected_columns: None,
+    };
+    let mut probe_schema = db.table("key_probe").unwrap();
+    let stats = &mut Arc::make_mut(&mut probe_schema).stats;
+    stats.row_count = 1_000_000;
+    stats.heap_page_count = 10_000;
+    for (name, column) in &mut stats.columns {
+        column.distinct_count = if name == "tenant" { 10 } else { 100_000 };
+        column.min = Some(Value::Int(1));
+        column.max = Some(Value::Int(column.distinct_count as i64));
+        column.top_values.clear();
+        column.histogram.clear();
+        column.frequency = Default::default();
+    }
+    stats
+        .indexes
+        .values_mut()
+        .for_each(|index| index.prefix_distinct_counts = vec![10, 1_000_000]);
+    let index = probe_schema
+        .indexes
+        .iter()
+        .find(|i| i.primary)
+        .unwrap()
+        .clone();
+    let mut right = PhysicalPlan::IndexLookup {
+        table: PlanTable::new(probe_schema.id, probe_schema, None),
+        index,
+        key: IndexKey::from(vec![KeyPart::Param {
+            idx: 0,
+            target: crate::storage::ParamTarget::Int,
+        }]),
+        exact: false,
+        filter: None,
+        estimated_rows: 100_000.0,
+        access_rows: 100_000.0,
+        cost: crate::engine::cbo::Cost::scalar(10_000.0),
+        possible_keys: vec![],
+        covering: false,
+        hint_note: None,
+        projected_columns: None,
+    };
+    let keys = [Expr::Identifier("id".into())];
+    let ctx = crate::engine::cbo::CboContext::from_db(db);
+    let cost = |right: &PhysicalPlan, safe| {
+        estimate_hash_join_operator_cost(
+            &ctx,
+            &left,
+            right,
+            JoinType::Inner,
+            &keys,
+            &keys,
+            &[safe],
+            None,
+            128.0,
+            100_000.0,
+        )
+        .0
+    };
+    let accelerated = cost(&right, false);
+    let null_safe = cost(&right, true);
+    assert!(accelerated.total < null_safe.total);
+    let mut spill_ctx = ctx.clone();
+    spill_ctx.planning_mem_budget_bytes = 1;
+    assert!(
+        exact_runtime_index_probe_cost(
+            &spill_ctx, &left, &right, &keys[0], &keys[0], 128.0, 100_000.0
+        )
+        .is_none(),
+        "a spilled hash build cannot install the in-memory exact-key filter"
+    );
+    let make_probe = |rows, key: &Expr| {
+        exact_runtime_index_probe_cost(&ctx, &left, &right, &keys[0], key, rows, 100_000.0)
+    };
+    assert!(make_probe(0.0, &keys[0]).is_none());
+    assert!(make_probe(
+        (crate::engine::executor::vec::index_scan::RUNTIME_EXACT_MULTI_LOOKUP_MAX_KEYS + 1) as f64,
+        &keys[0]
+    )
+    .is_none());
+    for ddl in [
+        "CREATE TABLE text_key_probe(tenant INT,id VARCHAR(32),PRIMARY KEY(tenant,id))",
+        "CREATE TABLE nullable_key_probe(tenant INT,id INT,UNIQUE KEY by_key(tenant,id))",
+        "CREATE TABLE nonunique_key_probe(tenant INT,id INT,KEY by_key(tenant,id))",
+    ] {
+        engine.execute(ddl).unwrap();
+    }
+    for name in [
+        "text_key_probe",
+        "nullable_key_probe",
+        "nonunique_key_probe",
+    ] {
+        let schema = db.table(name).unwrap();
+        let mut unsupported = right.clone();
+        let PhysicalPlan::IndexLookup { table, index, .. } = &mut unsupported else {
+            unreachable!()
+        };
+        *index = schema.indexes[0].clone();
+        *table = PlanTable::new(schema.id, schema, None);
+        assert!(
+            exact_runtime_index_probe_cost(
+                &ctx,
+                &left,
+                &unsupported,
+                &keys[0],
+                &keys[0],
+                128.0,
+                100_000.0
+            )
+            .is_none(),
+            "{name}"
+        );
+    }
+    assert!(make_probe(
+        128.0,
+        &Expr::Literal(crate::parser::Literal::String("id".into()))
+    )
+    .is_none());
+    let PhysicalPlan::IndexLookup { covering, .. } = &mut right else {
+        unreachable!()
+    };
+    *covering = true;
+    let ordinary = cost(&right, false);
+    assert_eq!(ordinary.total, null_safe.total);
+    assert!(accelerated.total<ordinary.total,"a bounded exact-key filter replaces the broad prefix scan: accelerated={accelerated:?}, ordinary={ordinary:?}");
+}
+
+#[test]
+fn costing_ordered_limit_prices_residual_survival_with_deferred_composite_keys() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE event_cost (tenant INT, area INT, id INT, owner INT, payload INT, PRIMARY KEY(tenant,area,id), UNIQUE KEY by_owner(tenant,area,owner,id))").unwrap();
+    engine
+        .execute("INSERT INTO event_cost VALUES (1,1,1,1,42),(2,2,2,2,42)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE event_cost").unwrap();
+    let mut table = engine.db_for_tests().table("event_cost").unwrap();
+    // Exercise a large statistics population without constructing a large
+    // heap: this regression concerns candidate cost, not storage iteration.
+    let stats = &mut Arc::make_mut(&mut table).stats;
+    stats.row_count = 300_000;
+    stats.heap_page_count = 4000;
+    stats.multi_column_stats.clear();
+    stats.conditional_key_domains.clear();
+    for (name, column) in &mut stats.columns {
+        column.distinct_count = if name == "tenant" || name == "area" {
+            10
+        } else {
+            3000
+        };
+        column.min = Some(Value::Int(1));
+        column.max = Some(Value::Int(column.distinct_count as i64));
+        column.top_values.clear();
+        column.histogram.clear();
+        column.frequency = Default::default();
+    }
+    for (name, index) in &mut stats.indexes {
+        index.prefix_distinct_counts = if name.eq_ignore_ascii_case("primary") {
+            vec![10, 100, 300_000]
+        } else {
+            vec![10, 100, 200_000, 300_000]
+        };
+    }
+    let Statement::Select(select) = parse_statement("SELECT id,payload FROM event_cost WHERE tenant=? AND area=? AND owner=? ORDER BY id DESC LIMIT 1").unwrap() else { unreachable!() };
+    let predicate = select.selection.as_ref().unwrap();
+    let hints = ScanHints {
+        order_by: &select.order_by,
+        limit_with_offset: Some(1),
+        required_columns: Some(
+            [
+                "id".into(),
+                "payload".into(),
+                "tenant".into(),
+                "area".into(),
+                "owner".into(),
+            ]
+            .into(),
+        ),
+        ..ScanHints::none()
+    };
+    let ctx = crate::engine::cbo::CboContext::from_db(engine.db_for_tests());
+    let choice = with_planning_params(&[Value::Int(1), Value::Int(1), Value::Int(17)], || {
+        best_index_access(&ctx, &table, predicate, &hints, 300_000.0, 4000.0, 24.0)
+    })
+    .unwrap();
+    assert_eq!(choice.0.index.name, "by_owner");
+    assert!(
+        matches!(choice.0.kind, IndexAccessKind::Lookup { ref key, .. } if key.contains_param())
+    );
+}
+
+#[test]
+fn costing_resolves_planning_parameters_without_execution_bindings() {
+    use crate::storage::{DataTypeKind, ParamTarget};
+    let cases = [
+        (Value::Int(7), ParamTarget::Int, DataTypeKind::Int),
+        (
+            Value::UInt(u64::MAX),
+            ParamTarget::UInt,
+            DataTypeKind::BigInt,
+        ),
+        (Value::Int(-1), ParamTarget::UInt, DataTypeKind::BigInt),
+        (Value::Null, ParamTarget::Int, DataTypeKind::Int),
+        (
+            Value::String("hello".into()),
+            ParamTarget::String,
+            DataTypeKind::VarChar { len: None },
+        ),
+    ];
+    for (value, target, ty) in cases {
+        let key = KeyPart::Param { idx: 0, target };
+        let expected = crate::engine::params::with_params_slice(&[value.clone()], || {
+            key.resolve_param().unwrap().to_value(&ty)
+        });
+        let actual = with_planning_params(&[value], || concrete_key_part_value(&key, &ty));
+        assert_eq!(actual, Some(expected));
+        assert!(crate::engine::params::current_param(0).is_none());
+        assert!(matches!(key, KeyPart::Param { .. }));
+    }
+}
+
+#[test]
+fn costing_parameterized_range_matches_literal_prefix_estimate() {
+    use crate::storage::ParamTarget;
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE cost_ranges (tenant INT, area INT, id INT, PRIMARY KEY(tenant,area,id))",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO cost_ranges VALUES (1,1,1),(1,1,2),(1,1,3),(1,2,1),(2,1,1),(2,1,2)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE cost_ranges").unwrap();
+    let table = engine.db_for_tests().table("cost_ranges").unwrap();
+    let index = table.indexes.iter().find(|i| i.primary).unwrap();
+    let filter = parsed_filter("SELECT 1 WHERE tenant=? AND area=?");
+    let literal = parsed_filter("SELECT 1 WHERE tenant=1 AND area=1");
+    let expected_filter = estimate_filter_rows(&table, &literal, 6.0);
+    let actual_filter = with_planning_params(&[Value::Int(1), Value::Int(1)], || {
+        estimate_filter_rows(&table, &filter, 6.0)
+    });
+    assert_eq!(actual_filter, expected_filter);
+    let bounds = |deferred| {
+        let prefix = || {
+            if deferred {
+                vec![
+                    KeyPart::Param {
+                        idx: 0,
+                        target: ParamTarget::Int,
+                    },
+                    KeyPart::Param {
+                        idx: 1,
+                        target: ParamTarget::Int,
+                    },
+                ]
+            } else {
+                vec![KeyPart::Int(1), KeyPart::Int(1)]
+            }
+        };
+        let mut lo = prefix();
+        lo.push(KeyPart::Int(1));
+        let mut hi = prefix();
+        hi.push(KeyPart::Int(3));
+        (
+            Some(IndexBound {
+                key: IndexKey::from(lo),
+                inclusive: true,
+            }),
+            Some(IndexBound {
+                key: IndexKey::from(hi),
+                inclusive: true,
+            }),
+        )
+    };
+    let (lo, hi) = bounds(false);
+    let expected = estimate_index_range_access_rows(&table, index, &lo, &hi, 6.0);
+    let (lo, hi) = bounds(true);
+    let actual = with_planning_params(&[Value::Int(1), Value::Int(1)], || {
+        estimate_index_range_access_rows(&table, index, &lo, &hi, 6.0)
+    });
+    assert_eq!(actual, expected);
+    assert!(lo.unwrap().key.contains_param());
+}
+
+#[test]
+fn constant_probe_prefix_does_not_turn_rounded_values_into_equalities() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE rounded_outer (id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO rounded_outer VALUES (1),(2)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE rounded_inner (tenant DECIMAL(20,2), id INT, PRIMARY KEY(tenant,id), KEY by_id(id))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO rounded_inner VALUES (7.25,1),(7.25,2)")
+        .unwrap();
+    let result = engine
+        .execute("SELECT /*+ NO_HASH_JOIN(o,i) USE_INDEX(i,PRIMARY) */ COUNT(*) FROM rounded_outer o, rounded_inner i WHERE i.id=o.id AND i.tenant=7.251")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let rows = match result {
+        crate::engine::api::QueryResponse::ResultSet(r) => r.rows,
+        crate::engine::api::QueryResponse::SharedResultSet(r) => r.rows,
+        r => panic!("expected rows, got {r:?}"),
+    };
+    assert_eq!(rows, vec![vec![Value::Int(0)]]);
+}
+
+#[test]
+fn dependent_lookup_uses_inner_constant_composite_prefix() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE prefix_outer (id INT PRIMARY KEY)")
+        .unwrap();
+    engine.execute("CREATE TABLE prefix_inner (tenant INT, id INT, value INT, PRIMARY KEY(tenant,id), KEY by_id(id))").unwrap();
+    let db = engine.db_for_tests();
+    let scan = |name: &str, filter| {
+        let schema = db.table(name).unwrap();
+        PhysicalPlan::SeqScan {
+            table: PlanTable::new(schema.id, schema, None),
+            filter,
+            estimated_rows: 100.0,
+            access_rows: 100.0,
+            cost: crate::engine::cbo::Cost::scalar(100.0),
+            possible_keys: vec![],
+            runtime_filters: vec![],
+            hint_note: None,
+            projected_columns: None,
+        }
+    };
+    let outer = scan("prefix_outer", None);
+    let condition = parsed_filter("SELECT 1 WHERE prefix_inner.id=prefix_outer.id");
+    for predicate in ["prefix_inner.tenant=7", "7=prefix_inner.tenant"] {
+        let inner = scan(
+            "prefix_inner",
+            Some(parsed_filter(&format!("SELECT 1 WHERE {predicate}"))),
+        );
+        let (_, index, prefix, _, _) =
+            dependent_range_join_index(&outer, &inner, Some(&condition), &[]).unwrap();
+        assert!(
+            index.primary,
+            "constant prefix must participate before candidate selection: {index:?}"
+        );
+        assert_eq!(prefix, 2);
+    }
+    for value in [Value::Int(7), Value::UInt(7), Value::Null] {
+        crate::engine::params::with_params_slice(&[value], || {
+            let inner = scan(
+                "prefix_inner",
+                Some(parsed_filter("SELECT 1 WHERE prefix_inner.tenant=?")),
+            );
+            let (_, index, prefix, _, _) =
+                dependent_range_join_index(&outer, &inner, Some(&condition), &[]).unwrap();
+            assert!(index.primary);
+            assert_eq!(prefix, 2);
+        });
+    }
+}
+
+#[test]
+fn inner_constant_prefix_preserves_comparison_and_outer_join_results() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE constant_outer (id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO constant_outer VALUES (1),(2),(3)")
+        .unwrap();
+    for (kind, values, predicates) in [
+        (
+            "INT",
+            "(7,1,11),(7,2,22),(8,1,33)",
+            vec!["7", "NULL", "7.5", "'7.5'", "'7'", "-1"],
+        ),
+        (
+            "DECIMAL(20,2)",
+            "(7.25,1,11),(7.25,2,22),(8,1,33)",
+            vec!["7.25", "NULL", "7.251", "'7.25'"],
+        ),
+        (
+            "VARCHAR(10) COLLATE utf8mb4_0900_ai_ci",
+            "('Seven',1,11),('Seven',2,22),('8',1,33)",
+            vec!["'SEVEN'", "NULL", "8", "'8'"],
+        ),
+    ] {
+        engine.execute(&format!("CREATE TABLE constant_inner (tenant {kind}, id INT, v INT, PRIMARY KEY(tenant,id), KEY by_id(id))")).unwrap();
+        engine
+            .execute(&format!("INSERT INTO constant_inner VALUES {values}"))
+            .unwrap();
+        for predicate in predicates {
+            for join in ["JOIN", "LEFT JOIN"] {
+                let sql = |hint| {
+                    format!("SELECT {hint} o.id,i.v FROM constant_outer o {join} constant_inner i ON i.id=o.id AND i.tenant={predicate} ORDER BY o.id,i.v")
+                };
+                let rows = |sql: String| match engine.execute(&sql).unwrap().materialize().unwrap()
+                {
+                    crate::engine::api::QueryResponse::ResultSet(r) => r.rows,
+                    crate::engine::api::QueryResponse::SharedResultSet(r) => r.rows,
+                    r => panic!("expected rows, got {r:?}"),
+                };
+                assert_eq!(
+                    rows(sql("/*+ NO_HASH_JOIN(o,i) */")),
+                    rows(sql("/*+ HASH_JOIN(o,i) */")),
+                    "{kind} {join} {predicate}"
+                );
+            }
+        }
+        engine.execute("DROP TABLE constant_inner").unwrap();
+    }
+}
+
+#[test]
 fn vector_cost_signatures_cover_nested_literals_and_output_aliases() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
@@ -492,6 +953,7 @@ fn reverse_semi_anti_cost_selects_hash_over_broad_noncovering_lookup() {
             join_type,
             &left_keys,
             &right_keys,
+            &[false],
             Some(&Expr::Literal(crate::parser::Literal::Bool(true))),
             estimated_rows(&outer),
             estimated_rows(&inner),
@@ -504,6 +966,7 @@ fn reverse_semi_anti_cost_selects_hash_over_broad_noncovering_lookup() {
             join_type,
             &left_keys,
             &right_keys,
+            &[false],
             None,
             estimated_rows(&outer),
             estimated_rows(&inner),

@@ -159,6 +159,30 @@ pub(super) fn estimate_ngram_prefilter_rows(
 }
 
 pub(crate) fn estimate_filter_rows(table: &TableSchema, expr: &Expr, total_rows: f64) -> f64 {
+    // All predicate helpers below (finite domains, correlated equalities,
+    // histograms and row goals) must see the same costing-only bindings.
+    // The executor's filter and general normalization remain deferred.
+    let mut bound;
+    let expr = if PLANNING_PARAMS.with(|params| params.borrow().is_some())
+        && crate::parser::visit::try_for_each_expr(expr, |node| {
+            if matches!(node, Expr::Placeholder(_)) {
+                Err(())
+            } else {
+                Ok(true)
+            }
+        })
+        .is_err()
+    {
+        bound = expr.clone();
+        bind_cost_parameters(&mut bound);
+        &bound
+    } else {
+        expr
+    };
+    estimate_bound_filter_rows(table, expr, total_rows)
+}
+
+fn estimate_bound_filter_rows(table: &TableSchema, expr: &Expr, total_rows: f64) -> f64 {
     if total_rows <= 0.0 {
         return 0.0;
     }
@@ -1452,6 +1476,24 @@ pub(super) fn estimate_index_range_access_rows(
     }
     // Find only the prefix actually fixed by BOTH endpoints. A tuple
     // bound (a,b)>(1,2) does not constrain a=1.
+    // Resolve copies, never the reusable scan bounds. Comparing deferred
+    // parameter ordinals cannot establish either key order or equality.
+    let resolve = |bound: &Option<IndexBound>| {
+        bound.as_ref().map(|bound| {
+            let mut resolved = bound.clone();
+            for (pos, part) in resolved.key.0.iter_mut().enumerate() {
+                if matches!(part, KeyPart::Param { .. }) {
+                    if let Some(value) = resolve_cost_key_part(part) {
+                        *part = index.apply_prefix_to_key_part(pos, value);
+                    }
+                }
+            }
+            resolved
+        })
+    };
+    let resolved_low = resolve(low);
+    let resolved_high = resolve(high);
+    let (low, high) = (&resolved_low, &resolved_high);
     let common = match (low, high) {
         (Some(low), Some(high)) => low
             .key
@@ -2280,6 +2322,7 @@ pub(super) fn estimate_hash_join_operator_cost(
     join_type: JoinType,
     left_keys: &[Expr],
     right_keys: &[Expr],
+    null_safe: &[bool],
     residual: Option<&Expr>,
     left_rows: f64,
     right_rows: f64,
@@ -2433,22 +2476,49 @@ pub(super) fn estimate_hash_join_operator_cost(
         || (matches!(join_type, JoinType::Inner | JoinType::Semi)
             && build_rows <= BLOOM_COST_MAX_BUILD_ROWS
             && match_rate <= 0.5);
+    let runtime_probe = if join_type == JoinType::Inner
+        && residual.is_none()
+        && left_keys.len() == 1
+        && right_keys.len() == 1
+        && !null_safe.iter().any(|safe| *safe)
+    {
+        let (build_plan, build_key, probe_key) = match build_side {
+            BuildSide::Left => (left, &left_keys[0], &right_keys[0]),
+            BuildSide::Right => (right, &right_keys[0], &left_keys[0]),
+        };
+        exact_runtime_index_probe_cost(
+            ctx, build_plan, probe_plan, build_key, probe_key, build_rows, probe_rows,
+        )
+    } else {
+        None
+    };
+    // The child retains its standalone scan cost for the non-installed-filter
+    // fallback. This join prices the conditional complete-key lookup instead;
+    // applying a parallel broad-scan discount as well would count it twice.
+    let effective_probe_cost = runtime_probe.as_ref().map_or(probe_cost, |(cost, _)| cost);
+    let effective_probe_rows = runtime_probe.as_ref().map_or(probe_rows, |(_, rows)| *rows);
     let mut cost = operator_cost::hash_join(
         ctx,
         build_cost,
-        probe_cost,
+        effective_probe_cost,
         build_rows,
-        probe_rows,
+        effective_probe_rows,
         build_width,
         output_est,
         left_width + right_width,
-        match_rate,
+        if runtime_probe.is_some() {
+            1.0
+        } else {
+            match_rate
+        },
         bloom_applicable,
     );
-    apply_hash_join_parallel_probe_cost_adjustment(
-        &mut cost, probe_plan, probe_cost, build_rows, probe_rows, join_type, build_side, residual,
-        match_rate,
-    );
+    if runtime_probe.is_none() {
+        apply_hash_join_parallel_probe_cost_adjustment(
+            &mut cost, probe_plan, probe_cost, build_rows, probe_rows, join_type, build_side,
+            residual, match_rate,
+        );
+    }
     (cost, build_side, output_est)
 }
 

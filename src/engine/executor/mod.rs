@@ -1424,6 +1424,7 @@ fn auto_param_mode_for_statement(
         && (safe_integer_counter_update(db, session, statement)
             || safe_numeric_counter_update(db, session, statement)
             || safe_typed_point_update(db, session, statement)
+            || safe_integer_point_delete(db, session, statement)
             || safe_large_literal_update(statement))
     {
         return crate::engine::auto_param::AutoParameterizeMode::All;
@@ -1462,6 +1463,140 @@ fn parameterized_update_column_name(expr: &Expr) -> Option<&str> {
         Expr::CompoundIdentifier(parts) => parts.last().map(String::as_str),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextLiteralDomain {
+    Null,
+    Integer,
+    Numeric,
+    Text,
+    Binary,
+}
+
+/// The default policy is also checked on parser-proven placeholder ASTs.
+/// Borrow the current binding: proving its source domain must not clone a
+/// string/decimal value or erase the distinction between text and numbers.
+fn text_literal_domain(expr: &Expr) -> Option<TextLiteralDomain> {
+    use TextLiteralDomain as D;
+    match expr {
+        Expr::Literal(literal) => match literal {
+            Literal::Null => Some(D::Null),
+            Literal::Int(_) | Literal::UInt(_) => Some(D::Integer),
+            Literal::Float(_) | Literal::Decimal(_) => Some(D::Numeric),
+            Literal::String(_) => Some(D::Text),
+            Literal::HexBytes(_) | Literal::BitBytes(_) => Some(D::Binary),
+            _ => None,
+        },
+        Expr::Placeholder(index) => {
+            crate::engine::params::with_current_param(*index, |value| match value? {
+                Value::Null => Some(D::Null),
+                Value::Int(_) | Value::UInt(_) => Some(D::Integer),
+                Value::Float(_)
+                | Value::Double(_)
+                | Value::Decimal(_)
+                | Value::DecimalCompact(..)
+                | Value::Decimal128(..)
+                | Value::DecimalWide(_) => Some(D::Numeric),
+                Value::String(_) | Value::SmallString(_) => Some(D::Text),
+                Value::Bytes(_) => Some(D::Binary),
+                _ => None,
+            })
+        }
+        Expr::Unary {
+            op: crate::parser::UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Literal::Int(n)) if n.checked_neg().is_some() => Some(D::Integer),
+            Expr::Literal(Literal::Float(_) | Literal::Decimal(_)) => Some(D::Numeric),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Default-on DELETE reuse is limited to an exact unique integer key. This
+/// leaves broad deletes, modifiers and expression/coercion diagnostics on the
+/// ordinary path while allowing ordinary composite business keys to reuse the
+/// same prepared deletion, FK and statement-rollback machinery.
+fn safe_integer_point_delete(
+    db: &Database,
+    session: &SessionContext,
+    statement: &Statement,
+) -> bool {
+    let Statement::Delete(delete) = statement else {
+        return false;
+    };
+    if delete.selection.is_none()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+        || delete.primary_alias.is_some()
+        || !delete.joins.is_empty()
+        || !delete.targets.is_empty()
+        || !delete.partitions.is_empty()
+        || delete.low_priority
+        || delete.quick
+        || delete.ignore
+        || !delete.query_hints.is_empty()
+        || !delete.hint_warnings.is_empty()
+        || delete.returning.is_some()
+    {
+        return false;
+    }
+    let (database, name) = split_table_name(&session.current_database, &delete.table);
+    if is_system_database(&database) {
+        return false;
+    }
+    let Ok(table) = db.table_in_database(&database, &name) else {
+        return false;
+    };
+    fn collect(expr: &Expr, table: &crate::storage::TableSchema, columns: &mut Vec<usize>) -> bool {
+        let Expr::Binary { left, op, right } = expr else {
+            return false;
+        };
+        if *op == BinaryOp::And {
+            return collect(left, table, columns) && collect(right, table, columns);
+        }
+        if *op != BinaryOp::Eq {
+            return false;
+        }
+        for (column, literal) in [
+            (left.as_ref(), right.as_ref()),
+            (right.as_ref(), left.as_ref()),
+        ] {
+            if text_literal_domain(literal) != Some(TextLiteralDomain::Integer) {
+                continue;
+            }
+            if let Some(index) = parameterized_update_column_name(column)
+                .and_then(|name| table.column_index(name).ok())
+            {
+                if matches!(
+                    table.columns[index].data_type,
+                    DataTypeKind::TinyInt
+                        | DataTypeKind::SmallInt
+                        | DataTypeKind::MediumInt
+                        | DataTypeKind::Int
+                        | DataTypeKind::BigInt
+                ) {
+                    columns.push(index);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut columns = Vec::new();
+    collect(delete.selection.as_ref().unwrap(), &table, &mut columns)
+        && table.iter_queryable_indexes().any(|index| {
+            index.unique
+                && !index.has_prefix_columns()
+                && !index.has_expression_parts()
+                && index.columns.iter().all(|name| {
+                    table
+                        .column_index(name)
+                        .is_ok_and(|position| columns.contains(&position))
+                })
+        })
 }
 
 /// Default-on parameterisation for a plain UPDATE carrying a large direct
@@ -1693,10 +1828,8 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
     };
     fn numeric_literal(expr: &Expr) -> bool {
         matches!(
-            expr,
-            Expr::Literal(
-                Literal::Int(_) | Literal::UInt(_) | Literal::Float(_) | Literal::Decimal(_)
-            )
+            text_literal_domain(expr),
+            Some(TextLiteralDomain::Integer | TextLiteralDomain::Numeric)
         )
     }
     fn numeric_type(kind: &DataTypeKind) -> bool {
@@ -1713,10 +1846,11 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
         )
     }
     fn literal_compatible(column: &crate::storage::ColumnSchema, expr: &Expr) -> bool {
-        let Expr::Literal(literal) = expr else {
+        use TextLiteralDomain as D;
+        let Some(domain) = text_literal_domain(expr) else {
             return false;
         };
-        if matches!(literal, Literal::Null) {
+        if domain == D::Null {
             return column.nullable;
         }
         match column.data_type {
@@ -1726,26 +1860,20 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
             | DataTypeKind::Int
             | DataTypeKind::BigInt
             | DataTypeKind::Bool
-            | DataTypeKind::Year => matches!(literal, Literal::Int(_) | Literal::UInt(_)),
+            | DataTypeKind::Year => domain == D::Integer,
             DataTypeKind::Float { .. }
             | DataTypeKind::Double { .. }
-            | DataTypeKind::Decimal { .. } => matches!(
-                literal,
-                Literal::Int(_) | Literal::UInt(_) | Literal::Float(_) | Literal::Decimal(_)
-            ),
+            | DataTypeKind::Decimal { .. } => matches!(domain, D::Integer | D::Numeric),
             DataTypeKind::Char { .. }
             | DataTypeKind::VarChar { .. }
-            | DataTypeKind::Text { .. } => matches!(literal, Literal::String(_)),
+            | DataTypeKind::Text { .. } => domain == D::Text,
             DataTypeKind::Binary { .. }
             | DataTypeKind::VarBinary { .. }
-            | DataTypeKind::Blob { .. } => matches!(
-                literal,
-                Literal::String(_) | Literal::HexBytes(_) | Literal::BitBytes(_)
-            ),
+            | DataTypeKind::Blob { .. } => matches!(domain, D::Text | D::Binary),
             DataTypeKind::Date
             | DataTypeKind::Time { .. }
             | DataTypeKind::DateTime { .. }
-            | DataTypeKind::Timestamp { .. } => matches!(literal, Literal::String(_)),
+            | DataTypeKind::Timestamp { .. } => domain == D::Text,
             // Complex/domain types keep their dedicated legacy coercion and
             // validation surfaces.
             _ => false,
@@ -2103,7 +2231,8 @@ fn text_shape_key_and_params(
     sql: &str,
     parser_mode_bits: u16,
 ) -> Option<(crate::engine::cache::ParsedStatementKey, Vec<Value>)> {
-    if !(select_keyword_prefix(sql) || bulk_dml_keyword_prefix(sql))
+    if sql.len() > TEXT_DML_SHAPE_MAX_BYTES
+        || !(select_keyword_prefix(sql) || bulk_dml_keyword_prefix(sql))
         || has_non_trailing_statement_separator_with_mode(
             sql,
             crate::sql_lex::SqlLexMode::from_parser_bits(parser_mode_bits),
@@ -2332,6 +2461,45 @@ fn scan_literal_normalized_dml_impl(
         }
         last_was_space = false;
         match b {
+            b'-' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+                && shape
+                    .bytes()
+                    .rev()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .is_some_and(|b| {
+                        matches!(
+                            b,
+                            b'=' | b'('
+                                | b','
+                                | b'<'
+                                | b'>'
+                                | b'!'
+                                | b'+'
+                                | b'-'
+                                | b'*'
+                                | b'/'
+                                | b'%'
+                        )
+                    }) =>
+            {
+                let start = i;
+                i += 2;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_digit()
+                        || matches!(bytes[i], b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    if matches!(bytes[i], b'+' | b'-') && !matches!(bytes[i - 1], b'e' | b'E') {
+                        break;
+                    }
+                    i += 1;
+                }
+                let value = parse_scanned_numeric_literal(&sql[start..i])?;
+                if collect_params {
+                    params.push(value);
+                }
+                saw_literal = true;
+                shape.push('?');
+            }
             b'\'' => {
                 let next = if collect_params {
                     let (value, next) = scan_sql_string_literal(bytes, i)?;
@@ -4621,16 +4789,11 @@ impl QueryEngine for StorageQueryEngine {
         if matches!(mode, crate::engine::auto_param::AutoParameterizeMode::Off) {
             return None;
         }
-        // A DML shape is only ever published while DML auto-parameterization
-        // is on, so under `Select` the lookup below could not hit — and it is
-        // not free: `text_shape_key_and_params` scans the whole statement and
-        // builds a shape string plus a value vector before the (certain)
-        // cache miss. Decline before paying for it.
-        if !matches!(mode, crate::engine::auto_param::AutoParameterizeMode::All)
-            && !select_keyword_prefix(sql)
-        {
-            return None;
-        }
+        // The default mode also publishes parser-proven INSERT and typed
+        // UPDATE shapes through `try_execute_scanned_text_dml`. Let the
+        // protocol borrow those artifacts and use its prepared scheduling
+        // policy; the cache publisher, not the configured broad DML mode,
+        // owns the provenance proof. Unproven shapes simply miss here.
         let parser_mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
         let (key, params) = text_shape_key_and_params(sql, parser_mode_bits)?;
         let statement = self.statement_cache.get(&key)?;
@@ -4641,6 +4804,27 @@ impl QueryEngine for StorageQueryEngine {
                 | Statement::Update(_)
                 | Statement::Delete(_)
         ) {
+            return None;
+        }
+        // Parser artifacts are unqualified and shared across catalogs. The
+        // cold publisher's catalog/type proof cannot authorize a different
+        // database, a post-DDL schema, or a new literal comparison domain.
+        if mode == crate::engine::auto_param::AutoParameterizeMode::Select
+            && !matches!(statement.as_ref(), Statement::Select(_))
+            && (statement_refs_temp_table(session, &statement)
+                || !crate::engine::params::with_params_slice(&params, || {
+                    match statement.as_ref() {
+                        Statement::Insert(insert) => !insert.delayed,
+                        Statement::Update(_) => {
+                            safe_typed_point_update(&self.db, session, &statement)
+                        }
+                        Statement::Delete(_) => {
+                            safe_integer_point_delete(&self.db, session, &statement)
+                        }
+                        _ => false,
+                    }
+                }))
+        {
             return None;
         }
         self.db.record_select_parse_cache_hit();
@@ -5196,7 +5380,8 @@ impl StorageQueryEngine {
             let proven_shape = matches!(&statement, Statement::Insert(insert) if !insert.delayed)
                 || safe_integer_counter_update(&self.db, session, &statement)
                 || safe_numeric_counter_update(&self.db, session, &statement)
-                || safe_typed_point_update(&self.db, session, &statement);
+                || safe_typed_point_update(&self.db, session, &statement)
+                || safe_integer_point_delete(&self.db, session, &statement);
             if !proven_shape
                 || !should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement)
             {

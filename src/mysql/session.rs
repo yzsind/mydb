@@ -498,6 +498,7 @@ struct ParsedStatementMemo {
 
 struct TextShapeExecutionMemo {
     shape_sql: Arc<str>,
+    qualified_statement: Option<Arc<Statement>>,
     state: crate::engine::api::PreparedSelectMemoState,
     dml_state: crate::engine::api::PreparedDmlState,
 }
@@ -506,6 +507,7 @@ const TEXT_SHAPE_MEMO_SLOTS: usize = 32;
 
 struct TextShapeMemoCache {
     database: String,
+    parser_mode_bits: u16,
     slots: Box<[Option<TextShapeExecutionMemo>; TEXT_SHAPE_MEMO_SLOTS]>,
     next_victim: usize,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
@@ -526,6 +528,7 @@ impl TextShapeMemoCache {
         )?;
         Some(Self {
             database: String::new(),
+            parser_mode_bits: 0,
             slots: Box::new(std::array::from_fn(|_| None)),
             next_victim: 0,
             _charge: charge,
@@ -542,18 +545,14 @@ impl TextShapeMemoCache {
             .and_then(Option::take)
     }
 
-    fn take_or_new(&mut self, shape_sql: &Arc<str>) -> (TextShapeExecutionMemo, bool) {
-        match self.take(shape_sql) {
-            Some(memo) => (memo, false),
-            None => (
-                TextShapeExecutionMemo {
-                    shape_sql: Arc::clone(shape_sql),
-                    state: crate::engine::api::PreparedSelectMemoState::default(),
-                    dml_state: crate::engine::api::PreparedDmlState::default(),
-                },
-                true,
-            ),
-        }
+    fn take_or_new(&mut self, shape_sql: &Arc<str>) -> TextShapeExecutionMemo {
+        self.take(shape_sql)
+            .unwrap_or_else(|| TextShapeExecutionMemo {
+                shape_sql: Arc::clone(shape_sql),
+                qualified_statement: None,
+                state: crate::engine::api::PreparedSelectMemoState::default(),
+                dml_state: crate::engine::api::PreparedDmlState::default(),
+            })
     }
 
     fn put(&mut self, memo: TextShapeExecutionMemo) {
@@ -3679,10 +3678,15 @@ where
     }
 
     async fn handle_single_query(&mut self, sql: String) -> io::Result<()> {
+        let parser_mode_bits =
+            crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode);
         if let Some(cache) = self.text_shape_memos.as_mut() {
-            if cache.database != self.context.current_database {
+            if cache.database != self.context.current_database
+                || cache.parser_mode_bits != parser_mode_bits
+            {
                 cache.slots.fill_with(|| None);
                 cache.database.clone_from(&self.context.current_database);
+                cache.parser_mode_bits = parser_mode_bits;
             }
         }
         if let Some(err) = self.context.cancelled_error() {
@@ -3691,9 +3695,7 @@ where
         if let Some(handle) = &self.handle {
             handle.set_base_state(ProcessState::Executing);
         }
-        let lex_mode = crate::sql_lex::SqlLexMode::from_parser_bits(
-            crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode),
-        );
+        let lex_mode = crate::sql_lex::SqlLexMode::from_parser_bits(parser_mode_bits);
         if !self.capabilities.has(CLIENT_MULTI_STATEMENTS) {
             match query_requires_multi_statements(
                 sql.as_str(),
@@ -3888,20 +3890,10 @@ where
                     // clients before server-side cursor support landed.
                     let result = match params {
                         Some((params, shape_sql)) => {
-                            let (mut memo, memo_is_new) = self
+                            let mut memo = self
                                 .text_shape_memos
                                 .as_mut()
-                                .map(|cache| cache.take_or_new(&shape_sql))
-                                .map_or((None, false), |(memo, is_new)| (Some(memo), is_new));
-                            // Parser-shape artifacts are deliberately shared
-                            // across databases and therefore remain
-                            // unqualified. Prepared SELECT compilation,
-                            // however, expects the PREPARE-time qualified AST.
-                            // Qualify one short-lived clone only when this
-                            // per-connection shape memo is born; Ready states
-                            // never inspect `parsed` again.
-                            let qualified = self.qualify_new_text_shape(&sql, &parsed, memo_is_new);
-                            let compile_parsed = qualified.as_ref().unwrap_or(&parsed);
+                                .map(|cache| cache.take_or_new(&shape_sql));
                             // Bind Performance Schema's digest to the shape,
                             // not to this execution's literal bytes. Without
                             // it every literal spelling is a fresh key in the
@@ -3911,6 +3903,8 @@ where
                             // (the compile-miss fallback just below) already
                             // scopes the same override.
                             let compiled = memo.as_mut().and_then(|memo| {
+                                self.prepare_text_shape_template(&sql, &parsed, memo);
+                                let compile_parsed = memo.qualified_statement.as_ref()?;
                                 crate::engine::perf_events::with_statement_digest_sql_override(
                                     Arc::clone(&shape_sql),
                                     || {
@@ -4078,22 +4072,30 @@ where
         }
         let result = match parsed_for_blocking {
             Some((parsed, Some((params, shape_sql)))) if self.text_shape_memos.is_some() => {
-                let (mut memo, memo_is_new) = self
+                let mut memo = self
                     .text_shape_memos
                     .as_mut()
                     .expect("shape cache checked above")
                     .take_or_new(&shape_sql);
-                let qualified = self.qualify_new_text_shape(&sql, &parsed, memo_is_new);
-                let compile_parsed = qualified.unwrap_or_else(|| Arc::clone(&parsed));
-                let (dml_state, result) = self
-                    .execute_engine_blocking_shape(
-                        sql,
-                        compile_parsed,
-                        params,
-                        Arc::clone(&shape_sql),
-                        std::mem::take(&mut memo.dml_state),
-                    )
-                    .await;
+                self.prepare_text_shape_template(&sql, &parsed, &mut memo);
+                let dml_state = std::mem::take(&mut memo.dml_state);
+                let (dml_state, result) = match memo.qualified_statement.as_ref() {
+                    Some(statement) => {
+                        self.execute_engine_blocking_shape(
+                            sql,
+                            Arc::clone(statement),
+                            params,
+                            Arc::clone(&shape_sql),
+                            dml_state,
+                        )
+                        .await
+                    }
+                    None => (
+                        dml_state,
+                        self.execute_engine_blocking_parsed(sql, parsed, Some((params, shape_sql)))
+                            .await,
+                    ),
+                };
                 memo.dml_state = dml_state;
                 if let Some(cache) = self.text_shape_memos.as_mut() {
                     cache.put(memo);
@@ -7295,23 +7297,23 @@ where
         result
     }
 
-    /// Shared parser artifacts remain unqualified. Only a new per-session
-    /// execution memo needs a qualified clone; normal execution owns any error.
-    fn qualify_new_text_shape(
+    /// Keep the connection's qualified template across plan invalidations.
+    /// Shared parser artifacts remain unqualified; ANALYZE, DDL and session
+    /// semantic changes can require compiling an existing shape again.
+    /// Qualification failures leave execution to the ordinary dispatcher.
+    fn prepare_text_shape_template(
         &mut self,
         sql: &str,
         parsed: &Statement,
-        is_new: bool,
-    ) -> Option<Arc<Statement>> {
-        is_new
-            .then(|| {
-                self.engine
-                    .prepare_statement_template(&mut self.context, sql, parsed.clone())
-            })
-            .transpose()
-            .ok()
-            .flatten()
-            .map(Arc::new)
+        memo: &mut TextShapeExecutionMemo,
+    ) {
+        if memo.qualified_statement.is_none() {
+            memo.qualified_statement = self
+                .engine
+                .prepare_statement_template(&mut self.context, sql, parsed.clone())
+                .ok()
+                .map(Arc::new);
+        }
     }
 
     /// Execute a shape-matched literal COM_QUERY DML statement through the
@@ -7335,18 +7337,16 @@ where
             let result = self.execute_engine_blocking(sql).await;
             return self.write_query_response(result).await;
         };
-        let (mut memo, memo_is_new) = cache.take_or_new(&shape_sql);
-        // Parser-shape artifacts are shared across databases and therefore
-        // stay unqualified; the compiled DML vehicle expects the PREPARE-time
-        // qualified AST. Qualify one short-lived clone only when this
-        // per-connection shape memo is born.
-        let qualified = self.qualify_new_text_shape(&sql, &parsed, memo_is_new);
-        let compile_parsed = qualified.unwrap_or(parsed);
-
+        let mut memo = cache.take_or_new(&shape_sql);
+        self.prepare_text_shape_template(&sql, &parsed, &mut memo);
         let dml_state = std::mem::take(&mut memo.dml_state);
-        let (dml_state, result) = self
-            .dispatch_text_dml_shape(&sql, &compile_parsed, dml_state, &params, &shape_sql)
-            .await;
+        let (dml_state, result) = match memo.qualified_statement.as_ref() {
+            Some(statement) => {
+                self.dispatch_text_dml_shape(&sql, statement, dml_state, &params, &shape_sql)
+                    .await
+            }
+            None => (dml_state, None),
+        };
         memo.dml_state = dml_state;
         if let Some(cache) = self.text_shape_memos.as_mut() {
             cache.put(memo);
@@ -10724,6 +10724,227 @@ mod tests {
                 1525
             );
         }
+    }
+
+    #[test]
+    fn text_shape_dml_recompiles_after_auto_analyze_and_ddl() {
+        use crate::mysql::packet::read_packet;
+
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    for database in ["test", "shape_other"] {
+                        for autocommit in [true, false] {
+                            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                            let engine = Arc::new(
+                                crate::engine::StorageQueryEngine::open(dir.path()).unwrap(),
+                            );
+                            engine.execute("CREATE DATABASE shape_other").unwrap();
+                            for name in ["test", "shape_other"] {
+                                let sql = format!(
+                                    "CREATE TABLE {name}.shape_rebind(id INT PRIMARY KEY,n INT)"
+                                );
+                                engine.execute(&sql).unwrap();
+                            }
+                            let listener =
+                                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                                .await
+                                .unwrap();
+                            let (stream, peer) = listener.accept().await.unwrap();
+                            let mut session = Session::try_new(
+                                4244,
+                                peer,
+                                stream,
+                                None,
+                                Arc::clone(&engine),
+                                Arc::new(SessionRegistry::new()),
+                            )
+                            .unwrap();
+                            session.authenticated = true;
+                            session.context.current_database = database.into();
+                            session.context.autocommit = autocommit;
+                            let mut warm_compiles = None;
+                            for id in 1..=7 {
+                                let sql = format!("INSERT INTO shape_rebind(id,n) VALUES ({id},7)");
+                                session.handle_single_query(sql.clone()).await.unwrap();
+                                let packet = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(
+                                    packet.payload[0], 0x00,
+                                    "{database}, autocommit={autocommit}, {sql}: {:?}",
+                                    packet.payload
+                                );
+                                if !autocommit {
+                                    session.handle_single_query("COMMIT".into()).await.unwrap();
+                                    assert_eq!(
+                                        read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                                        0x00
+                                    );
+                                }
+                                let compiles =
+                                    engine.db_handle().storage_status().prepared_dml_compiles;
+                                if id == 2 {
+                                    warm_compiles = Some(compiles);
+                                } else if id == 3 {
+                                    assert_eq!(
+                                        Some(compiles),
+                                        warm_compiles,
+                                        "a warm shape must reuse its compiled plan"
+                                    );
+                                }
+                                let key = format!("{database}.shape_rebind");
+                                if id == 3 {
+                                    let before =
+                                        engine.db_handle().table(&key).unwrap().schema_version;
+                                    assert!(
+                                        engine.db_handle().auto_analyze_stale_tables(0.1).unwrap()
+                                            > 0
+                                    );
+                                    assert!(
+                                        engine.db_handle().table(&key).unwrap().schema_version
+                                            > before
+                                    );
+                                } else if id == 4 {
+                                    engine
+                                        .execute(&format!(
+                                            "ALTER TABLE {key} ADD COLUMN extra INT DEFAULT 9"
+                                        ))
+                                        .unwrap();
+                                } else if id == 5 {
+                                    session
+                                        .handle_single_query("SET time_zone='+01:00'".into())
+                                        .await
+                                        .unwrap();
+                                    assert_eq!(
+                                        read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                                        0x00
+                                    );
+                                } else if id == 6 {
+                                    engine.invalidate_statement_cache();
+                                }
+                            }
+                            let QueryResponse::ResultSet(rows) = engine
+                                .execute(&format!(
+                                    "SELECT id,n,extra FROM {database}.shape_rebind ORDER BY id"
+                                ))
+                                .unwrap()
+                                .materialize()
+                                .unwrap()
+                            else {
+                                panic!("expected inserted rows");
+                            };
+                            assert_eq!(rows.rows.len(), 7);
+                            for (index, row) in rows.rows.iter().enumerate() {
+                                assert_eq!(
+                                    row.iter()
+                                        .map(|value| value.to_display_string())
+                                        .collect::<Vec<_>>(),
+                                    vec![(index + 1).to_string(), "7".into(), "9".into()]
+                                );
+                            }
+                        }
+                    }
+                });
+        });
+    }
+
+    #[test]
+    fn text_shape_reads_recompile_and_follow_database_switches() {
+        use crate::mysql::packet::read_packet;
+
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                    let engine =
+                        Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+                    engine.execute("CREATE DATABASE shape_reads").unwrap();
+                    for (database, value) in [("test", 11), ("shape_reads", 22)] {
+                        engine
+                            .execute(&format!(
+                                "CREATE TABLE {database}.shape_read(id INT PRIMARY KEY,n INT)"
+                            ))
+                            .unwrap();
+                        engine
+                            .execute(&format!(
+                                "INSERT INTO {database}.shape_read VALUES (1,{value}),(2,{value})"
+                            ))
+                            .unwrap();
+                    }
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    let mut session = Session::try_new(
+                        4245,
+                        peer,
+                        stream,
+                        None,
+                        Arc::clone(&engine),
+                        Arc::new(SessionRegistry::new()),
+                    )
+                    .unwrap();
+                    session.authenticated = true;
+                    for (database, sql_mode, value) in [
+                        ("test", "", "1"),
+                        ("test", "PIPES_AS_CONCAT", "1111"),
+                        ("shape_reads", "PIPES_AS_CONCAT", "2222"),
+                        ("shape_reads", "", "1"),
+                        ("test", "PIPES_AS_CONCAT", "1111"),
+                    ] {
+                        session
+                            .handle_single_query(format!("USE {database}"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                            0x00
+                        );
+                        session
+                            .handle_single_query(format!("SET sql_mode='{sql_mode}'"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                            0x00
+                        );
+                        for round in 0..4 {
+                            if round == 3 {
+                                engine
+                                    .execute(&format!("ANALYZE TABLE {database}.shape_read"))
+                                    .unwrap();
+                            }
+                            for suffix in ["", " FOR UPDATE"] {
+                                let sql = format!(
+                                    "SELECT n || n FROM shape_read WHERE id = {}{suffix}",
+                                    round % 2 + 1
+                                );
+                                session.handle_single_query(sql.clone()).await.unwrap();
+                                let header = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(header.payload, vec![1], "{database}: {sql}");
+                                read_packet(&mut client).await.unwrap().unwrap();
+                                let eof = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(eof.payload[0], 0xfe);
+                                let row = read_packet(&mut client).await.unwrap().unwrap();
+                                let mut expected = vec![value.len() as u8];
+                                expected.extend_from_slice(value.as_bytes());
+                                assert_eq!(row.payload, expected, "{database}: {sql}");
+                                let eof = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(eof.payload[0], 0xfe);
+                            }
+                        }
+                    }
+                });
+        });
     }
 
     #[tokio::test(flavor = "current_thread")]

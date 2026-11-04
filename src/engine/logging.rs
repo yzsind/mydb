@@ -970,8 +970,15 @@ fn user_host(session: &SessionContext) -> String {
 }
 
 pub(crate) fn redact_sql_for_log(sql: &str) -> String {
+    redact_sql_for_log_borrowed(sql).into_owned()
+}
+
+/// Preserve the same redaction/truncation boundary without copying ordinary
+/// short SQL before a consumer moves it into its own shared text allocation.
+pub(crate) fn redact_sql_for_log_borrowed(sql: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     if crate::engine::ai::sql::sql_may_have_ai(sql) || crate::engine::http::sensitive(sql) {
-        return crate::engine::http::redaction_marker(sql, false).to_string();
+        return Cow::Borrowed(crate::engine::http::redaction_marker(sql, false));
     }
     fn starts_with_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
         haystack
@@ -1005,9 +1012,13 @@ pub(crate) fn redact_sql_for_log(sql: &str) -> String {
         || contains_ascii_case_insensitive(sql, b" IDENTIFIED BY ", 13)
         || contains_ascii_case_insensitive(sql, b" PASSWORD(", 5)
     {
-        return "[redacted credential statement]".to_string();
+        return Cow::Borrowed("[redacted credential statement]");
     }
-    truncate_sql_for_log(sql)
+    if sql.len() <= MAX_SQL_LOG_BYTES {
+        Cow::Borrowed(sql)
+    } else {
+        Cow::Owned(truncate_sql_for_log(sql))
+    }
 }
 
 fn response_rows_sent(result: &Result<QueryResponse, QueryError>) -> u64 {
@@ -1086,8 +1097,9 @@ pub(crate) struct QueryLogMetadata {
     pub(crate) dml_race_rollbacks: u64,
 }
 
+const MAX_SQL_LOG_BYTES: usize = 1024;
+
 pub(crate) fn truncate_sql_for_log(sql: &str) -> String {
-    const MAX_SQL_LOG_BYTES: usize = 1024;
     if sql.len() <= MAX_SQL_LOG_BYTES {
         return sql.to_string();
     }

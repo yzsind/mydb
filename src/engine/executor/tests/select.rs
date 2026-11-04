@@ -18270,6 +18270,238 @@ fn default_safe_counter_text_shape_reuses_compiled_dml_and_checks_residual() {
 }
 
 #[test]
+fn default_dml_protocol_reuse_rechecks_catalog_and_literal_domains() {
+    crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_test_engine(dir.path());
+        engine.execute("CREATE DATABASE other_shapes").unwrap();
+        engine
+            .execute("CREATE TABLE domain_shape (id INT PRIMARY KEY, n BIGINT)")
+            .unwrap();
+        engine
+            .execute("CREATE TABLE other_shapes.domain_shape (id INT PRIMARY KEY, n VARCHAR(32))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO domain_shape VALUES (1,0)")
+            .unwrap();
+        engine
+            .execute("UPDATE domain_shape SET n=n+1 WHERE id=1")
+            .unwrap();
+        let mut session = SessionContext::default();
+        assert!(
+            QueryEngine::cached_text_statement(
+                &engine,
+                &session,
+                "UPDATE domain_shape SET n=n+'bad' WHERE id=2"
+            )
+            .is_none(),
+            "a numeric template must not admit a text operand"
+        );
+        session.current_database = "other_shapes".into();
+        assert!(
+            QueryEngine::cached_text_statement(
+                &engine,
+                &session,
+                "UPDATE domain_shape SET n=n+2 WHERE id=1"
+            )
+            .is_none(),
+            "unqualified parser artifacts do not prove another catalog's column types"
+        );
+        session.current_database = "test".into();
+        engine
+            .execute("ALTER TABLE domain_shape MODIFY n VARCHAR(32)")
+            .unwrap();
+        assert!(
+            QueryEngine::cached_text_statement(
+                &engine,
+                &session,
+                "UPDATE domain_shape SET n=n+2 WHERE id=1"
+            )
+            .is_none(),
+            "DDL invalidates the catalog-dependent default policy"
+        );
+    });
+}
+
+#[test]
+fn warmed_text_shapes_keep_syntax_errors_and_delete_residuals() {
+    crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_test_engine(dir.path());
+        engine.execute("CREATE TABLE shape_boundaries (id INT PRIMARY KEY, version INT, amount DECIMAL(10,2))").unwrap();
+        engine
+            .execute("INSERT INTO shape_boundaries VALUES (1,1,1.25)")
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute("INSERT INTO shape_boundaries VALUES (2,1,1.2.3)")
+                .unwrap_err()
+                .code(),
+            1064
+        );
+        engine
+            .execute("DELETE FROM shape_boundaries WHERE id=1 AND version=2")
+            .unwrap();
+        engine
+            .execute("DELETE FROM shape_boundaries WHERE id=2 AND version=1")
+            .unwrap();
+        assert_eq!(
+            collect_select_response_rows(
+                engine
+                    .execute("SELECT COUNT(*) FROM shape_boundaries")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int(1)]]
+        );
+        engine.execute("CREATE TABLE shape_child (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY(parent_id) REFERENCES shape_boundaries(id))").unwrap();
+        engine
+            .execute("INSERT INTO shape_child VALUES (1,1)")
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute("DELETE FROM shape_boundaries WHERE id=1 AND version=1")
+                .unwrap_err()
+                .code(),
+            1451
+        );
+        assert_eq!(
+            collect_select_response_rows(
+                engine
+                    .execute("SELECT COUNT(*) FROM shape_boundaries")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int(1)]]
+        );
+    });
+}
+
+#[test]
+fn signed_numeric_text_updates_and_point_deletes_reuse_proven_shapes() {
+    crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_test_engine(dir.path());
+        engine.execute("CREATE TABLE signed_shapes (tenant INT, id INT, balance DECIMAL(20,2), PRIMARY KEY(tenant,id))").unwrap();
+        engine
+            .execute("INSERT INTO signed_shapes VALUES (1,1,0),(1,2,0),(2,1,0)")
+            .unwrap();
+        engine
+            .execute("UPDATE signed_shapes SET balance=-12.25 WHERE tenant=1 AND id=1")
+            .unwrap();
+        let before = crate::parser::parse_statement_calls_for_test();
+        engine
+            .execute("UPDATE signed_shapes SET balance=-23.50 WHERE tenant=1 AND id=2")
+            .unwrap();
+        assert_eq!(
+            crate::parser::parse_statement_calls_for_test(),
+            before,
+            "signed numeric literal shape must reuse"
+        );
+        assert_eq!(
+            collect_select_response_rows(
+                engine
+                    .execute("SELECT balance FROM signed_shapes WHERE tenant=1 ORDER BY id")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::DecimalCompact(-1225, 2)],
+                vec![Value::DecimalCompact(-2350, 2)]
+            ]
+        );
+        engine
+            .execute("DELETE FROM signed_shapes WHERE tenant=1 AND id=1")
+            .unwrap();
+        let before = crate::parser::parse_statement_calls_for_test();
+        engine
+            .execute("DELETE FROM signed_shapes WHERE tenant=1 AND id=2")
+            .unwrap();
+        assert_eq!(
+            crate::parser::parse_statement_calls_for_test(),
+            before,
+            "point delete shape must reuse"
+        );
+        assert_eq!(
+            collect_select_response_rows(
+                engine
+                    .execute("SELECT tenant,id FROM signed_shapes")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int(2), Value::Int(1)]]
+        );
+    });
+}
+
+#[test]
+fn bounded_multirow_text_insert_reuses_parse_and_preserves_atomic_rollback() {
+    crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_test_engine(dir.path());
+        engine
+            .execute(
+                "CREATE TABLE bounded_insert (id INT PRIMARY KEY, n DECIMAL(10,2), s VARCHAR(16))",
+            )
+            .unwrap();
+        let sql = |start| {
+            format!(
+                "INSERT INTO bounded_insert VALUES {}",
+                (start..start + 8)
+                    .map(|i| format!("({i},1.25,'row{i}')"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        engine.execute(&sql(1)).unwrap();
+        let before = crate::parser::parse_statement_calls_for_test();
+        engine.execute(&sql(9)).unwrap();
+        assert_eq!(
+            crate::parser::parse_statement_calls_for_test(),
+            before,
+            "a repeated bounded VALUES shape should not parse again"
+        );
+        let error = engine.execute("INSERT INTO bounded_insert VALUES (17,2.5,'new'),(1,3.5,'duplicate'),(18,4.5,'new')").unwrap_err();
+        assert_eq!(error.code(), 1062);
+        assert_eq!(
+            collect_select_response_rows(
+                engine
+                    .execute("SELECT COUNT(*),SUM(n) FROM bounded_insert")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int(16), Value::DecimalCompact(2000, 2)]]
+        );
+    });
+}
+
+#[test]
+fn default_proven_dml_shapes_are_available_to_protocol_memos() {
+    crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE protocol_shapes (id BIGINT PRIMARY KEY, n BIGINT)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO protocol_shapes VALUES (1,10)")
+            .unwrap();
+        let session = SessionContext::default();
+        let (statement, params, _) = QueryEngine::cached_text_statement(
+            &engine,
+            &session,
+            "INSERT INTO protocol_shapes VALUES (2,20)",
+        )
+        .expect("default-on parser-proven DML must reach the protocol memo path");
+        assert!(matches!(statement.as_ref(), Statement::Insert(_)));
+        assert_eq!(params, vec![Value::Int(2), Value::Int(20)]);
+        // Unsupported expression provenance must never be inferred from a
+        // lexical skeleton that happened to look similar.
+        assert!(QueryEngine::cached_text_statement(
+            &engine,
+            &session,
+            "INSERT INTO protocol_shapes VALUES (3,1/0)",
+        )
+        .is_none());
+    });
+}
+
+#[test]
 fn default_text_insert_shape_compiles_once_without_reparsing() {
     let _guard = AUTO_PARAM_ENV_LOCK
         .lock()
@@ -18311,18 +18543,18 @@ fn default_text_insert_shape_compiles_once_without_reparsing() {
     let after = engine.db_for_tests().storage_status();
     assert_eq!(
         parse_after - parse_before,
-        8,
-        "cold INSERT/UPDATE shapes prove placeholder structure; hot shapes do not parse; DELETE stays legacy"
+        9,
+        "cold INSERT/UPDATE/point DELETE shapes prove placeholder structure; hot shapes do not parse"
     );
     assert_eq!(
         after.prepared_dml_compiles - before.prepared_dml_compiles,
-        2,
-        "plain INSERT and catalog-typed UPDATE are default-on"
+        3,
+        "plain INSERT, catalog-typed UPDATE and integer point DELETE are default-on"
     );
     assert_eq!(
         after.prepared_dml_reuses - before.prepared_dml_reuses,
-        4,
-        "cold and warm INSERT/UPDATE executions use compiled DML kernels"
+        6,
+        "cold and warm executions use compiled DML kernels"
     );
 
     let QueryResponse::ResultSet(result) = engine

@@ -2,6 +2,176 @@
 
 use super::*;
 
+/// Price the native exact-integer runtime filter that can replace a broad
+/// unique-index prefix scan with sorted complete-key probes. This models the
+/// existing executor transformation; it never changes a predicate or a bound.
+pub(super) fn exact_runtime_index_probe_cost(
+    ctx: &crate::engine::cbo::CboContext,
+    build: &PhysicalPlan,
+    probe: &PhysicalPlan,
+    build_key: &Expr,
+    probe_key: &Expr,
+    build_rows: f64,
+    probe_rows: f64,
+) -> Option<(crate::engine::cbo::Cost, f64)> {
+    use crate::engine::cbo::operator_cost;
+    if !(build_rows > 0.0
+        && build_rows
+            <= crate::engine::executor::vec::index_scan::RUNTIME_EXACT_MULTI_LOOKUP_MAX_KEYS as f64)
+    {
+        return None;
+    }
+    // Computed/renamed build outputs need a separate type and lineage proof.
+    // Bare scan keys already have the same integer domain as the native set.
+    let build_table = match build {
+        PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::ZoneMapScan { table, .. }
+        | PhysicalPlan::IndexLookup { table, .. }
+        | PhysicalPlan::IndexRangeScan { table, .. }
+        | PhysicalPlan::IndexFastScan { table, .. }
+        | PhysicalPlan::ParallelSeqScan { table, .. }
+        | PhysicalPlan::ParallelIndexRangeScan { table, .. }
+        | PhysicalPlan::ParallelIndexFastScan { table, .. } => table,
+        _ => return None,
+    };
+    let integer_column = |table: &PlanTable, expr: &Expr| -> Option<usize> {
+        let name = expr_column_name(expr)?;
+        if !expr_matches_table_column(expr, table, name) {
+            return None;
+        }
+        let column = table.schema.column_index(name).ok()?;
+        matches!(
+            table.schema.columns[column].data_type,
+            crate::storage::DataTypeKind::TinyInt
+                | crate::storage::DataTypeKind::SmallInt
+                | crate::storage::DataTypeKind::MediumInt
+                | crate::storage::DataTypeKind::Int
+                | crate::storage::DataTypeKind::BigInt
+        )
+        .then_some(column)
+    };
+    let build_column = integer_column(build_table, build_key)?;
+    let (table, index, prefix, filter, access_rows) = match probe {
+        PhysicalPlan::IndexLookup {
+            table,
+            index,
+            key,
+            exact: false,
+            covering: false,
+            filter,
+            access_rows,
+            ..
+        } => (table, index, key, filter, *access_rows),
+        PhysicalPlan::IndexRangeScan {
+            table,
+            index,
+            low: Some(low),
+            high: Some(high),
+            covering: false,
+            reverse: false,
+            filter,
+            access_rows,
+            ..
+        } if low.inclusive && high.inclusive && low.key == high.key => {
+            (table, index, &low.key, filter, *access_rows)
+        }
+        _ => return None,
+    };
+    let column = integer_column(table, probe_key)?;
+    if !index.unique
+        || filter.as_ref().is_some_and(sip_expr_has_subquery)
+        || build_table.schema.columns[build_column].unsigned
+            != table.schema.columns[column].unsigned
+        || (!index.primary
+            && index.columns.iter().any(|name| {
+                table
+                    .schema
+                    .column_index(name)
+                    .ok()
+                    .is_none_or(|col| table.schema.columns[col].nullable)
+            }))
+        || !index.included_columns.is_empty()
+        || index.has_expression_parts()
+        || !index.key_parts_are_exact(index.columns.len())
+        || prefix.0.len() + 1 != index.columns.len()
+        || prefix.0.len() >= 4
+        || !index
+            .columns
+            .last()?
+            .eq_ignore_ascii_case(&table.schema.columns[column].name)
+        || prefix.0.iter().any(|part| {
+            !matches!(
+                part,
+                KeyPart::Null
+                    | KeyPart::Int(_)
+                    | KeyPart::UInt(_)
+                    | KeyPart::Float32(_)
+                    | KeyPart::Float64(_)
+                    | KeyPart::Decimal { .. }
+                    | KeyPart::Date(_)
+                    | KeyPart::Time(_)
+                    | KeyPart::DateTime(_)
+                    | KeyPart::Year(_)
+                    | KeyPart::Param {
+                        target: crate::storage::ParamTarget::Int
+                            | crate::storage::ParamTarget::UInt
+                            | crate::storage::ParamTarget::Float32
+                            | crate::storage::ParamTarget::Float64
+                            | crate::storage::ParamTarget::Date
+                            | crate::storage::ParamTarget::Time
+                            | crate::storage::ParamTarget::DateTime
+                            | crate::storage::ParamTarget::Timestamp
+                            | crate::storage::ParamTarget::Year,
+                        ..
+                    }
+            )
+        })
+    {
+        return None;
+    }
+    let keys = ndv_in_plan(build, expr_column_name(build_key)?)
+        .map_or(build_rows, |ndv| (ndv as f64).min(build_rows))
+        .max(1.0);
+    if keys > access_rows {
+        return None;
+    }
+    // Grace builds do not retain the payload needed to install this filter.
+    // Include the native key-vector/bitmap transition and lookup workspace,
+    // in addition to the same hash-state estimate used by hash_join().
+    let bytes_per_key = std::mem::size_of::<IndexKey>()
+        + std::mem::size_of::<(IndexKey, IndexKey)>()
+        + std::mem::size_of::<crate::storage::RowId>();
+    let lookup_bytes = keys * bytes_per_key as f64;
+    let filter_bytes = build_rows * std::mem::size_of::<i128>() as f64;
+    let state_bytes =
+        build_rows * (build.output_width() + 64.0) * 1.25 + 2.0 * filter_bytes + lookup_bytes;
+    if !state_bytes.is_finite() || state_bytes > ctx.planning_mem_budget_bytes as f64 {
+        return None;
+    }
+    let fetched = keys.min(access_rows.max(0.0));
+    let total_rows = table.schema.stats.row_count.max(1) as f64;
+    let mut cost = operator_cost::estimate_batched_index_lookup(
+        ctx,
+        operator_cost::BatchedIndexLookupInput {
+            index_height: index_cost_height(&table.schema, index, total_rows),
+            leaf_pages: operator_cost::estimated_index_leaf_pages(&table.schema, index, fetched),
+            matched_rows: fetched,
+            probe_keys: keys,
+            table_pages: table_heap_pages_for_cost(&table.schema),
+            output_width: probe.output_width(),
+            correlation: index_cost_correlation(&table.schema, index),
+            competing_pages: plan_cost(build).io_seq_pages + plan_cost(build).io_rnd_pages,
+        },
+    )
+    .cost;
+    let predicate_cpu = fetched * filter.as_ref().map_or(0.0, qual_cost_per_row);
+    cost.total += predicate_cpu;
+    cost.cpu_units += predicate_cpu;
+    cost.mem_bytes += lookup_bytes + filter_bytes;
+    let survivors = fetched * (probe_rows / access_rows.max(1.0)).clamp(0.0, 1.0);
+    Some((cost, survivors))
+}
+
 /// Shared with the vector executor: reverse existence joins retain the
 /// preserved input and stream the larger input through its key set.
 pub(crate) fn reverse_semi_anti_hash_join_eligible(

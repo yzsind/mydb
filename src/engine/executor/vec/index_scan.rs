@@ -655,7 +655,7 @@ const DIRECT_HEAP_BATCH_MIN_ROWS: usize = 8;
 // Dynamic point probing is intentionally bounded. Above one ordinary pair of
 // vector batches, a sequential prefix walk is usually cheaper and avoids a
 // large transient probe array.
-const RUNTIME_EXACT_MULTI_LOOKUP_MAX_KEYS: usize = 4_096;
+pub(crate) const RUNTIME_EXACT_MULTI_LOOKUP_MAX_KEYS: usize = 4_096;
 
 fn runtime_int_key_part(value: i128, target: crate::storage::ParamTarget) -> Option<KeyPart> {
     use crate::storage::ParamTarget;
