@@ -253,9 +253,21 @@ fn resolve_collected(db: &Arc<Database>, collect: Collect) -> Result<Option<Bind
     let mut bindings = capture().as_deref().cloned().unwrap_or_default();
     for (table, spec) in collect.0 {
         if table.generate_series.is_some()
+            || db.is_system_table_name(crate::storage::DEFAULT_DATABASE, &table.name)
             || crate::engine::executor::cte::lookup_cte(&table.name).is_some()
-            || db.table(&table.name).map_or(true, |schema| schema.system)
         {
+            return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                .error("TABLESAMPLE requires a user base table"));
+        }
+        let schema = db.table(&table.name).map_err(|err| {
+            if db.view_definition(crate::storage::DEFAULT_DATABASE, &table.name).is_some() {
+                crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("TABLESAMPLE requires a user base table")
+            } else {
+                err
+            }
+        })?;
+        if schema.system {
             return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
                 .error("TABLESAMPLE requires a user base table"));
         }

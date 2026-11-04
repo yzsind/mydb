@@ -1788,8 +1788,9 @@ impl Database {
                 // materialising the row. The previous read-lock-reread shape
                 // decoded every UPDATE candidate twice and, in the prepared
                 // inline path, decoded a contended row before returning the
-                // internal would-block marker. Row ids are not reused, so a
-                // concurrently removed candidate is handled by the post-lock
+                // internal would-block marker. Slots cannot be reused while
+                // the candidate snapshot is active, so a concurrently removed
+                // candidate is handled by the post-lock
                 // read without making the early lock unsafe.
                 if txn.txn_id != 0 {
                     self.lock_rows_nonblocking(txn.txn_id, table.id, std::iter::once(row.row_id))?;

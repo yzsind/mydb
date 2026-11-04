@@ -890,3 +890,81 @@ fn sql_rowid_prepared_partition_dml_legacy_dispatch() {
         }
     }
 }
+
+#[test]
+fn sql_rowid_release_audit_locking_and_delete_order() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE t(id INT PRIMARY KEY,v INT)")
+        .unwrap();
+    engine.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
+    let rid = result(&engine, "SELECT ROWID FROM t WHERE id=1").rows[0][0].to_display_string();
+    for sql in [
+        format!("SELECT id FROM t WHERE ROWID={rid} ORDER BY ROWID FOR UPDATE"),
+        "SELECT id FROM t WHERE ROWID=(SELECT ROWID FROM t WHERE id=1) FOR UPDATE".into(),
+        "SELECT id FROM t WHERE ROWID IN(SELECT ROWID FROM t WHERE id=1) FOR UPDATE".into(),
+        "SELECT id FROM t WHERE id>0 AND ROWID>0 ORDER BY id LIMIT 1 FOR UPDATE".into(),
+    ] {
+        assert_eq!(
+            result(&engine, &sql).rows,
+            vec![vec![Value::Int(1)]],
+            "{sql}"
+        );
+    }
+    engine
+        .execute(&format!(
+            "DELETE FROM t WHERE ROWID={rid} ORDER BY ROWID LIMIT 1"
+        ))
+        .unwrap();
+    assert_eq!(
+        result(&engine, "SELECT id FROM t").rows,
+        vec![vec![Value::Int(2)]]
+    );
+    assert!(engine
+        .execute("DELETE FROM t ORDER BY absent LIMIT 0")
+        .is_err());
+}
+
+#[test]
+fn sql_rowid_release_audit_multi_table_and_view_dml() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE t(id INT PRIMARY KEY,v INT)",
+        "INSERT INTO t VALUES(1,10),(2,20)",
+        "CREATE TABLE n(id INT)",
+        "INSERT INTO n VALUES(1),(2)",
+        "CREATE VIEW vt AS SELECT ROWID AS rid,id,v FROM t",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let rid = result(&engine, "SELECT ROWID FROM t WHERE id=1").rows[0][0].to_display_string();
+    engine
+        .execute(&format!("UPDATE t AS a,n SET a.v=11 WHERE a.ROWID={rid}"))
+        .unwrap();
+    assert_eq!(
+        result(&engine, "SELECT v FROM t WHERE id=1").rows,
+        vec![vec![Value::Int(11)]]
+    );
+    engine
+        .execute(&format!("UPDATE vt SET v=12 WHERE rid={rid}"))
+        .unwrap();
+    assert_eq!(
+        result(&engine, "SELECT v FROM t WHERE id=1").rows,
+        vec![vec![Value::Int(12)]]
+    );
+    for sql in ["UPDATE t,n SET t.v=0 WHERE ROWID>0", "UPDATE t,n SET t.ROWID=1"] {
+        assert!(engine.execute(sql).is_err(), "{sql}");
+    }
+    engine
+        .execute(&format!("DELETE t FROM t,n WHERE t.ROWID={rid}"))
+        .unwrap();
+    let rid = result(&engine, "SELECT ROWID FROM t WHERE id=2").rows[0][0].to_display_string();
+    engine
+        .execute(&format!("DELETE FROM vt WHERE rid={rid}"))
+        .unwrap();
+    assert!(result(&engine, "SELECT * FROM t").rows.is_empty());
+}

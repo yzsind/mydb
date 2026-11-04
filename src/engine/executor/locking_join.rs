@@ -168,6 +168,19 @@ fn bind_source(
             alias: None,
         })
         .collect();
+    // The private source replaces the base relation for predicate evaluation.
+    // Preserve its physical address just like ordinary planner scans do.
+    // Wildcards have already been expanded against the original relation.
+    let include_rowid = crate::storage::rowid::demanded()
+        && !table.system
+        && table.id != 0
+        && table.find_column_index("rowid").is_none();
+    if include_rowid {
+        query.projection.push(SelectItem::Expr {
+            expr: Expr::Identifier("ROWID".into()),
+            alias: None,
+        });
+    }
     let mut columns = super::select::single_table_result_columns(&query, &table, Some(&alias))?;
     let token = format!("\0mydb_lock_origin_{}", sources.len());
     columns.push(Column {
@@ -190,6 +203,9 @@ fn bind_source(
                 .iter()
                 .map(|&i| values[i].clone())
                 .collect::<Vec<_>>();
+            if include_rowid {
+                values.push(Value::UInt(crate::storage::rowid::for_row(&table, origin)?));
+            }
             values.push(Value::UInt(origins.len() as u64));
             origins.push(origin);
             builder.push(values)

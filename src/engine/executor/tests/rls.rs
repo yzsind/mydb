@@ -2177,3 +2177,52 @@ fn rls_precompiled_dml_rebinds_the_original_statement_after_privilege_changes() 
     assert!(matches!(response, QueryResponse::OkAffected { affected_rows: 1 }));
     assert_eq!(rows(&engine, &mut root, "SELECT payload FROM secured WHERE id=2"), vec![vec![Value::String("changed".into())]]);
 }
+
+#[test]
+fn rls_release_audit_dependency_rename_is_rejected_atomically() {
+    let (_dir, engine, mut root) = fixture();
+    for sql in ["CREATE TABLE dep(tenant_id INT)", "INSERT INTO dep VALUES(1)", "GRANT SELECT ON test.dep TO alice", "CREATE POLICY pdep ON secured FOR SELECT USING(EXISTS(SELECT 1 FROM test.dep WHERE dep.tenant_id=secured.tenant_id))", "CREATE TABLE unrelated(id INT)"] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    let mut alice = user("alice", 771);
+    assert_eq!(
+        rows(&engine, &mut alice, "SELECT id FROM secured"),
+        vec![vec![Value::Int(1)]]
+    );
+    for sql in [
+        "RENAME TABLE dep TO dep2",
+        "ALTER TABLE dep RENAME TO dep2",
+        "RENAME TABLE unrelated TO moved,dep TO dep2",
+        "RENAME TABLE dep TO tmp,unrelated TO dep,tmp TO unrelated",
+    ] {
+        let err = engine.execute_with_session(&mut root, sql).unwrap_err();
+        assert!(
+            err.message()
+                .contains("referenced by a row security policy"),
+            "{sql}: {err:?}"
+        );
+        assert!(engine.db_handle().table("test.dep").is_ok());
+        assert!(engine.db_handle().table("test.unrelated").is_ok());
+        assert!(engine.db_handle().table("test.moved").is_err());
+        assert_eq!(
+            rows(&engine, &mut alice, "SELECT id FROM secured"),
+            vec![vec![Value::Int(1)]]
+        );
+    }
+    engine
+        .execute_with_session(&mut root, "RENAME TABLE secured TO renamed")
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "GRANT SELECT ON test.renamed TO alice")
+        .unwrap();
+    assert_eq!(
+        rows(&engine, &mut alice, "SELECT id FROM renamed"),
+        vec![vec![Value::Int(1)]]
+    );
+    engine
+        .execute_with_session(&mut root, "DROP POLICY pdep ON renamed")
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "ALTER TABLE dep RENAME TO dep2")
+        .unwrap();
+}

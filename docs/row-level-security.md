@@ -68,7 +68,11 @@ Subqueries must have the necessary referenced-table/column privileges. Policy
 account references prevent the account from being dropped or renamed without
 first removing the dependency. Target-column references use stable column IDs,
 so renaming a referenced column preserves its policy. Dropping such a column is
-rejected. Each clause retains its creation-time SQL mode, type-related session
+rejected. Tables referenced by policy subqueries cannot be dropped or renamed
+until their dependent policies are altered or removed. This includes
+`RENAME TABLE` and `ALTER TABLE ... RENAME`; a multi-table rename is rejected
+before changing any names. Renaming the table that owns a policy preserves it.
+Each clause retains its creation-time SQL mode, type-related session
 settings and connection collation; ALTER replaces these settings only for a
 changed clause. External-column and function dependency rebinding still needs
 complete acceptance coverage.

@@ -1243,7 +1243,7 @@ fn reject_view_temp_table_refs(
     collect_select_table_uses(select, false, &Default::default(), &mut uses);
     if uses
         .iter()
-        .any(|usage| session.has_temp_table(&usage.table))
+        .any(|usage| super::is_session_temp_table_ref(session, &usage.table))
     {
         return Err(error(
             crate::error::catalog::ER_VIEW_SELECT_TMPTABLE,

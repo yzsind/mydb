@@ -54,6 +54,7 @@ struct Participant {
     rows: Vec<StoredJoinRow>,
     partitions: Vec<String>,
     width: usize,
+    rowid: bool,
     base: usize,
     enforce_rls: bool,
     rls_read_required: bool,
@@ -164,7 +165,11 @@ fn build_context(
                 format!("Not unique table/alias: '{alias_lc}'"),
             ));
         }
-        let width = schema.columns.len();
+        let rowid = crate::storage::rowid::demanded()
+            && !schema.system
+            && schema.id != 0
+            && schema.find_column_index("rowid").is_none();
+        let width = schema.columns.len() + usize::from(rowid);
         let base = participants.iter().map(|p| p.width).sum::<usize>();
         participants.push(Participant {
             alias: alias_lc,
@@ -174,6 +179,7 @@ fn build_context(
             rows: Vec::new(),
             partitions: partitions.to_vec(),
             width,
+            rowid,
             base,
             enforce_rls: false,
             rls_read_required: false,
@@ -202,6 +208,14 @@ fn build_context(
     let mut unqualified: HashMap<String, usize> = HashMap::new();
     let mut ambiguous: HashSet<String> = HashSet::new();
     for p in &participants {
+        if p.rowid {
+            let col = "rowid".to_string();
+            let combined = p.base + p.schema.columns.len();
+            qualified.insert((p.alias.clone(), col.clone()), combined);
+            if unqualified.insert(col.clone(), combined).is_some() {
+                ambiguous.insert(col);
+            }
+        }
         for (i, column) in p.schema.columns.iter().enumerate() {
             // Skip dropped columns — they have no logical position.
             if !matches!(column.state, crate::storage::ColumnState::Dropped) {
@@ -221,31 +235,35 @@ fn build_context(
     }
 
     let mut expression_schema = participants[0].schema.clone();
-    expression_schema.columns = participants
-        .iter()
-        .flat_map(|p| {
-            p.schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(move |(index, column)| {
-                    let mut column = column.clone();
-                    column.name = slot_name(p.base + index);
-                    column.column_id = (p.base + index + 1) as u32;
-                    column.collation = Some(
-                        crate::engine::expr_program::resolve_column_collation_id(
-                            &p.schema,
-                            &p.schema.columns[index],
-                        )
-                        .and_then(crate::charset::resolve_collation_id)
-                        .map_or(p.schema.collation.as_str(), |info| info.name)
-                        .to_string(),
-                    );
-                    column.generated_expr = None;
-                    column
-                })
-        })
-        .collect();
+    expression_schema.columns.clear();
+    expression_schema
+        .columns
+        .reserve(participants.iter().map(|p| p.width).sum());
+    for p in &participants {
+        let schema = if p.rowid {
+            std::borrow::Cow::Owned(crate::storage::rowid::query_schema(&p.schema))
+        } else {
+            std::borrow::Cow::Borrowed(&p.schema)
+        };
+        expression_schema
+            .columns
+            .extend(schema.columns.iter().enumerate().map(|(index, column)| {
+                let mut column = column.clone();
+                column.name = slot_name(p.base + index);
+                column.column_id = (p.base + index + 1) as u32;
+                column.collation = Some(
+                    crate::engine::expr_program::resolve_column_collation_id(
+                        &p.schema,
+                        &schema.columns[index],
+                    )
+                    .and_then(crate::charset::resolve_collation_id)
+                    .map_or(p.schema.collation.as_str(), |info| info.name)
+                    .to_string(),
+                );
+                column.generated_expr = None;
+                column
+            }));
+    }
     expression_schema.indexes.clear();
     expression_schema.primary_key.clear();
     expression_schema.check_constraints.clear();
@@ -553,6 +571,15 @@ where
         for (i, v) in stored.values.iter().enumerate() {
             combined[base + i] = v.clone();
         }
+        if p.rowid {
+            combined[base + p.schema.columns.len()] = Value::UInt(crate::storage::rowid::for_row(
+                &p.schema,
+                crate::storage::DmlRowRef {
+                    storage_id: stored.storage_id,
+                    row_id: stored.row_id,
+                },
+            )?);
+        }
         // Evaluate this participant's join `ON` condition (depth >= 1).
         // depth 0 has no incoming join clause.
         if depth >= 1 {
@@ -835,6 +862,9 @@ pub(super) fn execute_multi_update(
         };
         let (p_idx, col_idx) = ctx.participant_for_combined(combined_idx);
         let participant = &ctx.participants[p_idx];
+        if col_idx >= participant.schema.columns.len() {
+            return Err(crate::error::catalog::ER_BAD_FIELD_ERROR.error("ROWID is read-only"));
+        }
         if participant.schema.columns[col_idx].generated_expr.is_some() {
             return Err(error(
                 crate::error::catalog::ER_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,

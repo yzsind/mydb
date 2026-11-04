@@ -413,3 +413,59 @@ fn tablesample_argument_warnings_are_evaluated_once_on_cold_and_warm_plans() {
         assert_eq!(warnings[0][1].to_display_string(), "1292");
     }
 }
+
+#[test]
+fn tablesample_release_audit_unqualified_ddl_and_missing_relation() {
+    let (_dir, engine) = fixture();
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE DATABASE sample_audit",
+        "USE sample_audit",
+        "CREATE TABLE sampled(id INT PRIMARY KEY)",
+        "INSERT INTO sampled VALUES(1),(2),(3)",
+        "CREATE TABLE dst AS SELECT id FROM sampled TABLESAMPLE SYSTEM(2 ROWS) REPEATABLE(1)",
+        "CREATE TEMPORARY TABLE tmp AS SELECT id FROM sampled TABLESAMPLE SYSTEM(2 ROWS)",
+        "CREATE VIEW v AS SELECT id FROM sampled TABLESAMPLE SYSTEM(2 ROWS)",
+        "CREATE OR REPLACE VIEW v AS SELECT id FROM sampled TABLESAMPLE SYSTEM(2 ROWS)",
+        "ALTER VIEW v AS SELECT id FROM sampled TABLESAMPLE SYSTEM(1 ROWS)",
+        "DO (SELECT COUNT(*) FROM sampled TABLESAMPLE SYSTEM(2 ROWS))",
+    ] {
+        engine
+            .execute_with_session(&mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    for sql in [
+        "CREATE VIEW badtmp AS SELECT id FROM tmp TABLESAMPLE(100)",
+        "CREATE VIEW badtmp AS SELECT id FROM sampled WHERE id IN(SELECT id FROM tmp)",
+        "CREATE OR REPLACE VIEW v AS SELECT id FROM tmp TABLESAMPLE(100)",
+        "ALTER VIEW v AS SELECT id FROM tmp TABLESAMPLE(100)",
+    ] {
+        let err = engine.execute_with_session(&mut session, sql).unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_VIEW_SELECT_TMPTABLE), "{sql}: {err:?}");
+    }
+    for (table, count) in [("dst", 2), ("tmp", 2), ("v", 1)] {
+        let rs = engine
+            .execute_with_session(&mut session, &format!("SELECT COUNT(*) FROM {table}"))
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let QueryResponse::ResultSet(rs) = rs else {
+            panic!()
+        };
+        assert_eq!(rs.rows[0][0].to_display_string(), count.to_string());
+    }
+    let err = engine
+        .execute_with_session(&mut session, "SELECT * FROM absent TABLESAMPLE(10)")
+        .unwrap_err();
+    assert!(err.is(crate::error::catalog::ER_NO_SUCH_TABLE), "{err:?}");
+    for sql in [
+        "WITH z AS(SELECT * FROM sampled) SELECT * FROM z TABLESAMPLE(10)",
+        "WITH z AS(SELECT * FROM sampled) SELECT sampled.id FROM sampled JOIN z TABLESAMPLE(10) ON sampled.id=z.id",
+        "SELECT * FROM v TABLESAMPLE(10)",
+        "SELECT * FROM information_schema.tables TABLESAMPLE(10)",
+    ] {
+        let err = engine.execute_with_session(&mut session, sql).unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_NOT_SUPPORTED_YET), "{sql}: {err:?}");
+    }
+
+}

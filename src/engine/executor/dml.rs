@@ -133,6 +133,7 @@ pub(super) fn lock_select_rows_for_update(
             .collect();
         let mut ranked = Vec::with_capacity(matched.len());
         for row in matched.drain(..) {
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
             let _scores = fulltext.enter(row.row_ref);
             let keys = stmt
                 .order_by
@@ -1867,9 +1868,14 @@ pub(super) fn ordered_limited_dml_candidates(
     // early return so unknown columns and unsupported expressions cannot be
     // hidden by an empty window.
     if !order_by.is_empty() {
-        let null_row = vec![Value::Null; table.columns.len()];
+        let schema = if crate::storage::rowid::demanded() {
+            std::borrow::Cow::Owned(crate::storage::rowid::query_schema(table))
+        } else {
+            std::borrow::Cow::Borrowed(table)
+        };
+        let null_row = vec![Value::Null; schema.columns.len()];
         for item in order_by {
-            eval_expr(&item.expr, table, &null_row)?;
+            eval_expr(&item.expr, &schema, &null_row)?;
         }
     }
     if limit == Some(0) {
@@ -2319,6 +2325,7 @@ pub(super) fn ordered_index_limited_dml_candidates(
             let Some(row) = db.dml_candidate_row_at_for_write(table, row_ref, txn)? else {
                 continue;
             };
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(table, row_ref)?;
             if let Some(filter) = residual_filter.as_ref() {
                 if !eval_bool(filter, table, &row.values)? {
                     continue;

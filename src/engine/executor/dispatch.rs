@@ -7639,7 +7639,7 @@ pub(super) fn execute_qualified_statement(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     super::rls::enforce_policy_statement(&statement)?;
-    let _rowid_demand = crate::storage::rowid::DemandScope::enter(&statement);
+    let _rowid_demand = crate::storage::rowid::DemandScope::enter_before_view_rewrite(&statement);
     authorize_statement(db, session, &statement)?;
     if crate::binlog::enabled() {
         let kind = match &statement {
@@ -9644,6 +9644,7 @@ pub(super) fn execute_qualified_statement(
             }
             reject_system_catalog_dml(db, session, &stmt.table)?;
             let stmt = rewrite_update_through_view(db, session, stmt)?;
+            let _rowid_demand = crate::storage::rowid::DemandScope::enter_update(&stmt);
             if is_session_temp_table_ref(session, &stmt.table) {
                 execute_temp_in_transaction_with_session(db, session, |db, session, txn| {
                     execute_update(db, session, txn, stmt, registry)
@@ -9663,6 +9664,7 @@ pub(super) fn execute_qualified_statement(
             }
             reject_system_catalog_dml(db, session, &stmt.table)?;
             let stmt = rewrite_delete_through_view(db, session, stmt)?;
+            let _rowid_demand = crate::storage::rowid::DemandScope::enter_delete(&stmt);
             if is_session_temp_table_ref(session, &stmt.table) {
                 execute_temp_in_transaction_with_session(db, session, |db, session, txn| {
                     execute_delete(db, session, txn, stmt, registry)
