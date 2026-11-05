@@ -254,6 +254,10 @@ impl Database {
         context: RecoveryContext,
         runtime_directory: Option<PathBuf>,
     ) -> Result<Self, QueryError> {
+        // Fixtures bypass main.rs, which configures this before opening storage.
+        // Match the server's process limits before bootstrap or replica recovery.
+        #[cfg(test)]
+        crate::mysql::server::configure_open_files_limit();
         let preparing = matches!(
             context.mode,
             DatabaseOpenMode::SealBaseline | DatabaseOpenMode::RestoreWorkspace
