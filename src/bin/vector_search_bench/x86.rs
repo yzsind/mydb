@@ -18,7 +18,7 @@ pub(super) fn avx512_available() -> bool {
 }
 
 #[inline]
-unsafe fn sum4(v: __m128) -> f32 {
+pub(super) unsafe fn sum4(v: __m128) -> f32 {
     let pairs = _mm_add_ps(v, _mm_shuffle_ps::<0xb1>(v, v));
     _mm_cvtss_f32(_mm_add_ss(pairs, _mm_movehl_ps(pairs, pairs)))
 }
@@ -209,8 +209,116 @@ pub(super) unsafe fn topk(
         .collect()
 }
 
+/// Four independent queries share each database load; arithmetic order within
+/// each query remains identical to the single-query 64-lane reference.
+#[target_feature(enable = "avx512f,fma")]
+#[inline]
+unsafe fn l2_queries4(q: [*const f32; 4], row: *const f32, dim: usize) -> [f32; 4] {
+    let mut sums = [[_mm512_setzero_ps(); 4]; 4];
+    let mut i = 0;
+    macro_rules! step {
+        ($offset:expr, $lane:expr) => {{
+            let x = _mm512_loadu_ps(row.add(i + $offset));
+            macro_rules! query {
+                ($qi:expr) => {{
+                    let d = _mm512_sub_ps(_mm512_loadu_ps(q[$qi].add(i + $offset)), x);
+                    sums[$qi][$lane] = _mm512_fmadd_ps(d, d, sums[$qi][$lane]);
+                }};
+            }
+            query!(0);
+            query!(1);
+            query!(2);
+            query!(3);
+        }};
+    }
+    while dim - i >= 64 {
+        step!(0, 0);
+        step!(16, 1);
+        step!(32, 2);
+        step!(48, 3);
+        i += 64;
+    }
+    if i < dim {
+        macro_rules! tail {
+            ($offset:expr, $lane:expr) => {
+                if dim - i > $offset {
+                    let count = (dim - i - $offset).min(16);
+                    let mask = ((1u32 << count) - 1) as u16;
+                    let x = _mm512_maskz_loadu_ps(mask, row.add(i + $offset));
+                    macro_rules! query {
+                        ($qi:expr) => {{
+                            let d = _mm512_sub_ps(
+                                _mm512_maskz_loadu_ps(mask, q[$qi].add(i + $offset)),
+                                x,
+                            );
+                            sums[$qi][$lane] = _mm512_fmadd_ps(d, d, sums[$qi][$lane]);
+                        }};
+                    }
+                    query!(0);
+                    query!(1);
+                    query!(2);
+                    query!(3);
+                }
+            };
+        }
+        tail!(0, 0);
+        tail!(16, 1);
+        tail!(32, 2);
+        tail!(48, 3);
+    }
+    std::array::from_fn(|qi| {
+        let s = sums[qi];
+        let v = _mm512_add_ps(_mm512_add_ps(s[0], s[2]), _mm512_add_ps(s[1], s[3]));
+        let lo = _mm_add_ps(_mm512_castps512_ps128(v), _mm512_extractf32x4_ps::<2>(v));
+        let hi = _mm_add_ps(
+            _mm512_extractf32x4_ps::<1>(v),
+            _mm512_extractf32x4_ps::<3>(v),
+        );
+        sum4(_mm_add_ps(lo, hi))
+    })
+}
+
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn batch_topk_inner(queries: &[f32], db: &[f32], dim: usize, k: usize) -> Vec<TopK> {
+    let nq = queries.len() / dim;
+    let mut result: Vec<_> = (0..nq).map(|_| TopK::new(k)).collect();
+    let full = nq / 4 * 4;
+    for qi in (0..full).step_by(4) {
+        let q = std::array::from_fn(|j| queries.as_ptr().add((qi + j) * dim));
+        for (id, row) in db.chunks_exact(dim).enumerate() {
+            let distances = l2_queries4(q, row.as_ptr(), dim);
+            for j in 0..4 {
+                result[qi + j].push(distances[j], id as u32);
+            }
+        }
+    }
+    for qi in full..nq {
+        for (id, row) in db.chunks_exact(dim).enumerate() {
+            result[qi].push(
+                l2_avx512(queries.as_ptr().add(qi * dim), row.as_ptr(), dim),
+                id as u32,
+            );
+        }
+    }
+    result
+}
+
+pub(super) fn batch_topk(queries: &[f32], db: &[f32], dim: usize, k: usize) -> Vec<TopK> {
+    assert!(avx512_available(), "AVX-512F/FMA is unavailable");
+    assert!(dim > 0 && queries.len().is_multiple_of(dim) && db.len().is_multiple_of(dim));
+    // SAFETY: complete vector slices and feature support are checked above.
+    unsafe { batch_topk_inner(queries, db, dim, k) }
+}
+
+pub(super) fn search_batch(queries: &[f32], db: &[f32], dim: usize, k: usize) -> f64 {
+    batch_topk(queries, db, dim, k)
+        .iter()
+        .map(TopK::checksum)
+        .sum()
+}
+
 /// Portable oracle for the shared accumulation/reduction order.
-fn canonical_l2(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn canonical_l2(a: &[f32], b: &[f32]) -> f32 {
     let mut lanes = [0.0f32; 64];
     for (i, (&a, &b)) in a.iter().zip(b).enumerate() {
         let d = a - b;
@@ -261,7 +369,14 @@ fn topk_bits(rows: &[TopK]) -> Vec<Vec<(u32, u32)>> {
         .collect()
 }
 
-pub(super) fn validate(queries: &[f32], db: &[f32], dim: usize, k: usize, check_avx512: bool) {
+pub(super) fn validate(
+    queries: &[f32],
+    db: &[f32],
+    dim: usize,
+    k: usize,
+    check_avx512: bool,
+    check_batch: bool,
+) -> Vec<TopK> {
     assert!(avx2_available());
     // SAFETY: feature support was checked and slices contain complete vectors.
     let reference = unsafe { topk(queries, db, dim, k, l2_avx2) };
@@ -288,6 +403,19 @@ pub(super) fn validate(queries: &[f32], db: &[f32], dim: usize, k: usize, check_
             actual.len()
         );
     }
+    if check_batch {
+        let actual = batch_topk(queries, db, dim, k);
+        assert_eq!(
+            topk_bits(&actual),
+            topk_bits(&reference),
+            "batched AVX-512 top-k differs from AVX2"
+        );
+        println!(
+            "  avx512-batch: all {} queries match canonical FP32 IDs, order, and distance bits",
+            actual.len()
+        );
+    }
+    reference
 }
 
 #[cfg(test)]
@@ -393,6 +521,12 @@ mod tests {
                             "dim={dim} n={n} nq={nq} k={k}"
                         );
                     }
+                    if avx512_available() {
+                        assert_eq!(
+                            topk_bits(&batch_topk(&queries, &db, dim, k)),
+                            topk_bits(&reference)
+                        );
+                    }
                 }
             }
         }
@@ -415,6 +549,7 @@ mod tests {
             }
             if avx512_available() {
                 assert_eq!(search_avx512(&queries, &db, dim, n, k), expected);
+                assert_eq!(search_batch(&queries, &db, dim, k), expected);
             }
         }
     }
@@ -478,6 +613,11 @@ mod tests {
             }
             for kernel in kernels() {
                 check_distance(&qa, &qb, unsafe { kernel(pa, pb, dim) });
+            }
+            if avx512_available() {
+                for d in unsafe { l2_queries4([pa; 4], pb, dim) } {
+                    check_distance(&qa, &qb, d);
+                }
             }
         }
     }

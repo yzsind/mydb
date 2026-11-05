@@ -2048,7 +2048,9 @@ fn reconstruct_auth(set: &DdRowSet) -> Result<AuthCatalog, crate::types::QueryEr
     Ok(auth)
 }
 
-fn validate_persisted_layouts(table: &TableSchema) -> Result<(), crate::types::QueryError> {
+pub(crate) fn validate_persisted_layouts(
+    table: &TableSchema,
+) -> Result<(), crate::types::QueryError> {
     let fail = || {
         super::error(
             crate::error::catalog::ER_GET_ERRNO,

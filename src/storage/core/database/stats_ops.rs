@@ -1267,17 +1267,10 @@ impl Database {
             }
             return Ok(false);
         }
-        let table = self
-            .catalog_read()?
-            .tables
-            .get(table_key)
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NO_SUCH_TABLE,
-                    format!("Table '{table_key}' doesn't exist"),
-                )
-            })?;
+        // Cache eviction leaves only an object header in the live catalog.
+        // Statistics publication replaces the DD table row, so retain a full
+        // current descriptor even when the cache cannot keep it resident.
+        let table = self.snapshot_table_schema(table_key)?;
         // Background statistics are optional while an online DDL owns a
         // descriptor. Publishing them would bump the same dependency revision
         // that the DDL validates at its final barrier, aborting a long build.

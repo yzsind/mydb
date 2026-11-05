@@ -1708,8 +1708,15 @@ impl Database {
         mut candidate: TableSchema,
         skip_online: bool,
     ) -> Result<bool, QueryError> {
-        use crate::storage::data_dictionary::{dd_rows_for_table, DD_STATS_TABLES, DD_TABLES};
+        use crate::storage::data_dictionary::{
+            dd_rows_for_table, validate_persisted_layouts, DD_STATS_TABLES, DD_TABLES,
+        };
         crate::engine::cancel::check_cancelled()?;
+        // Neither side of the statistics diff may be a lazy object header.
+        // Validate before serializing or starting a transaction so malformed
+        // candidates cannot erase the authoritative row layout or primary key.
+        validate_persisted_layouts(expected)?;
+        validate_persisted_layouts(&candidate)?;
         candidate.bump_schema_version_without_system_time_epoch();
         let rows = dd_rows_for_table(&candidate)?;
         let previous = dd_rows_for_table(expected)?;

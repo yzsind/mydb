@@ -11,6 +11,9 @@
 //!      timed and shared across queries; potential top-k candidates are rescored
 //!      with direct NEON L2 to avoid cancellation and approximate rankings.
 //!   6. `avx2` / `avx512`: direct L2 with a common 64-lane FMA reduction tree.
+//!   7. `avx512-batch`: exact FP32 query batching with shared database loads.
+//!   8. `f16c`, `bf16`, `avx-vnni`, `avx512-vnni256`, `avx512-vnni`: compressed input experiments.
+//!      Database encoding is reported separately; query conversion is timed.
 //!
 //! Find L2 top-k neighbors for batches of queries against `DB` vectors of dimension `DIM`.
 //! Each worker processes its own query batch; measure wall-clock throughput with 1/2/4/8/16 threads.
@@ -28,7 +31,8 @@
 //!   VS_THREADS: comma-separated concurrency list (default 1,2,4,8,16).
 //!   VS_SME_BATCH_ROWS: SME batch rows (default 512, matching production).
 //!   VS_DIM_SWEEP=1: additionally sweep {128,384,768,1536} dimensions with one thread.
-//!   VS_METHODS: optional comma-separated scalar,neon,sme,sme-streaming,amx,avx2,avx512 filter.
+//!   VS_METHODS: comma-separated method keys, including avx512-batch, f16c,
+//!      bf16, avx-vnni, avx512-vnni256, avx512-vnni. Compressed methods report FP32 recall.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,6 +44,10 @@ mod sme;
 #[cfg(target_arch = "x86_64")]
 #[path = "vector_search_bench/x86.rs"]
 mod x86;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "vector_search_bench/lowp.rs"]
+mod lowp;
 
 fn sme_streaming_available() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -178,7 +186,10 @@ impl TopK {
             .sum()
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     fn cutoff(&self) -> f32 {
         if self.buf.len() < self.k {
             f32::INFINITY
@@ -524,6 +535,12 @@ enum Method {
     Amx,
     Avx2,
     Avx512,
+    Avx512Batch,
+    F16,
+    Bf16,
+    Vnni,
+    Vnni256Evex,
+    Vnni512,
 }
 impl Method {
     fn name(&self) -> &'static str {
@@ -535,6 +552,12 @@ impl Method {
             Method::Amx => "amx(accelerate)",
             Method::Avx2 => "avx2(fma)",
             Method::Avx512 => "avx512(fma)",
+            Method::Avx512Batch => "avx512-batch(fp32)",
+            Method::F16 => "f16c(fp16,approx)",
+            Method::Bf16 => "bf16(dp,approx)",
+            Method::Vnni => "avx-vnni(int8,approx)",
+            Method::Vnni256Evex => "avx512-vnni256(int8,approx)",
+            Method::Vnni512 => "avx512-vnni(int8,approx)",
         }
     }
 
@@ -547,6 +570,12 @@ impl Method {
             Self::Amx => "amx",
             Self::Avx2 => "avx2",
             Self::Avx512 => "avx512",
+            Self::Avx512Batch => "avx512-batch",
+            Self::F16 => "f16c",
+            Self::Bf16 => "bf16",
+            Self::Vnni => "avx-vnni",
+            Self::Vnni256Evex => "avx512-vnni256",
+            Self::Vnni512 => "avx512-vnni",
         }
     }
 
@@ -576,7 +605,7 @@ impl Method {
                     false
                 }
             }
-            Self::Avx512 => {
+            Self::Avx512 | Self::Avx512Batch => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     x86::avx512_available()
@@ -586,6 +615,28 @@ impl Method {
                     false
                 }
             }
+            Self::F16 | Self::Bf16 | Self::Vnni | Self::Vnni256Evex | Self::Vnni512 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    self.compressed().unwrap().available()
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    false
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn compressed(self) -> Option<lowp::Kind> {
+        match self {
+            Self::F16 => Some(lowp::Kind::F16),
+            Self::Bf16 => Some(lowp::Kind::Bf16),
+            Self::Vnni => Some(lowp::Kind::Vnni),
+            Self::Vnni256Evex => Some(lowp::Kind::Vnni256Evex),
+            Self::Vnni512 => Some(lowp::Kind::Vnni512),
+            _ => None,
         }
     }
 }
@@ -599,6 +650,8 @@ struct Shared {
     n: usize,
     k: usize,
     qpt: usize,
+    #[cfg(target_arch = "x86_64")]
+    packed: lowp::Prepared,
     #[cfg(target_arch = "aarch64")]
     sme_batch_rows: usize,
 }
@@ -637,8 +690,26 @@ fn run_config(sh: &Arc<Shared>, method: Method, threads: usize) -> (f64, f64) {
                 Method::Avx2 => x86::search_avx2(q, &sh.db, sh.dim, sh.n, sh.k),
                 #[cfg(target_arch = "x86_64")]
                 Method::Avx512 => x86::search_avx512(q, &sh.db, sh.dim, sh.n, sh.k),
+                #[cfg(target_arch = "x86_64")]
+                Method::Avx512Batch => x86::search_batch(q, &sh.db, sh.dim, sh.k),
+                #[cfg(target_arch = "x86_64")]
+                Method::F16
+                | Method::Bf16
+                | Method::Vnni
+                | Method::Vnni256Evex
+                | Method::Vnni512 => {
+                    sh.packed
+                        .search(method.compressed().unwrap(), q, sh.dim, sh.k)
+                }
                 #[cfg(not(target_arch = "x86_64"))]
-                Method::Avx2 | Method::Avx512 => unreachable!("x86 SIMD is unavailable"),
+                Method::Avx2
+                | Method::Avx512
+                | Method::Avx512Batch
+                | Method::F16
+                | Method::Bf16
+                | Method::Vnni
+                | Method::Vnni256Evex
+                | Method::Vnni512 => unreachable!("x86 SIMD is unavailable"),
             }
         }));
     }
@@ -689,6 +760,12 @@ fn main() {
         Method::Scalar,
         Method::Avx2,
         Method::Avx512,
+        Method::Avx512Batch,
+        Method::F16,
+        Method::Bf16,
+        Method::Vnni,
+        Method::Vnni256Evex,
+        Method::Vnni512,
         Method::Neon,
         Method::Sme,
         Method::SmeMatrix,
@@ -750,6 +827,16 @@ fn main() {
         .map(|j| db[j * dim..j * dim + dim].iter().map(|v| v * v).sum())
         .collect();
     let queries = gen(max_threads * qpt, dim, 0x123456);
+    #[cfg(target_arch = "x86_64")]
+    let packed = lowp::Prepared::new(
+        &db,
+        dim,
+        &methods
+            .iter()
+            .filter_map(|m| m.compressed())
+            .collect::<Vec<_>>(),
+    )
+    .expect("database encoding failed");
 
     let sh = Arc::new(Shared {
         db,
@@ -760,6 +847,8 @@ fn main() {
         n,
         k,
         qpt,
+        #[cfg(target_arch = "x86_64")]
+        packed,
         #[cfg(target_arch = "aarch64")]
         sme_batch_rows,
     });
@@ -782,14 +871,21 @@ fn main() {
         );
     }
     #[cfg(target_arch = "x86_64")]
-    if methods.contains(&Method::Avx2) || methods.contains(&Method::Avx512) {
-        x86::validate(
+    if methods.iter().any(|m| {
+        matches!(m, Method::Avx2 | Method::Avx512 | Method::Avx512Batch) || m.compressed().is_some()
+    }) {
+        let reference = x86::validate(
             &sh.queries,
             &sh.db,
             dim,
             k,
             methods.contains(&Method::Avx512),
+            methods.contains(&Method::Avx512Batch),
         );
+        for kind in methods.iter().filter_map(|m| m.compressed()) {
+            sh.packed
+                .validate(kind, &sh.queries, &sh.db, dim, k, &reference);
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -890,6 +986,16 @@ fn main() {
         println!();
         for d in [128usize, 384, 768, 1536] {
             let db = gen(n, d, 0xABCDEF);
+            #[cfg(target_arch = "x86_64")]
+            let packed = lowp::Prepared::new(
+                &db,
+                d,
+                &methods
+                    .iter()
+                    .filter_map(|m| m.compressed())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("sweep encoding failed");
             #[cfg(target_os = "macos")]
             let xnorm = db
                 .chunks_exact(d)
@@ -904,6 +1010,8 @@ fn main() {
                 n,
                 k,
                 qpt,
+                #[cfg(target_arch = "x86_64")]
+                packed,
                 #[cfg(target_arch = "aarch64")]
                 sme_batch_rows,
             });
