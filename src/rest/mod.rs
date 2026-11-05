@@ -1,12 +1,10 @@
 //! HTTP SQL transport sharing the database engine and SQL session lifecycle.
-mod codec;
 pub mod config;
-mod failure;
-mod runtime;
 use crate::engine::{
     api::{QueryEngine, SessionContext},
     session_registry::SessionRegistry,
 };
+use crate::sql_service::{self as runtime, codec, failure};
 #[cfg(test)]
 use axum::body::to_bytes;
 use axum::{
@@ -28,6 +26,7 @@ use tokio_stream::StreamExt;
 pub struct RestServer<E: QueryEngine> {
     state: Arc<runtime::State<E>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    mcp: Option<crate::mcp::McpConfig>,
 }
 impl<E: QueryEngine> RestServer<E> {
     pub fn new(
@@ -39,38 +38,36 @@ impl<E: QueryEngine> RestServer<E> {
         Self {
             state: runtime::State::new(config, engine, registry),
             tls,
+            mcp: None,
         }
     }
-    pub async fn run_with_listener(&self, listener: TcpListener) -> std::io::Result<()> {
-        if self.state.config.tls != self.tls.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "REST TLS configuration and acceptor must agree",
-            ));
-        }
-        if self.tls.is_none() && !listener.local_addr()?.ip().is_loopback() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Plaintext REST requires an actual loopback listener",
-            ));
-        }
-        let sockets = Arc::new(tokio::sync::Semaphore::new(
-            self.state.config.max_connections,
-        ));
-        let router = Router::new()
+    pub fn with_mcp(mut self, config: crate::mcp::McpConfig) -> Self {
+        self.mcp = config.enabled.then_some(config);
+        self
+    }
+    pub(crate) fn router(&self) -> Router {
+        let mut router = Router::new()
             .route("/health/live", get(endpoint::<E>))
-            .route("/health/ready", get(endpoint::<E>))
-            .route("/api/v1/status", get(endpoint::<E>))
-            .route("/api/v1/sql", post(endpoint::<E>))
-            .route("/api/v1/sessions", post(endpoint::<E>))
-            .route(
-                "/api/v1/sessions/{id}",
-                get(endpoint::<E>).delete(endpoint::<E>),
-            )
-            .route("/api/v1/sessions/{id}/sql", post(endpoint::<E>))
-            .route("/api/v1/sessions/{id}/touch", post(endpoint::<E>))
-            .route("/api/v1/requests/{id}", get(endpoint::<E>))
-            .route("/api/v1/requests/{id}/cancel", post(endpoint::<E>))
+            .route("/health/ready", get(endpoint::<E>));
+        if self.state.config.enabled {
+            router = router
+                .route("/api/v1/status", get(endpoint::<E>))
+                .route("/api/v1/sql", post(endpoint::<E>))
+                .route("/api/v1/sessions", post(endpoint::<E>))
+                .route(
+                    "/api/v1/sessions/{id}",
+                    get(endpoint::<E>).delete(endpoint::<E>),
+                )
+                .route("/api/v1/sessions/{id}/sql", post(endpoint::<E>))
+                .route("/api/v1/sessions/{id}/touch", post(endpoint::<E>))
+                .route("/api/v1/requests/{id}", get(endpoint::<E>))
+                .route("/api/v1/requests/{id}/cancel", post(endpoint::<E>));
+        }
+        let mut router = router.with_state(self.state.clone());
+        if let Some(config) = &self.mcp {
+            router = router.merge(crate::mcp::router(self.state.clone(), config.clone()));
+        }
+        router
             .fallback(|| async { Failure::not_found() })
             .method_not_allowed_fallback(|| async {
                 Failure::new(
@@ -88,7 +85,27 @@ impl<E: QueryEngine> RestServer<E> {
                     response
                 },
             ))
-            .with_state(self.state.clone());
+    }
+    pub async fn run_with_listener(&self, listener: TcpListener) -> std::io::Result<()> {
+        if self.state.config.tls != self.tls.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "REST TLS configuration and acceptor must agree",
+            ));
+        }
+        if self.tls.is_none() && !listener.local_addr()?.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Plaintext REST requires an actual loopback listener",
+            ));
+        }
+        let sockets = Arc::new(tokio::sync::Semaphore::new(
+            self.state.config.max_connections,
+        ));
+        let router = self.router();
+        // HTTP/2 admission must leave room for cancellation/status requests even
+        // when SQL occupies every execution slot on the client's connection.
+        let control_streams = if self.mcp.is_some() { 8 } else { 0 };
         let mut sweep = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
@@ -107,8 +124,8 @@ impl<E: QueryEngine> RestServer<E> {
                 peer.cipher=connection.negotiated_cipher_suite().map(|v|crate::mysql::session::tls_names::cipher_name(v.suite()));
                 peer.version=connection.protocol_version().map(|v|format!("{v:?}"));
                 if let Some(cert)=connection.peer_certificates().and_then(|v|v.first()){if let Ok((_,cert))=x509_parser::parse_x509_certificate(cert.as_ref()){peer.subject=Some(crate::mysql::session::tls_names::distinguished_name(cert.subject()));peer.issuer=Some(crate::mysql::session::tls_names::distinguished_name(cert.issuer()));}}
-                serve(stream,app.layer(Extension(peer)),config).await;
-               }else{serve(stream,app.layer(Extension(peer)),config).await;}
+                serve(stream,app.layer(Extension(peer)),config,control_streams).await;
+               }else{serve(stream,app.layer(Extension(peer)),config,control_streams).await;}
               })?;
              }
             }
@@ -117,12 +134,26 @@ impl<E: QueryEngine> RestServer<E> {
         Ok(())
     }
 }
-async fn serve<I>(io: I, app: Router, config: RestConfig)
+/// Connection-level abort for response deadlines, including HTTP/2 flow
+/// control stalls where Hyper has stopped polling an application response body.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionAbort(Arc<tokio::sync::Notify>);
+impl ConnectionAbort {
+    pub(crate) fn close(&self) {
+        self.0.notify_one();
+    }
+    async fn closed(&self) {
+        self.0.notified().await;
+    }
+}
+async fn serve<I>(io: I, app: Router, config: RestConfig, control_streams: usize)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(io);
-    let service = hyper_util::service::TowerToHyperService::new(app);
+    let abort = ConnectionAbort::default();
+    let service =
+        hyper_util::service::TowerToHyperService::new(app.layer(Extension(abort.clone())));
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     builder
@@ -132,11 +163,16 @@ where
         .max_buf_size(config.max_header_bytes.max(8192));
     builder
         .http2()
-        .max_concurrent_streams(config.max_inflight.min(u32::MAX as usize) as u32)
+        .max_concurrent_streams(
+            config
+                .max_inflight
+                .saturating_add(control_streams)
+                .min(u32::MAX as usize) as u32,
+        )
         .max_header_list_size(config.max_header_bytes.min(u32::MAX as usize) as u32);
     let connection = builder.serve_connection_with_upgrades(io, service);
     tokio::pin!(connection);
-    tokio::select! {_=&mut connection=>{},_=crate::mysql::shutdown::shutdown_notified()=>{connection.as_mut().graceful_shutdown();let _=tokio::time::timeout(crate::mysql::shutdown::shutdown_timeout(),connection).await;}}
+    tokio::select! {_=&mut connection=>{},_=abort.closed()=>{},_=crate::mysql::shutdown::shutdown_notified()=>{connection.as_mut().graceful_shutdown();let _=tokio::time::timeout(crate::mysql::shutdown::shutdown_timeout(),connection).await;}}
 }
 async fn endpoint<E: QueryEngine>(
     State(state): State<Arc<runtime::State<E>>>,
@@ -230,10 +266,6 @@ async fn endpoint<E: QueryEngine>(
         let create: Create = serde_json::from_slice(&bytes)
             .map_err(|_| Failure::bad("Invalid session creation request"))?;
         let session = runtime::create_session(state.clone(), identity, create.database).await?;
-        state
-            .sessions
-            .lock()
-            .insert(session.id.clone(), session.clone());
         let mut response = (
             StatusCode::CREATED,
             Json(session_info(&session, &state.config)),
@@ -247,7 +279,7 @@ async fn endpoint<E: QueryEngine>(
     }
     sql(state, request, identity, None).await
 }
-fn session_info<E: QueryEngine>(
+pub(crate) fn session_info<E: QueryEngine>(
     session: &runtime::Session<E>,
     config: &RestConfig,
 ) -> serde_json::Value {
@@ -266,14 +298,14 @@ fn session_info<E: QueryEngine>(
         .saturating_add(limit.as_millis() as u64));
     info
 }
-fn strict(bytes: &[u8], max: usize) -> Result<()> {
+pub(crate) fn strict(bytes: &[u8], max: usize) -> Result<()> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| Failure::bad("Request must contain UTF-8 JSON"))?;
     crate::engine::http::parse_strict_json(text, max)
         .map_err(|_| Failure::bad("Invalid JSON, duplicate fields or excessive nesting"))?;
     Ok(())
 }
-async fn body<E: QueryEngine>(
+pub(crate) async fn body<E: QueryEngine>(
     state: &runtime::State<E>,
     request: Request<Body>,
 ) -> Result<(axum::body::Bytes, runtime::Memory)> {
@@ -452,13 +484,9 @@ async fn sql<E: QueryEngine>(
         session
     } else {
         let session = runtime::create_session(state.clone(), identity, database).await?;
-        state
-            .sessions
-            .lock()
-            .insert(session.id.clone(), session.clone());
         session
     };
-    let response = runtime::execute(
+    let response = execute(
         state.clone(),
         session.clone(),
         items,
@@ -475,6 +503,61 @@ async fn sql<E: QueryEngine>(
         state.sessions.lock().remove(&session.id);
     }
     response.map_err(|error| error.with_request_id(id))
+}
+
+/// Adapt shared SQL execution to the existing JSON/NDJSON REST contract.
+async fn execute<E: QueryEngine>(
+    state: Arc<runtime::State<E>>,
+    session: Arc<runtime::Session<E>>,
+    items: Vec<codec::SqlItem>,
+    atomic: bool,
+    temporary: bool,
+    timeout_ms: u64,
+    id: String,
+    stream: bool,
+    memory: runtime::Memory,
+) -> Result<Response> {
+    let execution = runtime::start(
+        state,
+        session,
+        items,
+        atomic,
+        temporary,
+        timeout_ms,
+        id.clone(),
+        if stream {
+            runtime::OutputFormat::Ndjson
+        } else {
+            runtime::OutputFormat::Json
+        },
+        memory,
+    )
+    .await?;
+    let status = execution.status();
+    let chunks = execution.map(|chunk| {
+        chunk.map(|chunk| match chunk.payload {
+            runtime::Payload::Encoded(bytes) => bytes,
+            _ => unreachable!(),
+        })
+    });
+    let mut response = (status, Body::from_stream(chunks)).into_response();
+    response.headers_mut().insert(
+        "content-type",
+        axum::http::HeaderValue::from_static(if stream {
+            "application/x-ndjson"
+        } else {
+            "application/json"
+        }),
+    );
+    response.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        "x-request-id",
+        id.parse().map_err(|_| Failure::bad("Invalid request ID"))?,
+    );
+    Ok(response)
 }
 
 /// Validate independently provisioned master keys before accepting REST traffic.

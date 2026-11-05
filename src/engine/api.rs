@@ -2088,6 +2088,13 @@ pub trait QueryEngine: Send + Sync + 'static {
         self.execute_load_data_statement(session, statement)
     }
 
+    /// Roll back a server-owned transaction after an execution failure. Cleanup
+    /// must remain possible after credentials or privileges have been revoked.
+    /// This entry point never executes caller-supplied SQL.
+    fn rollback_session_for_cleanup(&self, session: &mut SessionContext) -> Result<(), QueryError> {
+        self.execute(session, "ROLLBACK").map(|_| ())
+    }
+
     fn close_session(&self, _session: &mut SessionContext) -> Result<(), QueryError> {
         Ok(())
     }

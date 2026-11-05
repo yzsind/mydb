@@ -114,6 +114,46 @@ macro_rules! spec {
 // separately below, using their registry metadata as the whitelist.
 static OPTION_SPECS: &[OptionSpec] = &[
     OptionSpec {
+        name: "mcp_enabled",
+        env: "MYDB_MCP_ENABLED",
+        kind: OptionKind::Bool,
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "mcp_max_inflight",
+        env: "MYDB_MCP_MAX_INFLIGHT",
+        kind: OptionKind::U64Range(1, 1073741824),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "mcp_max_result_rows",
+        env: "MYDB_MCP_MAX_RESULT_ROWS",
+        kind: OptionKind::U64Range(1, 1073741824),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "mcp_max_result_bytes",
+        env: "MYDB_MCP_MAX_RESULT_BYTES",
+        kind: OptionKind::U64Range(8192, 1073741824),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "mcp_allowed_origins",
+        env: "MYDB_MCP_ALLOWED_ORIGINS",
+        kind: OptionKind::String,
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
         name: "rest_enabled",
         env: "MYDB_REST_ENABLED",
         kind: OptionKind::Bool,

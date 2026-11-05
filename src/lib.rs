@@ -29,6 +29,7 @@ pub mod error;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 mod gtid;
+pub mod mcp;
 pub mod mysql;
 pub mod parser;
 pub mod parser_partition;
@@ -43,6 +44,7 @@ mod replication_types;
 pub mod rest;
 pub(crate) mod server_version;
 pub(crate) mod sql_lex;
+pub(crate) mod sql_service;
 pub mod startup_config;
 pub(crate) mod statement_effects;
 pub mod storage;
