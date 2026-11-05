@@ -4746,18 +4746,27 @@ impl QueryEngine for StorageQueryEngine {
             || crate::planner::sql_mentions_load_file_fn(sql)
             || crate::engine::http::may_call(&self.db, sql))
         .then(crate::planner::force_serial_scope);
-        let Statement::Select(select) = statement.as_ref() else {
-            return self.execute_parsed(session, sql, statement);
+        let fingerprint = match statement.as_ref() {
+            Statement::Select(select) => {
+                Some(crate::engine::auto_param::typed_text_shape_fingerprint(
+                    &shape_sql, select, &params,
+                ))
+            }
+            _ => None,
         };
-        let fingerprint =
-            crate::engine::auto_param::typed_text_shape_fingerprint(&shape_sql, select, &params);
         let statement = (*statement).clone();
         let auto_result = crate::engine::auto_param::AutoParamResult {
             params,
-            fingerprint: Some(fingerprint),
+            fingerprint,
         };
-        let (result, metadata) =
-            self.execute_single_statement_tail(session, sql, statement, auto_result, false);
+        let (result, metadata) = self.execute_single_statement_tail_with_binding(
+            session,
+            sql,
+            statement,
+            auto_result,
+            false,
+            false,
+        );
         // Sequence state belongs to the live connection. A deferred cursor
         // must not outlive that state or evaluate on a worker's copied session.
         let result = if sequence_dependent {
@@ -6104,6 +6113,25 @@ impl StorageQueryEngine {
         auto_result: crate::engine::auto_param::AutoParamResult,
         reparse_when_cache_hint_is_unsafe: bool,
     ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata) {
+        self.execute_single_statement_tail_with_binding(
+            session,
+            sql,
+            statement,
+            auto_result,
+            reparse_when_cache_hint_is_unsafe,
+            true,
+        )
+    }
+
+    fn execute_single_statement_tail_with_binding(
+        &self,
+        session: &mut SessionContext,
+        sql: &str,
+        statement: Statement,
+        auto_result: crate::engine::auto_param::AutoParamResult,
+        reparse_when_cache_hint_is_unsafe: bool,
+        auto_parameterized: bool,
+    ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata) {
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let is_ddl = is_ddl_statement(&statement);
         let wake_purge = is_ddl
@@ -6167,13 +6195,17 @@ impl StorageQueryEngine {
             return (result, metadata.with_lock_wait_stats(wait_stats));
         }
         let execute = || {
-            crate::engine::params::with_auto_params(auto_result.params, || {
-                if reparse_when_cache_hint_is_unsafe && skip_plan_cache_hint {
-                    self.execute_statement_with_lock_wait_reparse(session, statement, sql)
-                } else {
-                    self.execute_statement_with_lock_wait(session, statement)
-                }
-            })
+            crate::engine::params::with_params_slice_and_provenance(
+                &auto_result.params,
+                auto_parameterized,
+                || {
+                    if reparse_when_cache_hint_is_unsafe && skip_plan_cache_hint {
+                        self.execute_statement_with_lock_wait_reparse(session, statement, sql)
+                    } else {
+                        self.execute_statement_with_lock_wait(session, statement)
+                    }
+                },
+            )
         };
         let (result, wait_stats) = match hint {
             Some(hint) => crate::engine::cache::with_query_hint(hint, execute),

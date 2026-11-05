@@ -537,3 +537,168 @@ async fn rest_protocol_temporary_session_releases_admission_before_reply() {
         assert!(state.sessions.lock().is_empty());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_audit_rest_bound_dml_and_atomic_rollback() {
+    let (_dir, engine) = engine();
+    let identity = identity(&engine);
+    let state = runtime::State::new(
+        RestConfig::from_startup().unwrap(),
+        engine.clone(),
+        engine.registry().clone(),
+    );
+    let s = create_session(state.clone(), identity, None).await.unwrap();
+    let requests = [
+        json!({"sql":"CREATE TABLE audit_params(id INT PRIMARY KEY,v VARCHAR(80))"}),
+        json!({"sql":"INSERT INTO audit_params VALUES (?,?)","params":[1,"first"]}),
+        json!({"sql":"INSERT INTO audit_params SELECT ?,?","params":[2,"second"]}),
+        json!({"sql":"REPLACE INTO audit_params VALUES (?,?)","params":[1,"replaced"]}),
+        json!({"sql":"UPDATE audit_params SET v=? WHERE id=?","params":["bound ' ? \\ text",2]}),
+        json!({"sql":"UPDATE audit_params SET v=? WHERE id=?","params":["no match",999]}),
+        json!({"sql":"DELETE FROM audit_params WHERE id=?","params":[1]}),
+        json!({"sql":"SET @audit_value=?","params":[123]}),
+        json!({"atomic":true,"statements":[{"sql":"INSERT INTO audit_params VALUES (?,?)","params":[3,"third"]},{"sql":"UPDATE audit_params SET v=? WHERE id=?","params":["updated",3]}]}),
+    ];
+    for request in requests {
+        let (status, bytes) = query(state.clone(), s.clone(), request.clone(), false).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{request}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    let (_, bytes) = query(
+        state.clone(),
+        s.clone(),
+        json!({"sql":"SELECT id,v,@audit_value FROM audit_params ORDER BY id"}),
+        false,
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        result["results"][0]["rows"],
+        json!([["2", "bound ' ? \\ text", "123"], ["3", "updated", "123"]])
+    );
+    let (status, bytes) = query(state.clone(), s.clone(), json!({"atomic":true,"statements":[{"sql":"INSERT INTO audit_params VALUES (?,?)","params":[4,"fourth"]},{"sql":"INSERT INTO audit_params VALUES (?,?)","params":[3,"duplicate"]}]}), false).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["error"]["rollback_confirmed"], true);
+    let (_, bytes) = query(
+        state.clone(),
+        s.clone(),
+        json!({"sql":"SELECT COUNT(*) FROM audit_params"}),
+        false,
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["results"][0]["rows"], json!([["2"]]));
+    s.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_audit_rest_returning_overflow_confirms_commit_and_batch_rollback() {
+    let (_dir, engine) = engine();
+    let identity = identity(&engine);
+    let mut config = RestConfig::from_startup().unwrap();
+    config.max_json_response_bytes = 4096;
+    let state = runtime::State::new(config, engine.clone(), engine.registry().clone());
+    let s = create_session(state.clone(), identity, None).await.unwrap();
+    query(
+        state.clone(),
+        s.clone(),
+        json!({"sql":"CREATE TABLE audit_overflow(id INT PRIMARY KEY,v TEXT)"}),
+        false,
+    )
+    .await;
+    for atomic in [false, true] {
+        let id = if atomic { 2 } else { 1 };
+        let (status,bytes) = query(state.clone(),s.clone(),json!({"atomic":atomic,"sql":format!("INSERT INTO audit_overflow VALUES ({id},REPEAT('x',5000)) RETURNING *")}),false).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["execution_outcome"], "succeeded", "{result}");
+        assert_eq!(result["results_omitted"], true);
+        assert_eq!(result["error"]["code"], "RESULT_TOO_LARGE");
+    }
+    let (status, bytes) = query(state.clone(),s.clone(),json!({"atomic":true,"statements":[{"sql":"INSERT INTO audit_overflow VALUES (3,REPEAT('x',5000)) RETURNING *"},{"sql":"INSERT INTO audit_overflow VALUES (1,'duplicate')"}]}),false).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["error"]["mysql_errno"], 1062);
+    assert_eq!(result["error"]["rollback_confirmed"], true);
+    let (_, bytes) = query(
+        state.clone(),
+        s.clone(),
+        json!({"sql":"SELECT COUNT(*) FROM audit_overflow"}),
+        false,
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["results"][0]["rows"], json!([["2"]]));
+    s.close().await;
+}
+
+#[test]
+fn release_audit_rest_accept_negotiation() {
+    use axum::http::HeaderMap;
+    for (accept, expected) in [
+        ("APPLICATION/JSON", Some(false)),
+        ("application/json; q=0.8", Some(false)),
+        ("application/json, application/x-ndjson", Some(false)),
+        ("*/*;q=0.8", Some(false)),
+        ("application/*", Some(false)),
+        ("application/json;q=0, */*;q=1", Some(true)),
+        (
+            "application/json;q=0.2, application/x-ndjson;q=0.8",
+            Some(true),
+        ),
+        ("application/json;q=0, application/x-ndjson;q=0", None),
+        ("text/html", None),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", accept.parse().unwrap());
+        assert_eq!(negotiate_format(&headers).ok(), expected, "{accept}");
+    }
+    let mut headers = HeaderMap::new();
+    headers.append("accept", "text/html".parse().unwrap());
+    headers.append("accept", "application/x-ndjson".parse().unwrap());
+    assert!(negotiate_format(&headers).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_audit_rest_chunked_body_memory_and_transaction_expiry() {
+    let (_dir, engine) = engine();
+    let identity = identity(&engine);
+    let mut config = RestConfig::from_startup().unwrap();
+    config.memory_limit = 1024 * 1024;
+    config.session_idle = Duration::from_secs(600);
+    config.transaction_idle = Duration::from_secs(30);
+    let state = runtime::State::new(config, engine.clone(), engine.registry().clone());
+    let chunks: Vec<_> = (0..64)
+        .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")))
+        .collect();
+    let request = Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from_stream(tokio_stream::iter(chunks)))
+        .unwrap();
+    let (bytes, memory) = body(&state, request).await.unwrap();
+    assert_eq!(bytes.len(), 64);
+    assert!(state.used.load(std::sync::atomic::Ordering::Acquire) < 8192);
+    drop(memory);
+    assert_eq!(state.used.load(std::sync::atomic::Ordering::Acquire), 0);
+    let s = create_session(state.clone(), identity, None).await.unwrap();
+    s.transaction
+        .store(true, std::sync::atomic::Ordering::Release);
+    s.transaction_touched
+        .store(1000, std::sync::atomic::Ordering::Release);
+    s.touched.store(10000, std::sync::atomic::Ordering::Release);
+    assert_eq!(session_info(&s, &state.config)["expires_at_ms"], 31000);
+    s.transaction
+        .store(false, std::sync::atomic::Ordering::Release);
+    assert_eq!(session_info(&s, &state.config)["expires_at_ms"], 610000);
+    s.close().await;
+}

@@ -942,6 +942,11 @@ mydb ships **two fully independent** replication stacks, distinguished in the SQ
 - ◑ Single SQL applier (no MTS multi-threaded/parallel apply; `replica_parallel_*` is advisory); consecutive
   row-only source transactions still commit independently in order but may share a bounded durability barrier at the highest WAL LSN.
 
+Connection failures retry until STOP REPLICA. SOURCE_RETRY_COUNT is advisory
+and produces a warning; the legacy Source_Retry_Count status value of 86400
+is a compatibility display, not a finite retry limit. Deterministic source
+binlog errors stop the IO thread and preserve the source error number.
+
 ### mydb → MySQL (as a Binlog Source)
 
 **◑** `sync_binlog` / `max_binlog_size` / `log_replica_updates` are writable at runtime.
@@ -950,6 +955,14 @@ rotation. `max_binlog_cache_size`, `max_binlog_stmt_cache_size`, and `expire_log
 are read-only rather than writable stubs. `binlog_format` / `binlog_row_image` /
 `binlog_row_metadata` and friends are
 boundary-validated (supported values are idempotent, others report 1231).
+
+`binlog_row_metadata=FULL` currently emits SIGNEDNESS, COLUMN_NAME,
+COLUMN_CHARSET, and ENUM_AND_SET_COLUMN_CHARSET optional metadata. Other
+MySQL FULL fields, including primary-key descriptions, ENUM/SET member
+lists, and geometry subtypes, are omitted. Consumers needing those fields
+must obtain the table schema separately. FDE events retain their checksum
+trailer even under `binlog_checksum=NONE`, as required by MySQL's format;
+subsequent events then omit checksums.
 
 GTID dump excludes already executed transactions throughout the stream, including
 sets with holes and exclusions spanning bounded batches or rotated files.

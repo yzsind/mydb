@@ -125,6 +125,10 @@ Integers outside ±9007199254740991 require a typed representation.
 | `bit` | Unsigned decimal string and `bits` from 1 through 64 |
 | `vector` | Array text string plus `datatype` and `dimension` |
 
+Temporal parameters use the engine's existing SQL conversion rules. In
+particular, a TIME beyond the supported range is clamped to
+`±838:59:59`; parameter conversion does not currently add a statement warning.
+
 ```json
 {
   "sql": "SELECT ?, ?, ?",
@@ -197,12 +201,24 @@ result_end
 complete
 ```
 
+An OK-only result (such as INSERT without RETURNING) emits a single
+`result_end` containing `result.kind: "ok"`, without a preceding
+`result_start`. CALL may append such an OK result after its result sets.
+Accept media types are case-insensitive and support lists, wildcards, and
+quality weights; JSON wins ties. A quality of zero excludes that format.
+
 There may be multiple results. Failure terminates with `error` instead of
 `complete`. HTTP 200, partial rows, or EOF do not establish successful
 completion. After headers are sent, SQL errors are represented in the stream.
 Buffered JSON exceeding the complete-response ceiling returns an error rather than
 silently truncating. Stream buffering is bounded and slow consumers are
 cancelled.
+
+If buffered results exceed the ceiling, the server drains the result and
+finishes execution before reporting `RESULT_TOO_LARGE` with
+`results_omitted: true`. Check `execution_outcome` and transaction state:
+`succeeded` confirms execution, including the commit of an atomic batch.
+Later SQL errors in a batch still take precedence and may cause rollback.
 
 ## Status, cancellation, and retries
 

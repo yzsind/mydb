@@ -3229,24 +3229,30 @@ where
         excluded_gtids: String,
     ) -> io::Result<()> {
         let handle = self.handle.as_ref().map(Arc::clone);
-        let killed = async {
-            if let Some(handle) = handle {
-                loop {
-                    handle.notified().await;
-                    if handle.kill_flag().load(Ordering::Acquire) {
-                        return;
-                    }
-                }
+        let cancel = self.context.current_cancel_token().cloned();
+        let replaced = self
+            .registered_replica_guard
+            .as_ref()
+            .map(|g| g.cancellation());
+        let replacement = async {
+            if let Some(notify) = replaced {
+                notify.notified().await;
             } else {
                 std::future::pending::<()>().await;
             }
         };
-        tokio::select! {
+        let killed = local_infile_cancelled(handle.as_deref(), cancel.as_ref());
+        let result = tokio::select! {
             biased;
             _ = crate::mysql::shutdown::shutdown_notified() => Ok(()),
             _ = killed => Ok(()),
+            _ = replacement => Ok(()),
             result = self.stream_binlog_events_inner(manager, file, position, non_blocking, excluded_gtids) => result,
-        }
+        };
+        // A stopped dump has no command-response boundary at which a client
+        // can resume. Close it, including KILL QUERY and replaced identities.
+        self.context.close_after_response = true;
+        result
     }
 
     async fn stream_binlog_events_inner(

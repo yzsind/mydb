@@ -7,8 +7,10 @@ use crate::engine::{
     api::{QueryEngine, SessionContext},
     session_registry::SessionRegistry,
 };
+#[cfg(test)]
+use axum::body::to_bytes;
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -22,6 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tokio_stream::StreamExt;
 pub struct RestServer<E: QueryEngine> {
     state: Arc<runtime::State<E>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
@@ -250,10 +253,17 @@ fn session_info<E: QueryEngine>(
 ) -> serde_json::Value {
     let mut info = session.info.lock().clone();
     info["busy"] = json!(session.busy.load(std::sync::atomic::Ordering::Acquire));
-    info["expires_at_ms"] = json!(
-        session.touched.load(std::sync::atomic::Ordering::Acquire)
-            + config.session_idle.as_millis() as u64
-    );
+    let transaction = session
+        .transaction
+        .load(std::sync::atomic::Ordering::Acquire);
+    let (clock, limit) = if transaction {
+        (&session.transaction_touched, config.transaction_idle)
+    } else {
+        (&session.touched, config.session_idle)
+    };
+    info["expires_at_ms"] = json!(clock
+        .load(std::sync::atomic::Ordering::Acquire)
+        .saturating_add(limit.as_millis() as u64));
     info
 }
 fn strict(bytes: &[u8], max: usize) -> Result<()> {
@@ -297,7 +307,7 @@ async fn body<E: QueryEngine>(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(state.config.max_request_bytes);
+        .unwrap_or(0);
     if len > state.config.max_request_bytes {
         return Err(Failure::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -305,47 +315,106 @@ async fn body<E: QueryEngine>(
             "Request body exceeds limit",
         ));
     }
-    let memory = state.memory(len.saturating_mul(4) + 4096)?;
-    let bytes = tokio::time::timeout(
-        Duration::from_secs(10),
-        to_bytes(request.into_body(), state.config.max_request_bytes),
-    )
+    let mut memory = state.memory(4096)?;
+    let bytes = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = request.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        let mut charged_capacity = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| Failure::bad("Invalid request body"))?;
+            let required = bytes.len().saturating_add(chunk.len());
+            if required > state.config.max_request_bytes {
+                return Err(Failure::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "REQUEST_TOO_LARGE",
+                    "Request body exceeds limit",
+                ));
+            }
+            if required > charged_capacity {
+                let capacity = required
+                    .next_power_of_two()
+                    .min(state.config.max_request_bytes);
+                state.grow_memory(&mut memory, (capacity - charged_capacity).saturating_mul(4))?;
+                bytes.reserve_exact(capacity - bytes.len());
+                charged_capacity = capacity;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok::<_, Failure>(axum::body::Bytes::from(bytes))
+    })
     .await
-    .map_err(|_| Failure::bad("Request body read timeout"))?
-    .map_err(|_| {
-        Failure::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "REQUEST_TOO_LARGE",
-            "Invalid or oversized request body",
-        )
-    })?;
+    .map_err(|_| Failure::bad("Request body read timeout"))??;
     state
         .received_bytes
         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok((bytes, memory))
 }
+fn negotiate_format(headers: &axum::http::HeaderMap) -> Result<bool> {
+    if !headers.contains_key("accept") {
+        return Ok(false);
+    }
+    // Specific exclusions override wildcard ranges (for example json;q=0,
+    // */*;q=1). Prefer JSON when both representations have equal quality.
+    let mut formats: [Option<(u8, u16)>; 2] = [None, None];
+    for value in headers.get_all("accept") {
+        let value = value
+            .to_str()
+            .map_err(|_| Failure::bad("Invalid Accept header"))?;
+        for range in value.split(',') {
+            let mut parts = range.split(';');
+            let media = parts.next().unwrap_or("").trim();
+            let mut quality = 1000;
+            for parameter in parts {
+                if let Some((key, value)) = parameter.trim().split_once('=') {
+                    if key.trim().eq_ignore_ascii_case("q") {
+                        let value = value.trim();
+                        let parsed = value
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|q| (0.0..=1.0).contains(q));
+                        quality = parsed.map(|q| (q * 1000.0).round() as u16).unwrap_or(0);
+                    }
+                }
+            }
+            for (index, offered) in ["application/json", "application/x-ndjson"]
+                .iter()
+                .enumerate()
+            {
+                let specificity = if media.eq_ignore_ascii_case(offered) {
+                    2
+                } else if media.eq_ignore_ascii_case("application/*") {
+                    1
+                } else if media == "*/*" {
+                    0
+                } else {
+                    continue;
+                };
+                if formats[index]
+                    .is_none_or(|(s, q)| specificity > s || (specificity == s && quality > q))
+                {
+                    formats[index] = Some((specificity, quality));
+                }
+            }
+        }
+    }
+    let quality = |i: usize| formats[i].map_or(0, |(_, q)| q);
+    if quality(0) == 0 && quality(1) == 0 {
+        return Err(Failure::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "UNSUPPORTED_FORMAT",
+            "Accept must allow application/json or application/x-ndjson",
+        ));
+    }
+    Ok(quality(1) > quality(0))
+}
+
 async fn sql<E: QueryEngine>(
     state: Arc<runtime::State<E>>,
     request: Request<Body>,
     identity: Identity,
     session: Option<Arc<runtime::Session<E>>>,
 ) -> Result<Response> {
-    let stream = match request
-        .headers()
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-    {
-        "application/json" | "*/*" => false,
-        "application/x-ndjson" => true,
-        _ => {
-            return Err(Failure::new(
-                StatusCode::NOT_ACCEPTABLE,
-                "UNSUPPORTED_FORMAT",
-                "Accept must be application/json or application/x-ndjson",
-            ))
-        }
-    };
+    let stream = negotiate_format(request.headers())?;
     if request.headers().get_all("x-request-id").iter().count() > 1 {
         return Err(Failure::bad("Duplicate request ID header"));
     }

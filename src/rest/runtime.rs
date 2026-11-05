@@ -137,7 +137,7 @@ impl<E: QueryEngine> State<E> {
             }
         }
     }
-    fn grow_memory(&self, memory: &mut Memory, extra: usize) -> Result<()> {
+    pub(super) fn grow_memory(&self, memory: &mut Memory, extra: usize) -> Result<()> {
         if memory.bytes.saturating_add(extra) > self.config.memory_limit {
             return Err(Failure::unavailable("REST memory limit exceeded"));
         }
@@ -689,6 +689,7 @@ pub struct Output<E: QueryEngine> {
     stream: bool,
     pub results: Vec<J>,
     pub bytes: usize,
+    results_omitted: bool,
     _memory: Memory,
     deadline: Instant,
     cancel: crate::engine::cancel::QueryCancelToken,
@@ -781,6 +782,20 @@ impl<E: QueryEngine> Output<E> {
         }
     }
     fn row(&mut self, row: J, rows: &mut Vec<J>, bytes: usize) -> Result<()> {
+        if !self.stream && self.results_omitted {
+            return Ok(());
+        }
+        if !self.stream
+            && self.bytes.saturating_add(bytes) > self.state.config.max_json_response_bytes
+        {
+            // Drain the cursor and finish execution/COMMIT before reporting the
+            // output failure. A response limit must not obscure a known outcome.
+            self.results_omitted = true;
+            self.results.clear();
+            rows.clear();
+            self._memory = self.state.memory(0)?;
+            return Ok(());
+        }
         if bytes > self.state.config.max_json_response_bytes {
             return Err(Failure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -845,7 +860,7 @@ fn emit<E: QueryEngine>(
                 };
                 let result = json!({"statement_index":statement,"result_index":current,"kind":"ok","affected_rows":affected.to_string(),"matched_rows":meta["matched_rows"],"last_insert_id":meta["last_insert_id"],"info":meta["info"],"diagnostics":diagnostics(ctx)});
                 output.event(json!({"type":"result_end","result":result}))?;
-                if !output.stream {
+                if !output.stream && !output.results_omitted {
                     output.results.push(result);
                 }
                 return Ok(());
@@ -885,7 +900,7 @@ fn emit<E: QueryEngine>(
     }
     let end = json!({"statement_index":statement,"result_index":current,"row_count":row_count.to_string(),"diagnostics":diagnostics(ctx)});
     output.event(json!({"type":"result_end","result":end}))?;
-    if !output.stream {
+    if !output.stream && !output.results_omitted {
         output.results.push(json!({"statement_index":statement,"result_index":current,"kind":"result_set","columns":metadata,"rows":rows,"row_count":row_count.to_string(),"diagnostics":diagnostics(ctx)}));
     }
     Ok(())
@@ -1223,6 +1238,7 @@ pub async fn execute<E: QueryEngine>(
             stream,
             results: Vec::new(),
             bytes: 0,
+            results_omitted: false,
             _memory: worker_state.memory(0).expect("zero-byte protocol charge"),
             deadline,
             cancel: ctx.current_cancel_token().unwrap().clone(),
@@ -1310,8 +1326,9 @@ pub async fn execute<E: QueryEngine>(
             json!({"request_id":request.id,"session_id":if temporary{None}else{Some(&worker_session.id)},"results":std::mem::take(&mut output.results),"session":info,"error":error,"execution_outcome":execution,"transaction_state":transaction})
         };
         if !stream
-            && codec::encoded_len(&terminal).unwrap_or(usize::MAX)
-                > worker_state.config.max_json_response_bytes
+            && (output.results_omitted
+                || codec::encoded_len(&terminal).unwrap_or(usize::MAX)
+                    > worker_state.config.max_json_response_bytes)
         {
             let failure = Failure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1324,9 +1341,11 @@ pub async fn execute<E: QueryEngine>(
             detail["execution_outcome"] = json!(execution);
             detail["transaction_state"] = json!(transaction);
             detail["rollback_confirmed"] = json!(rolled_back);
-            terminal["error"] = detail;
-            status = failure.status;
-            final_error = Some(failure);
+            if final_error.is_none() {
+                terminal["error"] = detail;
+                status = failure.status;
+                final_error = Some(failure);
+            }
         }
         {
             let mut record = request.state.lock();
