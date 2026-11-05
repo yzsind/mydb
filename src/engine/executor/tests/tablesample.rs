@@ -471,3 +471,103 @@ fn tablesample_release_audit_unqualified_ddl_and_missing_relation() {
         assert!(err.is(crate::error::catalog::ER_NOT_SUPPORTED_YET), "{sql}: {err:?}");
     }
 }
+
+#[test]
+fn tablesample_row_small_samples_and_limits_only_probe_block_prefixes() {
+    let (_dir, engine) = fixture();
+    use crate::engine::executor::select::sampling::SAMPLE_PAGES;
+    for vectorized in ["off", "on"] {
+        with_test_env(&[("MYDB_VECTORIZED", Some(vectorized))], || {
+            for clause in ["ROW(2 ROWS)", "BERNOULLI(2 ROWS)"] {
+                let before = SAMPLE_PAGES.load(AtomicOrdering::Relaxed);
+                let rows = query_rows(&engine,&format!("SELECT /*+ NO_PARALLEL */ ROWID,id,s,d,j FROM sampled TABLESAMPLE {clause} REPEATABLE(42)"));
+                assert_eq!(rows.len(), 2);
+                let page = |r: &Vec<Value>| r[0].to_display_string().parse::<u64>().unwrap() >> 16;
+                assert_ne!(page(&rows[0]), page(&rows[1]));
+                assert!(SAMPLE_PAGES.load(AtomicOrdering::Relaxed) - before <= 4);
+            }
+            for percent in [1, 100] {
+                let sql = format!("SELECT /*+ NO_PARALLEL */ id FROM sampled TABLESAMPLE ROW({percent} PERCENT) REPEATABLE(42)");
+                let full = query_rows(&engine, &sql);
+                assert!(!full.is_empty());
+                let before = SAMPLE_PAGES.load(AtomicOrdering::Relaxed);
+                let prefix = query_rows(&engine, &format!("{sql} LIMIT 1"));
+                assert_eq!(prefix, full[..1]);
+                assert!(SAMPLE_PAGES.load(AtomicOrdering::Relaxed) - before <= 8);
+            }
+            let tree = explain_analyze_tree(
+                &engine,
+                "SELECT /*+ NO_PARALLEL */ * FROM sampled TABLESAMPLE ROW(2 ROWS) REPEATABLE(42)",
+            );
+            assert!(tree.contains("sampler=block_round_row"), "{tree}");
+            assert!(tree.contains("sample_decoded_rows=2"), "{tree}");
+        });
+    }
+}
+
+#[test]
+fn tablesample_full_percent_consumers_keep_membership_limits_and_history() {
+    let (_dir, engine) = fixture();
+    for vectorized in ["off", "on"] {
+        with_test_env(&[("MYDB_VECTORIZED", Some(vectorized))], || {
+            let source = "FROM sampled TABLESAMPLE ROW(25 PERCENT) REPEATABLE(42)";
+            let raw = query_rows(&engine, &format!("SELECT id,k {source}"));
+            let sum = raw
+                .iter()
+                .map(|r| r[0].to_display_string().parse::<u64>().unwrap())
+                .sum::<u64>();
+            let filtered = raw.iter().filter(|r| r[1] == Value::Int(3)).count();
+            for hint in ["NO_PARALLEL", "PARALLEL(4)"] {
+                let aggregated = query_rows(
+                    &engine,
+                    &format!("SELECT /*+ {hint} */ COUNT(*),SUM(id) {source}"),
+                );
+                assert_eq!(aggregated[0][0].to_display_string(), raw.len().to_string());
+                assert_eq!(aggregated[0][1].to_display_string(), sum.to_string());
+                assert_eq!(
+                    query_rows(
+                        &engine,
+                        &format!("SELECT /*+ {hint} */ COUNT(*) {source} WHERE k=3")
+                    )[0][0]
+                        .to_display_string(),
+                    filtered.to_string()
+                );
+            }
+            let prefix_sum = raw
+                .iter()
+                .take(3)
+                .map(|r| r[0].to_display_string().parse::<u64>().unwrap())
+                .sum::<u64>();
+            assert_eq!(
+                query_rows(
+                    &engine,
+                    &format!("SELECT SUM(id) FROM (SELECT id {source} LIMIT 3) q")
+                )[0][0]
+                    .to_display_string(),
+                prefix_sum.to_string()
+            );
+            let tree = explain_analyze_tree(&engine, &format!("SELECT COUNT(*) {source}"));
+            assert!(tree.contains("sampler=row_percent_scan"), "{tree}");
+        });
+    }
+    let mut reader = SessionContext::default();
+    engine
+        .execute_with_session(
+            &mut reader,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        )
+        .unwrap();
+    engine
+        .execute_with_session(&mut reader, "START TRANSACTION")
+        .unwrap();
+    let sql = "SELECT COUNT(*) FROM sampled TABLESAMPLE ROW(100 PERCENT) REPEATABLE(42)";
+    let count = |reader: &mut SessionContext| {
+        support::result_rows(support::execute_materialized(&engine, reader, sql).unwrap())[0][0]
+            .to_display_string()
+    };
+    assert_eq!(count(&mut reader), "2048");
+    engine.execute("DELETE FROM sampled WHERE id>1024").unwrap();
+    assert_eq!(count(&mut reader), "2048");
+    engine.execute_with_session(&mut reader, "COMMIT").unwrap();
+    assert_eq!(query_rows(&engine, sql)[0][0].to_display_string(), "1024");
+}

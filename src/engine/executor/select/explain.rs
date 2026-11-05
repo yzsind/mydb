@@ -5321,6 +5321,10 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
                 s.candidate_window_peak
             ));
         }
+        if let Some(work) = s.sample {
+            extra.push_str(&format!(", \"sampler\": \"{}\", \"sample_pages\": {}, \"sample_nonempty_pages\": {}, \"sample_root_checks\": {}, \"sample_visible_candidates\": {}, \"sample_rounds\": {}, \"sample_decoded_rows\": {}, \"sample_workers\": {}, \"sample_directory_peak_bytes\": {}",
+                if work.sequential_percent {"row_percent_scan"} else {"block_round_row"},work.root_pages,work.nonempty_pages,work.root_checks,work.visible_roots,work.rounds,work.decoded_rows,work.workers,work.directory_peak_bytes));
+        }
         if s.spill_bytes > 0 {
             extra.push_str(&format!(", \"spill_bytes\": {}", s.spill_bytes));
             extra.push_str(&format!(", \"spill_bytes_written\": {}", s.spill_bytes));

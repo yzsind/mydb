@@ -78,11 +78,11 @@ Ordinary user tables and partitioned tables accept sampling after the table alia
 | Method and unit | Behavior |
 | --- | --- |
 | `SYSTEM (p PERCENT)` | Selects each physical heap page with probability `p / 100`, returning its visible rows. |
-| `BERNOULLI (p PERCENT)` | Selects each visible row independently with probability `p / 100`. |
+| `BERNOULLI (p PERCENT)` | Selects each visible row independently with probability `p / 100`; streaming prefixes use block rounds. |
 | `SYSTEM (n ROWS)` | Visits pages in a random order until `n` visible rows have been selected; the last page can be truncated. |
-| `BERNOULLI (n ROWS)` | Selects exactly `n` visible rows by random priority, scanning the complete population. |
+| `BERNOULLI (n ROWS)` | Visits randomly ordered blocks in rounds, selecting at most one new visible root row per block per round, until `n` rows have been selected. |
 
-Both `ROWS` methods return the complete visible population when fewer than `n` rows exist. Percentage samples have variable sizes. Page sampling can exhibit clustering when neighboring rows have related values. Exact row sampling scans all visible row identities and can spill candidates to temporary storage under memory pressure.
+Both `ROWS` methods return the complete visible population when fewer than `n` rows exist. Percentage samples have variable sizes. Page sampling can exhibit clustering when neighboring rows have related values. Exact row sampling uses a seeded random row permutation within each block and never selects the same root row twice. Small row-count samples stop after visiting enough nonempty blocks. Larger samples reuse compact page inventories across rounds; inventories and selected identities can spill under memory pressure. Each round takes at most one row per block, so blocks with fewer visible rows give their individual rows a higher selection probability in small exact samples. This block-balanced `ROWS` extension is not a globally uniform row sample. Percentage membership remains independent per visible row; the percentage refers to rows, not blocks. Aggregations that consume a complete percentage sample can combine physical reads and reorder delivery without changing membership. Streaming LIMIT inputs retain block rounds.
 
 Sampling happens before WHERE, joins, aggregation, ordering, and LIMIT. A WHERE condition can therefore leave fewer than `n` output rows. An explicit `PARTITION (...)` clause defines the sampling population; predicate-derived partition pruning does not reduce that population. Sampling follows the query's MVCC read view, including transaction-local writes and supported historical reads.
 
@@ -90,7 +90,7 @@ Amounts and seeds accept numeric literals, constant arithmetic, numeric CAST exp
 
 `REPEATABLE` selects the same sample when the seed, arguments, visible data, physical layout, and execution method remain unchanged. Changing parallel degree or execution mode is outside this guarantee. Physical reorganization or data changes can change a sample. Omitted seeds produce fresh samples on each statement execution. Plan caching never freezes a generated seed or stores a sample. Use ORDER BY when output order matters.
 
-The optimizer can use parallel sampling, including within a single partition. Existing `PARALLEL(n)` and `NO_PARALLEL` hints control eligibility. Workers share the read view, memory budget, and cancellation state. EXPLAIN TREE, JSON, and traditional output identify the sampling method and arguments; parallel plans show their degree.
+The optimizer can use parallel sampling, including within a single partition. Existing `PARALLEL(n)` and `NO_PARALLEL` hints control eligibility. Workers share the read view, memory budget, and cancellation state. Small row goals can execute serially to avoid worker startup and excessive prefetch. EXPLAIN TREE, JSON, and traditional output identify the sampling method and arguments; parallel plans show their degree. EXPLAIN ANALYZE exposes `block_round_row` and `row_percent_scan` runtime counters, including root pages, root-header checks, rounds, decoded rows, actual sampling workers, directory memory, and spill bytes.
 
 ```sql
 -- Approximately 1% of the table, selected by physical page.

@@ -10714,13 +10714,6 @@ fn sample_scan_plan(
         SampleUnit::Percent => total * amount.unwrap_or(10.0).clamp(0.0, 100.0) / 100.0,
         SampleUnit::Rows => total.min(amount.unwrap_or(1000.0).max(0.0)),
     };
-    let access_rows = if rows == 0.0 {
-        0.0
-    } else if spec.method == SampleMethod::System {
-        rows
-    } else {
-        total
-    };
     let ctx = crate::engine::cbo::CboContext::from_db(db);
     let storage_ids = table
         .explicit_partition_storage_ids
@@ -10739,24 +10732,66 @@ fn sample_scan_plan(
         } else {
             expected
         }
+    } else if spec.unit == SampleUnit::Rows {
+        // One visible root per nonempty block in the first round. Counts
+        // are estimates only; the executor proves exhaustion independently.
+        let nonempty = total_pages.min(total).max(1.0);
+        (rows * (total_pages + 1.0) / (nonempty + 1.0))
+            .ceil()
+            .min(total_pages)
     } else {
         total_pages
     };
+    let access_rows = if spec.method == SampleMethod::System {
+        rows
+    } else if total_pages > 0.0 {
+        (total * pages / total_pages).min(total)
+    } else {
+        0.0
+    };
     let width = crate::engine::cbo::operator_cost::estimated_row_width(&table.schema);
-    let qual_cost = ctx.model.cpu_operator_cost
-        * if spec.method == SampleMethod::Bernoulli && spec.unit == SampleUnit::Rows {
-            rows.max(2.0).log2()
-        } else {
-            1.0
+    let qual_cost = ctx.model.cpu_operator_cost;
+    let cost = if spec.method == SampleMethod::Bernoulli {
+        use crate::engine::cbo::{
+            cache_model::{page_io_cost, AccessKind},
+            operator_cost::per_row_decode_cost,
+            Cost,
         };
-    let cost = crate::engine::cbo::operator_cost::seq_scan(
-        &ctx,
-        pages,
-        access_rows,
-        rows,
-        width,
-        qual_cost,
-    );
+        let io = page_io_cost(
+            AccessKind::Random,
+            pages,
+            ctx.effective_cache_pages as f64,
+            total_pages,
+        );
+        let later = (rows - total_pages.min(total)).max(0.0);
+        let cpu = access_rows * (per_row_decode_cost(16.0) + qual_cost)
+            + rows * per_row_decode_cost(width)
+            + later * later.max(2.0).log2() * qual_cost;
+        let directory = pages * 24.0 + access_rows * 2.0;
+        let ordered = later * 32.0;
+        let workspace = crate::engine::executor::mem_budget::current_budget()
+            .map_or(8.0 * 1024.0 * 1024.0, |b| {
+                (b.limit() / 16).clamp(4096, 8 * 1024 * 1024) as f64
+            });
+        Cost {
+            startup: 0.0,
+            total: io + cpu,
+            io_seq_pages: 0.0,
+            io_rnd_pages: pages,
+            cpu_units: cpu,
+            mem_bytes: directory.min(workspace) + ordered.min(workspace),
+            spill_bytes: (directory - workspace).max(0.0) + (ordered - workspace).max(0.0),
+        }
+    } else {
+        crate::engine::cbo::operator_cost::seq_scan(
+            &ctx,
+            pages,
+            access_rows,
+            rows,
+            width,
+            qual_cost,
+        )
+    };
     let scan = PhysicalPlan::SampleScan {
         table: table.clone(),
         filter: None,

@@ -503,6 +503,7 @@ impl DeferredHashAggBatchOperator<'_> {
         if self.output.is_some() {
             return Ok(());
         }
+        let _sample_consumer = super::super::sampling::enter_full_percent_consumer();
         self.started = analyze_stats::is_recording().then(std::time::Instant::now);
         self.io_start = self.started.map(|_| self.db.buffer_stats_counts());
 
@@ -1209,6 +1210,7 @@ pub(super) fn build_vec_hash_agg_stream_with_count_topk(
     aggregates: &[Expr],
     count_topk: Option<vec_hash_agg::AggregateCountTopKHint>,
 ) -> Result<Option<HashAggregateStream>, QueryError> {
+    let _sample_consumer = super::super::sampling::enter_full_percent_consumer();
     if !vectorize_enabled_for_plan(agg_input) {
         return Ok(None);
     }

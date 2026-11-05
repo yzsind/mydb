@@ -71,7 +71,7 @@ pub(crate) use core::{
     decode_row_into_sink_fast, decode_row_schema_columns_into_with_plan_ext_for_layout,
     f32_from_order_u32, f64_from_order_u64, fast_decode_fallback_reason, format_decimal_v3,
     DirectScanScratch, FastDecodeFallbackReason, OnlineWalApplyContext, PayloadStreamHit,
-    RowDecodeSink, ORDER_STATS_CACHE_HITS, ORDER_STATS_CACHE_INVALIDATIONS,
+    RowDecodeSink, VisibleRootScanScratch, ORDER_STATS_CACHE_HITS, ORDER_STATS_CACHE_INVALIDATIONS,
     ORDER_STATS_CACHE_MISSES,
 };
 pub(crate) use core::{

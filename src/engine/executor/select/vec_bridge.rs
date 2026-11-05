@@ -2209,6 +2209,7 @@ impl NativeVecCompiler {
         txn: TxnView,
         plan: &'a PhysicalPlan,
     ) -> Result<NativeCompileOutcome<'a>, QueryError> {
+        let _sample_consumer = super::sampling::full_percent_consumer_scope(plan);
         if super::plan::is_sql_rowid_direct_scan(db, plan)? {
             return Ok(NativeCompileOutcome::Native(
                 try_build_row_storage_batch(db, txn, plan)?
@@ -3946,7 +3947,7 @@ fn try_build_vec_limit_input<'a>(
 /// but must stop at blocking operators such as Sort/TopK/Aggregate. Pushing a
 /// one-row hint through TopK made ORDER BY RAND() scan a complete relation in
 /// one-row source batches even though the sort cannot stop early.
-fn scan_row_goal_pushdown_safe(plan: &PhysicalPlan) -> bool {
+pub(super) fn scan_row_goal_pushdown_safe(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::SeqScan { .. }
         | PhysicalPlan::ZoneMapScan { .. }
@@ -3957,10 +3958,12 @@ fn scan_row_goal_pushdown_safe(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::ParallelSeqScan { .. }
         | PhysicalPlan::ParallelZoneMapScan { .. }
         | PhysicalPlan::ParallelIndexRangeScan { .. }
-        | PhysicalPlan::ParallelIndexFastScan { .. } => true,
-        PhysicalPlan::Projection { input, .. } | PhysicalPlan::Filter { input, .. } => {
-            scan_row_goal_pushdown_safe(input)
-        }
+        | PhysicalPlan::ParallelIndexFastScan { .. }
+        | PhysicalPlan::SampleScan { .. }
+        | PhysicalPlan::ParallelSampleScan { .. } => true,
+        PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Exchange { input, .. } => scan_row_goal_pushdown_safe(input),
         PhysicalPlan::Apply { outer, .. } => scan_row_goal_pushdown_safe(outer),
         _ => false,
     }
