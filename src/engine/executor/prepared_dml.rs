@@ -291,8 +291,7 @@ fn compile_prepared_dml_in_context(
     {
         return None;
     }
-    if super::routines::statement_references_stored_function(db, session, parsed)
-    {
+    if super::routines::statement_references_stored_function(db, session, parsed) {
         return None;
     }
     if statement_refs_temp_table(session, parsed) {
@@ -355,16 +354,41 @@ fn compile_prepared_dml_in_context(
         match &mut secured {
             Statement::Update(u) => {
                 let read = super::rls::update_requires_read(db, session, u, &table);
-                u.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Update, read, u.selection.take()).ok()?;
-            },
-            Statement::Delete(d) => d.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Delete, d.selection.is_some(), d.selection.take()).ok()?,
+                u.selection = super::rls::dml_filter(
+                    db,
+                    &table,
+                    crate::parser::rls::Command::Update,
+                    read,
+                    u.selection.take(),
+                )
+                .ok()?;
+            }
+            Statement::Delete(d) => {
+                d.selection = super::rls::dml_filter(
+                    db,
+                    &table,
+                    crate::parser::rls::Command::Delete,
+                    d.selection.is_some(),
+                    d.selection.take(),
+                )
+                .ok()?
+            }
             Statement::Select(s) => {
-                s.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Update, true, s.selection.take()).ok()?;
-            },
-            _ => {},
+                s.selection = super::rls::dml_filter(
+                    db,
+                    &table,
+                    crate::parser::rls::Command::Update,
+                    true,
+                    s.selection.take(),
+                )
+                .ok()?;
+            }
+            _ => {}
         }
         Some(Arc::new(secured))
-    } else { None };
+    } else {
+        None
+    };
     let parsed = security_statement.as_ref().unwrap_or(parsed);
     let enum_statement = table
         .columns
@@ -518,7 +542,14 @@ pub(super) fn execute_prepared_dml_plan(
     connection_id: u64,
 ) -> Result<QueryResponse, QueryError> {
     let _rowid_demand = crate::storage::rowid::DemandScope::enter(&dp.statement);
-    if dp.rls_bound && !super::compiled_select::semantics_match(db, &dp.semantics, &dp.optimizer_switch, session) {
+    if dp.rls_bound
+        && !super::compiled_select::semantics_match(
+            db,
+            &dp.semantics,
+            &dp.optimizer_switch,
+            session,
+        )
+    {
         return Err(crate::error::catalog::ER_NEED_REPREPARE
             .error("prepared DML security identity changed before statement execution"));
     }

@@ -556,8 +556,12 @@ impl RowSecurity {
                 .iter()
                 .map(|policy| {
                     policy.name.capacity()
-                        + policy.using_settings.iter().chain(&policy.check_settings)
-                            .map(|settings| settings.allocated_bytes()).sum::<usize>()
+                        + policy
+                            .using_settings
+                            .iter()
+                            .chain(&policy.check_settings)
+                            .map(|settings| settings.allocated_bytes())
+                            .sum::<usize>()
                         + (policy.using_columns.capacity() + policy.check_columns.capacity())
                             * std::mem::size_of::<crate::parser::rls::PolicyColumnReference>()
                         + policy.roles.capacity()

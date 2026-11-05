@@ -217,11 +217,22 @@ fn expand_view_body(
     expand_views_in_select(db, &context, &mut expanded, depth + 1, trail)?;
     // Keep identity local to this reference: a table-wide override would also
     // authorize a sibling direct reference or another view of the same table.
-    struct Protected<'a> { db: &'a Database, found: bool }
+    struct Protected<'a> {
+        db: &'a Database,
+        found: bool,
+    }
     impl crate::parser::visit::AstVisitor for Protected<'_> {
         fn enter_select(&mut self, query: &Select) {
-            self.found |= query.from.iter().chain(query.joins.iter().map(|j| &j.table))
-                .any(|table| self.db.table(&table.name).is_ok_and(|schema| crate::engine::rls::statement_security_enabled(self.db, &schema).unwrap_or(true)));
+            self.found |= query
+                .from
+                .iter()
+                .chain(query.joins.iter().map(|j| &j.table))
+                .any(|table| {
+                    self.db.table(&table.name).is_ok_and(|schema| {
+                        crate::engine::rls::statement_security_enabled(self.db, &schema)
+                            .unwrap_or(true)
+                    })
+                });
         }
     }
     let mut protected = Protected { db, found: false };
@@ -1243,7 +1254,7 @@ fn reject_view_temp_table_refs(
     collect_select_table_uses(select, false, &Default::default(), &mut uses);
     if uses
         .iter()
-        .any(|usage| session.has_temp_table(&usage.table))
+        .any(|usage| super::is_session_temp_table_ref(session, &usage.table))
     {
         return Err(error(
             crate::error::catalog::ER_VIEW_SELECT_TMPTABLE,
@@ -2223,7 +2234,10 @@ pub(super) fn effective_view_security_account(
         if !auth.accounts.contains_key(&account_id(&account)) {
             return Err(error(
                 crate::error::catalog::ER_NO_SUCH_USER,
-                format!("The user specified as a definer ({}) does not exist", account.display()),
+                format!(
+                    "The user specified as a definer ({}) does not exist",
+                    account.display()
+                ),
             ));
         }
         Ok(crate::engine::auth::AuthorizationContext {

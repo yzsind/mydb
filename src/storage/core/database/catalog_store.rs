@@ -1088,6 +1088,23 @@ impl Database {
             );
         }
 
+        for change in before.api_keys.diff(&after.api_keys) {
+            use imbl::ordmap::DiffItem::*;
+            let (id, record) = match change {
+                Add(id, v) => (id, Some(v)),
+                Remove(id, _) => (id, None),
+                Update { new: (id, v), .. } => (id, Some(v)),
+            };
+            let rows = record
+                .map(|r| Ok(vec![vec![Value::String(id.clone()), auth_json_value(r)?]]))
+                .transpose()?
+                .unwrap_or_default();
+            txn.replace(
+                crate::storage::data_dictionary::DD_API_KEYS,
+                CatalogRowSelector::PrimaryValues(vec![Value::String(id.clone())]),
+                rows,
+            );
+        }
         // Ordinals are snapshot-local. Only inspect changed slots, then
         // coalesce by persistent stable key (swap-remove may move a survivor).
         let mut grant_delta = BTreeMap::new();
@@ -1665,6 +1682,7 @@ impl Database {
                     let rows = dd_rows_for_auth(&catalog.auth)?;
                     for (dd_table_id, family) in [
                         (DD_USERS, rows.users),
+                        (crate::storage::data_dictionary::DD_API_KEYS, rows.api_keys),
                         (DD_GLOBAL_PRIVILEGES, rows.grants),
                         (DD_ROLE_EDGES, rows.role_edges),
                         (DD_RESTRICTIONS, rows.restrictions),

@@ -135,7 +135,12 @@ fn rls_policy_storage_relocation_retains_the_same_logical_version() {
 #[test]
 fn rls_nested_late_binding_keeps_policy_versions_across_publication() {
     let (_dir, engine, mut root) = fixture();
-    engine.execute_with_session(&mut root, "CREATE POLICY tenant ON secured USING(tenant_id=1)").unwrap();
+    engine
+        .execute_with_session(
+            &mut root,
+            "CREATE POLICY tenant ON secured USING(tenant_id=1)",
+        )
+        .unwrap();
     let alice = user("alice", 2);
     let db = engine.db_handle();
     let old_table = db.table("test.secured").unwrap();
@@ -150,7 +155,10 @@ fn rls_nested_late_binding_keeps_policy_versions_across_publication() {
             let _statement = crate::engine::rls::EvaluationScope::enter_statement(&db);
             let captured = crate::engine::expr::current_session_expr_info().unwrap();
             std::thread::scope(|threads| {
-                threads.spawn(|| engine.execute_with_session(&mut root, change).unwrap()).join().unwrap();
+                threads
+                    .spawn(|| engine.execute_with_session(&mut root, change).unwrap())
+                    .join()
+                    .unwrap();
             });
             let mut nested = alice.clone();
             let values = rows(&engine, &mut nested, "SELECT id FROM secured ORDER BY id");
@@ -167,18 +175,35 @@ fn rls_nested_late_binding_keeps_policy_versions_across_publication() {
             let mut nested = alice.clone();
             let engine = &engine;
             std::thread::scope(|threads| {
-                threads.spawn(move || crate::engine::expr::with_session_expr_info_snapshot(captured, || {
-                    assert_eq!(rows(engine, &mut nested, "SELECT id FROM secured"), vec![vec![Value::Int(1)]]);
-                })).join().unwrap();
+                threads
+                    .spawn(move || {
+                        crate::engine::expr::with_session_expr_info_snapshot(captured, || {
+                            assert_eq!(
+                                rows(engine, &mut nested, "SELECT id FROM secured"),
+                                vec![vec![Value::Int(1)]]
+                            );
+                        })
+                    })
+                    .join()
+                    .unwrap();
             });
         }
     }
-    engine.execute_with_session(&mut root, "ALTER TABLE secured ENABLE ROW LEVEL SECURITY").unwrap();
+    engine
+        .execute_with_session(&mut root, "ALTER TABLE secured ENABLE ROW LEVEL SECURITY")
+        .unwrap();
     let mut alice = alice;
     assert!(rows(&engine, &mut alice, "SELECT id FROM secured").is_empty());
     crate::engine::expr::with_session_expr_info(&alice, || {
         // A stale full descriptor may not restore an old policy.
-        let predicate = crate::engine::rls::binding(&db, &old_table, crate::parser::rls::Command::Select, false).unwrap().unwrap();
+        let predicate = crate::engine::rls::binding(
+            &db,
+            &old_table,
+            crate::parser::rls::Command::Select,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(predicate.expression, Expr::Literal(Literal::Bool(false)));
     });
 }
@@ -205,11 +230,24 @@ fn rls_definer_default_roles_are_frozen_until_the_next_statement() {
     crate::engine::expr::with_session_expr_info(&caller, || {
         let _statement = crate::engine::rls::EvaluationScope::enter_statement(&db);
         std::thread::scope(|threads| {
-            threads.spawn(|| engine.execute_with_session(&mut root, "SET DEFAULT ROLE dormant TO bob").unwrap()).join().unwrap();
+            threads
+                .spawn(|| {
+                    engine
+                        .execute_with_session(&mut root, "SET DEFAULT ROLE dormant TO bob")
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
         });
-        assert_eq!(rows(&engine, &mut alice, "SELECT read_hidden()"), vec![vec![Value::Null]]);
+        assert_eq!(
+            rows(&engine, &mut alice, "SELECT read_hidden()"),
+            vec![vec![Value::Null]]
+        );
     });
-    assert_eq!(rows(&engine, &mut alice, "SELECT read_hidden()"), vec![vec![Value::String("two".into())]]);
+    assert_eq!(
+        rows(&engine, &mut alice, "SELECT read_hidden()"),
+        vec![vec![Value::String("two".into())]]
+    );
 }
 
 #[test]
@@ -2156,24 +2194,105 @@ fn rls_precompiled_dml_rebinds_the_original_statement_after_privilege_changes() 
         "CREATE POLICY read_policy ON secured FOR SELECT USING(tenant_id=1)",
         "CREATE POLICY write_policy ON secured FOR UPDATE USING(TRUE) WITH CHECK(TRUE)",
         "GRANT SUPER ON *.* TO alice",
-    ] { engine.execute_with_session(&mut root, sql).unwrap(); }
+    ] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
     let mut alice = user("alice", 2);
     let compile = |session: &SessionContext| {
-        let statement = Arc::new(crate::parser::parse_statement("UPDATE test.secured SET payload='changed' WHERE id=2").unwrap());
+        let statement = Arc::new(
+            crate::parser::parse_statement("UPDATE test.secured SET payload='changed' WHERE id=2")
+                .unwrap(),
+        );
         crate::engine::params::with_params_slice(&[], || {
             crate::engine::executor::prepared_dml::compile_prepared_dml(
-                engine.database(), session, &statement, engine.prepared_dml_cache.current_epoch()).unwrap()
+                engine.database(),
+                session,
+                &statement,
+                engine.prepared_dml_cache.current_epoch(),
+            )
+            .unwrap()
         })
     };
     let privileged = compile(&alice);
     assert!(privileged.point_write.is_some());
-    engine.execute_with_session(&mut root, "REVOKE SUPER ON *.* FROM alice").unwrap();
-    let response = engine.execute_prepared_dml_core(&mut alice, &privileged, &[], Instant::now()).0.unwrap();
-    assert!(matches!(response, QueryResponse::OkAffected { affected_rows: 0 }));
-    assert_eq!(rows(&engine, &mut root, "SELECT payload FROM secured WHERE id=2"), vec![vec![Value::String("two".into())]]);
+    engine
+        .execute_with_session(&mut root, "REVOKE SUPER ON *.* FROM alice")
+        .unwrap();
+    let response = engine
+        .execute_prepared_dml_core(&mut alice, &privileged, &[], Instant::now())
+        .0
+        .unwrap();
+    assert!(matches!(
+        response,
+        QueryResponse::OkAffected { affected_rows: 0 }
+    ));
+    assert_eq!(
+        rows(&engine, &mut root, "SELECT payload FROM secured WHERE id=2"),
+        vec![vec![Value::String("two".into())]]
+    );
     let protected = compile(&alice);
-    engine.execute_with_session(&mut root, "GRANT SUPER ON *.* TO alice").unwrap();
-    let response = engine.execute_prepared_dml_core(&mut alice, &protected, &[], Instant::now()).0.unwrap();
-    assert!(matches!(response, QueryResponse::OkAffected { affected_rows: 1 }));
-    assert_eq!(rows(&engine, &mut root, "SELECT payload FROM secured WHERE id=2"), vec![vec![Value::String("changed".into())]]);
+    engine
+        .execute_with_session(&mut root, "GRANT SUPER ON *.* TO alice")
+        .unwrap();
+    let response = engine
+        .execute_prepared_dml_core(&mut alice, &protected, &[], Instant::now())
+        .0
+        .unwrap();
+    assert!(matches!(
+        response,
+        QueryResponse::OkAffected { affected_rows: 1 }
+    ));
+    assert_eq!(
+        rows(&engine, &mut root, "SELECT payload FROM secured WHERE id=2"),
+        vec![vec![Value::String("changed".into())]]
+    );
+}
+
+#[test]
+fn rls_release_audit_dependency_rename_is_rejected_atomically() {
+    let (_dir, engine, mut root) = fixture();
+    for sql in ["CREATE TABLE dep(tenant_id INT)", "INSERT INTO dep VALUES(1)", "GRANT SELECT ON test.dep TO alice", "CREATE POLICY pdep ON secured FOR SELECT USING(EXISTS(SELECT 1 FROM test.dep WHERE dep.tenant_id=secured.tenant_id))", "CREATE TABLE unrelated(id INT)"] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    let mut alice = user("alice", 771);
+    assert_eq!(
+        rows(&engine, &mut alice, "SELECT id FROM secured"),
+        vec![vec![Value::Int(1)]]
+    );
+    for sql in [
+        "RENAME TABLE dep TO dep2",
+        "ALTER TABLE dep RENAME TO dep2",
+        "RENAME TABLE unrelated TO moved,dep TO dep2",
+        "RENAME TABLE dep TO tmp,unrelated TO dep,tmp TO unrelated",
+    ] {
+        let err = engine.execute_with_session(&mut root, sql).unwrap_err();
+        assert!(
+            err.message()
+                .contains("referenced by a row security policy"),
+            "{sql}: {err:?}"
+        );
+        assert!(engine.db_handle().table("test.dep").is_ok());
+        assert!(engine.db_handle().table("test.unrelated").is_ok());
+        assert!(engine.db_handle().table("test.moved").is_err());
+        assert_eq!(
+            rows(&engine, &mut alice, "SELECT id FROM secured"),
+            vec![vec![Value::Int(1)]]
+        );
+    }
+    engine
+        .execute_with_session(&mut root, "RENAME TABLE secured TO renamed")
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "GRANT SELECT ON test.renamed TO alice")
+        .unwrap();
+    assert_eq!(
+        rows(&engine, &mut alice, "SELECT id FROM renamed"),
+        vec![vec![Value::Int(1)]]
+    );
+    engine
+        .execute_with_session(&mut root, "DROP POLICY pdep ON renamed")
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "ALTER TABLE dep RENAME TO dep2")
+        .unwrap();
 }

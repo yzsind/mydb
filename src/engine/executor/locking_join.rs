@@ -121,16 +121,18 @@ fn bind_source(
         }
         expand_projection(db, inner)?;
         let context = inner.rls_security_context.clone();
-        let mut bind = || bind_source(
-            db,
-            txn,
-            &mut inner.from[0],
-            &mut inner.derived,
-            sources,
-            stores,
-            skipped,
-            require_update,
-        );
+        let mut bind = || {
+            bind_source(
+                db,
+                txn,
+                &mut inner.from[0],
+                &mut inner.derived,
+                sources,
+                stores,
+                skipped,
+                require_update,
+            )
+        };
         let token = match context {
             Some(context) => crate::engine::expr::with_row_security_identity(&context, bind)?,
             None => bind()?,
@@ -151,7 +153,11 @@ fn bind_source(
     }
     let table = db.table(&reference.name)?;
     let read = crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Select, false)?;
-    let write = if require_update { crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)? } else { None };
+    let write = if require_update {
+        crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)?
+    } else {
+        None
+    };
     let enforce = read.is_some() || write.is_some();
     let mut query = source_query(reference, None);
     let indices = table
@@ -168,6 +174,19 @@ fn bind_source(
             alias: None,
         })
         .collect();
+    // The private source replaces the base relation for predicate evaluation.
+    // Preserve its physical address just like ordinary planner scans do.
+    // Wildcards have already been expanded against the original relation.
+    let include_rowid = crate::storage::rowid::demanded()
+        && !table.system
+        && table.id != 0
+        && table.find_column_index("rowid").is_none();
+    if include_rowid {
+        query.projection.push(SelectItem::Expr {
+            expr: Expr::Identifier("ROWID".into()),
+            alias: None,
+        });
+    }
     let mut columns = super::select::single_table_result_columns(&query, &table, Some(&alias))?;
     let token = format!("\0mydb_lock_origin_{}", sources.len());
     columns.push(Column {
@@ -182,14 +201,33 @@ fn bind_source(
             if skipped.contains(&(sources.len(), origin)) {
                 return Ok(());
             }
-            if enforce && (!crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Select, false, values)?
-                || (require_update && !crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Update, false, values)?)) {
+            if enforce
+                && (!crate::engine::rls::row_allowed(
+                    db,
+                    txn,
+                    &table,
+                    crate::parser::rls::Command::Select,
+                    false,
+                    values,
+                )? || (require_update
+                    && !crate::engine::rls::row_allowed(
+                        db,
+                        txn,
+                        &table,
+                        crate::parser::rls::Command::Update,
+                        false,
+                        values,
+                    )?))
+            {
                 return Ok(());
             }
             let mut values = indices
                 .iter()
                 .map(|&i| values[i].clone())
                 .collect::<Vec<_>>();
+            if include_rowid {
+                values.push(Value::UInt(crate::storage::rowid::for_row(&table, origin)?));
+            }
             values.push(Value::UInt(origins.len() as u64));
             origins.push(origin);
             builder.push(values)

@@ -403,6 +403,10 @@ fn ddl_state_default_bool_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RelayOp {
     Noop,
+    RowsWithForeignKeyChecks {
+        enabled: bool,
+        op: Box<RelayOp>,
+    },
     // Source bytes are interpreted only by the SQL thread, after preceding
     // DDL has applied. IO must not consult the replica's mutable catalog.
     RawRows {
@@ -685,6 +689,7 @@ pub struct ReplicationManager {
     data_dir: PathBuf,
     engine: Arc<StorageQueryEngine>,
     channels: Mutex<HashMap<String, Arc<ChannelRuntime>>>,
+    retired_gtids: Mutex<Option<String>>,
 }
 
 pub fn init_global(
@@ -697,6 +702,7 @@ pub fn init_global(
             data_dir,
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         })
     });
     Arc::clone(manager)
@@ -757,6 +763,46 @@ fn skip_replica_start() -> bool {
 }
 
 impl ReplicationManager {
+    fn retired_gtid_set(&self) -> Result<String, QueryError> {
+        let mut cached = self.retired_gtids.lock().map_err(|_| relay_lock_error())?;
+        if cached.is_none() {
+            *cached = Some(
+                self.engine
+                    .database_for_replication()
+                    .replication_property("mysql-replication-executed-gtids")?
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(cached.as_ref().expect("loaded GTID history").clone())
+    }
+
+    pub(crate) fn executed_gtid_set(&self) -> Result<String, QueryError> {
+        let channels = self.channels.lock().map_err(|_| relay_lock_error())?;
+        let mut sets = self.retired_gtid_set()?;
+        for runtime in channels.values() {
+            sets.push(',');
+            sets.push_str(
+                &runtime
+                    .status
+                    .lock()
+                    .map_err(|_| relay_lock_error())?
+                    .executed_gtid_set,
+            );
+        }
+        Ok(format_gtid_interval_map(&parse_gtid_interval_map(&sets)))
+    }
+
+    fn channel_exists(&self, channel: &str) -> Result<bool, QueryError> {
+        validate_channel_name(channel)?;
+        Ok(self
+            .channels
+            .lock()
+            .map_err(|_| relay_lock_error())?
+            .contains_key(channel)
+            || channel_path(&self.data_dir, channel)
+                .try_exists()
+                .map_err(|e| io_error("check replication channel", e))?)
+    }
     /// Scan the replication directory for persisted `<channel>.json` metadata
     /// and load each channel into memory (so it reports in SHOW REPLICA
     /// STATUS after a restart) and, unless `skip_replica_start`, resume its
@@ -844,6 +890,8 @@ impl ReplicationManager {
     }
 
     pub fn change_source(&self, cfg: ReplicationChannelConfig) -> Result<(), QueryError> {
+        validate_channel_name(&cfg.channel)?;
+        let global_executed = self.executed_gtid_set()?;
         validate_existing_channel_metadata(&self.data_dir, &cfg.channel)?;
         fs::create_dir_all(replication_dir(&self.data_dir))
             .map_err(|err| io_error("create replication directory", err))?;
@@ -937,7 +985,9 @@ impl ReplicationManager {
             let executed = status.executed_gtid_set.clone();
             let retrieved = status.retrieved_gtid_set.clone();
             *status = ReplicationStatus::from_config(&cfg, &self.data_dir);
-            status.executed_gtid_set = executed;
+            status.executed_gtid_set = format_gtid_interval_map(&parse_gtid_interval_map(
+                &format!("{executed},{global_executed}"),
+            ));
             status.retrieved_gtid_set = retrieved;
         }
         if let (Ok(status), Ok(mut durable)) =
@@ -1185,6 +1235,9 @@ impl ReplicationManager {
         sel: ReplThreadSel,
         shutdown: bool,
     ) -> Result<(), QueryError> {
+        if !self.channel_exists(channel)? {
+            return Ok(());
+        }
         let runtime = self.ensure_channel(channel)?;
         let stop_io = matches!(sel, ReplThreadSel::Both | ReplThreadSel::Io);
         let stop_sql = matches!(sel, ReplThreadSel::Both | ReplThreadSel::Sql);
@@ -1249,6 +1302,9 @@ impl ReplicationManager {
     }
 
     pub fn reset_channel(&self, channel: &str) -> Result<(), QueryError> {
+        if !self.channel_exists(channel)? {
+            return Ok(());
+        }
         self.stop_channel(channel)?;
         if relay_reclaim_path(&self.data_dir, channel).exists() {
             return Err(error(
@@ -1284,8 +1340,8 @@ impl ReplicationManager {
             // received position, `Retrieved_Gtid_Set`, applied/received
             // counters, and last errors — but **preserve** `@@gtid_executed`
             // (aka `Executed_Gtid_Set` in `SHOW REPLICA STATUS`). Only
-            // `RESET REPLICA ALL` or `RESET MASTER` clears the executed GTID
-            // history. Erasing it here was the source of a re-connect (with
+            // `RESET REPLICA ALL` also preserves global executed history.
+            // Erasing it here was the source of a re-connect (with
             // `AUTO_POSITION=1`) requesting the *entire* source binlog from
             // GTID 1 and flooding the applier with 1062 duplicate-key errors
             // for rows we had already applied.
@@ -1323,6 +1379,7 @@ impl ReplicationManager {
         }
         runtime.relay_cond.notify_all();
         let _ = fs::remove_file(relay_log_path(&self.data_dir, channel));
+        *runtime.until.lock().map_err(|_| relay_lock_error())? = None;
         self.persist_runtime(&runtime)
     }
 
@@ -1332,7 +1389,30 @@ impl ReplicationManager {
     /// forgotten entirely (MySQL semantics). After this, `SHOW REPLICA
     /// STATUS` no longer lists the channel.
     pub fn reset_channel_all(&self, channel: &str) -> Result<(), QueryError> {
+        if !self.channel_exists(channel)? {
+            return Ok(());
+        }
         self.reset_channel(channel)?;
+        // Persist history before removing its last channel owner. Serialize
+        // concurrent resets with the channel map so no retired GTIDs are lost.
+        {
+            let channels = self.channels.lock().map_err(|_| relay_lock_error())?;
+            let db = self.engine.database_for_replication();
+            let mut executed = self.retired_gtid_set()?;
+            if let Some(runtime) = channels.get(channel) {
+                executed.push(',');
+                executed.push_str(
+                    &runtime
+                        .status
+                        .lock()
+                        .map_err(|_| relay_lock_error())?
+                        .executed_gtid_set,
+                );
+            }
+            let executed = format_gtid_interval_map(&parse_gtid_interval_map(&executed));
+            db.set_replication_property("mysql-replication-executed-gtids", Some(&executed))?;
+            *self.retired_gtids.lock().map_err(|_| relay_lock_error())? = Some(executed);
+        }
         let tombstone = channel_tombstone(&self.data_dir, channel);
         crate::repl::durable::atomic_write_sync(
             &tombstone,
@@ -1379,7 +1459,32 @@ impl ReplicationManager {
                 .lock()
                 .map_err(|_| poisoned_lock("replication status lock poisoned"))?
                 .clone();
-            rows.push(status.row(&cfg));
+            let mut row = status.row(&cfg);
+            if let Some(until) = runtime
+                .until
+                .lock()
+                .map_err(|_| relay_lock_error())?
+                .as_ref()
+            {
+                row[23] = Value::String(
+                    match until {
+                        UntilCondition::Position { file, pos } => {
+                            row[24] = Value::String(file.clone());
+                            row[25] = Value::UInt(*pos);
+                            if legacy {
+                                "Master"
+                            } else {
+                                "Source"
+                            }
+                        }
+                        UntilCondition::SqlBeforeGtids(_) => "SQL_BEFORE_GTIDS",
+                        UntilCondition::SqlAfterGtids(_) => "SQL_AFTER_GTIDS",
+                        UntilCondition::SqlAfterMtsGaps => "SQL_AFTER_MTS_GAPS",
+                    }
+                    .to_string(),
+                );
+            }
+            rows.push(row);
         }
         Ok(QueryResponse::ResultSet(ResultSet {
             columns: ReplicationStatus::columns(legacy),
@@ -1432,6 +1537,7 @@ impl ReplicationManager {
     }
 
     fn ensure_channel(&self, channel: &str) -> Result<Arc<ChannelRuntime>, QueryError> {
+        validate_channel_name(channel)?;
         if let Some(runtime) = self
             .channels
             .lock()
@@ -1482,7 +1588,11 @@ impl ReplicationManager {
         let bytes = fs::read(&path).map_err(|err| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                format!("replication channel '{channel}' is not configured: {err}"),
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    format!("replication channel '{channel}' is not configured")
+                } else {
+                    format!("cannot read replication channel '{channel}': {err}")
+                },
             )
         })?;
         crate::storage::metadata::decode(
@@ -1627,7 +1737,14 @@ impl ChannelRunner {
                         crate::engine::session_registry::ProcessState::ReconnectingAfterSourceFailure,
                     );
                     let delay = Duration::from_millis(cfg.connect_retry_ms.max(100));
-                    thread::sleep(delay);
+                    let started = Instant::now();
+                    while !self.io_should_stop() {
+                        let remaining = delay.saturating_sub(started.elapsed());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        thread::sleep(remaining.min(Duration::from_millis(50)));
+                    }
                 }
             }
         }
@@ -2249,6 +2366,7 @@ impl ChannelRunner {
                 }
             }
             RelayOp::Noop
+            | RelayOp::RowsWithForeignKeyChecks { .. }
             | RelayOp::RawRows { .. }
             | RelayOp::WriteRows { .. }
             | RelayOp::UpdateRows { .. }
@@ -2465,6 +2583,7 @@ impl ChannelRunner {
             data_dir: self.data_dir.clone(),
             engine: Arc::clone(&self.engine),
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         if manager.persist_runtime(&self.runtime).is_ok() {
             progress.pending_updates = 0;
@@ -2482,6 +2601,7 @@ impl ChannelRunner {
             data_dir: self.data_dir.clone(),
             engine: Arc::clone(&self.engine),
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         manager.persist_runtime(&self.runtime)?;
         progress.pending_updates = 0;
@@ -2534,7 +2654,10 @@ impl ChannelRunner {
         let mut conn = mysql::Conn::new(opts).map_err(|err| {
             error(
                 crate::error::catalog::CR_CONN_HOST_ERROR,
-                format!("connect replication source failed: {err}"),
+                format!(
+                    "connect replication source failed: {}",
+                    source_error_message(&err)
+                ),
             )
         })?;
 
@@ -2545,7 +2668,10 @@ impl ChannelRunner {
             .map_err(|err| {
                 error(
                     crate::error::catalog::CR_SERVER_LOST,
-                    format!("register replica UUID failed: {err}"),
+                    format!(
+                        "register replica UUID failed: {}",
+                        source_error_message(&err)
+                    ),
                 )
             })?;
 
@@ -2573,7 +2699,10 @@ impl ChannelRunner {
                 mark_io_error_fatal();
                 error(
                     crate::error::catalog::CR_SERVER_LOST,
-                    format!("cannot verify replication source binlog_format: {err}"),
+                    format!(
+                        "cannot verify replication source binlog_format: {}",
+                        source_error_message(&err)
+                    ),
                 )
             })?;
         require_replication_source_setting("binlog_format", fmt.as_deref(), "ROW")?;
@@ -2589,7 +2718,10 @@ impl ChannelRunner {
                 mark_io_error_fatal();
                 error(
                     crate::error::catalog::CR_SERVER_LOST,
-                    format!("cannot verify replication source binlog_row_image: {err}"),
+                    format!(
+                        "cannot verify replication source binlog_row_image: {}",
+                        source_error_message(&err)
+                    ),
                 )
             })?;
         require_replication_source_setting("binlog_row_image", image.as_deref(), "FULL")?;
@@ -2641,12 +2773,9 @@ impl ChannelRunner {
             crate::engine::session_registry::ProcessState::WaitingForSourceEvent,
         );
         let request = self.build_binlog_request(cfg, &file, pos)?;
-        let mut stream = conn.get_binlog_stream(request).map_err(|err| {
-            error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                format!("request binlog stream failed: {err}"),
-            )
-        })?;
+        let mut stream = conn
+            .get_binlog_stream(request)
+            .map_err(|err| source_io_error("request binlog stream", err))?;
 
         let mut table_maps: HashMap<u64, mysql::binlog::events::TableMapEvent<'static>> =
             HashMap::new();
@@ -2663,12 +2792,7 @@ impl ChannelRunner {
             let Some(event_result) = stream.next() else {
                 return Ok(());
             };
-            let event = event_result.map_err(|err| {
-                error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!("read binlog event from source failed: {err}"),
-                )
-            })?;
+            let event = event_result.map_err(|err| source_io_error("read binlog event", err))?;
             let header = event.header();
             let next_pos = header.log_pos() as u64;
             let event_ts = header.timestamp() as u64;
@@ -3002,7 +3126,10 @@ impl ChannelRunner {
             .map_err(|err| {
                 error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!("cannot discover source binary log status: {err}"),
+                    format!(
+                        "cannot discover source binary log status: {}",
+                        source_error_message(&err)
+                    ),
                 )
             })?
             .ok_or_else(|| {
@@ -3029,14 +3156,27 @@ impl ChannelRunner {
     ) -> Result<mysql::BinlogRequest<'static>, QueryError> {
         if cfg.auto_position {
             let status = self.status_snapshot();
+            let global_executed = if let Some(manager) =
+                global_manager().filter(|m| Arc::ptr_eq(&m.engine, &self.engine))
+            {
+                manager.executed_gtid_set()?
+            } else {
+                ReplicationManager {
+                    data_dir: self.data_dir.clone(),
+                    engine: self.engine.clone(),
+                    channels: Mutex::new(HashMap::new()),
+                    retired_gtids: Mutex::new(None),
+                }
+                .executed_gtid_set()?
+            };
             let durable = self
                 .runtime
                 .durable_io_progress
                 .lock()
                 .map_err(|_| relay_lock_error())?;
             let received = format!(
-                "{},{}",
-                status.executed_gtid_set, durable.retrieved_gtid_set
+                "{},{},{}",
+                status.executed_gtid_set, durable.retrieved_gtid_set, global_executed
             );
             let sids = parse_gtid_set(&format_gtid_interval_map(&parse_gtid_interval_map(
                 &received,
@@ -3110,7 +3250,13 @@ impl ChannelRunner {
             Ok((rows.into_owned(), map.into_owned()))
         };
         let (rows, map) = decode().map_err(|err| io_error("decode relay rows", err))?;
-        self.convert_rows_event(rows, &map)
+        let enabled = !rows
+            .flags()
+            .contains(mysql_common::binlog::consts::RowsEventFlags::NO_FOREIGN_KEY_CHECKS);
+        Ok(RelayOp::RowsWithForeignKeyChecks {
+            enabled,
+            op: Box::new(self.convert_rows_event(rows, &map)?),
+        })
     }
 
     fn convert_rows_event(
@@ -3912,6 +4058,10 @@ fn apply_ops_to_storage(
     let _row_security = crate::engine::rls::TrustedInternalScope::enter();
     for op in ops {
         match op {
+            RelayOp::RowsWithForeignKeyChecks { enabled, op } => {
+                let _fk_checks = crate::storage::FkChecksGuard::new(*enabled);
+                apply_ops_to_storage(_engine, db, txn, std::slice::from_ref(op.as_ref()))?;
+            }
             RelayOp::RawRows { .. } => {
                 return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
@@ -3970,18 +4120,16 @@ fn apply_write_rows(
                     }
                     Err(e) => {
                         return Err(e.map_message(|message| {
-                            format!(
-                                "{message} (replicating WRITE_ROWS to {database}.{table}: {row:?})"
-                            )
+                            format!("{message} (replicating WRITE_ROWS to {database}.{table})")
                         }))
                     }
                 }
             }
             Ok(())
         }
-        Err(err) => Err(err.map_message(|message| {
-            format!("{message} (replicating to {database}.{table}: {rows:?})")
-        })),
+        Err(err) => {
+            Err(err.map_message(|message| format!("{message} (replicating to {database}.{table})")))
+        }
     }
 }
 
@@ -4314,12 +4462,7 @@ fn convert_binlog_row(
             before_image.and_then(|row| row.get(idx)),
         )
         .map_err(|err| {
-            err.map_message(|message| {
-                format!(
-                    "{message} (column `{}` type {:?} unsigned={} raw={:?})",
-                    column.name, column.data_type, column.unsigned, value
-                )
-            })
+            err.map_message(|message| format!("{message} (column `{}`)", column.name))
         })?;
         out[idx] = converted;
     }
@@ -4693,6 +4836,35 @@ fn mysql_value_to_mydb(
     unsigned: bool,
     target_charset: Option<&str>,
 ) -> Result<Value, QueryError> {
+    if let DataTypeKind::Enum { values } = target {
+        let ordinal = match value {
+            mysql::Value::Int(v) => Some(u64::try_from(*v).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    "invalid ENUM ordinal in binlog row",
+                )
+            })?),
+            mysql::Value::UInt(v) => Some(*v),
+            _ => None,
+        };
+        if let Some(ordinal) = ordinal {
+            return if ordinal == 0 {
+                Ok(Value::String(String::new()))
+            } else {
+                usize::try_from(ordinal - 1)
+                    .ok()
+                    .and_then(|i| values.get(i))
+                    .cloned()
+                    .map(Value::String)
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                            "ENUM ordinal exceeds target member count",
+                        )
+                    })
+            };
+        }
+    }
     // mysql_common decodes integer binlog values without the column's
     // signed/unsigned flag (the unsigned bit lives only in the extended
     // TABLE_MAP metadata mysql_common does not surface). When the source
@@ -4801,13 +4973,21 @@ fn mysql_value_to_mydb(
             // (e.g. an IEEE-754 coordinate byte) with U+FFFD and corrupt the
             // geometry (observed: `POINT(1 2)` round-tripping to garbage).
             DataTypeKind::Geometry { .. } => Value::Geometry(bytes.clone()),
-            // BIT(M): the row image carries the value as `ceil(M/8)`
-            // big-endian bytes. Hand the raw bytes to `coerce_value`'s Bit
-            // arm (which reads them big-endian into an integer) — the `_`
-            // arm's `from_utf8_lossy` would corrupt any non-ASCII byte
-            // (`BIT(8)=0x35` silently became the ASCII digit `"5"` → 5, and
-            // high-bit values like `0x81` became U+FFFD and broke apply).
-            DataTypeKind::Bit { .. } => Value::Bytes(bytes.clone()),
+            // Normalize both images to the stored integer representation;
+            // key lookup and heap row matching do not run insert coercion.
+            DataTypeKind::Bit { .. } => {
+                if bytes.len() > 8 {
+                    return Err(error(
+                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                        "BIT row value exceeds 64 bits",
+                    ));
+                }
+                Value::UInt(
+                    bytes
+                        .iter()
+                        .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)),
+                )
+            }
             // VECTOR(n): mydb producers use the versioned portable envelope;
             // legacy/raw producers remain accepted for backward compatibility.
             DataTypeKind::Vector { dim, datatype } => {
@@ -4820,13 +5000,28 @@ fn mysql_value_to_mydb(
             _ => decode_replicated_string(bytes, target_charset)?,
         },
         mysql::Value::Date(y, m, d, hh, mm, ss, us) => {
-            if *y == 0 && *m == 0 && *d == 0 {
+            if *y == 0
+                && *m == 0
+                && *d == 0
+                && (matches!(target, DataTypeKind::Date)
+                    || (*hh == 0 && *mm == 0 && *ss == 0 && *us == 0))
+            {
                 match target {
                     DataTypeKind::Date => Value::Date(crate::types::ZERO_DATE),
                     DataTypeKind::Timestamp { .. } => Value::Timestamp(crate::types::ZERO_DATETIME),
                     _ => Value::DateTime(crate::types::ZERO_DATETIME),
                 }
             } else if matches!(target, DataTypeKind::Date) {
+                if NaiveDate::from_ymd_opt(*y as i32, *m as u32, *d as u32).is_none() {
+                    return crate::types::encode_tagged_date(*y as u32, *m as u32, *d as u32)
+                        .map(Value::Date)
+                        .ok_or_else(|| {
+                            error(
+                                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                                "invalid DATE components in binlog row",
+                            )
+                        });
+                }
                 let date =
                     NaiveDate::from_ymd_opt(*y as i32, *m as u32, *d as u32).ok_or_else(|| {
                         error(
@@ -4837,6 +5032,20 @@ fn mysql_value_to_mydb(
                 let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                 Value::Date(date.signed_duration_since(epoch).num_days() as i32)
             } else {
+                if !matches!(target, DataTypeKind::Timestamp { .. })
+                    && NaiveDate::from_ymd_opt(*y as i32, *m as u32, *d as u32).is_none()
+                {
+                    return crate::types::encode_tagged_datetime(
+                        *y as u32, *m as u32, *d as u32, *hh as u32, *mm as u32, *ss as u32, *us,
+                    )
+                    .map(Value::DateTime)
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                            "invalid DATETIME components in binlog row",
+                        )
+                    });
+                }
                 let date =
                     NaiveDate::from_ymd_opt(*y as i32, *m as u32, *d as u32).ok_or_else(|| {
                         error(
@@ -4974,6 +5183,7 @@ pub fn handle_admin_sql(sql: &str) -> Result<QueryResponse, QueryError> {
         // else persisted, else default) rather than a blank default — a
         // `CHANGE ... SOURCE_DELAY=60` must not wipe host/user/password/etc.
         let channel = parse_change_source_channel(trimmed);
+        validate_channel_name(&channel)?;
         let base = manager.base_config_for_change(&channel);
         let cfg = parse_change_source_onto(trimmed, base)?;
         manager.change_source(cfg)?;
@@ -5018,8 +5228,7 @@ fn parse_start_replica(
         let until_body_full = tail[pos..].trim();
         // Find the next FOR CHANNEL boundary (if any) so we don't slurp it
         // into the UNTIL body.
-        let upper_body = until_body_full.to_ascii_uppercase();
-        let (until_body, after_body) = if let Some(pos) = upper_body.rfind(" FOR CHANNEL ") {
+        let (until_body, after_body) = if let Some(pos) = channel_clause_offset(until_body_full) {
             (until_body_full[..pos].trim(), until_body_full[pos..].trim())
         } else {
             (until_body_full, "")
@@ -5183,12 +5392,68 @@ fn advisory_change_source_clause(clause: &str, why: &str) {
 /// Extract just the `FOR CHANNEL 'x'` name from a CHANGE statement (empty
 /// default channel when absent) so the caller can load that channel's current
 /// config as the merge base.
+fn channel_clause_offset(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut quote = None;
+    let mut found = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(i + 1) == Some(&delimiter) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+        } else if bytes
+            .get(i..i + 13)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b" FOR CHANNEL "))
+        {
+            found = Some(i);
+        }
+        i += 1;
+    }
+    found
+}
+
+fn validate_channel_name(channel: &str) -> Result<(), QueryError> {
+    if channel.len() > 64
+        || channel
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+        || matches!(channel, "." | "..")
+    {
+        return Err(error(crate::error::catalog::ER_PARSE_ERROR,
+            "Replication channel name must be at most 64 bytes and contain no path separators or control characters"));
+    }
+    Ok(())
+}
+
+fn parse_replication_bool(value: &str, option: &str) -> Result<bool, QueryError> {
+    match value.to_ascii_uppercase().as_str() {
+        "1" | "ON" | "TRUE" => Ok(true),
+        "0" | "OFF" | "FALSE" => Ok(false),
+        _ => Err(error(
+            crate::error::catalog::ER_PARSE_ERROR,
+            format!("Invalid {option} value; expected 0 or 1, OFF or ON, FALSE or TRUE"),
+        )),
+    }
+}
+
 fn parse_change_source_channel(sql: &str) -> String {
     let body = match sql.to_ascii_uppercase().find(" TO ") {
         Some(pos) => &sql[pos + 4..],
         None => return DEFAULT_CHANNEL.to_string(),
     };
-    if let Some(pos) = body.to_ascii_uppercase().rfind(" FOR CHANNEL ") {
+    if let Some(pos) = channel_clause_offset(body) {
         unquote_sql_value(body[pos + " FOR CHANNEL ".len()..].trim())
     } else {
         DEFAULT_CHANNEL.to_string()
@@ -5215,7 +5480,7 @@ fn parse_change_source_onto(
             "CHANGE REPLICATION SOURCE TO requires assignments",
         ));
     };
-    if let Some(pos) = body.to_ascii_uppercase().rfind(" FOR CHANNEL ") {
+    if let Some(pos) = channel_clause_offset(body) {
         cfg.channel = unquote_sql_value(body[pos + " FOR CHANNEL ".len()..].trim());
         body = body[..pos].trim();
     }
@@ -5250,7 +5515,7 @@ fn parse_change_source_onto(
                 })?
             }
             "SOURCE_AUTO_POSITION" | "MASTER_AUTO_POSITION" => {
-                cfg.auto_position = matches!(value.as_str(), "1" | "ON" | "on" | "TRUE" | "true")
+                cfg.auto_position = parse_replication_bool(&value, &key)?;
             }
             "SOURCE_SERVER_ID" | "SERVER_ID" => {
                 cfg.server_id = value.parse().map_err(|_| {
@@ -5269,7 +5534,7 @@ fn parse_change_source_onto(
                 })?
             }
             "SOURCE_SSL" | "MASTER_SSL" => {
-                let enabled = matches!(value.as_str(), "1" | "ON" | "on" | "TRUE" | "true");
+                let enabled = parse_replication_bool(&value, &key)?;
                 if enabled && cfg.ssl_mode == ReplicationSslMode::Disabled {
                     cfg.ssl_mode = ReplicationSslMode::Required;
                 } else if !enabled {
@@ -5419,6 +5684,7 @@ fn parse_change_source_onto(
             }
         }
     }
+    validate_channel_name(&cfg.channel)?;
     Ok(cfg)
 }
 
@@ -5860,6 +6126,39 @@ fn take_io_error_fatal() -> bool {
 /// errors (2003) and racy mid-stream conditions retry. (R8)
 fn io_error_is_fatal(error: &QueryError, marked_fatal: bool) -> bool {
     marked_fatal || error.is(crate::error::catalog::ER_BINLOG_FATAL_ERROR)
+}
+
+fn source_error_message(err: &mysql::Error) -> String {
+    std::error::Error::source(err)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "Source protocol or value conversion failed".to_string())
+}
+
+fn source_io_error(action: &str, err: mysql::Error) -> QueryError {
+    match err {
+        mysql::Error::MySqlError(err) => {
+            // A source ERR packet rejects this dump, rather than indicating a
+            // transient socket failure. Preserve its diagnostics and stop IO.
+            mark_io_error_fatal();
+            QueryError::user_defined(err.code, &err.state, err.message).unwrap_or_else(|_| {
+                error(
+                    crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+                    "Source returned invalid error diagnostics",
+                )
+            })
+        }
+        mysql::Error::IoError(err) => error(
+            crate::error::catalog::CR_SERVER_LOST,
+            format!("{action} from source failed: {err}"),
+        ),
+        err => error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            format!(
+                "{action} from source failed: {}",
+                source_error_message(&err)
+            ),
+        ),
+    }
 }
 
 // A disposable applier session cannot reproduce source-session table lifetime.
@@ -6436,6 +6735,9 @@ fn channel_path(data_dir: &Path, channel: &str) -> PathBuf {
 /// shape. mydb's relay log is JSON-Lines, not the binary MySQL format —
 /// the labels are a best-effort translation.
 fn relay_op_event_type(op: &RelayOp, gtid: &Option<String>) -> &'static str {
+    if let RelayOp::RowsWithForeignKeyChecks { op, .. } = op {
+        return relay_op_event_type(op, gtid);
+    }
     if gtid.is_some()
         && matches!(
             op,
@@ -6451,6 +6753,7 @@ fn relay_op_event_type(op: &RelayOp, gtid: &Option<String>) -> &'static str {
         return "Gtid_log_event";
     }
     match op {
+        RelayOp::RowsWithForeignKeyChecks { op, .. } => relay_op_event_type(op, gtid),
         RelayOp::RawRows { .. } => "Rows_log_event",
         RelayOp::Noop => "Rotate_log_event",
         RelayOp::TxnCommit { .. } => "Xid_log_event",
@@ -6470,6 +6773,7 @@ fn relay_op_info(op: &RelayOp, gtid: &Option<String>) -> String {
         return format!("SET @@SESSION.GTID_NEXT= '{gtid}'");
     }
     match op {
+        RelayOp::RowsWithForeignKeyChecks { op, .. } => relay_op_info(op, gtid),
         RelayOp::RawRows { event_type, .. } => format!("source rows event type {event_type}"),
         RelayOp::Noop => String::new(),
         RelayOp::TxnCommit { event_count, .. } => format!("COMMIT /* events={event_count} */"),
@@ -6824,6 +7128,7 @@ fn io_error(action: &str, err: std::io::Error) -> QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("repl/release_audit_tests.rs");
     use mysql_common::binlog::consts::{EventFlags, EventType, TransactionPayloadCompressionType};
     use mysql_common::binlog::events::{BinlogEventHeader, QueryEvent, TransactionPayloadEvent};
     use mysql_common::proto::MySerialize;
@@ -6884,6 +7189,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine: Arc::clone(&engine),
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         manager
             .change_source(
@@ -7699,11 +8005,10 @@ mod tests {
     }
 
     #[test]
-    fn bit_row_value_preserves_bytes_not_lossy_string() {
+    fn bit_row_value_preserves_big_endian_integer_not_lossy_string() {
         // BIT(8) = 53 arrives as the single big-endian byte 0x35. The old `_`
         // arm ran `from_utf8_lossy(b"\x35")` = "5" → coerced to 5 (silent data
-        // corruption). The Bit arm must hand the raw bytes to coerce as
-        // `Value::Bytes` so it reads 53 big-endian.
+        // corruption). Decode the same integer for inserts and row lookup.
         let converted = mysql_value_to_mydb(
             &mysql::Value::Bytes(vec![0x35]),
             &DataTypeKind::Bit { len: Some(8) },
@@ -7711,10 +8016,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(converted, Value::Bytes(vec![0x35]));
+        assert_eq!(converted, Value::UInt(53));
 
         // High-bit value 0x81 (129): the old path produced U+FFFD and broke
-        // apply; now it survives as raw bytes.
+        // apply; now it survives as an integer.
         let converted = mysql_value_to_mydb(
             &mysql::Value::Bytes(vec![0x81]),
             &DataTypeKind::Bit { len: Some(8) },
@@ -7722,7 +8027,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(converted, Value::Bytes(vec![0x81]));
+        assert_eq!(converted, Value::UInt(129));
     }
 
     #[test]
@@ -8033,6 +8338,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         let path = channel_path(dir.path(), DEFAULT_CHANNEL);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8057,6 +8363,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
 
         let sql1 = "CHANGE REPLICATION SOURCE TO SOURCE_HOST='10.0.0.5', SOURCE_PORT=3310, \
@@ -8088,6 +8395,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         crate::repl::replica::progress::write_resync_marker(dir.path(), "native").unwrap();
         for name in ["role", "replica_progress", "resync_required"] {
@@ -8121,6 +8429,7 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
                 engine,
                 channels: Mutex::new(HashMap::new()),
+                retired_gtids: Mutex::new(None),
             });
             let cfg = parse_change_source(
                 "CHANGE REPLICATION SOURCE TO SOURCE_HOST='10.1.2.3', SOURCE_PORT=3307, SOURCE_USER='repl'",
@@ -8135,6 +8444,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         });
         manager.restore_persisted_channels();
 
@@ -8331,6 +8641,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         let cfg = parse_change_source("CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1', SOURCE_USER='repl', SOURCE_LOG_FILE='bin.000002', SOURCE_LOG_POS=456").unwrap();
         manager.change_source(cfg.clone()).unwrap();
@@ -8353,6 +8664,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         });
         let cfg = parse_change_source(
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1', SOURCE_PORT=3307, SOURCE_USER='repl'",
@@ -8679,6 +8991,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine,
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         manager
             .change_source(
@@ -9132,6 +9445,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             engine: Arc::clone(&engine),
             channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
         };
         manager.persist_runtime(&runtime).unwrap();
         let persisted = manager.load_channel(DEFAULT_CHANNEL).unwrap();

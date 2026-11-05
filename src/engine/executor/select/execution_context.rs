@@ -381,7 +381,8 @@ impl ExecutionContext {
         f: impl FnOnce() -> R,
     ) -> R {
         let txn = self.txn;
-        let _security = crate::engine::rls::EvaluationScope::enter_snapshot(self.rls_evaluation.as_ref());
+        let _security =
+            crate::engine::rls::EvaluationScope::enter_snapshot(self.rls_evaluation.as_ref());
         let _statement_now =
             crate::engine::api::StatementNowScope::enter(self.statement_now_micros);
         let _http_scope = crate::engine::http::enter_context(self.http_context.as_ref());

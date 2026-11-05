@@ -322,8 +322,7 @@ impl CatalogStore {
                     lease
                 } else if let Some((_, security)) = new.as_ref().filter(|(_, security)| {
                     security.version == old.version && security.enabled == old.enabled
-                })
-                {
+                }) {
                     // A storage relocation preserves the logical object's
                     // policy version. Its complete incoming descriptor is
                     // also the authoritative payload for the old root. On a

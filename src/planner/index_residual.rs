@@ -297,18 +297,14 @@ fn covered(
         low.is_some_and(|b| {
             b.key.0.len() == pos + 1
                 && ((b.key.0[pos] == key && (!strict || !b.inclusive))
-                    || (!b.key.0[pos].is_deferred()
-                        && !key.is_deferred()
-                        && b.key.0[pos] > key))
+                    || (!b.key.0[pos].is_deferred() && !key.is_deferred() && b.key.0[pos] > key))
         })
     };
     let upper_ok = |strict: bool| {
         high.is_some_and(|b| {
             b.key.0.len() == pos + 1
                 && ((b.key.0[pos] == key && (!strict || !b.inclusive))
-                    || (!b.key.0[pos].is_deferred()
-                        && !key.is_deferred()
-                        && b.key.0[pos] < key))
+                    || (!b.key.0[pos].is_deferred() && !key.is_deferred() && b.key.0[pos] < key))
         })
     };
     match op {

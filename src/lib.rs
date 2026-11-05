@@ -40,6 +40,7 @@ pub mod replication;
 pub mod replication_columns;
 mod replication_sql;
 mod replication_types;
+pub mod rest;
 pub(crate) mod server_version;
 pub(crate) mod sql_lex;
 pub mod startup_config;

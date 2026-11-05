@@ -79,7 +79,8 @@ pub(crate) fn invalidate_authorization_cache() {
 static PARTIAL_REVOKES: AtomicBool = AtomicBool::new(false);
 
 pub fn partial_revokes_enabled() -> bool {
-    STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.partial_revokes))
+    STATEMENT_POLICY
+        .with(|slot| slot.borrow().as_ref().map(|p| p.partial_revokes))
         .unwrap_or_else(|| PARTIAL_REVOKES.load(Ordering::Relaxed))
 }
 
@@ -95,7 +96,8 @@ pub fn set_partial_revokes(value: bool) {
 static ACTIVATE_ALL_ROLES_ON_LOGIN: AtomicBool = AtomicBool::new(false);
 
 pub fn activate_all_roles_on_login() -> bool {
-    STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.activate_all_roles))
+    STATEMENT_POLICY
+        .with(|slot| slot.borrow().as_ref().map(|p| p.activate_all_roles))
         .unwrap_or_else(|| ACTIVATE_ALL_ROLES_ON_LOGIN.load(Ordering::Relaxed))
 }
 
@@ -113,7 +115,11 @@ static MANDATORY_ROLES_RAW: Mutex<String> = Mutex::new(String::new());
 static MANDATORY_ROLES_EMPTY: AtomicBool = AtomicBool::new(true);
 
 pub fn mandatory_roles_raw() -> String {
-    if let Some(raw) = STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.mandatory_roles.as_deref().unwrap_or_default().to_string())) {
+    if let Some(raw) = STATEMENT_POLICY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|p| p.mandatory_roles.as_deref().unwrap_or_default().to_string())
+    }) {
         return raw;
     }
     MANDATORY_ROLES_RAW
@@ -1422,6 +1428,14 @@ pub struct AuthCatalog {
     #[serde(default)]
     pub accounts: AuthCow<imbl::OrdMap<String, UserAccount>>,
     #[serde(default)]
+    pub api_keys: imbl::OrdMap<String, crate::engine::access_keys::Record>,
+    #[serde(skip)]
+    api_key_names: imbl::OrdMap<AccountKey, imbl::OrdMap<String, String>>,
+    #[serde(skip)]
+    api_key_memory: usize,
+    #[serde(skip)]
+    api_key_masters: imbl::OrdMap<String, usize>,
+    #[serde(default)]
     pub grants: GrantStore,
     #[serde(default)]
     pub role_edges: AuthRows<RoleEdge>,
@@ -1503,6 +1517,10 @@ impl AuthCatalog {
             password_validation_component: false,
             epoch: 1,
             accounts: Default::default(),
+            api_keys: Default::default(),
+            api_key_names: Default::default(),
+            api_key_memory: 0,
+            api_key_masters: Default::default(),
             grants: GrantStore::new(),
             role_edges: Default::default(),
             default_roles: Default::default(),
@@ -1559,17 +1577,113 @@ impl AuthCatalog {
                     .sum()
             });
         accounts
+            .saturating_add(self.api_key_memory)
             .saturating_add(self.grants.memory_bytes())
             .saturating_add(self.role_edges.memory_bytes())
             .saturating_add(self.default_roles.memory_bytes())
             .saturating_add(self.restrictions.memory_bytes())
     }
 
+    pub(crate) fn api_keys_for<'a>(
+        &'a self,
+        owner: &AccountKey,
+    ) -> impl Iterator<Item = &'a crate::engine::access_keys::Record> {
+        self.api_key_names
+            .get(owner)
+            .into_iter()
+            .flat_map(|names| names.values())
+            .filter_map(|id| self.api_keys.get(id))
+    }
+    pub(crate) fn api_key_named(
+        &self,
+        owner: &AccountKey,
+        name: &str,
+    ) -> Option<&crate::engine::access_keys::Record> {
+        self.api_key_names
+            .get(owner)?
+            .get(name)
+            .and_then(|id| self.api_keys.get(id))
+    }
+    pub(crate) fn api_key_master_ids(&self) -> impl Iterator<Item = &String> {
+        self.api_key_masters.keys()
+    }
+    fn unindex_api_key(&mut self, record: &crate::engine::access_keys::Record) {
+        if let Some(mut names) = self.api_key_names.get(&record.owner).cloned() {
+            names.remove(&record.name);
+            if names.is_empty() {
+                self.api_key_names.remove(&record.owner);
+            } else {
+                self.api_key_names.insert(record.owner.clone(), names);
+            }
+        }
+        let count = self
+            .api_key_masters
+            .get(&record.envelope.master_id)
+            .copied()
+            .unwrap_or(1);
+        if count <= 1 {
+            self.api_key_masters.remove(&record.envelope.master_id);
+        } else {
+            self.api_key_masters
+                .insert(record.envelope.master_id.clone(), count - 1);
+        }
+        self.api_key_memory = self.api_key_memory.saturating_sub(record.memory_bytes());
+    }
+    fn index_api_key(&mut self, record: &crate::engine::access_keys::Record) {
+        let mut names = self
+            .api_key_names
+            .get(&record.owner)
+            .cloned()
+            .unwrap_or_default();
+        names.insert(record.name.clone(), record.id.clone());
+        self.api_key_names.insert(record.owner.clone(), names);
+        let count = self
+            .api_key_masters
+            .get(&record.envelope.master_id)
+            .copied()
+            .unwrap_or(0);
+        self.api_key_masters
+            .insert(record.envelope.master_id.clone(), count + 1);
+        self.api_key_memory = self.api_key_memory.saturating_add(record.memory_bytes());
+    }
     pub fn rebuild_runtime_indexes(&mut self) {
         self.refresh_runtime_indexes(None);
     }
 
     pub(crate) fn refresh_runtime_indexes(&mut self, before: Option<&AuthCatalog>) {
+        if let Some(before) = before {
+            let changes: Vec<_> = before
+                .api_keys
+                .diff(&self.api_keys)
+                .map(|change| {
+                    use imbl::ordmap::DiffItem::*;
+                    match change {
+                        Add(_, r) => (None, Some(r.clone())),
+                        Remove(_, r) => (Some(r.clone()), None),
+                        Update {
+                            old: (_, old),
+                            new: (_, new),
+                        } => (Some(old.clone()), Some(new.clone())),
+                    }
+                })
+                .collect();
+            for (old, new) in changes {
+                if let Some(r) = old {
+                    self.unindex_api_key(&r);
+                }
+                if let Some(r) = new {
+                    self.index_api_key(&r);
+                }
+            }
+        } else {
+            self.api_key_names = Default::default();
+            self.api_key_memory = 0;
+            self.api_key_masters = Default::default();
+            let records: Vec<_> = self.api_keys.values().cloned().collect();
+            for record in records {
+                self.index_api_key(&record);
+            }
+        }
         if self.account_memory.map(|(r, _)| r) != Some(self.accounts.revision()) {
             let bytes = if let Some((before, (_, mut bytes))) =
                 before.and_then(|b| b.account_memory.map(|m| (b, m)))
@@ -2049,7 +2163,12 @@ impl AuthCatalog {
     pub fn mandatory_role_keys(&self) -> BTreeSet<AccountKey> {
         // The usual empty setting must not serialize all role checks on a
         // process-wide mutex. The setter publishes this flag under its lock.
-        let empty = STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.mandatory_roles.as_deref().is_none_or(str::is_empty)))
+        let empty = STATEMENT_POLICY
+            .with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|p| p.mandatory_roles.as_deref().is_none_or(str::is_empty))
+            })
             .unwrap_or_else(|| MANDATORY_ROLES_EMPTY.load(Ordering::Acquire));
         if empty {
             return BTreeSet::new();
@@ -3470,7 +3589,10 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
     static SET: std::sync::OnceLock<Vec<Privilege>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         [
-            "ROW_SECURITY_ADMIN", "BYPASS_RLS", "RLS_CONTEXT_ADMIN",
+            "ROW_SECURITY_ADMIN",
+            "BYPASS_RLS",
+            "RLS_CONTEXT_ADMIN",
+            "API_KEY_ADMIN",
             "HTTP_ADMIN",
             "HTTP_USE",
             "AI_ADMIN",

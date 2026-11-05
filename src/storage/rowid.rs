@@ -55,21 +55,22 @@ pub(crate) struct DemandScope {
     previous: bool,
     alias: Option<std::sync::Arc<str>>,
 }
+struct Search(bool);
+impl crate::parser::visit::AstVisitor for Search {
+    fn enter_expr(&mut self, expr: &crate::parser::Expr) {
+        self.0 |= crate::engine::expr::expr_column_name(expr).is_some_and(|name| {
+            name.rsplit('.')
+                .next()
+                .is_some_and(|n| n.eq_ignore_ascii_case("rowid"))
+        });
+    }
+    fn continue_expr_walk(&self) -> bool {
+        !self.0
+    }
+}
+
 impl DemandScope {
     pub(crate) fn enter(statement: &crate::parser::Statement) -> Self {
-        struct Search(bool);
-        impl crate::parser::visit::AstVisitor for Search {
-            fn enter_expr(&mut self, expr: &crate::parser::Expr) {
-                self.0 |= crate::engine::expr::expr_column_name(expr).is_some_and(|name| {
-                    name.rsplit('.')
-                        .next()
-                        .is_some_and(|n| n.eq_ignore_ascii_case("rowid"))
-                });
-            }
-            fn continue_expr_walk(&self) -> bool {
-                !self.0
-            }
-        }
         let mut search = Search(false);
         if !matches!(statement, crate::parser::Statement::Select(select) if !select.for_update && select.lock_clause.is_none())
         {
@@ -95,8 +96,49 @@ impl DemandScope {
         } else {
             None
         };
+        Self::install(search.0, alias)
+    }
+
+    /// UPDATE/DELETE must inspect the rewritten base-table expressions once
+    /// view aliases have been expanded. Prepared plans are already rewritten.
+    pub(crate) fn enter_before_view_rewrite(statement: &crate::parser::Statement) -> Self {
+        if matches!(
+            statement,
+            crate::parser::Statement::Update(_) | crate::parser::Statement::Delete(_)
+        ) {
+            Self::install(false, None)
+        } else {
+            Self::enter(statement)
+        }
+    }
+
+    pub(crate) fn enter_update(stmt: &crate::parser::Update) -> Self {
+        let mut search = Search(false);
+        crate::parser::visit::visit_update(&mut search, stmt);
+        Self::install(
+            search.0,
+            stmt.primary_alias
+                .as_deref()
+                .filter(|_| search.0)
+                .map(std::sync::Arc::from),
+        )
+    }
+
+    pub(crate) fn enter_delete(stmt: &crate::parser::Delete) -> Self {
+        let mut search = Search(false);
+        crate::parser::visit::visit_delete(&mut search, stmt);
+        Self::install(
+            search.0,
+            stmt.primary_alias
+                .as_deref()
+                .filter(|_| search.0)
+                .map(std::sync::Arc::from),
+        )
+    }
+
+    fn install(required: bool, alias: Option<std::sync::Arc<str>>) -> Self {
         Self {
-            previous: DEMAND.with(|state| state.replace(search.0)),
+            previous: DEMAND.with(|state| state.replace(required)),
             alias: DML_ALIAS.with(|state| state.replace(alias)),
         }
     }
@@ -106,6 +148,10 @@ impl Drop for DemandScope {
         DEMAND.with(|state| state.set(self.previous));
         DML_ALIAS.with(|state| *state.borrow_mut() = self.alias.take());
     }
+}
+
+pub(crate) fn demanded() -> bool {
+    DEMAND.with(|state| state.get())
 }
 
 pub(crate) fn with_dml_alias<T>(body: impl FnOnce(Option<&str>) -> T) -> T {

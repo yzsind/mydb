@@ -5,18 +5,18 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 
 use crate::engine::executor::mem_budget::{self, ScopedCharge};
-use crate::engine::executor::vec::batch::{
-    Batch, ColumnAccumulator, ColumnVector, DEFAULT_BATCH_ROWS,
-};
+use crate::engine::executor::vec::batch::{Batch, ColumnAccumulator, DEFAULT_BATCH_ROWS};
 use crate::engine::executor::vec::schema::{BatchField, BatchSchema};
 use crate::engine::executor::vec::stream::BatchOperator;
 use crate::parser::{Expr, SampleMethod, SampleUnit, Select, Statement, TableSampleSpec};
 use crate::planner::{PhysicalPlan, PlanTable};
-use crate::storage::{Database, DmlRowRef, RowId, TxnView};
-use crate::types::{ColumnType, QueryError, Value};
+use crate::storage::{Database, DmlRowRef, RowId, TxnView, VisibleRootScanScratch};
+use crate::types::{QueryError, Value};
 
+#[cfg(test)]
 pub(crate) static SAMPLE_WORKER_TASKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
 pub(crate) static SAMPLE_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
@@ -24,11 +24,48 @@ pub(crate) struct Resolved {
     method: SampleMethod,
     unit: SampleUnit,
     percent: f64,
+    threshold: u128,
     rows: u64,
     seed: u64,
 }
 pub(crate) type Bindings = Arc<HashMap<u32, Resolved>>;
+thread_local! { static FULL_PERCENT: std::cell::Cell<bool> = const {std::cell::Cell::new(false)}; }
 thread_local! { static CURRENT: RefCell<Option<Bindings>> = const { RefCell::new(None) }; }
+/// Full aggregations observe membership, not the sampler's output order.
+/// LIMIT hints still take precedence when opening a sampled descendant.
+pub(super) struct FullPercentScope(bool);
+pub(super) fn enter_full_percent_consumer() -> FullPercentScope {
+    FullPercentScope(FULL_PERCENT.with(|slot| slot.replace(true)))
+}
+impl Drop for FullPercentScope {
+    fn drop(&mut self) {
+        FULL_PERCENT.with(|slot| slot.set(self.0));
+    }
+}
+pub(super) fn full_percent_consumer_scope(plan: &PhysicalPlan) -> Option<FullPercentScope> {
+    if matches!(plan, PhysicalPlan::Limit { .. })
+        || matches!(plan,PhysicalPlan::TopWindow {order_by,..} if order_by.is_empty())
+    {
+        return full_percent_allowed()
+            .then(|| FullPercentScope(FULL_PERCENT.with(|slot| slot.replace(false))));
+    }
+    matches!(
+        plan,
+        PhysicalPlan::HashAggregate { .. }
+            | PhysicalPlan::StreamingAggregate { .. }
+            | PhysicalPlan::ParallelHashAggregate { .. }
+            | PhysicalPlan::HashRollupAggregate { .. }
+            | PhysicalPlan::HashGroupingSetsAggregate { .. }
+            | PhysicalPlan::StreamingRollupAggregate { .. }
+            | PhysicalPlan::StreamingGroupingSetsAggregate { .. }
+            | PhysicalPlan::ParallelRollupAggregate { .. }
+            | PhysicalPlan::ParallelGroupingSetsAggregate { .. }
+    )
+    .then(enter_full_percent_consumer)
+}
+fn full_percent_allowed() -> bool {
+    FULL_PERCENT.with(std::cell::Cell::get)
+}
 pub(crate) struct Scope(Option<Bindings>);
 impl Drop for Scope {
     fn drop(&mut self) {
@@ -218,6 +255,7 @@ fn resolve(spec: &TableSampleSpec) -> Result<Resolved, QueryError> {
         method: spec.method,
         unit: spec.unit,
         percent: amount,
+        threshold: probability_threshold(amount),
         rows,
         seed,
     })
@@ -253,9 +291,24 @@ fn resolve_collected(db: &Arc<Database>, collect: Collect) -> Result<Option<Bind
     let mut bindings = capture().as_deref().cloned().unwrap_or_default();
     for (table, spec) in collect.0 {
         if table.generate_series.is_some()
+            || db.is_system_table_name(crate::storage::DEFAULT_DATABASE, &table.name)
             || crate::engine::executor::cte::lookup_cte(&table.name).is_some()
-            || db.table(&table.name).map_or(true, |schema| schema.system)
         {
+            return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                .error("TABLESAMPLE requires a user base table"));
+        }
+        let schema = db.table(&table.name).map_err(|err| {
+            if db
+                .view_definition(crate::storage::DEFAULT_DATABASE, &table.name)
+                .is_some()
+            {
+                crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("TABLESAMPLE requires a user base table")
+            } else {
+                err
+            }
+        })?;
+        if schema.system {
             return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
                 .error("TABLESAMPLE requires a user base table"));
         }
@@ -285,6 +338,7 @@ fn mix(mut n: u64) -> u64 {
     n = (n ^ (n >> 27)).wrapping_mul(0x94d049bb133111eb);
     n ^ (n >> 31)
 }
+#[cfg(test)]
 #[inline]
 fn priority(seed: u64, row: DmlRowRef) -> u64 {
     mix(mix(seed ^ row.storage_id ^ 0x726f775f73616d70) ^ pack(row.row_id))
@@ -298,13 +352,25 @@ fn pack(row: RowId) -> u64 {
 fn unpack(row: u64) -> RowId {
     RowId::new((row >> 16) as u32, row as u16)
 }
+#[cfg(test)]
 fn selected(hash: u64, percent: f64) -> bool {
-    percent >= 100.0
-        || (percent > 0.0 && u128::from(hash) < (percent / 100.0 * 18446744073709551616.0) as u128)
+    u128::from(hash) < probability_threshold(percent)
+}
+fn probability_threshold(percent: f64) -> u128 {
+    (percent / 100.0 * 18446744073709551616.0) as u128
+}
+fn round_key(seed: u64, round: u64) -> u64 {
+    mix(seed ^ mix(round) ^ 0x706167655f726e64)
+}
+fn root_key(seed: u64, storage_id: u64, page: u64) -> u64 {
+    mix(mix(seed ^ storage_id ^ 0x726f775f726e64) ^ page)
 }
 /// Six-round Feistel permutation on the next power-of-four domain, with
 /// cycle walking to obtain a bijection on [0,n) without a page-number array.
-fn permute(mut ordinal: u64, n: u64, seed: u64) -> u64 {
+fn permute(ordinal: u64, n: u64, seed: u64) -> u64 {
+    permute_direction(ordinal, n, seed, false)
+}
+fn permute_direction(mut ordinal: u64, n: u64, seed: u64, inverse: bool) -> u64 {
     if n <= 1 {
         return 0;
     }
@@ -312,12 +378,14 @@ fn permute(mut ordinal: u64, n: u64, seed: u64) -> u64 {
     let mask = (1u64 << half) - 1;
     loop {
         let (mut left, mut right) = (ordinal >> half, ordinal & mask);
-        for round in 0u64..6 {
-            (left, right) = (
-                right,
-                left ^ (mix(right ^ seed.wrapping_add(round.wrapping_mul(0x9e3779b97f4a7c15)))
-                    & mask),
-            );
+        for step in 0u64..6 {
+            let round = if inverse { 5 - step } else { step };
+            let key = seed.wrapping_add(round.wrapping_mul(0x9e3779b97f4a7c15));
+            if inverse {
+                (left, right) = (right ^ (mix(left ^ key) & mask), left);
+            } else {
+                (left, right) = (right, left ^ (mix(right ^ key) & mask));
+            }
         }
         ordinal = (left << half) | right;
         if ordinal < n {
@@ -340,14 +408,22 @@ struct Tasks {
     page: u64,
     sample: Resolved,
     morsel_pages: u64,
+    full_percent: bool,
 }
 impl Tasks {
     fn next(&mut self) -> Option<Task> {
-        if self.sample.unit == SampleUnit::Rows && self.sample.method == SampleMethod::System {
+        if (self.sample.method == SampleMethod::Bernoulli && !self.full_percent)
+            || self.sample.unit == SampleUnit::Rows
+        {
             if self.ordinal == self.total {
                 return None;
             }
-            let page = permute(self.ordinal, self.total, self.sample.seed);
+            let seed = if self.sample.method == SampleMethod::Bernoulli {
+                round_key(self.sample.seed, 0)
+            } else {
+                self.sample.seed
+            };
+            let page = permute(self.ordinal, self.total, seed);
             self.ordinal += 1;
             let i = self.heaps.partition_point(|(_, end)| *end <= page);
             let lo = page - if i == 0 { 0 } else { self.heaps[i - 1].1 };
@@ -374,18 +450,15 @@ impl Tasks {
             self.page += 1;
             if self.sample.method == SampleMethod::System && self.sample.unit == SampleUnit::Percent
             {
-                if !selected(
-                    page_priority(self.sample.seed, storage_id, lo),
-                    self.sample.percent,
-                ) {
+                if u128::from(page_priority(self.sample.seed, storage_id, lo))
+                    >= self.sample.threshold
+                {
                     continue;
                 }
                 while self.page < pages
                     && self.page - lo < self.morsel_pages
-                    && selected(
-                        page_priority(self.sample.seed, storage_id, self.page),
-                        self.sample.percent,
-                    )
+                    && u128::from(page_priority(self.sample.seed, storage_id, self.page))
+                        < self.sample.threshold
                 {
                     self.page += 1;
                 }
@@ -401,9 +474,139 @@ impl Tasks {
         None
     }
 }
+/// Inline up to four identities from one root page. Common page/storage
+/// components are stored once, keeping this variant no larger than a Vec.
+/// Sparse percentage pages therefore need no per-page allocation/admission.
+enum RowRefs {
+    Inline {
+        first: DmlRowRef,
+        slots: [u16; 3],
+        len: u8,
+    },
+    Heap(Vec<DmlRowRef>),
+}
+#[inline(always)]
+fn push_reference(
+    rows: &mut Vec<DmlRowRef>,
+    row: DmlRowRef,
+    charge: &mut ScopedCharge,
+) -> Result<(), QueryError> {
+    if rows.len() == rows.capacity() {
+        let additional = rows.capacity().max(64);
+        mem_budget::try_reserve_vec_hard(rows, additional, charge, "sample row references")?;
+    }
+    rows.push(row);
+    Ok(())
+}
+impl RowRefs {
+    fn inline() -> Self {
+        Self::Inline {
+            first: DmlRowRef {
+                storage_id: 0,
+                row_id: RowId::new(0, 0),
+            },
+            slots: [0; 3],
+            len: 0,
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => usize::from(*len),
+            Self::Heap(rows) => rows.len(),
+        }
+    }
+    fn at(&self, index: usize) -> DmlRowRef {
+        match self {
+            Self::Heap(rows) => rows[index],
+            Self::Inline { first, slots, len } => {
+                assert!(index < usize::from(*len));
+                if index == 0 {
+                    *first
+                } else {
+                    DmlRowRef {
+                        storage_id: first.storage_id,
+                        row_id: RowId::new(first.row_id.page_id, slots[index - 1]),
+                    }
+                }
+            }
+        }
+    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = DmlRowRef> + '_ {
+        (0..self.len()).map(|i| self.at(i))
+    }
+    fn push(&mut self, row: DmlRowRef, charge: &mut ScopedCharge) -> Result<(), QueryError> {
+        if let Self::Inline { first, slots, len } = self {
+            if *len == 0 {
+                *first = row;
+                *len = 1;
+                return Ok(());
+            }
+            if *len < 4
+                && first.storage_id == row.storage_id
+                && first.row_id.page_id == row.row_id.page_id
+            {
+                slots[usize::from(*len) - 1] = row.row_id.slot_id;
+                *len += 1;
+                return Ok(());
+            }
+            let mut heap = Vec::new();
+            *charge = ScopedCharge::new(0);
+            mem_budget::try_reserve_vec_hard(&mut heap, 64, charge, "sample row references")?;
+            heap.extend(self.iter());
+            *self = Self::Heap(heap);
+        }
+        let Self::Heap(rows) = self else {
+            unreachable!()
+        };
+        push_reference(rows, row, charge)
+    }
+    fn sort_unstable(&mut self) {
+        match self {
+            Self::Heap(rows) => rows.sort_unstable(),
+            Self::Inline { first, slots, len } if *len > 1 => {
+                let mut ids = [first.row_id.slot_id, slots[0], slots[1], slots[2]];
+                ids[..usize::from(*len)].sort_unstable();
+                first.row_id.slot_id = ids[0];
+                slots.copy_from_slice(&ids[1..]);
+            }
+            _ => {}
+        }
+    }
+    fn truncate(&mut self, n: usize) {
+        match self {
+            Self::Inline { len, .. } => *len = usize::from(*len).min(n) as u8,
+            Self::Heap(rows) => rows.truncate(n),
+        }
+    }
+    fn into_vec(self, charge: &mut ScopedCharge) -> Result<Vec<DmlRowRef>, QueryError> {
+        match self {
+            Self::Heap(rows) => Ok(rows),
+            inline => {
+                let mut heap = Vec::new();
+                *charge = ScopedCharge::new(0);
+                mem_budget::try_reserve_vec_hard(
+                    &mut heap,
+                    inline.len(),
+                    charge,
+                    "sample reference handoff",
+                )?;
+                heap.extend(inline.iter());
+                Ok(heap)
+            }
+        }
+    }
+}
 struct RefChunk {
-    rows: Vec<DmlRowRef>,
+    rows: RowRefs,
     _charge: ScopedCharge,
+    task: Task,
+}
+#[derive(Default)]
+struct ScanWork {
+    enabled: bool,
+    pages: std::sync::atomic::AtomicU64,
+    nonempty: std::sync::atomic::AtomicU64,
+    roots: std::sync::atomic::AtomicU64,
 }
 fn scan_refs(
     db: &Arc<Database>,
@@ -411,55 +614,151 @@ fn scan_refs(
     txn: TxnView,
     task: Task,
     sample: Resolved,
+    work: &ScanWork,
+    scratch: &mut Option<VisibleRootScanScratch>,
 ) -> Result<RefChunk, QueryError> {
-    let mut rows = Vec::new();
-    let mut charge = ScopedCharge::new(0);
-    db.scan_rows_columns_storage_streaming_range_with_ids(
-        &table.schema,
-        task.storage_id,
-        txn,
-        &[],
-        task.lo,
-        task.hi,
-        |row_id, _| {
-            crate::engine::cancel::check_cancelled()?;
-            let row = DmlRowRef {
-                storage_id: task.storage_id,
-                row_id,
-            };
-            if sample.method == SampleMethod::Bernoulli
-                && sample.unit == SampleUnit::Percent
-                && !selected(priority(sample.seed, row), sample.percent)
-            {
-                return Ok(());
-            }
-            if rows.len() == rows.capacity() {
-                let additional = rows.capacity().max(64);
-                mem_budget::try_reserve_vec_hard(
-                    &mut rows,
-                    additional,
+    if work.enabled {
+        work.pages
+            .fetch_add(task.hi - task.lo, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut rows = if sample.method == SampleMethod::Bernoulli && sample.unit == SampleUnit::Percent
+    {
+        RowRefs::inline()
+    } else {
+        RowRefs::Heap(Vec::new())
+    };
+    let mut charge =
+        if sample.method == SampleMethod::Bernoulli && sample.unit == SampleUnit::Percent {
+            ScopedCharge::for_budget(None)
+        } else {
+            ScopedCharge::new(0)
+        };
+    let threshold = sample.threshold;
+    let prefix = mix(sample.seed ^ task.storage_id ^ 0x726f775f73616d70);
+    let mut visit = |row_id| {
+        let row = DmlRowRef {
+            storage_id: task.storage_id,
+            row_id,
+        };
+        rows.push(row, &mut charge)
+    };
+    let mut examined = 0u64;
+    if sample.method == SampleMethod::Bernoulli {
+        if scratch.is_none() {
+            *scratch = Some(db.visible_root_scan_scratch(&table.schema, txn)?);
+        }
+        db.scan_visible_root_ids_with_scratch(
+            &table.schema,
+            task.storage_id,
+            task.lo,
+            task.hi,
+            scratch.as_mut().unwrap(),
+            |row_id| {
+                examined += 1;
+                sample.unit != SampleUnit::Percent
+                    || u128::from(mix(prefix ^ pack(row_id))) < threshold
+            },
+            &mut visit,
+        )?;
+    } else {
+        let RowRefs::Heap(heap_rows) = &mut rows else {
+            unreachable!()
+        };
+        db.scan_rows_columns_storage_streaming_range_with_ids(
+            &table.schema,
+            task.storage_id,
+            txn,
+            &[],
+            task.lo,
+            task.hi,
+            |row_id, _| {
+                crate::engine::cancel::check_cancelled()?;
+                push_reference(
+                    heap_rows,
+                    DmlRowRef {
+                        storage_id: task.storage_id,
+                        row_id,
+                    },
                     &mut charge,
-                    "sample row references",
-                )?;
-            }
-            rows.push(row);
-            Ok(())
-        },
-    )?;
+                )
+            },
+        )?;
+    }
     // Historical versions are deferred by ordinary scans; root-slot sorting
     // makes truncation independent of that callback order.
-    if sample.method == SampleMethod::System && sample.unit == SampleUnit::Rows {
+    if sample.method == SampleMethod::Bernoulli || sample.unit == SampleUnit::Rows {
         rows.sort_unstable();
     }
+    #[cfg(test)]
     SAMPLE_PAGES.fetch_add(task.hi - task.lo, std::sync::atomic::Ordering::Relaxed);
+    if work.enabled {
+        let mut previous = None;
+        let mut pages = 0u64;
+        for row in rows.iter() {
+            let page = (row.storage_id, row.row_id.page_id);
+            if previous != Some(page) {
+                pages += 1;
+                previous = Some(page);
+            }
+        }
+        work.nonempty
+            .fetch_add(pages, std::sync::atomic::Ordering::Relaxed);
+        work.roots
+            .fetch_add(examined, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(RefChunk {
         rows,
         _charge: charge,
+        task,
     })
 }
+enum Work {
+    One(Task),
+    Many(Vec<Task>, ScopedCharge),
+}
+enum Completed {
+    One(RefChunk),
+    Many(Vec<RefChunk>, ScopedCharge),
+}
+fn scan_work(
+    db: &Arc<Database>,
+    table: &PlanTable,
+    txn: TxnView,
+    work: Work,
+    sample: Resolved,
+    counters: &ScanWork,
+    scratch: &mut Option<VisibleRootScanScratch>,
+) -> Result<Completed, QueryError> {
+    match work {
+        Work::One(task) => {
+            #[cfg(test)]
+            SAMPLE_WORKER_TASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Completed::One(scan_refs(
+                db, table, txn, task, sample, counters, scratch,
+            )?))
+        }
+        Work::Many(tasks, _charge) => {
+            let mut chunks = Vec::new();
+            let mut charge = ScopedCharge::new(0);
+            mem_budget::try_reserve_vec_hard(
+                &mut chunks,
+                tasks.len(),
+                &mut charge,
+                "sample completed page window",
+            )?;
+            for task in tasks {
+                crate::engine::cancel::check_cancelled()?;
+                #[cfg(test)]
+                SAMPLE_WORKER_TASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                chunks.push(scan_refs(db, table, txn, task, sample, counters, scratch)?);
+            }
+            Ok(Completed::Many(chunks, charge))
+        }
+    }
+}
 struct Lane {
-    send: Option<mpsc::SyncSender<Task>>,
-    receive: mpsc::Receiver<Result<RefChunk, QueryError>>,
+    send: Option<mpsc::SyncSender<Work>>,
+    receive: mpsc::Receiver<Result<Completed, QueryError>>,
 }
 struct RefScan {
     db: Arc<Database>,
@@ -471,8 +770,13 @@ struct RefScan {
     context: super::execution_context::ExecutionContext,
     _pressure: Option<crate::util::exec_permit::ParallelReadPressureGuard>,
     next_lane: usize,
+    batch_pages: usize,
+    pending: std::vec::IntoIter<RefChunk>,
+    pending_charge: ScopedCharge,
     remaining: Option<u64>,
     finished: bool,
+    work: Arc<ScanWork>,
+    scratch: Option<VisibleRootScanScratch>,
 }
 impl RefScan {
     fn new(
@@ -481,6 +785,7 @@ impl RefScan {
         txn: TxnView,
         sample: Resolved,
         degree: usize,
+        full_percent: bool,
     ) -> Result<Self, QueryError> {
         let mut total = 0u64;
         let mut heaps = Vec::new();
@@ -513,6 +818,7 @@ impl RefScan {
                 heap: 0,
                 page: 0,
                 sample,
+                full_percent,
                 morsel_pages: mem_budget::current_budget().map_or(32, |budget| {
                     (budget.limit() / degree.max(1) / crate::storage::PAGE_SIZE / 8).clamp(1, 32)
                         as u64
@@ -523,33 +829,73 @@ impl RefScan {
             context,
             _pressure: None,
             next_lane: 0,
+            batch_pages: 1,
+            pending: Vec::new().into_iter(),
+            pending_charge: ScopedCharge::new(0),
             remaining: (sample.unit == SampleUnit::Rows && sample.method == SampleMethod::System)
                 .then_some(sample.rows),
             finished: zero,
+            work: Arc::new(ScanWork {
+                enabled: cfg!(test) || super::analyze_stats::is_recording(),
+                ..Default::default()
+            }),
+            scratch: None,
         };
+        let degree = if sample.method == SampleMethod::Bernoulli
+            && sample.unit == SampleUnit::Rows
+            && sample.rows <= 4
+        {
+            1
+        } else {
+            degree
+        };
+        let degree = degree.min(mem_budget::current_budget().map_or(degree, |budget| {
+            (budget.limit() / crate::storage::PAGE_SIZE / 16).max(1)
+        }));
         let degree = degree
             .min(usize::try_from(total).unwrap_or(usize::MAX))
             .max(1);
+        if degree > 1
+            && sample.method == SampleMethod::Bernoulli
+            && super::vec_bridge::scan_batch_rows() == DEFAULT_BATCH_ROWS
+        {
+            let budget_pages = mem_budget::current_budget().map_or(16, |budget| {
+                (budget.limit() / degree / crate::storage::PAGE_SIZE / 32).max(1)
+            });
+            let goal_pages = if sample.unit == SampleUnit::Rows {
+                usize::try_from(sample.rows / degree as u64 / 4)
+                    .unwrap_or(usize::MAX)
+                    .max(1)
+            } else {
+                16
+            };
+            scan.batch_pages = 16.min(budget_pages).min(goal_pages).min(
+                usize::try_from(total / degree as u64)
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+            );
+        }
         if degree > 1 && !zero {
             scan._pressure = scan.context.enter_parallel_read_pressure()?;
             for _ in 0..degree {
-                let Some(task) = scan.tasks.next() else { break };
-                let (send, receive_task) = mpsc::sync_channel::<Task>(1);
+                let Some(task) = scan.next_work()? else { break };
+                let (send, receive_task) = mpsc::sync_channel::<Work>(1);
                 let (send_result, receive) = mpsc::sync_channel(1);
                 let db = scan.db.clone();
                 let table = scan.table.clone();
                 let context = scan.context.clone();
+                let work = scan.work.clone();
                 let worker = std::thread::Builder::new()
                     .name("mydb-sample-scan".into())
                     .spawn(move || {
                         context.run(&db, || {
+                            let mut scratch = None;
                             while let Ok(task) = receive_task.recv() {
                                 if context.cancellation().check().is_err() {
                                     break;
                                 }
-                                SAMPLE_WORKER_TASKS
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let result = scan_refs(&db, &table, txn, task, sample);
+                                let result =
+                                    scan_work(&db, &table, txn, task, sample, &work, &mut scratch);
                                 let failed = result.is_err();
                                 if send_result.send(result).is_err() || failed {
                                     break;
@@ -569,6 +915,28 @@ impl RefScan {
         }
         Ok(scan)
     }
+    fn next_work(&mut self) -> Result<Option<Work>, QueryError> {
+        let Some(first) = self.tasks.next() else {
+            return Ok(None);
+        };
+        if self.batch_pages == 1 {
+            return Ok(Some(Work::One(first)));
+        }
+        let mut tasks = Vec::new();
+        let mut charge = ScopedCharge::new(0);
+        mem_budget::try_reserve_vec_hard(
+            &mut tasks,
+            self.batch_pages,
+            &mut charge,
+            "sample page window",
+        )?;
+        tasks.push(first);
+        for _ in 1..self.batch_pages {
+            let Some(task) = self.tasks.next() else { break };
+            tasks.push(task);
+        }
+        Ok(Some(Work::Many(tasks, charge)))
+    }
     fn next(&mut self) -> Result<Option<RefChunk>, QueryError> {
         if self.finished {
             return Ok(None);
@@ -578,14 +946,25 @@ impl RefScan {
         }
         self.context.cancellation().check()?;
         crate::engine::cancel::check_cancelled()?;
-        let chunk = if self.lanes.is_empty() {
+        let chunk = if let Some(chunk) = self.pending.next() {
+            chunk
+        } else if self.lanes.is_empty() {
             let Some(task) = self.tasks.next() else {
                 self.finished = true;
                 return Ok(None);
             };
-            scan_refs(&self.db, &self.table, self.txn, task, self.tasks.sample)?
+            scan_refs(
+                &self.db,
+                &self.table,
+                self.txn,
+                task,
+                self.tasks.sample,
+                &self.work,
+                &mut self.scratch,
+            )?
         } else {
-            let lane = &mut self.lanes[self.next_lane];
+            let lane_index = self.next_lane;
+            let lane = &self.lanes[lane_index];
             if lane.send.is_none() {
                 self.finished = true;
                 return Ok(None);
@@ -597,15 +976,23 @@ impl RefScan {
                     .or_else(|| self.context.cancellation().check().err())
                     .unwrap_or_else(|| invalid("sampling worker terminated unexpectedly"))
             })?;
-            let chunk = result?;
-            if let Some(task) = self.tasks.next() {
-                lane.send
+            let chunk = match result? {
+                Completed::One(chunk) => chunk,
+                Completed::Many(chunks, charge) => {
+                    self.pending = chunks.into_iter();
+                    self.pending_charge = charge;
+                    self.pending.next().expect("nonempty sample page window")
+                }
+            };
+            if let Some(task) = self.next_work()? {
+                self.lanes[lane_index]
+                    .send
                     .as_ref()
                     .unwrap()
                     .send(task)
                     .map_err(|_| invalid("sampling worker stopped"))?;
             } else {
-                lane.send.take();
+                self.lanes[lane_index].send.take();
             }
             self.next_lane = (self.next_lane + 1) % self.lanes.len();
             chunk
@@ -634,6 +1021,7 @@ impl Drop for RefScan {
 }
 
 mod output;
+mod rounds;
 pub(in crate::engine::executor) use output::selected_refs;
 pub(super) use output::{open, SampleBatchStream};
 
@@ -645,6 +1033,12 @@ mod tests {
         for n in [0, 1, 2, 3, 4, 5, 17, 63, 64, 65, 257, 1021, 4097] {
             for seed in [0, 1, 42, u64::MAX] {
                 let mut pages = (0..n).map(|i| permute(i, n, seed)).collect::<Vec<_>>();
+                for ordinal in 0..n {
+                    assert_eq!(
+                        permute_direction(permute(ordinal, n, seed), n, seed, true),
+                        ordinal
+                    );
+                }
                 pages.sort_unstable();
                 assert_eq!(pages, (0..n).collect::<Vec<_>>());
             }
@@ -707,19 +1101,26 @@ mod tests {
             db.visible_scn(),
             crate::storage::IsolationLevel::ReadCommitted,
         );
-        for oom in [false, true] {
+        for (oom, method) in [
+            (false, SampleMethod::System),
+            (true, SampleMethod::System),
+            (false, SampleMethod::Bernoulli),
+            (true, SampleMethod::Bernoulli),
+        ] {
             let budget = Arc::new(mem_budget::MemBudget::new(4 * 1024 * 1024));
             let token = crate::engine::cancel::QueryCancelToken::noop();
             let _token = crate::engine::cancel::enter(token.clone());
             mem_budget::with_query_budget(budget.clone(), || {
                 let sample = Resolved {
-                    method: SampleMethod::System,
+                    method,
                     unit: SampleUnit::Percent,
                     percent: 100.0,
+                    threshold: probability_threshold(100.0),
                     rows: 0,
                     seed: 42,
                 };
-                let mut scan = RefScan::new(db.clone(), table.clone(), txn, sample, 4).unwrap();
+                let mut scan =
+                    RefScan::new(db.clone(), table.clone(), txn, sample, 4, false).unwrap();
                 assert!(!scan.workers.is_empty());
                 if oom {
                     budget.latch_terminal_oom(

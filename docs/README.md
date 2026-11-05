@@ -62,4 +62,5 @@ execution, and storage documentation.
 - Pinned MySQL 8.0.46 baselines: [INFORMATION_SCHEMA](fixtures/mysql80-information-schema-8.0.46.json), [Performance Schema](fixtures/mysql80-performance-schema-8.0.46.json), [SHOW STATUS](fixtures/mysql80-show-status-8.0.46.json).
 - [Unicode license](UNICODE-LICENSE.txt).
 
+- [REST SQL API](rest-api.md): authenticated HTTP SQL, persistent sessions, transactions, and streaming results.
 - [HTTP SQL Functions](http.md): bounded outbound HTTP/HTTPS calls from SQL.

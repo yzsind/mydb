@@ -9900,6 +9900,33 @@ impl Database {
     /// pristine. Physical paths and handles retain their immutable object IDs;
     /// a logical rename never moves files or flushes unrelated dirty data.
     pub fn rename_tables_atomic(&self, pairs: &[(String, String)]) -> Result<(), QueryError> {
+        // Validate the whole rename graph before changing any name. Policies
+        // bind dependencies by object identity and SQL name; renaming a
+        // dependency without rewriting its expressions would strand readers.
+        let renamed_ids: HashSet<_> = pairs
+            .iter()
+            .filter_map(|(name, _)| self.table(name).ok().map(|table| table.object_id))
+            .collect();
+        let policy_tables: Vec<_> = self
+            .catalog_read()?
+            .tables
+            .values()
+            .filter(|table| table.row_security.version != 0)
+            .map(|table| table.qualified_name())
+            .collect();
+        for name in policy_tables {
+            let table = self.table(&name)?;
+            if table.row_security.policies.iter().any(|policy| {
+                policy
+                    .table_dependencies
+                    .iter()
+                    .any(|(id, _)| renamed_ids.contains(id))
+            }) {
+                return Err(error(crate::error::catalog::ER_ROW_SECURITY_POLICY,
+                    "Table is referenced by a row security policy; alter or drop dependent policies before renaming",
+                ));
+            }
+        }
         let mut definitions = Vec::new();
         let mut seen = HashSet::new();
         for (name, _) in pairs {

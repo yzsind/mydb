@@ -1476,12 +1476,7 @@ pub(super) fn estimate_index_range_access_rows(
     };
     if let (Some(lo), Some(hi)) = (low, high) {
         if lo.key.0.len() == hi.key.0.len()
-            && lo
-                .key
-                .0
-                .iter()
-                .chain(&hi.key.0)
-                .all(|p| !p.is_deferred())
+            && lo.key.0.iter().chain(&hi.key.0).all(|p| !p.is_deferred())
         {
             match lo.key.cmp(&hi.key) {
                 std::cmp::Ordering::Greater => return 0.0,

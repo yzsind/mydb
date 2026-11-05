@@ -55,11 +55,20 @@ impl ReturningCollector {
             if let Some((db, txn)) = crate::engine::rls::current_statement_view() {
                 if crate::engine::rls::might_require_binding(&db, &projector.policy_table) {
                     for values in old.into_iter().chain(new) {
-                        crate::engine::rls::check_row(&db, txn, &projector.policy_table, crate::parser::rls::Command::Select, false, values)?;
+                        crate::engine::rls::check_row(
+                            &db,
+                            txn,
+                            &projector.policy_table,
+                            crate::parser::rls::Command::Select,
+                            false,
+                            values,
+                        )?;
                     }
                 }
             } else if projector.policy_table.row_security.version != 0 {
-                return Err(crate::engine::rls::violation("RETURNING requires the owning DML read view"));
+                return Err(crate::engine::rls::violation(
+                    "RETURNING requires the owning DML read view",
+                ));
             }
             self.rows
                 .push(projector.project(old, new, old_ref, new_ref)?);

@@ -78,7 +78,8 @@ macro_rules! define_walk {
                 | Statement::ShowVariables { filter, .. }
                 | Statement::ShowStatus { filter, .. }
                 | Statement::ShowOpenTables { filter, .. } => walk_show_filter(visitor, filter),
-                Statement::Begin { .. }
+                Statement::ApiKey(_)
+                | Statement::Begin { .. }
                 | Statement::Commit { .. }
                 | Statement::Rollback { .. }
                 | Statement::Savepoint(_)

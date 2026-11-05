@@ -1,51 +1,9 @@
 //! Common columnar output and spillable exact row selection.
 use super::*;
 
-fn identity_schema() -> Arc<BatchSchema> {
-    Arc::new(BatchSchema::new(
-        ["priority", "storage", "row"]
-            .into_iter()
-            .map(|name| BatchField {
-                table: "__sample".into(),
-                alias: None,
-                name: name.into(),
-                column_type: ColumnType::LongLong,
-                source: Default::default(),
-            })
-            .collect(),
-    ))
-}
-struct Candidates {
-    scan: RefScan,
-    schema: Arc<BatchSchema>,
-    seed: u64,
-}
-impl BatchOperator for Candidates {
-    fn schema(&self) -> &Arc<BatchSchema> {
-        &self.schema
-    }
-    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
-        let Some(chunk) = self.scan.next()? else {
-            return Ok(None);
-        };
-        let mut columns = (0..3).map(|_| Vec::new()).collect::<Vec<_>>();
-        for row in &chunk.rows {
-            columns[0].push(Value::UInt(priority(self.seed, *row)));
-            columns[1].push(Value::UInt(row.storage_id));
-            columns[2].push(Value::UInt(pack(row.row_id)));
-        }
-        let columns = columns.into_iter().map(ColumnVector::from_values).collect();
-        Ok(Some(Batch::with_row_count(
-            self.schema.clone(),
-            columns,
-            chunk.rows.len(),
-        )))
-    }
-}
 enum Refs {
     Scan(RefScan),
-    Resident(std::vec::IntoIter<Vec<Value>>, ScopedCharge),
-    External(Box<dyn BatchOperator>),
+    Rows(rounds::RoundScan),
 }
 
 /// Keep block-sample payload probes inside selected page ranges. The shared
@@ -72,10 +30,13 @@ pub(in crate::engine::executor::select) struct SampleBatchStream {
     schema: Arc<BatchSchema>,
     binding: Option<Resolved>,
     degree: usize,
+    full_percent: bool,
     batch_rows: usize,
+    max_batch_rows: usize,
     refs: Option<Refs>,
     pending: std::vec::IntoIter<DmlRowRef>,
     pending_charge: ScopedCharge,
+    key: Option<crate::planner::PlanNodeId>,
 }
 impl SampleBatchStream {
     pub(in crate::engine::executor::select) fn new(
@@ -124,6 +85,12 @@ impl SampleBatchStream {
                 .saturating_add(std::mem::size_of::<DmlRowRef>() * 2);
             (budget.limit() / degree.max(1) / 8 / row_bytes).clamp(1, DEFAULT_BATCH_ROWS)
         });
+        let hint = super::super::vec_bridge::scan_batch_rows();
+        let full_percent = full_percent_allowed()
+            && hint == DEFAULT_BATCH_ROWS
+            && table.sample.as_ref().unwrap().method == SampleMethod::Bernoulli
+            && table.sample.as_ref().unwrap().unit == SampleUnit::Percent;
+        let batch_rows = batch_rows.min(hint);
         Self {
             db: db.clone(),
             table: table.clone(),
@@ -136,10 +103,13 @@ impl SampleBatchStream {
             columns,
             schema,
             degree,
+            full_percent,
             batch_rows,
+            max_batch_rows: batch_rows,
             refs: None,
             pending: Vec::new().into_iter(),
             pending_charge: ScopedCharge::new(0),
+            key: super::super::analyze_stats::plan_key(plan),
         }
     }
     fn start(&mut self) -> Result<(), QueryError> {
@@ -153,98 +123,42 @@ impl SampleBatchStream {
             self.table.clone(),
             self.txn,
             sample,
-            self.degree,
-        )?;
-        self.refs = Some(
-            if sample.method == SampleMethod::Bernoulli
-                && sample.unit == SampleUnit::Rows
-                && sample.rows > 0
-            {
-                use crate::engine::executor::vec::scheduler::topn_driver::{
-                    run_topn_parallel_spillable, ParallelTopNOutput, SortKey,
-                };
-                let mut candidates = Candidates {
-                    scan,
-                    schema: identity_schema(),
-                    seed: sample.seed,
-                };
-                let keys = (0..3)
-                    .map(|column| SortKey {
-                        column,
-                        ascending: true,
-                        nulls_first: true,
-                        collation_id: None,
-                    })
-                    .collect();
-                let k = usize::try_from(sample.rows).unwrap_or(usize::MAX);
-                match run_topn_parallel_spillable(
-                    &mut candidates,
-                    keys,
-                    k,
-                    self.degree,
-                    self.db.data_dir(),
-                    0,
-                )? {
-                    ParallelTopNOutput::Resident(rows, charge) => {
-                        Refs::Resident(rows.into_iter(), charge)
-                    }
-                    ParallelTopNOutput::External(stream) => Refs::External(stream),
-                }
+            if sample.method == SampleMethod::Bernoulli && self.batch_rows <= 64 {
+                1
             } else {
-                Refs::Scan(scan)
+                self.degree
             },
-        );
+            self.full_percent,
+        )?;
+        if sample.method == SampleMethod::Bernoulli {
+            self.max_batch_rows = self.max_batch_rows.min(2048);
+            self.batch_rows = self.batch_rows.min(256);
+            if sample.unit == SampleUnit::Rows {
+                self.max_batch_rows = self
+                    .max_batch_rows
+                    .min(usize::try_from(sample.rows).unwrap_or(usize::MAX).max(1));
+                self.batch_rows = self
+                    .batch_rows
+                    .min(usize::try_from(sample.rows).unwrap_or(usize::MAX).max(1));
+            }
+        }
+        self.refs = Some(if sample.method == SampleMethod::Bernoulli {
+            Refs::Rows(rounds::RoundScan::new(scan, self.key))
+        } else {
+            Refs::Scan(scan)
+        });
         Ok(())
     }
     fn next_refs(&mut self) -> Result<bool, QueryError> {
         loop {
             let chunk = match self.refs.as_mut().unwrap() {
                 Refs::Scan(scan) => scan.next()?,
-                Refs::Resident(rows, _charge) => {
-                    let refs = rows
-                        .by_ref()
-                        .take(self.batch_rows)
-                        .map(|row| identity(&row))
-                        .collect::<Vec<_>>();
-                    if refs.is_empty() {
-                        None
-                    } else {
-                        let charge = ScopedCharge::new_strict(
-                            refs.capacity() * std::mem::size_of::<DmlRowRef>(),
-                            "sample references",
-                        )?;
-                        Some(RefChunk {
-                            rows: refs,
-                            _charge: charge,
-                        })
-                    }
-                }
-                Refs::External(stream) => match stream.next_batch()? {
-                    None => None,
-                    Some(batch) => {
-                        let rows = batch
-                            .visible_indices()
-                            .map(|i| {
-                                identity(
-                                    &(0..3)
-                                        .map(|j| batch.columns()[j].value_at(i))
-                                        .collect::<Vec<_>>(),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        let charge = ScopedCharge::new_strict(
-                            rows.capacity() * std::mem::size_of::<DmlRowRef>(),
-                            "sample references",
-                        )?;
-                        Some(RefChunk {
-                            rows,
-                            _charge: charge,
-                        })
-                    }
-                },
+                Refs::Rows(scan) => scan.next(self.batch_rows)?,
             };
-            let Some(chunk) = chunk else { return Ok(false) };
-            self.pending = chunk.rows.into_iter();
+            let Some(mut chunk) = chunk else {
+                return Ok(false);
+            };
+            self.pending = chunk.rows.into_vec(&mut chunk._charge)?.into_iter();
             self.pending_charge = chunk._charge;
             if self.pending.len() != 0 {
                 return Ok(true);
@@ -252,16 +166,6 @@ impl SampleBatchStream {
         }
     }
 }
-fn identity(row: &[Value]) -> DmlRowRef {
-    let (Value::UInt(storage_id), Value::UInt(row)) = (&row[1], &row[2]) else {
-        unreachable!("sample identity types")
-    };
-    DmlRowRef {
-        storage_id: *storage_id,
-        row_id: unpack(*row),
-    }
-}
-
 /// Locking readers use the same population selector before evaluating their
 /// predicates and acquiring locks. No private origin column enters SQL.
 pub(in crate::engine::executor) fn selected_refs(
@@ -326,12 +230,51 @@ impl BatchOperator for SampleBatchStream {
         )?;
         while references.len() < self.batch_rows {
             crate::engine::cancel::check_cancelled()?;
-            if self.pending.len() == 0 && !self.next_refs()? {
-                break;
+            if self.pending.len() == 0 {
+                // A row sampler publishes bounded prefixes, even when they
+                // do not fill a batch. Never wait for EOF at low percentages.
+                if !references.is_empty()
+                    && matches!(&self.refs,Some(Refs::Rows(scan)) if !scan.full_percent)
+                {
+                    break;
+                }
+                if !self.next_refs()? {
+                    break;
+                }
             }
             references.push(self.pending.next().unwrap());
         }
+        let row_sample = matches!(self.refs, Some(Refs::Rows(_)));
+        let row_order = matches!(&self.refs,Some(Refs::Rows(scan)) if !scan.full_percent);
+        let mut physical_order = Vec::new();
+        let mut order_charge = ScopedCharge::new(0);
+        if row_order {
+            mem_budget::try_reserve_vec_hard(
+                &mut physical_order,
+                references.len(),
+                &mut order_charge,
+                "sample identity order",
+            )?;
+            physical_order.extend(
+                references
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, row)| (row, i)),
+            );
+            physical_order.sort_unstable_by_key(|(row, _)| *row);
+        }
         references.sort_unstable();
+        let mut fetched = Vec::new();
+        let mut fetched_charge = ScopedCharge::new(0);
+        if row_order && !self.columns.is_empty() {
+            mem_budget::try_reserve_vec_hard(
+                &mut fetched,
+                references.len(),
+                &mut fetched_charge,
+                "sample output order",
+            )?;
+        }
         let mut count = 0;
         if self.columns.is_empty() {
             count = references.len();
@@ -356,13 +299,37 @@ impl BatchOperator for SampleBatchStream {
                     self.txn,
                     &self.columns,
                 )?;
-                for (_, values) in rows {
-                    for (column, value) in accumulators.iter_mut().zip(values.iter()) {
-                        column.push(value);
+                for (row_id, values) in rows {
+                    if row_order {
+                        let identity = DmlRowRef { storage_id, row_id };
+                        let position = physical_order
+                            .binary_search_by_key(&identity, |(row, _)| *row)
+                            .map(|i| physical_order[i].1)
+                            .map_err(|_| invalid("unexpected sampled payload identity"))?;
+                        fetched_charge
+                            .add_non_spillable(mem_budget::estimate_row_bytes(&values))?;
+                        fetched.push((position, values));
+                    } else {
+                        for (column, value) in accumulators.iter_mut().zip(values.iter()) {
+                            column.push(value);
+                        }
                     }
                     count += 1;
                 }
                 first = end;
+            }
+        }
+        if row_order && !self.columns.is_empty() {
+            fetched.sort_unstable_by_key(|(position, _)| *position);
+            for (_, values) in fetched {
+                for (column, value) in accumulators.iter_mut().zip(values.iter()) {
+                    column.push(value);
+                }
+            }
+        }
+        if !self.columns.is_empty() {
+            if let Some(Refs::Rows(scan)) = &mut self.refs {
+                scan.stats.decoded_rows += count as u64;
             }
         }
         if count == 0 {
@@ -372,6 +339,12 @@ impl BatchOperator for SampleBatchStream {
             .into_iter()
             .map(ColumnAccumulator::finish_validated)
             .collect::<Result<Vec<_>, _>>()?;
+        // Publish the first bounded prefix promptly, then amortize payload
+        // probes and downstream exchanges when the consumer keeps pulling.
+        // The captured LIMIT/budget ceiling remains authoritative.
+        if row_sample {
+            self.batch_rows = self.batch_rows.saturating_mul(2).min(self.max_batch_rows);
+        }
         Ok(Some(Batch::with_row_count(
             self.schema.clone(),
             columns,

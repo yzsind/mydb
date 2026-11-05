@@ -2734,7 +2734,14 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
     returning: &mut super::returning::ReturningCollector,
 ) -> Result<(bool, u64), QueryError> {
     let _security = crate::engine::rls::StrictOldScope::enter();
-    crate::engine::rls::check_row(db, txn, table, crate::parser::rls::Command::Insert, true, proposed)?;
+    crate::engine::rls::check_row(
+        db,
+        txn,
+        table,
+        crate::parser::rls::Command::Insert,
+        true,
+        proposed,
+    )?;
     let changed_columns = odku_changed_columns(table, updates)?;
     let on_update = super::dml::on_update_timestamp_columns(table, &changed_columns);
     let mut write_columns = changed_columns.clone();

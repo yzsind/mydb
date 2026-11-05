@@ -1564,3 +1564,34 @@ format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.
 HTTP client SQL functions are enabled by default and require `HTTP_USE`. See
 [HTTP SQL Functions](http.md#node-configuration) for the `http_*` startup options,
 node egress policy, private CA bindings, account quotas, and runtime controls.
+
+## REST SQL listener
+
+The REST SQL listener is disabled by default and shares the SQL engine and
+account resource limits with MySQL. See [REST SQL API](rest-api.md) for
+credentials, full key retrieval, transactions, result formats and recovery.
+All options below also support CLI `--rest-...` and `MYDB_REST_*` variables.
+
+| Option | Default |
+| --- | --- |
+| `rest_enabled` | `OFF` |
+| `rest_host`, `rest_port` | `127.0.0.1`, `8739` |
+| `rest_tls_mode` | `required`; `disabled` requires loopback |
+| `rest_ssl_cert`, `rest_ssl_key` | Unset; supply both or neither |
+| `rest_max_connections` | `512` |
+| `rest_max_sessions` | `256`; also subject to SQL connection limits |
+| `rest_max_inflight` | `64` |
+| `rest_max_request_bytes` | `8388608` |
+| `rest_max_header_bytes` | `16384` |
+| `rest_max_json_response_bytes` | `16777216` |
+| `rest_memory_limit_mb` | `128` |
+| `rest_default_timeout_ms`, `rest_max_timeout_ms` | `30000`, `300000` |
+| `rest_session_idle_timeout_ms` | `300000` |
+| `rest_transaction_idle_timeout_ms` | `60000` |
+| `rest_previous_keys_file` | Unset; old master-key keyring for rotation |
+
+API keys default to no expiration and have a fixed limit of 1024 records per
+account. Complete keys can be retrieved through TLS MySQL `SHOW API KEY`.
+The master key is environment-only `MYDB_REST_ENCRYPT_KEY` or the independently
+managed `<data_dir>/rest-keys.mydb`. Master-key values cannot be supplied in
+ordinary startup configuration or command-line arguments.

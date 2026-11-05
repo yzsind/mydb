@@ -418,6 +418,7 @@ fn audit1028_running_channel_change_source_uses_channel_must_stop() {
             DEFAULT_CHANNEL.to_owned(),
             runtime.clone(),
         )])),
+        retired_gtids: Mutex::new(None),
     };
     let cfg = runtime.config.lock().unwrap().clone();
     let result = manager.change_source(cfg);

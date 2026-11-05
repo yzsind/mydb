@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Statement {
+    ApiKey(crate::engine::access_keys::Command),
     Ai(crate::engine::ai::sql::AiStatement),
     RowSecurity(rls::RlsStatement),
     /// `START TRANSACTION`/`BEGIN` with the MySQL 8.0 characteristic list.
@@ -2441,7 +2442,8 @@ pub struct Select {
     /// Creation-time semantics of a policy's internal query. Rebound from
     /// policy metadata and never accepted from serialized/user queries.
     #[serde(skip)]
-    pub rls_expression_settings: Option<std::sync::Arc<crate::engine::expr::PolicyExpressionSettings>>,
+    pub rls_expression_settings:
+        Option<std::sync::Arc<crate::engine::expr::PolicyExpressionSettings>>,
     pub projection: Vec<SelectItem>,
     pub table: Option<String>,
     pub from: Vec<TableRef>,

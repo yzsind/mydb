@@ -3440,11 +3440,14 @@ pub(super) fn execute_select(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     if let Some(settings) = stmt.rls_expression_settings.take() {
-        return crate::engine::expr::with_policy_query_settings(&settings, || execute_select(db, txn, stmt, registry));
+        return crate::engine::expr::with_policy_query_settings(&settings, || {
+            execute_select(db, txn, stmt, registry)
+        });
     }
     if let Some(context) = stmt.rls_security_context.take() {
-        return crate::engine::expr::with_row_security_identity(&context, ||
-            execute_select(db, txn, stmt, registry));
+        return crate::engine::expr::with_row_security_identity(&context, || {
+            execute_select(db, txn, stmt, registry)
+        });
     }
     let _read_schema = crate::storage::read_schema::ReadSchemaScope::enter(
         (!txn.dirty_read).then_some(txn.snapshot_scn),

@@ -951,9 +951,7 @@ fn eval_plan_expr_legacy_inner(expr: &Expr, row: &PlanRow) -> Result<Value, Quer
                 "parameter is not bound",
             )
         }),
-        Expr::UserVariable(name) => {
-            crate::engine::expr::checked_session_user_variable(name)
-        }
+        Expr::UserVariable(name) => crate::engine::expr::checked_session_user_variable(name),
         Expr::SystemVariable { scope, name } => {
             crate::engine::expr::eval_system_variable(*scope, name, None)
         }

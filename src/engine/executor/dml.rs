@@ -40,12 +40,23 @@ pub(super) fn lock_select_rows_for_update(
     validate_lock_targets(stmt)?;
     let table = db.table(stmt.table.as_deref().unwrap_or_default())?;
     let secured;
-    let stmt = if crate::engine::rls::might_require_binding(db, &table) && crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)?.is_some() {
+    let stmt = if crate::engine::rls::might_require_binding(db, &table)
+        && crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)?
+            .is_some()
+    {
         let mut select = stmt.clone();
-        select.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Update, true, select.selection.take())?;
+        select.selection = super::rls::dml_filter(
+            db,
+            &table,
+            crate::parser::rls::Command::Update,
+            true,
+            select.selection.take(),
+        )?;
         secured = select;
         &secured
-    } else { stmt };
+    } else {
+        stmt
+    };
     let lock_clause = stmt
         .lock_clause
         .clone()
@@ -133,6 +144,7 @@ pub(super) fn lock_select_rows_for_update(
             .collect();
         let mut ranked = Vec::with_capacity(matched.len());
         for row in matched.drain(..) {
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
             let _scores = fulltext.enter(row.row_ref);
             let keys = stmt
                 .order_by
@@ -298,8 +310,23 @@ pub(super) fn execute_locked_single_table_select(
         let Some(row) = db.dml_candidate_row_at_for_write(&table, row_ref, txn)? else {
             continue;
         };
-        if !crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Select, false, &row.values)?
-            || !crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Update, false, &row.values)? { continue; }
+        if !crate::engine::rls::row_allowed(
+            db,
+            txn,
+            &table,
+            crate::parser::rls::Command::Select,
+            false,
+            &row.values,
+        )? || !crate::engine::rls::row_allowed(
+            db,
+            txn,
+            &table,
+            crate::parser::rls::Command::Update,
+            false,
+            &row.values,
+        )? {
+            continue;
+        }
         let _scores = fulltext.enter(row.row_ref);
         if stmt
             .selection
@@ -380,7 +407,13 @@ pub(super) fn execute_update(
     if stmt.joins.is_empty() {
         let table = db.table(&stmt.table)?;
         let read_required = super::rls::update_requires_read(db, session, &stmt, &table);
-        stmt.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Update, read_required, stmt.selection.take())?;
+        stmt.selection = super::rls::dml_filter(
+            db,
+            &table,
+            crate::parser::rls::Command::Update,
+            read_required,
+            stmt.selection.take(),
+        )?;
     }
     // M5.C2 — `UPDATE t PARTITION (p0, p1) ...` restricts scans to the
     // named partitions; resolve to storage_ids and install via the
@@ -1459,7 +1492,13 @@ pub(super) fn execute_delete(
     if stmt.joins.is_empty() {
         let table = db.table(&stmt.table)?;
         let read_required = stmt.selection.is_some() || stmt.returning.is_some();
-        stmt.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Delete, read_required, stmt.selection.take())?;
+        stmt.selection = super::rls::dml_filter(
+            db,
+            &table,
+            crate::parser::rls::Command::Delete,
+            read_required,
+            stmt.selection.take(),
+        )?;
     }
     if super::multi_table::is_multi_table_delete(&stmt) {
         return super::multi_table::execute_multi_delete(db, session, txn, stmt, registry);
@@ -1867,9 +1906,14 @@ pub(super) fn ordered_limited_dml_candidates(
     // early return so unknown columns and unsupported expressions cannot be
     // hidden by an empty window.
     if !order_by.is_empty() {
-        let null_row = vec![Value::Null; table.columns.len()];
+        let schema = if crate::storage::rowid::demanded() {
+            std::borrow::Cow::Owned(crate::storage::rowid::query_schema(table))
+        } else {
+            std::borrow::Cow::Borrowed(table)
+        };
+        let null_row = vec![Value::Null; schema.columns.len()];
         for item in order_by {
-            eval_expr(&item.expr, table, &null_row)?;
+            eval_expr(&item.expr, &schema, &null_row)?;
         }
     }
     if limit == Some(0) {
@@ -2319,6 +2363,7 @@ pub(super) fn ordered_index_limited_dml_candidates(
             let Some(row) = db.dml_candidate_row_at_for_write(table, row_ref, txn)? else {
                 continue;
             };
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(table, row_ref)?;
             if let Some(filter) = residual_filter.as_ref() {
                 if !eval_bool(filter, table, &row.values)? {
                     continue;

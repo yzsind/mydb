@@ -37,7 +37,10 @@ thread_local! {
     static SCAN_BATCH_ROWS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-pub(super) fn with_scan_limit_hint<T>(row_target: Option<usize>, f: impl FnOnce() -> T) -> T {
+pub(in crate::engine::executor::select) fn with_scan_limit_hint<T>(
+    row_target: Option<usize>,
+    f: impl FnOnce() -> T,
+) -> T {
     SCAN_MORSEL_PAGES.with(|cell| {
         let previous = cell.replace(row_target.map(|_| 1));
         struct Restore<'a> {

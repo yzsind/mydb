@@ -2079,7 +2079,7 @@ fn replication_applier_status_rows() -> Vec<Vec<Value>> {
     };
     let mut rows = Vec::new();
     for (_cfg, st) in mgr.snapshot_all_channels() {
-        let service_state = if st.running { "ON" } else { "OFF" };
+        let service_state = if st.sql_running { "ON" } else { "OFF" };
         rows.push(vec![
             s(&st.channel),
             s(service_state),

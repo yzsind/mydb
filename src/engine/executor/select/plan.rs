@@ -1987,6 +1987,7 @@ pub(super) fn execute_plan_rows_inner(
     txn: TxnView,
     plan: &PhysicalPlan,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    let _sample_consumer = super::sampling::full_percent_consumer_scope(plan);
     if let Some(mut stream) = sql_rowid::open(db, txn, plan)? {
         let mut rows = Vec::new();
         while let Some(row) = stream.next()? {
@@ -4169,6 +4170,7 @@ fn execute_plan_stream_inner(
     txn: TxnView,
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
+    let _sample_consumer = super::sampling::full_percent_consumer_scope(plan);
     if let Some(stream) = sql_rowid::open(db, txn, plan)? {
         return Ok(stream);
     }
@@ -4366,7 +4368,7 @@ fn execute_plan_stream_inner(
                 .unwrap_or(0)
                 .saturating_add(limit.unwrap_or(usize::MAX));
             let inner = if limit.is_some() {
-                execute_plan_stream_limited(db, txn, input, target)?
+                execute_sample_limit_stream(db, txn, input, target)?
             } else {
                 execute_plan_stream(db, txn, input)?
             };
@@ -4454,6 +4456,30 @@ fn execute_plan_stream_inner(
             let rows = execute_plan_rows_inner(db, txn, plan)?;
             Ok(Box::new(MaterializedStream::new(rows)))
         }
+    }
+}
+
+/// Row goals change sampling batch sizes, never the sample population.
+fn execute_sample_limit_stream(
+    db: &Arc<Database>,
+    txn: TxnView,
+    input: &PhysicalPlan,
+    target: usize,
+) -> Result<Box<dyn PlanStream>, QueryError> {
+    let sample = target <= crate::engine::executor::vec::batch::DEFAULT_BATCH_ROWS
+        && input.any(|p| {
+            matches!(
+                p,
+                PhysicalPlan::SampleScan { .. } | PhysicalPlan::ParallelSampleScan { .. }
+            )
+        })
+        && super::vec_bridge::scan_row_goal_pushdown_safe(input);
+    if sample {
+        super::vec_bridge::with_scan_limit_hint(Some(target.max(1)), || {
+            execute_plan_stream_limited(db, txn, input, target)
+        })
+    } else {
+        execute_plan_stream_limited(db, txn, input, target)
     }
 }
 
@@ -4869,7 +4895,7 @@ fn drain_via_stream(
     let target = offset
         .unwrap_or(0)
         .saturating_add(limit.unwrap_or(usize::MAX));
-    let mut stream = execute_plan_stream_limited(db, txn, input, target)?;
+    let mut stream = execute_sample_limit_stream(db, txn, input, target)?;
     let mut rows = Vec::with_capacity(target.min(64));
     while rows.len() < target {
         match stream.next()? {

@@ -263,6 +263,12 @@ where
         // Stopped accepting: run the controlled-shutdown sequence. Never
         // returns when the intent is `Restart` (it re-execs in place).
         drop(listener);
+        if !crate::mysql::shutdown::is_shutting_down() {
+            crate::mysql::shutdown::request_shutdown(
+                crate::mysql::shutdown::ShutdownSource::Signal("MySQL listener stopped"),
+                crate::mysql::shutdown::ShutdownIntent::Halt,
+            );
+        }
         // Keep one shutdown future alive across repeated signals. A terminal
         // and its wrapper may both send SIGINT; neither repetition nor SIGTERM
         // may cancel a checkpoint or change an accepted RESTART into a halt.

@@ -1196,7 +1196,7 @@ impl SessionHandle {
         self.notify.notified().await;
     }
 
-    fn kill_connection(&self) {
+    pub(crate) fn kill_connection(&self) {
         self.kill_flag.store(true, Ordering::Release);
         self.connection_kill_generation
             .fetch_add(1, Ordering::AcqRel);
@@ -1208,7 +1208,7 @@ impl SessionHandle {
         self.notify.notify_one();
     }
 
-    fn cancel_query(&self) {
+    pub(crate) fn cancel_query(&self) {
         self.query_cancel_generation.fetch_add(1, Ordering::AcqRel);
         // Also kick waiters so any blocking I/O `select!` on the session
         // (e.g. a long streaming result write that's hit TCP

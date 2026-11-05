@@ -215,28 +215,14 @@ pub(crate) fn load_keys(dir: &Path, state: &AiCatalog, create: bool) -> Result<K
     read_keyfile(&path)
 }
 fn wrap(key: &[u8], input: &[u8], encrypt: bool) -> Result<Zeroizing<Vec<u8>>, QueryError> {
-    use openssl::{
-        cipher::Cipher,
-        cipher_ctx::{CipherCtx, CipherCtxFlags},
-    };
-    let fail = || {
-        error(
-            "ER_AI_SECRET_DECRYPT_FAILED",
-            "credential key authentication failed",
-        )
-    };
-    let mut ctx = CipherCtx::new().map_err(|_| fail())?;
-    ctx.set_flags(CipherCtxFlags::FLAG_WRAP_ALLOW);
-    if encrypt {
-        ctx.encrypt_init(Some(Cipher::aes_256_wrap_pad()), Some(key), None)
-    } else {
-        ctx.decrypt_init(Some(Cipher::aes_256_wrap_pad()), Some(key), None)
-    }
-    .map_err(|_| fail())?;
-    let mut out = Zeroizing::new(Vec::new());
-    ctx.cipher_update_vec(input, &mut out).map_err(|_| fail())?;
-    ctx.cipher_final_vec(&mut out).map_err(|_| fail())?;
-    Ok(out)
+    crate::engine::credential_crypto::wrap(key, input, encrypt)
+        .map(Zeroizing::new)
+        .map_err(|_| {
+            error(
+                "ER_AI_SECRET_DECRYPT_FAILED",
+                "credential key authentication failed",
+            )
+        })
 }
 fn aad(state: &AiCatalog, id: u64, generation: u64) -> Vec<u8> {
     let mut a = b"mydb.ai.secret.payload.v1\0".to_vec();
