@@ -3144,8 +3144,18 @@ impl Database {
         if txn.txn_id != 0 {
             self.acquire_row_lock_blocking(txn.txn_id, storage_id, row_id, LockMode::Exclusive)?;
         }
-        let Some((header, mut projected_values, stored_count)) = self
-            .read_mvcc_row_columns_with_plan(storage_id, row_id, required_columns, decode_plan)?
+        let Some((header, projected_values, stored_count, patch_source)) = self
+            .read_mvcc_row_columns_for_update(
+                storage_id,
+                row_id,
+                required_columns,
+                decode_plan,
+                if txn.txn_id != 0 {
+                    effective_changed_columns
+                } else {
+                    &[]
+                },
+            )?
         else {
             return Ok(Some(false));
         };
@@ -3154,11 +3164,13 @@ impl Database {
         }
         // A logical None can be a physically reserved zero undo slot. Check
         // the encoded shape rather than rejecting every first UPDATE.
-        if header.undo_ptr.is_none()
+        if patch_source.is_none()
+            && header.undo_ptr.is_none()
             && !self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?
         {
             return Ok(None);
         }
+        let mut projected_values = projected_values;
         Self::backfill_projected_with_defaults(
             &mut projected_values,
             required_columns,
@@ -3240,6 +3252,7 @@ impl Database {
             &current_values,
             effective_changed_columns,
             before_values_sparse.into_vec(),
+            patch_source,
         )?;
         if !patched {
             return self
@@ -4222,6 +4235,7 @@ impl Database {
             new_values,
             changed_cols,
             before_values_sparse,
+            None,
         )
     }
 
@@ -4240,14 +4254,22 @@ impl Database {
         new_values: &[Value],
         changed_cols: &[usize],
         before_values_sparse: Vec<Value>,
+        patch_source: Option<HeapPatchSource>,
     ) -> Result<bool, QueryError> {
         debug_assert_eq!(changed_cols.len(), before_values_sparse.len());
         // Release the heap handle/page guards before reserving or appending
         // undo: preparation must not introduce a heap -> undo lock order.
         let heap = self.heap_handle(storage_id)?;
-        let prepared = heap
-            .read()
-            .prepare_mvcc_patch(row_id, new_values, changed_cols)?;
+        let prepared = {
+            let heap = heap.read();
+            match patch_source {
+                Some(source) => {
+                    debug_assert_eq!(source.row_id, row_id);
+                    source.prepare(&heap.codec, new_values)?
+                }
+                None => heap.prepare_mvcc_patch(row_id, new_values, changed_cols)?,
+            }
+        };
         let Some(prepared) = prepared else {
             return Ok(false);
         };

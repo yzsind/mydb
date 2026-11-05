@@ -1479,14 +1479,14 @@ where
     }
 
     async fn command_loop_with_disconnect(&mut self) -> io::Result<()> {
-        let peer = self.stream.clone_socket()?;
+        let peer = self.stream.peer_monitor()?;
         let handle = self.handle.as_ref().map(Arc::clone);
         let commands = self.command_loop();
         tokio::pin!(commands);
         tokio::select! {
             biased;
             result = &mut commands => result,
-            _ = wait_peer_closed(&peer) => {
+            _ = peer.closed() => {
                 if let Some(handle) = handle { handle.peer_disconnected(); }
                 // Retain ownership of the in-flight context until cooperative
                 // cancellation completes; ordinary teardown then rolls back.
@@ -9510,9 +9510,9 @@ enum MysqlStream {
 }
 
 impl MysqlStream {
-    /// A separate reactor registration observes EOF without reading protocol
-    /// bytes, including pipelined requests or TLS records buffered by the codec.
-    fn clone_socket(&self) -> io::Result<TcpStream> {
+    /// Observe transport closure without consuming pipelined commands or TLS
+    /// records. Linux subscribes to closure separately from readable input.
+    fn peer_monitor(&self) -> io::Result<super::peer_monitor::PeerCloseMonitor> {
         let stream = match self {
             Self::Plain(stream) => stream.get_ref(),
             Self::Tls(stream) => stream.get_ref().0.get_ref(),
@@ -9523,36 +9523,7 @@ impl MysqlStream {
                 ))
             }
         };
-        #[cfg(unix)]
-        let socket = {
-            use std::os::fd::AsFd;
-            std::net::TcpStream::from(stream.as_fd().try_clone_to_owned()?)
-        };
-        #[cfg(windows)]
-        let socket = {
-            use std::os::windows::io::AsSocket;
-            std::net::TcpStream::from(stream.as_socket().try_clone_to_owned()?)
-        };
-        TcpStream::from_std(socket)
-    }
-}
-
-async fn wait_peer_closed(stream: &TcpStream) {
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.ready(tokio::io::Interest::READABLE).await {
-            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
-            Err(_) => return,
-            _ => {}
-        }
-        match stream.peek(&mut byte).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                // Never consume another command. A pipelined request may stay
-                // unread while a worker runs, so avoid spinning on readiness.
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
+        super::peer_monitor::PeerCloseMonitor::new(stream)
     }
 }
 
@@ -10520,19 +10491,18 @@ mod tests {
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let mut stream = MysqlStream::Plain(BufReader::new(server));
-        let peer = stream.clone_socket().unwrap();
+        let peer = stream.peer_monitor().unwrap();
         client.write_all(b"queued command").await.unwrap();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(75),
-            wait_peer_closed(&peer)
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(75), peer.closed())
+                .await
+                .is_err()
+        );
         let mut bytes = [0u8; 14];
         stream.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"queued command");
         drop(client);
-        tokio::time::timeout(std::time::Duration::from_secs(2), wait_peer_closed(&peer))
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.closed())
             .await
             .unwrap();
     }

@@ -1770,6 +1770,49 @@ impl Database {
         )
     }
 
+    /// Capture bounded patch metadata during the locked projected read. A
+    /// speculative source miss/error must retain the ordinary post-evaluation
+    /// patch checks and their error ordering, including cold/forwarded rows.
+    #[allow(clippy::type_complexity)]
+    fn read_mvcc_row_columns_for_update(
+        &self,
+        table_id: u64,
+        row_id: RowId,
+        columns: &[usize],
+        decode_plan: Option<&RowDecodePlan>,
+        changed_columns: &[usize],
+    ) -> Result<Option<(RowHeader, Vec<Value>, usize, Option<HeapPatchSource>)>, QueryError> {
+        let heap = self.heap_handle(table_id)?;
+        let heap = heap.read();
+        heap.with_lob(|| {
+            let compiled;
+            let plan = match decode_plan {
+                Some(plan) => plan,
+                None => {
+                    compiled = RowDecodePlan::compile_with_codec(columns, &heap.codec);
+                    &compiled
+                }
+            };
+            let mut source = None;
+            let read =
+                heap.read_mvcc_columns_cached_with_plan_inspect(row_id, plan, |payload| {
+                    source =
+                        HeapPatchSource::capture(row_id, payload, &heap.codec, changed_columns)
+                            .ok()
+                            .flatten();
+                })?;
+            match read {
+                CachedProjectedRead::Hit(header, values, count) => {
+                    Ok(Some((header, values, count, source)))
+                }
+                CachedProjectedRead::NotFound => Ok(None),
+                CachedProjectedRead::MissingPage => heap
+                    .read_mvcc_columns_uncached_with_plan(row_id, plan)
+                    .map(|read| read.map(|(header, values, count)| (header, values, count, None))),
+            }
+        })
+    }
+
     #[cfg(test)]
     pub fn lock_row_for_update(
         &self,

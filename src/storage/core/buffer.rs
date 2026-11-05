@@ -1287,6 +1287,39 @@ impl BufferPool {
         true
     }
 
+    /// Reserve deferred WAL protection and mutate through the same residency
+    /// pin. A miss never loads a page or invokes the caller's mutator. Success
+    /// transfers one deferred pin to the WAL publisher; failure or unwinding
+    /// releases only this operation's reservation.
+    fn try_with_deferred_raw_page_mut<T>(
+        self: &Arc<Self>,
+        key: &PageKey,
+        f: impl FnOnce(&mut [u8]) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
+        let Some(pinned) = self.try_pin_resident_page(key)? else {
+            return Ok(None);
+        };
+        struct DeferredReservation<'a> {
+            frame: &'a Frame,
+            published: bool,
+        }
+        impl Drop for DeferredReservation<'_> {
+            fn drop(&mut self) {
+                if !self.published {
+                    self.frame.deferred_pins.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+        pinned.frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+        let mut reservation = DeferredReservation {
+            frame: &pinned.frame,
+            published: false,
+        };
+        let result = self.with_pinned_raw_page_mut(&pinned, 0, f)?;
+        reservation.published = true;
+        Ok(Some(result))
+    }
+
     /// Txn-buffering: the deferred record for `key` has now been appended at
     /// `lsn`. Publish the real WAL LSN (so the WAL-ahead flush gate syncs up to
     /// it) BEFORE releasing the deferred pin, so the page never becomes
@@ -1739,7 +1772,20 @@ impl BufferPool {
         dirty_lsn: u64,
         f: impl FnOnce(&mut [u8]) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
-        let pinned = self.pin_page_with_intent(key.clone(), AccessIntent::Normal)?;
+        let pinned = self.pin_page_with_intent(key, AccessIntent::Normal)?;
+        self.with_pinned_raw_page_mut(&pinned, dirty_lsn, f)
+    }
+
+    /// Use the ordinary raw-image mutation and dirty-publication rules with
+    /// an already acquired pin. No page latch survives this call.
+    fn with_pinned_raw_page_mut<T>(
+        self: &Arc<Self>,
+        pinned: &PinnedFrame,
+        dirty_lsn: u64,
+        f: impl FnOnce(&mut [u8]) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        debug_assert!(Arc::ptr_eq(self, &pinned.pool));
+        let key = &pinned.frame.key;
         let result = {
             let mut bytes = pinned.frame.bytes.write().map_err(|_| {
                 error(
@@ -6275,6 +6321,8 @@ impl BufferPool {
     }
 
     fn lookup_frame(&self, key: &PageKey) -> Result<Option<Arc<Frame>>, QueryError> {
+        #[cfg(test)]
+        deferred_raw_page_tests::record_lookup();
         let shard = self.shards[self.shard_index(key)]
             .frames
             .read()
@@ -10580,7 +10628,12 @@ mod oldest_dirty_tests {
         let pool =
             BufferPool::new_with_options(100, log, DurabilityMode::Strict, Duration::ZERO, 1, 0);
         pool.shutdown_flusher();
-        for _ in 0..4 {pool.log.lock().append(0,WalPayload::CheckpointBegin).unwrap();}
+        for _ in 0..4 {
+            pool.log
+                .lock()
+                .append(0, WalPayload::CheckpointBegin)
+                .unwrap();
+        }
         let file = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
         for page_id in 0..50 {
             pool.store_page(
@@ -10764,7 +10817,12 @@ mod oldest_dirty_tests {
             1,
             0,
         );
-        for _ in 0..4 {pool.log.lock().append(0,WalPayload::CheckpointBegin).unwrap();}
+        for _ in 0..4 {
+            pool.log
+                .lock()
+                .append(0, WalPayload::CheckpointBegin)
+                .unwrap();
+        }
         let file_key = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
         let mut frames = Vec::new();
         for page_id in 0..3 {
@@ -11537,5 +11595,113 @@ mod round2_buffer_tests {
         assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 1);
         pool.finalize_deferred(&key, 7);
         assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod deferred_raw_page_tests {
+    use super::*;
+
+    thread_local! {
+        static LOOKUPS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn record_lookup() {
+        LOOKUPS.with(|count| {
+            if let Some(current) = count.get() {
+                count.set(Some(current + 1));
+            }
+        });
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<BufferPool>, PageKey, Arc<Frame>) {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("deferred-raw.lob");
+        fs::write(&path, vec![0; PAGE_SIZE]).unwrap();
+        let pool = BufferPool::new_with_options(
+            2,
+            Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            )),
+            DurabilityMode::Memory,
+            Duration::ZERO,
+            1,
+            0,
+        );
+        let key = PageKey {
+            file: Arc::new(BufferPool::overflow_file_key(path, 7)),
+            page_id: 0,
+        };
+        drop(pool.pin_page(key.clone()).unwrap());
+        let frame = pool.lookup_frame(&key).unwrap().unwrap();
+        (dir, pool, key, frame)
+    }
+
+    #[test]
+    fn deferred_mutation_uses_one_lookup_and_blocks_flush_until_publication() {
+        let (_dir, pool, key, frame) = fixture();
+        LOOKUPS.with(|count| count.set(Some(0)));
+        let result = pool.try_with_deferred_raw_page_mut(&key, |bytes| {
+            assert!(frame.deferred_pins.load(Ordering::Acquire) > 0);
+            bytes[128] = 42;
+            Ok(17)
+        });
+        let lookups = LOOKUPS.with(|count| count.replace(None).unwrap());
+        assert_eq!(result.unwrap(), Some(17));
+        assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+        assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 1);
+        assert!(!pool.flush_frame(&frame).unwrap());
+        assert_eq!(fs::read(&key.file.path).unwrap()[128], 0);
+        pool.finalize_deferred(&key, 0);
+        assert!(pool.flush_frame(&frame).unwrap());
+        assert_eq!(fs::read(&key.file.path).unwrap()[128], 42);
+        assert_eq!(
+            lookups, 1,
+            "a resident mutation must reuse its WAL-protection pin"
+        );
+    }
+
+    #[test]
+    fn deferred_mutation_miss_and_eviction_do_not_run_the_mutator() {
+        let (_dir, pool, key, frame) = fixture();
+        let absent = PageKey {
+            file: key.file.clone(),
+            page_id: 1,
+        };
+        for rejected in [&absent, &key] {
+            frame
+                .pin_count
+                .store(BufferPool::EVICTING_PIN, Ordering::Release);
+            let result = pool.try_with_deferred_raw_page_mut::<()>(rejected, |_| {
+                panic!("an unavailable frame must use the caller's eager fallback")
+            });
+            frame.pin_count.store(0, Ordering::Release);
+            assert_eq!(result.unwrap(), None);
+            assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn unwinding_deferred_mutation_releases_its_residency_and_wal_pins() {
+        let (_dir, pool, key, frame) = fixture();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.try_with_deferred_raw_page_mut::<()>(&key, |_| panic!("injected unwind"))
+        }));
+        assert!(result.is_err());
+        assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+        assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_deferred_mutation_preserves_other_transactions_pins() {
+        let (_dir, pool, key, frame) = fixture();
+        assert!(pool.add_deferred_pin(&key));
+        let result = pool.try_with_deferred_raw_page_mut::<()>(&key, |_| {
+            Err(crate::error::catalog::ER_OUTOFMEMORY.error("injected preflight failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+        assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 1);
+        pool.finalize_deferred(&key, 0);
     }
 }

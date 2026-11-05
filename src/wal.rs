@@ -5185,11 +5185,10 @@ fn wal_zero_fill_enabled() -> bool {
     })
 }
 
-/// Overwrite `[from, to)` with zeros, syncing every chunk. Concurrent commit
-/// `fdatasync`s then queue behind at most one chunk of writeback: syncing every
-/// 16 MiB stalled them for up to ~90 ms (every 20 terminals' commit at once,
-/// once per segment), while 256 KiB steps keep the worst case within a few ms
-/// and still fill 256 MiB in ~2 s. The caller performs the final sync.
+/// Overwrite an unpublished segment in bounded writeback steps. Intermediate
+/// barriers only pace I/O: forcing a filesystem journal/cache flush for every
+/// chunk interferes with commits on the active segment. Publication still
+/// requires the caller's final full-file and parent-directory syncs.
 fn zero_fill_segment(file: &File, from: u64, to: u64) -> Result<(), QueryError> {
     const CHUNK: usize = 256 * 1024;
     static ZEROS: [u8; CHUNK] = [0; CHUNK];
@@ -5199,10 +5198,81 @@ fn zero_fill_segment(file: &File, from: u64, to: u64) -> Result<(), QueryError> 
         write_all_at(file, &ZEROS[..len], offset)?;
         offset += len as u64;
         if offset < to {
-            file.sync_data().map_err(io_err)?;
+            pace_segment_zero_fill(file, offset - len as u64, len as u64).map_err(io_err)?;
         }
     }
     Ok(())
+}
+
+/// This is flow control for a hidden preparation file, never a WAL durability
+/// acknowledgement. sync_file_range does not persist metadata or device caches;
+/// initialize_segment retains the complete publication barriers afterwards.
+#[cfg(target_os = "linux")]
+fn pace_segment_zero_fill(file: &File, offset: u64, bytes: u64) -> std::io::Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let offset = libc::off_t::try_from(offset).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WAL writeback offset exceeds off_t",
+        )
+    })?;
+    let bytes = libc::off_t::try_from(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WAL writeback length exceeds off_t",
+        )
+    })?;
+    pace_segment_zero_fill_with(
+        || {
+            // SAFETY: file owns a live descriptor and both checked ranges fit
+            // off_t. The call takes no pointers and does not change file data.
+            let rc = unsafe {
+                libc::sync_file_range(
+                    file.as_raw_fd(),
+                    offset,
+                    bytes,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+        || file.sync_data(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn pace_segment_zero_fill_with(
+    mut writeback: impl FnMut() -> std::io::Result<()>,
+    durable_fallback: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    loop {
+        match writeback() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+                ) =>
+            {
+                return durable_fallback();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pace_segment_zero_fill(file: &File, _offset: u64, _bytes: u64) -> std::io::Result<()> {
+    file.sync_data()
 }
 
 fn segment_header(path: &Path, segment_id: u64) -> Result<Vec<u8>, QueryError> {
@@ -10878,3 +10948,106 @@ mod compensation_codec_tests {
 #[cfg(test)]
 #[path = "wal/correctness_tests.rs"]
 mod correctness_tests;
+
+#[cfg(test)]
+mod zero_fill_pacing_contract_tests {
+    use super::*;
+
+    #[test]
+    fn zero_fill_preserves_header_and_bytes_beyond_partial_final_chunk() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("unpublished-segment.tmp");
+        let from = 64usize;
+        let to = from + 2 * 256 * 1024 + 19;
+        fs::write(&path, vec![0x5a; to + 73]).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        zero_fill_segment(&file, from as u64, to as u64).unwrap();
+        // The range writer does not replace the segment publication barrier.
+        file.sync_all().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes[..from].iter().all(|&byte| byte == 0x5a));
+        assert!(bytes[from..to].iter().all(|&byte| byte == 0));
+        assert!(bytes[to..].iter().all(|&byte| byte == 0x5a));
+        zero_fill_segment(&file, to as u64, to as u64).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_retries_interruption_without_forcing_a_durable_barrier() {
+        let mut attempts = 0;
+        pace_segment_zero_fill_with(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    Ok(())
+                }
+            },
+            || panic!("supported range writeback must not force fsync"),
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_writeback_uses_the_existing_durable_fallback() {
+        for code in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EINVAL] {
+            let mut called = false;
+            pace_segment_zero_fill_with(
+                || Err(std::io::Error::from_raw_os_error(code)),
+                || {
+                    called = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(called);
+        }
+        let err = pace_segment_zero_fill_with(
+            || Err(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+            || Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_does_not_hide_io_or_capacity_failures() {
+        for code in [libc::EIO, libc::ENOSPC, libc::ENOMEM, libc::EBADF] {
+            let err = pace_segment_zero_fill_with(
+                || Err(std::io::Error::from_raw_os_error(code)),
+                || panic!("a real I/O error must reach segment preparation"),
+            )
+            .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_checks_ranges_and_accepts_an_empty_step() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let file = File::create(dir.path().join("range.tmp")).unwrap();
+        assert_eq!(
+            pace_segment_zero_fill(&file, u64::MAX, 1)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            pace_segment_zero_fill(&file, 0, u64::MAX)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        pace_segment_zero_fill(&file, u64::MAX, 0).unwrap();
+    }
+}
