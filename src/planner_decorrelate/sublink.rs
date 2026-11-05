@@ -680,6 +680,8 @@ mod tests {
 
     fn empty_select() -> Select {
         Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             distinct: false,
             projection: vec![],
             from: vec![TableRef {

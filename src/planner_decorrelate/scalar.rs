@@ -371,6 +371,8 @@ fn add_outer_key_domain(
     let mut domain_source = source.clone();
     domain_source.alias = Some(source_alias);
     let domain = Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         table: Some(domain_source.name.clone()),
         from: vec![domain_source],
         projection: domain_projection,
@@ -983,6 +985,8 @@ mod tests {
 
     fn empty_inner_select() -> Select {
         Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             distinct: false,
             projection: vec![],
             from: vec![TableRef {

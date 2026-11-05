@@ -751,6 +751,7 @@ impl Database {
         txn: TxnView,
         _table_id: u64,
     ) -> Result<(), QueryError> {
+        if crate::engine::rls::policy_active() { return Err(crate::engine::rls::violation("Policy functions cannot modify database rows")); }
         self.check_dml_allowed(txn)?;
         Ok(())
     }

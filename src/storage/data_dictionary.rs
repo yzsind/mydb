@@ -130,6 +130,8 @@ pub(crate) const DD_COLUMN_STATS: u64 = DD_TABLE_ID_BASE + 28;
 pub(crate) const DD_INDEX_STATS: u64 = DD_TABLE_ID_BASE + 29;
 pub(crate) const DD_EXTENDED_STATS: u64 = DD_TABLE_ID_BASE + 30;
 pub(crate) const DD_COLUMN_HISTOGRAMS: u64 = DD_TABLE_ID_BASE + 31;
+pub(crate) const DD_ROW_SECURITY_POLICIES: u64 = DD_TABLE_ID_BASE + 32;
+pub(crate) const DD_ROW_SECURITY_DEPENDENCIES: u64 = DD_TABLE_ID_BASE + 33;
 pub(crate) const DD_STATS_TABLES: [u64; 5] = [
     DD_TABLE_STATS,
     DD_COLUMN_STATS,
@@ -819,6 +821,13 @@ fn sequence_values_table() -> TableSchema {
     )
 }
 
+fn row_security_table(id: u64, name: &str, dependencies: bool) -> TableSchema {
+    let mut columns = vec![ucol("table_id", DataTypeKind::BigInt, false), col("name", varchar(64), false)];
+    if dependencies { columns.push(ucol("ordinal", DataTypeKind::BigInt, false)); }
+    columns.push(col("definition_json", DataTypeKind::Text { max_len: 16_777_215 }, false));
+    TableSchema::system_table(id, name, columns)
+}
+
 fn build_dd_tables() -> Vec<Arc<TableSchema>> {
     vec![
         Arc::new(schemata_table()),
@@ -827,6 +836,8 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
         Arc::new(indexes_table()),
         Arc::new(index_column_usage_table()),
         Arc::new(check_constraints_table()),
+        Arc::new(row_security_table(DD_ROW_SECURITY_POLICIES, "row_security_policies", false)),
+        Arc::new(row_security_table(DD_ROW_SECURITY_DEPENDENCIES, "row_security_dependencies", true)),
         Arc::new(foreign_keys_table()),
         Arc::new(foreign_key_column_usage_table()),
         Arc::new(views_table()),
@@ -928,6 +939,8 @@ pub(crate) struct DdRowSet {
     pub indexes: Vec<Vec<Value>>,
     pub index_column_usage: Vec<Vec<Value>>,
     pub check_constraints: Vec<Vec<Value>>,
+    pub row_security_policies: Vec<Vec<Value>>,
+    pub row_security_dependencies: Vec<Vec<Value>>,
     pub foreign_keys: Vec<Vec<Value>>,
     pub foreign_key_column_usage: Vec<Vec<Value>>,
     pub views: Vec<Vec<Value>>,
@@ -950,7 +963,7 @@ pub(crate) struct DdRowSet {
 
 impl DdRowSet {
     /// `(dictionary table id, rows)` pairs, for writing into heap files.
-    pub(crate) fn per_table(&self) -> [(u64, &Vec<Vec<Value>>); 24] {
+    pub(crate) fn per_table(&self) -> [(u64, &Vec<Vec<Value>>); 26] {
         [
             (DD_SCHEMATA, &self.schemata),
             (DD_TABLES, &self.tables),
@@ -958,6 +971,8 @@ impl DdRowSet {
             (DD_INDEXES, &self.indexes),
             (DD_INDEX_COLUMN_USAGE, &self.index_column_usage),
             (DD_CHECK_CONSTRAINTS, &self.check_constraints),
+            (DD_ROW_SECURITY_POLICIES, &self.row_security_policies),
+            (DD_ROW_SECURITY_DEPENDENCIES, &self.row_security_dependencies),
             (DD_FOREIGN_KEYS, &self.foreign_keys),
             (DD_FOREIGN_KEY_COLUMN_USAGE, &self.foreign_key_column_usage),
             (DD_VIEWS, &self.views),
@@ -1400,6 +1415,15 @@ fn push_table_rows(
             ord += 1;
         }
     }
+    for policy in &table.row_security.policies {
+        set.row_security_policies.push(vec![uv(table.id), sv(&policy.name), jsonv(policy)]);
+        for (ordinal, account) in policy.roles.iter().enumerate() {
+            set.row_security_dependencies.push(vec![uv(table.id), sv(&policy.name), uv(ordinal as u64), jsonv(account)]);
+        }
+        for (ordinal, dependency) in policy.table_dependencies.iter().enumerate() {
+            set.row_security_dependencies.push(vec![uv(table.id), sv(&policy.name), uv((policy.roles.len() + ordinal) as u64), jsonv(dependency)]);
+        }
+    }
     for chk in &table.check_constraints {
         set.check_constraints.push(vec![
             uv(table.id),
@@ -1495,6 +1519,7 @@ pub(crate) fn table_header_from_dd_row(
         mysql_table_options: table_options.mysql_options,
         column_name_map: Default::default(),
         column_id_map: HashMap::new(),
+        row_security: table_options.row_security,
         row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
     }))
 }
@@ -1855,6 +1880,8 @@ fn catalog_from_dd_rows_with_auth(
             ));
         }
         let table_options: crate::storage::schema::TableOptions = r_json(trow, 18)?;
+        let mut security = (*table_options.row_security).clone();
+        security.policies = set.row_security_policies.iter().filter(|row| r_u64(row, 0) == id).map(|row| r_json(row, 2)).collect::<Result<Vec<crate::parser::rls::Policy>, _>>()?;
         let mut table = TableSchema {
             id,
             object_id: r_u64(trow, 1),
@@ -1892,7 +1919,8 @@ fn catalog_from_dd_rows_with_auth(
             mysql_table_options: table_options.mysql_options,
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
-            row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
+            row_security: Arc::new(security),
+        row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
         if let Some(partitioning) = &table.partitioning {
             partitioning.validate_rowid_tags()?;
@@ -2892,7 +2920,8 @@ mod tests {
             mysql_table_options: Vec::new(),
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
-            row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
+            row_security: crate::engine::rls::RowSecurity::empty(),
+        row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
         table.build_column_index();
 

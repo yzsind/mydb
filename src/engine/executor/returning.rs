@@ -15,6 +15,7 @@ pub(super) struct ReturningCollector {
 
 struct ReturningProjector {
     rowid: bool,
+    policy_table: TableSchema,
     eval_table: TableSchema,
     columns: Vec<Column>,
     program: super::select::TableProjectionProgram,
@@ -51,6 +52,15 @@ impl ReturningCollector {
         new_ref: Option<crate::storage::DmlRowRef>,
     ) -> Result<(), QueryError> {
         if let Some(projector) = &self.projector {
+            if let Some((db, txn)) = crate::engine::rls::current_statement_view() {
+                if crate::engine::rls::might_require_binding(&db, &projector.policy_table) {
+                    for values in old.into_iter().chain(new) {
+                        crate::engine::rls::check_row(&db, txn, &projector.policy_table, crate::parser::rls::Command::Select, false, values)?;
+                    }
+                }
+            } else if projector.policy_table.row_security.version != 0 {
+                return Err(crate::engine::rls::violation("RETURNING requires the owning DML read view"));
+            }
             self.rows
                 .push(projector.project(old, new, old_ref, new_ref)?);
         }
@@ -85,6 +95,7 @@ impl ReturningProjector {
         default_image: DefaultImage,
         target_alias: Option<&str>,
     ) -> Result<Self, QueryError> {
+        let policy_table = table.clone();
         let rowid = clause.projection.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => {
                 crate::parser::visit::any_expr(expr, |node| super::rowid::is_pseudo(table, node))
@@ -230,6 +241,8 @@ impl ReturningProjector {
             }
         }
         let select = Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             projection,
             ..Select::default()
         };
@@ -250,6 +263,7 @@ impl ReturningProjector {
         let null_row = vec![Value::Null; base_width];
         Ok(Self {
             rowid,
+            policy_table,
             eval_table,
             columns,
             program,

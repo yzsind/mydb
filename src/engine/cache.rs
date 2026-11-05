@@ -347,6 +347,7 @@ impl CacheEpoch {
 /// same exhaustive set instead of growing ad-hoc fingerprint fields.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PlanSemantics {
+    pub rls_authorization: Option<Arc<crate::engine::rls::PlanIdentity>>,
     pub sql_mode_fingerprint: u64,
     pub optimizer_switch_fingerprint: u64,
     pub sql_select_limit: u64,
@@ -366,6 +367,7 @@ pub struct PlanSemantics {
 impl Default for PlanSemantics {
     fn default() -> Self {
         Self {
+            rls_authorization: None,
             sql_mode_fingerprint: 0,
             optimizer_switch_fingerprint: 0,
             sql_select_limit: u64::MAX,
@@ -1835,6 +1837,7 @@ mod tests {
             primary_publication_job_id: 0,
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Default::default(),
             partitioning: None,
             pctfree: 0,

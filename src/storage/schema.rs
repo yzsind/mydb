@@ -820,6 +820,8 @@ pub struct DatabaseSchema {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
+    #[serde(default = "crate::engine::rls::RowSecurity::empty")]
+    pub row_security: Arc<crate::engine::rls::RowSecurity>,
     pub id: u64,
     #[serde(default)]
     pub object_id: u64,
@@ -976,8 +978,10 @@ fn default_object_generation() -> u64 {
 /// `PCTFREE`/`PCTUSED`; future fields (e.g. ITL slot count, async-merge
 /// cap) plug in without bumping `CATALOG_VERSION` again — unknown JSON
 /// keys are ignored, missing keys default to zero (= "follow global").
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TableOptions {
+    #[serde(default = "crate::engine::rls::RowSecurity::empty")]
+    pub row_security: Arc<crate::engine::rls::RowSecurity>,
     /// `PCTFREE = N` percentage. `0` means "follow `MYDB_PCTFREE` or
     /// `MYDB_HEAP_UPDATE_RESERVE_BYTES`".
     #[serde(default)]
@@ -1000,11 +1004,33 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+impl Default for TableOptions {
+    fn default() -> Self {
+        Self {
+            row_security: crate::engine::rls::RowSecurity::empty(),
+            pctfree: 0,
+            pctused: 0,
+            mysql_options: Vec::new(),
+            system_time_epoch_us: 0,
+            row_generation_txn_id: 0,
+        }
+    }
+}
+
 impl TableOptions {
     /// Project the runtime per-table options off a `TableSchema`. Used
     /// when emitting JSON for the dictionary row.
     pub fn from_schema(t: &TableSchema) -> Self {
         Self {
+            row_security: if t.row_security.version == 0 && !t.row_security.enabled {
+                crate::engine::rls::RowSecurity::empty()
+            } else {
+                Arc::new(crate::engine::rls::RowSecurity {
+                    enabled: t.row_security.enabled,
+                    version: t.row_security.version,
+                    policies: Vec::new(),
+                })
+            },
             pctfree: t.pctfree,
             pctused: t.pctused,
             mysql_options: t.mysql_table_options.clone(),
@@ -1017,7 +1043,8 @@ impl TableOptions {
     /// JSON column (stores NULL) so older rows are byte-identical to new
     /// rows in the common case.
     pub fn is_default(&self) -> bool {
-        self.pctfree == 0
+        *self.row_security == crate::engine::rls::RowSecurity::default()
+            && self.pctfree == 0
             && self.pctused == 0
             && self.mysql_options.is_empty()
             && self.system_time_epoch_us == 0
@@ -1121,7 +1148,8 @@ impl TableSchema {
             "columns" => vec!["table_id", "column_id"],
             "indexes" => vec!["table_id", "name"],
             "index_column_usage" => vec!["table_id", "index_name", "ordinal_position"],
-            "check_constraints" => vec!["table_id", "name"],
+            "check_constraints" | "row_security_policies" => vec!["table_id", "name"],
+            "row_security_dependencies" => vec!["table_id", "name", "ordinal"],
             "foreign_keys" => vec!["table_id", "name"],
             "foreign_key_column_usage" => {
                 vec!["table_id", "fk_name", "ordinal_position"]
@@ -1218,6 +1246,7 @@ impl TableSchema {
             mysql_table_options: Vec::new(),
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
         table.build_column_index();
@@ -1316,6 +1345,7 @@ impl TableSchema {
             mysql_table_options: Vec::new(),
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         }
     }
@@ -3083,6 +3113,71 @@ pub enum ParamTarget {
 /// reflects real numeric order, including for negative values — the
 /// pre-v6 index encoded floats as `format!("{:020.8}")` ASCII strings,
 /// which mis-ordered any value with a `-` prefix.
+/// A statement-stable expression retained by a reusable index plan. Identity
+/// uses the complete serialized AST, never a digest or the first bound value.
+#[derive(Debug, Clone)]
+pub struct StatementValue {
+    expression: Arc<Expr>,
+    identity: Arc<str>,
+    _memory: Arc<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+}
+
+impl StatementValue {
+    pub(crate) fn for_expression(expression: &Expr) -> Option<Self> {
+        let Expr::Function {
+            name,
+            args,
+            distinct: false,
+        } = expression
+        else {
+            return None;
+        };
+        if !name.eq_ignore_ascii_case("CAST") || args.len() != 2 {
+            return None;
+        }
+        let Expr::Literal(crate::parser::Literal::String(target)) = &args[1] else {
+            return None;
+        };
+        match target.trim().to_ascii_uppercase().as_str() {
+            "UNSIGNED" | "UNSIGNED INTEGER" | "SIGNED" | "SIGNED INTEGER" => (),
+            _ => return None,
+        };
+        let Expr::Function {
+            name,
+            args: input,
+            distinct: false,
+        } = &args[0]
+        else {
+            return None;
+        };
+        if !name.eq_ignore_ascii_case("RLS_CONTEXT")
+            || input.len() != 1
+            || !matches!(&input[0], Expr::Literal(crate::parser::Literal::String(_)))
+        {
+            return None;
+        }
+        let identity = serde_json::to_string(expression).ok()?;
+        let memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
+            std::mem::size_of::<Self>()
+                + crate::engine::expr_program::expr_ast_heap_bytes(expression)
+                + identity.len(),
+        )?;
+        Some(Self {
+            expression: Arc::new(expression.clone()),
+            identity: Arc::from(identity),
+            _memory: Arc::new(memory),
+        })
+    }
+
+    pub(crate) fn expression(&self) -> &Expr {
+        &self.expression
+    }
+    pub(crate) fn evaluate(&self) -> Result<Value, QueryError> {
+        crate::engine::expr::eval_const_runtime(&self.expression)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KeyPart {
     Null,
@@ -3133,6 +3228,12 @@ pub enum KeyPart {
     #[serde(skip)]
     Param {
         idx: usize,
+        target: ParamTarget,
+    },
+    /// Like a parameter, this is resolved at each execution and cannot persist.
+    #[serde(skip)]
+    Statement {
+        value: StatementValue,
         target: ParamTarget,
     },
 }
@@ -3229,6 +3330,16 @@ fn key_part_cmp_fast(left: &KeyPart, right: &KeyPart) -> std::cmp::Ordering {
                 target: bt,
             },
         ) => (ai, at).cmp(&(bi, bt)),
+        (
+            KeyPart::Statement {
+                value: a,
+                target: at,
+            },
+            KeyPart::Statement {
+                value: b,
+                target: bt,
+            },
+        ) => (&a.identity, at).cmp(&(&b.identity, bt)),
         _ => key_part_rank(left).cmp(&key_part_rank(right)),
     }
 }
@@ -3289,6 +3400,10 @@ impl Hash for KeyPart {
                 idx.hash(state);
                 target.hash(state);
             }
+            KeyPart::Statement { value, target } => {
+                value.identity.hash(state);
+                target.hash(state);
+            }
         }
     }
 }
@@ -3310,6 +3425,7 @@ pub(crate) fn key_part_rank(part: &KeyPart) -> u8 {
         KeyPart::DateTime(_) => 11,
         KeyPart::Year(_) => 12,
         KeyPart::Param { .. } => 13,
+        KeyPart::Statement { .. } => 14,
     }
 }
 
@@ -3510,7 +3626,7 @@ impl IndexKey {
     /// as a fast-path check to avoid cloning when no resolution is
     /// needed.
     pub fn contains_param(&self) -> bool {
-        self.0.iter().any(|p| matches!(p, KeyPart::Param { .. }))
+        self.0.iter().any(KeyPart::is_deferred)
     }
 
     /// Resolve every `KeyPart::Param` against the thread-local parameter
@@ -3531,11 +3647,34 @@ impl IndexKey {
 }
 
 impl KeyPart {
+    pub(crate) fn is_deferred(&self) -> bool {
+        matches!(self, Self::Param { .. } | Self::Statement { .. })
+    }
     /// Resolve a single `KeyPart::Param` against the thread-local
     /// parameter context, coercing the bound value into the storage
     /// shape recorded at planning time. Concrete variants are returned
     /// as-is.
     pub fn resolve_param(&self) -> Result<KeyPart, QueryError> {
+        if let Self::Statement { value, target } = self {
+            let value = value.evaluate()?;
+            // Preserve ordering outside the target domain. Wrapping a large
+            // UNSIGNED constant into a negative signed bound loses rows.
+            if matches!(target, ParamTarget::Int) {
+                if let Value::UInt(value) = &value {
+                    if *value > i64::MAX as u64 {
+                        return Ok(KeyPart::UInt(*value));
+                    }
+                }
+            }
+            if matches!(target, ParamTarget::UInt) {
+                if let Value::Int(value) = &value {
+                    if *value < 0 {
+                        return Ok(KeyPart::Int(*value));
+                    }
+                }
+            }
+            return KeyPart::for_target(value, *target);
+        }
         let KeyPart::Param { idx, target } = self else {
             return Ok(self.clone());
         };
@@ -5492,7 +5631,7 @@ impl KeyPart {
                 }
             }
             KeyPart::Year(y) => Value::Year(*y),
-            KeyPart::Param { .. } => {
+            KeyPart::Param { .. } | KeyPart::Statement { .. } => {
                 panic!("internal error: KeyPart::Param has no concrete value")
             }
         }
@@ -6471,6 +6610,7 @@ mod tests {
             primary_publication_job_id: 0,
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Default::default(),
             partitioning: None,
             pctfree: 0,

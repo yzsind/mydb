@@ -1865,6 +1865,19 @@ const AI_RUNTIME_COLUMNS: &[SystemColumn] = &[
     ),
 ];
 
+const ROW_SECURITY_POLICY_COLUMNS: &[SystemColumn] = &[
+    varchar_column!("TABLE_SCHEMA", 64, 256, false),
+    varchar_column!("TABLE_NAME", 64, 256, false),
+    varchar_column!("POLICY_NAME", 64, 256, false),
+    varchar_column!("COMMAND", 16, 64, false),
+    varchar_column!("KIND", 16, 64, false),
+    SystemColumn::longtext("ROLES", false),
+    SystemColumn::longtext("USING_EXPRESSION", true),
+    SystemColumn::longtext("CHECK_EXPRESSION", true),
+    SystemColumn::int("ENABLED", false),
+    SystemColumn::unsigned_bigint("POLICY_VERSION", false),
+];
+
 const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
     def("SCHEMATA", SCHEMATA_COLUMNS),
     def("TABLES", TABLES_COLUMNS),
@@ -1929,6 +1942,7 @@ const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
     def("USER_ATTRIBUTES", USER_ATTRIBUTES_COLUMNS),
     legacy_def("global_variables", VARIABLES_COLUMNS),
     legacy_def("session_variables", VARIABLES_COLUMNS),
+    mydb_def("mydb_row_security_policies", ROW_SECURITY_POLICY_COLUMNS),
     mydb_def("ai_models", AI_MODELS_COLUMNS),
     mydb_def("ai_connections", AI_CONNECTIONS_COLUMNS),
     mydb_def("ai_secrets", AI_SECRETS_COLUMNS),
@@ -2492,6 +2506,7 @@ fn rows(
         ("information_schema", "key_column_usage") => Ok(key_column_usage_rows(db)),
         ("information_schema", "referential_constraints") => Ok(referential_constraints_rows(db)),
         ("information_schema", "check_constraints") => Ok(check_constraints_rows(db)),
+        ("information_schema", "mydb_row_security_policies") => crate::engine::rls::metadata_rows(db, |schema, table| scan_request_matches_table(request, schema, table)),
         ("information_schema", "views") => Ok(views_rows(db)),
         ("information_schema", "view_table_usage") => Ok(view_table_usage_rows(db)),
         ("information_schema", "view_routine_usage") => Ok(view_routine_usage_rows(db)),
@@ -8080,7 +8095,7 @@ mod tests {
 
     #[test]
     fn information_schema_registry_uses_namespaced_native_tables() {
-        assert_eq!(INFORMATION_SCHEMA_REGISTRY.len(), 103);
+        assert_eq!(INFORMATION_SCHEMA_REGISTRY.len(), 104);
         let mut names = std::collections::BTreeSet::new();
         let mut class_counts = [0usize; 4];
         for registration in INFORMATION_SCHEMA_REGISTRY {
@@ -8110,7 +8125,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(class_counts, [76, 3, 7, 17]);
+        assert_eq!(class_counts, [76, 3, 7, 18]);
         assert!(!names.contains("zone_maps"));
         assert!(!names.contains("zone_map_storage"));
         assert!(names.contains("mydb_zone_maps"));

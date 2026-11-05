@@ -862,6 +862,8 @@ fn materialize_filtered_system_source(
             .unwrap_or_else(|| table_ref.name.clone())
     });
     let star = Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Wildcard],
         table: Some(table_ref.name.clone()),
         from: vec![table_ref.clone()],
@@ -1116,6 +1118,8 @@ fn materialize_join_source_with_derived(
     // `generate_series` spec on FROM[0] and emits a `GenerateSeries` leaf).
     if table_ref.generate_series.is_some() {
         let star = Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             projection: vec![SelectItem::Wildcard],
             table: Some(table_ref.name.clone()),
             from: vec![table_ref.clone()],
@@ -1137,6 +1141,8 @@ fn materialize_join_source_with_derived(
     }
     // 3) JOIN <catalog table>
     let star = Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Wildcard],
         table: Some(table_ref.name.clone()),
         from: vec![TableRef {
@@ -3430,9 +3436,16 @@ pub(crate) fn check_primary_definition_for_select(
 pub(super) fn execute_select(
     db: &Arc<Database>,
     txn: TxnView,
-    stmt: Select,
+    mut stmt: Select,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    if let Some(settings) = stmt.rls_expression_settings.take() {
+        return crate::engine::expr::with_policy_query_settings(&settings, || execute_select(db, txn, stmt, registry));
+    }
+    if let Some(context) = stmt.rls_security_context.take() {
+        return crate::engine::expr::with_row_security_identity(&context, ||
+            execute_select(db, txn, stmt, registry));
+    }
     let _read_schema = crate::storage::read_schema::ReadSchemaScope::enter(
         (!txn.dirty_read).then_some(txn.snapshot_scn),
     );

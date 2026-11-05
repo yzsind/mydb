@@ -858,6 +858,16 @@ fn reject_column_referenced_by_check(
     table: &TableSchema,
     column_name: &str,
 ) -> Result<(), QueryError> {
+    if let Ok(index) = table.column_index(column_name) {
+        let column_id = table.columns[index].column_id;
+        if table.row_security.policies.iter().any(|policy|
+            policy.using_columns.iter().chain(&policy.check_columns)
+                .any(|reference| reference.column_id == column_id)) {
+            return Err(crate::engine::rls::violation(format!(
+                "Cannot drop column '{column_name}' referenced by a row security policy"
+            )));
+        }
+    }
     if table
         .check_constraints
         .iter()

@@ -3,6 +3,7 @@ pub mod api;
 mod async_row_wait;
 pub mod audit_log;
 pub mod auth;
+pub mod rls;
 pub mod auto_analyze;
 pub mod auto_param;
 pub(crate) mod background;

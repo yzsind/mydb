@@ -11968,7 +11968,7 @@ fn encoded_key_part_len(part: &KeyPart) -> usize {
         // Param parts are deferred placeholders that must be resolved by
         // the executor before any storage call; reaching here indicates
         // a missed `IndexKey::resolve_params` call upstream.
-        KeyPart::Param { .. } => {
+        KeyPart::Param { .. } | KeyPart::Statement { .. } => {
             panic!("internal error: KeyPart::Param leaked into btree encoding")
         }
         KeyPart::Bytes(v) => 5 + v.len(),
@@ -20696,7 +20696,7 @@ fn encode_index_key_into(key: &IndexKey, out: &mut Vec<u8>) -> Result<(), QueryE
                 out.extend_from_slice(&collation_id.to_le_bytes());
                 encode_bytes_into(value.as_bytes(), out)?;
             }
-            KeyPart::Param { .. } => {
+            KeyPart::Param { .. } | KeyPart::Statement { .. } => {
                 panic!("internal error: KeyPart::Param leaked into btree encoding")
             }
         }
@@ -20820,7 +20820,7 @@ fn encode_index_key_parts_into_page(
                 write_index_payload_u16(buf, offset, *collation_id)?;
                 encode_bytes_into_page(value.as_bytes(), buf, offset)?;
             }
-            KeyPart::Param { .. } => {
+            KeyPart::Param { .. } | KeyPart::Statement { .. } => {
                 panic!("internal error: KeyPart::Param leaked into btree page encoding")
             }
         }
@@ -20858,7 +20858,7 @@ fn encoded_index_key_len(key: &IndexKey) -> Result<usize, QueryError> {
                         )
                     })?,
                 KeyPart::Bytes(v) => checked_index_bytes_len(v.len())?,
-                KeyPart::Param { .. } => {
+                KeyPart::Param { .. } | KeyPart::Statement { .. } => {
                     panic!("internal error: KeyPart::Param leaked into btree size calculation")
                 }
             })

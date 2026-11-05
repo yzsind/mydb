@@ -2131,7 +2131,7 @@ fn hash_key_part(hasher: &mut StatsHasher, part: &KeyPart) {
             hasher.write_u8(11);
             hasher.write_u8(*value);
         }
-        KeyPart::Param { .. } => {
+        KeyPart::Param { .. } | KeyPart::Statement { .. } => {
             panic!("internal error: KeyPart::Param has no stats hash representation")
         }
     }

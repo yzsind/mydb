@@ -5913,6 +5913,20 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 .then(|| bound_result_coercion(expr, schema))
                 .flatten(),
         }),
+        Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("__MYDB_RLS_SETTINGS") => {
+            let [Expr::Literal(Literal::String(encoded)), inner] = args.as_slice() else {
+                return Err(CompileError::Unsupported);
+            };
+            let inner = crate::engine::expr::with_policy_expression_settings(encoded, || compile_node(inner, schema))
+                .map_err(|_| CompileError::Unsupported)??;
+            Ok(ExprNode::Function {
+                kernel: FunctionKernel::RowSecuritySettings,
+                args: vec![ExprNode::Const(Value::String(encoded.clone())), inner],
+                collation_id: None,
+                suppress_string_truncation: false,
+                result_coercion: None,
+            })
+        }
         Expr::Function {
             name,
             args,
@@ -8095,6 +8109,25 @@ impl FunctionKernel {
             FunctionKernel::User => {
                 expect_len("USER", args, 0)?;
                 Ok(crate::engine::expr::eval_user_session_func())
+            }
+            FunctionKernel::RowSecurityGuard => {
+                expect_len("__MYDB_RLS_GUARD", args, 2)?;
+                let id = crate::engine::expr::uint_value(&args[0].eval(row, scratch)?)?;
+                let _guard = crate::engine::rls::PolicyScope::enter(id)?;
+                args[1].eval(row, scratch)
+            }
+            FunctionKernel::RowSecuritySettings => {
+                expect_len("__MYDB_RLS_SETTINGS", args, 2)?;
+                let ExprNode::Const(Value::String(encoded)) = &args[0] else {
+                    return Err(crate::engine::rls::violation("Invalid policy expression settings"));
+                };
+                crate::engine::expr::with_policy_expression_settings(encoded, || args[1].eval(row, scratch))?
+            }
+            FunctionKernel::RlsContext => {
+                expect_len("RLS_CONTEXT", args, 1)?;
+                let key = args[0].eval(row, scratch)?;
+                if matches!(key, Value::Null) { return Ok(Value::Null); }
+                Ok(crate::engine::expr::row_security_context(&crate::storage::value_to_string(&key)))
             }
             FunctionKernel::CurrentUser => {
                 expect_len("CURRENT_USER", args, 0)?;

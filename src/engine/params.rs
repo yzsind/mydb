@@ -276,7 +276,7 @@ pub(crate) fn with_auto_params_slice<R>(params: &[Value], f: impl FnOnce() -> R)
 }
 
 #[inline]
-fn with_params_slice_and_provenance<R>(
+pub(crate) fn with_params_slice_and_provenance<R>(
     params: &[Value],
     auto_parameterized: bool,
     f: impl FnOnce() -> R,

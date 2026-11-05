@@ -428,6 +428,15 @@ scalar_catalog! {
         User => (false, |_arity| true) {
             [("USER", "user"), ("SESSION_USER", "session_user")] => (SessionDependent, VarString, None, false);
         }
+        RowSecurityGuard => (false, |_arity| true) {
+            [("__MYDB_RLS_GUARD", "__mydb_rls_guard")] => (Unknown, LongLong, None, true);
+        }
+        RowSecuritySettings => (false, |arity| arity == 2) {
+            [("__MYDB_RLS_SETTINGS", "__mydb_rls_settings")] => (Unknown, LongLong, None, true);
+        }
+        RlsContext => (false, |arity| arity == 1) {
+            [("RLS_CONTEXT", "rls_context")] => (SessionDependent, VarString, None, false);
+        }
         CurrentUser => (false, |_arity| true) {
             [("CURRENT_USER", "current_user")] => (SessionDependent, VarString, None, false);
         }
@@ -516,6 +525,7 @@ scalar_catalog! {
             [("CONV", "conv"), ("GREATEST", "greatest"), ("LEAST", "least"), ("INSERT", "insert"), ("BIN_TO_UUID", "bin_to_uuid"), ("INET6_NTOA", "inet6_ntoa"), ("CONVERT_USING", "convert_using"), ("COLLATE", "collate")] => (Unknown, VarString, None, false);
         }
         LegacySession {
+
             [("MAKEDATE", "makedate")] => (DateTimeImmutable, Date, (Temporal, 1, 2, Immutable, fixed_temporal_result(Date, true)), false);
             [("TIMEDIFF", "timediff")] => (DateTimeImmutable, Time, (Temporal, 2, 2, Immutable, fixed_temporal_result(Time, true)), false);
             [("PERIOD_ADD", "period_add"), ("PERIOD_DIFF", "period_diff")] => (DateTimeImmutable, VarString, ( Period, 2, 2, Immutable, fixed_integer_result(Big, false, true)), false);

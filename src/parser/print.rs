@@ -1,6 +1,8 @@
 //! SQL presentation and literal encoding, independent of AST conversion.
 
 use super::{current_parser_sql_mode_bits, BinaryOp, Expr, Literal, SystemVariableScope, UnaryOp};
+#[path = "print_query.rs"]
+mod query;
 
 pub(super) fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -165,14 +167,44 @@ pub fn try_expr_to_sql(expr: &Expr) -> Result<String, SqlEncodeError> {
     Ok(render_expr(expr, true))
 }
 
+/// Executable policy display, including supported nested query syntax.
+/// Unsupported syntax is an error, never the best-effort display placeholder.
+pub fn try_query_expr_to_sql(expr: &Expr) -> Result<String, SqlEncodeError> {
+    validate_encoding(expr, true)?;
+    Ok(render_expr_options(expr, true, true))
+}
+
 fn validate_scalar_encoding(expr: &Expr) -> Result<(), SqlEncodeError> {
+    validate_encoding(expr, false)
+}
+fn validate_encoding(expr: &Expr, queries: bool) -> Result<(), SqlEncodeError> {
     use super::visit::{visit_expr, AstVisitor};
     struct Validate {
+        queries: bool,
         depth: usize,
         numeric_contexts: Vec<bool>,
         error: Option<SqlEncodeError>,
     }
     impl AstVisitor for Validate {
+        fn enter_limit(&mut self, limit: &super::LimitValue) {
+            if !matches!(limit, super::LimitValue::Rows(_)) {
+                self.error = Some(SqlEncodeError(
+                    "parameter identity cannot be persisted as query SQL",
+                ));
+            }
+        }
+        fn enter_select(&mut self, select: &super::Select) {
+            if self.queries && self.error.is_none() {
+                self.error = query::validate_select(select).err();
+            }
+        }
+        fn enter_query(&mut self, query: &super::QueryExpr) {
+            if self.queries && matches!(query, super::QueryExpr::Rrf(_)) {
+                self.error = Some(SqlEncodeError(
+                    "rank fusion query encoding is not supported",
+                ));
+            }
+        }
         fn enter_expr(&mut self, expr: &Expr) {
             self.depth += 1;
             let numeric_parent = self.numeric_contexts.last().copied().unwrap_or(false);
@@ -188,10 +220,12 @@ fn validate_scalar_encoding(expr: &Expr) -> Result<(), SqlEncodeError> {
                     Expr::Subquery(_)
                     | Expr::InSubquery { .. }
                     | Expr::Exists { .. }
-                    | Expr::QuantifiedComparison { .. } => {
+                    | Expr::QuantifiedComparison { .. }
+                        if !self.queries =>
+                    {
                         Some("query expression is not supported by the scalar encoder")
                     }
-                    Expr::WindowFunction { .. } => {
+                    Expr::WindowFunction { .. } if !self.queries => {
                         Some("window expression is not supported by the scalar encoder")
                     }
                     Expr::BoundValue(_) | Expr::GroupKeyRef { .. } | Expr::Grouping(_) => {
@@ -239,6 +273,11 @@ fn validate_scalar_encoding(expr: &Expr) -> Result<(), SqlEncodeError> {
                     | Expr::Case { .. }
                     | Expr::Function { .. }
                     | Expr::Tuple(_) => None,
+                    Expr::Subquery(_)
+                    | Expr::InSubquery { .. }
+                    | Expr::Exists { .. }
+                    | Expr::QuantifiedComparison { .. }
+                    | Expr::WindowFunction { .. } => None,
                 }
             };
             self.error = reason.map(SqlEncodeError);
@@ -252,6 +291,7 @@ fn validate_scalar_encoding(expr: &Expr) -> Result<(), SqlEncodeError> {
         }
     }
     let mut validator = Validate {
+        queries,
         depth: 0,
         numeric_contexts: Vec::new(),
         error: None,
@@ -277,7 +317,10 @@ pub fn expr_to_sql(expr: &Expr) -> String {
 }
 
 fn render_expr(expr: &Expr, canonical: bool) -> String {
-    let expr_to_sql = |expr: &Expr| render_expr(expr, canonical);
+    render_expr_options(expr, canonical, false)
+}
+fn render_expr_options(expr: &Expr, canonical: bool, queries: bool) -> String {
+    let expr_to_sql = |expr: &Expr| render_expr_options(expr, canonical, queries);
     match expr {
         Expr::Wildcard => "*".to_string(),
         Expr::Identifier(name) => quote_ident(name),
@@ -452,6 +495,53 @@ fn render_expr(expr: &Expr, canonical: bool) -> String {
         Expr::Tuple(items) => format!(
             "({})",
             items.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Subquery(select) if queries => format!("({})", query::select_sql(select)),
+        Expr::Exists { subquery, negated } if queries => format!(
+            "({}EXISTS ({}))",
+            if *negated { "NOT " } else { "" },
+            query::select_sql(subquery)
+        ),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } if queries => format!(
+            "({} {}IN ({}))",
+            expr_to_sql(expr),
+            if *negated { "NOT " } else { "" },
+            query::select_sql(subquery)
+        ),
+        Expr::QuantifiedComparison {
+            left,
+            op,
+            quantifier,
+            right,
+        } if queries => {
+            let right = match right {
+                super::QuantifiedComparisonRight::Subquery(select) => query::select_sql(select),
+                super::QuantifiedComparisonRight::List(items) => {
+                    items.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ")
+                }
+            };
+            format!(
+                "({} {} {:?} ({}))",
+                expr_to_sql(left),
+                binary_op_sql_pub(*op),
+                quantifier,
+                right
+            )
+        }
+        Expr::WindowFunction { name, args, spec } if queries => format!(
+            "{}({}) OVER ({})",
+            function_name_sql(name),
+            args.iter().map(expr_to_sql).collect::<Vec<_>>().join(", "),
+            query::window_sql(
+                &spec.partition_by,
+                &spec.order_by,
+                spec.frame.as_ref(),
+                spec.inherits.as_deref()
+            )
         ),
         Expr::Subquery(_)
         | Expr::QuantifiedComparison { .. }

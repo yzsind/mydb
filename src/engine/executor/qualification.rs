@@ -31,6 +31,13 @@ pub(super) fn qualify_statement_tables<'q>(
 ) -> Result<(), QueryError> {
     let statement = statement.into();
     match statement {
+        crate::parser::QueryMut::Other(Statement::RowSecurity(command)) => {
+            use crate::parser::rls::RlsStatement;
+            match command {
+                RlsStatement::Create { table, .. } | RlsStatement::Alter { table, .. } | RlsStatement::Drop { table, .. } | RlsStatement::Enable { table, .. } | RlsStatement::Show { table, .. } => *table = qualify_persistent_table_name(session, table),
+                _ => {},
+            }
+        }
         crate::parser::QueryMut::Other(Statement::Insert(stmt)) => {
             stmt.table = qualify_table_name(session, &stmt.table);
             match &mut stmt.source {

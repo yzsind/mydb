@@ -10,6 +10,12 @@ macro_rules! define_walk {
         ) {
             visitor.enter_statement(statement);
             match statement {
+                Statement::RowSecurity(command) => {
+                    match command {
+                        crate::parser::rls::RlsStatement::SetContext { value, .. } => walk_expr(visitor, value),
+                        _ => {},
+                    }
+                },
                 Statement::Ai(command) => { if let Some(value) = & $($mutable)* command.value { walk_expr(visitor, value); } },
                 Statement::CreateView { query, .. } | Statement::AlterView { query, .. } => {
                     walk_query(visitor, query)

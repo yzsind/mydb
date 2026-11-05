@@ -22,6 +22,7 @@ pub(in crate::engine::executor) struct ExecutionContext {
     params: Option<crate::engine::params::ParamContextSnapshot>,
     budget: Arc<MemBudget>,
     session_expr_info: Option<SessionExprInfo>,
+    rls_evaluation: Option<crate::engine::rls::EvaluationSnapshot>,
     statement_now_micros: i64,
     http_context: Option<crate::engine::http::Context>,
     // Owned per-context clone: SessionContext is Send but intentionally not
@@ -255,6 +256,7 @@ impl ExecutionContext {
             params: crate::engine::params::snapshot_current_context(),
             budget,
             session_expr_info: crate::engine::expr::current_session_expr_info(),
+            rls_evaluation: crate::engine::rls::evaluation_snapshot(),
             statement_now_micros: crate::engine::expr::session_utc_now()
                 .and_utc()
                 .timestamp_micros(),
@@ -379,6 +381,7 @@ impl ExecutionContext {
         f: impl FnOnce() -> R,
     ) -> R {
         let txn = self.txn;
+        let _security = crate::engine::rls::EvaluationScope::enter_snapshot(self.rls_evaluation.as_ref());
         let _statement_now =
             crate::engine::api::StatementNowScope::enter(self.statement_now_micros);
         let _http_scope = crate::engine::http::enter_context(self.http_context.as_ref());

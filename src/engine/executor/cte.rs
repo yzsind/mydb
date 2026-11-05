@@ -1181,6 +1181,7 @@ fn fork_cte_worker_session(parent: &SessionContext) -> SessionContext {
         user: parent.user.clone(),
         host: parent.host.clone(),
         authenticated_as: parent.authenticated_as.clone(),
+        rls: parent.rls.clone(),
         login_user: parent.login_user.clone(),
         active_roles: parent.active_roles.clone(),
         auth_epoch: parent.auth_epoch,

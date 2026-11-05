@@ -7536,6 +7536,7 @@ mod tests {
             mysql_table_options: Vec::new(),
             column_name_map: Default::default(),
             column_id_map: Default::default(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Default::default(),
         };
         table.build_column_index();

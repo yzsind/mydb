@@ -42,8 +42,9 @@
 //
 // 4. Data-dictionary writes are detected (any path `tables/<id>.heap`
 //    with `id ≥ DD_TABLE_ID_BASE`). Their txn_id is recorded in
-//    `applier_dd_dirty_txns`; on the matching `CommitTxn`, CatalogDelta
-//    refreshes only affected table ids or the bounded non-table families.
+//    `applier_dd_dirty_txns`. CatalogDelta precedes DD writes and pins old
+//    descriptors; CommitTxn refreshes only affected table ids or bounded
+//    non-table families before releasing those leases.
 //
 // 5. Checkpoint records are replica-local. File lifecycle records and undo
 //    records are applied online as well: promotion needs the undo directory to
@@ -341,10 +342,41 @@ impl Database {
                 object_ids,
                 invalidate_all,
             } => {
+                use crate::engine::executor::mem_budget::{
+                    ControlledMemoryCategory, ControlledMemoryCharge,
+                };
+                let mut old_tables = Vec::new();
+                for id in object_ids {
+                    if let Some(table) = self.table_by_id_checked(*id)? {
+                        if !old_tables
+                            .iter()
+                            .any(|old: &CatalogApplyTableLease| old.table.id == table.id)
+                        {
+                            let memory = ControlledMemoryCharge::try_new(
+                                ControlledMemoryCategory::SystemMetadata,
+                                CatalogManager::descriptor_bytes(&table)
+                                    .saturating_add(std::mem::size_of::<CatalogApplyTableLease>()),
+                            )?;
+                            old_tables.push(CatalogApplyTableLease {
+                                table,
+                                _memory: memory,
+                            });
+                        }
+                    }
+                }
                 let mut deltas = self.applier_dd_dirty_txns.lock();
                 let delta = deltas.entry(txn_id).or_default();
                 delta.invalidate_all |= *invalidate_all;
                 delta.object_ids.extend(object_ids.iter().copied());
+                for lease in old_tables {
+                    if !delta
+                        .old_tables
+                        .iter()
+                        .any(|old| old.table.id == lease.table.id)
+                    {
+                        delta.old_tables.push(lease);
+                    }
+                }
             }
             WalPayload::SequenceState {
                 sequence_id,
@@ -1087,17 +1119,32 @@ impl Database {
     }
 
     fn apply_commit_txn(&self, txn_id: u64, commit_scn: u64) -> Result<(), QueryError> {
-        let ddl_ids = self
+        let (ddl_ids, mut old_tables) = self
             .applier_dd_dirty_txns
             .lock()
             .get(&txn_id)
             .filter(|d| d.dd_touched)
-            .map(|d| d.object_ids.iter().copied().collect::<Vec<_>>())
+            .map(|d| {
+                (
+                    d.object_ids.iter().copied().collect::<Vec<_>>(),
+                    d.old_tables
+                        .iter()
+                        .map(|lease| lease.table.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
             .unwrap_or_default();
-        let old_tables = ddl_ids
-            .iter()
-            .filter_map(|id| self.table_by_id(*id))
-            .collect::<Vec<_>>();
+        for id in ddl_ids {
+            if old_tables
+                .iter()
+                .any(|table| table.id == id || table.storage_ids().contains(&id))
+            {
+                continue;
+            }
+            if let Some(table) = self.table_by_id(id) {
+                old_tables.push(table);
+            }
+        }
         let requests: Vec<_> = old_tables
             .iter()
             .map(|t| MdlRequest {
@@ -1238,6 +1285,23 @@ impl Database {
                     ));
                     return Err(err);
                 }
+                let incoming_security_objects: HashSet<_> = loaded.iter()
+                    .filter_map(|(_, table)| table.as_ref().map(|table| table.object_id)).collect();
+                let security_changes = loaded.iter().filter_map(|(id, new)| {
+                    if let Some(table) = new {
+                        Some((table.object_id, Some((table.id, table.row_security.clone()))))
+                    } else {
+                        old_tables.iter().find(|table| table.id == *id && !incoming_security_objects.contains(&table.object_id)).map(|table| (table.object_id, None))
+                    }
+                }).collect();
+                let security_publication = self.catalog.row_security.prepare(security_changes, |id, version| {
+                    if let Some(old) = old_tables.iter().find(|table| table.id == id && table.row_security.version == version) {
+                        Ok(old.row_security.clone())
+                    } else { self.load_row_security_snapshot(id, version) }
+                }).map_err(|err| {
+                    self.quarantine_mvcc(format!("replicated policy publication failed: {}", err.message()));
+                    err
+                })?;
                 {
                     let mut catalog = self.catalog.write().map_err(|_| {
                         self.quarantine_mvcc("replicated catalog lock poisoned");
@@ -1279,6 +1343,7 @@ impl Database {
                             catalog.tables.insert(table.qualified_name(), table.clone());
                         }
                     }
+                    if let Some(publication) = security_publication { publication.publish(); }
                 }
                 // CatalogManager keeps a compact id→key index and bounded
                 // descriptor/header caches outside the live Catalog value.

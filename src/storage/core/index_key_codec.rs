@@ -147,7 +147,7 @@ pub(crate) fn encode_part_memcmp(part: &KeyPart, out: &mut Vec<u8>) {
                 encode_varlen_into(bytes, out);
             });
         }
-        KeyPart::Param { .. } => {
+        KeyPart::Param { .. } | KeyPart::Statement { .. } => {
             panic!("internal error: KeyPart::Param leaked into memcmp encoding")
         }
     }
@@ -199,7 +199,7 @@ fn estimated_memcmp_len(key: &IndexKey) -> usize {
             KeyPart::Bytes(v) => 1 + v.len() + 2,
             KeyPart::String(v) => 1 + v.len() + 2,
             KeyPart::CollatedString { value, .. } => 1 + 2 + value.len() + 2,
-            KeyPart::Param { .. } => 0,
+            KeyPart::Param { .. } | KeyPart::Statement { .. } => 0,
         })
         .sum()
 }
@@ -402,7 +402,7 @@ pub(crate) fn encoded_index_key_len_v6(key: &IndexKey) -> usize {
             KeyPart::Bytes(v) => 4 + v.len(),
             KeyPart::String(v) => 4 + v.as_bytes().len(),
             KeyPart::CollatedString { value, .. } => 2 + 4 + value.as_bytes().len(),
-            KeyPart::Param { .. } => 0,
+            KeyPart::Param { .. } | KeyPart::Statement { .. } => 0,
         };
     }
     len

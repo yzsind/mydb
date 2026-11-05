@@ -575,6 +575,7 @@ fn execute_statement_inner(
 ) -> Result<QueryResponse, QueryError> {
     use crate::engine::session_registry::ProcessState;
     let _http_scope = crate::engine::http::enter(db);
+    super::rls::enforce_policy_statement(&statement)?;
 
     if session.current_database.is_empty()
         && auth_required_privileges(session, &statement)
@@ -620,6 +621,7 @@ fn execute_statement_inner(
         });
     }
     ai::validate(session, &statement)?;
+    super::rls::enforce_statement(db, session, &statement)?;
     publish_optimizer_hint_diagnostics(&statement);
     let _backup_ddl_admission = crate::backup::ddl_admission(db, &statement)?;
     {
@@ -3321,7 +3323,7 @@ pub(super) fn execute_statement_with_qualification(
         })
         && !super::routines::statement_references_stored_function(
             db,
-            &session.current_database,
+            session,
             &statement,
         )
     {
@@ -3480,6 +3482,7 @@ fn auth_required_privileges(
         }
     };
     match statement {
+        Statement::RowSecurity(_) => Vec::new(),
         Statement::Ai(_) => Vec::new(),
         Statement::AlterSystemReloadHttpConfig | Statement::ShowHttpStatus => {
             vec![global(Privilege::Dynamic("HTTP_ADMIN".into()))]
@@ -7629,6 +7632,7 @@ pub(super) fn execute_qualified_statement(
     mut statement: Statement,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    super::rls::enforce_policy_statement(&statement)?;
     let _rowid_demand = crate::storage::rowid::DemandScope::enter(&statement);
     authorize_statement(db, session, &statement)?;
     if crate::binlog::enabled() {
@@ -7705,6 +7709,7 @@ pub(super) fn execute_qualified_statement(
                     .collect(),
             }))
         }
+        Statement::RowSecurity(command) => super::rls::execute(db, session, command),
         Statement::Ai(command) => ai::admin(db, session, command, registry),
         Statement::Begin {
             read_only,
@@ -7733,7 +7738,9 @@ pub(super) fn execute_qualified_statement(
             let txn = ensure_statement_txn(db, session)?;
             // Successful temporary DDL is not user-transactional. Only the
             // storage engine's DML savepoint participates in ROLLBACK TO.
+            let rls_savepoint = session.rls.prepare_savepoint(&name)?;
             db.create_named_savepoint(txn.txn_id, name)?;
+            session.rls.install_savepoint(rls_savepoint);
             Ok(QueryResponse::Ok)
         }
         Statement::RollbackToSavepoint(name) => {
@@ -7745,6 +7752,7 @@ pub(super) fn execute_qualified_statement(
                 ));
             };
             db.rollback_to_named_savepoint(txn_id, &name)?;
+            session.rls.rollback_to(&name);
             Ok(QueryResponse::Ok)
         }
         Statement::ReleaseSavepoint(name) => {
@@ -7756,6 +7764,7 @@ pub(super) fn execute_qualified_statement(
                 ));
             };
             db.release_named_savepoint(txn_id, &name)?;
+            session.rls.release(&name);
             Ok(QueryResponse::Ok)
         }
         Statement::Prepare { name, source } => {
@@ -10331,6 +10340,8 @@ fn execute_do_statement(
         .map(|expr| SelectItem::Expr { expr, alias: None })
         .collect();
     let synthetic_select = Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection,
         ..Select::default()
     };
