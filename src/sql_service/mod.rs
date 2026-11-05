@@ -1,8 +1,11 @@
-use super::{
-    codec::{self, SqlItem},
-    config::RestConfig,
+//! Shared API-key SQL sessions, execution, and bounded result delivery.
+pub(crate) mod codec;
+pub(crate) mod failure;
+use self::{
+    codec::SqlItem,
     failure::{Failure, Result},
 };
+use crate::rest::RestConfig;
 use crate::{
     engine::{
         api::{self, QueryEngine, QueryResponse, ResultCursor, SessionContext, VecResultCursor},
@@ -12,11 +15,7 @@ use crate::{
     },
     mysql::connection_manager::ConnectionSlot,
 };
-use axum::{
-    body::{Body, Bytes},
-    http::{HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-};
+use axum::{body::Bytes, http::StatusCode};
 use parking_lot::Mutex;
 use serde_json::{json, Value as J};
 use std::{
@@ -67,6 +66,28 @@ impl Memory {
         }
         self.bytes += bytes;
         Ok(())
+    }
+}
+/// Ownership carried through classification and SQL even if the caller stops
+/// awaiting. An optional adapter admission lease also covers detached workers.
+pub struct ExecutionResources {
+    _memory: Memory,
+    _admission: Option<Arc<OwnedSemaphorePermit>>,
+}
+impl From<Memory> for ExecutionResources {
+    fn from(memory: Memory) -> Self {
+        Self {
+            _memory: memory,
+            _admission: None,
+        }
+    }
+}
+impl ExecutionResources {
+    pub fn with_admission(memory: Memory, admission: Arc<OwnedSemaphorePermit>) -> Self {
+        Self {
+            _memory: memory,
+            _admission: Some(admission),
+        }
     }
 }
 pub struct State<E: QueryEngine> {
@@ -402,7 +423,15 @@ impl<E: QueryEngine> Session<E> {
         if self.busy.load(Ordering::Acquire) {
             return;
         }
-        let ctx = self.context.lock().take();
+        let ctx = {
+            let mut context = self.context.lock();
+            // Serialize the ownership check with execution admission. A close
+            // which observed an idle session must not steal a newly busy context.
+            if self.busy.load(Ordering::Acquire) {
+                return;
+            }
+            context.take()
+        };
         if let Some(mut ctx) = ctx {
             let s = self.clone();
             let _ = crate::util::blocking_pool::spawn(move || {
@@ -469,6 +498,29 @@ impl<E: QueryEngine> Drop for Session<E> {
         }
     }
 }
+struct SessionCreation<E: QueryEngine> {
+    session: Mutex<Option<Arc<Session<E>>>>,
+    abandoned: AtomicBool,
+}
+struct CreationGuard<E: QueryEngine> {
+    creation: Arc<SessionCreation<E>>,
+    runtime: tokio::runtime::Handle,
+    armed: bool,
+}
+impl<E: QueryEngine> Drop for CreationGuard<E> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.creation.abandoned.store(true, Ordering::Release);
+            let session = self.creation.session.lock().take();
+            if let Some(session) = session {
+                session.begin_close();
+                self.runtime.spawn(async move {
+                    session.cleanup_idle().await;
+                });
+            }
+        }
+    }
+}
 pub async fn create_session<E: QueryEngine>(
     state: Arc<State<E>>,
     identity: Identity,
@@ -480,7 +532,19 @@ pub async fn create_session<E: QueryEngine>(
         .try_acquire_owned()
         .map_err(|_| Failure::unavailable("REST session limit exceeded"))?;
     let memory = state.memory(std::mem::size_of::<Session<E>>() + 16384)?;
-    crate::util::blocking_pool::spawn(move || {
+    let creation = Arc::new(SessionCreation {
+        session: Mutex::new(None),
+        abandoned: AtomicBool::new(false),
+    });
+    let runtime = tokio::runtime::Handle::current();
+    let mut guard = CreationGuard {
+        creation: creation.clone(),
+        runtime: runtime.clone(),
+        armed: true,
+    };
+    let worker_creation = creation.clone();
+    let result = crate::util::blocking_pool::spawn(move || {
+        let _runtime = runtime.enter();
         let slot = ConnectionSlot::acquire_with_admin_reserve(
             crate::mysql::connection_manager::effective_max_connections(),
         ).ok_or_else(|| Failure::unavailable("SQL connection limit exceeded"))?;
@@ -520,22 +584,38 @@ pub async fn create_session<E: QueryEngine>(
             engine: state.engine.clone(), registry: state.registry.clone(), handle,
             context: Mutex::new(Some(ctx)), slot: Mutex::new(Some(slot)),
             txn_admission: Mutex::new(None),
-            closed: AtomicBool::new(false), busy: AtomicBool::new(false),
+            closed: AtomicBool::new(false), busy: AtomicBool::new(true),
             touched: AtomicU64::new(now()), transaction: AtomicBool::new(false),
             transaction_touched: AtomicU64::new(now()), info: Mutex::new(info),
             _permit: Mutex::new(Some(permit)), owner_state:Arc::downgrade(&state), _memory: memory,
         });
-        if let Some(database) = database {
-            let mut guard = session.context.lock();
-            if let Err(error) = state.engine.init_session_database(guard.as_mut().unwrap(), &database) {
-                drop(guard);
-                return Err(error.into());
-            }
-            session.info.lock()["database"] = json!(database);
+        *worker_creation.session.lock() = Some(session.clone());
+        state.sessions.lock().insert(session.id.clone(), session.clone());
+        let mut context = session.context.lock().take().expect("new session owns its context");
+        let initialized = if worker_creation.abandoned.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
+            Err(Failure::not_found())
+        } else if let Some(database) = database {
+            state.engine.init_session_database(&mut context, &database).map_err(Failure::from)
+        } else { Ok(()) };
+        session.info.lock()["database"] = json!(context.current_database);
+        *session.context.lock() = Some(context);
+        session.busy.store(false, Ordering::Release);
+        if initialized.is_err() || worker_creation.abandoned.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
+            session.begin_close();
+            let cleanup = session.clone();
+            runtime.spawn(async move { cleanup.cleanup_idle().await; });
+            initialized?;
+            return Err(Failure::not_found());
         }
         Ok(session)
-    }).await.map_err(|_| Failure::internal("Session admission worker failed"))?
+    }).await.map_err(|_| Failure::internal("Session admission worker failed"))?;
+    if result.is_ok() {
+        guard.armed = false;
+        creation.session.lock().take();
+    }
+    result
 }
+
 pub struct RequestState<E: QueryEngine> {
     pub id: String,
     pub key_id: String,
@@ -556,17 +636,20 @@ impl<E: QueryEngine> RequestState<E> {
             queue.push_back(Arc::downgrade(self));
         }
     }
-    pub fn cancel(&self) {
+    pub fn cancel(&self) -> bool {
         let mut status = self.state.lock();
-        if self.completed.load(Ordering::Acquire) == 0 {
-            if let Some(s) = self.session.upgrade() {
-                s.handle.cancel_query();
-                s.handle.mark_killed_state();
-                crate::engine::cancel::record_killed_query();
-                s.engine.notify_lock_waiters_for_kill();
-            }
-            status["state"] = json!("cancel_requested");
+        if self.completed.load(Ordering::Acquire) != 0 {
+            return false;
         }
+        let Some(session) = self.session.upgrade() else {
+            return false;
+        };
+        session.handle.cancel_query();
+        session.handle.mark_killed_state();
+        crate::engine::cancel::record_killed_query();
+        session.engine.notify_lock_waiters_for_kill();
+        status["state"] = json!("cancel_requested");
+        true
     }
 }
 struct GovernedPayload {
@@ -585,27 +668,64 @@ pub(super) fn governed_bytes(bytes: Vec<u8>, memory: Memory) -> Bytes {
         _memory: memory,
     })
 }
-pub struct Chunk {
-    pub bytes: Bytes,
-    pub terminal: bool,
-    status: StatusCode,
+pub enum Payload {
+    Encoded(Bytes),
+    Structured(J, Memory),
 }
-pub struct ResponseStream<E: QueryEngine> {
+#[derive(Clone, Copy)]
+pub enum OutputFormat {
+    Json,
+    Ndjson,
+    Structured {
+        max_rows: usize,
+        max_bytes: usize,
+        explain_only: bool,
+    },
+}
+impl OutputFormat {
+    fn streaming(self) -> bool {
+        matches!(self, Self::Ndjson)
+    }
+    fn max_bytes(self, default: usize) -> usize {
+        match self {
+            Self::Structured { max_bytes, .. } => max_bytes,
+            _ => default,
+        }
+    }
+}
+pub struct Chunk {
+    pub payload: Payload,
+    pub terminal: bool,
+    pub status: StatusCode,
+    permit: Option<OwnedSemaphorePermit>,
+}
+pub struct ExecutionStream<E: QueryEngine> {
     first: Option<Chunk>,
     rx: mpsc::Receiver<Chunk>,
     session: Arc<Session<E>>,
     terminal: bool,
     temporary: bool,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
     deadline: Pin<Box<tokio::time::Sleep>>,
     timed_out: bool,
 }
-impl<E: QueryEngine> Stream for ResponseStream<E> {
-    type Item = std::result::Result<Bytes, std::io::Error>;
+impl<E: QueryEngine> ExecutionStream<E> {
+    pub fn abandon(&self) {
+        self.session.begin_close();
+    }
+    pub fn status(&self) -> StatusCode {
+        self.first.as_ref().map_or(StatusCode::OK, |c| c.status)
+    }
+}
+impl<E: QueryEngine> Stream for ExecutionStream<E> {
+    type Item = std::result::Result<Chunk, std::io::Error>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(chunk) = self.first.take() {
+        if let Some(mut chunk) = self.first.take() {
             self.terminal |= chunk.terminal;
-            return Poll::Ready(Some(Ok(chunk.bytes)));
+            if let Some(permit) = chunk.permit.take() {
+                self._permit = Some(permit);
+            }
+            return Poll::Ready(Some(Ok(chunk)));
         }
         if !self.terminal
             && !self.timed_out
@@ -623,16 +743,19 @@ impl<E: QueryEngine> Stream for ResponseStream<E> {
             return Poll::Ready(None);
         }
         match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(chunk)) => {
+            Poll::Ready(Some(mut chunk)) => {
                 self.terminal |= chunk.terminal;
-                Poll::Ready(Some(Ok(chunk.bytes)))
+                if let Some(permit) = chunk.permit.take() {
+                    self._permit = Some(permit);
+                }
+                Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
 }
-impl<E: QueryEngine> Drop for ResponseStream<E> {
+impl<E: QueryEngine> Drop for ExecutionStream<E> {
     fn drop(&mut self) {
         if self.temporary {
             self.session.closed.store(true, Ordering::Release);
@@ -687,6 +810,8 @@ pub struct Output<E: QueryEngine> {
     state: Arc<State<E>>,
     tx: mpsc::Sender<Chunk>,
     stream: bool,
+    format: OutputFormat,
+    rows: usize,
     pub results: Vec<J>,
     pub bytes: usize,
     results_omitted: bool,
@@ -694,9 +819,20 @@ pub struct Output<E: QueryEngine> {
     deadline: Instant,
     cancel: crate::engine::cancel::QueryCancelToken,
     status: StatusCode,
+    permit: Option<OwnedSemaphorePermit>,
 }
 impl<E: QueryEngine> Output<E> {
     fn send(&mut self, value: J, terminal: bool) -> Result<()> {
+        if matches!(self.format, OutputFormat::Structured { .. }) {
+            let memory = std::mem::replace(&mut self._memory, self.state.memory(0)?);
+            let permit = if terminal { self.permit.take() } else { None };
+            return self.deliver(Chunk {
+                payload: Payload::Structured(value, memory),
+                terminal,
+                status: self.status,
+                permit,
+            });
+        }
         let required = codec::encoded_len(&value)? + usize::from(self.stream);
         let mut bytes = Vec::with_capacity(required);
         serde_json::to_writer(&mut bytes, &value)
@@ -709,18 +845,30 @@ impl<E: QueryEngine> Output<E> {
             self._memory = self.state.memory(0)?;
         }
         let memory = self.state.memory(bytes.capacity() + 128)?;
+        let permit = if terminal { self.permit.take() } else { None };
         self.deliver(Chunk {
-            bytes: governed_bytes(bytes, memory),
+            payload: Payload::Encoded(governed_bytes(bytes, memory)),
             terminal,
             status: self.status,
+            permit,
         })
     }
     fn send_control(
-        &self,
+        &mut self,
         request: &Arc<RequestState<E>>,
         value: J,
         status: StatusCode,
     ) -> Result<()> {
+        if matches!(self.format, OutputFormat::Structured { .. }) {
+            let memory = request._memory.lock().split(2048);
+            let permit = self.permit.take();
+            return self.deliver(Chunk {
+                payload: Payload::Structured(value, memory),
+                terminal: true,
+                status,
+                permit,
+            });
+        }
         let mut bytes =
             serde_json::to_vec(&value).map_err(|_| Failure::internal("Error encoding failed"))?;
         if self.stream {
@@ -736,17 +884,21 @@ impl<E: QueryEngine> Output<E> {
             }
             reservation.split(required)
         };
+        let permit = self.permit.take();
         self.deliver(Chunk {
-            bytes: governed_bytes(bytes, memory),
+            payload: Payload::Encoded(governed_bytes(bytes, memory)),
             terminal: true,
             status,
+            permit,
         })
     }
     fn deliver(&self, chunk: Chunk) -> Result<()> {
         let terminal = chunk.terminal;
-        self.state
-            .sent_bytes
-            .fetch_add(chunk.bytes.len() as u64, Ordering::Relaxed);
+        if let Payload::Encoded(bytes) = &chunk.payload {
+            self.state
+                .sent_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
         let remaining = if terminal {
             Duration::from_secs(1)
         } else {
@@ -781,12 +933,46 @@ impl<E: QueryEngine> Output<E> {
             Ok(())
         }
     }
+    fn push_result(&mut self, result: J, charged_row_bytes: usize) -> Result<()> {
+        if self.stream || self.results_omitted {
+            return Ok(());
+        }
+        if matches!(self.format, OutputFormat::Json) {
+            self.results.push(result);
+            return Ok(());
+        }
+        let overhead = codec::encoded_len(&result)?
+            .saturating_sub(charged_row_bytes)
+            .saturating_add(1);
+        if self.bytes.saturating_add(overhead)
+            > self
+                .format
+                .max_bytes(self.state.config.max_json_response_bytes)
+        {
+            self.results_omitted = true;
+            self.results.clear();
+            self._memory = self.state.memory(0)?;
+            return Ok(());
+        }
+        self.bytes += overhead;
+        self.state.grow_memory(
+            &mut self._memory,
+            overhead.saturating_mul(3).saturating_add(128),
+        )?;
+        self.results.push(result);
+        Ok(())
+    }
     fn row(&mut self, row: J, rows: &mut Vec<J>, bytes: usize) -> Result<()> {
         if !self.stream && self.results_omitted {
             return Ok(());
         }
+        self.rows = self.rows.saturating_add(1);
         if !self.stream
-            && self.bytes.saturating_add(bytes) > self.state.config.max_json_response_bytes
+            && (self.bytes.saturating_add(bytes)
+                > self
+                    .format
+                    .max_bytes(self.state.config.max_json_response_bytes)
+                || matches!(self.format, OutputFormat::Structured { max_rows, .. } if self.rows > max_rows))
         {
             // Drain the cursor and finish execution/COMMIT before reporting the
             // output failure. A response limit must not obscure a known outcome.
@@ -796,7 +982,11 @@ impl<E: QueryEngine> Output<E> {
             self._memory = self.state.memory(0)?;
             return Ok(());
         }
-        if bytes > self.state.config.max_json_response_bytes {
+        if bytes
+            > self
+                .format
+                .max_bytes(self.state.config.max_json_response_bytes)
+        {
             return Err(Failure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "RESULT_TOO_LARGE",
@@ -805,7 +995,11 @@ impl<E: QueryEngine> Output<E> {
         }
         if !self.stream {
             self.bytes = self.bytes.saturating_add(bytes);
-            if self.bytes > self.state.config.max_json_response_bytes {
+            if self.bytes
+                > self
+                    .format
+                    .max_bytes(self.state.config.max_json_response_bytes)
+            {
                 return Err(Failure::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "RESULT_TOO_LARGE",
@@ -860,9 +1054,7 @@ fn emit<E: QueryEngine>(
                 };
                 let result = json!({"statement_index":statement,"result_index":current,"kind":"ok","affected_rows":affected.to_string(),"matched_rows":meta["matched_rows"],"last_insert_id":meta["last_insert_id"],"info":meta["info"],"diagnostics":diagnostics(ctx)});
                 output.event(json!({"type":"result_end","result":result}))?;
-                if !output.stream && !output.results_omitted {
-                    output.results.push(result);
-                }
+                output.push_result(result, 0)?;
                 return Ok(());
             }
             QueryResponse::MultiResult(_) => unreachable!(),
@@ -877,6 +1069,10 @@ fn emit<E: QueryEngine>(
     loop {
         crate::engine::cancel::check_cancelled()?;
         let Some(row) = cursor.next_row()? else { break };
+        if !output.stream && output.results_omitted {
+            row_count += 1;
+            continue;
+        }
         let row = codec::row(row, &columns)?;
         let size = codec::encoded_len(&row)?;
         if output.stream {
@@ -901,7 +1097,7 @@ fn emit<E: QueryEngine>(
     let end = json!({"statement_index":statement,"result_index":current,"row_count":row_count.to_string(),"diagnostics":diagnostics(ctx)});
     output.event(json!({"type":"result_end","result":end}))?;
     if !output.stream && !output.results_omitted {
-        output.results.push(json!({"statement_index":statement,"result_index":current,"kind":"result_set","columns":metadata,"rows":rows,"row_count":row_count.to_string(),"diagnostics":diagnostics(ctx)}));
+        output.push_result(json!({"statement_index":statement,"result_index":current,"kind":"result_set","columns":metadata,"rows":rows,"row_count":row_count.to_string(),"diagnostics":diagnostics(ctx)}), batch_bytes)?;
     }
     Ok(())
 }
@@ -987,6 +1183,7 @@ fn perform<E: QueryEngine>(
     output: &mut Output<E>,
     failed_at: &mut usize,
     started: &mut bool,
+    owns_atomic_transaction: &mut bool,
 ) -> Result<()> {
     if session.closed.load(Ordering::Acquire)
         || !state
@@ -1008,8 +1205,26 @@ fn perform<E: QueryEngine>(
     }
     // Decode all parameter values before the first side effect.
     let mut prepared = Vec::new();
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
+        *failed_at = index;
         let parsed = parse_item(item, ctx)?;
+        if matches!(
+            output.format,
+            OutputFormat::Structured {
+                explain_only: true,
+                ..
+            }
+        ) {
+            use crate::parser::Statement as S;
+            if !matches!(&parsed.0, S::Explain { analyze: false, target, .. }
+                if matches!(target.as_ref(), S::Select(_) | S::WithCte(_) | S::SetOperation(_)
+                    | S::Insert(_) | S::Update(_) | S::Delete(_)))
+            {
+                return Err(Failure::bad(
+                    "explain_sql accepts an explainable SQL statement, without EXPLAIN or ANALYZE",
+                ));
+            }
+        }
         if atomic && !atomic_allowed(&parsed.0) {
             return Err(Failure::bad(
                 "Atomic batch accepts transactional query and DML statements only",
@@ -1024,6 +1239,9 @@ fn perform<E: QueryEngine>(
     }
     output.event(json!({"type":"request_start","request_id":request.id,"session_id":if temporary{None}else{Some(&session.id)}}))?;
     if atomic {
+        // Precondition/argument failures must never roll back a transaction
+        // which was already owned by the caller before this request.
+        *owns_atomic_transaction = true;
         state.engine.execute(ctx, "BEGIN")?;
     }
     for (i, item) in items.iter().enumerate() {
@@ -1081,7 +1299,7 @@ fn perform<E: QueryEngine>(
     }
     Ok(())
 }
-pub async fn execute<E: QueryEngine>(
+pub async fn start<E: QueryEngine>(
     state: Arc<State<E>>,
     session: Arc<Session<E>>,
     items: Vec<SqlItem>,
@@ -1089,9 +1307,11 @@ pub async fn execute<E: QueryEngine>(
     temporary: bool,
     timeout_ms: u64,
     id: String,
-    stream: bool,
-    request_memory: Memory,
-) -> Result<Response> {
+    format: OutputFormat,
+    request_memory: impl Into<ExecutionResources> + Send,
+) -> Result<ExecutionStream<E>> {
+    let request_memory = request_memory.into();
+    let stream = format.streaming();
     let admitted_at = Instant::now();
     let absolute_deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let permit = state
@@ -1117,6 +1337,28 @@ pub async fn execute<E: QueryEngine>(
         executing: false,
         request: None,
     };
+    let (mode, in_transaction, token) = {
+        let mut context = session.context.lock();
+        if session.closed.load(Ordering::Acquire) {
+            return Err(Failure::not_found());
+        }
+        let context = context.as_mut().ok_or_else(Failure::not_found)?;
+        // Snapshot before publishing a cancellable request. Otherwise an early
+        // cancellation can be swallowed by this generation refresh.
+        context.refresh_cancel_generations();
+        let token = context
+            .current_cancel_token()
+            .ok_or_else(|| Failure::internal("Missing SQL cancellation context"))?
+            .clone();
+        if session.closed.load(Ordering::Acquire) {
+            return Err(Failure::not_found());
+        }
+        (
+            api::parse_temporal_sql_mode_bits(&context.sql_mode),
+            context.in_transaction(),
+            token,
+        )
+    };
     let memory = state.memory(4096)?;
     let request = Arc::new(RequestState {
         id: id.clone(),
@@ -1131,25 +1373,9 @@ pub async fn execute<E: QueryEngine>(
     });
     state.register_request(request.clone())?;
     guard.request = Some(request.clone());
-    session
-        .context
-        .lock()
-        .as_mut()
-        .unwrap()
-        .refresh_cancel_generations();
-    // Admission waits run on the reactor, never on a blocking-pool worker.
-    // Retaining the permit across open transactions preserves a free worker
-    // for the COMMIT/ROLLBACK which releases contended row locks.
+    // Admission waits run on the reactor. Open transactions retain their
+    // scheduling permit so COMMIT/ROLLBACK can always make progress.
     guard.started = true;
-    let (mode, in_transaction, token) = {
-        let context = session.context.lock();
-        let context = context.as_ref().unwrap();
-        (
-            api::parse_temporal_sql_mode_bits(&context.sql_mode),
-            context.in_transaction(),
-            context.current_cancel_token().unwrap().clone(),
-        )
-    };
     let source: Vec<_> = items.iter().map(|item| item.sql.clone()).collect();
     let classification_token = token.clone();
     let classification = crate::util::blocking_pool::spawn(move || {
@@ -1160,7 +1386,7 @@ pub async fn execute<E: QueryEngine>(
                 .max(Duration::from_nanos(1)),
         );
         let _mode = crate::parser::ParserSqlModeGuard::activate(mode);
-        in_transaction
+        let needs_admission = in_transaction
             || source.iter().any(|sql| {
                 crate::parser::parse_statement(sql).is_ok_and(|statement| {
                     !crate::mysql::session::statement_is_lock_safe_read(&statement)
@@ -1170,9 +1396,12 @@ pub async fn execute<E: QueryEngine>(
                                 !crate::engine::cbo::function_cost::is_known_builtin_function(name)
                             })
                 })
-            })
+            });
+        // Transfer the input charge through classification, not merely through
+        // its awaiting future. Dropping a BlockingHandle does not stop its job.
+        (needs_admission, request_memory, permit)
     });
-    let needs_admission = tokio::time::timeout_at(
+    let (needs_admission, request_memory, permit) = tokio::time::timeout_at(
         tokio::time::Instant::from_std(absolute_deadline),
         classification,
     )
@@ -1236,6 +1465,8 @@ pub async fn execute<E: QueryEngine>(
             state: worker_state.clone(),
             tx,
             stream,
+            format,
+            rows: 0,
             results: Vec::new(),
             bytes: 0,
             results_omitted: false,
@@ -1243,9 +1474,11 @@ pub async fn execute<E: QueryEngine>(
             deadline,
             cancel: ctx.current_cancel_token().unwrap().clone(),
             status: StatusCode::OK,
+            permit: Some(permit),
         };
         let mut failed_at = 0;
         let mut started = false;
+        let mut owns_atomic_transaction = false;
         let result = perform(
             &worker_state,
             &worker_session,
@@ -1257,19 +1490,35 @@ pub async fn execute<E: QueryEngine>(
             &mut output,
             &mut failed_at,
             &mut started,
+            &mut owns_atomic_transaction,
         );
         let commit_failed = atomic && failed_at == items.len() && result.is_err();
         if commit_failed {
             worker_session.begin_close();
         }
         let mut rolled_back = false;
-        if !commit_failed && result.is_err() && (atomic || temporary) && ctx.in_transaction() {
+        let mut cleanup_failed = false;
+        if !commit_failed
+            && result.is_err()
+            && (owns_atomic_transaction || temporary)
+            && ctx.in_transaction()
+        {
             // Cleanup must remain possible after the query deadline or cancellation fired.
             ctx.refresh_cancel_generations();
             let _cleanup_cancel = crate::engine::cancel::install_session_cancel_context(ctx);
             let _cleanup_deadline =
                 crate::engine::cancel::install_statement_deadline(Duration::ZERO);
-            rolled_back = worker_state.engine.execute(ctx, "ROLLBACK").is_ok();
+            rolled_back = worker_state
+                .engine
+                .rollback_session_for_cleanup(ctx)
+                .is_ok();
+            if !rolled_back {
+                // A caller must never be able to COMMIT a partially failed
+                // atomic batch after its rollback failed. Retain ownership for
+                // close_session cleanup and report the outcome as unknown.
+                cleanup_failed = true;
+                worker_session.begin_close();
+            }
         }
         let mut final_error = None;
         let mut status = match result {
@@ -1290,7 +1539,7 @@ pub async fn execute<E: QueryEngine>(
         } else {
             "unknown"
         };
-        let transaction = if commit_failed {
+        let transaction = if commit_failed || cleanup_failed {
             "unknown"
         } else if ctx.in_transaction() {
             "active"
@@ -1328,12 +1577,12 @@ pub async fn execute<E: QueryEngine>(
         if !stream
             && (output.results_omitted
                 || codec::encoded_len(&terminal).unwrap_or(usize::MAX)
-                    > worker_state.config.max_json_response_bytes)
+                    > format.max_bytes(worker_state.config.max_json_response_bytes))
         {
             let failure = Failure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "RESULT_TOO_LARGE",
-                "Complete JSON response exceeds limit; request NDJSON",
+                "Complete result exceeds configured response limit",
             );
             terminal["results"] = json!([]);
             terminal["results_omitted"] = json!(true);
@@ -1451,35 +1700,18 @@ pub async fn execute<E: QueryEngine>(
                 .with_outcome("unknown")
                 .with_request_id(id.clone())
         })?;
-    let status = first.status;
-    let response_stream = ResponseStream {
+    let response_stream = ExecutionStream {
         first: Some(first),
         rx,
         session: session.clone(),
         terminal: false,
         temporary,
-        _permit: permit,
+        _permit: None,
         deadline: Box::pin(tokio::time::sleep_until(transport_deadline)),
         timed_out: false,
     };
-    let mut response = (status, Body::from_stream(response_stream)).into_response();
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static(if stream {
-            "application/x-ndjson"
-        } else {
-            "application/json"
-        }),
-    );
-    response
-        .headers_mut()
-        .insert("cache-control", HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        "x-request-id",
-        HeaderValue::from_str(&id).map_err(|_| Failure::bad("Invalid request ID"))?,
-    );
     guard.armed = false;
-    Ok(response)
+    Ok(response_stream)
 }
 
 #[cfg(test)]

@@ -63,4 +63,5 @@ execution, and storage documentation.
 - [Unicode license](UNICODE-LICENSE.txt).
 
 - [REST SQL API](rest-api.md): authenticated HTTP SQL, persistent sessions, transactions, and streaming results.
+- [MCP Server](mcp.md) — AI client tools, SQL sessions, authentication, and limits.
 - [HTTP SQL Functions](http.md): bounded outbound HTTP/HTTPS calls from SQL.

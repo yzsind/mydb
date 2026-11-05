@@ -1567,10 +1567,14 @@ node egress policy, private CA bindings, account quotas, and runtime controls.
 
 ## REST SQL listener
 
-The REST SQL listener is disabled by default and shares the SQL engine and
+The shared REST SQL/MCP listener is disabled by default and shares the SQL engine and
 account resource limits with MySQL. See [REST SQL API](rest-api.md) for
 credentials, full key retrieval, transactions, result formats and recovery.
 All options below also support CLI `--rest-...` and `MYDB_REST_*` variables.
+The listener starts when either `rest_enabled` or `mcp_enabled` is ON; REST
+and MCP routes are enabled independently. The `rest_*` listener, TLS, SQL
+session and memory settings below apply to both protocols. See [MCP Server](mcp.md)
+for the `/mcp` endpoint, authentication and `mcp_*` limits.
 
 | Option | Default |
 | --- | --- |

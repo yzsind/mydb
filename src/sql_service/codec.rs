@@ -276,6 +276,32 @@ pub fn row(values: Vec<Value>, columns: &[Column]) -> Result<Json> {
     }
     Ok(Json::Array(out))
 }
+/// Fund SQL and bound parameters independently of the transport request. The
+/// worker may outlive a cancelled HTTP/SDK request and must retain its charge.
+pub fn input_memory_bytes(items: &[SqlItem]) -> Result<usize> {
+    let overflow = || Failure::unavailable("SQL input memory size exceeds supported range");
+    let mut bytes = std::mem::size_of::<SqlItem>()
+        .checked_mul(items.len())
+        .ok_or_else(overflow)?;
+    for item in items {
+        bytes = bytes.checked_add(item.sql.len()).ok_or_else(overflow)?;
+        for parameter in &item.params {
+            bytes = bytes
+                .checked_add(parameter.get().len())
+                .and_then(|n| {
+                    n.checked_add(
+                        std::mem::size_of::<Value>() + std::mem::size_of::<Box<RawValue>>(),
+                    )
+                })
+                .ok_or_else(overflow)?;
+        }
+    }
+    bytes
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or_else(overflow)
+}
+
 // Runtime temporal parameters can carry more precision than conservative
 // expression metadata. Preserve all value digits while retaining declared padding.
 fn temporal_fsp(declared: Option<u8>, fraction: u32) -> Option<u8> {
@@ -300,7 +326,7 @@ fn float(v: f64) -> Json {
 }
 
 /// Measure encoded payloads without allocating a second serialized copy.
-pub fn encoded_len(value: &Json) -> Result<usize> {
+pub fn encoded_len<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize> {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

@@ -157,12 +157,14 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     let listener = mydb::mysql::server::bind_listener(addr)?;
     let addr = listener.local_addr()?;
     let rest_config = mydb::rest::RestConfig::from_startup()?;
-    let rest_listener = if rest_config.enabled {
+    let mcp_config = mydb::mcp::McpConfig::from_startup()?;
+    let http_enabled = rest_config.enabled || mcp_config.enabled;
+    let rest_listener = if http_enabled {
         Some(mydb::mysql::server::bind_listener(rest_config.addr)?)
     } else {
         None
     };
-    let rest_tls = if rest_config.enabled && rest_config.tls {
+    let rest_tls = if http_enabled && rest_config.tls {
         let paths = rest_config
             .cert
             .as_deref()
@@ -291,9 +293,10 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     let rest_task = if let Some(listener) = rest_listener {
         mydb::rest::validate_credentials(&engine).map_err(startup_error)?;
         let server =
-            mydb::rest::RestServer::new(rest_config, engine.clone(), registry.clone(), rest_tls);
+            mydb::rest::RestServer::new(rest_config, engine.clone(), registry.clone(), rest_tls)
+                .with_mcp(mcp_config);
         log_message(format_args!(
-            "mydb REST listening on {}",
+            "mydb HTTP SQL/MCP listening on {}",
             listener.local_addr()?
         ));
         Some(tokio::spawn(async move {
@@ -396,6 +399,12 @@ fn print_help() {
          \x20 --slow-sql-ms MS               Legacy slow SQL threshold\n\
          \x20 --ssl-mode auto|disabled       TLS advertisement mode\n\
          \x20 --ssl-cert PATH --ssl-key PATH Configured TLS certificate and key\n\
+         \nMCP server (shared REST HTTP listener):\n\
+         \x20 --mcp-enabled ON|OFF           Enable /mcp (default OFF)\n\
+         \x20 --mcp-max-inflight N           MCP SQL concurrency (default 16)\n\
+         \x20 --mcp-max-result-rows N        Result row ceiling (default 1000)\n\
+         \x20 --mcp-max-result-bytes N       Response ceiling (default 1048576)\n\
+         \x20 --mcp-allowed-origins JSON     Exact HTTP origins (default [])\n\
          \nREST SQL server:\n\
          \x20 --rest-enabled ON|OFF          Enable REST SQL (default OFF)\n\
          \x20 --rest-host IP --rest-port N    REST address (default 127.0.0.1:8739)\n\

@@ -4154,6 +4154,10 @@ impl QueryEngine for StorageQueryEngine {
         result
     }
 
+    fn rollback_session_for_cleanup(&self, session: &mut SessionContext) -> Result<(), QueryError> {
+        rollback_session_txn(&self.db, session)
+    }
+
     fn close_session(&self, session: &mut SessionContext) -> Result<(), QueryError> {
         StorageQueryEngine::close_session(self, session)
     }
