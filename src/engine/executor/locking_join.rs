@@ -167,26 +167,40 @@ fn bind_source(
     });
     let mut builder = super::cte::CteSpillBuilder::new(columns, db.data_dir().to_path_buf());
     let mut origins = Vec::new();
-    for (storage_id, row) in db.scan_rows_with_storage(&reference.name, txn)? {
-        let origin = crate::storage::DmlRowRef {
-            storage_id,
-            row_id: row.row_id,
+    let mut append =
+        |origin: crate::storage::DmlRowRef, values: &[Value]| -> Result<(), QueryError> {
+            if skipped.contains(&(sources.len(), origin)) {
+                return Ok(());
+            }
+            let mut values = indices
+                .iter()
+                .map(|&i| values[i].clone())
+                .collect::<Vec<_>>();
+            values.push(Value::UInt(origins.len() as u64));
+            origins.push(origin);
+            builder.push(values)
         };
-        if skipped.contains(&(sources.len(), origin)) {
-            continue;
+    if reference.sample.is_some() {
+        let (refs, _charge) = super::select::sampling::selected_refs(db, txn, reference)?;
+        for row in db.dml_candidate_rows_with_origin_for_write(&table, txn, Some(refs))? {
+            append(row.row_ref, &row.values)?;
         }
-        let mut values = indices
-            .iter()
-            .map(|&i| row.values[i].clone())
-            .collect::<Vec<_>>();
-        values.push(Value::UInt(origins.len() as u64));
-        origins.push(origin);
-        builder.push(values)?;
+    } else {
+        for (storage_id, row) in db.scan_rows_with_storage(&reference.name, txn)? {
+            append(
+                crate::storage::DmlRowRef {
+                    storage_id,
+                    row_id: row.row_id,
+                },
+                &row.values,
+            )?;
+        }
     }
     let name = super::cte::next_inline_derived_name();
     stores.insert(name.clone(), Arc::new(builder.finish()?));
     reference.name = name;
     reference.alias = Some(alias);
+    reference.sample = None;
     sources.push(Source {
         table,
         rows: origins,

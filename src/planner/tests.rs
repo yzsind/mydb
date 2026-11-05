@@ -1997,6 +1997,120 @@ fn equijoin_row_estimate_does_not_cap_low_ndv_many_to_many() {
 }
 
 #[test]
+fn equijoin_shared_keyset_uses_unindexed_unique_statistics() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE key_domain (k INT NOT NULL, label VARCHAR(8) NOT NULL, \
+             text_key VARCHAR(8), decimal_key DECIMAL(10,2), date_key DATE)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE key_events (fk INT NOT NULL, text_fk VARCHAR(8), \
+             decimal_fk DECIMAL(10,2), date_fk DATE)",
+        )
+        .unwrap();
+    let key_values = |i| format!("'v{i}',{i}.25,'2024-01-0{i}'");
+    let domains = (1..=5)
+        .map(|i| format!("({i},'{}',{})", (b'a' + i as u8 - 1) as char, key_values(i)))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO key_domain VALUES {domains}"))
+        .unwrap();
+    let events = (0..25)
+        .map(|i| format!("({},{})", i % 5 + 1, key_values(i % 5 + 1)))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO key_events VALUES {events}"))
+        .unwrap();
+    for table in ["key_domain", "key_events"] {
+        engine.execute(&format!("ANALYZE TABLE {table}")).unwrap();
+    }
+    let scan = |sql: &str| {
+        let Statement::Select(select) = parse_statement(sql).unwrap() else {
+            unreachable!()
+        };
+        build_physical_plan(engine.db_for_tests(), &select).unwrap()
+    };
+    let dimension = scan("SELECT * FROM key_domain d WHERE d.label='a'");
+    assert!((estimated_rows(&dimension) - 1.0).abs() < 1e-9);
+    for (foreign_key, domain_key) in [
+        ("fk", "k"),
+        ("text_fk", "text_key"),
+        ("decimal_fk", "decimal_key"),
+        ("date_fk", "date_key"),
+    ] {
+        let event_sql = format!(
+            "SELECT * FROM key_events e WHERE e.{foreign_key} IN \
+             (SELECT d.{domain_key} FROM key_domain d WHERE d.label='a')"
+        );
+        let events = scan(&event_sql);
+        let event_key = [Expr::CompoundIdentifier(vec![
+            "e".into(),
+            foreign_key.into(),
+        ])];
+        let dimension_key = [Expr::CompoundIdentifier(vec![
+            "d".into(),
+            domain_key.into(),
+        ])];
+        assert!((estimated_rows(&events) - 5.0).abs() < 1e-9);
+        for (left, right, left_keys, right_keys) in [
+            (&events, &dimension, &event_key, &dimension_key),
+            (&dimension, &events, &dimension_key, &event_key),
+        ] {
+            let estimate = estimate_equijoin_rows(
+                left,
+                right,
+                left_keys,
+                right_keys,
+                estimated_rows(left),
+                estimated_rows(right),
+            );
+            assert!(
+                (estimate - 5.0).abs() < 1e-9,
+                "the shared keyset must not be charged twice for {domain_key}: {estimate}"
+            );
+        }
+    }
+    let other_keyset = scan(
+        "SELECT * FROM key_events e WHERE e.fk IN \
+         (SELECT d.k FROM key_domain d WHERE d.label='b')",
+    );
+    assert!(!keyset_join_estimates_one_match(
+        &other_keyset,
+        &dimension,
+        &Expr::CompoundIdentifier(vec!["e".into(), "fk".into()]),
+        &Expr::CompoundIdentifier(vec!["d".into(), "k".into()]),
+    ));
+
+    use crate::storage::FrequencySource::{Exact, Sample};
+    for (name, source, complete, sample_rows, distinct, nulls) in [
+        ("sampled", Sample, true, 5, 5, 0),
+        ("incomplete", Exact, false, 5, 5, 0),
+        ("partial population", Exact, true, 4, 5, 0),
+        ("repeated keys", Exact, true, 5, 4, 0),
+        ("nullable population", Exact, true, 5, 5, 1),
+    ] {
+        let mut table = (*engine.db_for_tests().table("key_domain").unwrap()).clone();
+        let stats = table.stats.columns.get_mut("k").unwrap();
+        stats.frequency.source = source;
+        stats.frequency.complete = complete;
+        stats.frequency.sample_rows = sample_rows;
+        stats.distinct_count = distinct;
+        stats.null_count = nulls;
+        let table = PlanTable::new(table.id, Arc::new(table), Some("d".into()));
+        assert!(
+            !keyset_source_key_is_estimated_unique(&table, "k"),
+            "{name} must not establish population uniqueness"
+        );
+    }
+}
+
+#[test]
 fn sip_keyset_prefilter_makes_matching_unique_join_lossless() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -2104,7 +2218,8 @@ fn sip_keyset_prefilter_makes_matching_unique_join_lossless() {
         right: Box::new(region_filter),
     };
     let region_key = Expr::CompoundIdentifier(vec!["r".into(), "r_regionkey".into()]);
-    let (region_table, _) = unique_scan_for_key(&region, &region_key).expect("unique region scan");
+    let (region_table, _) =
+        keyset_unique_source_for_key(&region, &region_key).expect("unique region scan");
     let inlj_joined = apply_inlj_right_only_residual_selectivity(
         estimated_rows(&nation),
         Some(&inlj_condition),
@@ -2135,7 +2250,7 @@ fn sip_keyset_prefilter_makes_matching_unique_join_lossless() {
     let customer_key = Expr::CompoundIdentifier(vec!["c".into(), "c_nationkey".into()]);
     let nation_key = Expr::CompoundIdentifier(vec!["n".into(), "n_nationkey".into()]);
     assert!(
-        keyset_prefilter_guarantees_unique_join(
+        keyset_join_estimates_one_match(
             &customer,
             &nation_region,
             &customer_key,

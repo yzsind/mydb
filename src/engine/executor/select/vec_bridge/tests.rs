@@ -4,6 +4,158 @@ use super::hash_join::{
 use super::*;
 
 #[test]
+fn spilled_cte_projection_releases_unused_unique_column_reservations() {
+    let root = tempfile::tempdir().unwrap();
+    let schema = Arc::new(BatchSchema::new(
+        [
+            ("k", ColumnType::LongLong),
+            ("payload", ColumnType::VarString),
+        ]
+        .into_iter()
+        .map(|(name, column_type)| BatchField {
+            table: "c".into(),
+            alias: None,
+            name: name.into(),
+            column_type,
+            source: Default::default(),
+        })
+        .collect(),
+    ));
+    let output_schema = Arc::new(BatchSchema::new(vec![schema.fields()[0].clone()]));
+    let dir = Arc::new(
+        crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+            root.path(),
+            "projection-test",
+        )
+        .unwrap(),
+    );
+    let spill = Arc::new(crate::engine::api::CteSpillFile {
+        path: dir.path().join("unused"),
+        _dir: dir,
+        row_count: 1,
+        batch_schema: schema.clone(),
+    });
+    let stream =
+        SpilledCteBatchStream::new(spill, output_schema, vec![0], None, schema.clone(), None);
+    let budget = Arc::new(mem_budget::MemBudget::new(1024 * 1024));
+    mem_budget::with_query_budget(budget.clone(), || {
+        let input = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(vec![Value::Int(7)]),
+                ColumnVector::from_values(vec![Value::String("x".repeat(32 * 1024))]),
+            ],
+        )
+        .with_memory_charge(mem_budget::ScopedCharge::new(0))
+        .unwrap();
+        assert!(budget.used() > 32 * 1024);
+        let output = stream.project_batch(input).unwrap();
+        assert_eq!(output.columns()[0].value_at(0), Value::Int(7));
+        assert!(
+            budget.used() < 8 * 1024,
+            "pruned buffers must stop consuming the operator's memory grant"
+        );
+        drop(output);
+        assert_eq!(budget.used(), 0);
+    });
+}
+
+#[test]
+fn parallel_low_cardinality_rollup_keeps_native_group_state() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(root.path()).unwrap());
+    let columns = ["k", "v"]
+        .into_iter()
+        .map(|name| crate::types::Column {
+            name: name.into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        })
+        .collect();
+    let input = PhysicalPlan::Exchange {
+        input: Box::new(PhysicalPlan::ValuesScan {
+            rows: (0..512)
+                .map(|row| {
+                    vec![
+                        if row % 5 == 0 {
+                            Expr::Literal(crate::parser::Literal::Null)
+                        } else {
+                            Expr::Literal(crate::parser::Literal::Int(row % 2))
+                        },
+                        Expr::Literal(crate::parser::Literal::Int(row)),
+                    ]
+                })
+                .collect(),
+            columns,
+            filter: None,
+            estimated_rows: 512.0,
+            cost: Default::default(),
+        }),
+        degree: 4,
+        output_order: crate::planner::ExchangeOrder::Unordered,
+        merge_keys: Vec::new(),
+        estimated_rows: 512.0,
+        cost: Default::default(),
+    };
+    let groups = vec![Expr::Identifier("k".into())];
+    let aggregates = ["SUM(v)", "COUNT(v)", "AVG(v)", "MIN(v)", "MAX(v)"]
+        .into_iter()
+        .map(|sql| crate::parser::parse_expr_fragment(sql).unwrap())
+        .collect::<Vec<_>>();
+    let txn = TxnView::read_only(0, crate::storage::IsolationLevel::ReadCommitted);
+    let expected = super::super::plan::execute_hash_rollup_aggregate(
+        &db,
+        txn,
+        &input,
+        &groups,
+        None,
+        &aggregates,
+    )
+    .unwrap();
+    LAST_AGG_METRICS.with(|cell| cell.take());
+    let actual = super::super::parallel::execute_parallel_rollup_aggregate(
+        &db,
+        txn,
+        &input,
+        &groups,
+        None,
+        &aggregates,
+        4,
+        3.0,
+    )
+    .unwrap();
+    let metrics = LAST_AGG_METRICS.with(|cell| cell.take());
+    assert!(
+        metrics.is_some(),
+        "small group estimates must aggregate native batches instead of materializing input rows"
+    );
+    let canonical = |rows: Vec<PlanRow>| {
+        let mut result = rows
+            .into_iter()
+            .map(|row| {
+                let fields = row
+                    .fields
+                    .iter()
+                    .map(|f| f.value.to_display_string())
+                    .collect::<Vec<_>>();
+                let mut values = row
+                    .agg_values
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|(key, value)| (*key, value.to_display_string()))
+                    .collect::<Vec<_>>();
+                values.sort();
+                (fields, values)
+            })
+            .collect::<Vec<_>>();
+        result.sort();
+        result
+    };
+    assert_eq!(actual.len(), 4, "real NULL and grand total remain distinct");
+    assert_eq!(canonical(actual), canonical(expected));
+}
+
+#[test]
 fn scalar_projection_metadata_uses_bound_temporal_decimal_and_unsigned_domains() {
     for (column_type, flags) in [
         (ColumnType::Date, 0),
@@ -110,6 +262,7 @@ fn in_memory_cte_reads_bounded_projected_batches_without_an_admissible_mirror() 
                     }
                     let expected = cte
                         .rows()
+                        .unwrap()
                         .iter()
                         .filter(|row| {
                             !filtered

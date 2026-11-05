@@ -1176,6 +1176,7 @@ pub(in crate::engine::executor) fn execute_windowed_select(
             name,
             alias: None,
             system_time: None,
+            sample: None,
             index_hints: Vec::new(),
             partitions: Vec::new(),
             column_aliases: Vec::new(),

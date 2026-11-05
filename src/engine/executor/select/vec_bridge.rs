@@ -2085,7 +2085,9 @@ pub(crate) fn should_route_result_to_batch(plan: &PhysicalPlan, projection: &[Se
                     && supported_scan_spine(input)
             }
             PhysicalPlan::WindowAgg { input, .. } => supported_scan_spine(input),
-            PhysicalPlan::SeqScan { .. }
+            PhysicalPlan::SampleScan { .. }
+            | PhysicalPlan::ParallelSampleScan { .. }
+            | PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::ZoneMapScan { .. }
             | PhysicalPlan::ParallelSeqScan { .. }
             | PhysicalPlan::ParallelZoneMapScan { .. } => true,
@@ -2207,6 +2209,12 @@ impl NativeVecCompiler {
         txn: TxnView,
         plan: &'a PhysicalPlan,
     ) -> Result<NativeCompileOutcome<'a>, QueryError> {
+        if super::plan::is_sql_rowid_direct_scan(db, plan)? {
+            return Ok(NativeCompileOutcome::Native(
+                try_build_row_storage_batch(db, txn, plan)?
+                    .expect("ROWID scan has a row-to-batch adapter"),
+            ));
+        }
         let mut compiled = match plan {
             PhysicalPlan::NullExtend { .. } => try_build_null_extend_input(db, txn, plan)?,
             PhysicalPlan::Projection {
@@ -2250,6 +2258,28 @@ impl NativeVecCompiler {
                 try_build_vec_filter_input(db, txn, plan)?
             }
             PhysicalPlan::WindowAgg { .. } => try_build_window_batch(db, txn, plan)?,
+            PhysicalPlan::SampleScan { .. } | PhysicalPlan::ParallelSampleScan { .. } => {
+                let (table, projected_columns) = match plan {
+                    PhysicalPlan::SampleScan {
+                        table,
+                        projected_columns,
+                        ..
+                    }
+                    | PhysicalPlan::ParallelSampleScan {
+                        table,
+                        projected_columns,
+                        ..
+                    } => (table, projected_columns),
+                    _ => unreachable!(),
+                };
+                Some(VecBatchInput {
+                    template: scan::build_scan_template(
+                        table,
+                        projected_columns.as_deref().map(|v| v.as_slice()),
+                    ),
+                    stream: Box::new(super::sampling::SampleBatchStream::new(db, txn, plan)),
+                })
+            }
             PhysicalPlan::GenerateSeries { .. } => try_build_generate_series_batch(plan)?,
             PhysicalPlan::ValuesScan { .. } => try_build_values_batch(db, txn, plan)?,
             PhysicalPlan::JsonTableScan { .. } => try_build_json_table_batch(plan)?,
@@ -2387,6 +2417,7 @@ impl AnalyzedBatchOperator<'_> {
             conversion_rows,
             match self.plan {
                 PhysicalPlan::Exchange { degree, .. }
+                | PhysicalPlan::ParallelSampleScan { degree, .. }
                 | PhysicalPlan::ParallelSeqScan { degree, .. }
                 | PhysicalPlan::ParallelZoneMapScan { degree, .. }
                 | PhysicalPlan::ParallelIndexRangeScan { degree, .. }
@@ -4063,9 +4094,8 @@ impl BatchOperator for SparseSelectionCoalesceStream<'_> {
     }
 }
 
-/// Zero-copy column pruning/reordering inside a batch pipeline. Column vectors
-/// are ref-count-free owned buffers today, so this clones only the selected
-/// vector handles/buffers; it still avoids rebuilding row values or PlanRows.
+/// Move uniquely owned columns through pruning/reordering. Shared inputs and
+/// duplicate projections use admitted copies, preserving their original owner.
 struct ProjectColumnsBatchStream<'a> {
     upstream: Box<dyn BatchOperator + 'a>,
     columns: Vec<usize>,
@@ -4129,18 +4159,7 @@ impl BatchOperator for ProjectColumnsBatchStream<'_> {
         let Some(batch) = self.upstream.next_batch()? else {
             return Ok(None);
         };
-        let selection = batch.selection().cloned();
-        let row_count = batch.num_rows();
-        let columns = self
-            .columns
-            .iter()
-            .map(|&index| batch.columns()[index].clone())
-            .collect();
-        let mut projected = Batch::with_row_count(self.schema.clone(), columns, row_count);
-        if let Some(selection) = selection {
-            projected = projected.with_selection(selection);
-        }
-        Ok(Some(projected))
+        project_cte_batch(batch, &self.schema, &self.columns).map(Some)
     }
 }
 
@@ -5050,28 +5069,70 @@ fn try_build_cte_batch_scan<'a>(
     // Alias-qualified column metadata, identical to the CteScan row path's
     // template, so the downstream vec agg resolves group/agg columns the same.
     let alias_str = alias.clone().unwrap_or_else(|| name.clone());
-    let template: Vec<PlanField> = src_indices
+    let full_template: Vec<PlanField> = columns
         .iter()
-        .map(|&i| PlanField {
+        .map(|column| PlanField {
             meta: crate::engine::executor::select::plan::intern_col_meta(ColMeta {
                 invisible: false,
                 table: name.clone(),
                 alias: Some(alias_str.clone()),
-                column: columns[i].name.clone(),
-                column_type: columns[i].column_type,
-                source: columns[i].source.clone(),
+                column: column.name.clone(),
+                column_type: column.column_type,
+                source: column.source.clone(),
             }),
             value: Value::Null,
         })
         .collect();
+    let template = src_indices
+        .iter()
+        .map(|&index| full_template[index].clone())
+        .collect::<Vec<_>>();
     let schema = template_to_batch_schema(&template);
     if let Some(spill) = &cte.spill {
-        let stream = SpilledCteBatchStream::new(spill.clone(), schema, src_indices, predicate);
+        let full_schema = template_to_batch_schema(&full_template);
+        // The canonical row predicate remains available when the optional
+        // batch compiler cannot represent a filter in this binding scope.
+        let batch_predicate = filter.as_ref().and_then(|expr| {
+            expr_batch::BatchExprProgram::compile(expr, &full_schema)
+                .ok()
+                .flatten()
+        });
+        let stream = SpilledCteBatchStream::new(
+            spill.clone(),
+            schema,
+            src_indices,
+            predicate,
+            full_schema,
+            batch_predicate,
+        );
         CTE_BATCH_SCAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(Some(VecBatchInput {
             stream: Box::new(stream),
             template,
         }));
+    }
+    if let Some(chunks) = cte.store.native_batches() {
+        let full_schema = template_to_batch_schema(&full_template);
+        let program = filter.as_ref().and_then(|expr| {
+            expr_batch::BatchExprProgram::compile(expr, &full_schema)
+                .ok()
+                .flatten()
+        });
+        if filter.is_none() || program.is_some() {
+            CTE_BATCH_SCAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Some(VecBatchInput {
+                stream: Box::new(ResidentCteBatchStream {
+                    _cte: cte,
+                    chunks,
+                    next: 0,
+                    schema,
+                    full_schema,
+                    src_indices,
+                    program,
+                }),
+                template,
+            }));
+        }
     }
     // A shared mirror is optional. If it cannot be admitted, decode directly
     // from the retained rows; never materialize every reference as a second
@@ -5106,6 +5167,42 @@ struct CteRowsBatchStream {
     batch_charge: Option<mem_budget::ScopedCharge>,
 }
 
+struct ResidentCteBatchStream {
+    _cte: Arc<crate::engine::api::CteResult>,
+    chunks: Arc<Vec<Batch>>,
+    next: usize,
+    schema: Arc<BatchSchema>,
+    full_schema: Arc<BatchSchema>,
+    src_indices: Vec<usize>,
+    program: Option<Arc<expr_batch::BatchExprProgram>>,
+}
+
+impl BatchOperator for ResidentCteBatchStream {
+    batch_wrapper_method!(schema);
+    fn properties(&self) -> BatchProperties {
+        BatchProperties::UNORDERED_SINGLE
+    }
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        loop {
+            crate::engine::cancel::check_cancelled()?;
+            let Some(batch) = self.chunks.get(self.next) else {
+                return Ok(None);
+            };
+            self.next += 1;
+            let mut batch = batch.clone();
+            batch.schema = self.full_schema.clone();
+            if let Some(program) = &self.program {
+                let mask = program.eval_predicate_bitmap(&batch)?;
+                if mask.count_ones() == 0 {
+                    continue;
+                }
+                batch = batch.with_selection(Selection::Mask(mask));
+            }
+            return project_cte_batch(batch, &self.schema, &self.src_indices).map(Some);
+        }
+    }
+}
+
 impl BatchOperator for CteRowsBatchStream {
     fn schema(&self) -> &Arc<BatchSchema> {
         &self.schema
@@ -5130,7 +5227,7 @@ impl BatchOperator for CteRowsBatchStream {
                 .map(|&source| chunk[source].clone())
                 .collect()
         } else {
-            let rows = self.cte.rows();
+            let rows = self.cte.rows()?;
             let target = scan_decode_batch_rows(&self.schema);
             let mut selected =
                 Vec::with_capacity(target.min(rows.len().saturating_sub(self.position)));
@@ -5173,12 +5270,91 @@ impl BatchOperator for CteRowsBatchStream {
     }
 }
 
+fn project_cte_batch(
+    mut batch: Batch,
+    schema: &Arc<BatchSchema>,
+    src_indices: &[usize],
+) -> Result<Batch, QueryError> {
+    if src_indices.len() == batch.columns().len()
+        && src_indices
+            .iter()
+            .enumerate()
+            .all(|(index, &source)| index == source)
+    {
+        batch.schema = schema.clone();
+        return Ok(batch);
+    }
+    if Arc::strong_count(&batch.columns) > 1 {
+        let count = batch.visible_rows();
+        let mut charge = batch.memory_charge();
+        let bytes = batch
+            .visible_indices()
+            .fold(
+                count.saturating_mul(std::mem::size_of::<u32>()),
+                |bytes, row| {
+                    src_indices.iter().fold(bytes, |bytes, &column| {
+                        bytes.saturating_add(batch.columns()[column].owned_value_bytes(row))
+                    })
+                },
+            )
+            .saturating_add(
+                src_indices
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ColumnVector>()),
+            )
+            .saturating_add(128);
+        charge.add_force(bytes)?;
+        let mut indices = mem_budget::try_vec_with_capacity(count, "CTE visible row positions")?;
+        indices.extend(batch.visible_indices().map(|row| row as u32));
+        let columns = src_indices
+            .iter()
+            .map(|&column| batch.columns()[column].take_indices_exact(&indices))
+            .collect();
+        let output = Batch::with_row_count(schema.clone(), columns, count);
+        drop(indices);
+        drop(batch);
+        return output.with_memory_charge(charge);
+    }
+    let count = batch.num_rows();
+    let selection = batch.selection().cloned();
+    let mut charge = batch.memory_charge();
+    charge.add_force(
+        src_indices
+            .len()
+            .saturating_mul(std::mem::size_of::<ColumnVector>())
+            .saturating_add(128),
+    )?;
+    let (mut columns, owner) = batch.into_columns()?.into_parts();
+    let mut output = mem_budget::try_vec_with_capacity(src_indices.len(), "CTE projected columns")?;
+    for (position, &source) in src_indices.iter().enumerate() {
+        if src_indices[position + 1..].contains(&source) {
+            charge.add_force(columns[source].memory_bytes())?;
+            output.push(columns[source].try_clone_owned()?);
+        } else {
+            output.push(std::mem::replace(
+                &mut columns[source],
+                ColumnVector::Null { len: count },
+            ));
+        }
+    }
+    drop(columns);
+    let owned = crate::engine::executor::vec::batch::OwnedColumns::from_parts(output, owner, count)
+        .with_reconciled_charge(charge)?;
+    let output = Batch::from_owned_columns(schema.clone(), owned);
+    Ok(match selection {
+        Some(selection) => output.with_selection(selection),
+        None => output,
+    })
+}
+
 struct SpilledCteBatchStream {
     schema: Arc<BatchSchema>,
     src_indices: Vec<usize>,
     projection_has_duplicates: bool,
     predicate: Option<super::plan::CteRowPredicate>,
-    reader: Option<crate::engine::executor::select::grace::ValueRowReader>,
+    full_schema: Arc<BatchSchema>,
+    batch_predicate: Option<Arc<expr_batch::BatchExprProgram>>,
+    reader: Option<crate::engine::executor::cte::spool::Reader>,
     exhausted: bool,
     spill: Arc<crate::engine::api::CteSpillFile>,
 }
@@ -5189,6 +5365,8 @@ impl SpilledCteBatchStream {
         schema: Arc<BatchSchema>,
         src_indices: Vec<usize>,
         predicate: Option<super::plan::CteRowPredicate>,
+        full_schema: Arc<BatchSchema>,
+        batch_predicate: Option<Arc<expr_batch::BatchExprProgram>>,
     ) -> Self {
         let projection_has_duplicates = src_indices
             .iter()
@@ -5199,10 +5377,16 @@ impl SpilledCteBatchStream {
             src_indices,
             projection_has_duplicates,
             predicate,
+            full_schema,
+            batch_predicate,
             reader: None,
             exhausted: false,
             spill,
         }
+    }
+
+    fn project_batch(&self, batch: Batch) -> Result<Batch, QueryError> {
+        project_cte_batch(batch, &self.schema, &self.src_indices)
     }
 }
 
@@ -5219,10 +5403,7 @@ impl BatchOperator for SpilledCteBatchStream {
             return Ok(None);
         }
         if self.reader.is_none() {
-            self.reader = crate::engine::executor::select::grace::ValueRowReader::open(
-                &self.spill.path,
-                self.spill._dir.charger(),
-            )?;
+            self.reader = self.spill.open_reader()?;
             if self.reader.is_none() {
                 self.exhausted = true;
                 if self.spill.row_count > 0 {
@@ -5232,6 +5413,24 @@ impl BatchOperator for SpilledCteBatchStream {
                     ));
                 }
                 return Ok(None);
+            }
+        }
+        if self.predicate.is_none() || self.batch_predicate.is_some() {
+            loop {
+                let Some(mut batch) = self.reader.as_mut().expect("reader opened").next_batch()?
+                else {
+                    self.exhausted = true;
+                    return Ok(None);
+                };
+                batch.schema = self.full_schema.clone();
+                if let Some(program) = &self.batch_predicate {
+                    let mask = program.eval_predicate_bitmap(&batch)?;
+                    if mask.count_ones() == 0 {
+                        continue;
+                    }
+                    batch = batch.with_selection(Selection::Mask(mask));
+                }
+                return self.project_batch(batch).map(Some);
             }
         }
         let batch_rows = scan_decode_batch_rows(&self.schema);

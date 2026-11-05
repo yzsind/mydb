@@ -19,6 +19,8 @@ pub mod naming;
 pub mod partitioning;
 pub(crate) mod read_schema;
 pub(crate) mod recovery_context;
+pub mod rowid;
+pub(crate) use schema::DmlRowImages;
 pub(crate) mod schema;
 pub(crate) mod sequence;
 pub(crate) mod snapshot;

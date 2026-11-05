@@ -56,6 +56,8 @@ production-grade MySQL replacement.
 | MySQL operations ecosystem | ◑/❌ | Common configuration/logging/privilege surfaces work; no Group Replication, Router, Shell/X, or plugin ABI |
 | mydb extensions | ➕ | VECTOR/HNSW/IVF, Zone Map, time travel, sequences, DML RETURNING, physical replication, and more |
 
+**➕ Table sampling:** `TABLESAMPLE` supports row/page sampling by percentage or exact row count, execution-time parameters, `REPEATABLE`, and parallel scans over user base tables and partitions. The default is `SYSTEM` percentage sampling. MySQL 8.0.46 has no equivalent TABLESAMPLE clause; see [SELECT table sampling](statements/query/select.md#table-sampling) for semantics and restrictions.
+
 ---
 
 ## 1. Client Protocol and Connections
@@ -351,6 +353,7 @@ Closing the loop on MySQL 8.0 semantics:
 - **`CLIENT_FOUND_ROWS`**: the OK packet returns matched/changed per the bit + `Rows matched: N Changed: M Warnings: W`.
 - **CTE-driven DML**, **`SELECT ... INTO @var`**, **`DO expr`**: ✅
 - ➕ **`INSERT / UPDATE / DELETE ... RETURNING`**: a PostgreSQL 18-style extension returning NEW/NEW/OLD respectively by default, with explicit `OLD`/`NEW` references and `WITH (OLD AS ..., NEW AS ...)` aliases. Supports plain, ODKU, single-target JOIN DML, prepared statements, and updatable views; UPDATE/DELETE RETURNING that genuinely modifies multiple target tables returns 1235.
+- ➕ **[SQL ROWID](rowid.md)**: a read-only, table-scoped `BIGINT UNSIGNED` heap address with stable partition-leaf tags. Explicit projection, direct equality/IN access, DML predicates, and RETURNING are supported. Real `rowid` columns take precedence; addresses may be reused after deletion or physical DDL.
 - ❌ **`HANDLER`**: explicitly 1235.
 
 ---

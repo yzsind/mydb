@@ -17,54 +17,10 @@ import signal
 import struct
 import subprocess
 import time
-import zlib
 
 import pymysql
 from test_release_storage import StorageServers, start, query, binary_sha256
-
-
-def wal_frames(root):
-    frames = []
-    for path in sorted((root / 'system/wal').glob('*.log')):
-        raw = path.read_bytes()
-        assert raw[:8] == b'MYDBWAL1', path
-        offset = 40
-        while offset + 48 <= len(raw):
-            if raw[offset:offset + 4] == bytes(4):
-                break
-            magic, size, lsn, prev, txn, kind, reserved, timestamp, crc = struct.unpack_from('<IIQQQHHQI', raw, offset)
-            assert magic == 0x4d57414c and reserved == 0, (path, offset)
-            payload = raw[offset + 48:offset + 48 + size]
-            assert len(payload) == size and zlib.crc32(raw[offset:offset + 44] + payload) == crc, (path, offset, 'CRC')
-            frames.append({'lsn': lsn, 'txn': txn, 'kind': kind, 'file': path.name, 'payload': payload})
-            offset += 48 + size
-    return sorted(frames, key=lambda frame: frame['lsn'])
-
-
-def heap_versions(root, count):
-    matches = []
-    for path in root.rglob('*.heap'):
-        raw = path.read_bytes()
-        rows = {}
-        for page_id in range(len(raw) // 16384):
-            page = raw[page_id * 16384:(page_id + 1) * 16384]
-            if page[:4] != struct.pack('<I', 0x4d485032):
-                continue
-            assert zlib.crc32(page[:16] + bytes(4) + page[20:]) == struct.unpack_from('<I', page, 16)[0], (path, page_id, 'CRC')
-            for slot in range(struct.unpack_from('<H', page, 20)[0]):
-                offset, size, flags = struct.unpack_from('<HHB', page, 32 + slot * 5)
-                if not size or flags & 3:
-                    continue
-                row = page[offset:offset + size]
-                assert row[0] != 0xff, (path, page_id, slot, 'forwarded row')
-                if row[1] & 2:
-                    continue
-                txn = struct.unpack_from('<Q', row, 2)[0] if row[1] & 4 else 0
-                rows[f'{page_id}:{slot}'] = (row[1] & 3, txn)
-        if len(rows) == count:
-            matches.append((str(path.relative_to(root)), rows))
-    assert len(matches) == 1, [(name, len(rows)) for name, rows in matches]
-    return matches[0]
+from storage_oracle import heap_versions, metadata_payload, truncate_undo_tail, wal_frames
 
 
 class Gate:
@@ -72,7 +28,12 @@ class Gate:
         self.root = root
         self.marker = root / 'armed'
         self.hit = root / 'hit.json'
+        temporary = root / 'tmp'
+        temporary.mkdir(exist_ok=True)
         self.extra = {'DYLD_INSERT_LIBRARIES': str(library),
+                      # A syscall fault must not borrow another process's
+                      # successful device-cache barrier through the cache.
+                      'TMPDIR': str(temporary.resolve()),
                       'MYDB_PUBLICATION_ROOT': str((root / 'server').resolve()),
                       'MYDB_PUBLICATION_MARKER': str(self.marker),
                       'MYDB_PUBLICATION_HIT': str(self.hit),
@@ -366,11 +327,7 @@ def gap_case(binary, library, root, action, result):
         kill(process)
         truncated = []
         for path in sorted((root / 'server/system/undo').glob('*.seg')):
-            with path.open('r+b') as output:
-                original = output.seek(0, 2)
-                output.truncate(32)
-                output.flush()
-                os.fsync(output.fileno())
+            original = truncate_undo_tail(path)
             truncated.append({'file': path.name, 'old_size': original})
         result['truncated_owned_segments'] = truncated
         result['durable_undo_frames'] = len(undo)
@@ -385,7 +342,7 @@ def gap_case(binary, library, root, action, result):
         process = servers.processes[-1]
         result['hit'] = gate.wait(process, future, True)
         manifest_path = root / 'server/system/undo/undo.manifest'
-        manifest = json.loads(manifest_path.read_text())
+        manifest = metadata_payload(manifest_path, 5, 3)
         pending = manifest['pending_recovery_segments']
         assert len(pending) > 1, pending
         finals = sum((manifest_path.parent / f'undo-{segment:08x}.seg').exists() for segment in pending)
@@ -405,7 +362,7 @@ def gap_case(binary, library, root, action, result):
         process, admin, port = start(servers, extra)
         verify(admin, expected)
         assert len(query(admin, 'XA RECOVER')) == 1
-        assert not json.loads(manifest_path.read_text())['pending_recovery_segments']
+        assert not metadata_payload(manifest_path, 5, 3)['pending_recovery_segments']
         query(admin, "XA ROLLBACK 'gap_gate'")
         for restart in range(2):
             verify(admin, expected)
@@ -548,6 +505,7 @@ def main():
                           'publication': publication_cases, 'device': device_cases}[args.suite]
     identity = {'binary_sha256': binary_sha256(binary), 'library_sha256': binary_sha256(library),
                 'script_sha256': binary_sha256(Path(__file__).resolve()),
+                'oracle_sha256': binary_sha256(Path(__file__).with_name('storage_oracle.py')),
                 'helper_sha256': binary_sha256(Path(__file__).with_name('test_release_storage.py'))}
     for case in cases:
         folder = root / case

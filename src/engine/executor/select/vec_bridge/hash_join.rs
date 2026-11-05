@@ -32,6 +32,7 @@ use crate::storage::{Database, TxnView};
 use crate::types::QueryError;
 
 mod aggregate;
+mod build_domain;
 #[cfg(test)]
 mod tests;
 
@@ -953,10 +954,7 @@ impl HashJoinBatchOperator<'_> {
         use crate::engine::executor::work_area::{SpillHint, WorkAreaHandle};
         use crate::parser::JoinType;
 
-        if !self.reverse_semi_anti
-            || !matches!(self.join_type, JoinType::Semi | JoinType::Anti)
-            || self.residual.is_some()
-        {
+        if !self.reverse_semi_anti || !matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
             return Ok(false);
         }
 
@@ -1047,6 +1045,46 @@ impl HashJoinBatchOperator<'_> {
         if probe_rows == 0 {
             self.output = Some(Vec::new().into_iter());
             return Ok(true);
+        }
+
+        if self.residual.is_some() {
+            // A residual is a property of each pair, not of the equality key.
+            // Reduce only the build domain here; the existing kernel remains
+            // responsible for three-valued residual evaluation and output.
+            retained_charge.release_bytes(key_bytes);
+            if let Some(domain) = build_domain::BuildDomain::from_probe(
+                &probe_batches,
+                &self.probe_keys,
+                &self.null_safe,
+                &self.key_collations,
+                native_i64,
+                probe_rows,
+            ) {
+                let pushed = domain.install_scan_filter(
+                    self.build.as_mut(),
+                    &self.build_keys,
+                    &mut self.pushed_exact_runtime_rejected,
+                );
+                let build_schema = self.build.schema().clone();
+                let inner = std::mem::replace(
+                    &mut self.build,
+                    Box::new(MaterializedBatchOperator::new(build_schema, Vec::new())),
+                );
+                self.build = Box::new(build_domain::BuildDomainStream::new(
+                    inner,
+                    domain,
+                    pushed,
+                    self.build_keys.clone(),
+                    self.null_safe.clone(),
+                    self.key_collations.clone(),
+                ));
+            }
+            self.probe = Box::new(RetainedProbeStream {
+                prefix: probe_batches.into_iter(),
+                remainder: Box::new(MaterializedBatchOperator::new(probe_schema, Vec::new())),
+                memory_charge: Some(retained_charge),
+            });
+            return Ok(false);
         }
 
         // The dominant SEMI/ANTI shape is a single signed integer equality
@@ -1662,6 +1700,12 @@ impl HashJoinBatchOperator<'_> {
             .as_ref()
             .expect("residual semi/anti path requires a residual");
         let program = Arc::clone(program);
+        let referenced = program.referenced_columns();
+        let frontier_rounds = if program.allows_pair_short_circuit() {
+            2
+        } else {
+            0
+        };
         let schema = Arc::clone(&self.schema);
         let build_cols_first = self.build_is_left;
         let probe_keys = self.probe_keys.clone();
@@ -1691,13 +1735,14 @@ impl HashJoinBatchOperator<'_> {
             if pair_build.is_empty() {
                 return Ok(());
             }
-            let candidates = vec_hash_join::gather_pairs_batch(
+            let candidates = vec_hash_join::gather_residual_pairs_batch(
                 &state.payload.columns,
                 &batch,
                 pair_build,
                 pair_probe,
                 build_cols_first,
                 &schema,
+                &referenced,
             );
             let accepted = program.eval_predicate_bitmap(&candidates)?;
             for (position, &probe_row) in pair_probe.iter().enumerate() {
@@ -1711,15 +1756,55 @@ impl HashJoinBatchOperator<'_> {
             Ok(())
         };
 
-        for probe_row in batch.visible_indices() {
-            let (usable, hits) = lookup.lookup(probe_row, &mut key);
-            if usable && hits.is_none() {
-                analyze_stats::add_pending_runtime_filter_rejected(1);
+        // Existence is decided per probe row. Test a bounded frontier of
+        // first candidates together, then stop evaluating rows already known
+        // to match. Two rounds capture common early matches without turning
+        // an all-false, high-fanout bucket into many tiny predicate calls.
+        let mut probes = batch.visible_indices().peekable();
+        loop {
+            let mut active = Vec::with_capacity(DEFAULT_BATCH_ROWS);
+            for probe_row in probes.by_ref().take(DEFAULT_BATCH_ROWS) {
+                let (usable, hits) = lookup.lookup(probe_row, &mut key);
+                if usable && hits.is_none() {
+                    analyze_stats::add_pending_runtime_filter_rejected(1);
+                }
+                if let Some(hits) = hits.filter(|hits| !hits.is_empty()) {
+                    active.push((probe_row as u32, hits));
+                }
             }
-            if let Some(hits) = hits {
-                for &build_row in hits {
+            if active.is_empty() {
+                // Empty buckets can consume a whole frontier before later
+                // probes produce candidates, so do not confuse it with EOF.
+                if probes.peek().is_none() {
+                    break;
+                }
+                continue;
+            }
+            for offset in 0..frontier_rounds {
+                for &(probe_row, hits) in &active {
+                    pair_build.push(hits[offset]);
+                    pair_probe.push(probe_row);
+                }
+                flush(
+                    &mut pair_build,
+                    &mut pair_probe,
+                    &mut matched_probe,
+                    &mut match_rows,
+                )?;
+                active.retain(|&(row, hits)| {
+                    !matched_probe.get(row as usize) && hits.len() > offset + 1
+                });
+                if active.is_empty() {
+                    break;
+                }
+            }
+            for (probe_row, hits) in active {
+                for &build_row in hits.iter().skip(frontier_rounds) {
+                    if frontier_rounds != 0 && matched_probe.get(probe_row as usize) {
+                        break;
+                    }
                     pair_build.push(build_row);
-                    pair_probe.push(probe_row as u32);
+                    pair_probe.push(probe_row);
                     if pair_build.len() == DEFAULT_BATCH_ROWS {
                         flush(
                             &mut pair_build,
@@ -1730,13 +1815,13 @@ impl HashJoinBatchOperator<'_> {
                     }
                 }
             }
+            flush(
+                &mut pair_build,
+                &mut pair_probe,
+                &mut matched_probe,
+                &mut match_rows,
+            )?;
         }
-        flush(
-            &mut pair_build,
-            &mut pair_probe,
-            &mut matched_probe,
-            &mut match_rows,
-        )?;
         let selected: Vec<u32> = batch
             .visible_indices()
             .filter(|&row| matched_probe.get(row) == (join_type == JoinType::Semi))
@@ -2406,7 +2491,15 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
     let input_contains_inlj = build_plan
         .any(|node| matches!(node, PhysicalPlan::IndexNestedLoopJoin { .. }))
         || probe_plan.any(|node| matches!(node, PhysicalPlan::IndexNestedLoopJoin { .. }));
-    let defer_build = scalar_residual.is_some()
+    // Delay cache-sized builds so ancestor filters can reach their unopened
+    // sources. Large builds retain bottom-up work-area admission: reserving
+    // every ancestor before a large descendant consumes its input can force
+    // that descendant to spill or reclaim otherwise useful storage pages.
+    let small_build =
+        crate::planner::estimated_rows(build_plan) * (build_plan.output_width() + 64.0) * 1.25
+            <= super::super::plan::hash_join_parallel_probe_max_build_bytes() as f64;
+    let defer_build = small_build
+        || scalar_residual.is_some()
         || residual_program.is_some()
         || null_safe.iter().any(|value| *value)
         || preserved_build
@@ -2452,16 +2545,14 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         build_memory_charge: None,
         finished: false,
         empty_build_probe_passthrough: false,
-        reverse_semi_anti: crate::planner::reverse_semi_anti_hash_join_eligible(
+        reverse_semi_anti: crate::planner::semi_anti_probe_reduction_eligible(
             *join_type,
-            residual.is_some(),
             crate::planner::estimated_rows(probe_plan),
             crate::planner::estimated_rows(build_plan),
         ),
         pushed_exact_runtime_rejected: None,
         pushed_runtime_rejected_reported: 0,
     };
-    // Preserve build-before-parent-open behavior of ordinary equality joins.
     if !defer_build {
         operator.initialize()?;
     }

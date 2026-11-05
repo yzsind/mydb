@@ -14,6 +14,20 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
+    pub(super) fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Reuse decoded storage without accepting padding bits as logical rows.
+    pub(super) fn from_words(words: Vec<u64>, len: usize) -> Option<Self> {
+        if words.len() != word_count(len)
+            || (len % 64 != 0 && words.last().is_some_and(|word| word >> (len % 64) != 0))
+        {
+            return None;
+        }
+        Some(Self { words, len })
+    }
+
     pub(crate) fn try_clone(&self) -> Result<Self, crate::types::QueryError> {
         Ok(Self {
             words: crate::engine::executor::mem_budget::try_copy_slice(

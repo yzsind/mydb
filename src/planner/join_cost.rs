@@ -10,9 +10,17 @@ pub(crate) fn reverse_semi_anti_hash_join_eligible(
     probe_rows: f64,
     build_rows: f64,
 ) -> bool {
-    matches!(join_type, JoinType::Semi | JoinType::Anti)
-        && !has_residual
-        && probe_rows * 2.0 < build_rows
+    !has_residual && semi_anti_probe_reduction_eligible(join_type, probe_rows, build_rows)
+}
+
+/// A complete, bounded preserved input can filter the build's key domain even
+/// when pair residuals require the ordinary hash-join kernel afterwards.
+pub(crate) fn semi_anti_probe_reduction_eligible(
+    join_type: JoinType,
+    probe_rows: f64,
+    build_rows: f64,
+) -> bool {
+    matches!(join_type, JoinType::Semi | JoinType::Anti) && probe_rows * 2.0 < build_rows
 }
 
 /// Approximate per-row CPU cost (in cost-units) of evaluating a filter

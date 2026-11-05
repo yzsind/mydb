@@ -21,6 +21,8 @@ use crate::parser::{
 use crate::storage::{error, Database, IsolationLevel, TxnView};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
+pub(crate) mod spool;
+
 thread_local! {
     /// Active CTE registry for the current thread/statement. The map is
     /// keyed by lowercase CTE name. Empty when no `WITH` is active.
@@ -216,6 +218,7 @@ pub(super) struct CteSpillBuilder {
     ncols: usize,
     data_dir: std::path::PathBuf,
     buffered: Vec<Vec<Value>>,
+    buffered_batches: Vec<crate::engine::executor::vec::batch::Batch>,
     buffered_bytes: usize,
     /// Admitted capacity not yet occupied by rows. Small prepayments amortize
     /// the global governor atomics without changing the resident threshold.
@@ -314,7 +317,7 @@ fn cte_stats_max_rows() -> usize {
 struct CteSpillWriteState {
     dir: Arc<crate::engine::executor::select::grace::SpillTmpDir>,
     path: std::path::PathBuf,
-    writer: crate::engine::executor::select::grace::ValueRowWriter,
+    writer: spool::Writer,
 }
 
 impl CteSpillBuilder {
@@ -348,6 +351,7 @@ impl CteSpillBuilder {
             ncols,
             data_dir,
             buffered: Vec::new(),
+            buffered_batches: Vec::new(),
             buffered_bytes: 0,
             unspent_bytes: 0,
             threshold: memory_charge
@@ -362,6 +366,9 @@ impl CteSpillBuilder {
     }
 
     pub(super) fn push(&mut self, row: Vec<Value>) -> Result<(), QueryError> {
+        if !self.buffered_batches.is_empty() {
+            self.start_spill()?;
+        }
         self.row_count += 1;
         if let Some(stats) = self.stats.as_mut() {
             if !stats.observe(&row) {
@@ -369,7 +376,7 @@ impl CteSpillBuilder {
             }
         }
         if let Some(state) = self.spill.as_mut() {
-            state.writer.append(&row)?;
+            state.writer.append(row)?;
             return Ok(());
         }
 
@@ -397,7 +404,7 @@ impl CteSpillBuilder {
                 .as_mut()
                 .expect("spill initialized")
                 .writer
-                .append(&row)?;
+                .append(row)?;
             return Ok(());
         }
 
@@ -427,7 +434,7 @@ impl CteSpillBuilder {
                         .as_mut()
                         .expect("spill initialized")
                         .writer
-                        .append(&row)?;
+                        .append(row)?;
                     return Ok(());
                 }
             } else {
@@ -442,6 +449,159 @@ impl CteSpillBuilder {
             .map(|charge| charge.bytes().saturating_sub(self.unspent_bytes))
             .unwrap_or(0);
         self.buffered.push(row);
+        Ok(())
+    }
+
+    fn push_batch(
+        &mut self,
+        batch: &crate::engine::executor::vec::batch::Batch,
+    ) -> Result<(), QueryError> {
+        if batch.columns().len() != self.ncols {
+            return Err(error(
+                crate::error::catalog::ER_INTERNAL_ERROR,
+                "CTE batch width differs from its result metadata",
+            ));
+        }
+        if self.stats.is_some() {
+            for row in batch.visible_indices() {
+                if !self
+                    .stats
+                    .as_mut()
+                    .expect("CTE stats active")
+                    .observe(&batch.row(row))
+                {
+                    self.stats = None;
+                    break;
+                }
+            }
+        }
+        self.row_count += batch.visible_rows();
+        if batch.visible_rows() == 0 {
+            return Ok(());
+        }
+        if !self.buffered.is_empty() {
+            self.start_spill()?;
+        }
+        if let Some(spill) = self.spill.as_mut() {
+            return spill.writer.append_batch(batch);
+        }
+
+        use crate::engine::executor::vec::batch::{Batch, ColumnVector};
+        let old_capacity = self.buffered_batches.capacity();
+        let target_capacity = if old_capacity == self.buffered_batches.len() {
+            old_capacity.saturating_mul(2).max(4)
+        } else {
+            old_capacity
+        };
+        let outer_bytes =
+            (target_capacity - old_capacity).saturating_mul(std::mem::size_of::<Batch>());
+        let selected = batch.selection().is_some();
+        let payload = if selected {
+            batch.visible_indices().fold(
+                128usize.saturating_add(
+                    batch
+                        .columns()
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ColumnVector>()),
+                ),
+                |bytes, row| {
+                    bytes.saturating_add(
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| column.owned_value_bytes(row))
+                            .sum::<usize>(),
+                    )
+                },
+            )
+        } else {
+            batch.resident_bytes()
+        };
+        let extra = payload.saturating_add(outer_bytes);
+        if self.buffered_bytes.saturating_add(extra) > self.threshold
+            || !self.reserve_resident(extra)
+        {
+            self.start_spill()?;
+            return self
+                .spill
+                .as_mut()
+                .expect("CTE spill initialized")
+                .writer
+                .append_batch(batch);
+        }
+        if target_capacity > old_capacity {
+            self.buffered_batches
+                .try_reserve_exact(target_capacity - self.buffered_batches.len())
+                .map_err(|_| {
+                    crate::engine::executor::mem_budget::allocation_error("resident CTE batch list")
+                })?;
+        }
+        let columns = if selected {
+            let _scratch = crate::engine::executor::mem_budget::force_charge_scoped(
+                batch
+                    .visible_rows()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )?;
+            let mut indices = crate::engine::executor::mem_budget::try_vec_with_capacity(
+                batch.visible_rows(),
+                "resident CTE row positions",
+            )?;
+            indices.extend(batch.visible_indices().map(|row| row as u32));
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| column.take_indices_exact(&indices))
+                .collect::<Vec<_>>();
+            columns
+        } else {
+            batch
+                .columns()
+                .iter()
+                .map(ColumnVector::try_clone_owned)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut columns = columns;
+        // FLOAT precision belongs to result metadata even when a producer
+        // carries its values in the common f64 physical lane.
+        for (column, field) in columns.iter_mut().zip(&self.columns) {
+            if field.column_type == ColumnType::Float {
+                match column {
+                    ColumnVector::F64 { data, .. } => {
+                        for value in data {
+                            *value = (*value as f32) as f64;
+                        }
+                    }
+                    ColumnVector::Generic { values } => {
+                        for value in values {
+                            if let Value::Double(number) = value {
+                                *value = Value::Float(*number as f32);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let retained = Batch::with_row_count(batch.schema().clone(), columns, batch.visible_rows());
+        let actual = retained.resident_bytes().saturating_add(
+            self.buffered_batches
+                .capacity()
+                .saturating_sub(old_capacity)
+                .saturating_mul(std::mem::size_of::<Batch>()),
+        );
+        if actual > extra {
+            if !self.reserve_resident(actual - extra) {
+                return Err(crate::engine::executor::mem_budget::allocation_error(
+                    "resident CTE batch reservation",
+                ));
+            }
+        } else {
+            self.unspent_bytes = self.unspent_bytes.saturating_add(extra - actual);
+        }
+        self.buffered_batches.push(retained);
+        self.buffered_bytes = self.memory_charge.as_ref().map_or(0, |charge| {
+            charge.bytes().saturating_sub(self.unspent_bytes)
+        });
         Ok(())
     }
 
@@ -460,23 +620,7 @@ impl CteSpillBuilder {
                     }
                 }
                 ResultChunk::Columnar(owned) => {
-                    let batch = &owned.batch;
-                    if batch.columns().len() != self.ncols {
-                        return Err(error(
-                            crate::error::catalog::ER_INTERNAL_ERROR,
-                            "CTE batch width differs from its result metadata",
-                        ));
-                    }
-                    for row in batch.visible_indices() {
-                        if self.stats.is_none() {
-                            if let Some(spill) = self.spill.as_mut() {
-                                spill.writer.append_batch_row(batch, row)?;
-                                self.row_count += 1;
-                                continue;
-                            }
-                        }
-                        self.push(batch.row(row))?;
-                    }
+                    self.push_batch(&owned.batch)?;
                     // `owned` retains the producer's reservation until every
                     // visible row has been moved into resident or spill storage.
                 }
@@ -520,14 +664,27 @@ impl CteSpillBuilder {
             )?,
         );
         let path = dir.path().join("cte-rows.bin");
-        let mut writer = crate::engine::executor::select::grace::ValueRowWriter::create(
-            &path,
-            self.ncols,
-            dir.charger(),
-        )?;
+        let schema = Arc::new(crate::engine::executor::vec::schema::BatchSchema::new(
+            self.columns
+                .iter()
+                .map(|column| crate::engine::executor::vec::schema::BatchField {
+                    table: String::new(),
+                    alias: None,
+                    name: column.name.clone(),
+                    column_type: column.column_type,
+                    source: column.source.clone(),
+                })
+                .collect(),
+        ));
+        let mut writer = spool::Writer::create(&path, schema, dir.charger())?;
         for row in self.buffered.drain(..) {
-            writer.append(&row)?;
+            writer.append_precharged(row)?;
         }
+        writer.flush_rows()?;
+        for batch in self.buffered_batches.drain(..) {
+            writer.append_batch(&batch)?;
+        }
+        self.buffered_batches.shrink_to_fit();
         self.buffered.shrink_to_fit();
         if let Some(charge) = self.memory_charge.as_mut() {
             charge.shrink(charge.bytes());
@@ -545,11 +702,13 @@ impl CteSpillBuilder {
             .take()
             .map(|s| std::sync::Arc::new(s.finish(row_count as u64)));
         if let Some(state) = self.spill.take() {
+            let batch_schema = state.writer.schema.clone();
             state.writer.finish()?;
             let spill_file = Arc::new(crate::engine::api::CteSpillFile {
                 _dir: state.dir,
                 path: state.path,
                 row_count,
+                batch_schema,
             });
             crate::engine::status_counters::record_internal_temp_table(true);
             return Ok(CteResult::spilled(self.columns, spill_file).with_stats(stats));
@@ -560,6 +719,14 @@ impl CteSpillBuilder {
             .expect("in-memory CTE must retain its governor reservation");
         charge.shrink(self.unspent_bytes);
         crate::engine::status_counters::record_internal_temp_table(false);
+        if !self.buffered_batches.is_empty() {
+            return Ok(CteResult::materialized_batches_charged(
+                self.columns,
+                self.buffered_batches,
+                charge,
+            )?
+            .with_stats(stats));
+        }
         Ok(CteResult::materialized_charged(self.columns, self.buffered, charge).with_stats(stats))
     }
 }
@@ -598,10 +765,7 @@ pub(crate) fn spilled_cte_read_all(
         )?),
         None => None,
     };
-    if let Some(mut reader) = crate::engine::executor::select::grace::ValueRowReader::open(
-        &spill.path,
-        spill._dir.charger(),
-    )? {
+    if let Some(mut reader) = spill.open_reader()? {
         while let Some(row) = reader.next()? {
             if let Some(charge) = charge.as_mut() {
                 charge.add(crate::engine::executor::mem_budget::estimate_row_bytes(
@@ -1111,7 +1275,10 @@ fn estimate_cte_result_cache_bytes(result: &CteResult) -> usize {
     if let Some(bytes) = result.store.resident_memory_bytes() {
         return bytes;
     }
-    result.rows().iter().fold(0usize, |acc, row| {
+    let Some(rows) = result.store.row_major_rows() else {
+        return usize::MAX;
+    };
+    rows.iter().fold(0usize, |acc, row| {
         acc.saturating_add(crate::engine::executor::mem_budget::estimate_row_bytes(row))
     })
 }
@@ -2858,22 +3025,20 @@ fn append_union_branch_spool(
             union_column_needs_coercion(source, target).then_some(index)
         })
         .collect();
+    if let Some(chunks) = branch.store.native_batches() {
+        for batch in chunks.iter() {
+            append_union_batch(batch, builder, &conversions)?;
+        }
+        return Ok(());
+    }
     if let Some(spill) = &branch.spill {
-        if let Some(mut reader) =
-            super::select::grace::ValueRowReader::open(&spill.path, spill._dir.charger())?
-        {
-            while let Some(row) = reader.next()? {
-                crate::engine::cancel::check_cancelled()?;
-                let row = if conversions.is_empty() {
-                    row
-                } else {
-                    normalize_union_row(row, &builder.columns, &conversions)?
-                };
-                builder.push(row)?;
+        if let Some(mut reader) = spill.open_reader()? {
+            while let Some(batch) = reader.next_batch()? {
+                append_union_batch(&batch, builder, &conversions)?;
             }
         }
     } else {
-        for row in branch.store.dense_rows() {
+        for row in branch.store.dense_rows()? {
             crate::engine::cancel::check_cancelled()?;
             let row = if conversions.is_empty() {
                 row.clone()
@@ -2886,22 +3051,109 @@ fn append_union_branch_spool(
     Ok(())
 }
 
+fn append_union_batch(
+    batch: &crate::engine::executor::vec::batch::Batch,
+    builder: &mut CteSpillBuilder,
+    conversions: &[usize],
+) -> Result<(), QueryError> {
+    use crate::engine::executor::vec::batch::ColumnVector;
+    let identity = conversions.iter().all(|&index| {
+        let column = &batch.columns()[index];
+        let target = &builder.columns[index];
+        if matches!(column, ColumnVector::Null { .. }) {
+            return true;
+        }
+        match (target.column_type, column) {
+            (
+                ColumnType::VarString | ColumnType::Blob,
+                ColumnVector::Utf8 { offsets, data, .. },
+            ) if target.source.collation_id != Some(63) => {
+                std::str::from_utf8(data).is_ok_and(|text| {
+                    offsets
+                        .iter()
+                        .all(|offset| text.is_char_boundary(*offset as usize))
+                })
+            }
+            (ColumnType::VarString | ColumnType::Blob, ColumnVector::Bytes { .. }) => {
+                target.source.collation_id == Some(63)
+            }
+            (ColumnType::Double, ColumnVector::F64 { .. }) => {
+                batch.schema().fields()[index].column_type == ColumnType::Double
+            }
+            (
+                ColumnType::Decimal { precision, scale },
+                ColumnVector::Decimal32 {
+                    data,
+                    scale: actual,
+                    ..
+                },
+            ) => {
+                *actual == scale
+                    && decimal_lane_fits(data.iter().map(|v| i128::from(*v)), precision)
+            }
+            (
+                ColumnType::Decimal { precision, scale },
+                ColumnVector::Decimal64 {
+                    data,
+                    scale: actual,
+                    ..
+                },
+            ) => {
+                *actual == scale
+                    && decimal_lane_fits(data.iter().map(|v| i128::from(*v)), precision)
+            }
+            (
+                ColumnType::Decimal { precision, scale },
+                ColumnVector::Decimal128 {
+                    data,
+                    scale: actual,
+                    ..
+                },
+            ) => *actual == scale && decimal_lane_fits(data.iter().copied(), precision),
+            _ => false,
+        }
+    });
+    if identity {
+        return builder.push_batch(batch);
+    }
+    for index in batch.visible_indices() {
+        crate::engine::cancel::check_cancelled()?;
+        let row = normalize_union_row(batch.row(index), &builder.columns, conversions)?;
+        builder.push(row)?;
+    }
+    Ok(())
+}
+
+fn decimal_lane_fits(values: impl Iterator<Item = i128>, precision: u8) -> bool {
+    let Some(limit) = 10u128.checked_pow(u32::from(precision)) else {
+        return true;
+    };
+    values.into_iter().all(|value| value.unsigned_abs() < limit)
+}
+
 fn visit_cte_result_rows(
     result: &CteResult,
     mut visit: impl FnMut(Vec<Value>) -> Result<(), QueryError>,
 ) -> Result<(), QueryError> {
     if let Some(spill) = result.spill.as_ref() {
-        if let Some(mut reader) = crate::engine::executor::select::grace::ValueRowReader::open(
-            &spill.path,
-            spill._dir.charger(),
-        )? {
+        if let Some(mut reader) = spill.open_reader()? {
             while let Some(row) = reader.next()? {
                 crate::engine::cancel::check_cancelled()?;
                 visit(row)?;
             }
         }
+    } else if result.store.is_native() {
+        for index in 0..result.nrows() {
+            crate::engine::cancel::check_cancelled()?;
+            visit(
+                result
+                    .store
+                    .copy_row(index)?
+                    .expect("resident CTE row count is exact"),
+            )?;
+        }
     } else {
-        for row in result.store.dense_rows() {
+        for row in result.store.dense_rows()? {
             crate::engine::cancel::check_cancelled()?;
             visit(row.clone())?;
         }
@@ -2916,16 +3168,13 @@ fn visit_cte_result_rows(
 struct CteResultRowCursor {
     result: Arc<CteResult>,
     index: usize,
-    spill: Option<crate::engine::executor::select::grace::ValueRowReader>,
+    spill: Option<spool::Reader>,
 }
 
 impl CteResultRowCursor {
     fn open(result: Arc<CteResult>) -> Result<Self, QueryError> {
         let spill = match result.spill.as_ref() {
-            Some(file) => crate::engine::executor::select::grace::ValueRowReader::open(
-                &file.path,
-                file._dir.charger(),
-            )?,
+            Some(file) => file.open_reader()?,
             None => None,
         };
         Ok(Self {
@@ -2943,7 +3192,7 @@ impl CteResultRowCursor {
                 None => Ok(None),
             };
         }
-        let row = self.result.store.dense_rows().get(self.index).cloned();
+        let row = self.result.store.copy_row(self.index)?;
         self.index = self.index.saturating_add(usize::from(row.is_some()));
         Ok(row)
     }
@@ -7618,6 +7867,7 @@ fn placeholder_table_ref(alias: String) -> TableRef {
         name: alias.clone(),
         alias: Some(alias),
         system_time: None,
+        sample: None,
         index_hints: vec![],
         partitions: vec![],
         column_aliases: Vec::new(),
@@ -7671,10 +7921,15 @@ fn function_is_nondeterministic(name: &str) -> bool {
 }
 
 fn select_has_nondeterministic(s: &Select) -> bool {
-    s.projection.iter().any(|item| match item {
-        SelectItem::Expr { expr, .. } => expr_is_nondeterministic(expr),
-        _ => false,
-    }) || s.selection.as_ref().is_some_and(expr_is_nondeterministic)
+    s.from
+        .iter()
+        .chain(s.joins.iter().map(|join| &join.table))
+        .any(|table| table.sample.is_some())
+        || s.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => expr_is_nondeterministic(expr),
+            _ => false,
+        })
+        || s.selection.as_ref().is_some_and(expr_is_nondeterministic)
         || s.having.as_ref().is_some_and(expr_is_nondeterministic)
         || s.group_by.iter().any(expr_is_nondeterministic)
         || s.order_by.iter().any(|o| expr_is_nondeterministic(&o.expr))
@@ -7965,6 +8220,362 @@ mod audit1027_scope_tests {
 #[cfg(test)]
 mod spill_builder_reservation_tests {
     use super::*;
+
+    #[test]
+    fn native_cte_preserves_float_metadata_precision_and_selected_nulls() {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector, Selection},
+            schema::{BatchField, BatchSchema},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let columns = vec![Column {
+            name: "v".into(),
+            column_type: ColumnType::Float,
+            source: Default::default(),
+        }];
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "v".into(),
+            column_type: ColumnType::Float,
+            source: Default::default(),
+        }]));
+        let input = Batch::new(
+            schema,
+            vec![ColumnVector::from_values(vec![
+                Value::Double(1.234567890123),
+                Value::Double(99.0),
+                Value::Null,
+                Value::Double(-0.0),
+            ])],
+        )
+        .with_selection(Selection::Indices(vec![2, 0, 3, 0]));
+        let expected = input
+            .visible_indices()
+            .map(|i| input.row(i))
+            .collect::<Vec<_>>();
+        for threshold in [0, 1024 * 1024] {
+            let mut builder = CteSpillBuilder::new(columns.clone(), root.path().to_path_buf());
+            builder.threshold = threshold;
+            builder.push_batch(&input).unwrap();
+            let result = builder.finish().unwrap();
+            if let Some(file) = result.spill.as_ref() {
+                assert_eq!(file.row_count, expected.len());
+                let mut reader = file.open_reader().unwrap().unwrap();
+                for row in &expected {
+                    let (actual, _charge) = reader.next_owned().unwrap().unwrap();
+                    assert_eq!(&actual, row);
+                }
+                assert!(reader.next_owned().unwrap().is_none());
+            } else {
+                assert_eq!(result.nrows(), expected.len());
+                for (index, row) in expected.iter().enumerate() {
+                    assert_eq!(result.store.copy_row(index).unwrap().as_ref(), Some(row));
+                }
+                assert_eq!(result.store.dense_rows().unwrap(), expected);
+                let native = result.store.native_batches().unwrap();
+                for (index, row) in expected.iter().enumerate() {
+                    assert_eq!(native[0].row(index), *row);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn union_column_batches_reuse_identity_coercions_and_keep_conversion_semantics() {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector, Selection},
+            schema::{BatchField, BatchSchema},
+        };
+        let root = tempfile::tempdir().unwrap();
+        for (source_kind, target_kind, binary, values, direct) in [
+            (
+                ColumnType::VarString,
+                ColumnType::VarString,
+                false,
+                vec![Value::String("é".into()), Value::Null],
+                true,
+            ),
+            (
+                ColumnType::Blob,
+                ColumnType::Blob,
+                true,
+                vec![Value::Bytes(vec![255, 0, 128]), Value::Null],
+                true,
+            ),
+            (
+                ColumnType::Double,
+                ColumnType::Double,
+                false,
+                vec![Value::Double(-0.0), Value::Double(1.25)],
+                true,
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                ColumnType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                false,
+                vec![Value::DecimalCompact(-12345, 2), Value::Null],
+                true,
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                ColumnType::Decimal {
+                    precision: 14,
+                    scale: 3,
+                },
+                false,
+                vec![Value::DecimalCompact(-12345, 2), Value::Null],
+                false,
+            ),
+            (
+                ColumnType::VarString,
+                ColumnType::Blob,
+                true,
+                vec![Value::String("é".into()), Value::Null],
+                false,
+            ),
+            (
+                ColumnType::LongLong,
+                ColumnType::VarString,
+                false,
+                vec![Value::Int(321), Value::Null],
+                false,
+            ),
+        ] {
+            let target = Column {
+                name: "v".into(),
+                column_type: target_kind,
+                source: crate::types::ColumnSource {
+                    collation_id: binary.then_some(63),
+                    ..Default::default()
+                },
+            };
+            let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                table: String::new(),
+                alias: None,
+                name: "v".into(),
+                column_type: source_kind,
+                source: Default::default(),
+            }]));
+            let column = if source_kind == ColumnType::Blob {
+                let mut accumulator =
+                    crate::engine::executor::vec::batch::ColumnAccumulator::for_type(
+                        source_kind,
+                        values.len(),
+                    );
+                for value in &values {
+                    accumulator.push(value);
+                }
+                accumulator.finish()
+            } else {
+                ColumnVector::from_values(values)
+            };
+            let input =
+                Batch::new(schema, vec![column]).with_selection(Selection::Indices(vec![1, 0, 0]));
+            let expected = input
+                .visible_indices()
+                .map(|index| {
+                    normalize_union_row(input.row(index), std::slice::from_ref(&target), &[0])
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut builder = CteSpillBuilder::new(vec![target], root.path().to_path_buf());
+            builder.threshold = 1024 * 1024;
+            append_union_batch(&input, &mut builder, &[0]).unwrap();
+            assert_eq!(
+                !builder.buffered_batches.is_empty(),
+                direct,
+                "source={source_kind:?} target={target_kind:?} physical={:?} spill={}",
+                input.columns()[0],
+                builder.spill.is_some()
+            );
+            let result = builder.finish().unwrap();
+            for (index, row) in expected.iter().enumerate() {
+                assert_eq!(result.store.copy_row(index).unwrap().as_ref(), Some(row));
+            }
+        }
+    }
+
+    #[test]
+    fn resident_columnar_materialization_does_not_build_per_row_vectors() {
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector},
+            schema::{BatchField, BatchSchema},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let columns = [("k", ColumnType::LongLong), ("v", ColumnType::VarString)]
+            .into_iter()
+            .map(|(name, column_type)| Column {
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(BatchSchema::new(
+            columns
+                .iter()
+                .map(|column| BatchField {
+                    table: String::new(),
+                    alias: None,
+                    name: column.name.clone(),
+                    column_type: column.column_type,
+                    source: column.source.clone(),
+                })
+                .collect(),
+        ));
+        let batch = Batch::new(
+            schema,
+            vec![
+                ColumnVector::from_values((0..1024).map(Value::Int).collect()),
+                ColumnVector::from_values(
+                    (0..1024)
+                        .map(|row| Value::String(format!("row-{row}")))
+                        .collect(),
+                ),
+            ],
+        );
+        let mut builder = CteSpillBuilder::new(columns, root.path().to_path_buf());
+        builder.threshold = 8 * 1024 * 1024;
+        builder.push_batch(&batch).unwrap();
+        assert!(
+            builder.buffered.is_empty(),
+            "a native materialization must retain columns instead of allocating one Vec per row"
+        );
+        let result = builder.finish().unwrap();
+        assert!(result.spill.is_none());
+        assert_eq!(result.nrows(), 1024);
+    }
+
+    #[test]
+    fn resident_cte_does_not_retain_the_producing_query_budget() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget, ScopedCharge};
+        use crate::engine::executor::vec::{
+            batch::{Batch, ColumnVector},
+            schema::{BatchField, BatchSchema},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let columns = vec![Column {
+            name: "v".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }];
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "v".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }]));
+        let budget = Arc::new(MemBudget::new(1024 * 1024));
+        let result = with_query_budget(budget.clone(), || {
+            let input = Batch::new(
+                schema,
+                vec![ColumnVector::from_values(
+                    (0..2048).map(Value::Int).collect(),
+                )],
+            )
+            .with_memory_charge(ScopedCharge::new(0))
+            .unwrap();
+            let mut builder = CteSpillBuilder::new(columns, root.path().to_path_buf());
+            builder.threshold = 1024 * 1024;
+            builder.push_batch(&input).unwrap();
+            builder.finish().unwrap()
+        });
+        assert!(result.store.is_native());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(
+            Arc::strong_count(&budget),
+            1,
+            "a cached CTE must not prolong its producer's query budget lifetime"
+        );
+        assert_eq!(
+            result.store.copy_row(2047).unwrap().unwrap(),
+            vec![Value::Int(2047)]
+        );
+        let chunks = result.store.native_batches().unwrap();
+        let batch = chunks[0].clone();
+        drop(chunks);
+        drop(result);
+        assert_eq!(batch.columns()[0].value_at(2047), Value::Int(2047));
+        drop(batch);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn materialized_spill_retains_column_batches_for_replay() {
+        use crate::engine::executor::vec::{
+            schema::{BatchField, BatchSchema},
+            spill,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let columns = [("k", ColumnType::LongLong), ("v", ColumnType::VarString)]
+            .into_iter()
+            .map(|(name, column_type)| Column {
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(BatchSchema::new(
+            columns
+                .iter()
+                .map(|c| BatchField {
+                    table: String::new(),
+                    alias: None,
+                    name: c.name.clone(),
+                    column_type: c.column_type,
+                    source: c.source.clone(),
+                })
+                .collect(),
+        ));
+        let mut builder = CteSpillBuilder::new(columns, dir.path().to_path_buf());
+        builder.threshold = 0;
+        for row in 0..257 {
+            builder
+                .push(vec![
+                    Value::Int(row),
+                    if row % 3 == 0 {
+                        Value::Null
+                    } else {
+                        Value::String(format!("row-{row}"))
+                    },
+                ])
+                .unwrap();
+        }
+        let result = builder.finish().unwrap();
+        let file = result.spill.as_ref().unwrap();
+        let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+            &file.path,
+            file._dir.charger(),
+            32 * 1024,
+        )
+        .unwrap();
+        let mut count = 0;
+        while let Some(batch) = spill::read_owned_batch(&mut reader, schema.clone())
+            .expect("materialized spill must retain typed column batches")
+        {
+            for row in batch.visible_indices() {
+                assert_eq!(batch.columns()[0].value_at(row), Value::Int(count));
+                let expected = if count % 3 == 0 {
+                    Value::Null
+                } else {
+                    Value::String(format!("row-{count}"))
+                };
+                assert_eq!(batch.columns()[1].value_at(row), expected);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 257);
+    }
 
     #[test]
     fn prepaid_cte_reservations_track_rows_and_release_on_spill() {

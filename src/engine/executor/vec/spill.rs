@@ -23,12 +23,15 @@ use super::schema::BatchSchema;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+mod typed;
+
 // Column-block format tags.
 const BLOCK_RAW_VALUES: u8 = 0x10;
 const BLOCK_INT64_FOR: u8 = 0x11; // frame-of-reference + delta-varint i64 column
 const BLOCK_BYTES: u8 = 0x12;
 const BLOCK_UTF8: u8 = 0x13;
 const BLOCK_PACKED_I64: u8 = 0x14;
+const BLOCK_TYPED: u8 = 0x15;
 
 /// Write a `Batch` to `w` in the wire format described above. Each
 /// column is preceded by a block tag that tells the reader how the
@@ -158,6 +161,9 @@ pub fn write_batch<W: Write>(w: &mut W, batch: &Batch) -> Result<(), QueryError>
             w.write_all(data).map_err(io_err)?;
             continue;
         }
+        if typed::write_column(w, c, n)? {
+            continue;
+        }
         if let ColumnVector::Generic { values } = c {
             if values.iter().all(|value| matches!(value, Value::Int(_))) {
                 w.write_all(&[BLOCK_INT64_FOR]).map_err(io_err)?;
@@ -270,6 +276,7 @@ fn read_batch_body<R: Read>(
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         match tag[0] {
+            BLOCK_TYPED => columns.push(typed::read_column(r, nrows, &mut charge)?),
             BLOCK_RAW_VALUES => {
                 charge.add_force(nrows.saturating_mul(std::mem::size_of::<Value>()))?;
                 let mut col_values =
@@ -581,6 +588,112 @@ mod tests {
             write_value(&mut bytes, &value).unwrap();
             *bytes.last_mut().unwrap() = 0xff;
             assert!(read_value(&mut bytes.as_slice()).is_err());
+        }
+    }
+
+    #[test]
+    fn nullable_typed_spill_does_not_fall_back_to_scalar_cells() {
+        use super::super::bitmap::Bitmap;
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: String::new(),
+            alias: None,
+            name: "v".into(),
+            column_type: crate::types::ColumnType::VarString,
+            source: Default::default(),
+        }]));
+        let mut valid = Bitmap::new_all_valid(3);
+        valid.set(1, false);
+        let mask = || Some(valid.clone());
+        let columns = vec![
+            ColumnVector::I64 {
+                data: vec![i64::MIN, 0, i64::MAX],
+                nulls: mask(),
+            },
+            ColumnVector::U64 {
+                data: vec![0, 0, u64::MAX],
+                nulls: mask(),
+            },
+            ColumnVector::F64 {
+                data: vec![-0.0, 0.0, f64::from_bits(0x7ff8000000000042)],
+                nulls: mask(),
+            },
+            ColumnVector::Date32 {
+                data: vec![-123, 0, 123],
+                nulls: mask(),
+            },
+            ColumnVector::Time64 {
+                data: vec![-12345, 0, 12345],
+                nulls: mask(),
+            },
+            ColumnVector::DateTime64 {
+                data: vec![1, 0, 12345],
+                nulls: mask(),
+            },
+            ColumnVector::Timestamp64 {
+                data: vec![-12345, 0, 12345],
+                nulls: mask(),
+            },
+            ColumnVector::Decimal32 {
+                data: vec![i32::MIN, 0, i32::MAX],
+                scale: 7,
+                nulls: mask(),
+            },
+            ColumnVector::Decimal64 {
+                data: vec![i64::MIN, 0, i64::MAX],
+                scale: 12,
+                nulls: mask(),
+            },
+            ColumnVector::Decimal128 {
+                data: vec![i128::MIN, 0, i128::MAX],
+                scale: 25,
+                nulls: mask(),
+            },
+            ColumnVector::Utf8 {
+                offsets: vec![0, 1, 1, 5],
+                data: "A🌍".as_bytes().to_vec(),
+                nulls: mask(),
+            },
+            ColumnVector::Bytes {
+                offsets: vec![0, 0, 0, 2],
+                data: vec![0, 255],
+                nulls: mask(),
+            },
+            ColumnVector::Json {
+                offsets: vec![0, 0, 0, 2],
+                data: vec![0, 255],
+                nulls: mask(),
+            },
+            ColumnVector::Geometry {
+                offsets: vec![0, 0, 0, 2],
+                data: vec![0, 255],
+                nulls: mask(),
+            },
+            ColumnVector::Bool {
+                values: Bitmap::new_all_valid(3),
+                nulls: mask(),
+            },
+            ColumnVector::Null { len: 3 },
+        ];
+        for column in columns {
+            let batch = Batch::new(schema.clone(), vec![column]);
+            let mut encoded = Vec::new();
+            write_batch(&mut encoded, &batch).unwrap();
+            assert_ne!(
+                encoded[8], BLOCK_RAW_VALUES,
+                "nullable typed lanes must stay columnar"
+            );
+            let decoded = read_batch(&mut encoded.as_slice(), schema.clone()).unwrap();
+            for row in 0..3 {
+                let actual = decoded.columns()[0].value_at(row);
+                let expected = batch.columns()[0].value_at(row);
+                match (actual, expected) {
+                    (Value::Double(a), Value::Double(b)) => assert_eq!(a.to_bits(), b.to_bits()),
+                    (a, b) => assert_eq!(a, b),
+                }
+            }
+            encoded.pop();
+            // The compressed all-NULL sentinel intentionally has no row payload.
+            assert!(read_batch(&mut encoded.as_slice(), schema.clone()).is_err());
         }
     }
 

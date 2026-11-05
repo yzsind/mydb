@@ -159,7 +159,7 @@ impl ColumnVector {
         };
         std::mem::size_of::<Value>().saturating_add(payload)
     }
-    fn try_clone_owned(&self) -> Result<Self, crate::types::QueryError> {
+    pub(crate) fn try_clone_owned(&self) -> Result<Self, crate::types::QueryError> {
         use crate::engine::executor::mem_budget;
         let bitmap = |value: &Option<Bitmap>| value.as_ref().map(Bitmap::try_clone).transpose();
         macro_rules! lane {
@@ -1916,6 +1916,9 @@ pub(crate) struct BatchCharge(
     // column owner. Keep both until the final zero-copy view is dropped.
     Option<Arc<BatchCharge>>,
     Option<Arc<BatchCharge>>,
+    // Resident caches outlive a statement but must not retain its query
+    // budget. Their unified-governor lease follows the actual buffers.
+    Option<Arc<std::sync::Mutex<crate::engine::executor::mem_budget::ControlledMemoryCharge>>>,
 );
 
 impl BatchCharge {
@@ -1923,7 +1926,15 @@ impl BatchCharge {
         mut charge: crate::engine::executor::mem_budget::ScopedCharge,
     ) -> Result<Arc<Self>, crate::types::QueryError> {
         charge.add_force(std::mem::size_of::<Self>() + 16)?;
-        Ok(Arc::new(Self(charge, None, None)))
+        Ok(Arc::new(Self(charge, None, None, None)))
+    }
+
+    fn sibling(&self) -> crate::engine::executor::mem_budget::ScopedCharge {
+        if self.3.is_some() {
+            crate::engine::executor::mem_budget::ScopedCharge::new(0)
+        } else {
+            self.0.sibling()
+        }
     }
 }
 
@@ -1933,6 +1944,7 @@ impl std::fmt::Debug for BatchCharge {
             .field(&self.0.charged())
             .field(&self.1.is_some())
             .field(&self.2.is_some())
+            .field(&self.3.is_some())
             .finish()
     }
 }
@@ -1960,11 +1972,65 @@ impl std::ops::DerefMut for OwnedColumns {
 }
 
 impl OwnedColumns {
+    /// Rebase a uniquely owned transform after discarded buffers are freed.
+    /// Shared/linked owners retain their leases because another view may
+    /// still reference the original allocation.
+    pub(crate) fn with_reconciled_charge(
+        mut self,
+        mut extra: crate::engine::executor::mem_budget::ScopedCharge,
+    ) -> Result<Self, crate::types::QueryError> {
+        let mut charge = match self.charge.take() {
+            Some(owner) => match Arc::try_unwrap(owner) {
+                Ok(BatchCharge(mut charge, None, None, None)) => {
+                    charge.absorb(&mut extra);
+                    charge
+                }
+                Ok(owner) => {
+                    self.charge = Some(Arc::new(owner));
+                    self.attach_charge(extra);
+                    return Ok(self);
+                }
+                Err(owner) => {
+                    self.charge = Some(owner);
+                    self.attach_charge(extra);
+                    return Ok(self);
+                }
+            },
+            None => extra,
+        };
+        let actual = self
+            .columns
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ColumnVector>())
+            .saturating_add(
+                self.columns
+                    .iter()
+                    .map(ColumnVector::memory_bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(128);
+        if actual > charge.charged() {
+            if let Err(error) = charge.add_force(actual - charge.charged()) {
+                drop(self);
+                return Err(error);
+            }
+        } else {
+            charge.release_bytes(charge.charged() - actual);
+        }
+        self.charge = Some(Arc::new(BatchCharge(charge, None, None, None)));
+        Ok(self)
+    }
+
     pub(crate) fn attach_charge(
         &mut self,
         charge: crate::engine::executor::mem_budget::ScopedCharge,
     ) {
-        self.charge = Some(Arc::new(BatchCharge(charge, self.charge.take(), None)));
+        self.charge = Some(Arc::new(BatchCharge(
+            charge,
+            self.charge.take(),
+            None,
+            None,
+        )));
     }
 
     fn try_clone(&self) -> Result<Self, crate::types::QueryError> {
@@ -1972,7 +2038,7 @@ impl OwnedColumns {
         let mut charge = self
             .charge
             .as_ref()
-            .map(|owner| owner.0.sibling())
+            .map(|owner| owner.sibling())
             .unwrap_or_else(|| mem_budget::ScopedCharge::new(0));
         let bytes = self
             .columns
@@ -1992,7 +2058,7 @@ impl OwnedColumns {
         }
         Ok(Self {
             columns,
-            charge: Some(Arc::new(BatchCharge(charge, None, None))),
+            charge: Some(Arc::new(BatchCharge(charge, None, None, None))),
             rows: self.rows,
         })
     }
@@ -2130,7 +2196,7 @@ impl Batch {
         self.columns
             .charge
             .as_ref()
-            .map(|charge| charge.0.sibling())
+            .map(|charge| charge.sibling())
             .unwrap_or_else(|| crate::engine::executor::mem_budget::ScopedCharge::new(0))
     }
 
@@ -2143,9 +2209,9 @@ impl Batch {
         columns.charge = Some(match columns.charge.take() {
             None => owner,
             Some(existing) => {
-                let mut metadata = owner.0.sibling();
+                let mut metadata = owner.sibling();
                 metadata.add_force(std::mem::size_of::<BatchCharge>() + 16)?;
-                Arc::new(BatchCharge(metadata, Some(existing), Some(owner)))
+                Arc::new(BatchCharge(metadata, Some(existing), Some(owner), None))
             }
         });
         Ok(self)
@@ -2175,8 +2241,43 @@ impl Batch {
         }
         Arc::get_mut(&mut self.columns)
             .expect("newly decoded columns are unique")
-            .charge = Some(Arc::new(BatchCharge(charge, None, None)));
+            .charge = Some(Arc::new(BatchCharge(charge, None, None, None)));
         Ok(self)
+    }
+
+    pub(crate) fn set_resident_owner(
+        &mut self,
+        owner: Arc<std::sync::Mutex<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
+    ) -> Result<(), crate::types::QueryError> {
+        let columns = Arc::get_mut(&mut self.columns).ok_or_else(|| {
+            crate::error::catalog::ER_INTERNAL_ERROR
+                .error("resident batch ownership was not finalized")
+        })?;
+        columns.charge = Some(Arc::new(BatchCharge(
+            crate::engine::executor::mem_budget::ScopedCharge::for_budget(None),
+            None,
+            None,
+            Some(owner),
+        )));
+        Ok(())
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let selection = match &self.selection {
+            Some(Selection::Indices(indices)) => indices
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u32>()),
+            Some(Selection::Mask(mask)) => mask.memory_bytes(),
+            _ => 0,
+        };
+        self.memory_bytes()
+            .saturating_add(selection)
+            .saturating_add(
+                self.columns
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ColumnVector>()),
+            )
+            .saturating_add(128)
     }
 
     pub(crate) fn try_columns_mut(

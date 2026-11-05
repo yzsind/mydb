@@ -106,6 +106,25 @@ struct TruthMask {
 }
 
 impl BatchExprProgram {
+    /// Pair frontiers change evaluation order and may stop after a match.
+    /// Warning/error, volatile and session-dependent leaves retain ordered
+    /// evaluation, using the same capability contract as other batch nodes.
+    pub(crate) fn allows_pair_short_circuit(&self) -> bool {
+        fn safe(node: &BatchPredicateNode) -> bool {
+            match node {
+                BatchPredicateNode::And(left, right) | BatchPredicateNode::Or(left, right) => {
+                    safe(left) && safe(right)
+                }
+                BatchPredicateNode::Not(input) => safe(input),
+                BatchPredicateNode::Leaf { program, .. }
+                | BatchPredicateNode::TimestampDatePlusIntegerCmp {
+                    oracle: program, ..
+                } => !program.capability().requires_ordered_evaluation(),
+            }
+        }
+        safe(&self.root)
+    }
+
     pub(crate) fn referenced_columns(&self) -> std::collections::HashSet<usize> {
         fn visit(node: &BatchPredicateNode, columns: &mut std::collections::HashSet<usize>) {
             match node {
@@ -809,7 +828,7 @@ fn try_substring_column_string_in_const_set_truth_mask(
     program: &ExprProgram,
     batch: &Batch,
 ) -> Option<TruthMask> {
-    let (column, substring_start, substring_len, keys, has_null, negated) =
+    let (column, substring_start, substring_len, keys, has_null, negated, collation_id) =
         program.as_substring_column_string_in_const_set()?;
     let ColumnVector::Utf8 {
         offsets,
@@ -838,7 +857,10 @@ fn try_substring_column_string_in_const_set_truth_mask(
         let input = std::str::from_utf8(&data[start..end]).ok()?;
         let substring =
             crate::engine::expr::mysql_substring_slice(input, substring_start, substring_len);
-        let found = keys.contains(&ValueKey::string_from_str(substring));
+        let found = keys.contains(&ValueKey::string_from_str_with_collation(
+            substring,
+            collation_id,
+        ));
         if found {
             if !negated {
                 truth.set_true(row);
@@ -929,7 +951,8 @@ fn try_column_string_in_const_set_truth_mask(
     program: &ExprProgram,
     batch: &Batch,
 ) -> Option<TruthMask> {
-    let (column, keys, has_null, negated) = program.as_column_string_in_const_set()?;
+    let (column, keys, has_null, negated, collation_id) =
+        program.as_column_string_in_const_set()?;
     let ColumnVector::Utf8 {
         offsets,
         data,
@@ -955,7 +978,10 @@ fn try_column_string_in_const_set_truth_mask(
             return None;
         }
         let value = std::str::from_utf8(&data[start..end]).ok()?;
-        let found = keys.contains(&ValueKey::string_from_str(value));
+        let found = keys.contains(&ValueKey::string_from_str_with_collation(
+            value,
+            collation_id,
+        ));
         if found {
             if !negated {
                 truth.set_true(row);
@@ -4599,96 +4625,137 @@ mod tests {
     }
 
     #[test]
+    fn pair_short_circuit_rejects_diagnostics_and_volatile_functions() {
+        let schema = schema();
+        let column = Expr::Identifier("x".into());
+        let compare = |left| Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::BoundValue(Value::Int(0))),
+        };
+        let safe = compare(column.clone());
+        let division = compare(Expr::Binary {
+            left: Box::new(Expr::BoundValue(Value::Int(1))),
+            op: BinaryOp::Div,
+            right: Box::new(column),
+        });
+        let volatile = compare(Expr::Function {
+            name: "RAND".into(),
+            args: Vec::new(),
+            distinct: false,
+        });
+        for (expr, expected) in [(safe, true), (division, false), (volatile, false)] {
+            let program = BatchExprProgram::compile(&expr, &schema).unwrap().unwrap();
+            assert_eq!(program.allows_pair_short_circuit(), expected, "{expr:?}");
+        }
+    }
+
+    #[test]
     fn substring_utf8_in_const_set_batch_kernel_matches_scalar_oracle() {
         use crate::parser::Literal;
 
-        let schema = Arc::new(BatchSchema::new(vec![BatchField {
-            table: "t".into(),
-            alias: None,
-            name: "phone".into(),
-            column_type: ColumnType::VarString,
-            source: Default::default(),
-        }]));
-        let mut visible = Bitmap::new_all_invalid(7);
-        for row in [0, 1, 2, 4, 5, 6] {
-            visible.set_true(row);
-        }
-        let batch = Batch::new(
-            schema.clone(),
-            vec![ColumnVector::from_values(vec![
-                Value::String("13-555".into()),
-                Value::String("汉字-alpha".into()),
-                Value::String("A ".into()),
-                Value::String("31-hidden".into()),
-                Value::String("zz-tail".into()),
-                Value::String("".into()),
-                Value::Null,
-            ])],
-        )
-        .with_selection(Selection::Mask(visible));
-
-        for (start, len, constants) in [
-            (1, Some(2), vec!["13", "汉字", "a", "ZZ", "unused"]),
-            (-4, Some(2), vec!["55", "ph", "A ", "ta", "unused"]),
+        for collation in [
+            "utf8mb4_bin",
+            "utf8mb4_0900_ai_ci",
+            "utf8mb4_0900_as_cs",
+            "utf8mb4_0900_bin",
         ] {
-            for negated in [false, true] {
-                let expr = Expr::InList {
-                    expr: Box::new(Expr::Function {
-                        name: "SUBSTRING".into(),
-                        args: vec![
-                            Expr::Identifier("phone".into()),
-                            Expr::Literal(Literal::Int(start)),
-                            Expr::Literal(Literal::Int(len.expect("test length"))),
-                        ],
-                        distinct: false,
-                    }),
-                    list: constants
-                        .iter()
-                        .map(|value| Expr::Literal(Literal::String((*value).into())))
-                        .chain(std::iter::once(Expr::Literal(Literal::Null)))
-                        .collect(),
-                    negated,
-                };
-                let program = compile_for_batch(&expr, &schema)
-                    .unwrap()
-                    .expect("SUBSTRING IN compiles");
-                let native = try_substring_column_string_in_const_set_truth_mask(&program, &batch)
-                    .expect("SUBSTRING over UTF-8 uses the native lane");
-                let oracle = eval_value_per_row(&program, &batch).unwrap();
-                for (row, value) in oracle.iter().enumerate() {
-                    match value {
-                        Value::Null => {
-                            assert!(!native.truth.get(row));
-                            if batch.visible_indices().any(|visible| visible == row) {
-                                assert!(native.null.get(row));
+            let collation_id = crate::charset::resolve_collation(collation).unwrap().id;
+            let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "phone".into(),
+                column_type: ColumnType::VarString,
+                source: crate::types::ColumnSource {
+                    collation_id: Some(collation_id),
+                    ..Default::default()
+                },
+            }]));
+            let mut visible = Bitmap::new_all_invalid(7);
+            for row in [0, 1, 2, 4, 5, 6] {
+                visible.set_true(row);
+            }
+            let batch = Batch::new(
+                schema.clone(),
+                vec![ColumnVector::from_values(vec![
+                    Value::String("13-555".into()),
+                    Value::String("汉字-alpha".into()),
+                    Value::String("A ".into()),
+                    Value::String("31-hidden".into()),
+                    Value::String("zz-tail".into()),
+                    Value::String("".into()),
+                    Value::Null,
+                ])],
+            )
+            .with_selection(Selection::Mask(visible));
+
+            for (start, len, constants) in [
+                (1, Some(2), vec!["13", "汉字", "a", "ZZ", "unused"]),
+                (-4, Some(2), vec!["55", "ph", "A ", "ta", "unused"]),
+            ] {
+                for negated in [false, true] {
+                    let expr = Expr::InList {
+                        expr: Box::new(Expr::Function {
+                            name: "SUBSTRING".into(),
+                            args: vec![
+                                Expr::Identifier("phone".into()),
+                                Expr::Literal(Literal::Int(start)),
+                                Expr::Literal(Literal::Int(len.expect("test length"))),
+                            ],
+                            distinct: false,
+                        }),
+                        list: constants
+                            .iter()
+                            .map(|value| Expr::Literal(Literal::String((*value).into())))
+                            .chain(std::iter::once(Expr::Literal(Literal::Null)))
+                            .collect(),
+                        negated,
+                    };
+                    let program = compile_for_batch(&expr, &schema)
+                        .unwrap()
+                        .expect("SUBSTRING IN compiles");
+                    let native =
+                        try_substring_column_string_in_const_set_truth_mask(&program, &batch)
+                            .expect("SUBSTRING over UTF-8 uses the native lane");
+                    let legacy =
+                        ExprCompiler::compile_legacy_oracle(&expr, &batch_schema_input(&schema))
+                            .unwrap();
+                    let oracle = eval_value_per_row(&legacy, &batch).unwrap();
+                    for (row, value) in oracle.iter().enumerate() {
+                        match value {
+                            Value::Null => {
+                                assert!(!native.truth.get(row));
+                                if batch.visible_indices().any(|visible| visible == row) {
+                                    assert!(native.null.get(row));
+                                }
+                            }
+                            value => {
+                                assert_eq!(
+                                    native.truth.get(row),
+                                    crate::engine::expr::truthy(value),
+                                    "row {row}, start {start}, negated {negated}"
+                                );
+                                assert!(!native.null.get(row));
                             }
                         }
-                        value => {
-                            assert_eq!(
-                                native.truth.get(row),
-                                crate::engine::expr::truthy(value),
-                                "row {row}, start {start}, negated {negated}"
-                            );
-                            assert!(!native.null.get(row));
-                        }
                     }
-                }
 
-                let batch_program = BatchExprProgram::compile(&expr, &schema)
-                    .unwrap()
-                    .expect("batch SUBSTRING IN compiles");
-                let selected = batch_program.eval_predicate_bitmap(&batch).unwrap();
-                for (row, value) in oracle.iter().enumerate() {
-                    assert_eq!(selected.get(row), crate::engine::expr::truthy(value));
-                }
-                if !matches!(
-                    crate::engine::executor::vec::config::effective_mode(),
-                    crate::engine::executor::vec::config::VecMode::Off
-                ) {
-                    assert_eq!(
-                        batch_program.expression_rows(),
-                        (batch.visible_rows() as u64, 0)
-                    );
+                    let batch_program = BatchExprProgram::compile(&expr, &schema)
+                        .unwrap()
+                        .expect("batch SUBSTRING IN compiles");
+                    let selected = batch_program.eval_predicate_bitmap(&batch).unwrap();
+                    for (row, value) in oracle.iter().enumerate() {
+                        assert_eq!(selected.get(row), crate::engine::expr::truthy(value));
+                    }
+                    if !matches!(
+                        crate::engine::executor::vec::config::effective_mode(),
+                        crate::engine::executor::vec::config::VecMode::Off
+                    ) {
+                        assert_eq!(
+                            batch_program.expression_rows(),
+                            (batch.visible_rows() as u64, 0)
+                        );
+                    }
                 }
             }
         }

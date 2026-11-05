@@ -599,12 +599,20 @@ pub(crate) fn assign_system_time_bindings(statement: &mut Statement) {
     impl AstVisitorMut for BindingAssigner {
         fn enter_select(&mut self, select: &mut Select) {
             for table in &mut select.from {
+                if let Some(sample) = &mut table.sample {
+                    sample.binding_id = self.0;
+                    self.0 = self.0.saturating_add(1);
+                }
                 if let Some(system_time) = &mut table.system_time {
                     system_time.binding_id = self.0;
                     self.0 = self.0.saturating_add(1);
                 }
             }
             for join in &mut select.joins {
+                if let Some(sample) = &mut join.table.sample {
+                    sample.binding_id = self.0;
+                    self.0 = self.0.saturating_add(1);
+                }
                 if let Some(system_time) = &mut join.table.system_time {
                     system_time.binding_id = self.0;
                     self.0 = self.0.saturating_add(1);

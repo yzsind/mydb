@@ -57,7 +57,8 @@ pub(super) fn lock_select_rows_for_update(
     // candidate read+filter step entirely — the post-lock re-read in
     // `execute_locked_single_table_select` already reads the row at the fresh
     // snapshot, so reading it twice is wasteful.
-    if stmt.order_by.is_empty()
+    if stmt.from[0].sample.is_none()
+        && stmt.order_by.is_empty()
         && stmt.limit.is_none()
         && !stmt.distinct
         && stmt.group_by.is_empty()
@@ -74,24 +75,34 @@ pub(super) fn lock_select_rows_for_update(
             return Ok(Some(locked));
         }
     }
-    if fulltext.is_empty() {
+    if fulltext.is_empty() && stmt.from[0].sample.is_none() {
         if let Some(row_ids) = ordered_select_for_update_candidates(db, txn, &table, stmt)? {
             return apply_lock_clause(db, txn, &table, &row_ids, lock_clause).map(Some);
         }
     }
-    let candidates = candidate_row_refs_for_write(
-        db,
-        txn,
-        &table,
-        if fulltext.is_empty() {
-            stmt.selection.as_ref()
-        } else {
-            None
-        },
-    )?;
+    let mut sampled = stmt.from[0]
+        .sample
+        .as_ref()
+        .map(|_| super::select::sampling::selected_refs(db, txn, &stmt.from[0]))
+        .transpose()?;
+    let candidates = if let Some((rows, _charge)) = &mut sampled {
+        Some(std::mem::take(rows))
+    } else {
+        candidate_row_refs_for_write(
+            db,
+            txn,
+            &table,
+            if fulltext.is_empty() {
+                stmt.selection.as_ref()
+            } else {
+                None
+            },
+        )?
+    };
     let rows = db.dml_candidate_rows_with_origin_for_write(&table, txn, candidates)?;
     let mut matched = Vec::new();
     for row in rows {
+        let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
         let _scores = fulltext.enter(row.row_ref);
         crate::engine::cancel::check_cancelled()?;
         let matches = match &stmt.selection {
@@ -275,6 +286,7 @@ pub(super) fn execute_locked_single_table_select(
     let columns = single_table_result_columns(stmt, &table, None)?;
     let mut rows = Vec::with_capacity(row_refs.len());
     for row_ref in row_refs {
+        let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row_ref)?;
         crate::engine::cancel::check_cancelled()?;
         let Some(row) = db.dml_candidate_row_at_for_write(&table, row_ref, txn)? else {
             continue;
@@ -810,11 +822,17 @@ where
             continue;
         }
         affected_rows += u64::from(changed);
-        if let Some((old, new)) = images {
+        if let Some(crate::storage::DmlRowImages {
+            old_values: old,
+            new_values: new,
+            old_ref,
+            new_ref,
+        }) = images
+        {
             if has_triggers {
                 fire_after_update(db, session, table, old.clone(), new.clone(), registry)?;
             }
-            returning.push(Some(&old), Some(&new))?;
+            returning.push_with_refs(Some(&old), Some(&new), Some(old_ref), Some(new_ref))?;
         }
     }
     crate::engine::api::set_statement_matched_rows(matched_rows);
@@ -895,7 +913,7 @@ fn execute_delete_candidates(
                 if has_triggers {
                     fire_after_delete(db, session, table, old.clone(), registry)?;
                 }
-                returning.push(Some(&old), None)?;
+                returning.push_with_refs(Some(&old), None, Some(row_ref), None)?;
             }
             affected_rows += 1;
         }
@@ -1672,6 +1690,7 @@ pub(super) fn execute_delete_borrowed_simple(
         let rows = db.dml_candidate_rows_with_origin_for_write(&table, txn, candidates.clone())?;
         let mut affected_rows = 0u64;
         for row in rows {
+            let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
             crate::engine::cancel::check_cancelled()?;
             let matches = match &stmt.selection {
                 Some(expr) => eval_bool(expr, &table, &row.values)?,
@@ -1924,6 +1943,7 @@ pub(super) fn ordered_limited_dml_candidates(
         .collect();
     let mut matched = Vec::new();
     for row in rows.drain(..) {
+        let _rowid_scope = crate::storage::rowid::RowScope::enter(table, row.row_ref)?;
         let matches = match selection {
             Some(expr) => eval_bool(expr, table, &row.values)?,
             None => true,
@@ -2035,6 +2055,7 @@ fn topn_dml_candidates(
     let mut heap: BinaryHeap<TopnEntry> =
         BinaryHeap::with_capacity(limit.min(rows.len()).min(1024));
     for row in rows.drain(..) {
+        let _rowid_scope = crate::storage::rowid::RowScope::enter(table, row.row_ref)?;
         if let Some(expr) = selection {
             if !eval_bool(expr, table, &row.values)? {
                 continue;
@@ -2575,6 +2596,9 @@ impl UpdateOuterRow<'_> {
     /// an outer column. A string column keeps its collation (implicit
     /// derivation), so `t.s < 'ab'` on a `utf8mb4_bin` column stays binary.
     fn column_value(&self, column: &str) -> Option<Expr> {
+        if let Some(value) = crate::storage::rowid::current(self.table, column) {
+            return Some(Expr::BoundValue(value));
+        }
         let idx = self
             .table
             .columns
@@ -2654,6 +2678,9 @@ fn select_inner_columns(
         .chain(sel.joins.iter().map(|join| &join.table))
     {
         let table = db.table(&table_ref.name).ok()?;
+        if !table.system {
+            columns.insert("rowid".into());
+        }
         columns.extend(
             table
                 .columns
@@ -2678,9 +2705,10 @@ pub(super) fn expr_has_correlated_subquery(
     ) -> bool {
         if let Expr::Identifier(name) = expr {
             return !inner_columns.contains(&name.to_ascii_lowercase())
-                && outer_columns
-                    .iter()
-                    .any(|column| column.name.eq_ignore_ascii_case(name));
+                && (name.eq_ignore_ascii_case("rowid")
+                    || outer_columns
+                        .iter()
+                        .any(|column| column.name.eq_ignore_ascii_case(name)));
         }
         let mut found = false;
         for_each_child_expr(expr, &mut |child| {

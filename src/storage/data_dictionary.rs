@@ -1272,6 +1272,9 @@ fn push_table_rows(
     set: &mut DdRowSet,
     table: &TableSchema,
 ) -> Result<(), crate::types::QueryError> {
+    if let Some(partitioning) = &table.partitioning {
+        partitioning.validate_rowid_tags()?;
+    }
     let table_options = crate::storage::schema::TableOptions::from_schema(table);
     let table_options_json = if table_options.is_default() {
         Value::Null
@@ -1891,6 +1894,9 @@ fn catalog_from_dd_rows_with_auth(
             column_id_map: HashMap::new(),
             row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
+        if let Some(partitioning) = &table.partitioning {
+            partitioning.validate_rowid_tags()?;
+        }
         validate_persisted_layouts(&table)?;
         table.build_column_index();
         table.stats = super::stats_store::load(set, &table)?;

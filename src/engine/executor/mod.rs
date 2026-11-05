@@ -91,6 +91,7 @@ mod prepared_dml;
 pub(super) mod qualification;
 mod returning;
 pub(crate) mod routines;
+pub(crate) mod rowid;
 pub(crate) mod select;
 mod select_into_file;
 pub(crate) mod sort;

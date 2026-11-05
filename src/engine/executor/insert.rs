@@ -2682,8 +2682,9 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                     "INSERT did not return a row identity",
                 )
             })?;
+            let identity = inserted_row_ref(&table, &inserted.storage_ids, 0, row_id)?;
             let after = db
-                .dml_candidate_row_for_write(&table, row_id, txn)?
+                .dml_candidate_row_at_for_write(&table, identity, txn)?
                 .ok_or_else(|| {
                     error(
                         crate::error::catalog::ER_UNKNOWN_ERROR,
@@ -2700,7 +2701,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                     hook.registry,
                 )?;
             }
-            returning.push(None, Some(&after.values))?;
+            returning.push_with_refs(None, Some(&after.values), None, Some(identity))?;
         }
         affected += 1 + deleted;
         duplicates += deleted;
@@ -2811,7 +2812,13 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
     if needs_image {
         let (changed, images) =
             db.update_row_with_images_at(txn, table, None, row_id, writes, Some(compare), apply)?;
-        if let Some((old, new)) = images {
+        if let Some(crate::storage::DmlRowImages {
+            old_values: old,
+            new_values: new,
+            old_ref,
+            new_ref,
+        }) = images
+        {
             updated_id = auto_increment_row_id(&new, auto_idx);
             if TRIGGERS {
                 let hook = hooks.as_mut().expect("trigger context");
@@ -2825,7 +2832,7 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
                     hook.registry,
                 )?;
             }
-            returning.push(Some(&old), Some(&new))?;
+            returning.push_with_refs(Some(&old), Some(&new), Some(old_ref), Some(new_ref))?;
         }
         Ok((changed, if changed { updated_id } else { 0 }))
     } else {
@@ -3262,18 +3269,21 @@ pub(super) fn execute_insert_values(
         super::returning::DefaultImage::New,
         target_alias,
     )?;
-    for (ordinal, row_id) in inserted.row_ids.into_iter().enumerate() {
+    for (ordinal, row_id) in inserted.row_ids.iter().copied().enumerate() {
         let _partition = inserted
             .storage_ids
             .get(ordinal)
             .map(|storage_id| super::partition_router::push_pruned_partitions(vec![*storage_id]));
-        let row = db.read_row(&table, row_id, txn)?.ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_UNKNOWN_ERROR,
-                "inserted row disappeared before RETURNING",
-            )
-        })?;
-        collector.push(None, Some(&row.values))?;
+        let identity = inserted_row_ref(&table, &inserted.storage_ids, ordinal, row_id)?;
+        let row = db
+            .read_row_at(&table, identity.storage_id, row_id, txn)?
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_UNKNOWN_ERROR,
+                    "inserted row disappeared before RETURNING",
+                )
+            })?;
+        collector.push_with_refs(None, Some(&row.values), None, Some(identity))?;
     }
     Ok(collector.finish(QueryResponse::OkAffected { affected_rows }))
 }
@@ -3332,4 +3342,24 @@ fn generated_column_assignment_error() -> QueryError {
         crate::error::catalog::ER_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,
         "value specified for generated column is not allowed; use DEFAULT",
     )
+}
+
+/// Nonpartitioned detailed inserts intentionally omit the redundant storage vector.
+fn inserted_row_ref(
+    table: &TableSchema,
+    storage_ids: &[u64],
+    ordinal: usize,
+    row_id: crate::storage::RowId,
+) -> Result<crate::storage::DmlRowRef, QueryError> {
+    let storage_id = if table.is_partitioned() {
+        *storage_ids.get(ordinal).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_UNKNOWN_ERROR,
+                "INSERT lost partition storage identity",
+            )
+        })?
+    } else {
+        table.id
+    };
+    Ok(crate::storage::DmlRowRef { storage_id, row_id })
 }

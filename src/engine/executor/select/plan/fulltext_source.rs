@@ -30,14 +30,20 @@ pub(super) fn collect_heap_documents(
     };
     let mut rows = Vec::new();
     let mut charge = ScopedCharge::new(0);
-    db.scan_rows_ordered_streaming(&table.schema.qualified_name(), txn, |values| {
-        crate::engine::cancel::check_cancelled()?;
-        heap_document_id(rows.len())?;
-        // Include Vec growth headroom before retaining each visible document.
-        charge.add_non_spillable(estimate_row_bytes(values).saturating_mul(2))?;
-        rows.push(values.to_vec());
-        Ok(())
-    })?;
+    db.scan_rows_ordered_streaming_with_refs(
+        &table.schema.qualified_name(),
+        txn,
+        |identity, values| {
+            crate::engine::cancel::check_cancelled()?;
+            heap_document_id(rows.len())?;
+            // Include Vec growth headroom before retaining each visible document.
+            charge.add_non_spillable(estimate_row_bytes(values).saturating_mul(2))?;
+            let mut values = values.to_vec();
+            crate::storage::rowid::append_value(&table.schema, identity, &mut values)?;
+            rows.push(values);
+            Ok(())
+        },
+    )?;
     Ok((rows, charge))
 }
 

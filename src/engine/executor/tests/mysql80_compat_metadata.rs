@@ -25,6 +25,70 @@ fn cell_string(v: &Value) -> String {
 }
 
 #[test]
+fn system_count_pushdown_preserves_residual_and_conflicting_predicates() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE count_metadata(id INT PRIMARY KEY,a INT,b INT,KEY ka(a),KEY kab(a,b))",
+        )
+        .unwrap();
+    for (relation, predicate, expected) in [
+        ("statistics", "INDEX_NAME='ka'", 1),
+        ("statistics", "INDEX_NAME='missing'", 0),
+        ("statistics", "COLUMN_NAME='b'", 1),
+        ("statistics", "NON_UNIQUE=0", 1),
+        ("statistics", "SEQ_IN_INDEX=2", 1),
+        (
+            "statistics",
+            "TABLE_SCHEMA='missing' AND TABLE_SCHEMA='test'",
+            0,
+        ),
+        (
+            "statistics",
+            "TABLE_NAME='missing' AND TABLE_NAME='count_metadata'",
+            0,
+        ),
+        ("tables", "TABLE_TYPE='VIEW'", 0),
+        ("tables", "ENGINE='missing'", 0),
+        (
+            "tables",
+            "TABLE_SCHEMA='missing' AND TABLE_SCHEMA='test'",
+            0,
+        ),
+    ] {
+        let filter =
+            format!("TABLE_SCHEMA='test' AND TABLE_NAME='count_metadata' AND ({predicate})");
+        let detail = rows(
+            &engine,
+            &format!("SELECT TABLE_NAME FROM information_schema.{relation} WHERE {filter}"),
+        );
+        assert_eq!(detail.len(), expected as usize, "{relation}: {predicate}");
+        let count = rows(
+            &engine,
+            &format!("SELECT COUNT(*) FROM information_schema.{relation} WHERE {filter}"),
+        );
+        assert_eq!(
+            count,
+            vec![vec![Value::Int(expected)]],
+            "{relation}: {predicate}"
+        );
+    }
+    for filter in ["unknown_column='x'", "wrong.TABLE_NAME='count_metadata'"] {
+        assert_eq!(
+            engine
+                .execute(&format!(
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE {filter}"
+                ))
+                .unwrap_err()
+                .code(),
+            1054,
+            "{filter}"
+        );
+    }
+}
+
+#[test]
 fn engines_expose_innodb_compatibility_alias_consistently() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

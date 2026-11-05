@@ -87,6 +87,8 @@ pub(crate) use visit::{
 pub use crate::xa::Xid;
 
 #[cfg(test)]
+mod tablesample_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

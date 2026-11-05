@@ -26,6 +26,7 @@ returns an error before the statement changes data.
 | Stored-program labels | Quoted labels/cursor names; labels only on BEGIN/LOOP/WHILE/REPEAT; malformed names rejected |
 | Nested query tails | Each parenthesized ORDER/LIMIT scope is preserved; original inner qualifiers do not leak |
 | Parameters | Placeholder order is preserved through CTE/functions/windows/RETURNING and LIMIT; SQL PREPARE retains mode snapshot and runtime type for unresolved parameter domains |
+| Table sampling | TABLESAMPLE SYSTEM/BERNOULLI, ROW/BLOCK aliases, PERCENT/ROWS, and REPEATABLE expressions/parameters; defaults to SYSTEM PERCENT; user base tables and partitions only; unsupported sources and modifiers rejected |
 | Hex spelling | Valid 0x hex payloads stay binary; 0x/0xZZ/0xABZZ remain digit-leading identifiers; quoted aliases are separate |
 | Persistent expressions | Unary NOT preserves precedence; reserved/quoted function names retain required quoting; ROW requires at least two expressions |
 | DML parameters and hints | SELECT/DELETE/UPDATE preserve placeholder order and optimizer hints |

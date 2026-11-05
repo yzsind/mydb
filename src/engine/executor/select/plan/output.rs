@@ -860,6 +860,16 @@ pub(in crate::engine::executor::select) fn collect_plan_fields(
             projected_columns,
             ..
         }
+        | PhysicalPlan::SampleScan {
+            table,
+            projected_columns,
+            ..
+        }
+        | PhysicalPlan::ParallelSampleScan {
+            table,
+            projected_columns,
+            ..
+        }
         | PhysicalPlan::ZoneMapScan {
             table,
             projected_columns,

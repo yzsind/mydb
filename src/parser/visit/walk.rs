@@ -409,6 +409,12 @@ let crate::parser::WindowSpec { partition_by, order_by, frame, .. } = & $($mutab
         }
 
         pub(crate) fn walk_table_ref<V: $visitor_trait + ?Sized>(visitor: &mut V, table: & $($mutable)* TableRef) {
+            if let Some(sample) = & $($mutable)* table.sample {
+                walk_expr(visitor, & $($mutable)* sample.amount);
+                if let Some(seed) = & $($mutable)* sample.seed {
+                    walk_expr(visitor, seed);
+                }
+            }
             if let Some(system_time) = & $($mutable)* table.system_time {
                 walk_expr(visitor, & $($mutable)* system_time.expr);
             }

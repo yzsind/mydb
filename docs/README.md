@@ -26,6 +26,7 @@ execution, and storage documentation.
 | [generate_series](generate-series.md) | Table function semantics and boundaries |
 | [Sequences](sequences.md) | Catalog-backed counters, caching, durability, strict native replication, failover, diagnostics, and validation |
 | [DML RETURNING](design/dml-returning.md) | Row images, result sets, and compatibility boundaries |
+| [SQL ROWID](rowid.md) | Unsigned physical row addresses, partition tags, direct access, and address reuse |
 
 ## Configuration, Deployment, and Operations
 

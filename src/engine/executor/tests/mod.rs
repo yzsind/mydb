@@ -1,4 +1,5 @@
 mod ai;
+mod collated_constant_in;
 mod critical_audit;
 mod ddl_lock_contract;
 mod fresh_release_audit;
@@ -14,6 +15,7 @@ mod sql_execution_fixes;
 mod support;
 mod table_ddl_audit_1012;
 mod table_ddl_audit_1027;
+mod tablesample;
 mod temporal_comparison_consistency;
 
 use super::*;
@@ -415,6 +417,7 @@ mod rc_concurrency;
 mod read_compatible_ddl;
 mod rollup;
 mod routines;
+mod rowid;
 mod scalar_decorrelate;
 mod select;
 mod select_audit;

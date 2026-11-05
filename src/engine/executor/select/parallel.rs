@@ -2251,7 +2251,7 @@ pub(super) fn execute_parallel_rollup_aggregate(
     having: Option<&Expr>,
     aggregates: &[Expr],
     degree: u32,
-    estimated_rows: f64,
+    _estimated_rows: f64,
 ) -> Result<Vec<PlanRow>, QueryError> {
     if degree <= 1 || !crate::planner::plan_contains_parallel(input) {
         return super::plan::execute_hash_rollup_aggregate(
@@ -2274,12 +2274,19 @@ pub(super) fn execute_parallel_rollup_aggregate(
     // per level. Wide grouping keys no longer require duplicate hash maps or
     // a serial sort over all raw input rows. Unsupported aggregates still
     // select the canonical row/spill path before opening their input.
-    if estimated_rows >= 100.0 {
-        if let Some(finest) =
-            super::vec_bridge::vec_rollup_finest_groups(db, txn, input, group_by, &slots)?
-        {
-            return super::plan::rollup_emit_from_vec_finest(finest, group_by, &slots, having);
-        }
+    // A small group estimate does not bound input cardinality. Aggregate the
+    // native batches before considering row materialization: even a handful
+    // of groups may summarize millions of rows. Capability and budget checks
+    // inside the adapter retain the canonical fallback for unsupported input.
+    if let Some(finest) = super::vec_bridge::vec_rollup_finest_groups(
+        db,
+        txn,
+        input,
+        group_by,
+        &slots,
+        having.is_none(),
+    )? {
+        return super::plan::rollup_emit_from_vec_finest(finest, group_by, &slots, having);
     }
     // See `aggregate_rollup_plan_rows`: the per-group representative row is only
     // needed for the MySQL hidden-column extension, detectable from the slots.

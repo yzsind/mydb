@@ -2988,6 +2988,15 @@ pub struct CteSpillFile {
     pub(crate) _dir: std::sync::Arc<crate::engine::executor::select::grace::SpillTmpDir>,
     pub(crate) path: std::path::PathBuf,
     pub(crate) row_count: usize,
+    pub(crate) batch_schema: std::sync::Arc<crate::engine::executor::vec::schema::BatchSchema>,
+}
+
+impl CteSpillFile {
+    pub(crate) fn open_reader(
+        &self,
+    ) -> Result<Option<crate::engine::executor::cte::spool::Reader>, crate::types::QueryError> {
+        crate::engine::executor::cte::spool::Reader::open(self)
+    }
 }
 
 impl std::fmt::Debug for CteSpillFile {
@@ -3074,6 +3083,26 @@ pub struct CteResult {
 }
 
 impl CteResult {
+    pub(crate) fn materialized_batches_charged(
+        columns: Vec<crate::types::Column>,
+        batches: Vec<crate::engine::executor::vec::batch::Batch>,
+        charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    ) -> Result<Self, crate::types::QueryError> {
+        let store = crate::engine::executor::cte_store::CteStore::from_batches_charged(
+            columns.clone(),
+            batches,
+            charge,
+        )?;
+        Ok(Self {
+            estimated_rows: store.nrows() as f64,
+            columns,
+            store,
+            stats: None,
+            spill: None,
+            consumer_count: 1,
+        })
+    }
+
     /// Build a fully-materialised in-memory CTE result. The row-count
     /// estimate is exact (`store.nrows()`) because the body has actually
     /// been executed.
@@ -3158,7 +3187,7 @@ impl CteResult {
     /// Borrow the materialised row set. When the CTE was spilled the
     /// returned slice is empty (callers must check `self.spill`).
     #[inline]
-    pub fn rows(&self) -> &[Vec<crate::types::Value>] {
+    pub fn rows(&self) -> Result<&[Vec<crate::types::Value>], crate::types::QueryError> {
         self.store.dense_rows()
     }
 

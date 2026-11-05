@@ -26,6 +26,8 @@ mod filtered_vector;
 #[cfg(test)]
 mod filtered_vector_tests;
 mod scan;
+mod sql_rowid;
+pub(super) use sql_rowid::is_direct as is_sql_rowid_direct_scan;
 #[cfg(test)]
 mod scan_routing_tests;
 #[cfg(test)]
@@ -601,6 +603,8 @@ pub(crate) fn execute_physical_select(
     stmt: &Select,
     plan: &PhysicalPlan,
 ) -> Result<QueryResponse, QueryError> {
+    let sample_context = super::sampling::preflight(db, stmt)?;
+    let _sample_scope = sample_context.map(|context| super::sampling::enter(Some(context)));
     let _caller_partition_scope =
         crate::engine::executor::partition_router::suspend_pruned_partitions();
     let _explicit_scope = if stmt.from.len() == 1 && stmt.joins.is_empty() {
@@ -959,6 +963,8 @@ pub(crate) fn execute_compiled_select(
     stmt: &Select,
     compiled: &crate::engine::cache::CompiledSelectPlan,
 ) -> Result<QueryResponse, QueryError> {
+    let sample_context = super::sampling::preflight(db, stmt)?;
+    let _sample_scope = sample_context.map(|context| super::sampling::enter(Some(context)));
     let _read_schema = crate::storage::read_schema::ReadSchemaScope::enter(
         (!txn.dirty_read).then_some(txn.snapshot_scn),
     );
@@ -1454,6 +1460,10 @@ fn execute_physical_select_inner(
 /// Unbounded scans/ranges and aggregates therefore stay streaming.
 pub(super) fn bounded_result_plan(plan: &PhysicalPlan) -> bool {
     match plan {
+        PhysicalPlan::SeqScan {
+            hint_note: Some(access),
+            ..
+        } if access == "RowIdLookup" => true,
         PhysicalPlan::Projection { input, .. }
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Sort { input, .. }
@@ -1977,6 +1987,13 @@ pub(super) fn execute_plan_rows_inner(
     txn: TxnView,
     plan: &PhysicalPlan,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    if let Some(mut stream) = sql_rowid::open(db, txn, plan)? {
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next()? {
+            rows.push(row);
+        }
+        return Ok(rows);
+    }
     crate::engine::cancel::check_cancelled()?;
     // Partition fan-out: run a partitioned B-tree index scan once per
     // in-scope partition with a single-`storage_id` prune context
@@ -2009,6 +2026,14 @@ pub(super) fn execute_plan_rows_inner(
         }
     }
     match plan {
+        PhysicalPlan::SampleScan { .. } | PhysicalPlan::ParallelSampleScan { .. } => {
+            let mut stream = super::sampling::open(db, txn, plan)?;
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next()? {
+                rows.push(row);
+            }
+            Ok(rows)
+        }
         PhysicalPlan::NullExtend { input, table, .. } => {
             let mut rows = execute_plan_rows(db, txn, input)?;
             let fields = null_extended_table_fields(table)
@@ -4038,7 +4063,7 @@ fn open_cte_scan_stream(plan: &PhysicalPlan) -> Result<Box<dyn PlanStream>, Quer
         .and_then(|expr| compile_cte_row_predicate(expr, columns));
     let row_schema = RowSchema::from_fields(&templates);
     let reader = if let Some(spill) = &cte.spill {
-        let reader = super::grace::ValueRowReader::open(&spill.path, spill._dir.charger())?;
+        let reader = spill.open_reader()?;
         if reader.is_none() && spill.row_count != 0 {
             return Err(crate::error::catalog::ER_GET_ERRNO
                 .error("materialized CTE spill file is missing or truncated"));
@@ -4068,7 +4093,7 @@ struct CteScanPlanStream {
     filter: Option<Expr>,
     predicate_program: Option<super::eval::CompiledPlanPredicate>,
     row_schema: Arc<RowSchema>,
-    reader: Option<super::grace::ValueRowReader>,
+    reader: Option<crate::engine::executor::cte::spool::Reader>,
     position: usize,
 }
 
@@ -4085,8 +4110,14 @@ impl PlanStream for CteScanPlanStream {
                     return Ok(None);
                 };
                 std::borrow::Cow::Owned(row)
+            } else if self.cte.store.is_native() {
+                let Some(row) = self.cte.store.copy_row(self.position)? else {
+                    return Ok(None);
+                };
+                self.position += 1;
+                std::borrow::Cow::Owned(row)
             } else {
-                let Some(row) = self.cte.rows().get(self.position) else {
+                let Some(row) = self.cte.rows()?.get(self.position) else {
                     return Ok(None);
                 };
                 self.position += 1;
@@ -4138,7 +4169,13 @@ fn execute_plan_stream_inner(
     txn: TxnView,
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanStream>, QueryError> {
+    if let Some(stream) = sql_rowid::open(db, txn, plan)? {
+        return Ok(stream);
+    }
     match plan {
+        PhysicalPlan::SampleScan { .. } | PhysicalPlan::ParallelSampleScan { .. } => {
+            super::sampling::open(db, txn, plan)
+        }
         PhysicalPlan::FulltextScan { .. } => fulltext_stream::open(db, txn, plan),
         PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),
         PhysicalPlan::CteScan { .. } => open_cte_scan_stream(plan),

@@ -3457,12 +3457,23 @@ impl ValueKey {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn string_from_str(s: &str) -> Self {
+        Self::string_from_str_with_collation(s, None)
+    }
+
+    pub(crate) fn string_from_str_with_collation(s: &str, collation_id: Option<u16>) -> Self {
         // Zero-allocation path: write the key directly into the
         // SmallVec storage. Short ASCII keys (≤22 bytes after
         // PAD SPACE trim) stay inline; longer keys spill once
         // instead of allocating a throwaway `Vec<u8>` first.
         let mut buf = KeyBytes::new();
-        crate::charset::with_default_string_key(s, |bytes| buf.extend_from_slice(bytes));
+        match collation_id {
+            Some(id) => crate::charset::with_collation_key_by_id(id, s, |bytes| {
+                buf.extend_from_slice(bytes)
+            }),
+            None => {
+                crate::charset::with_default_string_key(s, |bytes| buf.extend_from_slice(bytes))
+            }
+        }
         ValueKey::String(buf)
     }
 
@@ -4150,8 +4161,14 @@ fn eval_expr_legacy_inner(
     values: &[Value],
 ) -> Result<Value, QueryError> {
     match expr {
-        Expr::Identifier(name) => Ok(values[table.column_index(name)?].clone()),
+        Expr::Identifier(name) => match crate::storage::rowid::current(table, name) {
+            Some(value) => Ok(value),
+            None => Ok(values[table.column_index(name)?].clone()),
+        },
         Expr::CompoundIdentifier(parts) => {
+            if let Some(value) = crate::storage::rowid::current_qualified(table, parts) {
+                return Ok(value);
+            }
             Ok(values[table.column_index(parts.last().unwrap())?].clone())
         }
         Expr::UserVariable(name) => Ok(session_user_variable(name).unwrap_or(Value::Null)),

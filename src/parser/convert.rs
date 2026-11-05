@@ -2479,6 +2479,7 @@ fn convert_set_expr_checked(
                 name,
                 alias: None,
                 system_time: None,
+                sample: None,
                 index_hints: Vec::new(),
                 partitions: Vec::new(),
                 column_aliases: Vec::new(),
@@ -6041,9 +6042,72 @@ fn unsupported_dml_join(kind: DmlKind, target: &TableRef, joins: &[Join]) -> Opt
     None
 }
 
-/// Plain table modifiers must be rejected consistently in queries and DML.
-/// Function-specific modifiers (for example generate_series ordinality) are
-/// handled by their own table-factor conversion.
+/// Convert the supported sampling grammar without dropping upstream modifiers.
+fn convert_table_sample(
+    sample: Option<&sqlparser::ast::TableSampleKind>,
+) -> Result<Option<Box<TableSampleSpec>>, String> {
+    use sqlparser::ast::{
+        TableSampleKind, TableSampleMethod as Method, TableSampleModifier, TableSampleSeedModifier,
+        TableSampleUnit as Unit,
+    };
+    let Some(sample) = sample else {
+        return Ok(None);
+    };
+    let sample = match sample {
+        TableSampleKind::AfterTableAlias(sample) => sample,
+        TableSampleKind::BeforeTableAlias(_) => {
+            return Err("TABLESAMPLE must follow the table alias".into())
+        }
+    };
+    if sample.modifier != TableSampleModifier::TableSample
+        || sample.bucket.is_some()
+        || sample.offset.is_some()
+    {
+        return Err(
+            "only TABLESAMPLE [method] (amount [ROWS | PERCENT]) [REPEATABLE (seed)] is supported"
+                .into(),
+        );
+    }
+    let quantity = sample
+        .quantity
+        .as_ref()
+        .ok_or("TABLESAMPLE requires an amount")?;
+    if !quantity.parenthesized {
+        return Err("TABLESAMPLE requires parentheses".into());
+    }
+    let seed = sample
+        .seed
+        .as_ref()
+        .map(|seed| {
+            if seed.modifier != TableSampleSeedModifier::Repeatable {
+                return Err("TABLESAMPLE supports REPEATABLE, not SEED".into());
+            }
+            if let SqlValue::Placeholder(name) = &seed.value {
+                if let Some(extensions::Extension::SampleSeed(expr)) = extensions::get(name) {
+                    return convert_expr(&expr).map_err(|e| e.message);
+                }
+            }
+            convert_expr(&SqlExpr::Value(seed.value.clone().with_empty_span()))
+                .map_err(|e| e.message)
+        })
+        .transpose()?;
+    Ok(Some(Box::new(TableSampleSpec {
+        method: match sample.name {
+            None | Some(Method::System | Method::Block) => SampleMethod::System,
+            Some(Method::Bernoulli | Method::Row) => SampleMethod::Bernoulli,
+        },
+        unit: match quantity.unit {
+            None | Some(Unit::Percent) => SampleUnit::Percent,
+            Some(Unit::Rows) => SampleUnit::Rows,
+        },
+        amount: convert_expr(&quantity.value).map_err(|e| e.message)?,
+        seed,
+        binding_id: 0,
+    })))
+}
+
+/// Reject unsupported plain-table modifiers consistently in queries and DML.
+/// Function-specific modifiers are handled by their table-factor conversion.
 fn validate_plain_table_modifiers(
     ordinality: bool,
     json_path: bool,
@@ -6217,6 +6281,7 @@ fn convert_table_factor(
                         .unwrap_or_else(|| "generate_series".to_string()),
                     alias: alias_name,
                     system_time: None,
+                    sample: None,
                     index_hints: vec![],
                     partitions: vec![],
                     column_aliases: Vec::new(),
@@ -6238,11 +6303,7 @@ fn convert_table_factor(
             sample,
             index_hints,
         } if args.is_none() && with_hints.is_empty() => {
-            validate_plain_table_modifiers(
-                *with_ordinality,
-                json_path.is_some(),
-                sample.is_some(),
-            )?;
+            validate_plain_table_modifiers(*with_ordinality, json_path.is_some(), false)?;
             let system_time = match version {
                 None => None,
                 Some(sqlparser::ast::TableVersion::ForSystemTimeAsOf(expr)) => {
@@ -6262,6 +6323,7 @@ fn convert_table_factor(
                     name: object_name_to_string(name)?,
                     alias: alias.as_ref().map(table_alias_name),
                     system_time,
+                    sample: convert_table_sample(sample.as_ref())?,
                     index_hints: convert_index_hints(index_hints),
                     partitions: partitions.iter().map(|i| i.value.clone()).collect(),
                     column_aliases: Vec::new(),
@@ -6340,6 +6402,7 @@ fn convert_table_factor(
                     name: alias_name.clone(),
                     alias: Some(alias_name),
                     system_time: None,
+                    sample: None,
                     index_hints: vec![],
                     partitions: vec![],
                     column_aliases: deferred_aliases,
@@ -6374,6 +6437,7 @@ fn convert_table_factor(
                     name: alias_name.clone(),
                     alias: Some(alias_name),
                     system_time: None,
+                    sample: None,
                     index_hints: vec![],
                     partitions: vec![],
                     column_aliases: Vec::new(),
@@ -6421,6 +6485,7 @@ fn convert_table_factor(
                     name: internal_name.to_string(),
                     alias: explicit_alias,
                     system_time: None,
+                    sample: None,
                     index_hints: Vec::new(),
                     partitions: Vec::new(),
                     column_aliases: Vec::new(),
@@ -7736,6 +7801,7 @@ fn apply_tail_modifiers(
                 name: name.clone(),
                 alias: Some(name),
                 system_time: None,
+                sample: None,
                 index_hints: Vec::new(),
                 partitions: Vec::new(),
                 column_aliases: Vec::new(),

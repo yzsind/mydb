@@ -3263,7 +3263,7 @@ pub(super) fn hash_join_parallel_probe_max_build_rows_opt() -> Option<usize> {
 /// C1: the parallel probe build-size cap is now measured in bytes (default 8 MiB ≈ per-worker
 /// L2 scale) — a fixed 8192 rows was too conservative for narrow builds. When the legacy
 /// `..._MAX_BUILD_ROWS` is set, the row-count rule still applies.
-pub(super) fn hash_join_parallel_probe_max_build_bytes() -> u64 {
+pub(in crate::engine::executor::select) fn hash_join_parallel_probe_max_build_bytes() -> u64 {
     crate::util::env::var("MYDB_HASH_JOIN_PARALLEL_PROBE_MAX_BUILD_BYTES")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

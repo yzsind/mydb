@@ -2553,10 +2553,10 @@ pub(crate) fn estimate_equijoin_rows(
         None
     };
     if left_keys.len() == 1 && right_keys.len() == 1 {
-        if keyset_prefilter_guarantees_unique_join(left, right, &left_keys[0], &right_keys[0]) {
+        if keyset_join_estimates_one_match(left, right, &left_keys[0], &right_keys[0]) {
             return left_rows.clamp(0.0, left_rows * right_rows);
         }
-        if keyset_prefilter_guarantees_unique_join(right, left, &right_keys[0], &left_keys[0]) {
+        if keyset_join_estimates_one_match(right, left, &right_keys[0], &left_keys[0]) {
             return right_rows.clamp(0.0, left_rows * right_rows);
         }
     }

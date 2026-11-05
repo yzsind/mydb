@@ -2439,12 +2439,12 @@ fn repeatable_read_read_only_txn_pins_on_first_consistent_read() {
 /// A plain SELECT (no FOR UPDATE) must never queue behind a row lock
 /// held by an unrelated writer — it walks the MVCC undo chain to read
 /// the prior committed version. A regression that caused SELECT to
-/// take row locks would surface here within `lock_wait_ms` (kept very
-/// short on purpose).
+/// take row locks must fail immediately in nonblocking mode. Wall-clock
+/// limits cannot distinguish a lock wait from CI scheduling or I/O delays.
 #[test]
 fn read_path_does_not_block_on_unrelated_row_lock_holder() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = std::sync::Arc::new(engine_with_lock_wait_ms(dir.path(), 100));
+    let engine = engine_with_lock_wait_ms(dir.path(), 100);
     engine
         .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -2458,23 +2458,34 @@ fn read_path_does_not_block_on_unrelated_row_lock_holder() {
         .execute_with_session(&mut owner, "UPDATE t SET v = 11 WHERE id = 1")
         .unwrap();
 
-    let started = Instant::now();
-    let QueryResponse::ResultSet(rs) = engine.execute("SELECT v FROM t WHERE id = 1").unwrap()
-    else {
+    let QueryResponse::ResultSet(rs) = crate::storage::with_nonblocking_lock_waits(|| {
+        engine.execute("SELECT v FROM t WHERE id = 1")
+    })
+    .unwrap() else {
         panic!("expected result set");
     };
     // MVCC: pre-update committed value is visible.
     assert_eq!(rs.rows, vec![vec![Value::Int(10)]]);
-    let QueryResponse::ResultSet(rs) = engine.execute("SELECT v FROM t WHERE id = 2").unwrap()
-    else {
+    let QueryResponse::ResultSet(rs) = crate::storage::with_nonblocking_lock_waits(|| {
+        engine.execute("SELECT v FROM t WHERE id = 2")
+    })
+    .unwrap() else {
         panic!("expected result set");
     };
     assert_eq!(rs.rows, vec![vec![Value::Int(20)]]);
-    assert!(
-        started.elapsed() < Duration::from_millis(50),
-        "MVCC SELECT was apparently waiting on a row lock: {:?}",
-        started.elapsed()
-    );
+
+    // Positive control: the writer still holds its lock, and the same
+    // nonblocking gate detects a conflicting locking read.
+    let mut reader = SessionContext::default();
+    engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+    let blocked = crate::storage::with_nonblocking_lock_waits(|| {
+        engine.execute_with_session(&mut reader, "SELECT v FROM t WHERE id = 1 FOR UPDATE")
+    })
+    .unwrap_err();
+    assert!(crate::storage::is_lock_would_block_error(&blocked));
+    engine
+        .execute_with_session(&mut reader, "ROLLBACK")
+        .unwrap();
 
     engine.execute_with_session(&mut owner, "COMMIT").unwrap();
 }

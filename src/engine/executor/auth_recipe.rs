@@ -129,6 +129,7 @@ impl BoundAccessRecipe {
             name: table.clone(),
             alias: alias.map(str::to_string),
             system_time: None,
+            sample: None,
             index_hints: Vec::new(),
             partitions: Vec::new(),
             column_aliases: Vec::new(),

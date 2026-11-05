@@ -982,6 +982,39 @@ pub(crate) fn gather_pairs_batch(
     Batch::new(out_schema.clone(), columns)
 }
 
+/// Residual-only pair batches are never SQL output. Keep field positions but
+/// do not copy payload columns the predicate cannot read (notably wide text).
+pub(crate) fn gather_residual_pairs_batch(
+    build_columns: &[ColumnVector],
+    probe_batch: &Batch,
+    pair_build: &[u32],
+    pair_probe: &[u32],
+    build_cols_first: bool,
+    out_schema: &Arc<BatchSchema>,
+    referenced: &std::collections::HashSet<usize>,
+) -> Batch {
+    debug_assert_eq!(pair_build.len(), pair_probe.len());
+    let (first, first_rows, second, second_rows) = if build_cols_first {
+        (build_columns, pair_build, probe_batch.columns(), pair_probe)
+    } else {
+        (probe_batch.columns(), pair_probe, build_columns, pair_build)
+    };
+    let columns = first
+        .iter()
+        .map(|col| (col, first_rows))
+        .chain(second.iter().map(|col| (col, second_rows)))
+        .enumerate()
+        .map(|(index, (column, rows))| {
+            if referenced.contains(&index) {
+                column.take_indices(rows)
+            } else {
+                ColumnVector::Null { len: rows.len() }
+            }
+        })
+        .collect();
+    Batch::new(out_schema.clone(), columns)
+}
+
 /// Gather only the build side when the output preserves every physical probe
 /// row in its original order. The probe vectors can then be moved into the
 /// output batch instead of being copied through `take_indices([0, 1, ...])`.

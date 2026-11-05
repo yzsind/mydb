@@ -2389,6 +2389,7 @@ impl QueryExpr {
                     name: "$rrf".into(),
                     alias: None,
                     system_time: None,
+                    sample: None,
                     index_hints: Vec::new(),
                     partitions: Vec::new(),
                     generate_series: None,
@@ -2663,6 +2664,7 @@ pub struct TableRef {
     /// at statement start; `binding_id` is deterministic within the parsed
     /// statement and lets self-joins use independent historical snapshots.
     pub system_time: Option<SystemTimeAsOf>,
+    pub sample: Option<Box<TableSampleSpec>>,
     pub index_hints: Vec<IndexHint>,
     /// M5.C2 — explicit `PARTITION (p0, p1, ...)` clause as written on a
     /// table reference. Empty means no restriction (visit all partitions).
@@ -2678,6 +2680,50 @@ pub struct TableRef {
     pub generate_series: Option<Box<GenerateSeriesSpec>>,
     /// Derived output aliases whose width is known only after binding.
     pub column_aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SampleMethod {
+    Bernoulli,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SampleUnit {
+    Percent,
+    Rows,
+}
+
+/// Sampling belongs to one table reference, independently of its alias.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableSampleSpec {
+    pub method: SampleMethod,
+    pub unit: SampleUnit,
+    pub amount: Expr,
+    pub seed: Option<Expr>,
+    pub binding_id: u32,
+}
+
+impl TableSampleSpec {
+    pub fn to_sql(&self) -> String {
+        let method = match self.method {
+            SampleMethod::Bernoulli => "BERNOULLI",
+            SampleMethod::System => "SYSTEM",
+        };
+        let unit = match self.unit {
+            SampleUnit::Rows => "ROWS",
+            SampleUnit::Percent => "PERCENT",
+        };
+        let mut sql = format!(
+            "TABLESAMPLE {method} ({} {unit})",
+            super::expr_to_sql(&self.amount)
+        );
+        if let Some(seed) = &self.seed {
+            sql.push_str(&format!(" REPEATABLE ({})", super::expr_to_sql(seed)));
+        }
+        sql
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -365,6 +365,9 @@ pub(super) fn collect_sip_tables(db: &Database, select: &Select) -> Option<Vec<S
 }
 
 pub(super) fn sip_table_from_ref(db: &Database, table: &TableRef) -> Option<SipTable> {
+    if table.sample.is_some() {
+        return None;
+    }
     if crate::engine::executor::cte::has_cte(&table.name) {
         return None;
     }
@@ -549,6 +552,7 @@ pub(super) fn build_sip_subquery(
         name: source_name,
         alias: Some(source_alias.to_string()),
         system_time: None,
+        sample: None,
         index_hints: Vec::new(),
         partitions: Vec::new(),
         column_aliases: Vec::new(),
@@ -566,6 +570,7 @@ pub(super) fn build_sip_subquery(
                 name: next_table,
                 alias: Some(next_alias.clone()),
                 system_time: None,
+                sample: None,
                 index_hints: Vec::new(),
                 partitions: Vec::new(),
                 column_aliases: Vec::new(),

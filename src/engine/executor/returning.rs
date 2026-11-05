@@ -14,6 +14,7 @@ pub(super) struct ReturningCollector {
 }
 
 struct ReturningProjector {
+    rowid: bool,
     eval_table: TableSchema,
     columns: Vec<Column>,
     program: super::select::TableProjectionProgram,
@@ -42,13 +43,16 @@ impl ReturningCollector {
         })
     }
 
-    pub(super) fn push(
+    pub(super) fn push_with_refs(
         &mut self,
         old: Option<&[Value]>,
         new: Option<&[Value]>,
+        old_ref: Option<crate::storage::DmlRowRef>,
+        new_ref: Option<crate::storage::DmlRowRef>,
     ) -> Result<(), QueryError> {
         if let Some(projector) = &self.projector {
-            self.rows.push(projector.project(old, new)?);
+            self.rows
+                .push(projector.project(old, new, old_ref, new_ref)?);
         }
         Ok(())
     }
@@ -81,6 +85,19 @@ impl ReturningProjector {
         default_image: DefaultImage,
         target_alias: Option<&str>,
     ) -> Result<Self, QueryError> {
+        let rowid = clause.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => {
+                crate::parser::visit::any_expr(expr, |node| super::rowid::is_pseudo(table, node))
+            }
+            _ => false,
+        });
+        let expanded;
+        let table = if rowid {
+            expanded = crate::storage::rowid::query_schema(table);
+            &expanded
+        } else {
+            table
+        };
         if clause.projection.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => returning_expr_forbidden(expr),
             _ => false,
@@ -106,6 +123,7 @@ impl ReturningProjector {
             .map(|(idx, col)| {
                 let mut col = col.clone();
                 col.name = format!("__mydb_returning_old_{idx}");
+                col.nullable |= matches!(default_image, DefaultImage::New);
                 col
             })
             .collect();
@@ -116,6 +134,7 @@ impl ReturningProjector {
             .map(|(idx, col)| {
                 let mut col = col.clone();
                 col.name = format!("__mydb_returning_new_{idx}");
+                col.nullable |= matches!(default_image, DefaultImage::Old);
                 col
             })
             .collect();
@@ -230,6 +249,7 @@ impl ReturningProjector {
             super::select::TableProjectionProgram::compile_once(&select.projection, &eval_table);
         let null_row = vec![Value::Null; base_width];
         Ok(Self {
+            rowid,
             eval_table,
             columns,
             program,
@@ -243,7 +263,40 @@ impl ReturningProjector {
         &self,
         old: Option<&[Value]>,
         new: Option<&[Value]>,
+        old_ref: Option<crate::storage::DmlRowRef>,
+        new_ref: Option<crate::storage::DmlRowRef>,
     ) -> Result<Vec<Value>, QueryError> {
+        if self.rowid {
+            let mut values = Vec::with_capacity(self.base_width * 3);
+            let append = |out: &mut Vec<Value>,
+                          image: Option<&[Value]>,
+                          identity: Option<crate::storage::DmlRowRef>|
+             -> Result<(), QueryError> {
+                if let Some(image) = image {
+                    out.extend_from_slice(image);
+                    let identity = identity.ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_UNKNOWN_ERROR,
+                            "RETURNING lost physical row identity",
+                        )
+                    })?;
+                    out.push(Value::UInt(crate::storage::rowid::for_row(
+                        &self.eval_table,
+                        identity,
+                    )?));
+                } else {
+                    out.extend_from_slice(&self.null_row);
+                }
+                Ok(())
+            };
+            match self.default_image {
+                DefaultImage::Old => append(&mut values, old, old_ref)?,
+                DefaultImage::New => append(&mut values, new, new_ref)?,
+            }
+            append(&mut values, old, old_ref)?;
+            append(&mut values, new, new_ref)?;
+            return self.program.project_row(&self.eval_table, &values);
+        }
         let old = old.unwrap_or(&self.null_row);
         let new = new.unwrap_or(&self.null_row);
         let default = match self.default_image {

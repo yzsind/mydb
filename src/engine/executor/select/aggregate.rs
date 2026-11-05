@@ -1461,6 +1461,16 @@ pub(crate) fn numeric_state_to_f64(state: &NumericAggState) -> f64 {
     }
 }
 
+/// Borrow a bounded exact subtotal without cloning arbitrary-precision data.
+pub(crate) fn numeric_state_compact_parts(state: &NumericAggState) -> Option<(i128, u8)> {
+    match state {
+        NumericAggState::Exact(value) if value.seen && value.wide.is_none() => {
+            Some((value.magnitude, value.scale))
+        }
+        _ => None,
+    }
+}
+
 /// Serialise an accumulator into a single `Value` that, when fed back
 /// through `accumulate_numeric_state`, reproduces the same state. Used
 /// by the vectorized HashAggregate spill path to round-trip a partial

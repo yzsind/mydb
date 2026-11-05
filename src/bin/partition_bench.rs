@@ -213,6 +213,7 @@ fn benchmark_partitions(kind: CaseKind, leaves: usize) -> Vec<Partition> {
             CaseKind::Hash | CaseKind::Key => PartitionBounds::Hash,
         };
         partitions.push(Partition {
+            rowid_tag: 0,
             name: format!("p{idx}"),
             storage_id: idx as u64 + 1,
             bounds,

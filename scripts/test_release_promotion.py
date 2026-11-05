@@ -23,6 +23,7 @@ import pymysql
 from test_native_readiness import free_port, query, status
 from test_release_storage import StorageServers, binary_sha256
 from test_release_publication import Gate, heap_versions, kill, setup, sql_outcome, verify, wal_frames
+from storage_oracle import metadata_payload, wal_frame_bytes
 
 
 def decode_wal(raw):
@@ -245,20 +246,11 @@ def wait_applied(connection, target, exact=False):
 
 
 def role_file(root):
-    return json.loads((root / 'system/replication/role.json').read_text())
+    return metadata_payload(root / 'system/replication/role.json', 6, 3)
 
 
 def local_wal_bytes(root, first_lsn, last_lsn=None):
-    output = bytearray()
-    for path in sorted((root / 'system/wal').glob('*.log')):
-        raw = path.read_bytes()
-        offset = 40
-        while offset + 48 <= len(raw) and raw[offset:offset + 4] != bytes(4):
-            length = 48 + struct.unpack_from('<I', raw, offset + 4)[0]
-            lsn = struct.unpack_from('<Q', raw, offset + 8)[0]
-            if lsn >= first_lsn and (last_lsn is None or lsn <= last_lsn):
-                output.extend(raw[offset:offset + length])
-            offset += length
+    output = wal_frame_bytes(root, first_lsn, last_lsn)
     decode_wal(output)
     return output
 
@@ -453,6 +445,7 @@ def main():
     identity = {'binary_sha256':binary_sha256(binary), 'script_sha256':binary_sha256(Path(__file__).resolve()),
                 'storage_helper_sha256':binary_sha256(Path(__file__).with_name('test_release_storage.py')),
                 'publication_helper_sha256':binary_sha256(Path(__file__).with_name('test_release_publication.py')),
+                'oracle_sha256':binary_sha256(Path(__file__).with_name('storage_oracle.py')),
                 'readiness_helper_sha256':binary_sha256(Path(__file__).with_name('test_native_readiness.py')),
                 'driver_version':importlib.metadata.version('pymysql'),
                 'client_timeout_seconds':StorageServers.client_timeout}

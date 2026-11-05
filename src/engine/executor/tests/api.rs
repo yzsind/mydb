@@ -3814,6 +3814,7 @@ fn prepared_limit_offset_and_dml_order_limit_execute() {
             name: "t".into(),
             alias: None,
             system_time: None,
+            sample: None,
             index_hints: vec![],
             partitions: vec![],
             column_aliases: Vec::new(),

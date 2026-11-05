@@ -3,6 +3,7 @@ pub(super) mod analyze_stats;
 pub(crate) mod bloom;
 pub(crate) mod eval;
 pub(in crate::engine::executor) mod execution_context;
+pub(crate) mod sampling;
 pub(crate) use eval::aggregate_function_result_type;
 mod explain;
 pub(super) mod external_sort;
@@ -341,7 +342,7 @@ fn execute_select_with_cte_joins_inner(
                     registry,
                 )?
             };
-            let mut current_rows = source_to_plan_rows(&primary_source);
+            let mut current_rows = source_to_plan_rows(&primary_source)?;
             let mut all_sources: Vec<MaterializedSource> = vec![primary_source];
             for join in &stmt.joins {
                 if join.lateral {
@@ -973,16 +974,16 @@ impl ExactSizeIterator for SourceRowsIter<'_> {}
 impl SourceRows {
     /// Iterate the backing rows. Respects `SharedCteSelected`'s selection.
     #[inline]
-    fn iter_rows(&self) -> SourceRowsIter<'_> {
-        match self {
+    fn iter_rows(&self) -> Result<SourceRowsIter<'_>, QueryError> {
+        Ok(match self {
             SourceRows::Owned(v) => SourceRowsIter::Slice(v.iter()),
             SourceRows::SpilledCteCollected { rows, .. } => SourceRowsIter::Slice(rows.iter()),
-            SourceRows::SharedCte(c) => SourceRowsIter::Slice(c.rows().iter()),
+            SourceRows::SharedCte(c) => SourceRowsIter::Slice(c.rows()?.iter()),
             SourceRows::SharedCteSelected { result, indices } => SourceRowsIter::Selected {
-                store_rows: result.rows(),
+                store_rows: result.rows()?,
                 indices: indices.iter(),
             },
-        }
+        })
     }
     #[inline]
     fn is_empty(&self) -> bool {
@@ -1139,13 +1140,8 @@ fn materialize_join_source_with_derived(
         projection: vec![SelectItem::Wildcard],
         table: Some(table_ref.name.clone()),
         from: vec![TableRef {
-            name: table_ref.name.clone(),
             alias: None,
-            system_time: None,
-            index_hints: vec![],
-            partitions: vec![],
-            column_aliases: Vec::new(),
-            generate_series: None,
+            ..table_ref.clone()
         }],
         ..Select::default()
     };
@@ -1299,7 +1295,7 @@ fn nested_loop_lateral_join(
         } else {
             right_columns = Some(right_source.columns.clone());
         }
-        let right_rows = source_to_plan_rows(&right_source);
+        let right_rows = source_to_plan_rows(&right_source)?;
         let mut left_matched = false;
         for right_row in &right_rows {
             let mut fields = left.fields.clone();
@@ -1397,7 +1393,9 @@ fn intern_source_metas(source: &MaterializedSource, bare_table: &str) -> Vec<pla
         .collect()
 }
 
-fn source_to_plan_rows(source: &MaterializedSource) -> Vec<self::plan::PlanRow> {
+fn source_to_plan_rows(
+    source: &MaterializedSource,
+) -> Result<Vec<self::plan::PlanRow>, QueryError> {
     // Strip a leading database qualifier so the in-memory join can resolve
     // both `t.col` (user-written) and `test.t.col` if needed; PlanField.table
     // for real tables in mydb stores the bare table name.
@@ -1407,9 +1405,9 @@ fn source_to_plan_rows(source: &MaterializedSource) -> Vec<self::plan::PlanRow> 
         .map(|(_, t)| t.to_string())
         .unwrap_or_else(|| source.table_name.clone());
     let metas = intern_source_metas(source, &bare_table);
-    source
+    Ok(source
         .rows
-        .iter_rows()
+        .iter_rows()?
         .map(|row| self::plan::PlanRow {
             fields: metas
                 .iter()
@@ -1423,7 +1421,7 @@ fn source_to_plan_rows(source: &MaterializedSource) -> Vec<self::plan::PlanRow> 
             agg_values: None,
             schema: PlanRow::empty_schema(),
         })
-        .collect()
+        .collect())
 }
 
 fn null_right_fields(right: &MaterializedSource) -> Vec<self::plan::PlanField> {
@@ -1693,13 +1691,13 @@ fn try_hash_join(
         hashbrown::HashMap::with_hasher(ahash::RandomState::new());
 
     if let Some((handle, positions)) = cache_attempt {
-        let store_rows_len = handle.dense_rows().len();
+        let store_rows_len = handle.dense_rows()?.len();
         let handle_for_build = handle.clone();
         let positions_for_build = positions.clone();
         let cached = handle.builds.get_or_init(
             positions,
             || -> Result<crate::engine::executor::cte_store::CachedHashBuild, QueryError> {
-                let store_rows = handle_for_build.dense_rows();
+                let store_rows = handle_for_build.dense_rows()?;
                 let mut b: hashbrown::HashMap<Vec<ValueKey>, Vec<u32>, ahash::RandomState> =
                     hashbrown::HashMap::with_hasher(ahash::RandomState::new());
                 for (i, row) in store_rows.iter().enumerate() {
@@ -1778,7 +1776,11 @@ fn try_hash_join(
         .map(|(_, t)| t.to_string())
         .unwrap_or_else(|| right_source.table_name.clone());
     let right_store_rows: Option<&[Vec<Value>]> = if cached_build.is_some() {
-        right_source.rows.cte_result().map(|r| r.rows())
+        right_source
+            .rows
+            .cte_result()
+            .map(|r| r.rows())
+            .transpose()?
     } else {
         None
     };
@@ -1936,7 +1938,7 @@ fn nested_loop_join(
     condition: Option<&Expr>,
 ) -> Result<Vec<self::plan::PlanRow>, QueryError> {
     use crate::parser::JoinType;
-    let right_rows = source_to_plan_rows(right);
+    let right_rows = source_to_plan_rows(right)?;
     // INNER/LEFT/RIGHT/FULL + decomposable equi-condition: switch to a hash
     // join so we don't pay an O(N×M) PlanField clone per row pair. TPC-H Q15
     // joins supplier (10k rows) to the materialised `revenue` CTE (10k rows)
@@ -2178,7 +2180,7 @@ fn try_greedy_equi_join(
             let metas = intern_source_metas(&sources[i], &bare_table);
             let sample = sources[i]
                 .rows
-                .iter_rows()
+                .iter_rows()?
                 .next()
                 .map(|row| build_right_plan_row_from_store(&metas, row));
             let compiled = sample
@@ -2189,7 +2191,7 @@ fn try_greedy_equi_join(
             // We therefore need to map j back to the underlying store row id.
             let prev_indices = sources[i].rows.cte_selection().cloned();
             let mut kept_idx: Vec<u32> = Vec::with_capacity(sources[i].rows.len());
-            for (j, raw) in sources[i].rows.iter_rows().enumerate() {
+            for (j, raw) in sources[i].rows.iter_rows()?.enumerate() {
                 let pr = build_right_plan_row_from_store(&metas, raw);
                 let keep = match &compiled {
                     Some(compiled) => compiled.eval_bool(&pr),
@@ -2213,12 +2215,12 @@ fn try_greedy_equi_join(
 
         // Non-CTE source (`Owned`) — the deep-copy path is unavoidable
         // since there is nothing shared to index into.
-        let plan_rows = source_to_plan_rows(&sources[i]);
+        let plan_rows = source_to_plan_rows(&sources[i])?;
         let compiled = plan_rows
             .first()
             .map(|row| self::eval::CompiledPlanPredicate::compile_once(e, row));
         let mut kept: Vec<Vec<Value>> = Vec::with_capacity(sources[i].rows.len());
-        for (raw, pr) in sources[i].rows.iter_rows().zip(plan_rows.iter()) {
+        for (raw, pr) in sources[i].rows.iter_rows()?.zip(plan_rows.iter()) {
             let keep = match &compiled {
                 Some(compiled) => compiled.eval_bool(pr),
                 None => self::eval::eval_plan_bool(e, pr),
@@ -2233,7 +2235,7 @@ fn try_greedy_equi_join(
     let full_mask: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
     let mut joined_mask: u64 = 1; // primary = index 0
     let mut order: Vec<usize> = vec![0];
-    let mut current_rows = source_to_plan_rows(&sources[0]);
+    let mut current_rows = source_to_plan_rows(&sources[0])?;
 
     while joined_mask != full_mask {
         // Prefer a source connected to the joined set by an equi-predicate (so
@@ -3478,6 +3480,8 @@ fn execute_select_inner(
     } else {
         None
     };
+    let sample_context = self::sampling::preflight(db, &stmt)?;
+    let _sample_scope = sample_context.map(|context| self::sampling::enter(Some(context)));
     let temporal_context = super::temporal::preflight(db, &stmt)?;
     let _temporal_scope = temporal_context.map(|context| super::temporal::enter(Some(context)));
     // Normalize WHERE / HAVING / JOIN-ON before planning and execution so
@@ -3617,7 +3621,7 @@ fn execute_select_inner(
         && stmt
             .selection
             .as_ref()
-            .is_none_or(system_count_filter_is_exact)
+            .is_none_or(|filter| system_count_filter_is_exact(filter, &stmt.from[0]))
     {
         return execute_system_select(db, stmt, registry);
     }
@@ -4501,6 +4505,8 @@ fn select_clauses_have_subquery(select: &Select) -> bool {
 fn walk_plan_tables<F: FnMut(&PlanTable)>(plan: &PhysicalPlan, f: &mut F) {
     plan.walk(|node| match node {
         PhysicalPlan::SeqScan { table, .. }
+        | PhysicalPlan::SampleScan { table, .. }
+        | PhysicalPlan::ParallelSampleScan { table, .. }
         | PhysicalPlan::ZoneMapScan { table, .. }
         | PhysicalPlan::IndexLookup { table, .. }
         | PhysicalPlan::IndexMultiLookup { table, .. }
@@ -4906,6 +4912,7 @@ pub(super) fn describe_select_columns(
             name: "derived".to_string(),
             alias: Some("derived".to_string()),
             system_time: None,
+            sample: None,
             index_hints: vec![],
             partitions: vec![],
             column_aliases: Vec::new(),
@@ -6084,6 +6091,7 @@ fn execute_derived_select(
             name: alias.clone(),
             alias: Some(alias.clone()),
             system_time: None,
+            sample: None,
             index_hints: Vec::new(),
             partitions: Vec::new(),
             column_aliases: Vec::new(),
@@ -6987,7 +6995,7 @@ pub(super) fn execute_system_select(
         && stmt
             .selection
             .as_ref()
-            .is_none_or(system_count_filter_is_exact)
+            .is_none_or(|filter| system_count_filter_is_exact(filter, &table_ref))
     {
         if let Some(count) =
             crate::engine::information_schema::fast_count_rows(db, &table_ref.name, &scan_request)?
@@ -7101,37 +7109,82 @@ fn system_count_pushdown_supported(name: &str) -> bool {
         && matches!(table.to_ascii_lowercase().as_str(), "tables" | "statistics")
 }
 
-/// True when the complete WHERE clause is a conjunction of literal equality
-/// predicates understood by `SystemScanRequest`. Partial predicate pushdown
-/// is safe for ordinary scans, but not for COUNT pushdown because omitted
-/// residuals would change the aggregate.
-fn system_count_filter_is_exact(expr: &Expr) -> bool {
-    fn identifier(expr: &Expr) -> bool {
-        matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+/// Header counts implement only schema/table identity filters. Other equality
+/// conjuncts remain residual predicates, even when a scan producer can use them
+/// to narrow its input. Repeated identity keys also require evaluation: the
+/// request's single field cannot represent contradictory equalities.
+fn system_count_filter_is_exact(expr: &Expr, table: &crate::parser::TableRef) -> bool {
+    fn identity(expr: &Expr, table: &crate::parser::TableRef) -> Option<u8> {
+        let name = match expr {
+            Expr::Identifier(name) => name,
+            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [qualifier, name]
+                    if qualifier.eq_ignore_ascii_case(table.alias.as_deref().unwrap_or_else(
+                        || table.name.rsplit('.').next().unwrap_or(&table.name),
+                    )) =>
+                {
+                    name
+                }
+                [schema, qualifier, name]
+                    if table.alias.is_none()
+                        && schema.eq_ignore_ascii_case("information_schema")
+                        && qualifier.eq_ignore_ascii_case(
+                            table.name.rsplit('.').next().unwrap_or(&table.name),
+                        ) =>
+                {
+                    name
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if name.eq_ignore_ascii_case("table_schema") {
+            Some(1)
+        } else if name.eq_ignore_ascii_case("table_name") {
+            Some(2)
+        } else {
+            None
+        }
     }
-    fn literal(expr: &Expr) -> bool {
-        matches!(
-            expr,
-            Expr::BoundValue(_)
-                | Expr::Literal(crate::parser::Literal::String(_))
-                | Expr::Literal(crate::parser::Literal::Int(_))
-                | Expr::Literal(crate::parser::Literal::UInt(_))
-                | Expr::Placeholder(_)
-        )
+    fn string(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(crate::parser::Literal::String(_))
+            | Expr::BoundValue(Value::String(_)) => true,
+            Expr::Placeholder(index) => {
+                matches!(
+                    crate::engine::params::current_param(*index),
+                    Some(Value::String(_))
+                )
+            }
+            _ => false,
+        }
     }
-    match expr {
-        Expr::Binary {
-            left,
-            op: crate::parser::BinaryOp::And,
-            right,
-        } => system_count_filter_is_exact(left) && system_count_filter_is_exact(right),
-        Expr::Binary {
-            left,
-            op: crate::parser::BinaryOp::Eq,
-            right,
-        } => (identifier(left) && literal(right)) || (identifier(right) && literal(left)),
-        _ => false,
+    fn visit(expr: &Expr, table: &crate::parser::TableRef, seen: &mut u8) -> bool {
+        match expr {
+            Expr::Binary {
+                left,
+                op: crate::parser::BinaryOp::And,
+                right,
+            } => visit(left, table, seen) && visit(right, table, seen),
+            Expr::Binary {
+                left,
+                op: crate::parser::BinaryOp::Eq,
+                right,
+            } => {
+                let key = identity(left, table)
+                    .filter(|_| string(right))
+                    .or_else(|| identity(right, table).filter(|_| string(left)));
+                let Some(key) = key else { return false };
+                if *seen & key != 0 {
+                    return false;
+                }
+                *seen |= key;
+                true
+            }
+            _ => false,
+        }
     }
+    visit(expr, table, &mut 0)
 }
 
 fn system_rows_capacity_bytes(rows: &Vec<Vec<Value>>) -> usize {

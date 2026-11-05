@@ -12359,6 +12359,7 @@ impl Database {
             .iter()
             .zip(build_sids.iter())
             .map(|(p, sid)| crate::storage::partitioning::Partition {
+                rowid_tag: p.rowid_tag,
                 name: p.name.clone(),
                 storage_id: *sid,
                 bounds: crate::storage::partitioning::PartitionBounds::Hash,
@@ -13941,6 +13942,7 @@ pub(crate) fn build_partition_info_from_def(
                 .map(|p| map_partition_options(&p.options))
                 .unwrap_or_default();
             partitions.push(StoragePartition {
+                rowid_tag: 0,
                 name: format!("p{}", i),
                 storage_id: *sid,
                 bounds: StorageBounds::Hash,
@@ -14056,6 +14058,7 @@ pub(crate) fn build_partition_info_from_def(
                         )
                     };
                 subpartitions.push(Subpartition {
+                    rowid_tag: 0,
                     name,
                     storage_id,
                     comment,
@@ -14063,6 +14066,7 @@ pub(crate) fn build_partition_info_from_def(
                 });
             }
             partitions.push(StoragePartition {
+                rowid_tag: 0,
                 name: item.name.clone(),
                 storage_id: *sid,
                 bounds,
@@ -14111,6 +14115,7 @@ fn validate_mysql80_partition_compat(
             "Partitioned TEMPORARY tables are not supported",
         ));
     }
+    part.validate_rowid_tags()?;
     validate_partition_layout_mysql80(table)?;
     validate_partition_unique_keys_mysql80(table)?;
     validate_partition_expr_type_mysql80(table)?;

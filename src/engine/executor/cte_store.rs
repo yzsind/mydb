@@ -9,21 +9,28 @@
 //!     build buckets across references. The key is the positions of the right-key columns in the CTE column list, alias-agnostic →
 //!     the `year_total t_s_firstyear/t_s_secyear/...` 4-way self-join shares one bucket set.
 //!
-//! Columnar representations (dictionary/constant columns) are left for P1; `CteColumnar::RowMajor` is the only concrete form here.
+//! Native column batches stay columnar across materialization and repeated scans.
+//! Row consumers obtain a separately admitted compatibility view on demand.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::engine::executor::vec::batch::{ColumnVector, DEFAULT_BATCH_ROWS};
+use crate::engine::executor::mem_budget::{self, ControlledMemoryCategory, ControlledMemoryCharge};
+use crate::engine::executor::memory_footprint::AllocatedBytes;
+use crate::engine::executor::vec::batch::{Batch, ColumnVector, DEFAULT_BATCH_ROWS};
 use crate::engine::expr::ValueKey;
-use crate::types::{Column, Value};
+use crate::types::{Column, ColumnType, QueryError, Value};
 
-/// Physical representation of a column in the store. Only `RowMajor` is implemented at the
-/// skeleton stage; dictionary/constant columns will be wired in as later P0 tasks require, transparent to consumers (via `value_at` / `dense_rows`).
+/// Physical representation of the materialized result.
 #[derive(Debug)]
 pub enum CteColumnar {
-    /// Row-major backing: equivalent to the old `Vec<Vec<Value>>` representation. The only construction form today.
+    /// Backing produced by scalar execution paths.
     RowMajor(Vec<Vec<Value>>),
+    Batches {
+        chunks: Arc<Vec<Batch>>,
+        rows: usize,
+        ends: Vec<usize>,
+    },
 }
 
 impl CteColumnar {
@@ -31,40 +38,46 @@ impl CteColumnar {
     pub fn nrows(&self) -> usize {
         match self {
             CteColumnar::RowMajor(r) => r.len(),
+            CteColumnar::Batches { rows, .. } => *rows,
         }
     }
 
-    /// Lends the dense slice of all rows. The equivalent of the old `CteResult.rows`.
-    /// Later dictionary/columnar-vectorized forms will be provided via materialization paths (kept for old consumers).
+    /// Borrow scalar storage without forcing a column-to-row compatibility view.
     #[inline]
-    pub fn dense_rows(&self) -> &[Vec<Value>] {
+    pub fn row_major_rows(&self) -> Option<&[Vec<Value>]> {
         match self {
-            CteColumnar::RowMajor(r) => r.as_slice(),
+            CteColumnar::RowMajor(r) => Some(r.as_slice()),
+            CteColumnar::Batches { .. } => None,
         }
     }
 }
 
 /// Columnar storage of materialized CTE results. Multiple references share one `Arc<CteStore>`;
 /// predicate pushdown avoids copies via a shared selection view; hash builds are reused across
-/// references through `CteHashBuildCache`. Skeleton stage:
-///   - `columnar` uses `RowMajor` only
-///   - `builds` is a placeholder (empty), to be filled by P0-B
+/// references through `CteHashBuildCache`.
 #[derive(Debug)]
 pub struct CteStore {
     pub schema: Arc<Vec<Column>>,
     pub columnar: CteColumnar,
-    /// Placeholder for the cross-reference shared hash build table. Once P0-B lands, the first
-    /// build goes through `OnceCell::get_or_init`; later references take the `Arc<HashTable>` in O(1).
+    /// Cross-reference shared hash build tables.
     pub builds: CteHashBuildCache,
     /// Columnar-form cache: all columns, `ColumnVector`s chunked by `DEFAULT_BATCH_ROWS`.
     /// Lazily built by the first vec consumer and shared across references via the `Arc<CteStore>` —
     /// the row→column transpose + lane finalization of a multi-reference CTE is done once, not once per reference.
     col_chunks: OnceLock<Arc<Vec<Vec<ColumnVector>>>>,
-    /// Unified-governor reservation for the resident row capacities.  The
+    /// Unified-governor reservation for the resident buffers. The
     /// charge lives in the shared store so multi-reference and session-cache
     /// owners release it exactly when the final `Arc<CteStore>` is dropped.
-    _memory_charge: Option<Mutex<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
+    _memory_charge: Option<Arc<Mutex<ControlledMemoryCharge>>>,
     row_memory_bytes: usize,
+    row_mirror: OnceLock<ResidentRows>,
+    row_mirror_build: Mutex<()>,
+}
+
+#[derive(Debug)]
+struct ResidentRows {
+    rows: Vec<Vec<Value>>,
+    charge: ControlledMemoryCharge,
 }
 
 impl CteStore {
@@ -78,6 +91,8 @@ impl CteStore {
             col_chunks: OnceLock::new(),
             _memory_charge: None,
             row_memory_bytes: 0,
+            row_mirror: OnceLock::new(),
+            row_mirror_build: Mutex::new(()),
         })
     }
 
@@ -92,8 +107,10 @@ impl CteStore {
             columnar: CteColumnar::RowMajor(rows),
             builds: CteHashBuildCache::new(),
             col_chunks: OnceLock::new(),
-            _memory_charge: Some(Mutex::new(memory_charge)),
+            _memory_charge: Some(Arc::new(Mutex::new(memory_charge))),
             row_memory_bytes,
+            row_mirror: OnceLock::new(),
+            row_mirror_build: Mutex::new(()),
         })
     }
 
@@ -107,7 +124,102 @@ impl CteStore {
             col_chunks: OnceLock::new(),
             _memory_charge: None,
             row_memory_bytes: 0,
+            row_mirror: OnceLock::new(),
+            row_mirror_build: Mutex::new(()),
         })
+    }
+
+    pub(crate) fn from_batches_charged(
+        schema: Vec<Column>,
+        mut batches: Vec<Batch>,
+        charge: ControlledMemoryCharge,
+    ) -> Result<Arc<Self>, QueryError> {
+        let owner = Arc::new(Mutex::new(charge));
+        let mut rows = 0usize;
+        let mut ends =
+            mem_budget::try_vec_with_capacity(batches.len(), "resident CTE batch offsets")?;
+        for batch in &batches {
+            rows = rows
+                .checked_add(batch.visible_rows())
+                .ok_or_else(|| mem_budget::allocation_error("resident CTE row count overflow"))?;
+            ends.push(rows);
+        }
+        let finalize = (|| {
+            for batch in &mut batches {
+                crate::engine::cancel::check_cancelled()?;
+                if batch.selection().is_some() {
+                    return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                        .error("resident CTE batch was not compacted"));
+                }
+                batch.set_resident_owner(owner.clone())?;
+            }
+            Ok::<_, QueryError>(())
+        })();
+        if let Err(error) = finalize {
+            drop(batches);
+            return Err(error);
+        }
+        Ok(Arc::new(Self {
+            schema: Arc::new(schema),
+            columnar: CteColumnar::Batches {
+                chunks: Arc::new(batches),
+                rows,
+                ends,
+            },
+            builds: CteHashBuildCache::new(),
+            col_chunks: OnceLock::new(),
+            _memory_charge: Some(owner),
+            row_memory_bytes: 0,
+            row_mirror: OnceLock::new(),
+            row_mirror_build: Mutex::new(()),
+        }))
+    }
+
+    pub(crate) fn native_batches(&self) -> Option<Arc<Vec<Batch>>> {
+        match &self.columnar {
+            CteColumnar::Batches { chunks, .. } => Some(chunks.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(&self.columnar, CteColumnar::Batches { .. })
+    }
+
+    pub(crate) fn copy_row(&self, index: usize) -> Result<Option<Vec<Value>>, QueryError> {
+        if let Some(rows) = self.row_major_rows() {
+            return rows
+                .get(index)
+                .map(|row| {
+                    row.iter()
+                        .map(|value| mem_budget::try_clone_value(value, "CTE row value"))
+                        .collect()
+                })
+                .transpose();
+        }
+        let CteColumnar::Batches { chunks, rows, ends } = &self.columnar else {
+            unreachable!()
+        };
+        if index >= *rows {
+            return Ok(None);
+        }
+        let batch_index = ends.partition_point(|end| *end <= index);
+        let start = if batch_index == 0 {
+            0
+        } else {
+            ends[batch_index - 1]
+        };
+        let batch = &chunks[batch_index];
+        let mut row =
+            mem_budget::try_vec_with_capacity(self.schema.len(), "resident CTE compatibility row")?;
+        for (column, field) in batch.columns().iter().zip(self.schema.iter()) {
+            let value = column.try_value_at(index - start)?;
+            row.push(match (field.column_type, value) {
+                (ColumnType::Float, Value::Double(value)) => Value::Float(value as f32),
+                (_, value) => value,
+            });
+        }
+        Ok(Some(row))
     }
 
     #[inline]
@@ -116,14 +228,94 @@ impl CteStore {
     }
 
     #[inline]
-    pub fn dense_rows(&self) -> &[Vec<Value>] {
-        self.columnar.dense_rows()
+    pub fn row_major_rows(&self) -> Option<&[Vec<Value>]> {
+        self.columnar.row_major_rows()
+    }
+
+    /// Only row consumers request this compatibility view. Reserve it before
+    /// cloning and propagate admission failure instead of hiding a row OOM.
+    pub fn dense_rows(&self) -> Result<&[Vec<Value>], QueryError> {
+        if let Some(rows) = self.row_major_rows() {
+            return Ok(rows);
+        }
+        if let Some(mirror) = self.row_mirror.get() {
+            return Ok(&mirror.rows);
+        }
+        let _build = self.row_mirror_build.lock().map_err(|_| {
+            crate::error::catalog::ER_INTERNAL_ERROR
+                .error("CTE row view initialization lock was poisoned")
+        })?;
+        crate::engine::cancel::check_cancelled()?;
+        if let Some(mirror) = self.row_mirror.get() {
+            return Ok(&mirror.rows);
+        }
+        let CteColumnar::Batches {
+            chunks,
+            rows: count,
+            ..
+        } = &self.columnar
+        else {
+            unreachable!()
+        };
+        let mut bytes = count
+            .saturating_mul(std::mem::size_of::<Vec<Value>>())
+            .saturating_add(128);
+        for batch in chunks.iter() {
+            crate::engine::cancel::check_cancelled()?;
+            for row in batch.visible_indices() {
+                bytes = bytes.saturating_add(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| column.owned_value_bytes(row))
+                        .sum::<usize>(),
+                );
+            }
+        }
+        if mem_budget::current_budget().is_some_and(|budget| bytes > budget.limit()) {
+            return Err(crate::error::catalog::ER_OUTOFMEMORY
+                .error("CTE compatibility row view exceeds the query work-area limit"));
+        }
+        let mut charge =
+            ControlledMemoryCharge::try_new(ControlledMemoryCategory::DerivedCache, bytes)?;
+        let mut rows = mem_budget::try_vec_with_capacity(*count, "CTE compatibility rows")?;
+        for batch in chunks.iter() {
+            for index in batch.visible_indices() {
+                crate::engine::cancel::check_cancelled()?;
+                let mut row =
+                    mem_budget::try_vec_with_capacity(self.schema.len(), "CTE compatibility row")?;
+                for (column, field) in batch.columns().iter().zip(self.schema.iter()) {
+                    let value = column.try_value_at(index)?;
+                    row.push(match (field.column_type, value) {
+                        (ColumnType::Float, Value::Double(value)) => Value::Float(value as f32),
+                        (_, value) => value,
+                    });
+                }
+                rows.push(row);
+            }
+        }
+        let actual = rows.allocated_bytes();
+        if actual > charge.bytes() {
+            charge.try_grow(actual - charge.bytes())?;
+        } else {
+            charge.shrink(charge.bytes() - actual);
+        }
+        let _ = self.row_mirror.set(ResidentRows { rows, charge });
+        Ok(&self
+            .row_mirror
+            .get()
+            .expect("CTE row view installed under lock")
+            .rows)
     }
 
     pub(crate) fn resident_memory_bytes(&self) -> Option<usize> {
-        self._memory_charge
-            .as_ref()
-            .and_then(|charge| charge.lock().ok().map(|charge| charge.bytes()))
+        self._memory_charge.as_ref().and_then(|charge| {
+            charge.lock().ok().map(|charge| {
+                charge
+                    .bytes()
+                    .saturating_add(self.row_mirror.get().map_or(0, |rows| rows.charge.bytes()))
+            })
+        })
     }
 
     /// All-column columnar form chunked by `DEFAULT_BATCH_ROWS` (lazy build + cache + Arc sharing).
@@ -136,7 +328,7 @@ impl CteStore {
             return Some(chunks.clone());
         }
         let charge_mutex = self._memory_charge.as_ref()?;
-        let rows = self.dense_rows();
+        let rows = self.row_major_rows()?;
         let ncols = self.schema.len();
         let nchunks = rows.len().div_ceil(DEFAULT_BATCH_ROWS);
         // Reserve before allocating both the completed typed mirror and the
