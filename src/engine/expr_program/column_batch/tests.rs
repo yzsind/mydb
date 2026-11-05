@@ -51,30 +51,67 @@ fn parity(sql: &str, kind: ColumnType, values: Vec<Value>) {
 
 #[test]
 fn statement_scalar_integer_comparisons_match_the_row_oracle_at_domain_edges() {
-    let signed = vec![Value::Int(i64::MIN), Value::Int(-1), Value::Int(0), Value::Int(42), Value::Int(i64::MAX), Value::Null];
-    let unsigned = vec![Value::UInt(0), Value::UInt(42), Value::UInt(i64::MAX as u64 + 1), Value::UInt(u64::MAX), Value::Null];
+    let signed = vec![
+        Value::Int(i64::MIN),
+        Value::Int(-1),
+        Value::Int(0),
+        Value::Int(42),
+        Value::Int(i64::MAX),
+        Value::Null,
+    ];
+    let unsigned = vec![
+        Value::UInt(0),
+        Value::UInt(42),
+        Value::UInt(i64::MAX as u64 + 1),
+        Value::UInt(u64::MAX),
+        Value::Null,
+    ];
     let mut session = SessionContext::default();
     for target in ["SIGNED", "UNSIGNED"] {
-        for value in [None, Some("-1"), Some("0"), Some("42"), Some("9223372036854775807"), Some("18446744073709551615")] {
+        for value in [
+            None,
+            Some("-1"),
+            Some("0"),
+            Some("42"),
+            Some("9223372036854775807"),
+            Some("18446744073709551615"),
+        ] {
             session.rls.reset(None);
             if let Some(value) = value {
-                session.rls.set("tenant".into(), Some(value.into()), false).unwrap();
+                session
+                    .rls
+                    .set("tenant".into(), Some(value.into()), false)
+                    .unwrap();
             }
             crate::engine::expr::with_session_expr_info(&session, || {
                 for values in [&signed, &unsigned] {
                     for op in ["=", "<>", "<", "<=", ">", ">="] {
                         for reverse in [false, true] {
                             let scalar = format!("CAST(RLS_CONTEXT('tenant') AS {target})");
-                            let sql = if reverse { format!("{scalar}{op}x") } else { format!("x{op}{scalar}") };
+                            let sql = if reverse {
+                                format!("{scalar}{op}x")
+                            } else {
+                                format!("x{op}{scalar}")
+                            };
                             let (program, schema) = compile(&sql, ColumnType::LongLong);
-                            let batch = Batch::new(schema, vec![ColumnVector::from_values(values.clone())]);
+                            let batch =
+                                Batch::new(schema, vec![ColumnVector::from_values(values.clone())]);
                             let expected = oracle(&program, &batch).unwrap();
                             // A diagnostic-producing out-of-range signed cast
                             // can decline and retains the ordinary evaluator.
                             if let Some(actual) = program.try_eval_column(&batch) {
-                                assert_eq!((0..batch.num_rows()).map(|row| actual.value_at(row)).collect::<Vec<_>>(), expected, "{sql}/{value:?}/{values:?}");
+                                assert_eq!(
+                                    (0..batch.num_rows())
+                                        .map(|row| actual.value_at(row))
+                                        .collect::<Vec<_>>(),
+                                    expected,
+                                    "{sql}/{value:?}/{values:?}"
+                                );
                             } else {
-                                assert!(target == "SIGNED" && value == Some("18446744073709551615"), "unexpected decline: {sql}/{value:?}");
+                                assert!(
+                                    target == "SIGNED" && value == Some("18446744073709551615"),
+                                    "unexpected decline: {sql}/{value:?}"
+                                );
                             }
                         }
                     }
@@ -109,7 +146,10 @@ fn rls_context_integer_cast_rebinds_native_program_without_tenant_capture() {
         for context in [Some("42"), Some("-1"), None, Some(maximum), Some("0")] {
             session.rls.reset(None);
             if let Some(value) = context {
-                session.rls.set("tenant".into(), Some(value.into()), false).unwrap();
+                session
+                    .rls
+                    .set("tenant".into(), Some(value.into()), false)
+                    .unwrap();
             }
             crate::engine::expr::with_session_expr_info(&session, || {
                 let expected = oracle(&program, &batch).unwrap();
@@ -128,7 +168,10 @@ fn rls_context_integer_cast_rebinds_native_program_without_tenant_capture() {
                 );
             });
         }
-        session.rls.set("tenant".into(), Some("not-an-integer".into()), false).unwrap();
+        session
+            .rls
+            .set("tenant".into(), Some("not-an-integer".into()), false)
+            .unwrap();
         crate::engine::expr::with_session_expr_info(&session, || {
             assert!(
                 program.try_eval_column(&batch).is_none(),

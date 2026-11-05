@@ -283,14 +283,24 @@ fn slot_name(index: usize) -> String {
 }
 
 fn row_security_read_references(
-    db: &Database, session: &SessionContext, statement: impl FnOnce() -> crate::parser::Statement,
+    db: &Database,
+    session: &SessionContext,
+    statement: impl FnOnce() -> crate::parser::Statement,
     context: &MultiContext,
 ) -> Option<std::collections::BTreeSet<usize>> {
-    if !context.participants.iter().any(|participant| crate::engine::rls::might_require_binding(db, &participant.schema)) {
+    if !context
+        .participants
+        .iter()
+        .any(|participant| crate::engine::rls::might_require_binding(db, &participant.schema))
+    {
         return None;
     }
     if let Some((identity, internal)) = crate::engine::expr::current_authorization_context() {
-        if crate::engine::rls::can_bypass(&crate::engine::rls::authorization_snapshot(db), &identity, internal) {
+        if crate::engine::rls::can_bypass(
+            &crate::engine::rls::authorization_snapshot(db),
+            &identity,
+            internal,
+        ) {
             return None;
         }
     }
@@ -440,19 +450,43 @@ impl MultiContext {
 
     /// Open sources only after every expression and target has been bound.
     fn load_rows(
-        &mut self, db: &Database, txn: TxnView,
-        command: crate::parser::rls::Command, targets: &HashSet<usize>,
+        &mut self,
+        db: &Database,
+        txn: TxnView,
+        command: crate::parser::rls::Command,
+        targets: &HashSet<usize>,
         reads: Option<&std::collections::BTreeSet<usize>>,
     ) -> Result<(), QueryError> {
         for (index, participant) in self.participants.iter_mut().enumerate() {
             let write = targets.contains(&index);
             let read = !write || reads.is_none_or(|reads| reads.contains(&index));
             participant.rls_read_required = read;
-            let read_binding = if read { crate::engine::rls::binding(db, &participant.schema, crate::parser::rls::Command::Select, false)? } else { None };
-            let write_binding = if write { crate::engine::rls::binding(db, &participant.schema, command, false)? } else { None };
+            let read_binding = if read {
+                crate::engine::rls::binding(
+                    db,
+                    &participant.schema,
+                    crate::parser::rls::Command::Select,
+                    false,
+                )?
+            } else {
+                None
+            };
+            let write_binding = if write {
+                crate::engine::rls::binding(db, &participant.schema, command, false)?
+            } else {
+                None
+            };
             participant.enforce_rls = read_binding.is_some() || write_binding.is_some();
-            if read_binding.iter().chain(write_binding.iter()).any(|bound|
-                matches!(&bound.expression, Expr::Literal(crate::parser::Literal::Bool(false)))) {
+            if read_binding
+                .iter()
+                .chain(write_binding.iter())
+                .any(|bound| {
+                    matches!(
+                        &bound.expression,
+                        Expr::Literal(crate::parser::Literal::Bool(false))
+                    )
+                })
+            {
                 participant.rows.clear();
                 continue;
             }
@@ -469,15 +503,47 @@ impl MultiContext {
                 // Scanning has released heap/page latches. Policy subqueries
                 // execute here before ON, WHERE, SET or trigger expressions.
                 rows.retain(|(_, row)| {
-                    if failure.is_some() { return false; }
+                    if failure.is_some() {
+                        return false;
+                    }
                     let allowed = (|| {
-                        if read && !crate::engine::rls::row_allowed(db, txn, &participant.schema, crate::parser::rls::Command::Select, false, &row.values)? { return Ok(false); }
-                        if write && !crate::engine::rls::row_allowed(db, txn, &participant.schema, command, false, &row.values)? { return Ok(false); }
+                        if read
+                            && !crate::engine::rls::row_allowed(
+                                db,
+                                txn,
+                                &participant.schema,
+                                crate::parser::rls::Command::Select,
+                                false,
+                                &row.values,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        if write
+                            && !crate::engine::rls::row_allowed(
+                                db,
+                                txn,
+                                &participant.schema,
+                                command,
+                                false,
+                                &row.values,
+                            )?
+                        {
+                            return Ok(false);
+                        }
                         Ok(true)
                     })();
-                    match allowed { Ok(allowed) => allowed, Err(error) => { failure = Some(error); false } }
+                    match allowed {
+                        Ok(allowed) => allowed,
+                        Err(error) => {
+                            failure = Some(error);
+                            false
+                        }
+                    }
                 });
-                if let Some(error) = failure { return Err(error); }
+                if let Some(error) = failure {
+                    return Err(error);
+                }
             }
             participant.rows = rows
                 .into_iter()
@@ -893,9 +959,20 @@ pub(super) fn execute_multi_update(
         .as_ref()
         .map(|expr| ctx.bind(db, session, expr, None))
         .transpose()?;
-    let read_references = row_security_read_references(db, session, || crate::parser::Statement::Update(stmt.clone()), &ctx);
+    let read_references = row_security_read_references(
+        db,
+        session,
+        || crate::parser::Statement::Update(stmt.clone()),
+        &ctx,
+    );
     let targets = assignments_per_participant.keys().copied().collect();
-    ctx.load_rows(db, txn, crate::parser::rls::Command::Update, &targets, read_references.as_ref())?;
+    ctx.load_rows(
+        db,
+        txn,
+        crate::parser::rls::Command::Update,
+        &targets,
+        read_references.as_ref(),
+    )?;
     let join_types: Vec<JoinType> = std::iter::once(JoinType::Inner)
         .chain(stmt.joins.iter().map(|j| j.join_type.clone()))
         .collect();
@@ -1008,9 +1085,26 @@ pub(super) fn execute_multi_update(
         if ctx.participants[p_idx].enforce_rls {
             db.lock_row_for_update_at(txn, &schema, storage_id, row_id)?;
             let row_ref = crate::storage::DmlRowRef { storage_id, row_id };
-            let Some(current) = db.dml_candidate_row_at_for_write(&schema, row_ref, txn)? else { continue; };
-            if !crate::engine::rls::row_allowed(db, txn, &schema, crate::parser::rls::Command::Update, false, &current.values)?
-                || (ctx.participants[p_idx].rls_read_required && !crate::engine::rls::row_allowed(db, txn, &schema, crate::parser::rls::Command::Select, false, &current.values)?) {
+            let Some(current) = db.dml_candidate_row_at_for_write(&schema, row_ref, txn)? else {
+                continue;
+            };
+            if !crate::engine::rls::row_allowed(
+                db,
+                txn,
+                &schema,
+                crate::parser::rls::Command::Update,
+                false,
+                &current.values,
+            )? || (ctx.participants[p_idx].rls_read_required
+                && !crate::engine::rls::row_allowed(
+                    db,
+                    txn,
+                    &schema,
+                    crate::parser::rls::Command::Select,
+                    false,
+                    &current.values,
+                )?)
+            {
                 continue;
             }
             new_values = patch_changed_columns(&current.values, &new_values, &update.user_columns);
@@ -1238,9 +1332,20 @@ pub(super) fn execute_multi_delete(
         .as_ref()
         .map(|expr| ctx.bind(db, session, expr, None))
         .transpose()?;
-    let read_references = row_security_read_references(db, session, || crate::parser::Statement::Delete(stmt.clone()), &ctx);
+    let read_references = row_security_read_references(
+        db,
+        session,
+        || crate::parser::Statement::Delete(stmt.clone()),
+        &ctx,
+    );
     let targets = target_participants.iter().copied().collect();
-    ctx.load_rows(db, txn, crate::parser::rls::Command::Delete, &targets, read_references.as_ref())?;
+    ctx.load_rows(
+        db,
+        txn,
+        crate::parser::rls::Command::Delete,
+        &targets,
+        read_references.as_ref(),
+    )?;
     let join_types: Vec<JoinType> = std::iter::once(JoinType::Inner)
         .chain(stmt.joins.iter().map(|j| j.join_type.clone()))
         .collect();
@@ -1320,7 +1425,17 @@ pub(super) fn execute_multi_delete(
                     )
                 });
             let result = db.delete_row_by_id_at_if(txn, &schema, storage_id, row_id, |values| {
-                if ctx.participants[p_idx].enforce_rls && ctx.participants[p_idx].rls_read_required && !crate::engine::rls::row_allowed(db, txn, &schema, crate::parser::rls::Command::Select, false, values)? {
+                if ctx.participants[p_idx].enforce_rls
+                    && ctx.participants[p_idx].rls_read_required
+                    && !crate::engine::rls::row_allowed(
+                        db,
+                        txn,
+                        &schema,
+                        crate::parser::rls::Command::Select,
+                        false,
+                        values,
+                    )?
+                {
                     return Ok(false);
                 }
                 if has_triggers {

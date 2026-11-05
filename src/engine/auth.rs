@@ -79,7 +79,8 @@ pub(crate) fn invalidate_authorization_cache() {
 static PARTIAL_REVOKES: AtomicBool = AtomicBool::new(false);
 
 pub fn partial_revokes_enabled() -> bool {
-    STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.partial_revokes))
+    STATEMENT_POLICY
+        .with(|slot| slot.borrow().as_ref().map(|p| p.partial_revokes))
         .unwrap_or_else(|| PARTIAL_REVOKES.load(Ordering::Relaxed))
 }
 
@@ -95,7 +96,8 @@ pub fn set_partial_revokes(value: bool) {
 static ACTIVATE_ALL_ROLES_ON_LOGIN: AtomicBool = AtomicBool::new(false);
 
 pub fn activate_all_roles_on_login() -> bool {
-    STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.activate_all_roles))
+    STATEMENT_POLICY
+        .with(|slot| slot.borrow().as_ref().map(|p| p.activate_all_roles))
         .unwrap_or_else(|| ACTIVATE_ALL_ROLES_ON_LOGIN.load(Ordering::Relaxed))
 }
 
@@ -113,7 +115,11 @@ static MANDATORY_ROLES_RAW: Mutex<String> = Mutex::new(String::new());
 static MANDATORY_ROLES_EMPTY: AtomicBool = AtomicBool::new(true);
 
 pub fn mandatory_roles_raw() -> String {
-    if let Some(raw) = STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.mandatory_roles.as_deref().unwrap_or_default().to_string())) {
+    if let Some(raw) = STATEMENT_POLICY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|p| p.mandatory_roles.as_deref().unwrap_or_default().to_string())
+    }) {
         return raw;
     }
     MANDATORY_ROLES_RAW
@@ -2157,7 +2163,12 @@ impl AuthCatalog {
     pub fn mandatory_role_keys(&self) -> BTreeSet<AccountKey> {
         // The usual empty setting must not serialize all role checks on a
         // process-wide mutex. The setter publishes this flag under its lock.
-        let empty = STATEMENT_POLICY.with(|slot| slot.borrow().as_ref().map(|p| p.mandatory_roles.as_deref().is_none_or(str::is_empty)))
+        let empty = STATEMENT_POLICY
+            .with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|p| p.mandatory_roles.as_deref().is_none_or(str::is_empty))
+            })
             .unwrap_or_else(|| MANDATORY_ROLES_EMPTY.load(Ordering::Acquire));
         if empty {
             return BTreeSet::new();
@@ -3578,7 +3589,9 @@ pub fn default_dynamic_privileges() -> &'static [Privilege] {
     static SET: std::sync::OnceLock<Vec<Privilege>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         [
-            "ROW_SECURITY_ADMIN", "BYPASS_RLS", "RLS_CONTEXT_ADMIN",
+            "ROW_SECURITY_ADMIN",
+            "BYPASS_RLS",
+            "RLS_CONTEXT_ADMIN",
             "API_KEY_ADMIN",
             "HTTP_ADMIN",
             "HTTP_USE",

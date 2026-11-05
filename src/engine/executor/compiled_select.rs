@@ -98,8 +98,7 @@ pub(super) fn compile_uncached_prepared_select(
     crate::engine::cache::CompiledSelectPlan,
 )> {
     let select = eligible_select(parsed)?;
-    if super::routines::statement_references_stored_function(db, session, parsed)
-    {
+    if super::routines::statement_references_stored_function(db, session, parsed) {
         return None;
     }
     if statement_refs_temp_table(session, parsed) {
@@ -193,7 +192,8 @@ pub(super) fn semantics_match(
     optimizer_switch: &str,
     session: &SessionContext,
 ) -> bool {
-    semantics.rls_authorization.as_deref() == Some(crate::engine::rls::session_signature(db, session).as_ref())
+    semantics.rls_authorization.as_deref()
+        == Some(crate::engine::rls::session_signature(db, session).as_ref())
         && semantics.sql_mode_fingerprint == crate::binlog::sql_mode_str_to_bits(&session.sql_mode)
         && optimizer_switch == session.sysvars.optimizer_switch
         && semantics.sql_select_limit == session.sysvars.sql_select_limit
@@ -273,11 +273,7 @@ pub(super) fn compile_prepared_select_from_memo(
         )
     } else {
         let select = eligible_select(parsed)?;
-        if super::routines::statement_references_stored_function(
-            db,
-            session,
-            parsed,
-        ) {
+        if super::routines::statement_references_stored_function(db, session, parsed) {
             return None;
         }
         // Temp tables get re-qualified per execute; keep them out of the

@@ -833,9 +833,20 @@ fn sequence_values_table() -> TableSchema {
 }
 
 fn row_security_table(id: u64, name: &str, dependencies: bool) -> TableSchema {
-    let mut columns = vec![ucol("table_id", DataTypeKind::BigInt, false), col("name", varchar(64), false)];
-    if dependencies { columns.push(ucol("ordinal", DataTypeKind::BigInt, false)); }
-    columns.push(col("definition_json", DataTypeKind::Text { max_len: 16_777_215 }, false));
+    let mut columns = vec![
+        ucol("table_id", DataTypeKind::BigInt, false),
+        col("name", varchar(64), false),
+    ];
+    if dependencies {
+        columns.push(ucol("ordinal", DataTypeKind::BigInt, false));
+    }
+    columns.push(col(
+        "definition_json",
+        DataTypeKind::Text {
+            max_len: 16_777_215,
+        },
+        false,
+    ));
     TableSchema::system_table(id, name, columns)
 }
 
@@ -847,8 +858,16 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
         Arc::new(indexes_table()),
         Arc::new(index_column_usage_table()),
         Arc::new(check_constraints_table()),
-        Arc::new(row_security_table(DD_ROW_SECURITY_POLICIES, "row_security_policies", false)),
-        Arc::new(row_security_table(DD_ROW_SECURITY_DEPENDENCIES, "row_security_dependencies", true)),
+        Arc::new(row_security_table(
+            DD_ROW_SECURITY_POLICIES,
+            "row_security_policies",
+            false,
+        )),
+        Arc::new(row_security_table(
+            DD_ROW_SECURITY_DEPENDENCIES,
+            "row_security_dependencies",
+            true,
+        )),
         Arc::new(foreign_keys_table()),
         Arc::new(foreign_key_column_usage_table()),
         Arc::new(views_table()),
@@ -985,7 +1004,10 @@ impl DdRowSet {
             (DD_INDEX_COLUMN_USAGE, &self.index_column_usage),
             (DD_CHECK_CONSTRAINTS, &self.check_constraints),
             (DD_ROW_SECURITY_POLICIES, &self.row_security_policies),
-            (DD_ROW_SECURITY_DEPENDENCIES, &self.row_security_dependencies),
+            (
+                DD_ROW_SECURITY_DEPENDENCIES,
+                &self.row_security_dependencies,
+            ),
             (DD_FOREIGN_KEYS, &self.foreign_keys),
             (DD_FOREIGN_KEY_COLUMN_USAGE, &self.foreign_key_column_usage),
             (DD_VIEWS, &self.views),
@@ -1241,7 +1263,9 @@ pub(crate) fn catalog_to_dd_rows(catalog: &Catalog) -> Result<DdRowSet, crate::t
     for seq in catalog.sequences.values() {
         set.sequences.push(sequence_row(seq));
     }
-    for key in catalog.auth.api_keys.values() { set.api_keys.push(vec![sv(&key.id), jsonv(key)]); }
+    for key in catalog.auth.api_keys.values() {
+        set.api_keys.push(vec![sv(&key.id), jsonv(key)]);
+    }
     for account in catalog.auth.accounts.values() {
         set.users.push(vec![
             sv(&account.key.user),
@@ -1431,12 +1455,23 @@ fn push_table_rows(
         }
     }
     for policy in &table.row_security.policies {
-        set.row_security_policies.push(vec![uv(table.id), sv(&policy.name), jsonv(policy)]);
+        set.row_security_policies
+            .push(vec![uv(table.id), sv(&policy.name), jsonv(policy)]);
         for (ordinal, account) in policy.roles.iter().enumerate() {
-            set.row_security_dependencies.push(vec![uv(table.id), sv(&policy.name), uv(ordinal as u64), jsonv(account)]);
+            set.row_security_dependencies.push(vec![
+                uv(table.id),
+                sv(&policy.name),
+                uv(ordinal as u64),
+                jsonv(account),
+            ]);
         }
         for (ordinal, dependency) in policy.table_dependencies.iter().enumerate() {
-            set.row_security_dependencies.push(vec![uv(table.id), sv(&policy.name), uv((policy.roles.len() + ordinal) as u64), jsonv(dependency)]);
+            set.row_security_dependencies.push(vec![
+                uv(table.id),
+                sv(&policy.name),
+                uv((policy.roles.len() + ordinal) as u64),
+                jsonv(dependency),
+            ]);
         }
     }
     for chk in &table.check_constraints {
@@ -1896,7 +1931,12 @@ fn catalog_from_dd_rows_with_auth(
         }
         let table_options: crate::storage::schema::TableOptions = r_json(trow, 18)?;
         let mut security = (*table_options.row_security).clone();
-        security.policies = set.row_security_policies.iter().filter(|row| r_u64(row, 0) == id).map(|row| r_json(row, 2)).collect::<Result<Vec<crate::parser::rls::Policy>, _>>()?;
+        security.policies = set
+            .row_security_policies
+            .iter()
+            .filter(|row| r_u64(row, 0) == id)
+            .map(|row| r_json(row, 2))
+            .collect::<Result<Vec<crate::parser::rls::Policy>, _>>()?;
         let mut table = TableSchema {
             id,
             object_id: r_u64(trow, 1),
@@ -1935,7 +1975,7 @@ fn catalog_from_dd_rows_with_auth(
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
             row_security: Arc::new(security),
-        row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
+            row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
         if let Some(partitioning) = &table.partitioning {
             partitioning.validate_rowid_tags()?;
@@ -2032,7 +2072,11 @@ fn reconstruct_auth(set: &DdRowSet) -> Result<AuthCatalog, crate::types::QueryEr
     let mut auth = AuthCatalog::empty();
     for row in &set.api_keys {
         let key: crate::engine::access_keys::Record = r_json(row, 1)?;
-        if r_str(row, 0) != key.id { return Err(crate::engine::access_keys::error("Invalid API key dictionary identity")); }
+        if r_str(row, 0) != key.id {
+            return Err(crate::engine::access_keys::error(
+                "Invalid API key dictionary identity",
+            ));
+        }
         auth.api_keys.insert(key.id.clone(), key);
     }
     for row in &set.users {
@@ -2941,7 +2985,7 @@ mod tests {
             column_name_map: Default::default(),
             column_id_map: HashMap::new(),
             row_security: crate::engine::rls::RowSecurity::empty(),
-        row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
+            row_codec: Arc::new(crate::storage::core::RowCodec::empty()),
         };
         table.build_column_index();
 

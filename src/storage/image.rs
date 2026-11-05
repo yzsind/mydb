@@ -343,7 +343,16 @@ pub(crate) fn validate_files(files: &[BackupFile]) -> Result<(), QueryError> {
 }
 
 pub(crate) fn validate_manifest(manifest: &BackupManifest) -> Result<(), QueryError> {
-    if manifest.rest_key_ids.len() > 16384 || manifest.rest_key_ids.iter().any(|id| id.len()!=64 || !id.bytes().all(|b| b.is_ascii_hexdigit())) { return Err(backup_err("Invalid REST master-key identifiers in backup manifest")); }
+    if manifest.rest_key_ids.len() > 16384
+        || manifest
+            .rest_key_ids
+            .iter()
+            .any(|id| id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(backup_err(
+            "Invalid REST master-key identifiers in backup manifest",
+        ));
+    }
     if manifest.ai_key_ids.len() > 16384
         || manifest
             .ai_key_ids

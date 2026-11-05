@@ -32,7 +32,9 @@ pub(super) fn key_part(
     let constraint = expr_to_plan_constraint(value)?;
     // Tuple endpoints require lossless conversion for every suffix component.
     // Keep the scalar deferred-index lane until that proof covers this shape.
-    if matches!(&constraint, PlanConstraintValue::Statement(_)) { return None; }
+    if matches!(&constraint, PlanConstraintValue::Statement(_)) {
+        return None;
+    }
     let target = target_for_index_column(table, index, pos);
     if !write_in_lookup_preserves_comparison(target, std::slice::from_ref(&constraint)) {
         return None;

@@ -25,9 +25,9 @@ mod adapter;
 #[cfg(test)]
 pub(crate) use adapter::max_set_operation_branches;
 mod ast;
-pub mod rls;
 pub(crate) mod boolean;
 mod budget;
+pub mod rls;
 pub(crate) use budget::MAX_SELECT_NESTING;
 mod bulk_string;
 mod convert;

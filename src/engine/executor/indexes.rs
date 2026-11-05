@@ -467,7 +467,10 @@ fn constraint_key_part_for_index(
     // `resolve_index_bound`) re-applies `apply_prefix_to_key_part`
     // after `KeyPart::resolve_param` materialises the literal value,
     // so passing the un-truncated `Param` here is safe.
-    if matches!(value, IndexConstraintValue::Param(_) | IndexConstraintValue::Statement(_)) {
+    if matches!(
+        value,
+        IndexConstraintValue::Param(_) | IndexConstraintValue::Statement(_)
+    ) {
         return Some(part);
     }
     Some(index.apply_prefix_to_key_part(pos, part))

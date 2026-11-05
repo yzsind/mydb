@@ -160,8 +160,11 @@ pub(in crate::engine::executor) fn execute_explain(
     let _security = crate::engine::rls::EvaluationScope::enter();
     let auth = crate::engine::rls::authorization_snapshot(db);
     let details_allowed = crate::engine::rls::trusted_internal()
-        || crate::engine::rls::has_global(&auth, &session.authorization_context(),
-            crate::engine::auth::Privilege::Dynamic("ROW_SECURITY_ADMIN".into()));
+        || crate::engine::rls::has_global(
+            &auth,
+            &session.authorization_context(),
+            crate::engine::auth::Privilege::Dynamic("ROW_SECURITY_ADMIN".into()),
+        );
     // Resolve before planning as well: a cached artifact may not bind again,
     // and concurrent policy publication must not expose an older expression.
     let protected = !details_allowed && explain_references_row_security(db, session, &target);
@@ -173,7 +176,9 @@ pub(in crate::engine::executor) fn execute_explain(
     // Ordinary users receive a logical security overview; every expression,
     // dependency, access estimate and actual counter remains administrator-only.
     let QueryResponse::ResultSet(mut result) = response.materialize()? else {
-        return Err(crate::engine::rls::violation("Invalid protected EXPLAIN response"));
+        return Err(crate::engine::rls::violation(
+            "Invalid protected EXPLAIN response",
+        ));
     };
     let description = "Row security boundary: base-table access, before user expressions, joins, ranking and LIMIT; detailed plan requires ROW_SECURITY_ADMIN";
     if result.columns.len() == 1 {
@@ -181,33 +186,55 @@ pub(in crate::engine::executor) fn execute_explain(
             serde_json::json!({"query_block": {"row_security": {
                 "placement": "base_table_access_before_user_evaluation",
                 "details_require": "ROW_SECURITY_ADMIN"
-            }}}).to_string()
-        } else { description.to_string() };
+            }}})
+            .to_string()
+        } else {
+            description.to_string()
+        };
         result.rows = vec![vec![Value::String(value)]];
     } else {
-        result.rows = vec![result.columns.iter().map(|column| match column.name.as_str() {
-            "id" => Value::Int(1),
-            "select_type" => Value::String("SECURITY OVERVIEW".into()),
-            "table" => Value::String("<row security>".into()),
-            "type" => Value::String("security".into()),
-            "Extra" => Value::String(description.into()),
-            _ => Value::Null,
-        }).collect()];
+        result.rows = vec![result
+            .columns
+            .iter()
+            .map(|column| match column.name.as_str() {
+                "id" => Value::Int(1),
+                "select_type" => Value::String("SECURITY OVERVIEW".into()),
+                "table" => Value::String("<row security>".into()),
+                "type" => Value::String("security".into()),
+                "Extra" => Value::String(description.into()),
+                _ => Value::Null,
+            })
+            .collect()];
     }
     Ok(QueryResponse::ResultSet(result))
 }
 
-fn explain_references_row_security(db: &Database, session: &SessionContext, statement: &Statement) -> bool {
+fn explain_references_row_security(
+    db: &Database,
+    session: &SessionContext,
+    statement: &Statement,
+) -> bool {
     let mut pending = super::super::dispatch::collect_statement_table_uses(statement)
-        .into_iter().map(|usage| crate::storage::split_table_name(&session.current_database, &usage.table))
+        .into_iter()
+        .map(|usage| crate::storage::split_table_name(&session.current_database, &usage.table))
         .collect::<Vec<_>>();
     let mut seen = std::collections::HashSet::new();
     while let Some((database, name)) = pending.pop() {
         let key = format!("{database}.{name}");
-        if !seen.insert(key.clone()) { continue; }
-        if db.table(&key).is_ok_and(|table| crate::engine::rls::statement_security_enabled(db, &table).unwrap_or(true)) { return true; }
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if db.table(&key).is_ok_and(|table| {
+            crate::engine::rls::statement_security_enabled(db, &table).unwrap_or(true)
+        }) {
+            return true;
+        }
         if let Some(view) = db.view_definition(&database, &name) {
-            pending.extend(view.dependencies.into_iter().map(|dependency| (dependency.database, dependency.name)));
+            pending.extend(
+                view.dependencies
+                    .into_iter()
+                    .map(|dependency| (dependency.database, dependency.name)),
+            );
         }
     }
     false

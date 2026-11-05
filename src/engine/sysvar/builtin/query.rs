@@ -85,7 +85,10 @@ pub(crate) fn register(reg: &mut Registry) {
         SysVarDef::new("row_security", Scope::Session, DataType::Bool)
             .with_doc("Apply row security; OFF errors unless the effective identity bypasses RLS."),
         |ctx| SysVarValue::Bool(ctx.session.map_or(true, |s| s.rls.enabled)),
-        |ctx, value| { ctx.session.rls.enabled = value.as_bool().unwrap(); Ok(()) },
+        |ctx, value| {
+            ctx.session.rls.enabled = value.as_bool().unwrap();
+            Ok(())
+        },
     ));
     // INFORMATION_SCHEMA reads storage-engine metadata on every query, without
     // a separate expiry cache. Its age is therefore already within this limit,

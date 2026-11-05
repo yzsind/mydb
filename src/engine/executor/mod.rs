@@ -60,12 +60,12 @@ use super::system::{
 #[macro_use]
 mod row_decode_macros;
 mod auth_recipe;
-pub(crate) mod rls;
 mod compiled_select;
 pub(crate) mod cte;
 pub(crate) mod cte_store;
 mod ddl_deprecation;
 mod dispatch;
+pub(crate) mod rls;
 pub(crate) mod row_spool;
 mod stream_mdl;
 pub(crate) use dispatch::{
@@ -1815,7 +1815,10 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
     typed_predicate(update.selection.as_ref().expect("checked above"), &table)
 }
 
-pub(super) fn plan_semantics(db: &Database, session: &SessionContext) -> crate::engine::cache::PlanSemantics {
+pub(super) fn plan_semantics(
+    db: &Database,
+    session: &SessionContext,
+) -> crate::engine::cache::PlanSemantics {
     crate::engine::cache::PlanSemantics {
         rls_authorization: Some(crate::engine::rls::session_signature(db, session)),
         sql_mode_fingerprint: crate::binlog::sql_mode_str_to_bits(&session.sql_mode),
@@ -4358,11 +4361,7 @@ impl QueryEngine for StorageQueryEngine {
         // budget here so sqlx / Connector/J prepared-binding apps don't sneak
         // past the limit.
         let full_routine_dispatch = matches!(statement, Statement::Call(_))
-            || routines::statement_references_stored_function(
-                &self.db,
-                session,
-                &statement,
-            );
+            || routines::statement_references_stored_function(&self.db, session, &statement);
         // Routine statements re-enter the full dispatcher, which charges the
         // account itself. Keep the lightweight path's accounting exactly once.
         if !session.internal_system_session && !full_routine_dispatch {
@@ -4655,34 +4654,52 @@ impl QueryEngine for StorageQueryEngine {
             return None;
         }
         let parser_mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
-        let shaped = text_shape_key_and_params(sql, parser_mode_bits)
-            .and_then(|(key, params)| self.statement_cache.get(&key).map(|statement| (key, statement, params)));
+        let shaped = text_shape_key_and_params(sql, parser_mode_bits).and_then(|(key, params)| {
+            self.statement_cache
+                .get(&key)
+                .map(|statement| (key, statement, params))
+        });
         let (key, statement, params) = if let Some(shaped) = shaped {
             shaped
         } else {
             // An exact parser-cache entry is also an authoritative zero-bind
             // template. Literal-free reads must not pay the generic dispatch
             // cost just because their selective quals came from a policy.
-            if sql.contains("/*+") || sql.contains("/*!")
-                || source_syntax_warning_scan_required(sql, parser_mode_bits) {
+            if sql.contains("/*+")
+                || sql.contains("/*!")
+                || source_syntax_warning_scan_required(sql, parser_mode_bits)
+            {
                 return None;
             }
             let key = crate::engine::cache::ParsedStatementKey::new(sql, parser_mode_bits);
             let statement = self.statement_cache.get(&key)?;
-            let Statement::Select(select) = statement.as_ref() else { return None; };
-            if select.from.len() != 1 || select.table.is_none()
+            let Statement::Select(select) = statement.as_ref() else {
+                return None;
+            };
+            if select.from.len() != 1
+                || select.table.is_none()
                 || crate::engine::cache::SelectExecutionClass::from_select(select)
-                != crate::engine::cache::SelectExecutionClass::ReadOnlyNonBlocking
-                || !crate::mysql::session::statement_is_lock_safe_read(statement.as_ref()) {
+                    != crate::engine::cache::SelectExecutionClass::ReadOnlyNonBlocking
+                || !crate::mysql::session::statement_is_lock_safe_read(statement.as_ref())
+            {
                 return None;
             }
             struct UnsafeTemplate(bool);
             impl crate::parser::visit::AstVisitor for UnsafeTemplate {
                 fn enter_expr(&mut self, expr: &Expr) {
-                    self.0 |= matches!(expr, Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
-                        | Expr::UserVariable(_) | Expr::SystemVariable { .. } | Expr::WindowFunction { .. });
+                    self.0 |= matches!(
+                        expr,
+                        Expr::Literal(_)
+                            | Expr::BoundValue(_)
+                            | Expr::Placeholder(_)
+                            | Expr::UserVariable(_)
+                            | Expr::SystemVariable { .. }
+                            | Expr::WindowFunction { .. }
+                    );
                 }
-                fn enter_limit(&mut self, _: &crate::parser::LimitValue) { self.0 = true; }
+                fn enter_limit(&mut self, _: &crate::parser::LimitValue) {
+                    self.0 = true;
+                }
             }
             let mut unsafe_template = UnsafeTemplate(false);
             crate::parser::visit::visit_statement(&mut unsafe_template, statement.as_ref());
@@ -4759,14 +4776,8 @@ impl QueryEngine for StorageQueryEngine {
             params,
             fingerprint,
         };
-        let (result, metadata) = self.execute_single_statement_tail_with_binding(
-            session,
-            sql,
-            statement,
-            auto_result,
-            false,
-            false,
-        );
+        let (result, metadata) =
+            self.execute_single_statement_tail(session, sql, statement, auto_result, false);
         // Sequence state belongs to the live connection. A deferred cursor
         // must not outlive that state or evaluate on a worker's copied session.
         let result = if sequence_dependent {
@@ -5240,12 +5251,15 @@ impl StorageQueryEngine {
         let key = crate::engine::cache::StatementKey {
             sql: Arc::<str>::from(shape),
             database: Arc::<str>::from(session.current_database.as_str()),
-            semantics: crate::engine::params::with_auto_params_slice(&scanned_params, || plan_semantics(&self.db, session)),
+            semantics: crate::engine::params::with_auto_params_slice(&scanned_params, || {
+                plan_semantics(&self.db, session)
+            }),
         };
         let current_epoch = self.prepared_dml_cache.current_epoch();
         let dp = if let Some(plan) = self.prepared_dml_cache.get(&key, |plan| {
-            crate::engine::params::with_auto_params_slice(&scanned_params, || prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch))
-                && should_use_shared_plan_cache(self.plan_cache_enabled, session, &plan.statement)
+            crate::engine::params::with_auto_params_slice(&scanned_params, || {
+                prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch)
+            }) && should_use_shared_plan_cache(self.plan_cache_enabled, session, &plan.statement)
         }) {
             plan
         } else {
@@ -5297,9 +5311,9 @@ impl StorageQueryEngine {
                 return ScannedTextDmlProbe::Parsed(fallback_statement);
             }
             let parsed = Arc::new(statement);
-            let Some(plan) =
-                crate::engine::params::with_auto_params_slice(&scanned_params, || prepared_dml::compile_prepared_dml(&self.db, session, &parsed, current_epoch))
-            else {
+            let Some(plan) = crate::engine::params::with_auto_params_slice(&scanned_params, || {
+                prepared_dml::compile_prepared_dml(&self.db, session, &parsed, current_epoch)
+            }) else {
                 return ScannedTextDmlProbe::Parsed(fallback_statement);
             };
             self.prepared_dml_cache.insert(key, Arc::new(plan))
@@ -5367,8 +5381,9 @@ impl StorageQueryEngine {
         fingerprint: &str,
         params: &[Value],
     ) -> Option<Arc<crate::engine::api::PreparedDmlPlan>> {
-        crate::engine::params::with_auto_params_slice(params, ||
-            self.get_or_compile_text_prepared_dml_in_context(session, statement, fingerprint))
+        crate::engine::params::with_auto_params_slice(params, || {
+            self.get_or_compile_text_prepared_dml_in_context(session, statement, fingerprint)
+        })
     }
 
     fn get_or_compile_text_prepared_dml_in_context(
@@ -5415,21 +5430,31 @@ impl StorageQueryEngine {
         let key = crate::engine::cache::StatementKey {
             sql: Arc::<str>::from(shape),
             database: Arc::<str>::from(session.current_database.as_str()),
-            semantics: crate::engine::params::with_auto_params_slice(scanned_params, || plan_semantics(&self.db, session)),
+            semantics: crate::engine::params::with_auto_params_slice(scanned_params, || {
+                plan_semantics(&self.db, session)
+            }),
         };
         let current_epoch = self.prepared_dml_batch_cache.current_epoch();
         let batch = if let Some(batch) = self.prepared_dml_batch_cache.get(&key, |batch| {
             let mut offset = 0usize;
-            batch.plans.iter().zip(batch.param_counts.iter().copied()).all(|(plan, count)| {
-                let Some(params) = scanned_params.get(offset..offset.saturating_add(count)) else { return false; };
-                offset += count;
-                crate::engine::params::with_auto_params_slice(params, || prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch))
-                    && should_use_shared_plan_cache(
+            batch
+                .plans
+                .iter()
+                .zip(batch.param_counts.iter().copied())
+                .all(|(plan, count)| {
+                    let Some(params) = scanned_params.get(offset..offset.saturating_add(count))
+                    else {
+                        return false;
+                    };
+                    offset += count;
+                    crate::engine::params::with_auto_params_slice(params, || {
+                        prepared_dml::memo_is_valid(&self.db, plan, session, current_epoch)
+                    }) && should_use_shared_plan_cache(
                         self.plan_cache_enabled,
                         session,
                         &plan.statement,
                     )
-            })
+                })
         }) {
             batch
         } else {
@@ -5464,8 +5489,12 @@ impl StorageQueryEngine {
                 if !should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement) {
                     return None;
                 }
-                let plan =
-                    self.get_or_compile_text_prepared_dml(session, &statement, fingerprint, &auto_result.params)?;
+                let plan = self.get_or_compile_text_prepared_dml(
+                    session,
+                    &statement,
+                    fingerprint,
+                    &auto_result.params,
+                )?;
                 param_counts.push(auto_result.params.len());
                 flat_params.extend(auto_result.params);
                 plans.push(plan);

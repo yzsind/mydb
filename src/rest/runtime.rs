@@ -451,7 +451,7 @@ impl<E: QueryEngine> Drop for Session<E> {
         let engine = self.engine.clone();
         let registry = self.registry.clone();
         if let Some(mut ctx) = ctx {
-            let _ = crate::util::blocking_pool::spawn(move || {
+            drop(crate::util::blocking_pool::spawn(move || {
                 if engine.close_session(&mut ctx).is_ok() {
                     registry.unregister(ctx.connection_id);
                     drop(slot);
@@ -465,7 +465,7 @@ impl<E: QueryEngine> Drop for Session<E> {
                         "REST session cleanup failed; retaining connection charge",
                     );
                 }
-            });
+            }));
         }
     }
 }

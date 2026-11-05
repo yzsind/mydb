@@ -441,7 +441,10 @@ fn tablesample_release_audit_unqualified_ddl_and_missing_relation() {
         "ALTER VIEW v AS SELECT id FROM tmp TABLESAMPLE(100)",
     ] {
         let err = engine.execute_with_session(&mut session, sql).unwrap_err();
-        assert!(err.is(crate::error::catalog::ER_VIEW_SELECT_TMPTABLE), "{sql}: {err:?}");
+        assert!(
+            err.is(crate::error::catalog::ER_VIEW_SELECT_TMPTABLE),
+            "{sql}: {err:?}"
+        );
     }
     for (table, count) in [("dst", 2), ("tmp", 2), ("v", 1)] {
         let rs = engine
@@ -467,5 +470,4 @@ fn tablesample_release_audit_unqualified_ddl_and_missing_relation() {
         let err = engine.execute_with_session(&mut session, sql).unwrap_err();
         assert!(err.is(crate::error::catalog::ER_NOT_SUPPORTED_YET), "{sql}: {err:?}");
     }
-
 }

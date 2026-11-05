@@ -260,7 +260,10 @@ fn resolve_collected(db: &Arc<Database>, collect: Collect) -> Result<Option<Bind
                 .error("TABLESAMPLE requires a user base table"));
         }
         let schema = db.table(&table.name).map_err(|err| {
-            if db.view_definition(crate::storage::DEFAULT_DATABASE, &table.name).is_some() {
+            if db
+                .view_definition(crate::storage::DEFAULT_DATABASE, &table.name)
+                .is_some()
+            {
                 crate::error::catalog::ER_NOT_SUPPORTED_YET
                     .error("TABLESAMPLE requires a user base table")
             } else {

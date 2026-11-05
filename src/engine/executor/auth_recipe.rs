@@ -102,12 +102,23 @@ impl BoundAccessRecipe {
             )
             .collect()
     }
-    pub(super) fn dml_read_references(db: &Database, session: &SessionContext, statement: &Statement) -> Option<BTreeSet<usize>> {
+    pub(super) fn dml_read_references(
+        db: &Database,
+        session: &SessionContext,
+        statement: &Statement,
+    ) -> Option<BTreeSet<usize>> {
         Self::build_dml(db, session, statement, true)?.root_reads
     }
-    fn build_dml(db: &Database, session: &SessionContext, statement: &Statement, track_reads: bool) -> Option<Self> {
+    fn build_dml(
+        db: &Database,
+        session: &SessionContext,
+        statement: &Statement,
+        track_reads: bool,
+    ) -> Option<Self> {
         let mut binder = Binder::new(db, session);
-        if track_reads { binder.recipe.root_reads = Some(BTreeSet::new()); }
+        if track_reads {
+            binder.recipe.root_reads = Some(BTreeSet::new());
+        }
         let mut select = Select::default();
         let (table, alias, joins, returning) = match statement {
             Statement::Update(u) => (
@@ -603,7 +614,9 @@ impl Binder<'_> {
                     }
                     if let Some(object) = &binding.object {
                         if depth == 0 {
-                            if let Some(reads) = &mut self.recipe.root_reads { reads.insert(index); }
+                            if let Some(reads) = &mut self.recipe.root_reads {
+                                reads.insert(index);
+                            }
                         }
                         self.recipe
                             .reads

@@ -215,8 +215,14 @@ pub(crate) fn load_keys(dir: &Path, state: &AiCatalog, create: bool) -> Result<K
     read_keyfile(&path)
 }
 fn wrap(key: &[u8], input: &[u8], encrypt: bool) -> Result<Zeroizing<Vec<u8>>, QueryError> {
-    crate::engine::credential_crypto::wrap(key, input, encrypt).map(Zeroizing::new)
-        .map_err(|_| error("ER_AI_SECRET_DECRYPT_FAILED", "credential key authentication failed"))
+    crate::engine::credential_crypto::wrap(key, input, encrypt)
+        .map(Zeroizing::new)
+        .map_err(|_| {
+            error(
+                "ER_AI_SECRET_DECRYPT_FAILED",
+                "credential key authentication failed",
+            )
+        })
 }
 fn aad(state: &AiCatalog, id: u64, generation: u64) -> Vec<u8> {
     let mut a = b"mydb.ai.secret.payload.v1\0".to_vec();

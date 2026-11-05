@@ -34,8 +34,14 @@ pub(super) fn qualify_statement_tables<'q>(
         crate::parser::QueryMut::Other(Statement::RowSecurity(command)) => {
             use crate::parser::rls::RlsStatement;
             match command {
-                RlsStatement::Create { table, .. } | RlsStatement::Alter { table, .. } | RlsStatement::Drop { table, .. } | RlsStatement::Enable { table, .. } | RlsStatement::Show { table, .. } => *table = qualify_persistent_table_name(session, table),
-                _ => {},
+                RlsStatement::Create { table, .. }
+                | RlsStatement::Alter { table, .. }
+                | RlsStatement::Drop { table, .. }
+                | RlsStatement::Enable { table, .. }
+                | RlsStatement::Show { table, .. } => {
+                    *table = qualify_persistent_table_name(session, table)
+                }
+                _ => {}
             }
         }
         crate::parser::QueryMut::Other(Statement::Insert(stmt)) => {

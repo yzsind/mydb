@@ -956,7 +956,10 @@ fn sql_rowid_release_audit_multi_table_and_view_dml() {
         result(&engine, "SELECT v FROM t WHERE id=1").rows,
         vec![vec![Value::Int(12)]]
     );
-    for sql in ["UPDATE t,n SET t.v=0 WHERE ROWID>0", "UPDATE t,n SET t.ROWID=1"] {
+    for sql in [
+        "UPDATE t,n SET t.v=0 WHERE ROWID>0",
+        "UPDATE t,n SET t.ROWID=1",
+    ] {
         assert!(engine.execute(sql).is_err(), "{sql}");
     }
     engine

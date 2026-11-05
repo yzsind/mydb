@@ -111,7 +111,11 @@ pub(crate) fn authorize(
     ctx: &crate::engine::auth::AuthorizationContext,
     privilege: &str,
 ) -> Result<(), QueryError> {
-    if crate::engine::rls::policy_active() { return Err(crate::engine::rls::violation("Policy cannot perform external HTTP calls")); }
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy cannot perform external HTTP calls",
+        ));
+    }
     use crate::engine::auth::{Privilege, PrivilegeScope, RequiredPrivilege};
     if !db.auth_catalog().account_has_privilege(
         ctx,

@@ -40,12 +40,23 @@ pub(super) fn lock_select_rows_for_update(
     validate_lock_targets(stmt)?;
     let table = db.table(stmt.table.as_deref().unwrap_or_default())?;
     let secured;
-    let stmt = if crate::engine::rls::might_require_binding(db, &table) && crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)?.is_some() {
+    let stmt = if crate::engine::rls::might_require_binding(db, &table)
+        && crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Update, false)?
+            .is_some()
+    {
         let mut select = stmt.clone();
-        select.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Update, true, select.selection.take())?;
+        select.selection = super::rls::dml_filter(
+            db,
+            &table,
+            crate::parser::rls::Command::Update,
+            true,
+            select.selection.take(),
+        )?;
         secured = select;
         &secured
-    } else { stmt };
+    } else {
+        stmt
+    };
     let lock_clause = stmt
         .lock_clause
         .clone()
@@ -299,8 +310,23 @@ pub(super) fn execute_locked_single_table_select(
         let Some(row) = db.dml_candidate_row_at_for_write(&table, row_ref, txn)? else {
             continue;
         };
-        if !crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Select, false, &row.values)?
-            || !crate::engine::rls::row_allowed(db, txn, &table, crate::parser::rls::Command::Update, false, &row.values)? { continue; }
+        if !crate::engine::rls::row_allowed(
+            db,
+            txn,
+            &table,
+            crate::parser::rls::Command::Select,
+            false,
+            &row.values,
+        )? || !crate::engine::rls::row_allowed(
+            db,
+            txn,
+            &table,
+            crate::parser::rls::Command::Update,
+            false,
+            &row.values,
+        )? {
+            continue;
+        }
         let _scores = fulltext.enter(row.row_ref);
         if stmt
             .selection
@@ -381,7 +407,13 @@ pub(super) fn execute_update(
     if stmt.joins.is_empty() {
         let table = db.table(&stmt.table)?;
         let read_required = super::rls::update_requires_read(db, session, &stmt, &table);
-        stmt.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Update, read_required, stmt.selection.take())?;
+        stmt.selection = super::rls::dml_filter(
+            db,
+            &table,
+            crate::parser::rls::Command::Update,
+            read_required,
+            stmt.selection.take(),
+        )?;
     }
     // M5.C2 — `UPDATE t PARTITION (p0, p1) ...` restricts scans to the
     // named partitions; resolve to storage_ids and install via the
@@ -1460,7 +1492,13 @@ pub(super) fn execute_delete(
     if stmt.joins.is_empty() {
         let table = db.table(&stmt.table)?;
         let read_required = stmt.selection.is_some() || stmt.returning.is_some();
-        stmt.selection = super::rls::dml_filter(db, &table, crate::parser::rls::Command::Delete, read_required, stmt.selection.take())?;
+        stmt.selection = super::rls::dml_filter(
+            db,
+            &table,
+            crate::parser::rls::Command::Delete,
+            read_required,
+            stmt.selection.take(),
+        )?;
     }
     if super::multi_table::is_multi_table_delete(&stmt) {
         return super::multi_table::execute_multi_delete(db, session, txn, stmt, registry);

@@ -2442,7 +2442,8 @@ pub struct Select {
     /// Creation-time semantics of a policy's internal query. Rebound from
     /// policy metadata and never accepted from serialized/user queries.
     #[serde(skip)]
-    pub rls_expression_settings: Option<std::sync::Arc<crate::engine::expr::PolicyExpressionSettings>>,
+    pub rls_expression_settings:
+        Option<std::sync::Arc<crate::engine::expr::PolicyExpressionSettings>>,
     pub projection: Vec<SelectItem>,
     pub table: Option<String>,
     pub from: Vec<TableRef>,

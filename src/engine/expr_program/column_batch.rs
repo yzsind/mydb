@@ -1496,11 +1496,23 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
             if comparison(*op) {
                 if matches!(left.as_ref(), ExprNode::Column(_)) {
                     if let Some(value) = integer_statement_scalar(right) {
-                        return compare_integer_scalar(operand(left, batch)?.as_ref(), value, *op, false, rows);
+                        return compare_integer_scalar(
+                            operand(left, batch)?.as_ref(),
+                            value,
+                            *op,
+                            false,
+                            rows,
+                        );
                     }
                 } else if matches!(right.as_ref(), ExprNode::Column(_)) {
                     if let Some(value) = integer_statement_scalar(left) {
-                        return compare_integer_scalar(operand(right, batch)?.as_ref(), value, *op, true, rows);
+                        return compare_integer_scalar(
+                            operand(right, batch)?.as_ref(),
+                            value,
+                            *op,
+                            true,
+                            rows,
+                        );
                     }
                 }
             }
@@ -1763,11 +1775,18 @@ fn compare_integer_scalar(
             BinaryOp::GtEq => BinaryOp::LtEq,
             other => other,
         }
-    } else { op };
-    if !matches!(column, ColumnVector::I64 { .. } | ColumnVector::U64 { .. } | ColumnVector::Null { .. }) {
+    } else {
+        op
+    };
+    if !matches!(
+        column,
+        ColumnVector::I64 { .. } | ColumnVector::U64 { .. } | ColumnVector::Null { .. }
+    ) {
         return None;
     }
-    let Some(scalar) = scalar else { return Some(ColumnVector::Null { len: rows }); };
+    let Some(scalar) = scalar else {
+        return Some(ColumnVector::Null { len: rows });
+    };
     fn lane<T: Copy + PartialOrd>(data: &[T], scalar: T, op: BinaryOp) -> Option<Vec<i64>> {
         let mut out = Vec::with_capacity(data.len());
         // Chunk boundaries retain cancellation without a branch per value.
@@ -1775,7 +1794,9 @@ fn compare_integer_scalar(
             crate::engine::cancel::check_cancelled().ok()?;
             match op {
                 BinaryOp::Eq => out.extend(chunk.iter().map(|value| i64::from(*value == scalar))),
-                BinaryOp::NotEq => out.extend(chunk.iter().map(|value| i64::from(*value != scalar))),
+                BinaryOp::NotEq => {
+                    out.extend(chunk.iter().map(|value| i64::from(*value != scalar)))
+                }
                 BinaryOp::Lt => out.extend(chunk.iter().map(|value| i64::from(*value < scalar))),
                 BinaryOp::LtEq => out.extend(chunk.iter().map(|value| i64::from(*value <= scalar))),
                 BinaryOp::Gt => out.extend(chunk.iter().map(|value| i64::from(*value > scalar))),
@@ -1797,13 +1818,19 @@ fn compare_integer_scalar(
     };
     let (data, nulls) = match column {
         ColumnVector::I64 { data, nulls } => (
-            if let Ok(scalar) = i64::try_from(scalar) { lane(data, scalar, op)? }
-            else { constant(scalar > i128::from(i64::MAX))? },
+            if let Ok(scalar) = i64::try_from(scalar) {
+                lane(data, scalar, op)?
+            } else {
+                constant(scalar > i128::from(i64::MAX))?
+            },
             nulls.clone(),
         ),
         ColumnVector::U64 { data, nulls } => (
-            if let Ok(scalar) = u64::try_from(scalar) { lane(data, scalar, op)? }
-            else { constant(scalar > i128::from(u64::MAX))? },
+            if let Ok(scalar) = u64::try_from(scalar) {
+                lane(data, scalar, op)?
+            } else {
+                constant(scalar > i128::from(u64::MAX))?
+            },
             nulls.clone(),
         ),
         ColumnVector::Null { .. } => return Some(ColumnVector::Null { len: rows }),

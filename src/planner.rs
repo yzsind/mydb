@@ -1624,13 +1624,17 @@ pub(crate) fn decorrelate_enabled_external() -> bool {
 pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, QueryError> {
     if let Some(settings) = &select.rls_expression_settings {
         if !settings.matches_current() {
-            return crate::engine::expr::with_policy_query_settings(settings, || plan_select(db, select));
+            return crate::engine::expr::with_policy_query_settings(settings, || {
+                plan_select(db, select)
+            });
         }
     }
     if let Some(context) = &select.rls_security_context {
         let mut select = select.clone();
         select.rls_security_context = None;
-        return crate::engine::expr::with_row_security_identity(context, || plan_select(db, &select));
+        return crate::engine::expr::with_row_security_identity(context, || {
+            plan_select(db, &select)
+        });
     }
     let _rowid_scope = crate::storage::rowid::PlanningScope::enter(select);
     crate::engine::params::validate_limit(select.limit.as_ref())?;
@@ -1888,7 +1892,9 @@ pub(crate) fn plan_prepared_physical_select(
 ) -> Result<PhysicalPlan, QueryError> {
     if let Some(settings) = &select.rls_expression_settings {
         if !settings.matches_current() {
-            return crate::engine::expr::with_policy_query_settings(settings, || plan_prepared_physical_select(db, select));
+            return crate::engine::expr::with_policy_query_settings(settings, || {
+                plan_prepared_physical_select(db, select)
+            });
         }
     }
     if let Some(context) = &select.rls_security_context {
@@ -5249,10 +5255,23 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         );
     }
 
-    for ((table, predicate), reference) in tables.iter().zip(base_predicates.iter_mut()).zip(source_refs.iter()) {
-        let locked = select.for_update && select.lock_clause.as_ref().is_none_or(|clause|
-            clause.for_reference(reference).is_some());
-        *predicate = crate::engine::rls::scan_filter(db, &table.schema, table.alias.as_deref(), locked, predicate.take())?;
+    for ((table, predicate), reference) in tables
+        .iter()
+        .zip(base_predicates.iter_mut())
+        .zip(source_refs.iter())
+    {
+        let locked = select.for_update
+            && select
+                .lock_clause
+                .as_ref()
+                .is_none_or(|clause| clause.for_reference(reference).is_some());
+        *predicate = crate::engine::rls::scan_filter(
+            db,
+            &table.schema,
+            table.alias.as_deref(),
+            locked,
+            predicate.take(),
+        )?;
     }
 
     // Order-preserving + LIMIT bonus only applies when there's a single
@@ -5296,7 +5315,9 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         let mut required = collect_required_columns(select, &tables[0]);
         // Security quals are bound after user-AST normalization. Covering
         // access must include their columns even when no user clause reads them.
-        if let Some(predicate) = &base_predicates[0] { collect_expr_columns(predicate, &mut required); }
+        if let Some(predicate) = &base_predicates[0] {
+            collect_expr_columns(predicate, &mut required);
+        }
         let has_wildcard = select.projection.iter().any(|item| {
             matches!(
                 item,
@@ -14238,7 +14259,10 @@ fn constraint_key_part_for_index(
     // bound, so they pass through unchanged — `resolve_index_key` /
     // `resolve_index_bound` at the storage boundary do the truncation
     // after `KeyPart::resolve_param` materialises the value.
-    if matches!(value, PlanConstraintValue::Param(_) | PlanConstraintValue::Statement(_)) {
+    if matches!(
+        value,
+        PlanConstraintValue::Param(_) | PlanConstraintValue::Statement(_)
+    ) {
         return Some(part);
     }
     Some(index.apply_prefix_to_key_part(pos, part))
