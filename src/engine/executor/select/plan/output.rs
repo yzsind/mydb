@@ -216,6 +216,14 @@ pub(in crate::engine::executor::select) fn result_columns(
     };
     projection_result_columns(stmt, sample, |expr, alias| {
         let planned = projected_expr_column(expr, alias, &plan_sample)?;
+        // Finalized aggregate rows can omit their argument columns. Inferring
+        // metadata from that runtime schema can fall back to DOUBLE, including
+        // a wire-type override, even when the bound plan declares DECIMAL.
+        // Keep the complete plan descriptor together so the column definition
+        // and binary row encoder use the same exact numeric domain.
+        if crate::engine::executor::select::expr_has_aggregate(expr) {
+            return Ok(planned);
+        }
         // An implicit single-group aggregate has no GROUP BY output
         // fields.  Permissive MySQL hidden columns are represented by
         // `__hidden_first_value` state in `agg_values`, so the runtime
@@ -237,18 +245,6 @@ pub(in crate::engine::executor::select) fn result_columns(
         } else {
             projected_expr_column(expr, alias, sample)?
         };
-        // A vectorized aggregate row contains finalized group keys and
-        // aggregate values, but not the aggregate's original argument
-        // columns. Runtime-only type inference therefore cannot
-        // resolve e.g. `SUM(decimal_col)` and conservatively reports
-        // DOUBLE. The immutable plan sample still carries the source
-        // column metadata, so use it as the type oracle for aggregate
-        // projections before this result is materialized as a
-        // CTE/derived table and consumed by schema-driven vector lanes.
-        if crate::engine::executor::select::expr_has_aggregate(expr) {
-            column.column_type = planned.column_type;
-            column.source.decimals = planned.source.decimals;
-        }
         if column.source.org_table.is_empty() {
             if !planned.source.org_table.is_empty() {
                 column = planned;

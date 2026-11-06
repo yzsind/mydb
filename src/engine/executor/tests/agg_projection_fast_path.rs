@@ -16,6 +16,113 @@
 use super::*;
 
 #[test]
+fn aggregate_having_subquery_preserves_exact_result_metadata() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE aggregate_wire (g INT, v INT)")
+        .unwrap();
+    let values = (0..16)
+        .map(|g| format!("({g},{})", if g < 3 { 1000 } else { 1 }))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO aggregate_wire VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE aggregate_wire").unwrap();
+    let sql = "SELECT g,SUM(v) AS total FROM aggregate_wire GROUP BY g \
+               HAVING SUM(v)>(SELECT SUM(v)*.005 FROM aggregate_wire) ORDER BY g";
+    let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap().materialize().unwrap()
+    else {
+        panic!("expected result set");
+    };
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(
+        result.columns[1].column_type,
+        ColumnType::Decimal {
+            precision: 32,
+            scale: 0
+        }
+    );
+    let column = &result.columns[1];
+    let definition = crate::mysql::protocol::column_definition_packet_full(
+        &column.name,
+        column.column_type,
+        &column.source,
+    );
+    assert_eq!(definition[definition.len() - 6], 0xf6); // MYSQL_TYPE_NEWDECIMAL
+    assert_eq!(result.columns[1].source.decimals, Some(0));
+    for row in &result.rows {
+        assert_eq!(row[1].to_display_string(), "1000");
+        let packet = crate::mysql::protocol::binary_row_packet(&result.columns, row);
+        assert_eq!(&packet[6..], b"\x041000");
+    }
+}
+
+#[test]
+fn aggregate_having_metadata_preserves_numeric_and_string_domains() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE aggregate_domains(g INT,u BIGINT UNSIGNED,d DECIMAL(50,8),f DOUBLE,s VARCHAR(8))").unwrap();
+    let values = (0..16)
+        .map(|i| {
+            if i % 5 == 0 {
+                format!("({},NULL,NULL,NULL,NULL)", i % 4)
+            } else {
+                format!(
+                    "({},18446744073709551615,9007199254740993.12345678,1.25,'v{i}')",
+                    i % 4
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO aggregate_domains VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE aggregate_domains").unwrap();
+    let rows = |sql: &str| {
+        let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap().materialize().unwrap()
+        else {
+            panic!("expected result set: {sql}");
+        };
+        result
+    };
+    for expression in [
+        "SUM(u)",
+        "AVG(u)",
+        "MIN(u)",
+        "MAX(u)",
+        "SUM(d)",
+        "AVG(d)",
+        "MIN(d)",
+        "MAX(d)",
+        "SUM(f)",
+        "AVG(f)",
+        "COUNT(d)",
+        "ABS(SUM(d))",
+        "GROUP_CONCAT(s ORDER BY s)",
+    ] {
+        let projection = format!("SELECT g,{expression} AS v FROM aggregate_domains GROUP BY g");
+        let expected = rows(&format!("{projection} ORDER BY g"));
+        let actual = rows(&format!(
+            "{projection} HAVING COUNT(*)>(SELECT COUNT(*)*.005 FROM aggregate_domains) ORDER BY g"
+        ));
+        assert_eq!(actual.columns, expected.columns, "{expression}");
+        let display = |result: &ResultSet| {
+            result
+                .rows
+                .iter()
+                .map(|row| row.iter().map(Value::to_display_string).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(display(&actual), display(&expected), "{expression}");
+    }
+}
+
+#[test]
 fn cached_aggregates_ignore_function_case_and_preserve_labels() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

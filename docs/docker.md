@@ -44,7 +44,7 @@ To build a Linux AMD64 image on an Apple Silicon Mac:
 docker buildx build \
   --platform linux/amd64 \
   --progress=plain \
-  -t registry.example.com/namespace/mydb:1.1.0 \
+  -t registry.example.com/namespace/mydb:1.2.0 \
   --load \
   .
 ```
