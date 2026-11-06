@@ -934,6 +934,8 @@ impl Database {
             #[cfg(test)]
             online_copy_publish_test_hook: Mutex::new(None),
             #[cfg(test)]
+            online_index_long_lived_wait_test_hook: Mutex::new(None),
+            #[cfg(test)]
             vector_copy_committed_test_hook: Mutex::new(None),
             #[cfg(test)]
             vector_apply_test_hook: Mutex::new(None),
