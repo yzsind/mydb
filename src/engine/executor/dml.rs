@@ -425,6 +425,10 @@ pub(super) fn execute_update(
         let storage_ids =
             super::partition_clause::resolve_partition_clause(db, &stmt.table, &stmt.partitions)?
                 .unwrap_or_default();
+        let _partition_write = super::partition_clause::PartitionWriteGuard::enter(
+            db.table(&stmt.table)?.id,
+            storage_ids.clone(),
+        );
         let partitions = std::mem::take(&mut stmt.partitions);
         let result = super::partition_router::with_pruned_partitions(storage_ids, || {
             execute_update(db, session, txn, stmt.clone(), registry)

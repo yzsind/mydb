@@ -1003,8 +1003,8 @@ fn from_days_out_of_range_returns_null_without_overflow() {
     assert_eq!(
         row,
         vec![
-            Value::String("0000-00-00".into()),
-            Value::String("0000-00-00".into()),
+            Value::Date(crate::types::ZERO_DATE),
+            Value::Date(crate::types::ZERO_DATE),
             Value::UInt(0)
         ]
     );
@@ -1402,7 +1402,7 @@ fn lc_time_names_drives_day_and_month_names() {
     );
     assert_eq!(as_text(&row[0]), "星期一");
     assert_eq!(as_text(&row[1]), "一月");
-    assert_eq!(as_text(&row[2]), "星期一/一月/周一/1月");
+    assert_eq!(as_text(&row[2]), "星期一/一月/一/ 1月");
 
     engine
         .execute_with_session(&mut s, "SET SESSION lc_time_names = 'de_DE'")
@@ -1417,12 +1417,15 @@ fn lc_time_names_drives_day_and_month_names() {
     assert_eq!(as_text(&row[1]), "März");
     assert_eq!(as_text(&row[2]), "So Mär");
 
-    // Unknown locales fall back to en_US.
-    engine
-        .execute_with_session(&mut s, "SET SESSION lc_time_names = 'xx_XX'")
-        .unwrap();
-    let row = one_row_s(&engine, &mut s, "SELECT DAYNAME('2024-01-15')");
-    assert_eq!(as_text(&row[0]), "Monday");
+    // Unknown locales must fail before changing the current locale.
+    assert_eq!(
+        engine
+            .execute_with_session(&mut s, "SET SESSION lc_time_names = 'xx_XX'")
+            .unwrap_err()
+            .code(),
+        1649
+    );
+    assert_eq!(s.sysvars.lc_time_names, "de_DE");
 }
 
 // ---------- P1#7: explicit_defaults_for_timestamp legacy OFF mode ----------
@@ -2493,14 +2496,14 @@ fn str_to_date_full_month_accepts_unambiguous_prefixes() {
 }
 
 #[test]
-fn str_to_date_full_month_preserves_localized_names() {
+fn str_to_date_full_month_uses_english_independent_of_output_locale() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_test_engine(tmp.path());
     let mut session = SessionContext::default();
     for (locale, name, expected) in [
-        ("de_DE", "März", "1995-03-20"),
-        ("fr_FR", "février", "1995-02-20"),
-        ("zh_CN", "十一月", "1995-11-20"),
+        ("de_DE", "März", "NULL"),
+        ("fr_FR", "février", "NULL"),
+        ("zh_CN", "十一月", "NULL"),
     ] {
         engine
             .execute_with_session(&mut session, &format!("SET lc_time_names='{locale}'"))

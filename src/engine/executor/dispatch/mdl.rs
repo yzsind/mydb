@@ -560,7 +560,9 @@ fn mdl_requests_for_statement(
             lock_type: MdlLockType::IntentionExclusive,
         }));
     }
-    if crate::replication::is_replica_write_statement(statement) {
+    if crate::replication::is_replica_write_statement(statement)
+        && !statement_writes_only_temp_tables(session, statement)
+    {
         requests.push(MdlRequest {
             key: MdlObjectKey::global(),
             lock_type: MdlLockType::SharedWrite,

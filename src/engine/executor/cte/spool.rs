@@ -285,12 +285,15 @@ impl Reader {
         if start == 0 {
             return Ok(Some(batch));
         }
-        let mut indices = mem_budget::try_vec_with_capacity(
-            batch.num_rows() - start,
-            "CTE remaining row positions",
-        )?;
-        indices.extend((start..batch.num_rows()).map(|row| row as u32));
-        Ok(Some(batch.with_selection(Selection::Indices(indices))))
+        let len = batch.num_rows() - start;
+        Ok(Some(
+            batch.with_selection(Selection::Range {
+                start: u32::try_from(start)
+                    .map_err(|_| mem_budget::allocation_error("CTE selection offset"))?,
+                len: u32::try_from(len)
+                    .map_err(|_| mem_budget::allocation_error("CTE selection length"))?,
+            }),
+        ))
     }
 
     fn copy_next_row(

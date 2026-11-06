@@ -81,11 +81,12 @@ fn inline_gtid_intervals_keep_u64_edges_canonical_output_and_errors() {
     .unwrap();
     assert_eq!(merged, all);
     assert_eq!(format_gtid_set(&gtid_set_subtract(&all, &all)), "");
+    for text in [format!("{uuid}"), format!("{uuid}:3-1")] {
+        assert!(parse_gtid_set_uncached(&text).unwrap().is_empty());
+    }
     for text in [
         "invalid".into(),
-        format!("{uuid}"),
         format!("{uuid}:0"),
-        format!("{uuid}:3-1"),
         format!("{uuid}:1--2"),
         format!("{uuid}:18446744073709551616"),
         format!("{uuid}:1,"),

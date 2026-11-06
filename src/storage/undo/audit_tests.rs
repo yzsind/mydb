@@ -2,6 +2,28 @@ use super::purge_tests::make_record;
 use super::*;
 
 #[test]
+fn undo_resident_admission_rejection_does_not_wait_for_accounting_owner() {
+    let undo = UndoManager::default();
+    let admission = undo.resident_admission();
+    let held = undo.resident_charge.lock();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result =
+            crate::engine::executor::mem_budget::with_test_effective_memory_limit(1, || {
+                admission.reserve(&make_record(1, 1, 1, None))
+            });
+        sender.send(result.map(|_| ())).unwrap();
+    });
+    let rejected = receiver.recv_timeout(std::time::Duration::from_secs(1));
+    drop(held);
+    worker.join().unwrap();
+    assert!(rejected
+        .expect("memory admission must finish before taking the accounting owner")
+        .is_err());
+    assert_eq!(undo.resident_charge_bytes(), 0);
+}
+
+#[test]
 fn refactor_undo_full_and_metadata_share_headers_lobs_and_reject_truncated_tail() {
     let mut record = make_record(17, 3, 5, Some(11));
     record.kind = UndoKind::Update;
@@ -212,4 +234,90 @@ fn undo_audit_ordered_replication_drains_at_limit_and_releases_budget() {
     let reopened = UndoManager::open_with_segments(&[], target_dir.path(), 1024 * 1024).unwrap();
     assert_eq!(reopened.record_count(), MAX_REPLICATED_PENDING_FRAMES + 1);
     assert!(reopened.get(first.unwrap()).is_some());
+}
+
+#[test]
+fn release1106_replicated_undo_missing_prefix_survives_limit_and_restart() {
+    let source_dir = tempdir();
+    let target_dir = tempdir();
+    let mut source =
+        UndoManager::open_with_segments(&[], source_dir.path(), 8 * 1024 * 1024).unwrap();
+    let mut target =
+        UndoManager::open_with_segments(&[], target_dir.path(), 8 * 1024 * 1024).unwrap();
+    // An allocated predecessor never enters WAL (source crash / uncommitted txn).
+    for lane in 0..source.write_shards.len() {
+        source.next_shard.store(lane as u64, Ordering::Relaxed);
+        source
+            .append_record(make_record(0, 1, 1, None), true)
+            .unwrap();
+    }
+    let mut ids = Vec::new();
+    for n in 0..MAX_REPLICATED_PENDING_FRAMES + 8 {
+        let (id, bytes, _) = source
+            .append_record(make_record(0, 7, n as u64 + 1, None), true)
+            .unwrap();
+        target.apply_replicated_wal_record(id, &bytes).unwrap();
+        ids.push(id);
+        assert!(target.replicated_pending_frames.len() <= MAX_REPLICATED_PENDING_FRAMES);
+    }
+    target.persist_replicated_frames_for_promotion().unwrap();
+    drop(target);
+    let reopened =
+        UndoManager::open_with_segments(&[], target_dir.path(), 8 * 1024 * 1024).unwrap();
+    for id in ids {
+        assert!(reopened.get(id).is_some(), "missing {id}");
+    }
+}
+
+#[test]
+fn release1106_source_recovery_never_reuses_published_undo_identity() {
+    for persisted in [false, true] {
+        let source_dir = tempdir();
+        let target_dir = tempdir();
+        let mut source =
+            UndoManager::open_with_segments(&[], source_dir.path(), 1024 * 1024).unwrap();
+        source.next_shard.store(0, Ordering::Relaxed);
+        let mut record = make_record(0, 7, 1, None);
+        record.kind = UndoKind::Insert;
+        let (old, bytes, _) = source.append_record(record, true).unwrap();
+        if persisted {
+            source.flush().unwrap();
+        }
+        let wal = vec![WalRecord {
+            source_time_us: 0,
+            lsn: 1,
+            txn_id: 7,
+            prev_txn_lsn: 0,
+            payload: WalPayload::UndoRecord {
+                undo_id: old,
+                bytes: bytes.clone(),
+            },
+        }];
+        let mut target =
+            UndoManager::open_with_segments(&[], target_dir.path(), 1024 * 1024).unwrap();
+        target.apply_replicated_wal_record(old, &bytes).unwrap();
+        target.drain_replicated_pending_frames().unwrap();
+        drop(source);
+        let mut source = UndoManager::open_with_segments_for_recovery(
+            &wal,
+            source_dir.path(),
+            1024 * 1024,
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+        source.next_shard.store(0, Ordering::Relaxed);
+        let (new, bytes, _) = source
+            .append_record(make_record(0, 8, 1, None), true)
+            .unwrap();
+        assert_ne!(
+            old, new,
+            "replicas may still retain frames from the previous source process"
+        );
+        target.apply_replicated_wal_record(new, &bytes).unwrap();
+        target.drain_replicated_pending_frames().unwrap();
+        target.set_mem_cache_limit_bytes(1);
+        target.evict_to_cache_budget();
+        assert_eq!(target.load_owned(new).unwrap().txn_id, 8);
+    }
 }

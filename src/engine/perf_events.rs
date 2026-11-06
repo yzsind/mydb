@@ -857,7 +857,7 @@ thread_local! {
 }
 
 struct TextStatementMemo {
-    raw: Box<str>,
+    raw: Arc<str>,
     generation: u64,
     trimmed: Arc<str>,
     class: StatementEventClass,
@@ -890,13 +890,17 @@ fn text_statement_identity(sql: &str) -> (Arc<str>, StatementEventClass) {
             return hit;
         }
     }
-    let safe = crate::engine::logging::redact_sql_for_log(sql);
+    let safe = crate::engine::logging::redact_sql_for_log_borrowed(sql);
     let trimmed: Arc<str> = Arc::from(safe.trim());
     let class = statement_event_class(&trimmed);
     if memoizable {
         TEXT_STATEMENT_MEMO.with(|memo| {
             *memo.borrow_mut() = Some(TextStatementMemo {
-                raw: Box::from(sql),
+                raw: if trimmed.as_ref() == sql {
+                    Arc::clone(&trimmed)
+                } else {
+                    Arc::from(sql)
+                },
                 generation,
                 trimmed: Arc::clone(&trimmed),
                 class,
@@ -2632,6 +2636,12 @@ mod tests {
         }
         let (trimmed, _) = text_statement_identity("ALTER USER u IDENTIFIED BY 'secret-value'");
         assert!(!trimmed.contains("secret-value"));
+        text_statement_identity("SELECT 42");
+        TEXT_STATEMENT_MEMO.with(|memo| {
+            let memo = memo.borrow();
+            let memo = memo.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&memo.raw, &memo.trimmed));
+        });
     }
 
     #[test]

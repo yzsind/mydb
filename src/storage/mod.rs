@@ -67,6 +67,11 @@ pub(crate) use core::{
     with_enum_field_copy_coercion, LoadDataIndexBuilders, LoadDataIndexKeyBatch,
     ShadowGenerationBuilder, ShadowHeapAppender,
 };
+#[cfg(test)]
+pub(crate) use core::{
+    captured_patch_preparations_for_test, lob_full_materializations_for_test,
+    prepared_point_sparse_patch_hits_for_test, record_prepared_point_sparse_patch_hit_for_test,
+};
 pub(crate) use core::{
     decode_row_into_sink_fast, decode_row_schema_columns_into_with_plan_ext_for_layout,
     f32_from_order_u32, f64_from_order_u64, fast_decode_fallback_reason, format_decimal_v3,
@@ -80,11 +85,6 @@ pub(crate) use core::{
     CompiledDirectRowEncoder, ZoneMapWorkerBatch,
 };
 pub(crate) use core::{expand_changed_columns_for_generated, index_may_be_affected_by_columns};
-#[cfg(test)]
-pub(crate) use core::{
-    lob_full_materializations_for_test, prepared_point_sparse_patch_hits_for_test,
-    record_prepared_point_sparse_patch_hit_for_test,
-};
 #[cfg(test)]
 pub(crate) use core::{
     mysql_status_snapshot_calls, reset_zone_map_cost_estimate_calls, zone_map_cost_estimate_calls,

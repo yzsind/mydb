@@ -261,6 +261,43 @@ impl MdlStateLatch {
         };
         self.objects(mask, smallvec::smallvec![(index, directory)])
     }
+
+    /// Release operations need a stable owner directory, but do not need to
+    /// hold every object shard at once. In particular, a busy table must not
+    /// extend the GLOBAL shard's critical section across the whole recipe.
+    pub(super) fn visit_owner_shards(
+        &self,
+        owner: u64,
+        mut visit: impl FnMut(&mut MdlState<'_>) -> bool,
+    ) -> bool {
+        let mut directory = self.owners[owner as usize % SHARDS].lock();
+        let mask = if directory.complete {
+            directory.masks.get(&owner).copied().unwrap_or(0)
+        } else {
+            u32::MAX
+        };
+        let mut changed = false;
+        let mut retained = false;
+        for index in 0..SHARDS {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            let mut state = self.objects(1 << index, SmallVec::new());
+            changed |= visit(&mut state);
+            retained |= state.objects.values().any(|object| {
+                object
+                    .granted
+                    .iter()
+                    .chain(&object.waiting)
+                    .any(|ticket| ticket.owner_id == owner)
+            });
+        }
+        if !retained {
+            directory.masks.remove(&owner);
+        }
+        changed
+    }
+
     pub(super) fn lock_key(&self, key: &MdlObjectKey) -> MdlState<'_> {
         self.objects(
             1 << (self.hash.hash_one(key) as usize % SHARDS),
@@ -320,6 +357,102 @@ mod tests {
             .expect("unrelated metadata shard was blocked")
             .unwrap();
         manager.release_owner(2);
+    }
+
+    #[test]
+    fn releasing_one_object_does_not_pin_it_behind_another_object() {
+        let manager = Arc::new(MdlManager::default());
+        let (mut first, mut second) = different_keys(&manager);
+        let shard = |key: &MdlObjectKey| manager.state.hash.hash_one(key) as usize % SHARDS;
+        if shard(&first) > shard(&second) {
+            std::mem::swap(&mut first, &mut second);
+        }
+        let first_shard = shard(&first);
+        let shared = |key| MdlRequest {
+            key,
+            lock_type: MdlLockType::SharedWrite,
+        };
+        manager
+            .acquire_many(
+                1,
+                Some(1),
+                MdlDuration::Transaction,
+                vec![shared(first.clone()), shared(second.clone())],
+                "test",
+            )
+            .unwrap();
+        let held = manager.state.lock_key(&second);
+        let releasing = Arc::clone(&manager);
+        let release =
+            std::thread::spawn(move || releasing.release_duration(1, MdlDuration::Transaction));
+        // Wait until release has reached the first shard. The old path keeps
+        // it locked while waiting for the second; the streaming path has
+        // already removed its ticket before waiting for the second.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progressed = match manager.state.objects[first_shard].try_lock() {
+                None => true,
+                Some(objects) => objects
+                    .get(&first)
+                    .is_none_or(|object| !object.granted.iter().any(|ticket| ticket.owner_id == 1)),
+            };
+            if progressed || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let acquiring = Arc::clone(&manager);
+        let (send, receive) = std::sync::mpsc::channel();
+        let acquire = std::thread::spawn(move || {
+            send.send(acquiring.acquire_cached(
+                2,
+                Some(2),
+                MdlDuration::Transaction,
+                &[shared(first)],
+                "test",
+            ))
+            .unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        assert!(release.join().unwrap());
+        acquire.join().unwrap();
+        result
+            .expect("a release pinned an unrelated metadata object shard")
+            .unwrap();
+        manager.release_owner(2);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn partial_release_retains_owner_routing_and_other_duration_blockers() {
+        let manager = MdlManager::default();
+        let (a, b) = different_keys(&manager);
+        for (key, duration) in [
+            (a.clone(), MdlDuration::Transaction),
+            (b.clone(), MdlDuration::Explicit),
+        ] {
+            manager
+                .acquire_cached(1, Some(1), duration, &[request(key)], "test")
+                .unwrap();
+        }
+        assert!(manager.release_duration(1, MdlDuration::Transaction));
+        let read = |key| MdlRequest {
+            key,
+            lock_type: MdlLockType::SharedRead,
+        };
+        let grant = manager
+            .try_acquire_statement_fast(&[read(a)])
+            .expect("released blocker must be unpublished");
+        assert!(manager
+            .try_acquire_statement_fast(&[read(b.clone())])
+            .is_none());
+        assert!(manager.release_owner(1));
+        let other_grant = manager
+            .try_acquire_statement_fast(&[read(b)])
+            .expect("the retained owner route must release the explicit blocker");
+        drop((grant, other_grant));
+        assert!(manager.snapshot().is_empty());
     }
 
     #[test]

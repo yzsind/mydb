@@ -342,7 +342,11 @@ pub(super) fn execute_load_data_with_reader(
     // general path funnels through `insert_rows_bulk_detailed`, which
     // enforces the child-side check. Gated on `fk_checks_enabled()` so
     // `SET foreign_key_checks=0` (every mysqldump body) keeps the fast path.
-    let needs_general = stmt.is_xml
+    // Vector maintenance must share the transactional INSERT journal, for
+    // every element type and both persistent backends. Heap-only import cannot
+    // publish a complete graph or a replayable vector completion boundary.
+    let needs_general = table.indexes.iter().any(|index| index.is_vector())
+        || stmt.is_xml
         || !stmt.set_clauses.is_empty()
         || stmt.has_user_var_targets()
         || charset_needs_transcode(stmt.charset.as_deref())
@@ -512,20 +516,6 @@ pub(super) fn execute_load_data_with_reader(
     // G8 — attach the `Records/Deleted/Skipped/Warnings` info trailer.
     if let Ok(QueryResponse::OkAffected { affected_rows }) = &result {
         finalize_load_info(*affected_rows);
-    }
-    // B1 — the fast/parallel LOAD paths write heap-only and never run the
-    // `note_vector_*` maintenance hooks, so any row bulk-loaded into a table
-    // with an already-*warm* vector index (HNSW or IVF) would be absent
-    // from KNN results until restart/OPTIMIZE. Evict the warm graphs on a
-    // successful load (no file deletion — the next KNN query rebuilds from the
-    // now-complete heap). Cold graphs are unaffected, and a bulk rebuild is the
-    // right maintenance shape for a bulk import anyway (it dodges the per-row
-    // write amplification of incremental maintenance). Defensive: today the
-    // VECTOR accepts text (`[x,...]`) and, with
-    // MYDB_LOAD_DATA_VECTOR_FORMAT=base64, raw little-endian f32 bytes. Bulk
-    // rebuild is preferable to per-row graph write amplification.
-    if result.is_ok() && table.indexes.iter().any(|index| index.is_vector()) {
-        db.evict_table_vector_graphs(table.id);
     }
     // A benchmark or migration commonly issues several large LOAD DATA
     // statements back-to-back. The general idle reclaimer waits for 250 ms
@@ -1020,7 +1010,7 @@ fn bind_target(
                 None => Value::Null,
                 Some(bytes) => str_to_string_value(&decode_field_text(&bytes, charset)?),
             };
-            session.set_user_variable(name, value);
+            session.set_user_variable(name, value)?;
         }
     }
     Ok(())
@@ -1165,7 +1155,10 @@ fn flush_general_batch(
             Err(e)
                 if e.is(crate::error::catalog::ER_DUP_ENTRY)
                     || (stmt.ignore_duplicates
-                        && e.is(crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED)) =>
+                        && e.is_any(&[
+                            crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED,
+                            crate::error::catalog::ER_NO_PARTITION_FOR_GIVEN_VALUE,
+                        ])) =>
             {
                 db.rollback_to_statement_savepoint(txn.txn_id, batch_savepoint)?;
                 let mut affected = 0u64;
@@ -1207,7 +1200,10 @@ fn flush_general_batch(
                         }
                         Err(e2)
                             if stmt.ignore_duplicates
-                                && e2.is(crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED) =>
+                                && e2.is_any(&[
+                                    crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED,
+                                    crate::error::catalog::ER_NO_PARTITION_FOR_GIVEN_VALUE,
+                                ]) =>
                         {
                             add_load_skipped(1);
                             crate::engine::api::push_statement_condition(
@@ -3932,7 +3928,10 @@ fn execute_load_data_with_conflict(
                 Err(e)
                     if e.is(crate::error::catalog::ER_DUP_ENTRY)
                         || (ignore
-                            && e.is(crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED)) =>
+                            && e.is_any(&[
+                                crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED,
+                                crate::error::catalog::ER_NO_PARTITION_FOR_GIVEN_VALUE,
+                            ])) =>
                 {
                     db.rollback_to_statement_savepoint(txn.txn_id, batch_savepoint)?;
                     for row in mapped_rows {

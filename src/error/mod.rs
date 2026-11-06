@@ -240,6 +240,7 @@ pub(crate) enum InternalErrorKind {
     VectorHashJoinFallback,
     ReplicaPoisonFrame,
     ReplicaApplyFailure,
+    ReplicaSnapshotBlocked,
     ReplicaHandshakeRejected,
 }
 
@@ -389,7 +390,6 @@ impl QueryError {
         specs.iter().copied().any(|spec| self.is(spec))
     }
 
-    #[cfg(test)]
     pub fn diagnostic_id(&self) -> Option<&'static str> {
         self.diagnostic.as_ref().map(|diagnostic| diagnostic.id)
     }

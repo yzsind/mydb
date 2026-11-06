@@ -56,7 +56,7 @@ pub(super) fn evaluate(
             },
         });
     }
-    let text = matches!(name.as_str(), "FROM_DAYS" | "MAKEDATE");
+    let text = name == "MAKEDATE";
     let mut numbers = Vec::new();
     let mut data = Vec::new();
     let mut offsets = Vec::new();
@@ -85,7 +85,7 @@ pub(super) fn evaluate(
             match name.as_str() {
                 "FROM_DAYS" => {
                     if first <= 0 {
-                        data.extend_from_slice(b"0000-00-00");
+                        Some(i64::from(crate::types::ZERO_DATE))
                     } else {
                         let ce =
                             i32::try_from(first.checked_sub(if first < 60 { 366 } else { 365 })?)
@@ -94,13 +94,8 @@ pub(super) fn evaluate(
                         if date.year() > 9999 {
                             return None;
                         }
-                        let mut buffer = [0; 32];
-                        data.extend_from_slice(crate::types::write_date_canonical(
-                            ce - 719_163,
-                            &mut buffer,
-                        ));
+                        Some(i64::from(ce - 719_163))
                     }
-                    Some(0)
                 }
                 "MAKEDATE" => {
                     let day = lanes[1].integer(row);
@@ -146,7 +141,7 @@ pub(super) fn evaluate(
                         .round()
                         .clamp(-(LIMIT as f64), LIMIT as f64) as i64,
                 ),
-                "PERIOD_ADD" if first == 0 => Some(0),
+                "PERIOD_ADD" if first == 0 => return None,
                 "PERIOD_ADD" => {
                     let (year, month) =
                         crate::engine::expr::checked_period_to_ym(first, "period_add").ok()?;
@@ -189,6 +184,11 @@ pub(super) fn evaluate(
         ColumnVector::Utf8 {
             data,
             offsets,
+            nulls,
+        }
+    } else if name == "FROM_DAYS" {
+        ColumnVector::Date32 {
+            data: numbers.into_iter().map(|value| value as i32).collect(),
             nulls,
         }
     } else if matches!(name.as_str(), "MAKETIME" | "SEC_TO_TIME") {

@@ -4965,6 +4965,12 @@ pub(super) fn describe_select_columns(
         return system_result_columns(stmt, &fields);
     }
     if stmt.joins.is_empty() && stmt.from.len() == 1 {
+        if stmt.from[0].generate_series.is_some() {
+            // Table functions have no catalog schema. Use the same typed
+            // source plan for derived/CTE and prepared-result metadata.
+            let plan = planner::plan_prepared_physical_select(db, stmt)?;
+            return empty_result_columns(stmt, &plan);
+        }
         let table = db.table(table_name)?;
         return single_table_result_columns(stmt, &table, None);
     }
@@ -5545,7 +5551,7 @@ fn json_table_require_conversion(result: Result<Value, QueryError>) -> Result<Va
 }
 
 fn json_table_out_of_range() -> QueryError {
-    crate::error::catalog::ER_JT_VALUE_OUT_OF_RANGE.error("Out of range JSON_TABLE value")
+    crate::error::catalog::ER_NUMERIC_JSON_VALUE_OUT_OF_RANGE.error("Out of range JSON_TABLE value")
 }
 
 /// Bridge inline derived tables sitting in JOIN positions into CTE registry

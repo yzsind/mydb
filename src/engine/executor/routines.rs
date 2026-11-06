@@ -2728,7 +2728,7 @@ impl OutBinding {
                         "Policy functions cannot assign session variables",
                     ));
                 }
-                session.set_user_variable(name, value);
+                session.set_user_variable(name, value)?;
                 Ok(())
             }
             OutBinding::Local(name) => {
@@ -4855,7 +4855,7 @@ fn assign_target(
                 )
                 .into());
             }
-            session.set_user_variable(name, value);
+            session.set_user_variable(name, value)?;
         }
     }
     Ok(())

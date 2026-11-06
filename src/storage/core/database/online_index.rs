@@ -226,7 +226,7 @@ impl Database {
         !txn.dirty_read && txn.snapshot_scn < self.read_definition_highwater.load(Ordering::Acquire)
     }
 
-    fn check_index_read_view(
+    pub(crate) fn check_index_read_view(
         &self,
         table: &TableSchema,
         index: &IndexSchema,

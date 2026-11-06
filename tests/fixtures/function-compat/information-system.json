@@ -3575,10 +3575,12 @@
             "status": "ok",
             "rows": [
               [
-                "root@localhost"
+                "NULL"
               ]
             ],
-            "warning_codes": []
+            "warning_codes": [
+              1292
+            ]
           },
           "mysql_sql": "SELECT sys.ps_thread_account('example')",
           "mysql_probe": {
@@ -3630,7 +3632,7 @@
             ]
           },
           "comparison": "contract",
-          "difference_reason": "The Community sys-schema routine depends on server-specific Performance Schema state or is unavailable with this unqualified compatibility surface; the MySQL probe is retained and mydb checks its reviewed local contract. The embedded fixture uses root@localhost; captured protocol probe identities are preserved separately.",
+          "difference_reason": "Unknown or NULL thread identifiers return NULL; native builtin arity errors use 1582.",
           "metadata_comparison": "contract",
           "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'BLOB', 'length': 262140, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
         },
@@ -3648,7 +3650,7 @@
             "status": "ok",
             "rows": [
               [
-                "root@localhost"
+                "NULL"
               ]
             ],
             "warning_codes": []
@@ -3675,7 +3677,7 @@
             "columns": []
           },
           "comparison": "contract",
-          "difference_reason": "The Community sys-schema routine depends on server-specific Performance Schema state or is unavailable with this unqualified compatibility surface; the MySQL probe is retained and mydb checks its reviewed local contract. The embedded fixture uses root@localhost; captured protocol probe identities are preserved separately."
+          "difference_reason": "Unknown or NULL thread identifiers return NULL; native builtin arity errors use 1582."
         },
         {
           "id": "invalid_arity",
@@ -3687,13 +3689,9 @@
           "sql": "SELECT PS_THREAD_ACCOUNT()",
           "cleanup": [],
           "expected": {
-            "status": "ok",
-            "rows": [
-              [
-                "root@localhost"
-              ]
-            ],
-            "warning_codes": []
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
           },
           "mysql_sql": "SELECT sys.ps_thread_account()",
           "mysql_probe": {
@@ -3702,7 +3700,7 @@
             "sqlstate": "42000"
           },
           "comparison": "contract",
-          "difference_reason": "The Community sys-schema routine depends on server-specific Performance Schema state or is unavailable with this unqualified compatibility surface; the MySQL probe is retained and mydb checks its reviewed local contract. The embedded fixture uses root@localhost; captured protocol probe identities are preserved separately.",
+          "difference_reason": "Unknown or NULL thread identifiers return NULL; native builtin arity errors use 1582.",
           "mydb_probe": {
             "status": "ok",
             "rows": [
@@ -3735,7 +3733,7 @@
             "status": "ok",
             "rows": [
               [
-                "0"
+                "NULL"
               ]
             ],
             "warning_codes": [
@@ -3796,7 +3794,7 @@
             ]
           },
           "comparison": "contract",
-          "difference_reason": "The Community sys-schema routine depends on server-specific Performance Schema state or is unavailable with this unqualified compatibility surface; the MySQL probe is retained and mydb checks its reviewed local contract.",
+          "difference_reason": "Unknown or NULL thread identifiers return NULL; native builtin arity errors use 1582.",
           "metadata_comparison": "contract",
           "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['NUM', 'UNSIGNED'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
         },
@@ -3843,7 +3841,7 @@
             "columns": []
           },
           "comparison": "contract",
-          "difference_reason": "The Community sys-schema routine depends on server-specific Performance Schema state or is unavailable with this unqualified compatibility surface; the MySQL probe is retained and mydb checks its reviewed local contract."
+          "difference_reason": "Unknown or NULL thread identifiers return NULL; native builtin arity errors use 1582."
         },
         {
           "id": "invalid_arity",
@@ -3855,13 +3853,9 @@
           "sql": "SELECT PS_THREAD_ID()",
           "cleanup": [],
           "expected": {
-            "status": "ok",
-            "rows": [
-              [
-                "597"
-              ]
-            ],
-            "warning_codes": []
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
           },
           "mysql_sql": "SELECT sys.ps_thread_id()",
           "mysql_probe": {
@@ -3870,7 +3864,7 @@
             "sqlstate": "42000"
           },
           "comparison": "contract",
-          "difference_reason": "The Community sys-schema routine depends on server-specific Performance Schema state or is unavailable with this unqualified compatibility surface; the MySQL probe is retained and mydb checks its reviewed local contract.",
+          "difference_reason": "Unknown or NULL thread identifiers return NULL; native builtin arity errors use 1582.",
           "mydb_probe": {
             "status": "ok",
             "rows": [

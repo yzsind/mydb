@@ -784,13 +784,13 @@ impl MdlManager {
     }
 
     pub fn release_duration(&self, owner_id: u64, duration: MdlDuration) -> bool {
-        let mut state = self.state.lock_owner(owner_id);
-        let (released, changed_blockers) = release_where(&mut state, |ticket| {
-            ticket.owner_id == owner_id && ticket.duration == duration
-        });
-        self.refresh_fast_blockers_for_keys(&state, &changed_blockers);
-        state.forget_if_empty(owner_id);
-        released
+        self.state.visit_owner_shards(owner_id, |state| {
+            let (released, changed_blockers) = release_where(state, |ticket| {
+                ticket.owner_id == owner_id && ticket.duration == duration
+            });
+            self.refresh_fast_blockers_for_keys(state, &changed_blockers);
+            released
+        })
     }
 
     pub fn release_cached(
@@ -834,12 +834,12 @@ impl MdlManager {
     }
 
     pub fn release_owner(&self, owner_id: u64) -> bool {
-        let mut state = self.state.lock_owner(owner_id);
-        let (released, changed_blockers) =
-            release_where(&mut state, |ticket| ticket.owner_id == owner_id);
-        self.refresh_fast_blockers_for_keys(&state, &changed_blockers);
-        state.forget_if_empty(owner_id);
-        released
+        self.state.visit_owner_shards(owner_id, |state| {
+            let (released, changed_blockers) =
+                release_where(state, |ticket| ticket.owner_id == owner_id);
+            self.refresh_fast_blockers_for_keys(state, &changed_blockers);
+            released
+        })
     }
 
     pub fn release_prepared(&self, txn_id: u64) -> bool {

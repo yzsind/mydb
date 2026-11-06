@@ -13,6 +13,8 @@ use std::{
 
 struct Mock {
     port: u16,
+    _policy: tempfile::TempDir,
+    _egress: crate::util::env::ScopedVars,
     stop: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<Json>>>,
     connections: Arc<AtomicUsize>,
@@ -22,6 +24,25 @@ impl Mock {
     fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let policy = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = policy.path().join("http-policy.json");
+        let origin = format!("http://127.0.0.1:{port}");
+        let mut allowed = vec![origin.clone()];
+        if let Ok(previous) = crate::util::env::var("MYDB_HTTP_LOCAL_CONFIG") {
+            if let Ok(bytes) = std::fs::read(previous) {
+                if let Ok(value) = serde_json::from_slice::<Json>(&bytes) {
+                    if let Some(origins) = value["egress"]["allowed_origins"].as_array() {
+                        allowed.extend(
+                            origins
+                                .iter()
+                                .filter_map(|origin| origin.as_str().map(str::to_owned)),
+                        );
+                    }
+                }
+            }
+        }
+        std::fs::write(&path,json!({"version":1,"egress":{"allowed_origins":allowed,"allow_plaintext_origins":allowed,"private_destinations":["127.0.0.1/32"]}}).to_string()).unwrap();
+        let egress = crate::util::env::scoped_vars(&[("MYDB_HTTP_LOCAL_CONFIG", path.to_str())]);
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -51,6 +72,8 @@ impl Mock {
         });
         Self {
             port,
+            _policy: policy,
+            _egress: egress,
             stop,
             requests,
             connections,
@@ -326,7 +349,8 @@ fn http_audit_rate_exhaustion_fails_fast_without_sending() {
     let dir = temp();
     let e = open_test_engine(dir.path());
     let policy = dir.path().join("rate-policy.json");
-    std::fs::write(&policy, r#"{"version":1,"user_limits":[{"user":"rate_user","host":"localhost","requests_per_minute":2}]}"#).unwrap();
+    let origin = m.url("");
+    std::fs::write(&policy, json!({"version":1,"egress":{"allowed_origins":[origin],"allow_plaintext_origins":[origin],"private_destinations":["127.0.0.1/32"]},"user_limits":[{"user":"rate_user","host":"localhost","requests_per_minute":2}]}).to_string()).unwrap();
     e.execute("CREATE USER 'rate_user'@'localhost' IDENTIFIED BY 'x'")
         .unwrap();
     e.execute("GRANT HTTP_USE ON *.* TO 'rate_user'@'localhost'")
@@ -716,12 +740,15 @@ fn http_kill_cancels_network_wait_and_preserves_session() {
     let e = engine.clone();
     let url = m.url("/slow");
     let (tx, rx) = std::sync::mpsc::channel();
+    let env = crate::util::env::override_snapshot();
     let worker = thread::spawn(move || {
-        let result = e.execute_with_session(
-            &mut victim,
-            &format!("SELECT HTTP_GET('{url}',JSON_OBJECT('on_error','return'))"),
-        );
-        tx.send(result).unwrap();
+        crate::util::env::with_override_snapshot(env, || {
+            let result = e.execute_with_session(
+                &mut victim,
+                &format!("SELECT HTTP_GET('{url}',JSON_OBJECT('on_error','return'))"),
+            );
+            tx.send(result).unwrap();
+        })
     });
     let until = std::time::Instant::now() + Duration::from_secs(3);
     while m.count() == 0 {
@@ -746,7 +773,12 @@ fn http_shutdown_cancels_active_wait_without_resending() {
     let engine = Arc::new(open_test_engine(dir.path()));
     let e = engine.clone();
     let url = m.url("/slow");
-    let worker = thread::spawn(move || e.execute(&format!("SELECT HTTP_GET('{url}')")));
+    let env = crate::util::env::override_snapshot();
+    let worker = thread::spawn(move || {
+        crate::util::env::with_override_snapshot(env, || {
+            e.execute(&format!("SELECT HTTP_GET('{url}')"))
+        })
+    });
     let until = std::time::Instant::now() + Duration::from_secs(3);
     while m.count() == 0 {
         assert!(std::time::Instant::now() < until);
@@ -1108,4 +1140,26 @@ fn http_sql_prepare_resolves_scheduling_and_redacts_bound_trace() {
             assert!(!v.to_display_string().contains("BOUND_HTTP_SECRET"));
         }
     }
+}
+
+#[test]
+fn audit1106_http_default_private_egress_is_denied_before_send() {
+    let mock = Mock::new();
+    let dir = temp();
+    let engine = open_test_engine(dir.path());
+    crate::util::env::with_vars(&[("MYDB_HTTP_LOCAL_CONFIG", None)], || {
+        let err = engine
+            .execute(&format!("SELECT HTTP_GET('{}')", mock.url("/echo")))
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::error::catalog::ER_HTTP_EGRESS_DENIED.code().get()
+        );
+    });
+    assert_eq!(mock.count(), 0);
+    response(
+        &engine,
+        &format!("SELECT HTTP_GET('{}')", mock.url("/echo")),
+    );
+    assert_eq!(mock.count(), 1);
 }

@@ -498,6 +498,7 @@ struct ParsedStatementMemo {
 
 struct TextShapeExecutionMemo {
     shape_sql: Arc<str>,
+    qualified_statement: Option<Arc<Statement>>,
     state: crate::engine::api::PreparedSelectMemoState,
     dml_state: crate::engine::api::PreparedDmlState,
 }
@@ -506,6 +507,7 @@ const TEXT_SHAPE_MEMO_SLOTS: usize = 32;
 
 struct TextShapeMemoCache {
     database: String,
+    parser_mode_bits: u16,
     slots: Box<[Option<TextShapeExecutionMemo>; TEXT_SHAPE_MEMO_SLOTS]>,
     next_victim: usize,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
@@ -526,6 +528,7 @@ impl TextShapeMemoCache {
         )?;
         Some(Self {
             database: String::new(),
+            parser_mode_bits: 0,
             slots: Box::new(std::array::from_fn(|_| None)),
             next_victim: 0,
             _charge: charge,
@@ -542,18 +545,14 @@ impl TextShapeMemoCache {
             .and_then(Option::take)
     }
 
-    fn take_or_new(&mut self, shape_sql: &Arc<str>) -> (TextShapeExecutionMemo, bool) {
-        match self.take(shape_sql) {
-            Some(memo) => (memo, false),
-            None => (
-                TextShapeExecutionMemo {
-                    shape_sql: Arc::clone(shape_sql),
-                    state: crate::engine::api::PreparedSelectMemoState::default(),
-                    dml_state: crate::engine::api::PreparedDmlState::default(),
-                },
-                true,
-            ),
-        }
+    fn take_or_new(&mut self, shape_sql: &Arc<str>) -> TextShapeExecutionMemo {
+        self.take(shape_sql)
+            .unwrap_or_else(|| TextShapeExecutionMemo {
+                shape_sql: Arc::clone(shape_sql),
+                qualified_statement: None,
+                state: crate::engine::api::PreparedSelectMemoState::default(),
+                dml_state: crate::engine::api::PreparedDmlState::default(),
+            })
     }
 
     fn put(&mut self, memo: TextShapeExecutionMemo) {
@@ -1076,12 +1075,7 @@ where
         .into_iter()
         .map(|row| (row.name.to_string(), row.value))
         .collect();
-        let user_variables = self
-            .context
-            .user_variables
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
+        let user_variables = self.context.user_variables.clone();
         handle.publish_pfs_variables(
             session_variables,
             user_variables,
@@ -1480,14 +1474,14 @@ where
     }
 
     async fn command_loop_with_disconnect(&mut self) -> io::Result<()> {
-        let peer = self.stream.clone_socket()?;
+        let peer = self.stream.peer_monitor()?;
         let handle = self.handle.as_ref().map(Arc::clone);
         let commands = self.command_loop();
         tokio::pin!(commands);
         tokio::select! {
             biased;
             result = &mut commands => result,
-            _ = wait_peer_closed(&peer) => {
+            _ = peer.closed() => {
                 if let Some(handle) = handle { handle.peer_disconnected(); }
                 // Retain ownership of the in-flight context until cooperative
                 // cancellation completes; ordinary teardown then rolls back.
@@ -2214,7 +2208,16 @@ where
             // from `wait_timeout` or `interactive_timeout` per the
             // CLIENT_INTERACTIVE capability.
             let idle_timeout = self.idle_command_timeout();
-            let packet = match self.read_command_packet(idle_timeout).await {
+            let read_span = crate::util::lock_diagnostics::Span::enter(
+                crate::util::lock_diagnostics::READ_BEGIN,
+                crate::util::lock_diagnostics::READ_END,
+                0,
+                self.context.current_txn.unwrap_or(0),
+                self.context.connection_id as u64,
+            );
+            let read_result = self.read_command_packet(idle_timeout).await;
+            drop(read_span);
+            let packet = match read_result {
                 Ok(packet) => packet,
                 Err(err) => {
                     if let Some(limit) = err
@@ -3686,10 +3689,15 @@ where
     }
 
     async fn handle_single_query(&mut self, sql: String) -> io::Result<()> {
+        let parser_mode_bits =
+            crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode);
         if let Some(cache) = self.text_shape_memos.as_mut() {
-            if cache.database != self.context.current_database {
+            if cache.database != self.context.current_database
+                || cache.parser_mode_bits != parser_mode_bits
+            {
                 cache.slots.fill_with(|| None);
                 cache.database.clone_from(&self.context.current_database);
+                cache.parser_mode_bits = parser_mode_bits;
             }
         }
         if let Some(err) = self.context.cancelled_error() {
@@ -3698,9 +3706,7 @@ where
         if let Some(handle) = &self.handle {
             handle.set_base_state(ProcessState::Executing);
         }
-        let lex_mode = crate::sql_lex::SqlLexMode::from_parser_bits(
-            crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode),
-        );
+        let lex_mode = crate::sql_lex::SqlLexMode::from_parser_bits(parser_mode_bits);
         if !self.capabilities.has(CLIENT_MULTI_STATEMENTS) {
             match query_requires_multi_statements(
                 sql.as_str(),
@@ -3730,6 +3736,14 @@ where
                 )))
                 .await;
         }
+        if self.context.auth_sandbox && !is_password_change_statement(sql.as_str(), &self.context) {
+            return self
+                .write_query_response(Err(error(
+                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
+                    "You must reset your password using ALTER USER before executing this statement",
+                )))
+                .await;
+        }
         // PROCESSLIST is an operational escape hatch. Running this tiny,
         // read-only registry snapshot through the blocking executor pool can
         // make it unobservable precisely when every worker is occupied by a
@@ -3749,14 +3763,6 @@ where
         }
         self.engine
             .log_general_event(&self.context, "Query", sql.as_str());
-        if self.context.auth_sandbox && !is_password_change_statement(sql.as_str()) {
-            return self
-                .write_query_response(Err(error(
-                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
-                    "You must reset your password using ALTER USER before executing this statement",
-                )))
-                .await;
-        }
         match ddl_cache_scope(sql.as_str(), lex_mode) {
             DdlCacheScope::None => {}
             // Prepared handles have a lifetime independent from DDL and
@@ -3895,20 +3901,10 @@ where
                     // clients before server-side cursor support landed.
                     let result = match params {
                         Some((params, shape_sql)) => {
-                            let (mut memo, memo_is_new) = self
+                            let mut memo = self
                                 .text_shape_memos
                                 .as_mut()
-                                .map(|cache| cache.take_or_new(&shape_sql))
-                                .map_or((None, false), |(memo, is_new)| (Some(memo), is_new));
-                            // Parser-shape artifacts are deliberately shared
-                            // across databases and therefore remain
-                            // unqualified. Prepared SELECT compilation,
-                            // however, expects the PREPARE-time qualified AST.
-                            // Qualify one short-lived clone only when this
-                            // per-connection shape memo is born; Ready states
-                            // never inspect `parsed` again.
-                            let qualified = self.qualify_new_text_shape(&sql, &parsed, memo_is_new);
-                            let compile_parsed = qualified.as_ref().unwrap_or(&parsed);
+                                .map(|cache| cache.take_or_new(&shape_sql));
                             // Bind Performance Schema's digest to the shape,
                             // not to this execution's literal bytes. Without
                             // it every literal spelling is a fresh key in the
@@ -3918,6 +3914,8 @@ where
                             // (the compile-miss fallback just below) already
                             // scopes the same override.
                             let compiled = memo.as_mut().and_then(|memo| {
+                                self.prepare_text_shape_template(&sql, &parsed, memo);
+                                let compile_parsed = memo.qualified_statement.as_ref()?;
                                 crate::engine::perf_events::with_statement_digest_sql_override(
                                     Arc::clone(&shape_sql),
                                     || {
@@ -4070,37 +4068,37 @@ where
             .split_ascii_whitespace()
             .next()
             .is_some_and(|keyword| keyword.eq_ignore_ascii_case("USE"));
-        let pw_check_prefix: Option<String> = if needs_password_check {
-            // is_password_change_statement only inspects the first few
-            // tokens. Capture a prefix that's safely longer than the
-            // longest matched form (`set password` / `alter user …
-            // identified …`) so the post-call check sees enough.
-            let prefix_len = sql.len().min(128);
-            Some(sql[..prefix_len].to_string())
-        } else {
-            None
-        };
+        let changes_own_password =
+            needs_password_check && is_password_change_statement(&sql, &self.context);
         if needs_txn_admission || looks_like_text_dml_candidate(sql.as_str(), lex_mode) {
             self.acquire_txn_admission().await;
         }
         let result = match parsed_for_blocking {
             Some((parsed, Some((params, shape_sql)))) if self.text_shape_memos.is_some() => {
-                let (mut memo, memo_is_new) = self
+                let mut memo = self
                     .text_shape_memos
                     .as_mut()
                     .expect("shape cache checked above")
                     .take_or_new(&shape_sql);
-                let qualified = self.qualify_new_text_shape(&sql, &parsed, memo_is_new);
-                let compile_parsed = qualified.unwrap_or_else(|| Arc::clone(&parsed));
-                let (dml_state, result) = self
-                    .execute_engine_blocking_shape(
-                        sql,
-                        compile_parsed,
-                        params,
-                        Arc::clone(&shape_sql),
-                        std::mem::take(&mut memo.dml_state),
-                    )
-                    .await;
+                self.prepare_text_shape_template(&sql, &parsed, &mut memo);
+                let dml_state = std::mem::take(&mut memo.dml_state);
+                let (dml_state, result) = match memo.qualified_statement.as_ref() {
+                    Some(statement) => {
+                        self.execute_engine_blocking_shape(
+                            sql,
+                            Arc::clone(statement),
+                            params,
+                            Arc::clone(&shape_sql),
+                            dml_state,
+                        )
+                        .await
+                    }
+                    None => (
+                        dml_state,
+                        self.execute_engine_blocking_parsed(sql, parsed, Some((params, shape_sql)))
+                            .await,
+                    ),
+                };
                 memo.dml_state = dml_state;
                 if let Some(cache) = self.text_shape_memos.as_mut() {
                     cache.put(memo);
@@ -4116,12 +4114,7 @@ where
         if result.is_ok() && selects_database {
             self.process_database = Some(self.context.current_database.clone());
         }
-        if result.is_ok()
-            && needs_password_check
-            && pw_check_prefix
-                .as_deref()
-                .is_some_and(is_password_change_statement)
-        {
+        if result.is_ok() && needs_password_check && changes_own_password {
             self.context.auth_sandbox = false;
             self.context.password_expired = false;
         }
@@ -4599,6 +4592,17 @@ where
                 return Ok(());
             }
         };
+        if self.context.auth_sandbox && !is_password_change_statement(&sql, &self.context) {
+            self.write_error_packet(
+                self.command_response_sequence,
+                &error(
+                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
+                    "You must reset your password using ALTER USER before executing this statement",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         self.engine
             .log_general_event(&self.context, "Prepare", sql.as_str());
         let mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode);
@@ -4956,6 +4960,15 @@ where
                     .await?;
                 return Ok(());
             };
+            if self.context.auth_sandbox
+                && !is_password_change_statement(&prepared.sql, &self.context)
+            {
+                self.write_error_packet(self.command_response_sequence, &error(
+                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
+                    "You must reset your password using ALTER USER before executing this statement",
+                )).await?;
+                return Ok(());
+            }
             if let Some(err) = &prepared.long_data_error {
                 self.prepared_execute_failed = true;
                 self.codec
@@ -5487,6 +5500,17 @@ where
         statement_id: Option<u32>,
         result: Result<QueryResponse, crate::types::QueryError>,
     ) -> io::Result<()> {
+        if result.is_ok()
+            && self.context.auth_sandbox
+            && statement_id.is_some_and(|id| {
+                self.prepared.get(&id).is_some_and(|prepared| {
+                    is_password_change_statement(&prepared.sql, &self.context)
+                })
+            })
+        {
+            self.context.auth_sandbox = false;
+            self.context.password_expired = false;
+        }
         let original = self.command_response_sequence;
         if let Some(sequence) = self.routine_response_sequence.take() {
             self.command_response_sequence = sequence;
@@ -7302,23 +7326,23 @@ where
         result
     }
 
-    /// Shared parser artifacts remain unqualified. Only a new per-session
-    /// execution memo needs a qualified clone; normal execution owns any error.
-    fn qualify_new_text_shape(
+    /// Keep the connection's qualified template across plan invalidations.
+    /// Shared parser artifacts remain unqualified; ANALYZE, DDL and session
+    /// semantic changes can require compiling an existing shape again.
+    /// Qualification failures leave execution to the ordinary dispatcher.
+    fn prepare_text_shape_template(
         &mut self,
         sql: &str,
         parsed: &Statement,
-        is_new: bool,
-    ) -> Option<Arc<Statement>> {
-        is_new
-            .then(|| {
-                self.engine
-                    .prepare_statement_template(&mut self.context, sql, parsed.clone())
-            })
-            .transpose()
-            .ok()
-            .flatten()
-            .map(Arc::new)
+        memo: &mut TextShapeExecutionMemo,
+    ) {
+        if memo.qualified_statement.is_none() {
+            memo.qualified_statement = self
+                .engine
+                .prepare_statement_template(&mut self.context, sql, parsed.clone())
+                .ok()
+                .map(Arc::new);
+        }
     }
 
     /// Execute a shape-matched literal COM_QUERY DML statement through the
@@ -7342,18 +7366,16 @@ where
             let result = self.execute_engine_blocking(sql).await;
             return self.write_query_response(result).await;
         };
-        let (mut memo, memo_is_new) = cache.take_or_new(&shape_sql);
-        // Parser-shape artifacts are shared across databases and therefore
-        // stay unqualified; the compiled DML vehicle expects the PREPARE-time
-        // qualified AST. Qualify one short-lived clone only when this
-        // per-connection shape memo is born.
-        let qualified = self.qualify_new_text_shape(&sql, &parsed, memo_is_new);
-        let compile_parsed = qualified.unwrap_or(parsed);
-
+        let mut memo = cache.take_or_new(&shape_sql);
+        self.prepare_text_shape_template(&sql, &parsed, &mut memo);
         let dml_state = std::mem::take(&mut memo.dml_state);
-        let (dml_state, result) = self
-            .dispatch_text_dml_shape(&sql, &compile_parsed, dml_state, &params, &shape_sql)
-            .await;
+        let (dml_state, result) = match memo.qualified_statement.as_ref() {
+            Some(statement) => {
+                self.dispatch_text_dml_shape(&sql, statement, dml_state, &params, &shape_sql)
+                    .await
+            }
+            None => (dml_state, None),
+        };
         memo.dml_state = dml_state;
         if let Some(cache) = self.text_shape_memos.as_mut() {
             cache.put(memo);
@@ -9508,9 +9530,9 @@ enum MysqlStream {
 }
 
 impl MysqlStream {
-    /// A separate reactor registration observes EOF without reading protocol
-    /// bytes, including pipelined requests or TLS records buffered by the codec.
-    fn clone_socket(&self) -> io::Result<TcpStream> {
+    /// Observe transport closure without consuming pipelined commands or TLS
+    /// records. Linux subscribes to closure separately from readable input.
+    fn peer_monitor(&self) -> io::Result<super::peer_monitor::PeerCloseMonitor> {
         let stream = match self {
             Self::Plain(stream) => stream.get_ref(),
             Self::Tls(stream) => stream.get_ref().0.get_ref(),
@@ -9521,36 +9543,7 @@ impl MysqlStream {
                 ))
             }
         };
-        #[cfg(unix)]
-        let socket = {
-            use std::os::fd::AsFd;
-            std::net::TcpStream::from(stream.as_fd().try_clone_to_owned()?)
-        };
-        #[cfg(windows)]
-        let socket = {
-            use std::os::windows::io::AsSocket;
-            std::net::TcpStream::from(stream.as_socket().try_clone_to_owned()?)
-        };
-        TcpStream::from_std(socket)
-    }
-}
-
-async fn wait_peer_closed(stream: &TcpStream) {
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.ready(tokio::io::Interest::READABLE).await {
-            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
-            Err(_) => return,
-            _ => {}
-        }
-        match stream.peek(&mut byte).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                // Never consume another command. A pipelined request may stay
-                // unread while a worker runs, so avoid spinning on readiness.
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
+        super::peer_monitor::PeerCloseMonitor::new(stream)
     }
 }
 
@@ -10103,25 +10096,53 @@ fn parse_semi_sync_ack_frames(buf: &mut Vec<u8>) -> (Vec<(u64, String)>, Option<
     (acks, last_seq)
 }
 
-fn is_password_change_statement(sql: &str) -> bool {
-    // Cheap byte-prefix sniff: only proceed with the (allocating) normalize
-    // when the statement plausibly starts with `SET` or `ALTER`. Bulk-INSERT
-    // / SELECT / DML never start with either, so this short-circuits
-    // without touching a 500KB body.
-    let trimmed = sql.trim_start();
-    let prefix = trimmed.as_bytes();
-    let starts_with_set = prefix.len() >= 4
-        && prefix[..3].eq_ignore_ascii_case(b"set")
-        && matches!(prefix[3], b' ' | b'\t' | b'\r' | b'\n');
-    let starts_with_alter = prefix.len() >= 6
-        && prefix[..5].eq_ignore_ascii_case(b"alter")
-        && matches!(prefix[5], b' ' | b'\t' | b'\r' | b'\n');
-    if !starts_with_set && !starts_with_alter {
-        return false;
+#[test]
+fn audit1106_password_sandbox_parses_exact_self_change() {
+    let mut session = SessionContext::default();
+    for sql in [
+        "SELECT 1",
+        "SHOW PROCESSLIST",
+        "ALTER USER CURRENT_USER() ATTRIBUTE '{\"a\":\" identified \"}'",
+        "SET PASSWORD='x'; SELECT 1",
+        "ALTER USER other@'%' IDENTIFIED BY 'x'",
+    ] {
+        assert!(!is_password_change_statement(sql, &session), "{sql}");
     }
-    let normalized = crate::engine::system::normalize_sql(sql);
-    normalized.starts_with("set password")
-        || (normalized.starts_with("alter user ") && normalized.contains(" identified "))
+    for sql in [
+        "SET PASSWORD='x'",
+        "/* comment */ ALTER USER CURRENT_USER() IDENTIFIED BY 'x'",
+        "ALTER USER CURRENT_USER() IDENTIFIED BY '密码'",
+        "ALTER USER CURRENT_USER() IDENTIFIED BY RANDOM PASSWORD",
+    ] {
+        assert!(is_password_change_statement(sql, &session), "{sql}");
+    }
+    session.sql_mode = "NO_BACKSLASH_ESCAPES".into();
+    assert!(is_password_change_statement(r"SET PASSWORD='x\'", &session));
+}
+
+fn is_password_change_statement(sql: &str, session: &SessionContext) -> bool {
+    let _mode = crate::parser::ParserSqlModeGuard::activate(
+        crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode),
+    );
+    let Ok(statements) = crate::parser::parse_statements(sql) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+    let is_self = |account: &crate::parser::AccountIdent| {
+        account.user == session.authenticated_as.user
+            && account.host == session.authenticated_as.host
+    };
+    match statement {
+        Statement::SetPassword { account, .. } => account.as_ref().is_none_or(is_self),
+        Statement::AlterUser(user) => {
+            (user.current_user || is_self(&user.account))
+                && (user.password.is_some() || user.random_password)
+                && user.password_expired != Some(true)
+        }
+        _ => false,
+    }
 }
 
 /// How a DDL-looking COM_QUERY affects the SQL caches.
@@ -10518,19 +10539,18 @@ mod tests {
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let mut stream = MysqlStream::Plain(BufReader::new(server));
-        let peer = stream.clone_socket().unwrap();
+        let peer = stream.peer_monitor().unwrap();
         client.write_all(b"queued command").await.unwrap();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(75),
-            wait_peer_closed(&peer)
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(75), peer.closed())
+                .await
+                .is_err()
+        );
         let mut bytes = [0u8; 14];
         stream.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"queued command");
         drop(client);
-        tokio::time::timeout(std::time::Duration::from_secs(2), wait_peer_closed(&peer))
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.closed())
             .await
             .unwrap();
     }
@@ -10731,6 +10751,227 @@ mod tests {
                 1525
             );
         }
+    }
+
+    #[test]
+    fn text_shape_dml_recompiles_after_auto_analyze_and_ddl() {
+        use crate::mysql::packet::read_packet;
+
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    for database in ["test", "shape_other"] {
+                        for autocommit in [true, false] {
+                            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                            let engine = Arc::new(
+                                crate::engine::StorageQueryEngine::open(dir.path()).unwrap(),
+                            );
+                            engine.execute("CREATE DATABASE shape_other").unwrap();
+                            for name in ["test", "shape_other"] {
+                                let sql = format!(
+                                    "CREATE TABLE {name}.shape_rebind(id INT PRIMARY KEY,n INT)"
+                                );
+                                engine.execute(&sql).unwrap();
+                            }
+                            let listener =
+                                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                                .await
+                                .unwrap();
+                            let (stream, peer) = listener.accept().await.unwrap();
+                            let mut session = Session::try_new(
+                                4244,
+                                peer,
+                                stream,
+                                None,
+                                Arc::clone(&engine),
+                                Arc::new(SessionRegistry::new()),
+                            )
+                            .unwrap();
+                            session.authenticated = true;
+                            session.context.current_database = database.into();
+                            session.context.autocommit = autocommit;
+                            let mut warm_compiles = None;
+                            for id in 1..=7 {
+                                let sql = format!("INSERT INTO shape_rebind(id,n) VALUES ({id},7)");
+                                session.handle_single_query(sql.clone()).await.unwrap();
+                                let packet = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(
+                                    packet.payload[0], 0x00,
+                                    "{database}, autocommit={autocommit}, {sql}: {:?}",
+                                    packet.payload
+                                );
+                                if !autocommit {
+                                    session.handle_single_query("COMMIT".into()).await.unwrap();
+                                    assert_eq!(
+                                        read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                                        0x00
+                                    );
+                                }
+                                let compiles =
+                                    engine.db_handle().storage_status().prepared_dml_compiles;
+                                if id == 2 {
+                                    warm_compiles = Some(compiles);
+                                } else if id == 3 {
+                                    assert_eq!(
+                                        Some(compiles),
+                                        warm_compiles,
+                                        "a warm shape must reuse its compiled plan"
+                                    );
+                                }
+                                let key = format!("{database}.shape_rebind");
+                                if id == 3 {
+                                    let before =
+                                        engine.db_handle().table(&key).unwrap().schema_version;
+                                    assert!(
+                                        engine.db_handle().auto_analyze_stale_tables(0.1).unwrap()
+                                            > 0
+                                    );
+                                    assert!(
+                                        engine.db_handle().table(&key).unwrap().schema_version
+                                            > before
+                                    );
+                                } else if id == 4 {
+                                    engine
+                                        .execute(&format!(
+                                            "ALTER TABLE {key} ADD COLUMN extra INT DEFAULT 9"
+                                        ))
+                                        .unwrap();
+                                } else if id == 5 {
+                                    session
+                                        .handle_single_query("SET time_zone='+01:00'".into())
+                                        .await
+                                        .unwrap();
+                                    assert_eq!(
+                                        read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                                        0x00
+                                    );
+                                } else if id == 6 {
+                                    engine.invalidate_statement_cache();
+                                }
+                            }
+                            let QueryResponse::ResultSet(rows) = engine
+                                .execute(&format!(
+                                    "SELECT id,n,extra FROM {database}.shape_rebind ORDER BY id"
+                                ))
+                                .unwrap()
+                                .materialize()
+                                .unwrap()
+                            else {
+                                panic!("expected inserted rows");
+                            };
+                            assert_eq!(rows.rows.len(), 7);
+                            for (index, row) in rows.rows.iter().enumerate() {
+                                assert_eq!(
+                                    row.iter()
+                                        .map(|value| value.to_display_string())
+                                        .collect::<Vec<_>>(),
+                                    vec![(index + 1).to_string(), "7".into(), "9".into()]
+                                );
+                            }
+                        }
+                    }
+                });
+        });
+    }
+
+    #[test]
+    fn text_shape_reads_recompile_and_follow_database_switches() {
+        use crate::mysql::packet::read_packet;
+
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                    let engine =
+                        Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+                    engine.execute("CREATE DATABASE shape_reads").unwrap();
+                    for (database, value) in [("test", 11), ("shape_reads", 22)] {
+                        engine
+                            .execute(&format!(
+                                "CREATE TABLE {database}.shape_read(id INT PRIMARY KEY,n INT)"
+                            ))
+                            .unwrap();
+                        engine
+                            .execute(&format!(
+                                "INSERT INTO {database}.shape_read VALUES (1,{value}),(2,{value})"
+                            ))
+                            .unwrap();
+                    }
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    let mut session = Session::try_new(
+                        4245,
+                        peer,
+                        stream,
+                        None,
+                        Arc::clone(&engine),
+                        Arc::new(SessionRegistry::new()),
+                    )
+                    .unwrap();
+                    session.authenticated = true;
+                    for (database, sql_mode, value) in [
+                        ("test", "", "1"),
+                        ("test", "PIPES_AS_CONCAT", "1111"),
+                        ("shape_reads", "PIPES_AS_CONCAT", "2222"),
+                        ("shape_reads", "", "1"),
+                        ("test", "PIPES_AS_CONCAT", "1111"),
+                    ] {
+                        session
+                            .handle_single_query(format!("USE {database}"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                            0x00
+                        );
+                        session
+                            .handle_single_query(format!("SET sql_mode='{sql_mode}'"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_packet(&mut client).await.unwrap().unwrap().payload[0],
+                            0x00
+                        );
+                        for round in 0..4 {
+                            if round == 3 {
+                                engine
+                                    .execute(&format!("ANALYZE TABLE {database}.shape_read"))
+                                    .unwrap();
+                            }
+                            for suffix in ["", " FOR UPDATE"] {
+                                let sql = format!(
+                                    "SELECT n || n FROM shape_read WHERE id = {}{suffix}",
+                                    round % 2 + 1
+                                );
+                                session.handle_single_query(sql.clone()).await.unwrap();
+                                let header = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(header.payload, vec![1], "{database}: {sql}");
+                                read_packet(&mut client).await.unwrap().unwrap();
+                                let eof = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(eof.payload[0], 0xfe);
+                                let row = read_packet(&mut client).await.unwrap().unwrap();
+                                let mut expected = vec![value.len() as u8];
+                                expected.extend_from_slice(value.as_bytes());
+                                assert_eq!(row.payload, expected, "{database}: {sql}");
+                                let eof = read_packet(&mut client).await.unwrap().unwrap();
+                                assert_eq!(eof.payload[0], 0xfe);
+                            }
+                        }
+                    }
+                });
+        });
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11969,7 +12210,8 @@ mod tests {
         ctx.set_user_variable(
             "@master_heartbeat_period",
             crate::types::Value::UInt(100_000_000),
-        );
+        )
+        .unwrap();
         assert_eq!(
             heartbeat_interval_from_session(&ctx),
             std::time::Duration::from_millis(100)

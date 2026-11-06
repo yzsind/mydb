@@ -239,9 +239,12 @@ the separate statement send budget. An empty bucket immediately raises
 Retry only when the application is ready to wait for replenishment. Concurrency
 limits still use the bounded queue and the request deadline.
 
-Omitting `egress` permits all HTTP/HTTPS destinations. Supplying it requires an
-allowed canonical origin; private destinations additionally need an explicit
-IP network, and HTTP origins need an explicit plaintext entry. An empty
+Omitting `egress` permits public HTTP/HTTPS destinations. Loopback, private,
+link-local, metadata, multicast, and other reserved destinations are denied by
+default, even for accounts holding `HTTP_USE`. Access to a private service
+requires an explicit `egress` policy with both its canonical origin and IP
+network allowed. Supplying `egress` also requires an allowed canonical origin
+for public services, and HTTP origins need an explicit plaintext entry. An empty
 `allowed_origins` denies all requests. DNS answers are checked and pinned to
 the client connection. IPv4-mapped IPv6 is checked as IPv4.
 

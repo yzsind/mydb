@@ -1082,6 +1082,12 @@ pub(super) fn execute_multi_update(
         let mut old_values = update.old;
         let mut new_values = update.new;
         let schema = ctx.participants[p_idx].schema.clone();
+        let _partition_write = super::partition_clause::resolve_partition_clause(
+            db,
+            &ctx.participants[p_idx].storage_key,
+            &ctx.participants[p_idx].partitions,
+        )?
+        .map(|allowed| super::partition_clause::PartitionWriteGuard::enter(schema.id, allowed));
         if ctx.participants[p_idx].enforce_rls {
             db.lock_row_for_update_at(txn, &schema, storage_id, row_id)?;
             let row_ref = crate::storage::DmlRowRef { storage_id, row_id };

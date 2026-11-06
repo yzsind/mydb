@@ -6647,3 +6647,181 @@ fn partition_audit_maintenance_stats() {
         }
     }
 }
+
+#[test]
+fn release1106_partition_clause_checks_materialized_insert_and_update() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE pc(id INT AUTO_INCREMENT, a INT, PRIMARY KEY(id,a)) PARTITION BY RANGE COLUMNS(a) (PARTITION p0 VALUES LESS THAN(10), PARTITION p1 VALUES LESS THAN MAXVALUE)").unwrap();
+    engine
+        .execute("INSERT INTO pc PARTITION(p0)(a) VALUES('5')")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute("UPDATE pc PARTITION(p0) SET a=50")
+            .unwrap_err()
+            .code(),
+        1748
+    );
+    engine
+        .execute("UPDATE IGNORE pc PARTITION(p0) SET a=50")
+        .unwrap();
+    let rows = match engine.execute("SELECT a FROM pc").unwrap() {
+        QueryResponse::ResultSet(rs) => rs.rows,
+        _ => panic!(),
+    };
+    assert_eq!(rows, vec![vec![Value::Int(5)]]);
+    engine.execute("CREATE TABLE pa(id INT AUTO_INCREMENT PRIMARY KEY, a INT) PARTITION BY HASH(id) PARTITIONS 2").unwrap();
+    assert_eq!(
+        engine
+            .execute("INSERT INTO pa PARTITION(p0)(a) VALUES(1)")
+            .unwrap_err()
+            .code(),
+        1748
+    );
+    engine
+        .execute("INSERT IGNORE INTO pa PARTITION(p0)(a) VALUES(1),(2),(3),(4)")
+        .unwrap();
+    let rows = match engine.execute("SELECT id FROM pa PARTITION(p1)").unwrap() {
+        QueryResponse::ResultSet(rs) => rs.rows,
+        _ => panic!(),
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn release1106_partition_composite_maxvalue_and_hash_metadata() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE pm(a INT,b INT) PARTITION BY RANGE COLUMNS(a,b) (PARTITION p0 VALUES LESS THAN(10,MAXVALUE),PARTITION p1 VALUES LESS THAN(20,MAXVALUE))").unwrap();
+    engine
+        .execute("INSERT INTO pm VALUES(9,100),(10,100),(19,100)")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE pm ADD PARTITION(PARTITION p2 VALUES LESS THAN(30,MAXVALUE))")
+        .unwrap();
+    engine.execute("CREATE TABLE ph(a INT) PARTITION BY HASH(a) (PARTITION alpha COMMENT 'keepme',PARTITION beta)").unwrap();
+    engine.execute("INSERT INTO ph VALUES(1),(2),(3)").unwrap();
+    engine
+        .execute("ALTER TABLE ph ADD PARTITION PARTITIONS 1")
+        .unwrap();
+    let table = engine.database_for_replication().table("test.ph").unwrap();
+    let partitions = &table.partitioning.as_ref().unwrap().partitions;
+    assert_eq!(partitions[0].name, "alpha");
+    assert_eq!(partitions[0].comment, "keepme");
+    assert_eq!(partitions[1].name, "beta");
+    assert_eq!(partitions.len(), 3);
+}
+
+#[test]
+fn release1106_partition_add_fulltext_indexes_all_leaves() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE pf(id INT,txt TEXT) PARTITION BY HASH(id) PARTITIONS 2")
+        .unwrap();
+    engine
+        .execute("INSERT INTO pf VALUES(1,'apple banana'),(2,'banana cherry'),(3,'cherry')")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE pf ADD FULLTEXT INDEX ft(txt)")
+        .unwrap();
+    let rows = match engine
+        .execute("SELECT id FROM pf WHERE MATCH(txt) AGAINST('banana' IN BOOLEAN MODE) ORDER BY id")
+        .unwrap()
+    {
+        QueryResponse::ResultSet(rs) => rs.rows,
+        _ => panic!(),
+    };
+    assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn release1106_partition_diagnostics_use_specific_mysql_errors() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE pe1(id INT) PARTITION BY HASH(id) PARTITIONS 2")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE pe2(id INT) PARTITION BY HASH(id) PARTITIONS 2")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute("ALTER TABLE pe1 EXCHANGE PARTITION p0 WITH TABLE pe2")
+            .unwrap_err()
+            .code(),
+        1732
+    );
+    assert_eq!(
+        engine
+            .execute("ALTER TABLE pe1 ADD PARTITION(PARTITION p2 VALUES LESS THAN(100))")
+            .unwrap_err()
+            .code(),
+        1480
+    );
+    assert_eq!(
+        engine
+            .execute("CREATE TABLE hugep(id INT) PARTITION BY HASH(id) PARTITIONS 99999999999")
+            .unwrap_err()
+            .code(),
+        1499
+    );
+}
+
+#[test]
+fn release1106_load_ignore_skips_unroutable_rows_and_reports_warning() {
+    for general in [false, true] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("rows.tsv");
+        std::fs::write(&path, "1\t5\n2\t100\n3\t15\n").unwrap();
+        let engine = open_partition_test_engine(dir.path());
+        engine.execute("CREATE TABLE load_part(id INT,a INT) PARTITION BY RANGE(a)(PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN(20))").unwrap();
+        let mut session = SessionContext::default();
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!(
+                    "LOAD DATA INFILE '{}' IGNORE INTO TABLE load_part{}",
+                    crate::util::file::sql_path(&path),
+                    if general { " SET a=a+0" } else { "" }
+                ),
+            )
+            .unwrap();
+        assert!(session
+            .warnings
+            .iter()
+            .any(|warning| warning.code() == 1526));
+        assert_eq!(
+            partition_test_rows(&engine, "SELECT id,a FROM load_part ORDER BY id"),
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(3), Value::Int(15)]
+            ]
+        );
+    }
+}
+
+#[test]
+fn release1106_partition_write_constraint_covers_joined_update() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE pj(id INT,a INT,PRIMARY KEY(id,a)) PARTITION BY RANGE(a)(PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN MAXVALUE)").unwrap();
+    engine.execute("CREATE TABLE pj_src(id INT,a INT)").unwrap();
+    engine.execute("INSERT INTO pj VALUES(1,5)").unwrap();
+    engine.execute("INSERT INTO pj_src VALUES(1,50)").unwrap();
+    assert_eq!(
+        engine
+            .execute("UPDATE pj PARTITION(p0) JOIN pj_src ON pj.id=pj_src.id SET pj.a=pj_src.a")
+            .unwrap_err()
+            .code(),
+        1748
+    );
+    engine
+        .execute("UPDATE IGNORE pj PARTITION(p0) JOIN pj_src ON pj.id=pj_src.id SET pj.a=pj_src.a")
+        .unwrap();
+    assert_eq!(
+        super::support::query_rows(&engine, "SELECT a FROM pj"),
+        vec![vec![Value::Int(5)]]
+    );
+}

@@ -120,6 +120,9 @@ fn decode(
     input: &[u8],
     expected: usize,
 ) -> Result<Option<Vec<u8>>, QueryError> {
+    if input.is_empty() {
+        return Ok(None);
+    }
     decoder.reset(true);
     let mut out = Vec::with_capacity(expected.min(1024 * 1024));
     let mut buffer = [0; 16 * 1024];
@@ -271,9 +274,10 @@ mod tests {
         ] {
             for expected in [0, 2, 6, 10] {
                 let mut reference = Vec::new();
-                let valid = flate2::read::ZlibDecoder::new(input)
-                    .read_to_end(&mut reference)
-                    .is_ok()
+                let valid = !input.is_empty()
+                    && flate2::read::ZlibDecoder::new(input)
+                        .read_to_end(&mut reference)
+                        .is_ok()
                     && reference.len() == expected;
                 assert_eq!(
                     uncompress(input, expected).unwrap(),

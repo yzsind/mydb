@@ -90,6 +90,9 @@ static MEMORY_TARGET_EXPLICIT: AtomicBool = AtomicBool::new(false);
 static EFFECTIVE_MEMORY_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(0);
 static EXECUTOR_MEMORY_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
 static QUERY_MEM_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(0);
+static EXECUTOR_TARGET_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+static QUERY_LIMIT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_LIMIT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
 static PROCESS_MEM_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Coarse controlled-memory governor. This is intentionally independent from
@@ -1402,7 +1405,9 @@ pub fn memory_target_bytes() -> usize {
     let init = explicit.unwrap_or_else(|| {
         crate::util::system_memory::default_memory_target_mb().saturating_mul(1024 * 1024) as usize
     });
-    MEMORY_TARGET_EXPLICIT.store(explicit.is_some(), Ordering::Release);
+    if explicit.is_some() {
+        MEMORY_TARGET_EXPLICIT.store(true, Ordering::Release);
+    }
     MEMORY_TARGET_BYTES
         .compare_exchange(0, init, Ordering::Relaxed, Ordering::Relaxed)
         .ok();
@@ -1452,6 +1457,10 @@ pub(crate) fn performance_schema_memory_limit_bytes() -> usize {
 ///      floored at `MIN_EXECUTOR_TARGET_BYTES` (16 MiB)
 /// Tiny `MYDB_MEMORY_TARGET` values clamp up to 16 MiB.
 pub fn executor_memory_target_bytes() -> usize {
+    let explicit = EXECUTOR_TARGET_RUNTIME.load(Ordering::Acquire);
+    if explicit != 0 {
+        return explicit;
+    }
     let cur = EXECUTOR_MEMORY_TARGET_BYTES.load(Ordering::Relaxed);
     if cur != 0 {
         return cur;
@@ -1474,6 +1483,7 @@ pub fn set_executor_memory_target_mb(mb: usize) -> Result<(), QueryError> {
     let bytes = mb
         .saturating_mul(1024 * 1024)
         .max(MIN_EXECUTOR_TARGET_BYTES);
+    EXECUTOR_TARGET_RUNTIME.store(bytes, Ordering::Release);
     EXECUTOR_MEMORY_TARGET_BYTES.store(bytes, Ordering::Relaxed);
     // Cascade to query / process defaults if those aren't explicitly
     // pinned via env — see `query_mem_limit_bytes`.
@@ -1521,6 +1531,10 @@ pub fn set_memory_target_mb(mb: usize) -> Result<(), QueryError> {
 /// Planning uses a stable baseline instead; this value is enforced by the
 /// executor and controls runtime spill/1037 behavior.
 pub fn query_mem_limit_bytes() -> usize {
+    let explicit = QUERY_LIMIT_RUNTIME.load(Ordering::Acquire);
+    if explicit != 0 {
+        return explicit;
+    }
     let cur = QUERY_MEM_LIMIT_BYTES.load(Ordering::Relaxed);
     if cur != 0 {
         return cur;
@@ -1551,6 +1565,7 @@ pub fn set_query_mem_limit_mb(mb: usize) -> Result<(), QueryError> {
         ));
     }
     let bytes = mb.saturating_mul(1024 * 1024);
+    QUERY_LIMIT_RUNTIME.store(bytes, Ordering::Release);
     QUERY_MEM_LIMIT_BYTES.store(bytes, Ordering::Relaxed);
     Ok(())
 }
@@ -1566,6 +1581,10 @@ pub fn set_query_mem_limit_mb(mb: usize) -> Result<(), QueryError> {
 ///
 /// Runtime-mutable through `set_process_mem_limit_mb`.
 pub fn process_mem_limit_bytes() -> usize {
+    let explicit = PROCESS_LIMIT_RUNTIME.load(Ordering::Acquire);
+    if explicit != 0 {
+        return explicit;
+    }
     let cur = PROCESS_MEM_LIMIT_BYTES.load(Ordering::Relaxed);
     if cur != 0 {
         return cur;
@@ -1587,6 +1606,7 @@ pub fn set_process_mem_limit_mb(mb: usize) -> Result<(), QueryError> {
         ));
     }
     let bytes = mb.saturating_mul(1024 * 1024);
+    PROCESS_LIMIT_RUNTIME.store(bytes, Ordering::Release);
     PROCESS_MEM_LIMIT_BYTES.store(bytes, Ordering::Relaxed);
     Ok(())
 }
@@ -3134,6 +3154,20 @@ mod tests {
         MEMORY_TARGET_BYTES.store(prior_target, Ordering::Release);
         EFFECTIVE_MEMORY_LIMIT_BYTES.store(prior_effective, Ordering::Release);
         reset_controlled_test_counters();
+    }
+
+    #[test]
+    fn audit1106_runtime_explicit_limits_survive_parent_target_changes() {
+        let _serial = GLOBAL_MEMORY_TEST_LOCK.lock().unwrap();
+        set_query_mem_limit_mb(512).unwrap();
+        set_process_mem_limit_mb(768).unwrap();
+        set_executor_memory_target_mb(1024).unwrap();
+        assert_eq!(query_mem_limit_bytes(), 512 * 1024 * 1024);
+        assert_eq!(process_mem_limit_bytes(), 768 * 1024 * 1024);
+        set_memory_target_mb(1024).unwrap();
+        assert_eq!(executor_memory_target_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(query_mem_limit_bytes(), 512 * 1024 * 1024);
+        assert_eq!(process_mem_limit_bytes(), 768 * 1024 * 1024);
     }
 
     #[test]

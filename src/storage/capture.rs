@@ -143,6 +143,7 @@ pub(crate) struct CaptureState {
     pub commit_pressure: Arc<CommitPressure>,
     pub budget: Arc<WalBudget>,
     pub active: Arc<AtomicBool>,
+    pub draining: AtomicBool,
     pub frozen: AtomicBool,
     pub admissions: AtomicUsize,
     pub capture_floor: AtomicU64,
@@ -200,6 +201,7 @@ impl CaptureState {
                 ..Default::default()
             }),
             active: Arc::new(AtomicBool::new(false)),
+            draining: AtomicBool::new(false),
             frozen: AtomicBool::new(false),
             admissions: AtomicUsize::new(0),
             capture_floor: AtomicU64::new(0),
@@ -236,6 +238,14 @@ impl CaptureState {
     }
     pub(crate) fn ensure_write(&self) -> Result<(), QueryError> {
         self.budget.check(1)?;
+        // Existing writers use Admission::for_active_writer and may finish.
+        // Refuse new writers while capture drains, before freezing mutations.
+        if self.draining.load(Ordering::SeqCst) && !self.frozen.load(Ordering::SeqCst) {
+            return Err(super::error(
+                crate::error::catalog::ER_OPTION_PREVENTS_STATEMENT,
+                "new writes are paused while physical backup drains active writers; retry",
+            ));
+        }
         self.ensure_barrier()
     }
     pub(crate) fn ensure_barrier(&self) -> Result<(), QueryError> {
@@ -243,8 +253,8 @@ impl CaptureState {
             && *self.owner.lock().unwrap() != Some(std::thread::current().id())
         {
             return Err(super::error(
-                crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
-                "write blocked by capture admission barrier",
+                crate::error::catalog::ER_OPTION_PREVENTS_STATEMENT,
+                "write blocked by capture admission barrier; retry after physical backup capture",
             ));
         }
         Ok(())

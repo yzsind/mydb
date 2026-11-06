@@ -246,6 +246,44 @@ impl<'a> RegexpRead<'a> {
             ColumnVector::Utf8 { data, .. } => data.as_slice(),
             _ => &[],
         };
+        // A simple-fold match also satisfies full folding. For boolean
+        // matching with line-free anchors, prove/allocate the extended VM
+        // only after the fast engine rejects a row; positions and captures
+        // still use the full preflight below.
+        if matches!(self.kind, Kind::Like) && regex.accepts_fast_positive(input_bytes) {
+            let mut numbers = Vec::with_capacity(batch.num_rows());
+            let nulls = validity(input).unwrap_or_else(|| Bitmap::new_all_valid(batch.num_rows()));
+            let mut line_free = None;
+            let mut memory = None;
+            for row in 0..batch.num_rows() {
+                if row & 63 == 0 {
+                    crate::engine::cancel::check_cancelled().ok()?;
+                }
+                if input.is_null(row) {
+                    numbers.push(0);
+                    continue;
+                }
+                let text = std::str::from_utf8(bytes_at(input, row)?).ok()?;
+                let matched = if regex.is_match_line_free(text) {
+                    true
+                } else {
+                    let line_free = *line_free.get_or_insert_with(|| regex.line_free(input_bytes));
+                    if line_free {
+                        false
+                    } else {
+                        if memory.is_none() {
+                            memory = regex.search_scope_bytes(input_bytes).ok()?;
+                        }
+                        regex.is_match_after_fast_reject(text)
+                    }
+                };
+                numbers.push(i64::from(matched));
+            }
+            return Some(ColumnVector::I64 {
+                data: numbers,
+                nulls: Some(nulls),
+            });
+        }
         let line_free = regex.line_free(input_bytes);
         let _memory = if line_free {
             None
@@ -276,6 +314,10 @@ impl<'a> RegexpRead<'a> {
                         regex.is_match(text)
                     });
                 } else {
+                    if matches!(self.kind, Kind::Instr) && text.is_empty() && self.pos > 1 {
+                        numbers.push(0);
+                        continue;
+                    }
                     let start = if self.pos == 1 {
                         0
                     } else {

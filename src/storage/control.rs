@@ -122,7 +122,7 @@ impl Control {
         ] {
             if contains_file(&root.join(name)).map_err(corrupt)? {
                 return Err(corrupt(
-                    "missing control file in an existing data directory; rebuild development data",
+                    format!("missing control file with existing storage at '{}'; restore a valid data directory from backup or use an empty data directory", root.join(name).display()),
                 ));
             }
         }

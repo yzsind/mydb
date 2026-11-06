@@ -383,7 +383,7 @@ fn json_table_preserves_unsigned_and_jsonb_scalar_types_and_errors() {
                )) AS jt"#,
         )
         .unwrap_err();
-    assert_eq!(err.code(), 3669);
+    assert_eq!(err.code(), 3155);
 
     let row = one_row(
         &engine,

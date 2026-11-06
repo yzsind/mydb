@@ -473,6 +473,7 @@ fn select_one_returns_single_integer_row() {
                         | crate::mysql::protocol::BINARY_FLAG,
                     length: Some(1),
                     decimals: Some(0),
+                    collation_coercibility: Some(5),
                     ..Default::default()
                 },
                 name: "1".to_string(),

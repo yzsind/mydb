@@ -1,3 +1,31 @@
+// Transaction-local shrink reservations keep page capacity independent of
+// transaction WAL publication order. Only the uncommon variable-width shrink
+// path allocates bookkeeping; fixed-width updates retain their existing path.
+#[derive(Debug, Default)]
+struct PendingHeapShrinks {
+    rows: HashMap<(u64, RowId), usize>,
+    charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+}
+
+#[derive(Debug, Default)]
+struct HeapShrinkRegistry {
+    active: AtomicBool,
+    transactions: parking_lot::Mutex<HashMap<u64, PendingHeapShrinks>>,
+}
+
+impl HeapShrinkRegistry {
+    fn remove(&self, txn_id: u64) -> Option<PendingHeapShrinks> {
+        if !self.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut transactions = self.transactions.lock();
+        let pending = transactions.remove(&txn_id);
+        self.active
+            .store(!transactions.is_empty(), Ordering::Release);
+        pending
+    }
+}
+
 // Differential benchmark oracle; absent from production builds.
 #[cfg(test)]
 fn serial_insert_lock_oracle() -> bool {
@@ -12,6 +40,7 @@ thread_local! {
     static HEAP_EXTENT_BASELINE_PREPARE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static HEAP_BATCH_HEADER_SLOTS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HEAP_CAPTURED_PATCH_PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // Share the forwarding-aware scan without adding a callback layer to the
@@ -175,6 +204,11 @@ pub(crate) fn prepared_point_sparse_patch_hits_for_test() -> u64 {
     PREPARED_POINT_SPARSE_PATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(test)]
+pub(crate) fn captured_patch_preparations_for_test() -> usize {
+    HEAP_CAPTURED_PATCH_PREPARATIONS.with(std::cell::Cell::get)
+}
+
 type HeapPatchBytes = smallvec::SmallVec<[u8; 16]>;
 type HeapColumnPatch = (usize, HeapPatchBytes, HeapPatchBytes);
 type HeapColumnPatches = smallvec::SmallVec<[HeapColumnPatch; 4]>;
@@ -210,6 +244,234 @@ struct PreparedHeapPatch {
     old_undo_ptr_bytes: [u8; 8],
     col_patches: HeapColumnPatches,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+/// Bounded, operation-local byte locations captured with the projected read.
+/// The transaction owns the row lock throughout evaluation and application;
+/// no page pin, byte latch, row visibility or content is cached across SQL.
+struct HeapPatchSource {
+    row_id: RowId,
+    layout_id: u32,
+    old_last_txn_id_bytes: [u8; 8],
+    old_undo_ptr_bytes: [u8; 8],
+    columns: smallvec::SmallVec<[HeapPatchSourceColumn; 4]>,
+}
+
+struct HeapPatchSourceColumn {
+    column_index: usize,
+    stored_ordinal: usize,
+    offset: usize,
+    null_offset: usize,
+    null_mask: u8,
+    old_null_byte: u8,
+    before: HeapPatchBytes,
+}
+
+impl HeapPatchSource {
+    fn capture(
+        row_id: RowId,
+        payload: &[u8],
+        codec: &RowCodec,
+        changed_columns: &[usize],
+    ) -> Result<Option<Self>, QueryError> {
+        if changed_columns.is_empty()
+            || changed_columns.len() > 4
+            || payload.first().copied() != Some(MVCC_ROW_VERSION)
+        {
+            return Ok(None);
+        }
+        let (header, mut offset, external) = read_mvcc_header(payload)?;
+        if offset != 18 || external || header.flags & MVCC_FLAG_ROW_PIECE != 0 {
+            return Ok(None);
+        }
+        let layout_id = read_varint(payload, &mut offset)? as u32;
+        let layout = codec.layout_for_id(layout_id)?;
+        let mut columns = smallvec::SmallVec::new();
+        for &column_index in changed_columns {
+            let Some((range, null_offset, null_mask)) =
+                column_patch_range(payload, codec, column_index)?
+            else {
+                return Ok(None);
+            };
+            if fixed_width_for_kind(range.kind) != Some(range.width) || range.width > 16 {
+                return Ok(None);
+            }
+            let end = range
+                .offset_in_payload
+                .checked_add(range.width)
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt heap patch range",
+                    )
+                })?;
+            let Some(before) = payload.get(range.offset_in_payload..end) else {
+                return Ok(None);
+            };
+            let Some(stored_ordinal) = layout
+                .columns
+                .iter()
+                .position(|column| column.column_index == column_index)
+            else {
+                return Ok(None);
+            };
+            columns.push(HeapPatchSourceColumn {
+                column_index,
+                stored_ordinal,
+                offset: range.offset_in_payload,
+                null_offset,
+                null_mask,
+                old_null_byte: payload[null_offset],
+                before: HeapPatchBytes::from_slice(before),
+            });
+        }
+        Ok(Some(Self {
+            row_id,
+            layout_id,
+            old_last_txn_id_bytes: payload[2..10].try_into().expect("validated MVCC header"),
+            old_undo_ptr_bytes: payload[10..18].try_into().expect("validated MVCC header"),
+            columns,
+        }))
+    }
+
+    fn prepare(
+        self,
+        codec: &RowCodec,
+        new_values: &[Value],
+    ) -> Result<Option<PreparedHeapPatch>, QueryError> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let layout = codec.layout_for_id(self.layout_id)?;
+        let mut charge =
+            ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, 0)?;
+        let mut patches = HeapColumnPatches::new();
+        for column in self.columns {
+            let Some(stored) = layout
+                .columns
+                .get(column.stored_ordinal)
+                .filter(|stored| stored.column_index == column.column_index)
+            else {
+                return Ok(None);
+            };
+            let Some(value) = new_values.get(column.column_index) else {
+                return Ok(None);
+            };
+            let new_is_null = matches!(value, Value::Null);
+            if (column.old_null_byte & column.null_mask != 0) != new_is_null {
+                if let Some((_, _, after)) = patches
+                    .iter_mut()
+                    .find(|(offset, _, _)| *offset == column.null_offset)
+                {
+                    if new_is_null {
+                        after[0] |= column.null_mask;
+                    } else {
+                        after[0] &= !column.null_mask;
+                    }
+                } else {
+                    let after = if new_is_null {
+                        column.old_null_byte | column.null_mask
+                    } else {
+                        column.old_null_byte & !column.null_mask
+                    };
+                    if !push_heap_column_patch(
+                        &mut patches,
+                        &mut charge,
+                        (
+                            column.null_offset,
+                            HeapPatchBytes::from_slice(&[column.old_null_byte]),
+                            HeapPatchBytes::from_slice(&[after]),
+                        ),
+                    ) {
+                        return Err(crate::error::catalog::ER_OUTOFMEMORY
+                            .error("heap patch scratch budget exhausted"));
+                    }
+                }
+            }
+            let mut after = HeapPatchBytes::from_elem(0, column.before.len());
+            if !new_is_null && !encode_column_patch_into(&stored.kind, value, &mut after)? {
+                return Ok(None);
+            }
+            if !push_heap_column_patch(
+                &mut patches,
+                &mut charge,
+                (column.offset, column.before, after),
+            ) {
+                return Err(crate::error::catalog::ER_OUTOFMEMORY
+                    .error("heap patch scratch budget exhausted"));
+            }
+        }
+        #[cfg(test)]
+        HEAP_CAPTURED_PATCH_PREPARATIONS.with(|count| count.set(count.get() + 1));
+        finish_mvcc_patch(
+            self.row_id,
+            self.old_last_txn_id_bytes,
+            self.old_undo_ptr_bytes,
+            patches,
+            charge,
+        )
+    }
+}
+
+fn finish_mvcc_patch(
+    row_id: RowId,
+    old_last_txn_id_bytes: [u8; 8],
+    old_undo_ptr_bytes: [u8; 8],
+    mut col_patches: HeapColumnPatches,
+    mut charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+) -> Result<Option<PreparedHeapPatch>, QueryError> {
+    // Adjacent fixed fields form one redo range. Keep their bytes inline
+    // when possible rather than allocating before/after Vecs per field.
+    col_patches.sort_unstable_by_key(|patch| patch.0);
+    let mut i = 0;
+    while i + 1 < col_patches.len() {
+        let width = col_patches[i].1.len() + col_patches[i + 1].1.len();
+        if col_patches[i].0 + col_patches[i].1.len() != col_patches[i + 1].0 {
+            i += 1;
+            continue;
+        }
+        let extra = [&col_patches[i].1, &col_patches[i].2]
+            .iter()
+            .map(|bytes| {
+                if width > bytes.capacity() {
+                    width
+                        .next_power_of_two()
+                        .saturating_sub(if bytes.spilled() { bytes.capacity() } else { 0 })
+                } else {
+                    0
+                }
+            })
+            .sum();
+        if !charge.try_grow_optional(extra) {
+            i += 1;
+            continue;
+        }
+        let (_, before, after) = col_patches.remove(i + 1);
+        col_patches[i].1.reserve_exact(before.len());
+        col_patches[i].2.reserve_exact(after.len());
+        col_patches[i].1.extend_from_slice(&before);
+        col_patches[i].2.extend_from_slice(&after);
+    }
+    let bytes = if col_patches.spilled() {
+        col_patches.capacity() * std::mem::size_of::<HeapColumnPatch>()
+    } else {
+        0
+    } + col_patches
+        .iter()
+        .map(|(_, before, after)| {
+            usize::from(before.spilled()) * before.capacity()
+                + usize::from(after.spilled()) * after.capacity()
+        })
+        .sum::<usize>();
+    debug_assert!(bytes <= charge.bytes());
+    charge.shrink(charge.bytes().saturating_sub(bytes));
+    Ok(Some(PreparedHeapPatch {
+        row_id,
+        old_last_txn_id_bytes,
+        old_undo_ptr_bytes,
+        col_patches,
+        _charge: charge,
+    }))
 }
 
 pub fn update_delta_hits() -> u64 {
@@ -583,6 +845,7 @@ impl HeapFile {
             table_id,
             durability: std::sync::atomic::AtomicU8::new(durability_to_u8(durability)),
             update_reserve_bytes: update_reserve_bytes.min(MAX_HEAP_UPDATE_RESERVE_BYTES),
+            pending_shrinks: None,
             page_count: std::sync::atomic::AtomicU64::new(page_count),
             file_key,
             buffer_pool,
@@ -857,6 +1120,7 @@ impl HeapFile {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        let mut single_payload = None;
         if rows.len() == 1 && !crate::storage::data_dictionary::is_dd_table_id(self.table_id) {
             let external = externals.first().map(Vec::as_slice).unwrap_or(&[]);
             if let Some(row_id) =
@@ -864,6 +1128,49 @@ impl HeapFile {
             {
                 return Ok(vec![row_id]);
             }
+            // A fitting tail insert needs only its page latch. Taking the
+            // file-extension latch here serialized unrelated appenders and
+            // rebuilt an owned 16 KiB Page for one small row. Full/new pages
+            // retain the ordinary extension path below.
+            let payload = encode_mvcc_row(headers[0], &rows[0], &self.codec, external)?;
+            if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
+                return Err(error(
+                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                    "row size is larger than one heap page",
+                ));
+            }
+            // Rows larger than half a page usually extend on every call.
+            // Keep their encoded payload for the existing batch path instead
+            // of paying for a predictably unsuccessful tail probe.
+            let page_count = if payload.len() <= (PAGE_SIZE - PAGE_HEADER_SIZE) / 2 {
+                self.page_count()?
+            } else {
+                1
+            };
+            if page_count > 1 {
+                let page_id = page_count - 1;
+                let _page_guard = self.page_latch(page_id).lock().map_err(|_| {
+                    error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned")
+                })?;
+                let plan = self.with_page(page_id, |page| {
+                    HeapPageMut::plan_insert(page.bytes, payload.len(), self.update_reserve_bytes)
+                })?;
+                if let Some(plan) = plan {
+                    let row_id = RowId {
+                        page_id: page_id as u32,
+                        slot_id: plan.slot_id,
+                    };
+                    self.write_heap_insert_raw_logged(
+                        txn_id,
+                        row_id,
+                        payload,
+                        plan,
+                        headers[0].undo_ptr,
+                    )?;
+                    return Ok(vec![row_id]);
+                }
+            }
+            single_payload = Some(payload);
         }
         // Encode batches before taking the heap append latch. Single-row
         // inserts keep their allocation-free descriptor path.
@@ -978,7 +1285,10 @@ impl HeapFile {
             let external = externals.get(idx).map(|m| m.as_slice()).unwrap_or(&[]);
             let payload = match prepared.as_mut() {
                 Some(payloads) => payloads.next().expect("prepared batch length"),
-                None => encode_mvcc_row(header, values, &self.codec, external)?,
+                None => match single_payload.take() {
+                    Some(payload) => payload,
+                    None => encode_mvcc_row(header, values, &self.codec, external)?,
+                },
             };
             if payload.len() + PAGE_HEADER_SIZE + SLOT_SIZE > PAGE_SIZE {
                 return Err(error(
@@ -1754,6 +2064,15 @@ impl HeapFile {
         _columns: &[usize],
         plan: &RowDecodePlan,
     ) -> Result<CachedProjectedRead, QueryError> {
+        self.read_mvcc_columns_cached_with_plan_inspect(row_id, plan, |_| {})
+    }
+
+    fn read_mvcc_columns_cached_with_plan_inspect(
+        &self,
+        row_id: RowId,
+        plan: &RowDecodePlan,
+        inspect: impl FnOnce(&[u8]),
+    ) -> Result<CachedProjectedRead, QueryError> {
         if (row_id.page_id as u64) >= self.page_count()? {
             return Ok(CachedProjectedRead::NotFound);
         }
@@ -1771,9 +2090,11 @@ impl HeapFile {
                     };
                     match decode_heap_payload_columns_with_plan(payload, plan, &self.codec)? {
                         HeapPayload::RowColumns(header, values, stored_count) => {
+                            inspect(payload);
                             Ok(CachedProjectedRead::Hit(header, values, stored_count))
                         }
                         HeapPayload::Row(header, values) => {
+                            inspect(payload);
                             let stored_count = values.len();
                             Ok(CachedProjectedRead::Hit(header, values, stored_count))
                         }
@@ -2459,8 +2780,8 @@ impl HeapFile {
             slot_id: row_id.slot_id,
             patches: vec![WalColumnPatch {
                 offset: 1,
-                before: before.to_vec(),
-                after: after.to_vec(),
+                before: smallvec::SmallVec::from_slice(&before),
+                after: smallvec::SmallVec::from_slice(&after),
             }],
             undo_lsn: header.undo_ptr,
         };
@@ -2636,7 +2957,7 @@ impl HeapFile {
         };
         let mut charge =
             ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, spill_bytes)?;
-        let Some((old_last_txn_id_bytes, old_undo_ptr_bytes, mut col_patches)) =
+        let Some((old_last_txn_id_bytes, old_undo_ptr_bytes, col_patches)) =
             self.with_page(row_id.page_id as u64, |page| {
                 let slot_bytes = page.payload(row_id.slot_id as usize)?.ok_or_else(|| {
                     error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found")
@@ -2766,58 +3087,13 @@ impl HeapFile {
             return Ok(None);
         };
 
-        // Adjacent fixed fields form one redo range. Keep their bytes inline
-        // when possible rather than allocating before/after Vecs per field.
-        col_patches.sort_unstable_by_key(|patch| patch.0);
-        let mut i = 0;
-        while i + 1 < col_patches.len() {
-            let width = col_patches[i].1.len() + col_patches[i + 1].1.len();
-            if col_patches[i].0 + col_patches[i].1.len() != col_patches[i + 1].0 {
-                i += 1;
-                continue;
-            }
-            let extra = [&col_patches[i].1, &col_patches[i].2]
-                .iter()
-                .map(|bytes| {
-                    if width > bytes.capacity() {
-                        width
-                            .next_power_of_two()
-                            .saturating_sub(if bytes.spilled() { bytes.capacity() } else { 0 })
-                    } else {
-                        0
-                    }
-                })
-                .sum();
-            if !charge.try_grow_optional(extra) {
-                i += 1;
-                continue;
-            }
-            let (_, before, after) = col_patches.remove(i + 1);
-            col_patches[i].1.reserve_exact(before.len());
-            col_patches[i].2.reserve_exact(after.len());
-            col_patches[i].1.extend_from_slice(&before);
-            col_patches[i].2.extend_from_slice(&after);
-        }
-        let bytes = if col_patches.spilled() {
-            col_patches.capacity() * std::mem::size_of::<HeapColumnPatch>()
-        } else {
-            0
-        } + col_patches
-            .iter()
-            .map(|(_, before, after)| {
-                usize::from(before.spilled()) * before.capacity()
-                    + usize::from(after.spilled()) * after.capacity()
-            })
-            .sum::<usize>();
-        debug_assert!(bytes <= charge.bytes());
-        charge.shrink(charge.bytes().saturating_sub(bytes));
-        Ok(Some(PreparedHeapPatch {
+        finish_mvcc_patch(
             row_id,
             old_last_txn_id_bytes,
             old_undo_ptr_bytes,
             col_patches,
-            _charge: charge,
-        }))
+            charge,
+        )
     }
 
     fn apply_prepared_mvcc_patch(
@@ -2875,16 +3151,14 @@ impl HeapFile {
             apply_patches.push((*off, after.as_slice()));
         }
 
-        // Build the WAL record. WalColumnPatch owns its before/after
-        // bytes because the frame is deferred-appended at commit; the
-        // patches need to survive the return from this function. This
-        // is where the (unavoidable) Vec<u8> allocations land — one
-        // pair per patch, mostly 4-8 bytes each.
+        // WAL patches retain their own bytes until deferred append. Keep
+        // fixed-width values and the 16-byte MVCC header inline; wider column
+        // bodies spill without changing the serialized record format.
         let mut wal_patches: Vec<WalColumnPatch> = Vec::with_capacity(1 + col_patches.len());
         wal_patches.push(WalColumnPatch {
             offset: 2,
-            before: old_header_bytes.to_vec(),
-            after: new_header_bytes.to_vec(),
+            before: smallvec::SmallVec::from_slice(&old_header_bytes),
+            after: smallvec::SmallVec::from_slice(&new_header_bytes),
         });
         for (off, before, after) in &col_patches {
             let offset = u16::try_from(*off).map_err(|_| {
@@ -2895,8 +3169,8 @@ impl HeapFile {
             })?;
             wal_patches.push(WalColumnPatch {
                 offset,
-                before: before.to_vec(),
-                after: after.to_vec(),
+                before: smallvec::SmallVec::from_slice(before),
+                after: smallvec::SmallVec::from_slice(after),
             });
         }
 
@@ -2920,14 +3194,13 @@ impl HeapFile {
                 patches: wal_patches,
                 undo_lsn: Some(new_undo_ptr),
             };
-            if self.buffer_pool.add_deferred_pin(&key) {
-                let applied = self.buffer_pool.with_raw_page_mut(key.clone(), 0, |bytes| {
+            if self
+                .buffer_pool
+                .try_with_deferred_raw_page_mut(&key, |bytes| {
                     patch_heap_page_raw(bytes, row_id.slot_id, &apply_patches)
-                });
-                if let Err(err) = applied {
-                    self.buffer_pool.finalize_deferred(&key, 0);
-                    return Err(err);
-                }
+                })?
+                .is_some()
+            {
                 if let Err((payload, keys)) =
                     push_txn_wal_record(&self.log, txn_id, payload, vec![key])
                 {
@@ -4863,13 +5136,46 @@ impl HeapFile {
         };
         let mut scratch = plan.compact.then(|| vec![0_u8; PAGE_SIZE]);
         self.maybe_emit_heap_fpi(row_id.page_id)?;
+        if self.durability() != DurabilityMode::Memory
+            && txn_wal_buffering_active(&self.log, txn_id)
+        {
+            let key = self.page_key(row_id.page_id as u64);
+            let record = WalPayload::HeapInsert {
+                path: self.relative_path(),
+                page_id: row_id.page_id,
+                slot_id: row_id.slot_id,
+                payload: payload.clone(),
+                undo_lsn,
+            };
+            let write = |lsn| {
+                self.buffer_pool
+                    .with_raw_page_mut(key.clone(), lsn, |bytes| {
+                        HeapPageMut::new(bytes)?.insert(&payload, plan, scratch.as_deref_mut())
+                    })
+            };
+            // Reclaimed slots use the same WAL-before-data publication fence
+            // as ordinary heap batches. Never leave this already-pinned page
+            // exposed to writeback before its transaction's WAL is appended.
+            return match try_buffer_txn_page_write(
+                &self.log,
+                &self.buffer_pool,
+                txn_id,
+                record,
+                vec![key.clone()],
+                write,
+            ) {
+                Ok(result) => result,
+                Err((record, mut write)) => {
+                    let pre = crate::wal::LogManager::pre_encode_record(txn_id, record)?;
+                    let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
+                    write(lsn)
+                }
+            };
+        }
         let lsn = if self.durability() == DurabilityMode::Memory {
             0
         } else {
-            let mut log = self.log.lock();
-            let lsn = log.reserve_txn_lsn(txn_id)?;
-            log.append_reserved(
-                lsn,
+            let pre = crate::wal::LogManager::pre_encode_record(
                 txn_id,
                 WalPayload::HeapInsert {
                     path: self.relative_path(),
@@ -4879,7 +5185,7 @@ impl HeapFile {
                     undo_lsn,
                 },
             )?;
-            lsn
+            crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?
         };
         self.buffer_pool
             .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
@@ -5126,15 +5432,101 @@ impl HeapFile {
         Ok(())
     }
 
+    fn reserve_heap_shrink(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        before_len: usize,
+        payload: &mut Vec<u8>,
+    ) -> Result<(), QueryError> {
+        if txn_id == 0 || self.durability() == DurabilityMode::Memory {
+            return Ok(());
+        }
+        let Some(registry) = &self.pending_shrinks else {
+            return Ok(());
+        };
+        if payload.len() >= before_len && !registry.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Never return uncommitted bytes to another row: its committed WAL
+        // may precede this transaction's shrink, including after a crash.
+        let key = (self.table_id, row_id);
+        let mut pending = registry.transactions.lock();
+        if payload.len() >= before_len {
+            if let Some(txn) = pending.get_mut(&txn_id) {
+                if let Some(length) = txn.rows.get_mut(&key) {
+                    *length = payload.len();
+                }
+            }
+            return Ok(());
+        }
+        // Publish before fallible admission so rollback also removes an empty
+        // entry left by a rejected first reservation.
+        registry.active.store(true, Ordering::Release);
+        let txn = pending.entry(txn_id).or_default();
+        if !txn.rows.contains_key(&key) {
+            use crate::engine::executor::mem_budget::{
+                ControlledMemoryCategory, ControlledMemoryCharge,
+            };
+            match &mut txn.charge {
+                Some(charge) => charge.try_grow(128)?,
+                None => {
+                    txn.charge = Some(ControlledMemoryCharge::try_new(
+                        ControlledMemoryCategory::StorageScratch,
+                        128,
+                    )?)
+                }
+            }
+        }
+        txn.rows.insert(key, payload.len());
+        payload.resize(before_len, 0);
+        Ok(())
+    }
+
+    fn trim_committed_heap_slot(
+        &self,
+        row_id: RowId,
+        desired_len: usize,
+    ) -> Result<(), QueryError> {
+        let _page_guard = self
+            .page_latch(row_id.page_id as u64)
+            .lock()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+        let Some(before) = self.with_page(row_id.page_id as u64, |page| {
+            Ok(page.payload(row_id.slot_id as usize)?.map(<[u8]>::to_vec))
+        })?
+        else {
+            return Ok(());
+        };
+        if desired_len >= before.len() {
+            return Ok(());
+        }
+        if before[desired_len..].iter().any(|byte| *byte != 0) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "heap shrink reservation no longer matches the row",
+            ));
+        }
+        // The transaction retains row locks until this redo-only shrink has
+        // been logged. A later writer can reuse capacity only after its WAL.
+        let payload = before[..desired_len].to_vec();
+        self.write_heap_update_raw_logged(0, row_id, before, payload, HeapUpdatePlan::InPlace, None)
+    }
+
     fn write_heap_update_logged(
         &self,
         txn_id: u64,
         row_id: RowId,
         before: Vec<u8>,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
         mut page: Page,
         undo_lsn: Option<u64>,
     ) -> Result<(), QueryError> {
+        let canonical_len = payload.len();
+        self.reserve_heap_shrink(txn_id, row_id, before.len(), &mut payload)?;
+        if payload.len() != canonical_len {
+            page.update(row_id.slot_id, &payload)?;
+        }
         self.maybe_emit_heap_fpi(row_id.page_id)?;
         let lsn = if self.durability() == DurabilityMode::Memory {
             0
@@ -5168,10 +5560,11 @@ impl HeapFile {
         txn_id: u64,
         row_id: RowId,
         before: Vec<u8>,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
         plan: HeapUpdatePlan,
         undo_lsn: Option<u64>,
     ) -> Result<(), QueryError> {
+        self.reserve_heap_shrink(txn_id, row_id, before.len(), &mut payload)?;
         let _scratch_charge = if plan == HeapUpdatePlan::Compact {
             Some(
                 crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(

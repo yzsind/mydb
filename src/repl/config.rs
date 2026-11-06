@@ -264,7 +264,7 @@ impl ReplConfig {
             cfg.apply_queue_bytes = (v as usize).clamp(64 * 1024, 1024 * 1024 * 1024);
         }
         if let Ok(Some(v)) = parse_env_u64("MYDB_REPL_BASE_BACKUP_DISK_RESERVE_PCT") {
-            cfg.base_backup_disk_reserve_pct = (v as u8).min(90);
+            cfg.base_backup_disk_reserve_pct = v.min(90) as u8;
         }
         // The current IO→blocking-apply handoff is deliberately one chunk
         // deep. Keep that bounded handoff within the configured byte budget.
@@ -362,5 +362,17 @@ mod release_audit_tests {
         assert!(token.matches(&token));
         assert!(!token.matches(&"a-different-private-replication-secret".into()));
         assert!(!format!("{token:?}").contains("private"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn release1106_disk_reserve_does_not_wrap() {
+    for value in ["256", "306", "18446744073709551615"] {
+        let cfg = crate::util::env::with_vars(
+            &[("MYDB_REPL_BASE_BACKUP_DISK_RESERVE_PCT", Some(value))],
+            ReplConfig::from_env,
+        );
+        assert_eq!(cfg.base_backup_disk_reserve_pct, 90);
     }
 }

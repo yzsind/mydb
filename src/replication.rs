@@ -4146,6 +4146,7 @@ fn apply_update_rows(
     // before-image is an O(1) lookup instead of a full-table rescan.
     let mut keyless = keyless_matcher(db, txn, &schema)?;
     for update in rows {
+        let _partition = replication_partition_guard(&schema, &update.before)?;
         let before_match = match keyless.as_mut() {
             Some(m) => m.take_match(&update.before),
             None => find_matching_row(db, txn, &schema, &update.before)?,
@@ -4178,7 +4179,10 @@ fn keyless_matcher(
     txn: TxnView,
     schema: &TableSchema,
 ) -> Result<Option<KeylessRowIndex>, QueryError> {
-    if has_usable_unique_index(schema) || !env_bool_default("MYDB_REPL_HASH_MATCH", true) {
+    if schema.is_partitioned()
+        || has_usable_unique_index(schema)
+        || !env_bool_default("MYDB_REPL_HASH_MATCH", true)
+    {
         return Ok(None);
     }
     Ok(Some(KeylessRowIndex::build(db, txn, schema)?))
@@ -4195,6 +4199,7 @@ fn apply_delete_rows(
     let schema = db.table(&table_name)?;
     let mut keyless = keyless_matcher(db, txn, &schema)?;
     for row in rows {
+        let _partition = replication_partition_guard(&schema, row)?;
         let matched = match keyless.as_mut() {
             Some(m) => m.take_match(row),
             None => find_matching_row(db, txn, &schema, row)?,
@@ -4221,6 +4226,23 @@ fn apply_delete_rows(
         }
     }
     Ok(())
+}
+
+// FULL row images carry every partition key. Keep the identity probe and
+// mutation in that same physical leaf; RowId alone is only leaf-local.
+fn replication_partition_guard(
+    table: &TableSchema,
+    image: &[Value],
+) -> Result<Option<crate::engine::executor::partition_router::PrunedPartitionsGuard>, QueryError> {
+    if !table.is_partitioned() {
+        return Ok(None);
+    }
+    let partition = table.route_row_to_partition(image)?;
+    Ok(Some(
+        crate::engine::executor::partition_router::push_pruned_partitions(vec![
+            partition.storage_id,
+        ]),
+    ))
 }
 
 fn find_matching_row(

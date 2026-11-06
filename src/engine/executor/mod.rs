@@ -65,6 +65,7 @@ pub(crate) mod cte;
 pub(crate) mod cte_store;
 mod ddl_deprecation;
 mod dispatch;
+pub(crate) use dispatch::statement_writes_only_temp_tables;
 pub(crate) mod rls;
 pub(crate) mod row_spool;
 mod stream_mdl;
@@ -136,7 +137,13 @@ use self::select_into_file::*;
 use self::triggers::*;
 use self::tx::*;
 
-fn begin_statement_diagnostics(session: &mut SessionContext, sql: &str) -> bool {
+fn begin_statement_diagnostics(db: &Database, session: &mut SessionContext, sql: &str) -> bool {
+    crate::util::lock_diagnostics::statement_begin(
+        db.lock_diagnostic_scope(),
+        session.current_txn.unwrap_or(0),
+        session.connection_id as u64,
+        sql,
+    );
     let preserve_warnings = preserves_statement_diagnostics(sql);
     crate::engine::perf_events::clear_thread_wait_samples();
     crate::engine::perf_events::start_statement_rows_examined();
@@ -793,6 +800,7 @@ fn capture_dml_statement_result(
 }
 
 fn finish_statement_diagnostics(
+    db: &Database,
     session: &mut SessionContext,
     preserve_warnings: bool,
     result: &Result<QueryResponse, QueryError>,
@@ -843,6 +851,11 @@ fn finish_statement_diagnostics(
     if !preserve_warnings {
         session.diagnostics_row_count = session.last_row_count;
     }
+    crate::util::lock_diagnostics::statement_end(
+        db.lock_diagnostic_scope(),
+        session.current_txn.unwrap_or(0),
+        session.connection_id as u64,
+    );
 }
 
 fn cap_direct_group_concat_limit_warnings(sql: &str, result: &Result<QueryResponse, QueryError>) {
@@ -1425,6 +1438,7 @@ fn auto_param_mode_for_statement(
         && (safe_integer_counter_update(db, session, statement)
             || safe_numeric_counter_update(db, session, statement)
             || safe_typed_point_update(db, session, statement)
+            || safe_integer_point_delete(db, session, statement)
             || safe_large_literal_update(statement))
     {
         return crate::engine::auto_param::AutoParameterizeMode::All;
@@ -1463,6 +1477,140 @@ fn parameterized_update_column_name(expr: &Expr) -> Option<&str> {
         Expr::CompoundIdentifier(parts) => parts.last().map(String::as_str),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextLiteralDomain {
+    Null,
+    Integer,
+    Numeric,
+    Text,
+    Binary,
+}
+
+/// The default policy is also checked on parser-proven placeholder ASTs.
+/// Borrow the current binding: proving its source domain must not clone a
+/// string/decimal value or erase the distinction between text and numbers.
+fn text_literal_domain(expr: &Expr) -> Option<TextLiteralDomain> {
+    use TextLiteralDomain as D;
+    match expr {
+        Expr::Literal(literal) => match literal {
+            Literal::Null => Some(D::Null),
+            Literal::Int(_) | Literal::UInt(_) => Some(D::Integer),
+            Literal::Float(_) | Literal::Decimal(_) => Some(D::Numeric),
+            Literal::String(_) => Some(D::Text),
+            Literal::HexBytes(_) | Literal::BitBytes(_) => Some(D::Binary),
+            _ => None,
+        },
+        Expr::Placeholder(index) => {
+            crate::engine::params::with_current_param(*index, |value| match value? {
+                Value::Null => Some(D::Null),
+                Value::Int(_) | Value::UInt(_) => Some(D::Integer),
+                Value::Float(_)
+                | Value::Double(_)
+                | Value::Decimal(_)
+                | Value::DecimalCompact(..)
+                | Value::Decimal128(..)
+                | Value::DecimalWide(_) => Some(D::Numeric),
+                Value::String(_) | Value::SmallString(_) => Some(D::Text),
+                Value::Bytes(_) => Some(D::Binary),
+                _ => None,
+            })
+        }
+        Expr::Unary {
+            op: crate::parser::UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Literal::Int(n)) if n.checked_neg().is_some() => Some(D::Integer),
+            Expr::Literal(Literal::Float(_) | Literal::Decimal(_)) => Some(D::Numeric),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Default-on DELETE reuse is limited to an exact unique integer key. This
+/// leaves broad deletes, modifiers and expression/coercion diagnostics on the
+/// ordinary path while allowing ordinary composite business keys to reuse the
+/// same prepared deletion, FK and statement-rollback machinery.
+fn safe_integer_point_delete(
+    db: &Database,
+    session: &SessionContext,
+    statement: &Statement,
+) -> bool {
+    let Statement::Delete(delete) = statement else {
+        return false;
+    };
+    if delete.selection.is_none()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+        || delete.primary_alias.is_some()
+        || !delete.joins.is_empty()
+        || !delete.targets.is_empty()
+        || !delete.partitions.is_empty()
+        || delete.low_priority
+        || delete.quick
+        || delete.ignore
+        || !delete.query_hints.is_empty()
+        || !delete.hint_warnings.is_empty()
+        || delete.returning.is_some()
+    {
+        return false;
+    }
+    let (database, name) = split_table_name(&session.current_database, &delete.table);
+    if is_system_database(&database) {
+        return false;
+    }
+    let Ok(table) = db.table_in_database(&database, &name) else {
+        return false;
+    };
+    fn collect(expr: &Expr, table: &crate::storage::TableSchema, columns: &mut Vec<usize>) -> bool {
+        let Expr::Binary { left, op, right } = expr else {
+            return false;
+        };
+        if *op == BinaryOp::And {
+            return collect(left, table, columns) && collect(right, table, columns);
+        }
+        if *op != BinaryOp::Eq {
+            return false;
+        }
+        for (column, literal) in [
+            (left.as_ref(), right.as_ref()),
+            (right.as_ref(), left.as_ref()),
+        ] {
+            if text_literal_domain(literal) != Some(TextLiteralDomain::Integer) {
+                continue;
+            }
+            if let Some(index) = parameterized_update_column_name(column)
+                .and_then(|name| table.column_index(name).ok())
+            {
+                if matches!(
+                    table.columns[index].data_type,
+                    DataTypeKind::TinyInt
+                        | DataTypeKind::SmallInt
+                        | DataTypeKind::MediumInt
+                        | DataTypeKind::Int
+                        | DataTypeKind::BigInt
+                ) {
+                    columns.push(index);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut columns = Vec::new();
+    collect(delete.selection.as_ref().unwrap(), &table, &mut columns)
+        && table.iter_queryable_indexes().any(|index| {
+            index.unique
+                && !index.has_prefix_columns()
+                && !index.has_expression_parts()
+                && index.columns.iter().all(|name| {
+                    table
+                        .column_index(name)
+                        .is_ok_and(|position| columns.contains(&position))
+                })
+        })
 }
 
 /// Default-on parameterisation for a plain UPDATE carrying a large direct
@@ -1694,10 +1842,8 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
     };
     fn numeric_literal(expr: &Expr) -> bool {
         matches!(
-            expr,
-            Expr::Literal(
-                Literal::Int(_) | Literal::UInt(_) | Literal::Float(_) | Literal::Decimal(_)
-            )
+            text_literal_domain(expr),
+            Some(TextLiteralDomain::Integer | TextLiteralDomain::Numeric)
         )
     }
     fn numeric_type(kind: &DataTypeKind) -> bool {
@@ -1714,10 +1860,11 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
         )
     }
     fn literal_compatible(column: &crate::storage::ColumnSchema, expr: &Expr) -> bool {
-        let Expr::Literal(literal) = expr else {
+        use TextLiteralDomain as D;
+        let Some(domain) = text_literal_domain(expr) else {
             return false;
         };
-        if matches!(literal, Literal::Null) {
+        if domain == D::Null {
             return column.nullable;
         }
         match column.data_type {
@@ -1727,26 +1874,20 @@ fn safe_typed_point_update(db: &Database, session: &SessionContext, statement: &
             | DataTypeKind::Int
             | DataTypeKind::BigInt
             | DataTypeKind::Bool
-            | DataTypeKind::Year => matches!(literal, Literal::Int(_) | Literal::UInt(_)),
+            | DataTypeKind::Year => domain == D::Integer,
             DataTypeKind::Float { .. }
             | DataTypeKind::Double { .. }
-            | DataTypeKind::Decimal { .. } => matches!(
-                literal,
-                Literal::Int(_) | Literal::UInt(_) | Literal::Float(_) | Literal::Decimal(_)
-            ),
+            | DataTypeKind::Decimal { .. } => matches!(domain, D::Integer | D::Numeric),
             DataTypeKind::Char { .. }
             | DataTypeKind::VarChar { .. }
-            | DataTypeKind::Text { .. } => matches!(literal, Literal::String(_)),
+            | DataTypeKind::Text { .. } => domain == D::Text,
             DataTypeKind::Binary { .. }
             | DataTypeKind::VarBinary { .. }
-            | DataTypeKind::Blob { .. } => matches!(
-                literal,
-                Literal::String(_) | Literal::HexBytes(_) | Literal::BitBytes(_)
-            ),
+            | DataTypeKind::Blob { .. } => matches!(domain, D::Text | D::Binary),
             DataTypeKind::Date
             | DataTypeKind::Time { .. }
             | DataTypeKind::DateTime { .. }
-            | DataTypeKind::Timestamp { .. } => matches!(literal, Literal::String(_)),
+            | DataTypeKind::Timestamp { .. } => domain == D::Text,
             // Complex/domain types keep their dedicated legacy coercion and
             // validation surfaces.
             _ => false,
@@ -2108,7 +2249,8 @@ fn text_shape_key_and_params(
     sql: &str,
     parser_mode_bits: u16,
 ) -> Option<(crate::engine::cache::ParsedStatementKey, Vec<Value>)> {
-    if !(select_keyword_prefix(sql) || bulk_dml_keyword_prefix(sql))
+    if sql.len() > TEXT_DML_SHAPE_MAX_BYTES
+        || !(select_keyword_prefix(sql) || bulk_dml_keyword_prefix(sql))
         || has_non_trailing_statement_separator_with_mode(
             sql,
             crate::sql_lex::SqlLexMode::from_parser_bits(parser_mode_bits),
@@ -2337,6 +2479,45 @@ fn scan_literal_normalized_dml_impl(
         }
         last_was_space = false;
         match b {
+            b'-' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+                && shape
+                    .bytes()
+                    .rev()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .is_some_and(|b| {
+                        matches!(
+                            b,
+                            b'=' | b'('
+                                | b','
+                                | b'<'
+                                | b'>'
+                                | b'!'
+                                | b'+'
+                                | b'-'
+                                | b'*'
+                                | b'/'
+                                | b'%'
+                        )
+                    }) =>
+            {
+                let start = i;
+                i += 2;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_digit()
+                        || matches!(bytes[i], b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    if matches!(bytes[i], b'+' | b'-') && !matches!(bytes[i - 1], b'e' | b'E') {
+                        break;
+                    }
+                    i += 1;
+                }
+                let value = parse_scanned_numeric_literal(&sql[start..i])?;
+                if collect_params {
+                    params.push(value);
+                }
+                saw_literal = true;
+                shape.push('?');
+            }
             b'\'' => {
                 let next = if collect_params {
                     let (value, next) = scan_sql_string_literal(bytes, i)?;
@@ -2794,6 +2975,16 @@ pub(crate) fn prepared_sparse_batch_hits() -> u64 {
 }
 
 impl StorageQueryEngine {
+    fn attach_expression_registry(&self, session: &mut SessionContext) {
+        if session
+            .expression_registry
+            .as_ref()
+            .is_none_or(|registry| registry.as_ptr() != Arc::as_ptr(&self.registry))
+        {
+            session.expression_registry = Some(Arc::downgrade(&self.registry));
+        }
+    }
+
     fn execute_with_operation(
         &self,
         session: &mut SessionContext,
@@ -2803,6 +2994,7 @@ impl StorageQueryEngine {
             &mut SessionContext,
         ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata),
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
@@ -2816,7 +3008,7 @@ impl StorageQueryEngine {
         let _trace_session =
             crate::engine::cbo::trace::activate(session.connection_id, trace_enabled);
         crate::engine::cbo::trace::begin(sql);
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         if !preserve_warnings {
             session
                 .warnings
@@ -2909,7 +3101,7 @@ impl StorageQueryEngine {
         }
         drop(_cancel_guard);
         if finish_diagnostics {
-            finish_statement_diagnostics(session, preserve_warnings, &result);
+            finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         }
         self.finish_or_observe_query(
             session,
@@ -3586,7 +3778,7 @@ impl QueryEngine for StorageQueryEngine {
             self.execute_text_prepared_dml_batch(session, sql, params, batch, Some(&mut statements))
         });
         if result.is_err() {
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
         }
         Some((statements, result))
     }
@@ -4043,10 +4235,10 @@ impl QueryEngine for StorageQueryEngine {
         session.check_cancelled()?;
         let _fk_checks_guard = crate::storage::FkChecksGuard::new(session.foreign_key_checks);
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
-        begin_statement_diagnostics(session, "LOAD DATA");
+        begin_statement_diagnostics(&self.db, session, "LOAD DATA");
         if let Err(err) = authorize_statement(&self.db, session, &statement) {
             let result = Err(err);
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
             return result;
         }
         if let Statement::LoadData(stmt) = statement {
@@ -4064,14 +4256,14 @@ impl QueryEngine for StorageQueryEngine {
                 })
             };
             drop(_cancel_guard);
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
             result
         } else {
             let err = Err(crate::storage::error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 "expected LOAD DATA statement",
             ));
-            finish_statement_diagnostics(session, false, &err);
+            finish_statement_diagnostics(&self.db, session, false, &err);
             err
         }
     }
@@ -4087,10 +4279,10 @@ impl QueryEngine for StorageQueryEngine {
         session.check_cancelled()?;
         let _fk_checks_guard = crate::storage::FkChecksGuard::new(session.foreign_key_checks);
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
-        begin_statement_diagnostics(session, "LOAD DATA LOCAL");
+        begin_statement_diagnostics(&self.db, session, "LOAD DATA LOCAL");
         if let Err(err) = authorize_statement(&self.db, session, &statement) {
             let result = Err(err);
-            finish_statement_diagnostics(session, false, &result);
+            finish_statement_diagnostics(&self.db, session, false, &result);
             return result;
         }
         // LOCAL bypasses the ordinary text dispatcher. Its metadata lease
@@ -4103,7 +4295,7 @@ impl QueryEngine for StorageQueryEngine {
             Ok(guard) => guard,
             Err(err) => {
                 let result = Err(err);
-                finish_statement_diagnostics(session, false, &result);
+                finish_statement_diagnostics(&self.db, session, false, &result);
                 return result;
             }
         };
@@ -4150,7 +4342,7 @@ impl QueryEngine for StorageQueryEngine {
             result,
             mdl_scope.outermost(),
         );
-        finish_statement_diagnostics(session, false, &result);
+        finish_statement_diagnostics(&self.db, session, false, &result);
         result
     }
 
@@ -4184,13 +4376,14 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Arc<Statement>,
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let started = Instant::now();
         let _http_scope = crate::engine::http::enter(&self.db);
         if _http_dependent {
@@ -4267,7 +4460,7 @@ impl QueryEngine for StorageQueryEngine {
         let result =
             result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(session, sql, started, metadata, result, None)
     }
 
@@ -4334,6 +4527,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Statement,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        self.attach_expression_registry(session);
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
@@ -4385,12 +4579,12 @@ impl QueryEngine for StorageQueryEngine {
                 }
             }
         }
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         if let Some(simple_kind) =
             simple_txn_control_kind(sql.trim_matches(|c: char| c.is_whitespace() || c == ';'))
         {
             let result = dispatch_simple_txn_control(&self.db, session, simple_kind);
-            finish_statement_diagnostics(session, preserve_warnings, &result);
+            finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
             return Some(result);
         }
         if self.plan_cache_enabled {
@@ -4440,7 +4634,7 @@ impl QueryEngine for StorageQueryEngine {
         let result =
             result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         Some(result)
     }
 
@@ -4452,6 +4646,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        self.attach_expression_registry(session);
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         if !matches!(parsed.as_ref(), Statement::Select(_)) {
             return None;
@@ -4647,16 +4842,11 @@ impl QueryEngine for StorageQueryEngine {
         if matches!(mode, crate::engine::auto_param::AutoParameterizeMode::Off) {
             return None;
         }
-        // A DML shape is only ever published while DML auto-parameterization
-        // is on, so under `Select` the lookup below could not hit — and it is
-        // not free: `text_shape_key_and_params` scans the whole statement and
-        // builds a shape string plus a value vector before the (certain)
-        // cache miss. Decline before paying for it.
-        if !matches!(mode, crate::engine::auto_param::AutoParameterizeMode::All)
-            && !select_keyword_prefix(sql)
-        {
-            return None;
-        }
+        // The default mode also publishes parser-proven INSERT and typed
+        // UPDATE shapes through `try_execute_scanned_text_dml`. Let the
+        // protocol borrow those artifacts and use its prepared scheduling
+        // policy; the cache publisher, not the configured broad DML mode,
+        // owns the provenance proof. Unproven shapes simply miss here.
         let parser_mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
         let shaped = text_shape_key_and_params(sql, parser_mode_bits).and_then(|(key, params)| {
             self.statement_cache
@@ -4721,6 +4911,27 @@ impl QueryEngine for StorageQueryEngine {
         ) {
             return None;
         }
+        // Parser artifacts are unqualified and shared across catalogs. The
+        // cold publisher's catalog/type proof cannot authorize a different
+        // database, a post-DDL schema, or a new literal comparison domain.
+        if mode == crate::engine::auto_param::AutoParameterizeMode::Select
+            && !matches!(statement.as_ref(), Statement::Select(_))
+            && (statement_refs_temp_table(session, &statement)
+                || !crate::engine::params::with_params_slice(&params, || {
+                    match statement.as_ref() {
+                        Statement::Insert(insert) => !insert.delayed,
+                        Statement::Update(_) => {
+                            safe_typed_point_update(&self.db, session, &statement)
+                        }
+                        Statement::Delete(_) => {
+                            safe_integer_point_delete(&self.db, session, &statement)
+                        }
+                        _ => false,
+                    }
+                }))
+        {
+            return None;
+        }
         self.db.record_select_parse_cache_hit();
         Some((statement, params, Arc::clone(&key.sql)))
     }
@@ -4733,6 +4944,7 @@ impl QueryEngine for StorageQueryEngine {
         params: Vec<Value>,
         shape_sql: Arc<str>,
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
@@ -4740,7 +4952,7 @@ impl QueryEngine for StorageQueryEngine {
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
         self.db.ensure_operational()?;
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let started = Instant::now();
         let _http_scope = crate::engine::http::enter(&self.db);
         if _http_dependent {
@@ -4792,7 +5004,7 @@ impl QueryEngine for StorageQueryEngine {
         let result =
             result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(session, sql, started, metadata, result, Some(shape_sql))
     }
 }
@@ -4810,11 +5022,12 @@ impl StorageQueryEngine {
         statement: Statement,
         digest_sql: Option<String>,
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         if let Err(err) = session.check_cancelled() {
             return Err(err);
         }
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let started = Instant::now();
         let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
@@ -4847,7 +5060,7 @@ impl StorageQueryEngine {
             self.undo_purge_worker.wake();
         }
         drop(_cancel_guard);
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(
             session,
             sql,
@@ -4920,7 +5133,7 @@ impl StorageQueryEngine {
     ) -> Result<QueryResponse, QueryError> {
         session.check_cancelled()?;
         let started = Instant::now();
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         // Pick the read view that matches the eligibility branch — the
         // autocommit path takes a fresh statement view; the lazy
         // in-transaction path threads the transaction's RR pin so
@@ -4962,7 +5175,7 @@ impl StorageQueryEngine {
             // not completed failed SQL statements and must not be logged as such.
             return result;
         }
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         self.finish_or_observe_query(
             session,
             sql,
@@ -5286,7 +5499,8 @@ impl StorageQueryEngine {
             let proven_shape = matches!(&statement, Statement::Insert(insert) if !insert.delayed)
                 || safe_integer_counter_update(&self.db, session, &statement)
                 || safe_numeric_counter_update(&self.db, session, &statement)
-                || safe_typed_point_update(&self.db, session, &statement);
+                || safe_typed_point_update(&self.db, session, &statement)
+                || safe_integer_point_delete(&self.db, session, &statement);
             if !proven_shape
                 || !should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement)
             {
@@ -5614,7 +5828,7 @@ impl StorageQueryEngine {
         }
         for (plan, count) in batch.plans.iter().zip(batch.param_counts.iter().copied()) {
             if statements.is_some() {
-                begin_statement_diagnostics(session, sql);
+                begin_statement_diagnostics(&self.db, session, sql);
                 if let Some(kind) =
                     crate::engine::status_counters::classify_statement_com(&plan.statement)
                 {
@@ -5644,7 +5858,7 @@ impl StorageQueryEngine {
                 .elapsed
                 .saturating_add(statement_wait_stats.elapsed);
             if let Some(out) = statements.as_deref_mut() {
-                finish_statement_diagnostics(session, false, &result);
+                finish_statement_diagnostics(&self.db, session, false, &result);
                 if let Ok(QueryResponse::OkAffected { affected_rows }) = &result {
                     out.push(capture_dml_statement_result(session, *affected_rows));
                 } else if matches!(result, Ok(QueryResponse::Ok)) {
@@ -5681,7 +5895,7 @@ impl StorageQueryEngine {
             return Err(err);
         }
         let started = Instant::now();
-        let preserve_warnings = begin_statement_diagnostics(session, sql);
+        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
         let metadata = QueryLogMetadata {
             is_ddl: false,
             ..QueryLogMetadata::default()
@@ -5692,7 +5906,7 @@ impl StorageQueryEngine {
         if result.is_ok() {
             self.undo_purge_worker.wake();
         }
-        finish_statement_diagnostics(session, preserve_warnings, &result);
+        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
         let metadata = metadata.with_lock_wait_stats(wait_stats);
         self.finish_or_observe_query(session, sql, started, metadata, result, None)
     }

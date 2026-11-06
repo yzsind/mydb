@@ -173,17 +173,33 @@ fn vector_prepared_filter_cost_accounts_for_candidate_survival() {
             )
         })
         .unwrap();
-        assert!(
-            memo.compiled.physical.any(|p| matches!(
-                p,
-                PhysicalPlan::VectorIndexScan { .. }
-                    | PhysicalPlan::FilteredVectorTopK {
-                        strategy: crate::planner::FilteredVectorStrategy::PrefilterAnn
-                            | crate::planner::FilteredVectorStrategy::IterativeAnn,
-                        ..
-                    }
-            )),
-            "{algorithm} with widening disabled must not pay for additional candidates"
+        // A correctly priced scalar range can beat ANN even when iterative
+        // widening is disabled. Parameterization must use the same scalar
+        // population and make the same choice as the literal predicate.
+        let Statement::Select(literal) = crate::parser::parse_statement(&format!(
+            "SELECT id FROM vector_cost WHERE id>={strong} ORDER BY L2_DISTANCE(v,TO_VECTOR('[17.1,2.1,3.1]')) LIMIT 10"
+        )).unwrap() else { unreachable!() };
+        let literal_plan = crate::engine::expr::with_session_expr_info(&session, || {
+            crate::planner::plan_prepared_physical_select(&engine.db, &literal)
+        })
+        .unwrap();
+        let uses_ann = |plan: &PhysicalPlan| {
+            plan.any(|p| {
+                matches!(
+                    p,
+                    PhysicalPlan::VectorIndexScan { .. }
+                        | PhysicalPlan::FilteredVectorTopK {
+                            strategy: crate::planner::FilteredVectorStrategy::PrefilterAnn
+                                | crate::planner::FilteredVectorStrategy::IterativeAnn,
+                            ..
+                        }
+                )
+            })
+        };
+        assert_eq!(
+            uses_ann(&memo.compiled.physical),
+            uses_ann(&literal_plan),
+            "{algorithm} scalar access must be costed identically for literal and deferred bounds"
         );
     }
 }

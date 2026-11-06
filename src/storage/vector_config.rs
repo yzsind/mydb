@@ -192,7 +192,7 @@ impl VectorIndexConfig {
             let m = number("m", crate::engine::vector::DEFAULT_M as u32, 2, 1024)?;
             let ef_construction = number(
                 "ef_construction",
-                crate::engine::vector::DEFAULT_EF_CONSTRUCTION as u32,
+                (crate::engine::vector::DEFAULT_EF_CONSTRUCTION as u32).max(m),
                 m,
                 65535,
             )?;

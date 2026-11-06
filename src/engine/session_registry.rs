@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 
 use crate::engine::status_counters::SessionStatusValues;
 use crate::storage::error;
-use crate::types::{QueryError, Value};
+use crate::types::QueryError;
 
 /// connection-id → session map. ahash is ~2.8× cheaper than std
 /// SipHash-1-3 on the `u32` key, and KILL / SHOW PROCESSLIST / register
@@ -304,7 +304,7 @@ struct SessionEntry {
     /// performance_schema.session_connect_attrs.
     connection_attrs: std::collections::BTreeMap<String, String>,
     session_variables: Vec<(String, String)>,
-    user_variables: Vec<(String, Value)>,
+    user_variables: crate::engine::user_variables::UserVariables,
     pfs_autocommit: bool,
     pfs_isolation: String,
     prepared_statements: Vec<PreparedStatementSnapshot>,
@@ -325,7 +325,7 @@ pub struct ProcessInfo {
     pub info: Option<String>,
     pub connection_attrs: std::collections::BTreeMap<String, String>,
     pub session_variables: Vec<(String, String)>,
-    pub user_variables: Vec<(String, Value)>,
+    pub user_variables: crate::engine::user_variables::UserVariables,
     pub autocommit: bool,
     pub isolation: String,
     pub(crate) prepared_statements: Vec<PreparedStatementSnapshot>,
@@ -688,7 +688,7 @@ impl SessionRegistry {
             time_reference_unix_secs: None,
             connection_attrs: std::collections::BTreeMap::new(),
             session_variables: Vec::new(),
-            user_variables: Vec::new(),
+            user_variables: Default::default(),
             pfs_autocommit: true,
             pfs_isolation: "REPEATABLE READ".to_string(),
             prepared_statements: Vec::new(),
@@ -1073,6 +1073,17 @@ impl SessionRegistry {
         }
     }
 
+    pub(crate) fn contains_connection(&self, connection_id: u32) -> bool {
+        self.sessions.read().contains_key(&connection_id)
+    }
+
+    pub(crate) fn account_for_connection(&self, connection_id: u32) -> Option<String> {
+        let sessions = self.sessions.read();
+        let entry = sessions.get(&connection_id)?.entry.lock();
+        (entry.kind == ProcessKind::Foreground)
+            .then(|| format!("{}@{}", entry.user, normalize_status_host(&entry.host)))
+    }
+
     pub fn snapshot(&self) -> Vec<ProcessInfo> {
         let sessions = self.sessions.read();
         let now = Instant::now();
@@ -1415,11 +1426,10 @@ impl SessionHandle {
     pub fn publish_pfs_variables(
         &self,
         session_variables: Vec<(String, String)>,
-        mut user_variables: Vec<(String, Value)>,
+        user_variables: crate::engine::user_variables::UserVariables,
         autocommit: bool,
         isolation: String,
     ) {
-        user_variables.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let mut entry = self.entry.lock();
         entry.session_variables = session_variables;
         entry.user_variables = user_variables;

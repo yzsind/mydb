@@ -175,6 +175,7 @@ pub(crate) enum BuiltinId {
     InetNtoa,
     Bin,
     Hex,
+    Conv,
     JsonType,
     Version,
     Uuid,
@@ -386,7 +387,11 @@ impl ExprType {
             kind,
             nullable: source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0,
             max_octets: source.length,
-            collation_id: source.collation_id,
+            collation_id: if matches!(kind, ExprTypeKind::Json) {
+                Some(46)
+            } else {
+                source.collation_id
+            },
             coercibility: source
                 .collation_coercibility
                 .unwrap_or(if source.org_name.is_empty() { 4 } else { 2 }),
@@ -615,7 +620,7 @@ impl ExprType {
             // them to binary; storing binary here would contaminate UNION's
             // character-domain collation aggregation.
             source.collation_id = None;
-            source.collation_coercibility = None;
+            source.collation_coercibility = Some(self.coercibility);
             source.decimals = Some(match self.kind {
                 ExprTypeKind::Decimal { scale, .. } | ExprTypeKind::Temporal { fsp: scale, .. } => {
                     scale
@@ -742,17 +747,23 @@ pub(crate) fn aggregate_branch_types(left: ExprType, right: ExprType) -> ExprTyp
             Decimal {
                 precision, scale, ..
             },
-            Integer { width, .. },
+            Integer { .. },
         )
         | (
-            Integer { width, .. },
+            Integer { .. },
             Decimal {
                 precision, scale, ..
             },
         ) => {
             let integer_digits = precision
                 .saturating_sub(scale)
-                .max(width.decimal_precision());
+                .max(integer_decimal_precision(
+                    if matches!(left.kind, Integer { .. }) {
+                        left
+                    } else {
+                        right
+                    },
+                ));
             ExprType::new(
                 Decimal {
                     precision: integer_digits
@@ -858,7 +869,16 @@ pub(crate) fn aggregate_branch_types(left: ExprType, right: ExprType) -> ExprTyp
             (l, r) => l.or(r),
         },
     };
-    out.collation_id = if left.coercibility <= right.coercibility {
+    out.collation_id = if matches!(out.kind, String { .. })
+        && (matches!(left.kind, Json) || matches!(right.kind, Json))
+        && !matches!(
+            out.kind,
+            String {
+                kind: StringKind::Binary | StringKind::Blob
+            }
+        ) {
+        Some(46)
+    } else if left.coercibility <= right.coercibility {
         left.collation_id
     } else {
         right.collation_id
@@ -909,7 +929,7 @@ pub(crate) fn checked_branch_types(
         let operands: Vec<Expr> = [left, right]
             .iter()
             .filter_map(|ty| {
-                if !matches!(ty.kind, ExprTypeKind::String { .. }) {
+                if !matches!(ty.kind, ExprTypeKind::String { .. } | ExprTypeKind::Json) {
                     return None;
                 }
                 let info = ty
@@ -929,7 +949,7 @@ pub(crate) fn checked_branch_types(
         if !operands.is_empty() {
             result.coercibility = [left, right]
                 .iter()
-                .filter(|ty| matches!(ty.kind, ExprTypeKind::String { .. }))
+                .filter(|ty| matches!(ty.kind, ExprTypeKind::String { .. } | ExprTypeKind::Json))
                 .map(|ty| ty.coercibility)
                 .min()
                 .unwrap_or(4);
@@ -1047,8 +1067,12 @@ fn bound_value_type(value: &Value, context: &TypeContext<'_>) -> ExprType {
     );
     match value {
         Value::Null => return ExprType::new(ExprTypeKind::Null, true),
-        Value::Int(value) => result.max_octets = Some(value.to_string().len() as u32),
+        Value::Int(value) => {
+            result.max_octets = Some(value.to_string().len() as u32);
+            result.coercibility = 5;
+        }
         Value::UInt(value) => {
+            result.coercibility = 5;
             result.max_octets = Some(value.to_string().len() as u32);
             if let ExprTypeKind::Integer { unsigned, .. } | ExprTypeKind::Decimal { unsigned, .. } =
                 &mut result.kind
@@ -1146,10 +1170,25 @@ pub(crate) fn current_parameter_type_fingerprint() -> u64 {
     fingerprint
 }
 
-fn numeric_decimal_spec(kind: ExprTypeKind) -> Option<crate::util::decimal::DecimalResultSpec> {
-    match kind {
-        ExprTypeKind::Integer { width, .. } => Some(crate::util::decimal::DecimalResultSpec::new(
-            width.decimal_precision(),
+fn integer_decimal_precision(ty: ExprType) -> u8 {
+    let ExprTypeKind::Integer { width, .. } = ty.kind else {
+        return 20;
+    };
+    if ty.coercibility == 5 {
+        ty.max_octets
+            .and_then(|length| u8::try_from(length).ok())
+            .unwrap_or(width.decimal_precision())
+            .min(width.decimal_precision())
+            .max(1)
+    } else {
+        width.decimal_precision()
+    }
+}
+
+fn numeric_decimal_spec(ty: ExprType) -> Option<crate::util::decimal::DecimalResultSpec> {
+    match ty.kind {
+        ExprTypeKind::Integer { .. } => Some(crate::util::decimal::DecimalResultSpec::new(
+            integer_decimal_precision(ty),
             0,
         )),
         ExprTypeKind::Decimal {
@@ -1282,7 +1321,7 @@ fn binary_type(
                 result.max_octets = Some(23);
                 return result;
             }
-            let Some(left_spec) = numeric_decimal_spec(left.kind) else {
+            let Some(left_spec) = numeric_decimal_spec(left) else {
                 let mut result = ExprType::new(
                     Float {
                         single: false,
@@ -1294,7 +1333,7 @@ fn binary_type(
                 result.max_octets = Some(23);
                 return result;
             };
-            let Some(right_spec) = numeric_decimal_spec(right.kind) else {
+            let Some(right_spec) = numeric_decimal_spec(right) else {
                 let mut result = ExprType::new(
                     Float {
                         single: false,
@@ -1442,6 +1481,29 @@ fn cast_type(args: &[Expr], input: ExprType, context: &TypeContext<'_>) -> ExprT
         },
     };
     let mut result = ExprType::new(kind, nullable);
+    if matches!(kind, ExprTypeKind::String { .. }) {
+        result.coercibility = 2;
+    }
+    if matches!(kind, ExprTypeKind::Json) {
+        result.collation_id = Some(46);
+        result.coercibility = 4;
+    }
+    if matches!(target.as_str(), "CHAR" | "BINARY") {
+        let length = args.get(2).and_then(|arg| match arg {
+            Expr::Literal(Literal::Int(n)) => u32::try_from(*n).ok(),
+            Expr::Literal(Literal::UInt(n)) => u32::try_from(*n).ok(),
+            _ => None,
+        });
+        result.max_octets = length
+            .map(|n| {
+                n.saturating_mul(if target == "CHAR" {
+                    u32::from(context.connection_mbmaxlen)
+                } else {
+                    1
+                })
+            })
+            .or(input.max_octets);
+    }
     if matches!(
         kind,
         ExprTypeKind::String {
@@ -1954,6 +2016,21 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     },
                     infer_expr_type(&args[0], context).nullable,
                 ),
+                "CHAR_USING" if args.len() == 2 => {
+                    let mut descriptor = infer_expr_type(&args[0], context);
+                    descriptor.kind = String {
+                        kind: StringKind::Character,
+                    };
+                    descriptor.coercibility = 4;
+                    if let Expr::Literal(Literal::String(charset)) = &args[1] {
+                        descriptor.collation_id =
+                            crate::charset::default_collation_for_charset(charset)
+                                .ok()
+                                .and_then(|name| crate::charset::resolve_collation(name).ok())
+                                .map(|info| info.id);
+                    }
+                    descriptor
+                }
                 "COLLATE" if args.len() == 2 => {
                     let mut descriptor = infer_expr_type(&args[0], context);
                     if let Expr::Literal(Literal::String(name)) = &args[1] {
@@ -2507,7 +2584,10 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                             Some(Temporal { fsp, .. }) => fsp,
                             Some(Decimal { scale, .. }) => scale.min(6),
                             Some(Integer { .. } | Year) => 0,
-                            _ => 6,
+                            _ => args
+                                .first()
+                                .map(|arg| temporal_argument_fsp(arg, context))
+                                .unwrap_or(0),
                         });
                     ExprType::new(
                         Temporal {
@@ -2543,6 +2623,15 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     }
                     let mut result =
                         ExprType::from_column_type(column_type, &ColumnSource::default());
+                    if matches!(
+                        name.to_ascii_uppercase().as_str(),
+                        "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNCATE"
+                    ) {
+                        result.nullable = first.is_none_or(|input| input.nullable)
+                            || args
+                                .get(1)
+                                .is_some_and(|arg| infer_expr_type(arg, context).nullable);
+                    }
                     if matches!(
                         name.to_ascii_uppercase().as_str(),
                         "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNCATE"

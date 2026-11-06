@@ -1267,17 +1267,10 @@ impl Database {
             }
             return Ok(false);
         }
-        let table = self
-            .catalog_read()?
-            .tables
-            .get(table_key)
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NO_SUCH_TABLE,
-                    format!("Table '{table_key}' doesn't exist"),
-                )
-            })?;
+        // Cache eviction leaves only an object header in the live catalog.
+        // Statistics publication replaces the DD table row, so retain a full
+        // current descriptor even when the cache cannot keep it resident.
+        let table = self.snapshot_table_schema(table_key)?;
         // Background statistics are optional while an online DDL owns a
         // descriptor. Publishing them would bump the same dependency revision
         // that the DDL validates at its final barrier, aborting a long build.
@@ -2934,4 +2927,30 @@ fn rank_page_correlation(pages: &[f64]) -> Option<f64> {
         return Some(1.0);
     }
     Some((cov / (var_x.sqrt() * var_y.sqrt())).abs().clamp(0.0, 1.0))
+}
+
+impl Database {
+    /// Reconstruct the committed BM25 corpus baseline from authoritative heap
+    /// visibility, once at open. Header-only scans avoid LOB/vector decoding;
+    /// ordinary queries retain the constant-time live-delta lookup.
+    fn restore_fulltext_live_row_counts(&self) -> Result<(), QueryError> {
+        let tables = self.user_table_snapshots()?;
+        let txn = TxnView::read_only(self.visible_scn(), IsolationLevel::ReadCommitted);
+        for table in tables {
+            if !table.indexes.iter().any(|index| index.is_fulltext()) {
+                continue;
+            }
+            let mut count = 0u64;
+            self.scan_rows_columns_streaming(&table.qualified_name(), txn, &[], |_| {
+                count = count.saturating_add(1);
+                Ok(())
+            })?;
+            let delta = (count as i128 - table.stats.row_count as i128)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            self.table_live_row_deltas
+                .write()
+                .insert(table.id, Arc::new(AtomicI64::new(delta)));
+        }
+        Ok(())
+    }
 }

@@ -296,6 +296,7 @@ fn prepared_point_update_mutates_wide_row_in_place_and_rolls_back_sparse_undo() 
     let mut state = PreparedDmlState::default();
     let hits_before = crate::storage::update_delta_hits();
     let sparse_hits_before = crate::storage::prepared_point_sparse_patch_hits_for_test();
+    let captured_before = crate::storage::captured_patch_preparations_for_test();
     let response = fast(
         &engine,
         &mut session,
@@ -308,6 +309,10 @@ fn prepared_point_update_mutates_wide_row_in_place_and_rolls_back_sparse_undo() 
     .unwrap();
     assert_eq!(affected(response), 1);
     assert!(crate::storage::update_delta_hits() > hits_before);
+    assert_eq!(
+        crate::storage::captured_patch_preparations_for_test(),
+        captured_before + 1
+    );
     assert_eq!(
         crate::storage::prepared_point_sparse_patch_hits_for_test(),
         sparse_hits_before + 1,
@@ -2829,4 +2834,117 @@ fn point_temporal_validation_proof_rebinds_after_schema_change() {
         (Err(actual), Err(expected)) => assert_eq!(actual.code(), expected.code()),
         (actual, expected) => panic!("temporal diagnostics differ: {actual:?} vs {expected:?}"),
     }
+}
+
+#[test]
+fn prepared_point_captured_patch_preserves_nullable_decimal_and_old_layout() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE t(id INT PRIMARY KEY, gone VARCHAR(20), amount DECIMAL(30,9), a INT NULL, b BIGINT NULL)").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES(1,'old-layout',123456789.123456789,NULL,1)")
+        .unwrap();
+    engine.execute("UPDATE t SET b=2 WHERE id=1").unwrap();
+    engine
+        .execute("ALTER TABLE t ALGORITHM=INSTANT, DROP COLUMN gone")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE t ALGORITHM=INSTANT, ADD COLUMN marker INT DEFAULT 7 FIRST")
+        .unwrap();
+    let original = result_rows(
+        engine
+            .execute("SELECT id,amount,a,b,marker FROM t")
+            .unwrap(),
+    );
+    let mut session = SessionContext::default();
+    let sql = "UPDATE t SET amount=amount+?,a=?,b=? WHERE id=?";
+    let parsed = engine.prepare_cached(&mut session, sql, 4).unwrap();
+    let mut state = PreparedDmlState::default();
+    engine.execute_with_session(&mut session, "BEGIN").unwrap();
+    let captured_before = crate::storage::captured_patch_preparations_for_test();
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(2), Value::Int(7), Value::Null, Value::Int(1)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        result_rows(
+            engine
+                .execute_with_session(&mut session, "SELECT id,amount,a,b,marker FROM t")
+                .unwrap()
+        ),
+        vec![vec![
+            Value::Int(1),
+            Value::DecimalCompact(123456791123456789, 9),
+            Value::Int(7),
+            Value::Null,
+            Value::Int(7)
+        ]]
+    );
+    assert_eq!(
+        result_rows(
+            engine
+                .execute("SELECT id,amount,a,b,marker FROM t")
+                .unwrap()
+        ),
+        original
+    );
+    engine
+        .execute_with_session(&mut session, "SAVEPOINT s")
+        .unwrap();
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(3), Value::Null, Value::Int(9), Value::Int(1)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        crate::storage::captured_patch_preparations_for_test(),
+        captured_before + 2
+    );
+    engine
+        .execute_with_session(&mut session, "ROLLBACK TO s")
+        .unwrap();
+    assert_eq!(
+        result_rows(
+            engine
+                .execute_with_session(&mut session, "SELECT amount,a,b FROM t")
+                .unwrap()
+        ),
+        vec![vec![
+            Value::DecimalCompact(123456791123456789, 9),
+            Value::Int(7),
+            Value::Null
+        ]]
+    );
+    engine
+        .execute_with_session(&mut session, "ROLLBACK")
+        .unwrap();
+    assert_eq!(
+        result_rows(
+            engine
+                .execute("SELECT id,amount,a,b,marker FROM t")
+                .unwrap()
+        ),
+        original
+    );
 }

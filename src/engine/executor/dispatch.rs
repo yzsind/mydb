@@ -28,7 +28,9 @@ pub(super) use views::{
     rewrite_insert_through_view, rewrite_update_through_view,
 };
 mod setop;
-pub(in crate::engine::executor) use setop::{coerce_setop_value, set_row_key};
+pub(in crate::engine::executor) use setop::{
+    coerce_setop_value, coerce_setop_value_from, set_row_key,
+};
 pub(crate) use setop::{
     combine_set_rows_spillable_charged, combine_set_sources_spillable,
     unify_setop_declared_column_metadata, IncrementalSetOutput,
@@ -322,6 +324,26 @@ fn is_session_temp_table_ref(session: &SessionContext, name: &str) -> bool {
             .temp_tables
             .values()
             .any(|table| table.internal_key.eq_ignore_ascii_case(name))
+}
+
+/// Only table-local writes may bypass persistent write barriers. Read sources
+/// may be persistent; mixed DROP and multi-target DML must check every writer.
+pub(crate) fn statement_writes_only_temp_tables(
+    session: &SessionContext,
+    statement: &Statement,
+) -> bool {
+    match statement {
+        Statement::CreateTable(stmt) => return stmt.temporary,
+        Statement::CreateTableLike { temporary, .. } => return *temporary,
+        Statement::CreateTableAsSelect { table, .. } => return table.temporary,
+        _ => {}
+    }
+    if session.temp_tables.is_empty() {
+        return false;
+    }
+    let uses = collect_statement_table_uses(statement);
+    let mut writes = uses.iter().filter(|usage| usage.write).peekable();
+    writes.peek().is_some() && writes.all(|usage| is_session_temp_table_ref(session, &usage.table))
 }
 
 pub(super) fn statement_is_temp_ddl(session: &SessionContext, statement: &Statement) -> bool {
@@ -7826,7 +7848,7 @@ pub(super) fn execute_qualified_statement(
                         crate::engine::expr::eval_const(&assignments[0].value)
                     })
                 })?;
-                session.set_user_variable(assignments[0].name.trim_start_matches('@'), value);
+                session.set_user_variable(assignments[0].name.trim_start_matches('@'), value)?;
                 return Ok(QueryResponse::Ok);
             }
             if assignments
@@ -8931,11 +8953,16 @@ pub(super) fn execute_qualified_statement(
                         .join(", ");
                     let sql = format!("DROP TABLE {if_exists_clause}{list}");
                     let ctx = super::binlog_ctx_from_session(session);
-                    let _ = crate::binlog::record_ddl_autocommit_with(
+                    if let Err(err) = crate::binlog::record_ddl_autocommit_with(
                         &session.current_database,
                         &sql,
                         &ctx,
-                    );
+                    ) {
+                        crate::engine::api::push_statement_condition(
+                            crate::error::ConditionLevel::Warning,
+                            &err,
+                        );
+                    }
                 }
             }
             if !temp_names.is_empty() {
@@ -10409,7 +10436,7 @@ fn execute_select_into_vars(
         ));
     }
     for (name, value) in targets.iter().zip(row.into_iter()) {
-        session.set_user_variable(name, value);
+        session.set_user_variable(name, value)?;
     }
     Ok(QueryResponse::Ok)
 }

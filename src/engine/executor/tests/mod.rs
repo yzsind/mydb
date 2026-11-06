@@ -537,3 +537,5 @@ mod lifecycle_json_index_audit_1031;
 mod release_audit_1101;
 
 mod xml_functions;
+
+mod audit_fixes_1106;

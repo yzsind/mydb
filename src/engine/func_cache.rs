@@ -286,7 +286,15 @@ fn compile_mysql_regex(
     }
     let fast = builder.build().map_err(|e| {
         let message = e.to_string();
-        let spec = if message.contains("unclosed character class") {
+        let spec = if message.contains("invalid character class range") {
+            crate::error::catalog::ER_REGEXP_INVALID_RANGE
+        } else if message.contains("Unicode property") || message.contains("unicode property") {
+            crate::error::catalog::ER_REGEXP_ILLEGAL_ARGUMENT
+        } else if message.contains("decimal literal")
+            || message.contains("repetition count") && message.contains("overflow")
+        {
+            crate::error::catalog::ER_REGEX_NUMBER_TOO_BIG
+        } else if message.contains("unclosed character class") {
             crate::error::catalog::ER_REGEXP_MISSING_CLOSE_BRACKET
         } else if message.contains("unclosed group") || message.contains("unopened group") {
             crate::error::catalog::ER_REGEXP_MISMATCHED_PAREN
@@ -558,11 +566,7 @@ mod tests {
             &**first,
             &crate::engine::expr::parse_gtid_set_uncached(text).unwrap()
         );
-        for text in [
-            "invalid",
-            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:3-1",
-            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:0",
-        ] {
+        for text in ["invalid", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:0"] {
             assert!(cached_gtid_set(text).is_err());
         }
         for end in 1..=GTID_SET_CACHE_CAPACITY * 2 {

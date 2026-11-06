@@ -164,6 +164,13 @@ parsed statement cache remains enabled. The parameter is read at process startup
 which suits differential verification or serves as a temporary escape hatch for
 plan cache failures; it does not affect SQL semantics.
 
+Parsed-statement and shared SELECT plan caches also have independent byte
+admission ceilings: each is sized at 1% of the startup working-set target,
+clamped to 1–64 MiB. Byte pressure evicts cached entries; an entry larger than
+its cache ceiling executes normally without being retained. Byte estimates
+include AST payloads and compiled-plan structures, so entry-count caps cannot
+retain an unbounded number of large SQL statements.
+
 Automatic checkpoints are triggered by `MYDB_CHECKPOINT_INTERVAL_MS` or
 `MYDB_CHECKPOINT_WAL_BYTES`. Setting the interval to zero disables only the
 periodic time trigger; WAL-size and explicit checkpoints remain enabled.
@@ -239,10 +246,14 @@ explicitly to override the default. This value does not open files in advance an
 is not a file cache capacity.
 
 `buffer_pool_file_cache_max` defaults to `1024` and bounds the number of file
-handles the buffer pool keeps long term; above the limit, idle handles are
-reclaimed with second chance. Under strict/relaxed durability, handles with
-pending fsync writes are kept until the sync completes, so the limit may be
-exceeded briefly; `0` explicitly disables the limit. Checkpoints in both modes
+handles the buffer pool keeps long term. The effective capacity is capped to a
+quarter of the process descriptor capacity, accounting for the extra direct-I/O
+descriptor on Linux and Darwin's kernel ceiling. Idle handles are reclaimed with
+second chance before opening another file; under strict/relaxed durability,
+pressure syncs pending writes in bounded batches before releasing descriptors,
+without depending on checkpoint progress. Active handles can temporarily exceed
+the limit; `0` explicitly disables the limit. Object handle caches also reserve
+descriptor headroom. Checkpoints in both modes
 sync written-back data files before releasing WAL; when history retention is
 enabled, undo history is synced as well, and replica restartpoints always sync
 undo. Outside of checkpoints, relaxed mode keeps its original weaker durability
@@ -1564,6 +1575,14 @@ format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.
 HTTP client SQL functions are enabled by default and require `HTTP_USE`. See
 [HTTP SQL Functions](http.md#node-configuration) for the `http_*` startup options,
 node egress policy, private CA bindings, account quotas, and runtime controls.
+
+### Date name locales
+
+`lc_time_names` supports `en_US`, `de_DE`, `fr_FR`, `es_ES`, `it_IT`,
+`pt_BR`, `zh_CN`, `ja_JP`, and `ko_KR`. Unsupported names return error 1649;
+assignments never silently fall back to English. It controls date name output.
+`STR_TO_DATE` recognizes English month and weekday names independently of this
+output setting, matching MySQL 8.0.
 
 ## REST SQL listener
 

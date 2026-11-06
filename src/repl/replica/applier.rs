@@ -396,6 +396,10 @@ impl Applier {
                 };
                 db.apply_wal_record_with_context(&record, &mut apply_context)
                     .map_err(|err| {
+                        if err.is_internal(crate::error::InternalErrorKind::ReplicaSnapshotBlocked)
+                        {
+                            return err;
+                        }
                         QueryError::internal_control(
                             crate::error::InternalErrorKind::ReplicaApplyFailure,
                             crate::error::catalog::ER_UNKNOWN_ERROR,

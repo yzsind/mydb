@@ -122,27 +122,39 @@ pub(crate) fn with_override_snapshot<R>(snapshot: OverrideSnapshot, f: impl FnOn
 }
 
 #[cfg(test)]
-pub fn with_vars<R>(vars: &[(&'static str, Option<&str>)], f: impl FnOnce() -> R) -> R {
-    OVERRIDES.with(|overrides| {
+pub(crate) struct ScopedVars {
+    depth: usize,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl Drop for ScopedVars {
+    fn drop(&mut self) {
+        OVERRIDES.with(|overrides| overrides.borrow_mut().truncate(self.depth));
+    }
+}
+
+/// Test fixtures use thread-local configuration and restore it on unwind.
+#[cfg(test)]
+pub(crate) fn scoped_vars(vars: &[(&'static str, Option<&str>)]) -> ScopedVars {
+    let depth = OVERRIDES.with(|overrides| {
         let mut overrides = overrides.borrow_mut();
+        let depth = overrides.len();
         for (key, value) in vars {
             overrides.push((*key, value.map(str::to_owned)));
         }
+        depth
     });
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-    OVERRIDES.with(|overrides| {
-        let mut overrides = overrides.borrow_mut();
-        for _ in vars {
-            overrides.pop();
-        }
-    });
-
-    match result {
-        Ok(value) => value,
-        Err(payload) => std::panic::resume_unwind(payload),
+    ScopedVars {
+        depth,
+        _thread_bound: std::marker::PhantomData,
     }
+}
+
+#[cfg(test)]
+pub fn with_vars<R>(vars: &[(&'static str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+    let _scope = scoped_vars(vars);
+    f()
 }
 
 /// Read a process-level boolean with the fulltext configuration's trimmed policy.

@@ -522,7 +522,8 @@ scalar_catalog! {
             [("UUID_TO_BIN", "uuid_to_bin"), ("INET6_ATON", "inet6_aton")] => (Unknown, Blob, None, false);
             [("INET_NTOA", "inet_ntoa")] => (Unknown, VarString, ( InetNtoa, 1, 1, Immutable, fixed_string_result(Some(31), true)), false);
             [("CAST", "cast")] => (Unknown, VarString, None, true);
-            [("CONV", "conv"), ("GREATEST", "greatest"), ("LEAST", "least"), ("INSERT", "insert"), ("BIN_TO_UUID", "bin_to_uuid"), ("INET6_NTOA", "inet6_ntoa"), ("CONVERT_USING", "convert_using"), ("COLLATE", "collate")] => (Unknown, VarString, None, false);
+            [("CONV", "conv")] => (Unknown, VarString, (Conv, 3, 3, Immutable, fixed_string_result(Some(65 * 4), true)), true);
+            [("GREATEST", "greatest"), ("LEAST", "least"), ("INSERT", "insert"), ("BIN_TO_UUID", "bin_to_uuid"), ("INET6_NTOA", "inet6_ntoa"), ("CONVERT_USING", "convert_using"), ("COLLATE", "collate")] => (Unknown, VarString, None, false);
         }
         LegacySession {
 

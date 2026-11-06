@@ -162,14 +162,7 @@ impl<'a> TemporalValue<'a> {
             (1, Domain::Exact)
         } else if name.eq_ignore_ascii_case("FROM_DAYS") || name.eq_ignore_ascii_case("SEC_TO_TIME")
         {
-            (
-                1,
-                if name.eq_ignore_ascii_case("SEC_TO_TIME") {
-                    Domain::Temporal
-                } else {
-                    Domain::Text
-                },
-            )
+            (1, Domain::Temporal)
         } else if name.eq_ignore_ascii_case("FORMAT_BYTES")
             || name.eq_ignore_ascii_case("FORMAT_PICO_TIME")
         {

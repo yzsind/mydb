@@ -730,3 +730,90 @@ impl Database {
         Ok(true)
     }
 }
+
+impl Database {
+    fn cleanup_unpublished_vector_generations(&self) -> Result<(), QueryError> {
+        if self.open_mode != DatabaseOpenMode::ReadWrite || self.physical_replica_mode() {
+            return Ok(());
+        }
+        // Catalog headers may have cold descriptors with no index metadata.
+        // Resolve authoritative descriptors before deciding file ownership.
+        let tables = self.user_table_snapshots()?;
+        let mut live = HashSet::new();
+        for table in &tables {
+            for index in table.indexes.iter().filter(|index| index.is_vector()) {
+                for storage_id in table.storage_ids() {
+                    let Some(manifest) = self.read_vector_manifest(table, index, storage_id)?
+                    else {
+                        continue;
+                    };
+                    for (owner, physical) in
+                        std::iter::once((manifest.physical_storage_id, manifest.active))
+                            .chain(manifest.retired)
+                    {
+                        let mut path = self.vector_generation_path(table, index, owner, physical);
+                        if manifest.resident {
+                            path.set_extension("hnsw");
+                        }
+                        live.insert(path.with_extension(format!(
+                            "{}.vpub",
+                            path.extension().unwrap().to_string_lossy()
+                        )));
+                        live.insert(path);
+                    }
+                }
+            }
+        }
+        // No source publisher or process-surviving reader exists at this
+        // startup boundary. Keep all manifest references, including physical
+        // owners moved by COPY/EXCHANGE and retired generations.
+        let mut directories = vec![self.data_dir.join("objects/indexes")];
+        while let Some(directory) = directories.pop() {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_err(err)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(io_err)?;
+                let kind = entry.file_type().map_err(io_err)?;
+                if kind.is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let in_generation_directory =
+                    directory.extension().is_some_and(|ext| ext == "vector");
+                let generated =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            let Some((id, suffix)) = name.split_once('.') else {
+                                return false;
+                            };
+                            id.parse::<u64>().is_ok()
+                                && matches!(suffix, "hvec" | "hnsw" | "hvec.vpub" | "hnsw.vpub")
+                        });
+                if !in_generation_directory || !generated || live.contains(&path) {
+                    continue;
+                }
+                let lsn = self.append_wal(
+                    0,
+                    WalPayload::FileDelete {
+                        path: self.relative_path(&path),
+                        before: Vec::new(),
+                    },
+                )?;
+                crate::wal::LogManager::sync_durable_to(&self.log, lsn)?;
+                self.buffer_pool.discard_pages_for_path(&path)?;
+                fs::remove_file(&path).map_err(io_err)?;
+                retire_page_owner_proof(&path);
+                crate::platform::fs::sync_path(&directory).map_err(io_err)?;
+            }
+        }
+        Ok(())
+    }
+}

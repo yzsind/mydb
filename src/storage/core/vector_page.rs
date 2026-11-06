@@ -667,8 +667,11 @@ fn node_page_append_native(
 
 /// Locate a record offset by slot, validating bounds.
 fn node_record_offset(buf: &[u8], slot: u16) -> Result<usize, QueryError> {
+    if buf.len() != PAGE_SIZE {
+        return Err(crate::engine::vector::persistence::corrupt());
+    }
     let slot_count = read_u16(buf, NODE_OFF_SLOT_COUNT);
-    if slot >= slot_count {
+    if slot_count > NODE_ID_SLOTS_PER_PAGE || slot >= slot_count {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "vector index: slot out of range",
@@ -798,6 +801,13 @@ fn node_page_navigation_ssd(
         return Ok(None);
     }
     let code_off = rec_off + 10 + dim * 4;
+    if code_off
+        .checked_add(dim)
+        .and_then(|end| end.checked_add(4))
+        .is_none_or(|end| end > buf.len())
+    {
+        return Err(crate::engine::vector::persistence::corrupt());
+    }
     let norm = read_u32(buf, code_off + dim) as i32;
     let code_bytes = &buf[code_off..code_off + dim];
     // Every i8 bit pattern is valid, and the borrowed slice cannot outlive
@@ -838,6 +848,12 @@ fn node_page_read_neighbors_into(
         return false;
     }
     let count_off = layer_count_offset(rec_off, level, dim, m, m0);
+    if count_off
+        .checked_add(2 + layer_cap(level, m, m0) * 4)
+        .is_none_or(|end| end > buf.len())
+    {
+        return false;
+    }
     let count = read_u16(buf, count_off) as usize;
     let n = count.min(layer_cap(level, m, m0));
     let vids_off = count_off + 2;
@@ -1004,15 +1020,21 @@ impl VectorIndexFile {
         &self,
         bytes: usize,
     ) -> Option<crate::engine::executor::mem_budget::ControlledMemoryCharge> {
-        use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
         ControlledMemoryCharge::try_new_optional_with_cache_reclaim(
             ControlledMemoryCategory::DerivedCache,
             bytes,
             |target| {
-                if let Some(database) = crate::engine::executor::mem_budget::current_reclaim_database() {
+                if let Some(database) =
+                    crate::engine::executor::mem_budget::current_reclaim_database()
+                {
                     database.reclaim_vector_navigation_caches();
                 }
-                let _ = self.buffer_pool.reclaim_for_memory_target(target, Duration::from_millis(100));
+                let _ = self
+                    .buffer_pool
+                    .reclaim_for_memory_target(target, Duration::from_millis(100));
             },
         )
     }
@@ -1274,7 +1296,7 @@ impl VectorIndexFile {
             file.set_len((last_page + 1) * PAGE_SIZE as u64)
                 .map_err(io_err)?;
             file.flush().map_err(io_err)?;
-            if self.durability == DurabilityMode::Strict {
+            if self.durability != DurabilityMode::Memory {
                 crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
             }
             self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes;
@@ -1282,7 +1304,7 @@ impl VectorIndexFile {
             file.set_len((last_page + 1) * PAGE_SIZE as u64)
                 .map_err(io_err)?;
             file.flush().map_err(io_err)?;
-            if self.durability == DurabilityMode::Strict {
+            if self.durability != DurabilityMode::Memory {
                 crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
             }
         }
@@ -2277,6 +2299,13 @@ impl VectorIndexFile {
                     return Ok(None);
                 }
                 let start = rec + 10 + self.dim_fixed * 4;
+                if start
+                    .checked_add(self.dim_fixed)
+                    .and_then(|end| end.checked_add(4))
+                    .is_none_or(|end| end > bytes.len())
+                {
+                    return Err(crate::engine::vector::persistence::corrupt());
+                }
                 let raw = &bytes[start..start + self.dim_fixed];
                 out.clear();
                 // SAFETY: all i8 bit patterns are valid; this borrow stays pinned.
@@ -2500,6 +2529,9 @@ impl VectorIndexFile {
                             ));
                         }
                         let code_off = rec_off + 10 + dim * 4;
+                        if rec_off.checked_add(node_record_size(bytes[rec_off + 1] as usize, dim, m, m0)).is_none_or(|end| end > bytes.len()) {
+                            return Err(crate::engine::vector::persistence::corrupt());
+                        }
                         let vector_bytes = &bytes[rec_off + 10..code_off];
                         let row_id = vec_unpack_row(read_u64(bytes, rec_off + 2));
                         let deleted = flags & REC_FLAG_TOMBSTONE != 0;
@@ -2894,6 +2926,14 @@ impl VectorIndexFile {
             }
             self.buffer_pool.flush_file(&self.file_key)?;
         }
+        if !wal_finalize && self.durability == DurabilityMode::Relaxed {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .map_err(io_err)?;
+            crate::platform::fs::sync_file_data_at(&file, &self.path).map_err(io_err)?;
+        }
         {
             let mut state = self.meta_state.lock();
             state.meta.finalized = true;
@@ -3081,6 +3121,27 @@ mod vector_page_tests {
             mid: 0.0,
             inv_scale: 1.0,
         }
+    }
+
+    #[test]
+    fn release1106_corrupt_navigation_record_reports_error_without_panicking() {
+        let mut page = vec![0; PAGE_SIZE];
+        format_empty_node_page(&mut page);
+        write_u16(&mut page, NODE_OFF_SLOT_COUNT, 1);
+        write_u16(&mut page, NODE_OFF_DIRECTORY, (PAGE_SIZE - 10) as u16);
+        page[PAGE_SIZE - 10] = REC_FLAG_INITIALIZED;
+        assert!(node_page_navigation_ssd(&page, 0, 8, &[0; 8], 0).is_err());
+        assert!(!node_page_read_neighbors_into(
+            &page,
+            0,
+            0,
+            8,
+            4,
+            8,
+            &mut Vec::new()
+        ));
+        write_u16(&mut page, NODE_OFF_SLOT_COUNT, u16::MAX);
+        assert!(node_record_offset(&page, u16::MAX - 1).is_err());
     }
 
     #[test]
@@ -3612,11 +3673,18 @@ mod vector_page_tests {
 
     #[test]
     fn mapped_navigation_record_cache_bounds_budget_and_native_geometries() {
-        for datatype in [crate::vector::VectorDataType::Float32,
-            crate::vector::VectorDataType::Float16, crate::vector::VectorDataType::BFloat16,
-            crate::vector::VectorDataType::Int8, crate::vector::VectorDataType::Binary] {
-            let geometry = if datatype == crate::vector::VectorDataType::Float32 { 16 }
-                else { native_vector_geometry(datatype, 16) as usize };
+        for datatype in [
+            crate::vector::VectorDataType::Float32,
+            crate::vector::VectorDataType::Float16,
+            crate::vector::VectorDataType::BFloat16,
+            crate::vector::VectorDataType::Int8,
+            crate::vector::VectorDataType::Binary,
+        ] {
+            let geometry = if datatype == crate::vector::VectorDataType::Float32 {
+                16
+            } else {
+                native_vector_geometry(datatype, 16) as usize
+            };
             let bytes = node_record_size(0, geometry, 8, 16);
             assert!(MappedRecordCache::try_new(4, bytes, 0).is_none());
             assert!(MappedRecordCache::try_new(usize::MAX, bytes, usize::MAX).is_none());
@@ -3642,53 +3710,70 @@ mod vector_page_tests {
         let vectors = gen_vectors(16, 8, 1987);
         let (graph, vids) = build_paged_with_wal_mode(dir.path(), "mapped", 8, 0, &vectors, true);
         let good = vids[0];
-        let bad = *vids.iter().rev().find(|&&id| vid_page(id) == vid_page(good) && id != good).unwrap();
+        let bad = *vids
+            .iter()
+            .rev()
+            .find(|&&id| vid_page(id) == vid_page(good) && id != good)
+            .unwrap();
         graph.file().flush().unwrap();
         graph.file().mapped_navigation.write().take();
-        let mut raw = std::fs::OpenOptions::new().read(true).write(true)
-            .open(dir.path().join("vec__1__mapped.hvec")).unwrap();
+        let mut raw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("vec__1__mapped.hvec"))
+            .unwrap();
         let mut page = vec![0u8; PAGE_SIZE];
-        raw.seek(SeekFrom::Start(vid_page(bad) * PAGE_SIZE as u64)).unwrap();
+        raw.seek(SeekFrom::Start(vid_page(bad) * PAGE_SIZE as u64))
+            .unwrap();
         raw.read_exact(&mut page).unwrap();
         let offset = node_record_offset(&page, vid_slot(bad)).unwrap();
         page[offset + 1] = 17;
         let checksum = page_checksum(&page, 16);
         write_u32(&mut page, 16, checksum);
-        raw.seek(SeekFrom::Start(vid_page(bad) * PAGE_SIZE as u64)).unwrap();
+        raw.seek(SeekFrom::Start(vid_page(bad) * PAGE_SIZE as u64))
+            .unwrap();
         raw.write_all(&page).unwrap();
         assert!(graph.file().prepare_navigation_mapping().unwrap());
-        graph.file().with_navigation_mapping(|view| {
-            let cache = view.records.as_ref().expect("small optional location cache");
-            assert_eq!(cache.get(good), None);
-            assert_eq!(cache.get(bad), None);
-            for id in [good, bad, vid_make(0, 0), vid_make(u32::MAX as u64, 255)] {
-                view.prefetch_navigation_node(id);
-            }
-            assert_eq!(cache.get(good), None);
-            assert_eq!(cache.get(bad), None);
-            std::thread::scope(|scope| {
-                let mut readers = Vec::new();
-                for _ in 0..8 {
-                    readers.push(scope.spawn(|| {
-                        let mut expected = None;
-                        for _ in 0..100 {
-                            let (_, offset) = view.record(good).unwrap();
-                            assert_eq!(*expected.get_or_insert(offset), offset);
-                        }
-                    }));
+        graph
+            .file()
+            .with_navigation_mapping(|view| {
+                let cache = view
+                    .records
+                    .as_ref()
+                    .expect("small optional location cache");
+                assert_eq!(cache.get(good), None);
+                assert_eq!(cache.get(bad), None);
+                for id in [good, bad, vid_make(0, 0), vid_make(u32::MAX as u64, 255)] {
+                    view.prefetch_navigation_node(id);
                 }
-                for reader in readers { reader.join().unwrap(); }
-            });
-            assert!(cache.get(good).is_some());
-            view.prefetch_navigation_node(good);
-            view.prefetch_navigation_node(bad);
-            assert_eq!(cache.get(bad), None);
-            // Validating one requested record must not validate another
-            // record early merely because they share a checksummed page.
-            assert!(view.record(bad).is_err());
-            assert_eq!(cache.get(bad), None);
-            assert!(view.record(good).is_ok());
-        }).unwrap();
+                assert_eq!(cache.get(good), None);
+                assert_eq!(cache.get(bad), None);
+                std::thread::scope(|scope| {
+                    let mut readers = Vec::new();
+                    for _ in 0..8 {
+                        readers.push(scope.spawn(|| {
+                            let mut expected = None;
+                            for _ in 0..100 {
+                                let (_, offset) = view.record(good).unwrap();
+                                assert_eq!(*expected.get_or_insert(offset), offset);
+                            }
+                        }));
+                    }
+                    for reader in readers {
+                        reader.join().unwrap();
+                    }
+                });
+                assert!(cache.get(good).is_some());
+                view.prefetch_navigation_node(good);
+                view.prefetch_navigation_node(bad);
+                assert_eq!(cache.get(bad), None);
+                // Validating one requested record must not validate another
+                // record early merely because they share a checksummed page.
+                assert!(view.record(bad).is_err());
+                assert_eq!(cache.get(bad), None);
+                assert!(view.record(good).is_ok());
+            })
+            .unwrap();
     }
 
     #[test]
@@ -3707,19 +3792,31 @@ mod vector_page_tests {
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             // Exercise an exact-query memo hit before revoking the view.
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
-            graph.file().with_navigation_mapping(|view| {
-                // Reclamation during an active read must be nonblocking.
-                let _ = view.record(vids[17]).unwrap();
-                graph.evict_query_navigation();
-                assert!(view.records.as_ref().is_none_or(|cache| cache.get(vids[17]).is_some()));
-            }).unwrap();
+            graph
+                .file()
+                .with_navigation_mapping(|view| {
+                    // Reclamation during an active read must be nonblocking.
+                    let _ = view.record(vids[17]).unwrap();
+                    graph.evict_query_navigation();
+                    assert!(view
+                        .records
+                        .as_ref()
+                        .is_none_or(|cache| cache.get(vids[17]).is_some()));
+                })
+                .unwrap();
             assert!(graph.file().with_navigation_mapping(|_| ()).is_some());
             graph.evict_query_navigation();
             assert!(graph.file().with_navigation_mapping(|_| ()).is_none());
             assert!(graph.file().prepare_navigation_mapping().unwrap());
-            graph.file().with_navigation_mapping(|view| {
-                assert!(view.records.as_ref().is_none_or(|cache| cache.get(vids[17]).is_none()));
-            }).unwrap();
+            graph
+                .file()
+                .with_navigation_mapping(|view| {
+                    assert!(view
+                        .records
+                        .as_ref()
+                        .is_none_or(|cache| cache.get(vids[17]).is_none()));
+                })
+                .unwrap();
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             graph
                 .mark_deleted_by_row_id(RowId {
@@ -3969,7 +4066,12 @@ mod vector_page_tests {
         graph.refresh_query_navigation().unwrap();
         assert!(!graph.has_query_navigation_for_test());
         assert_eq!(graph.search(&vectors[0], 10, 64).unwrap(), expected[0]);
-        assert_eq!(std::fs::read_dir(crate::storage::naming::system_tmp_dir(dir.path())).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(crate::storage::naming::system_tmp_dir(dir.path()))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -3980,24 +4082,45 @@ mod vector_page_tests {
         graph.file().disable_navigation_mapping();
         graph.refresh_query_navigation().unwrap();
         for query in &vectors[..8] {
-            let candidates = graph.search_navigation_candidates(query, 64, 64).unwrap().unwrap();
+            let candidates = graph
+                .search_navigation_candidates(query, 64, 64)
+                .unwrap()
+                .unwrap();
             let mut exact = Vec::new();
             for (row, _) in candidates {
                 let vid = vids[row.page_id as usize];
-                let (_, deleted, distance) = graph.file().read_vector_meta_distance(vid, query, crate::engine::vector::Metric::L2).unwrap().unwrap();
+                let (_, deleted, distance) = graph
+                    .file()
+                    .read_vector_meta_distance(vid, query, crate::engine::vector::Metric::L2)
+                    .unwrap()
+                    .unwrap();
                 assert!(!deleted);
                 exact.push((row, distance));
             }
-            exact.sort_unstable_by(|a,b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             exact.truncate(10);
             assert_eq!(exact, graph.search(query, 10, 64).unwrap());
         }
-        let deleted = RowId { page_id: 0, slot_id: 0 };
+        let deleted = RowId {
+            page_id: 0,
+            slot_id: 0,
+        };
         graph.mark_deleted_by_row_id(deleted).unwrap();
         graph.refresh_query_navigation().unwrap();
-        assert!(!graph.search_navigation_candidates(&vectors[0], 64, 64).unwrap().unwrap().iter().any(|(row,_)| *row == deleted));
-        assert!(graph.search_navigation_candidates(&vectors[0], 128, 128).unwrap().is_none());
-        assert!(graph.search_navigation_candidates(&vec![1e20; 24], 64, 64).unwrap().is_none());
+        assert!(!graph
+            .search_navigation_candidates(&vectors[0], 64, 64)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .any(|(row, _)| *row == deleted));
+        assert!(graph
+            .search_navigation_candidates(&vectors[0], 128, 128)
+            .unwrap()
+            .is_none());
+        assert!(graph
+            .search_navigation_candidates(&vec![1e20; 24], 64, 64)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

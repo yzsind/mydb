@@ -777,6 +777,7 @@ impl Database {
             zone_map_load_locks: std::array::from_fn(|_| Mutex::new(None)),
             zone_map_retirement_epoch: AtomicU64::new(0),
             pending_vector_deletes: Mutex::new(Default::default()),
+            pending_heap_shrinks: Arc::new(HeapShrinkRegistry::default()),
             vector_commits_publishing: parking_lot::Mutex::new(Default::default()),
             vector_recovery_active: AtomicBool::new(false),
             #[cfg(test)]
@@ -1166,6 +1167,8 @@ impl Database {
                     .map(|slot| (slot.txn_id, slot.status, slot.commit_scn.unwrap_or(0))),
             );
         }
+        db.cleanup_unpublished_vector_generations()?;
+        db.restore_fulltext_live_row_counts()?;
         recovery.wal_recovery_us = wal_recovery_us;
         recovery.total_startup_us = startup_started
             .elapsed()

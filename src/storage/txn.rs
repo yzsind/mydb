@@ -4998,6 +4998,13 @@ impl LockManager {
         owner: u64,
         lock: UniqueKeyLock,
     ) -> Result<(), QueryError> {
+        crate::util::lock_diagnostics::unique_blocker(
+            txn_id,
+            owner,
+            lock.table_id,
+            &lock.index_name,
+            &lock.key,
+        );
         self.record_resource_wait(
             txn_id,
             smallvec::smallvec![owner],
@@ -5571,6 +5578,15 @@ impl LockManager {
             .collect::<Vec<_>>();
         for &waiter in &affected_waiters {
             let remove_wait = self.waits_for.get_mut(&waiter).is_some_and(|wait| {
+                if let LockWaitResource::Unique(lock) = &wait.resource {
+                    crate::util::lock_diagnostics::unique_owner_released(
+                        waiter,
+                        txn_id,
+                        lock.table_id,
+                        &lock.index_name,
+                        &lock.key,
+                    );
+                }
                 wait.owners.retain(|owner| *owner != txn_id);
                 wait.owners.is_empty()
             });

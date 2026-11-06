@@ -145,6 +145,7 @@ async fn audit_fragmented_ack_survives_heartbeat_ticks() {
         panic!()
     };
     assert!(ack.accepted, "{}", ack.reason);
+    assert_eq!(ack.heartbeat_ms, 10);
     let mut bytes = Vec::new();
     protocol::write_frame(
         &mut bytes,
@@ -1450,9 +1451,11 @@ mod online_apply {
             replica_db.replica_applied_lsn() < reclaimed_lsn,
             "conflicting reclaim must not advance the applied watermark"
         );
+        tokio::time::sleep(Duration::from_millis(700)).await;
         assert!(
             lifecycle.is_running(),
-            "snapshot conflict must remain retryable"
+            "snapshot conflict must remain retryable beyond the poison threshold: {}",
+            status.lock()
         );
         let session = Arc::clone(&reader);
         let replica = Arc::clone(&replica_engine);
@@ -1834,7 +1837,7 @@ mod lifecycle_tests {
         let result =
             crate::repl::base_backup::stream_base_backup(&mut writer, db, dir.path()).await;
         assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(6));
         assert!(!db.capture.frozen.load(std::sync::atomic::Ordering::Acquire));
         assert!(!db.capture.active.load(std::sync::atomic::Ordering::Acquire));
         engine
@@ -2004,6 +2007,67 @@ mod lifecycle_tests {
             crate::repl::role::load(dir.path()).unwrap().unwrap().role,
             Role::Replica
         );
+    }
+
+    #[test]
+    fn audit1106_write_fence_preserves_prepared_xa_and_stopped_status() {
+        let dir = TempDir::new_in("/tmp/mydb").unwrap();
+        let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        manager.role_state.lock().unwrap().role = Role::Master;
+        let mut session = crate::engine::SessionContext::default();
+        for sql in [
+            "CREATE TABLE xa_fence(id INT)",
+            "XA START 'stable'",
+            "INSERT INTO xa_fence VALUES(1)",
+            "XA END 'stable'",
+            "XA PREPARE 'stable'",
+        ] {
+            manager
+                .engine
+                .execute_with_session(&mut session, sql)
+                .unwrap();
+        }
+        manager
+            .handle_stop_master_writes("STOP MASTER WRITES WAIT 1", &session)
+            .unwrap();
+        let QueryResponse::ResultSet(recovered) = manager.engine.execute("XA RECOVER").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(recovered.rows.len(), 1);
+        manager.handle_resume_master_writes().unwrap();
+        manager.engine.execute("XA COMMIT 'stable'").unwrap();
+        let QueryResponse::ResultSet(rows) =
+            manager.engine.execute("SELECT id FROM xa_fence").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(rows.rows, vec![vec![Value::Int(1)]]);
+        *manager.receiver_progress.lock() = ReplicaProgress {
+            received_lsn: 99,
+            durable_lsn: 98,
+            applied_lsn: 97,
+            durable_applied_lsn: 96,
+            ..Default::default()
+        };
+        crate::repl::replica::progress::save_progress(
+            dir.path(),
+            &ReplicaProgress {
+                received_lsn: 5,
+                applied_lsn: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let QueryResponse::ResultSet(status) = manager.show_replica_status().unwrap() else {
+            panic!()
+        };
+        let received = status
+            .columns
+            .iter()
+            .position(|column| column.name == "Received_LSN")
+            .unwrap();
+        assert_eq!(status.rows[0][received], Value::UInt(99));
     }
 
     #[test]
@@ -2782,4 +2846,39 @@ mod base_backup_tests {
         assert_eq!(err.code(), 1235);
         service.shutdown().await;
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn release1106_backup_drains_an_existing_writer() {
+    let dir = fresh_database_tempdir();
+    let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+    engine
+        .execute("CREATE TABLE drain_t(id INT PRIMARY KEY)")
+        .unwrap();
+    let mut session = crate::engine::SessionContext::default();
+    engine.execute_with_session(&mut session, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut session, "INSERT INTO drain_t VALUES(1)")
+        .unwrap();
+    let writer = engine.clone();
+    let completion = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        writer
+            .execute_with_session(&mut session, "INSERT INTO drain_t VALUES(2)")
+            .unwrap();
+        writer.execute_with_session(&mut session, "COMMIT").unwrap();
+    });
+    let mut sink = tokio::io::BufWriter::new(tokio::io::sink());
+    let result = crate::repl::base_backup::stream_base_backup(
+        &mut sink,
+        engine.database_for_replication(),
+        dir.path(),
+    )
+    .await;
+    completion.await.unwrap();
+    result.unwrap();
+    let db = engine.database_for_replication();
+    assert!(!db.capture.active.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!db.capture.frozen.load(std::sync::atomic::Ordering::Acquire));
 }

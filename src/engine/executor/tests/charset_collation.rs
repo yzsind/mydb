@@ -248,7 +248,7 @@ fn in_list_aggregates_all_operand_collations_with_mysql_errnos() {
                 .execute_with_session(
                     &mut session,
                     "SELECT * FROM coll_in
-                     WHERE 'a' COLLATE latin1_general_ci IN (a,b,c)",
+                     WHERE _latin1'a' COLLATE latin1_general_ci IN (a,b,c)",
                 )
                 .unwrap();
 

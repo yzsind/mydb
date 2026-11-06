@@ -430,6 +430,7 @@ pub fn optimizer_switch_fingerprint(value: &str) -> u64 {
 pub struct CachedStatement {
     pub ast: Arc<Statement>,
     pub epoch: u64,
+    _bytes: CacheByteLease,
 }
 
 #[derive(Debug, Default)]
@@ -461,6 +462,80 @@ struct Counters {
     misses: AtomicU64,
     stale_evictions: AtomicU64,
     lru_evictions: AtomicU64,
+}
+
+/// Bound cache admission by retained bytes as well as entry count. Leases
+/// follow shared entries, including plans still used by an executing query.
+#[derive(Debug)]
+struct CacheByteQuota {
+    used: AtomicU64,
+    limit: u64,
+}
+#[derive(Debug)]
+struct CacheByteLease {
+    quota: Arc<CacheByteQuota>,
+    bytes: u64,
+}
+impl CacheByteQuota {
+    fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicU64::new(0),
+            limit,
+        })
+    }
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<CacheByteLease> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.limit)
+            })
+            .ok()?;
+        Some(CacheByteLease {
+            quota: self.clone(),
+            bytes,
+        })
+    }
+}
+impl Drop for CacheByteLease {
+    fn drop(&mut self) {
+        self.quota.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+fn cache_byte_limit() -> u64 {
+    (crate::engine::executor::mem_budget::memory_target_bytes() / 100)
+        .clamp(1024 * 1024, 64 * 1024 * 1024) as u64
+}
+
+#[derive(Default)]
+struct AstBytes(u64);
+impl crate::parser::visit::AstVisitor for AstBytes {
+    fn enter_expr(&mut self, expr: &Expr) {
+        use crate::parser::Literal;
+        self.0 = self.0.saturating_add(std::mem::size_of::<Expr>() as u64);
+        let payload = match expr {
+            Expr::Literal(Literal::String(s) | Literal::Decimal(s))
+            | Expr::Identifier(s)
+            | Expr::UserVariable(s) => s.capacity(),
+            Expr::Literal(Literal::HexBytes(bytes) | Literal::BitBytes(bytes)) => bytes.capacity(),
+            Expr::CompoundIdentifier(parts) => parts.iter().map(String::capacity).sum(),
+            Expr::Function { name, .. } => name.capacity(),
+            Expr::BoundValue(value) => {
+                crate::engine::executor::mem_budget::estimate_value_bytes(value)
+            }
+            _ => 0,
+        };
+        self.0 = self.0.saturating_add(payload as u64);
+    }
+    fn enter_select(&mut self, select: &Select) {
+        self.0 = self.0.saturating_add(std::mem::size_of::<Select>() as u64);
+        for item in &select.projection {
+            if let SelectItem::Expr {
+                alias: Some(name), ..
+            } = item
+            {
+                self.0 = self.0.saturating_add(name.capacity() as u64);
+            }
+        }
+    }
 }
 
 /// Shard count for the statement / plan caches. Production-sized caches
@@ -534,6 +609,37 @@ impl<K: std::hash::Hash + Eq, V> ShardedLru<K, V> {
         (size, bytes)
     }
 
+    fn admit(
+        &self,
+        quota: &Arc<CacheByteQuota>,
+        bytes: u64,
+        evictions: &AtomicU64,
+    ) -> Option<CacheByteLease> {
+        if bytes > quota.limit {
+            return None;
+        }
+        loop {
+            if let Some(lease) = quota.reserve(bytes) {
+                return Some(lease);
+            }
+            let mut removed = false;
+            for shard in &self.shards {
+                let old = shard.lock().pop_lru();
+                if old.is_some() {
+                    removed = true;
+                    evictions.fetch_add(1, Ordering::Relaxed);
+                }
+                drop(old);
+                if let Some(lease) = quota.reserve(bytes) {
+                    return Some(lease);
+                }
+            }
+            if !removed {
+                return None;
+            }
+        }
+    }
+
     fn put(&self, key: K, value: V, evictions: &AtomicU64) {
         let mut guard = self.shard_for(&key).lock();
         if guard.len() == guard.cap().get() && guard.peek(&key).is_none() {
@@ -564,6 +670,7 @@ pub struct ParsedStatementCache {
     entries: ShardedLru<ParsedStatementKey, Arc<CachedStatement>>,
     epoch: Arc<CacheEpoch>,
     counters: Counters,
+    byte_quota: Arc<CacheByteQuota>,
 }
 
 impl ParsedStatementCache {
@@ -576,6 +683,7 @@ impl ParsedStatementCache {
             entries: ShardedLru::new(capacity),
             epoch,
             counters: Counters::default(),
+            byte_quota: CacheByteQuota::new(cache_byte_limit()),
         }
     }
 
@@ -630,9 +738,21 @@ impl ParsedStatementCache {
     /// Insert (or replace) a cached AST for `key`. Returns the inserted Arc so
     /// callers can use it directly without a follow-up `get`.
     pub fn insert(&self, key: ParsedStatementKey, ast: Arc<Statement>) -> Arc<Statement> {
+        let mut estimate = AstBytes::default();
+        crate::parser::visit::visit_statement(&mut estimate, &ast);
+        let bytes = parsed_key_bytes(&key)
+            .saturating_add(estimate.0)
+            .saturating_add(STMT_ENTRY_OVERHEAD);
+        let Some(lease) = self
+            .entries
+            .admit(&self.byte_quota, bytes, &self.counters.lru_evictions)
+        else {
+            return ast;
+        };
         let entry = Arc::new(CachedStatement {
             ast: Arc::clone(&ast),
             epoch: self.epoch.current(),
+            _bytes: lease,
         });
         self.entries.put(key, entry, &self.counters.lru_evictions);
         ast
@@ -890,6 +1010,7 @@ pub struct ProjectedPointLookupOperator {
 #[derive(Debug)]
 pub enum CompiledOperator {
     ProjectedUniquePointLookup(Arc<ProjectedPointLookupOperator>),
+    StreamingIndexPrefixSum,
     ProjectedIndexRangeOrMultiLookup,
     FusedScanFilterProjectLimit,
     OrderedIndexScan,
@@ -906,6 +1027,12 @@ impl CompiledOperator {
             )
         {
             return Self::ProjectedUniquePointLookup(Arc::new(operator));
+        }
+
+        // Prefix cardinality estimates can be wrong. This kernel streams
+        // bounded chunks even when a supposedly small prefix is highly skewed.
+        if crate::engine::executor::select::simple::prefer_streaming_prefix_sum(select, plan) {
+            return Self::StreamingIndexPrefixSum;
         }
 
         fn classify(plan: &PhysicalPlan, projected: bool, limited: bool) -> CompiledOperator {
@@ -1056,6 +1183,7 @@ pub struct CompiledSelectPlan {
     /// Per-entry hit counter, bumped on each cache hit. Powers the
     /// per-plan `HITS` column of `information_schema.mydb_plan_cache`.
     pub hits: AtomicU64,
+    _cache_bytes: Option<CacheByteLease>,
 }
 
 impl CompiledSelectPlan {
@@ -1099,6 +1227,7 @@ impl CompiledSelectPlan {
             required_privileges: OnceLock::new(),
             mdl_requests: OnceLock::new(),
             hits: AtomicU64::new(0),
+            _cache_bytes: None,
         }
     }
 
@@ -1168,6 +1297,7 @@ pub struct PlanCache {
     entries: ShardedLru<StatementKey, Arc<CompiledSelectPlan>>,
     epoch: Arc<CacheEpoch>,
     counters: PlanCounters,
+    byte_quota: Arc<CacheByteQuota>,
 }
 
 impl PlanCache {
@@ -1180,6 +1310,7 @@ impl PlanCache {
             entries: ShardedLru::new(capacity),
             epoch,
             counters: PlanCounters::default(),
+            byte_quota: CacheByteQuota::new(cache_byte_limit()),
         }
     }
 
@@ -1290,13 +1421,28 @@ impl PlanCache {
         deps: SmallVec<[PlanDep; 4]>,
         object_deps: SmallVec<[ObjectDep; 2]>,
     ) -> Arc<CompiledSelectPlan> {
-        let entry = Arc::new(CompiledSelectPlan::new(
+        let mut entry = CompiledSelectPlan::new(
             semantic_select,
             physical,
             deps,
             object_deps,
             self.epoch.current(),
-        ));
+        );
+        let mut estimate = AstBytes::default();
+        crate::parser::visit::visit_select(&mut estimate, &entry.semantic_select);
+        let mut nodes = 0u64;
+        crate::planner::walk_plan(&entry.physical, &mut |_| nodes = nodes.saturating_add(1));
+        let bytes = key_bytes(&key)
+            .saturating_add(estimate.0.saturating_mul(3))
+            .saturating_add(nodes.saturating_mul(PLAN_ENTRY_OVERHEAD));
+        let lease = self
+            .entries
+            .admit(&self.byte_quota, bytes, &self.counters.lru_evictions);
+        if lease.is_none() {
+            return Arc::new(entry);
+        }
+        entry._cache_bytes = lease;
+        let entry = Arc::new(entry);
         self.entries
             .put(key, Arc::clone(&entry), &self.counters.lru_evictions);
         entry
@@ -2013,5 +2159,33 @@ mod tests {
         assert_eq!(stats.hits + stats.misses, (WORKERS * ROUNDS * 16) as u64);
         assert_eq!(cache.current_epoch(), initial_epoch + ROUNDS as u64);
         assert!(stats.size <= 64, "size respects capacity");
+    }
+}
+
+#[cfg(test)]
+mod audit1106_byte_tests {
+    use super::*;
+    #[test]
+    fn audit1106_statement_byte_cap_evicts_and_rejects_large_entries() {
+        let mut cache = ParsedStatementCache::new(4096);
+        cache.byte_quota = CacheByteQuota::new(4096);
+        for i in 0..64 {
+            let sql = format!("SELECT '{}' AS n{i}", "x".repeat(200));
+            let statement = crate::parser::parse_statement(&sql).unwrap();
+            cache.insert(ParsedStatementKey::new(&sql, 0), Arc::new(statement));
+            assert!(cache.byte_quota.used.load(Ordering::Acquire) <= 4096);
+        }
+        assert!(cache.stats().size < 64);
+        let before = cache.stats().size;
+        let sql = format!("SELECT '{}'", "x".repeat(5000));
+        let key = ParsedStatementKey::new(&sql, 0);
+        cache.insert(
+            key.clone(),
+            Arc::new(crate::parser::parse_statement(&sql).unwrap()),
+        );
+        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.stats().size, before);
+        cache.clear();
+        assert_eq!(cache.byte_quota.used.load(Ordering::Acquire), 0);
     }
 }

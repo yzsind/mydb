@@ -1441,7 +1441,7 @@ impl Database {
         // slice.
         let mut backfill_scratch: Vec<Value> = Vec::new();
         let read_plan = ProjectedReadPlan::new(columns, &table_schema);
-        self.with_heap_mut(table_id, |heap| {
+        self.with_heap_read(table_id, |heap| {
             heap.scan_mvcc_columns_until_with_policy(columns, scan_policy, |row| {
                 if visit_err.is_some() || stopped {
                     return Ok(true);
@@ -1796,7 +1796,7 @@ impl Database {
             let mut visit_err: Option<QueryError> = None;
             let mut vis_cache = ScanVisibilityCache::new();
             let mut backfill_scratch: Vec<Value> = Vec::new();
-            self.with_heap_mut(storage_id, |heap| {
+            self.with_heap_read(storage_id, |heap| {
                 heap.scan_mvcc_columns_until_with_policy(columns, scan_policy, |row| {
                     if visit_err.is_some() || stopped {
                         return Ok(true);

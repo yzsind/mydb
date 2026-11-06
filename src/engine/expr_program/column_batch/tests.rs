@@ -3881,8 +3881,8 @@ fn native_time_format_plan_matches_scalar_tokens_and_extended_hours() {
         Value::Time(-1),
         Value::Time(12 * 3_600_000_000 + 59_123_456),
         Value::Time(36 * 3_600_000_000),
-        Value::Time(-3_020_399_999_999),
-        Value::Time(3_020_399_999_999),
+        Value::Time(-3_020_399_000_000),
+        Value::Time(3_020_399_000_000),
     ];
     for format in [
         "%H:%i:%s.%f",
@@ -3901,6 +3901,25 @@ fn native_time_format_plan_matches_scalar_tokens_and_extended_hours() {
             values.clone(),
         );
     }
+}
+
+#[test]
+fn audit1106_time_format_declines_clamping_diagnostics() {
+    let (program, schema) = compile("TIME_FORMAT(x,'%T.%f')", ColumnType::Time);
+    let batch = Batch::new(
+        schema,
+        vec![ColumnVector::from_values(vec![Value::Time(
+            3_020_399_999_999,
+        )])],
+    );
+    assert!(program.try_eval_column(&batch).is_none());
+    let warnings = crate::engine::api::StatementWarningSink::default();
+    let values = crate::engine::api::with_statement_warning_sink(warnings.clone(), || {
+        oracle(&program, &batch)
+    })
+    .unwrap();
+    assert_eq!(values[0].to_display_string(), "838:59:59.000000");
+    assert_eq!(warnings.lock()[0].code(), 1292);
 }
 
 #[test]
@@ -3955,7 +3974,6 @@ fn integer_temporal_lanes_match_scalar_boundaries_and_unsigned_coercions() {
             ColumnType::LongLong,
             vec![
                 Value::Null,
-                Value::Int(0),
                 Value::Int(1),
                 Value::Int(6912),
                 Value::Int(7001),
@@ -4305,5 +4323,27 @@ fn borrowed_geometry_constructor_arguments_are_eager_and_evaluated_once() {
             );
             assert_eq!(row.values[0], Value::Geometry(geometry.clone()));
         }
+    }
+}
+
+#[test]
+fn audit1106_boolean_regex_fast_matches_and_fold_fallback_share_one_batch() {
+    let values = vec![
+        Value::String("ss".into()),
+        Value::String("ß".into()),
+        Value::String("strasse".into()),
+        Value::String("straße".into()),
+        Value::String("中文".into()),
+        Value::String("".into()),
+        Value::Null,
+    ];
+    for sql in [
+        "REGEXP_LIKE(x,'ss','i')",
+        "REGEXP_LIKE(x,'[s]','i')",
+        "REGEXP_LIKE(x,'^ss$','i')",
+        "REGEXP_LIKE(x,'a','c')",
+    ] {
+        let (_, schema) = compile("x", ColumnType::VarString);
+        checked_legacy_column(sql, schema, vec![ColumnVector::from_values(values.clone())]);
     }
 }

@@ -77,6 +77,7 @@ pub(in crate::engine::executor) fn enforce_session_write_access(
         return Ok(());
     }
     if transaction_read_only
+        && !statement_writes_only_temp_tables(session, statement)
         && crate::statement_effects::is_read_only_transaction_forbidden(statement)
     {
         return Err(error(
@@ -310,11 +311,11 @@ pub(in crate::engine::executor) fn execute_set_statement(
                 Expr::Default(_) | Expr::DefaultQualified(_)
             ) {
                 // SET @x = DEFAULT — MySQL: clear the user variable.
-                session.set_user_variable(&name, Value::Null);
+                session.set_user_variable(&name, Value::Null)?;
                 continue;
             }
             let value = eval_set_assignment_value(session, db, subquery_txn, &assignment.value)?;
-            session.set_user_variable(&name, value);
+            session.set_user_variable(&name, value)?;
             continue;
         }
 

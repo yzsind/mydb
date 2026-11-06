@@ -1868,6 +1868,7 @@ pub(crate) fn wait_for_global_read_lock_scoped(
     if !GLOBAL_READ_LOCK.load(Ordering::Acquire)
         || crate::replication::replication_applier_active()
         || !crate::replication::is_replica_write_statement(statement)
+        || crate::engine::executor::statement_writes_only_temp_tables(session, statement)
     {
         return Ok(());
     }

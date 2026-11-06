@@ -1582,6 +1582,123 @@ fn key_part_payload_capacity(part: &KeyPart) -> usize {
     }
 }
 
+/// Canonical keys owned by one scalar INSERT batch. Lock identities own their own
+/// copies; the workset is released as soon as the index entries are installed.
+struct ScalarInsertKeys {
+    keys: smallvec::SmallVec<[IndexKey; 4]>,
+    index_count: usize,
+    _charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+}
+
+struct ScalarUpdateKeys {
+    keys: smallvec::SmallVec<[(usize, IndexKey, IndexKey); 2]>,
+    _charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+}
+
+fn index_key_heap_capacity(key: &IndexKey) -> usize {
+    let parts = if key.0.spilled() {
+        key.0
+            .capacity()
+            .saturating_mul(std::mem::size_of::<KeyPart>())
+    } else {
+        0
+    };
+    key.0.iter().fold(parts, |total, part| {
+        total.saturating_add(key_part_payload_capacity(part))
+    })
+}
+
+impl ScalarInsertKeys {
+    fn key(&self, row: usize, index: usize) -> &IndexKey {
+        &self.keys[row * self.index_count + index]
+    }
+
+    fn try_build(table: &TableSchema, rows: &[Vec<Value>]) -> Result<Option<Self>, QueryError> {
+        if rows.is_empty()
+            || table.indexes.is_empty()
+            // Preserve the existing large-batch parallel index fan-out.
+            || (rows.len() >= 64 && table.indexes.len() > 1)
+            || table.indexes.iter().any(|index| {
+                index.is_fulltext()
+                    || index.has_multi_valued_parts()
+                    || index.is_spatial()
+                    || index.is_vector()
+                    || index.has_expression_parts()
+            })
+        {
+            return Ok(None);
+        }
+        // Large INSERTs keep the existing one-index-at-a-time working set.
+        // This optional workset is bounded independently of row/index count.
+        const MAX_BYTES: usize = 64 * 1024;
+        let Some(count) = rows.len().checked_mul(table.indexes.len()) else {
+            return Ok(None);
+        };
+        if count > MAX_BYTES / std::mem::size_of::<IndexKey>() {
+            return Ok(None);
+        }
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let reserved = if count > 4 {
+            count * std::mem::size_of::<IndexKey>()
+        } else {
+            0
+        };
+        let mut charge = if reserved == 0 {
+            None
+        } else {
+            let Some(charge) = ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::StorageScratch,
+                reserved,
+            ) else {
+                return Ok(None);
+            };
+            Some(charge)
+        };
+        let mut keys = smallvec::SmallVec::<[IndexKey; 4]>::new();
+        keys.reserve_exact(count);
+        let capacity = if keys.spilled() {
+            keys.capacity()
+                .saturating_mul(std::mem::size_of::<IndexKey>())
+        } else {
+            0
+        };
+        let mut retained = capacity;
+        for row in rows {
+            for index in &table.indexes {
+                let key = table.index_key(index, row)?;
+                retained = retained.saturating_add(index_key_heap_capacity(&key));
+                if retained > MAX_BYTES {
+                    return Ok(None);
+                }
+                let admitted = charge.as_ref().map_or(0, |charge| charge.bytes());
+                if retained > admitted {
+                    if let Some(charge) = charge.as_mut() {
+                        if !charge.try_grow_optional(retained - admitted) {
+                            return Ok(None);
+                        }
+                    } else {
+                        let Some(reservation) = ControlledMemoryCharge::try_new_optional(
+                            ControlledMemoryCategory::StorageScratch,
+                            retained,
+                        ) else {
+                            return Ok(None);
+                        };
+                        charge = Some(reservation);
+                    }
+                }
+                keys.push(key);
+            }
+        }
+        Ok(Some(Self {
+            keys,
+            index_count: table.indexes.len(),
+            _charge: charge,
+        }))
+    }
+}
+
 #[inline]
 fn fixed_scalar_sort_kind(part: &KeyPart) -> Option<u8> {
     Some(match part {
@@ -2503,9 +2620,15 @@ impl Database {
         row_id: RowId,
         changed_columns: Option<&[usize]>,
         affected_index_positions: Option<&[usize]>,
-    ) -> Result<(), QueryError> {
+    ) -> Result<Option<ScalarUpdateKeys>, QueryError> {
         let mut repairs: smallvec::SmallVec<[(IndexRepairKey, bool); 4]> =
             smallvec::SmallVec::new();
+        let mut scalar_keys: smallvec::SmallVec<[(usize, IndexKey, IndexKey); 2]> =
+            smallvec::SmallVec::new();
+        let mut cacheable = true;
+        let mut payload_bytes = 0usize;
+        let mut cache_charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge> =
+            None;
         for (index_pos, index) in table.indexes.iter().enumerate() {
             if !affected_index_positions.map_or_else(
                 || index_may_be_affected_by_columns(table, index, changed_columns),
@@ -2541,6 +2664,48 @@ impl Database {
             if old_key.same_stored_value(&new_key) {
                 continue;
             }
+            if cacheable
+                && !index.is_spatial()
+                && !index.is_vector()
+                && !index.has_expression_parts()
+            {
+                let next_payload = payload_bytes
+                    .saturating_add(index_key_heap_capacity(&old_key))
+                    .saturating_add(index_key_heap_capacity(&new_key));
+                let next_capacity = if scalar_keys.len() < 2 {
+                    0
+                } else {
+                    (scalar_keys.len() + 1)
+                        .next_power_of_two()
+                        .saturating_mul(std::mem::size_of::<(usize, IndexKey, IndexKey)>())
+                };
+                let retained = next_payload.saturating_add(next_capacity);
+                // Admit the extra old-key copy before cloning it or growing
+                // the workset. Wide/many-index updates keep the streaming
+                // two-pass path instead of multiplying retained key payloads.
+                cacheable = retained <= 64 * 1024;
+                if cacheable {
+                    let admitted = cache_charge.as_ref().map_or(0, |charge| charge.bytes());
+                    if retained > admitted {
+                        cacheable = if let Some(charge) = cache_charge.as_mut() {
+                            charge.try_grow_optional(retained - admitted)
+                        } else {
+                            cache_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                                crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                                retained,
+                            );
+                            cache_charge.is_some()
+                        };
+                    }
+                }
+                if cacheable {
+                    scalar_keys.push((index_pos, old_key.clone(), new_key));
+                    payload_bytes = next_payload;
+                } else {
+                    scalar_keys = smallvec::SmallVec::new();
+                    cache_charge = None;
+                }
+            }
             repairs.push((
                 IndexRepairKey {
                     table_id: if index.is_spatial() {
@@ -2554,6 +2719,10 @@ impl Database {
                 true,
             ));
         }
+        let cached = cacheable.then_some(ScalarUpdateKeys {
+            keys: scalar_keys,
+            _charge: cache_charge,
+        });
         if !repairs.is_empty() {
             self.register_index_repair_entries(
                 txn_id,
@@ -2562,7 +2731,7 @@ impl Database {
                     .map(|(key, single_key)| (key, row_id, single_key)),
             )?;
         }
-        Ok(())
+        Ok(cached)
     }
 
     fn write_heap_rows(
@@ -2822,7 +2991,10 @@ impl Database {
         changed_columns: Option<&[usize]>,
         affected_index_positions: Option<&[usize]>,
     ) -> Result<(), QueryError> {
-        self.register_changed_index_repair_keys(
+        if affected_index_positions.is_some_and(|positions| positions.is_empty()) {
+            return self.maybe_flush_txn_wal_buffer(txn_id);
+        }
+        let cached = self.register_changed_index_repair_keys(
             txn_id,
             storage_id,
             table,
@@ -2832,6 +3004,12 @@ impl Database {
             changed_columns,
             affected_index_positions,
         )?;
+        let (_charge, mut scalar_keys) = match cached {
+            Some(ScalarUpdateKeys { keys, _charge }) => {
+                (_charge, Some(keys.into_iter().peekable()))
+            }
+            None => (None, None),
+        };
         for (index_pos, index) in table.indexes.iter().enumerate() {
             if !affected_index_positions.map_or_else(
                 || index_may_be_affected_by_columns(table, index, changed_columns),
@@ -2869,8 +3047,24 @@ impl Database {
                 })?;
                 continue;
             }
-            let old_key = table.index_key(index, old_values)?;
-            let new_key = table.index_key(index, new_values)?;
+            let cached = scalar_keys.as_mut().filter(|_| {
+                !index.is_spatial() && !index.is_vector() && !index.has_expression_parts()
+            });
+            let (old_key, new_key) = if let Some(keys) = cached {
+                if !keys
+                    .peek()
+                    .is_some_and(|(position, _, _)| *position == index_pos)
+                {
+                    continue;
+                }
+                let (_, old, new) = keys.next().expect("checked scalar key position");
+                (old, new)
+            } else {
+                (
+                    table.index_key(index, old_values)?,
+                    table.index_key(index, new_values)?,
+                )
+            };
             if old_key.same_stored_value(&new_key) {
                 continue;
             }
@@ -4020,6 +4214,17 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        if table.is_partitioned() && !index.is_vector() {
+            for storage_id in table.storage_ids() {
+                let mut leaf = table.clone();
+                leaf.id = storage_id;
+                leaf.active_generation = self.storage_generation(storage_id);
+                leaf.partitioning = None;
+                leaf.build_column_index();
+                self.rebuild_index_with_options(&leaf, index, options)?;
+            }
+            return Ok(());
+        }
         // Pin the explicitly typed backend while a private/temporary candidate
         // is not yet visible in the catalog used by cold handle resolution.
         let _spatial_build_handle = if index.is_spatial() {
@@ -4171,6 +4376,17 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        if table.is_partitioned() && !index.is_vector() {
+            for storage_id in table.storage_ids() {
+                let mut leaf = table.clone();
+                leaf.id = storage_id;
+                leaf.active_generation = self.storage_generation(storage_id);
+                leaf.partitioning = None;
+                leaf.build_column_index();
+                self.rebuild_index_offline_bulk_with_options(&leaf, index, options)?;
+            }
+            return Ok(());
+        }
         if index.index_type.eq_ignore_ascii_case("BTREE") {
             INDEX_BUILD_REQUESTED_WORKERS.fetch_add(
                 options.requested_degree.min(u64::MAX as usize) as u64,

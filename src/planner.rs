@@ -15389,12 +15389,41 @@ fn effective_index_access_cost(
     cost.weighted_total()
 }
 
+/// Resolve a disposable costing key without installing execution bindings.
+/// In particular, failed temporal conversions must not emit execution-time
+/// warnings while comparing alternative access paths.
+fn resolve_cost_key_part(part: &KeyPart) -> Option<KeyPart> {
+    let KeyPart::Param { idx, target } = part else {
+        return Some(part.clone());
+    };
+    let convert = |value: Option<&Value>| {
+        let value = value?;
+        if matches!(target, crate::storage::ParamTarget::UInt) {
+            if let Value::Int(n) = value {
+                if *n < 0 {
+                    return Some(KeyPart::Int(*n));
+                }
+            }
+        }
+        KeyPart::for_target(value.clone(), *target).ok()
+    };
+    PLANNING_PARAMS.with(|slot| {
+        let params = slot.borrow();
+        match params.as_ref() {
+            Some(params) => convert(params.get(*idx)),
+            None => crate::engine::params::with_current_param(*idx, convert),
+        }
+    })
+}
+
 fn concrete_key_part_value(
     part: &KeyPart,
     data_type: &crate::storage::DataTypeKind,
 ) -> Option<Value> {
     match part {
-        KeyPart::Param { .. } | KeyPart::Statement { .. } => part
+        KeyPart::Param { .. } => resolve_cost_key_part(part)
+            .and_then(|resolved| concrete_key_part_value(&resolved, data_type)),
+        KeyPart::Statement { .. } => part
             .resolve_param()
             .ok()
             .and_then(|resolved| concrete_key_part_value(&resolved, data_type)),
@@ -16958,6 +16987,7 @@ pub(crate) fn choose_join_with_hints(
                 join_type,
                 left_keys,
                 right_keys,
+                null_safe,
                 residual.as_ref(),
                 left_rows,
                 right_rows,
@@ -18931,7 +18961,15 @@ fn dependent_range_join_index(
     if table.schema.is_partitioned() {
         return None;
     }
-    let conjuncts = expr_conjuncts(condition);
+    // The executor merges the inner scan predicate into the probe condition.
+    // Candidate selection must see the same equalities: an inner constant can
+    // bind a composite prefix before the outer-driven suffix. Keep the scan
+    // predicate intact as the execution-time correctness recheck.
+    let scan_filter = extract_scan_filter(right);
+    let mut conjuncts = expr_conjuncts(condition);
+    if let Some(filter) = &scan_filter {
+        conjuncts.extend(expr_conjuncts(filter));
+    }
     let total_rows = table.schema.stats.row_count.max(1) as f64;
     // INLJ inner-side hint filtering: the inner table here is the join
     // probe, so a `USE_INDEX`/`NO_INDEX` hint targeting it must steer
@@ -19107,6 +19145,21 @@ fn equality_between_index_part_and_left_plan(
             None => false,
         }
     };
+    // A direct constant/parameter prefix has the same comparison-domain
+    // requirements as a standalone equality lookup. In particular, numeric
+    // equality against a string column must not collapse to one string key.
+    if let Some(crate::storage::IndexKeyPart::Column(column)) = index.key_part(pos) {
+        for (key, value) in [(a.as_ref(), b.as_ref()), (b.as_ref(), a.as_ref())] {
+            if matches_part(key) {
+                if let Some(constraint) = expr_to_plan_constraint(value) {
+                    if index_bounds::equality_fixes_order_value(&table.schema, column, &constraint)
+                    {
+                        return Some(value.clone());
+                    }
+                }
+            }
+        }
+    }
     let outer = if matches_part(a) && expr_can_resolve_in_plan(b, left) {
         b.as_ref()
     } else if matches_part(b) && expr_can_resolve_in_plan(a, left) {

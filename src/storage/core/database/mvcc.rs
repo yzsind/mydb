@@ -749,9 +749,16 @@ impl Database {
     pub(crate) fn check_dml_allowed_for_table(
         &self,
         txn: TxnView,
-        _table_id: u64,
+        table_id: u64,
     ) -> Result<(), QueryError> {
-        if crate::engine::rls::policy_active() { return Err(crate::engine::rls::violation("Policy functions cannot modify database rows")); }
+        if crate::engine::rls::policy_active() {
+            return Err(crate::engine::rls::violation(
+                "Policy functions cannot modify database rows",
+            ));
+        }
+        if is_temp_table_id(table_id) {
+            return Ok(());
+        }
         self.check_dml_allowed(txn)?;
         Ok(())
     }
@@ -1360,7 +1367,9 @@ impl Database {
             // `Instant::now()` — the probe measured the undo publish lock at
             // only ~2–7% of wall time, so it stays off in production.
             let lock_started = undo_publish_lock_probe_enabled().then(std::time::Instant::now);
-            if let Some(((ptr, segment_id, segment_end, segment_lease), reservation)) = concurrent_frame {
+            if let Some(((ptr, segment_id, segment_end, segment_lease), reservation)) =
+                concurrent_frame
+            {
                 let out = self.publish_concurrent_undo_frame(
                     record,
                     encoded,

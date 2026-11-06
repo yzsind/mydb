@@ -50,7 +50,7 @@
 //! additionally rewrites text-protocol DML:
 //! - UPDATE: SET values, WHERE, JOIN ON.
 //! - DELETE: WHERE, JOIN ON.
-//! - INSERT: small literal `VALUES` lists (≤ 4 rows — bulk inserts keep
+//! - INSERT: bounded literal `VALUES` lists (≤ 64 rows / 256 cells — bulk inserts keep
 //!   their literals: thousands of extracted params would buy nothing) and
 //!   ON DUPLICATE KEY UPDATE values; `INSERT ... SELECT` reuses the
 //!   SELECT rewriter for its source.
@@ -308,7 +308,7 @@ pub fn auto_parameterize(mode: AutoParameterizeMode, statement: &mut Statement) 
     // Large VALUES bodies without ODKU cannot reuse a parameterized plan.
     // Do not scan their payload merely to discover there is nothing to rewrite.
     let bulk_values = matches!(statement, Statement::Insert(insert)
-        if matches!(&insert.source, InsertSource::Values(rows) if rows.len() > INSERT_VALUES_MAX_PARAM_ROWS)
+        if matches!(&insert.source, InsertSource::Values(rows) if !bounded_insert_values(rows))
             && insert.on_duplicate_key_update.is_none());
     if !eligible || bulk_values {
         return AutoParamResult {
@@ -716,7 +716,20 @@ fn rewrite_select(
 /// literals — extracting thousands of params would scale the rewrite
 /// cost with row count for zero plan-shape benefit (the bulk body is
 /// one-shot for the plan cache anyway).
-const INSERT_VALUES_MAX_PARAM_ROWS: usize = 4;
+const INSERT_VALUES_MAX_PARAM_ROWS: usize = 64;
+const INSERT_VALUES_MAX_PARAM_CELLS: usize = 256;
+
+fn bounded_insert_values(rows: &[Vec<Expr>]) -> bool {
+    rows.len() <= INSERT_VALUES_MAX_PARAM_ROWS
+        && rows
+            .iter()
+            .try_fold(0usize, |cells, row| {
+                cells
+                    .checked_add(row.len())
+                    .filter(|n| *n <= INSERT_VALUES_MAX_PARAM_CELLS)
+            })
+            .is_some()
+}
 
 fn rewrite_insert(
     insert: &mut crate::parser::Insert,
@@ -725,7 +738,7 @@ fn rewrite_insert(
     cache_sensitive: &mut bool,
 ) {
     match &mut insert.source {
-        InsertSource::Values(rows) if rows.len() <= INSERT_VALUES_MAX_PARAM_ROWS => {
+        InsertSource::Values(rows) if bounded_insert_values(rows) => {
             for row in rows {
                 for expr in row {
                     try_replace_literal(expr, next_idx, params);
@@ -994,11 +1007,7 @@ fn parameterizable_literal(expr: &Expr) -> Option<Value> {
         Expr::Unary {
             op: crate::parser::UnaryOp::Neg,
             expr: inner,
-        } => match inner.as_ref() {
-            Expr::Literal(Literal::Int(n)) => Some(Value::Int(-*n)),
-            Expr::Literal(Literal::Float(f)) => Some(Value::Double(-*f)),
-            _ => None,
-        },
+        } => negated_numeric_literal_value(inner),
         _ => None,
     }
 }
@@ -1021,10 +1030,7 @@ fn parameterizable_literal_shape(expr: &Expr) -> bool {
         Expr::Unary {
             op: crate::parser::UnaryOp::Neg,
             expr: inner,
-        } => matches!(
-            inner.as_ref(),
-            Expr::Literal(Literal::Int(_) | Literal::Float(_))
-        ),
+        } => negated_numeric_literal_value(inner).is_some(),
         Expr::Function {
             name,
             args,
@@ -1048,11 +1054,7 @@ fn parameterizable_literal_owned(expr: Expr) -> Option<Value> {
         Expr::Unary {
             op: crate::parser::UnaryOp::Neg,
             expr: inner,
-        } => match *inner {
-            Expr::Literal(Literal::Int(n)) => Some(Value::Int(-n)),
-            Expr::Literal(Literal::Float(f)) => Some(Value::Double(-f)),
-            _ => None,
-        },
+        } => negated_numeric_literal_value(&inner),
         Expr::Function {
             name,
             mut args,
@@ -1068,6 +1070,23 @@ fn parameterizable_literal_owned(expr: Expr) -> Option<Value> {
                 Expr::Literal(Literal::String(value)) => Some(Value::Bytes(value.into_bytes())),
                 _ => unreachable!("binary introducer shape checked above"),
             }
+        }
+        _ => None,
+    }
+}
+
+/// Only pure numeric literal negation crosses the parameter boundary. Keep
+/// exact decimals exact, including scale and values wider than i128; unsigned
+/// overflow and general constant expressions retain the canonical evaluator.
+pub(crate) fn negated_numeric_literal_value(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Literal(Literal::Int(n)) => n.checked_neg().map(Value::Int),
+        Expr::Literal(Literal::Float(n)) => Some(Value::Double(-n)),
+        Expr::Literal(Literal::Decimal(text)) => {
+            let signed = text
+                .strip_prefix('-')
+                .map_or_else(|| format!("-{text}"), str::to_owned);
+            Some(compact_auto_param_decimal(&signed).unwrap_or(Value::Decimal(signed)))
         }
         _ => None,
     }
@@ -1161,9 +1180,30 @@ fn compact_auto_param_decimal(text: &str) -> Option<Value> {
 /// artifact is published.
 pub(crate) fn scanned_numeric_literal_value(text: &str) -> Option<Value> {
     if text.contains(['e', 'E']) {
-        return text.parse::<f64>().ok().map(Value::Double);
+        return text
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(Value::Double);
     }
     if text.contains('.') {
+        // A warm lexical template must not admit an invalid spelling such as
+        // 1.2.3 merely because it has the same placeholder skeleton as 1.25.
+        let magnitude = text.strip_prefix('-').unwrap_or(text);
+        let mut dots = 0;
+        let valid = !magnitude.is_empty()
+            && magnitude.bytes().all(|byte| {
+                if byte == b'.' {
+                    dots += 1;
+                    dots == 1
+                } else {
+                    byte.is_ascii_digit()
+                }
+            })
+            && magnitude.bytes().any(|b| b.is_ascii_digit());
+        if !valid {
+            return None;
+        }
         return parse_exact_decimal_str(text)
             .map(|(magnitude, scale)| {
                 Value::from_exact_decimal(ExactDecimal::from_i128(magnitude, scale))
@@ -1422,6 +1462,23 @@ mod tests {
     fn rewrites_negative_literal_as_single_value() {
         let (_stmt, params) = auto("SELECT * FROM t WHERE id = -7");
         assert_eq!(params, vec![Value::Int(-7)]);
+    }
+
+    #[test]
+    fn signed_decimal_parameters_remain_exact_and_bad_scanner_tokens_decline() {
+        let (_, params) = auto(
+            "SELECT * FROM t WHERE a=-12.25 AND b=-1234567890123456789012345678901234567890.50",
+        );
+        assert_eq!(
+            params,
+            vec![
+                Value::DecimalCompact(-1225, 2),
+                Value::Decimal("-1234567890123456789012345678901234567890.50".into())
+            ]
+        );
+        for text in ["1.2.3", "-1.2.3", "1e999", "2e-9999e1"] {
+            assert!(scanned_numeric_literal_value(text).is_none(), "{text}");
+        }
     }
 
     #[test]
@@ -1729,14 +1786,28 @@ mod tests {
 
     #[test]
     fn all_mode_skips_bulk_insert_values() {
-        let rows: Vec<String> = (0..8).map(|i| format!("({i}, 'r{i}')")).collect();
+        let rows: Vec<String> = (0..65).map(|i| format!("({i}, 'r{i}')")).collect();
         let sql = format!("INSERT INTO t (a, b) VALUES {}", rows.join(", "));
         let mut stmt = parse_statement(&sql).unwrap();
         let result = auto_parameterize(AutoParameterizeMode::All, &mut stmt);
         assert!(
             result.params.is_empty(),
-            "Bulk VALUES (>4 rows) retains literals to avoid unproductive parameter extraction"
+            "Bulk VALUES beyond the bounded cache policy retain literals"
         );
+    }
+
+    #[test]
+    fn insert_parameter_budget_bounds_rows_and_width() {
+        for (rows, width, expected) in [(8, 3, 24), (64, 4, 256), (65, 1, 0), (4, 65, 0)] {
+            let row = format!("({})", vec!["1"; width].join(","));
+            let mut statement = parse_statement(&format!(
+                "INSERT INTO t VALUES {}",
+                vec![row; rows].join(",")
+            ))
+            .unwrap();
+            let result = auto_parameterize(AutoParameterizeMode::All, &mut statement);
+            assert_eq!(result.params.len(), expected, "rows={rows}, width={width}");
+        }
     }
 
     #[test]

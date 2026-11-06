@@ -1,8 +1,8 @@
 //! `lc_time_names` month/day name tables for DAYNAME() / MONTHNAME() /
 //! DATE_FORMAT's `%M %W %a %b` specifiers. MySQL sources these from its
 //! built-in locale list; mydb ships the common subset below and falls
-//! back to `en_US` for anything it doesn't know (same spirit as the
-//! FORMAT() locale table in `expr.rs`).
+//! back to `en_US` only for internal callers. SQL assignments validate the
+//! supported locale set before storing the value.
 
 pub(crate) struct TimeLocale {
     /// Full month names, January..December.
@@ -92,7 +92,7 @@ const FR_FR: TimeLocale = TimeLocale {
         "décembre",
     ],
     months_abbr: [
-        "janv", "févr", "mars", "avr", "mai", "juin", "juil", "août", "sept", "oct", "nov", "déc",
+        "jan", "fév", "mar", "avr", "mai", "jun", "jui", "aoû", "sep", "oct", "nov", "déc",
     ],
     days: [
         "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
@@ -176,18 +176,12 @@ const PT_BR: TimeLocale = TimeLocale {
         "dezembro",
     ],
     months_abbr: [
-        "jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez",
+        "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez",
     ],
     days: [
-        "segunda-feira",
-        "terça-feira",
-        "quarta-feira",
-        "quinta-feira",
-        "sexta-feira",
-        "sábado",
-        "domingo",
+        "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo",
     ],
-    days_abbr: ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"],
+    days_abbr: ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"],
 };
 
 const ZH_CN: TimeLocale = TimeLocale {
@@ -206,7 +200,8 @@ const ZH_CN: TimeLocale = TimeLocale {
         "十二月",
     ],
     months_abbr: [
-        "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
+        " 1月", " 2月", " 3月", " 4月", " 5月", " 6月", " 7月", " 8月", " 9月", "10月", "11月",
+        "12月",
     ],
     days: [
         "星期一",
@@ -217,7 +212,7 @@ const ZH_CN: TimeLocale = TimeLocale {
         "星期六",
         "星期日",
     ],
-    days_abbr: ["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
+    days_abbr: ["一", "二", "三", "四", "五", "六", "日"],
 };
 
 const JA_JP: TimeLocale = TimeLocale {
@@ -225,7 +220,8 @@ const JA_JP: TimeLocale = TimeLocale {
         "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
     ],
     months_abbr: [
-        "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
+        " 1月", " 2月", " 3月", " 4月", " 5月", " 6月", " 7月", " 8月", " 9月", "10月", "11月",
+        "12月",
     ],
     days: [
         "月曜日",
@@ -241,10 +237,22 @@ const JA_JP: TimeLocale = TimeLocale {
 
 const KO_KR: TimeLocale = TimeLocale {
     months: [
-        "1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월",
+        "일월",
+        "이월",
+        "삼월",
+        "사월",
+        "오월",
+        "유월",
+        "칠월",
+        "팔월",
+        "구월",
+        "시월",
+        "십일월",
+        "십이월",
     ],
     months_abbr: [
-        "1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월",
+        " 1월", " 2월", " 3월", " 4월", " 5월", " 6월", " 7월", " 8월", " 9월", "10월", "11월",
+        "12월",
     ],
     days: [
         "월요일",
@@ -295,4 +303,14 @@ mod tests {
         assert_eq!(time_locale("zh_TW").days[0], "星期一");
         assert_eq!(time_locale("de_AT").months_abbr[2], "Mär");
     }
+}
+
+/// SQL accepts only locales with shipped output tables. Internal callers may
+/// still request the language fallback explicitly through `time_locale`.
+pub(crate) fn canonical_time_locale(name: &str) -> Option<&'static str> {
+    [
+        "en_US", "de_DE", "fr_FR", "es_ES", "it_IT", "pt_BR", "zh_CN", "ja_JP", "ko_KR",
+    ]
+    .into_iter()
+    .find(|locale| locale.eq_ignore_ascii_case(name))
 }

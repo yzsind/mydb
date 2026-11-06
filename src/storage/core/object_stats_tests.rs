@@ -4,6 +4,111 @@ fn stats_test_directory() -> tempfile::TempDir {
     tempfile::tempdir_in("/tmp/mydb").unwrap()
 }
 
+fn object_stats_cold_descriptor_roundtrip(automatic: bool) {
+    use crate::engine::{QueryResponse, StorageQueryEngine};
+
+    let dir = stats_test_directory();
+    let query = |engine: &StorageQueryEngine, sql: &str| {
+        let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap() else {
+            panic!("expected rows for {sql}");
+        };
+        result.rows
+    };
+    let definition = |table: &TableSchema| {
+        let mut json = serde_json::to_value(table).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("stats");
+        object.remove("schema_version");
+        json
+    };
+    let expected_schema;
+    let expected_ddl;
+    let expected_rows;
+    {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine.execute("CREATE TABLE t(id BIGINT UNSIGNED PRIMARY KEY, n DECIMAL(20,4), s VARCHAR(80) COLLATE utf8mb4_bin, b VARBINARY(16), d DATE, j JSON, g BIGINT AS (id+1) STORED, KEY ns(n,s), CONSTRAINT nonnegative CHECK(n>=0))").unwrap();
+        engine.execute("INSERT INTO t(id,n,s,b,d,j) VALUES(1,12.3400,'hello',X'00FF','1969-12-31','{\"x\":1}'),(2,NULL,NULL,NULL,NULL,NULL)").unwrap();
+        engine
+            .execute("ALTER TABLE t ADD COLUMN tag VARCHAR(20) DEFAULT 'backfill'")
+            .unwrap();
+        let db = engine.database_for_replication();
+        let before = db.snapshot_table_schema("test.t").unwrap();
+        assert!(before.row_layouts.len() > 1);
+        let persisted = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+        expected_schema = definition(&persisted);
+        expected_ddl = query(&engine, "SHOW CREATE TABLE t");
+        expected_rows = query(&engine, "SELECT * FROM t ORDER BY id");
+        db.set_catalog_cache_mb(0);
+        db.force_cold_online_descriptor_for_test("test.t");
+        assert!(db.catalog_read().unwrap().tables["test.t"]
+            .columns
+            .is_empty());
+
+        if automatic {
+            assert_eq!(db.auto_analyze_stale_tables(0.1).unwrap(), 1);
+            assert_eq!(db.auto_analyze_stale_tables(0.1).unwrap(), 0);
+        } else {
+            engine.execute("ANALYZE TABLE t").unwrap();
+        }
+        let persisted = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+        assert_eq!(definition(&persisted), expected_schema);
+        assert_eq!(persisted.stats.row_count, 2);
+        assert_eq!(persisted.stats.columns["n"].null_count, 1);
+        assert_eq!(query(&engine, "SHOW CREATE TABLE t"), expected_ddl);
+        assert_eq!(query(&engine, "SELECT * FROM t ORDER BY id"), expected_rows);
+        db.maintain_zone_maps().unwrap();
+    }
+    let engine = StorageQueryEngine::open(dir.path()).unwrap();
+    let table = engine.database().snapshot_table_schema("test.t").unwrap();
+    assert_eq!(definition(&table), expected_schema);
+    assert_eq!(table.stats.row_count, 2);
+    assert_eq!(query(&engine, "SHOW CREATE TABLE t"), expected_ddl);
+    assert_eq!(query(&engine, "SELECT * FROM t ORDER BY id"), expected_rows);
+}
+
+#[test]
+fn object_stats_explicit_analyze_preserves_cold_descriptor() {
+    object_stats_cold_descriptor_roundtrip(false);
+}
+
+#[test]
+fn object_stats_auto_analyze_preserves_cold_descriptor() {
+    object_stats_cold_descriptor_roundtrip(true);
+}
+
+#[test]
+fn object_stats_rejects_incomplete_descriptors_before_persistence() {
+    let dir = stats_test_directory();
+    let db = open_relaxed_test_db(dir.path());
+    create_checkpoint_test_table(&db);
+    let before = db.snapshot_table_schema("test.t").unwrap();
+    let persisted = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+    let expected = serde_json::to_value(&persisted).unwrap();
+    let dictionaries = crate::storage::data_dictionary::dd_tables()
+        .iter()
+        .map(|table| (table.id, db.scan_dd_table(table.id).unwrap()))
+        .collect::<Vec<_>>();
+    for invalid in [CatalogManager::object_header(&before).as_ref().clone(), {
+        let mut table = before.as_ref().clone();
+        table.row_layouts.clear();
+        table
+    }] {
+        let err = db
+            .publish_stats_candidate(&before, invalid.clone())
+            .unwrap_err();
+        assert_eq!(err.code(), 1030);
+        let err = db
+            .publish_stats_candidate(&invalid, before.as_ref().clone())
+            .unwrap_err();
+        assert_eq!(err.code(), 1030);
+        for (id, rows) in &dictionaries {
+            assert_eq!(&db.scan_dd_table(*id).unwrap(), rows);
+        }
+        let persisted = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&persisted).unwrap(), expected);
+    }
+}
+
 #[test]
 fn object_stats_large_lob_roundtrip_and_commit_failure() {
     use crate::storage::{data_dictionary::DD_COLUMN_STATS, stats::ValueFrequency};

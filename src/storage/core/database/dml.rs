@@ -25,20 +25,165 @@ mod audit_1029_tests {
     fn audit_1029_partial_lob_externalization_reclaims_rows_and_columns() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
-        engine.execute("CREATE TABLE lob_failure(b LONGBLOB, j JSON)").unwrap();
+        engine
+            .execute("CREATE TABLE lob_failure(b LONGBLOB, j JSON)")
+            .unwrap();
         let db = engine.db_handle();
         let table = db.table("test.lob_failure").unwrap();
-        let invalid = vec![Value::Bytes(vec![42; 20000]), Value::String("invalid".repeat(5000))];
-        assert!(db.externalize_row_lobs(table.id, &table.row_codec, &invalid).is_err());
+        let invalid = vec![
+            Value::Bytes(vec![42; 20000]),
+            Value::String("invalid".repeat(5000)),
+        ];
+        assert!(db
+            .externalize_row_lobs(table.id, &table.row_codec, &invalid)
+            .is_err());
         let (pages, free) = db.lob_space_stats(table.id).unwrap();
         assert!(pages > 1);
         assert_eq!(free, pages - 1);
-        let valid = vec![Value::Bytes(vec![43; 20000]), Value::String(format!("\"{}\"", "x".repeat(20000)))];
+        let valid = vec![
+            Value::Bytes(vec![43; 20000]),
+            Value::String(format!("\"{}\"", "x".repeat(20000))),
+        ];
         let txn = db.begin_txn().unwrap();
-        assert!(db.insert_mvcc_batch_externalized(txn.txn_id, table.id, &table.row_codec, &[], &[valid, invalid]).is_err());
+        assert!(db
+            .insert_mvcc_batch_externalized(
+                txn.txn_id,
+                table.id,
+                &table.row_codec,
+                &[],
+                &[valid, invalid]
+            )
+            .is_err());
         db.rollback_txn(txn.txn_id).unwrap();
         let (pages, free) = db.lob_space_stats(table.id).unwrap();
         assert_eq!(free, pages - 1);
+        engine.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod write_key_reuse_tests {
+    #[test]
+    fn scalar_insert_reuses_keys_and_preserves_duplicate_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine.execute("CREATE TABLE key_work(id BIGINT PRIMARY KEY, code VARCHAR(40) COLLATE utf8mb4_unicode_ci UNIQUE, amount DECIMAL(20,4), KEY amount_idx(amount))").unwrap();
+        crate::storage::schema::INDEX_KEY_BUILD_COUNT.with(|count| count.set(0));
+        engine
+            .execute("INSERT INTO key_work VALUES (1, 'Résumé', 12.3400)")
+            .unwrap();
+        let builds = crate::storage::schema::INDEX_KEY_BUILD_COUNT.with(|count| count.get());
+        assert!(
+            builds <= 3,
+            "one scalar key per index is sufficient, built {builds}"
+        );
+        assert!(engine
+            .execute("INSERT INTO key_work VALUES (2, 'resume', 99.0000)")
+            .is_err());
+        crate::storage::schema::INDEX_KEY_BUILD_COUNT.with(|count| count.set(0));
+        engine
+            .execute("UPDATE key_work SET amount = 13.3500 WHERE id = 1")
+            .unwrap();
+        let builds = crate::storage::schema::INDEX_KEY_BUILD_COUNT.with(|count| count.get());
+        assert!(
+            builds <= 3,
+            "secondary maintenance must reuse its old/new keys, built {builds}"
+        );
+        crate::storage::schema::INDEX_KEY_BUILD_COUNT.with(|count| count.set(0));
+        engine
+            .execute("INSERT INTO key_work VALUES (3, NULL, -1.0000), (4, NULL, -1.0000)")
+            .unwrap();
+        let builds = crate::storage::schema::INDEX_KEY_BUILD_COUNT.with(|count| count.get());
+        assert!(
+            builds <= 10,
+            "small batches must reuse their lock/probe/write keys, built {builds}"
+        );
+        let result = engine
+            .execute("SELECT id FROM key_work ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        assert_eq!(result.found_rows(), 3);
+        engine.shutdown().unwrap();
+        let reopened = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .execute("SELECT id FROM key_work FORCE INDEX(amount_idx) WHERE amount = -1.0000")
+                .unwrap()
+                .materialize()
+                .unwrap()
+                .found_rows(),
+            2
+        );
+        reopened.shutdown().unwrap();
+    }
+
+    #[test]
+    fn scalar_insert_key_workspace_falls_back_under_pressure_and_for_large_batches() {
+        use crate::types::Value;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine.execute("CREATE TABLE workspace(id BIGINT PRIMARY KEY, label TEXT, KEY label_idx(label(10)))").unwrap();
+        let table = engine.db_handle().table("test.workspace").unwrap();
+        let rows = vec![vec![Value::Int(1), Value::String("ordinary".into())]];
+        assert!(super::ScalarInsertKeys::try_build(&table, &rows)
+            .unwrap()
+            .is_some());
+        crate::engine::executor::mem_budget::with_test_effective_memory_limit(1, || {
+            assert!(super::ScalarInsertKeys::try_build(&table, &rows)
+                .unwrap()
+                .is_none());
+        });
+        let large = vec![rows[0].clone(); 64];
+        assert!(super::ScalarInsertKeys::try_build(&table, &large)
+            .unwrap()
+            .is_none());
+        engine
+            .execute("INSERT INTO workspace VALUES (1, 'ordinary')")
+            .unwrap();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn wide_index_update_bounds_key_workset_and_rolls_back_all_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        let indexes = (0..20)
+            .map(|i| format!("KEY k{i}(label)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine.execute(&format!("CREATE TABLE wide_work(id INT PRIMARY KEY, label VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin, {indexes})")).unwrap();
+        engine
+            .execute("INSERT INTO wide_work VALUES(1, REPEAT('a',1700))")
+            .unwrap();
+        let mut session = crate::engine::SessionContext::default();
+        session.connection_id = 76310;
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        engine
+            .execute_with_session(
+                &mut session,
+                "UPDATE wide_work SET label=REPEAT('b',1700) WHERE id=1",
+            )
+            .unwrap();
+        for i in [0, 9, 19] {
+            assert_eq!(engine.execute_with_session(&mut session, &format!("SELECT id FROM wide_work FORCE INDEX(k{i}) WHERE label=REPEAT('b',1700)")).unwrap().materialize().unwrap().found_rows(), 1);
+        }
+        engine
+            .execute_with_session(&mut session, "ROLLBACK")
+            .unwrap();
+        for i in [0, 9, 19] {
+            assert_eq!(
+                engine
+                    .execute(&format!(
+                        "SELECT id FROM wide_work FORCE INDEX(k{i}) WHERE label=REPEAT('a',1700)"
+                    ))
+                    .unwrap()
+                    .materialize()
+                    .unwrap()
+                    .found_rows(),
+                1
+            );
+        }
         engine.shutdown().unwrap();
     }
 }
@@ -246,39 +391,39 @@ impl Database {
         // BUG-2 — chains this call allocates (excludes reused old chains).
         let mut newly_allocated: Vec<LobRef> = Vec::new();
         let allocation = (|| -> Result<(), QueryError> {
-        for i in 0..n {
-            if externalized[i] {
-                // M1(LOB) — attach the kept/reused old chain: the caller (UPDATE reuse
-                // or rollback kept-chain) has already ensured the chain matches the column's
-                // bytes, so reuse it directly, skipping allocation + overflow-page rewrite.
-                // The reuse count is recorded where `compute_lob_reuse` decides (rollback's
-                // kept-chain retention must not count as reuse), not counted again here.
-                if let Some(Some(old_lob)) = reuse.get(i) {
-                    mask[i] = Some(*old_lob);
-                    continue;
-                }
-                let bytes = match codec.columns[i].kind {
-                    ColumnKind::VarString => value_to_string_bytes(&values[i]).into(),
-                    ColumnKind::Json => json_coerce_to_jsonb(&values[i])?,
-                    ColumnKind::Geometry => geometry_coerce_to_internal(&values[i])?.into(),
-                    ColumnKind::Vector { dim, datatype } => {
-                        vector_coerce_to_internal(&values[i], datatype, dim)?.into()
+            for i in 0..n {
+                if externalized[i] {
+                    // M1(LOB) — attach the kept/reused old chain: the caller (UPDATE reuse
+                    // or rollback kept-chain) has already ensured the chain matches the column's
+                    // bytes, so reuse it directly, skipping allocation + overflow-page rewrite.
+                    // The reuse count is recorded where `compute_lob_reuse` decides (rollback's
+                    // kept-chain retention must not count as reuse), not counted again here.
+                    if let Some(Some(old_lob)) = reuse.get(i) {
+                        mask[i] = Some(*old_lob);
+                        continue;
                     }
-                    _ => value_to_bytes(&values[i]).into(),
-                };
-                // M5(LOB compression) — text/json/bytes/geometry are compressible; vector
-                // is already-compact f32 little-endian that lz4 cannot shrink (only adds CPU) → skip.
-                let compressible = !matches!(codec.columns[i].kind, ColumnKind::Vector { .. });
-                let lob = self.with_overflow_mut(table_id, |ovf| {
-                    ovf.allocate_chain_compressible(&bytes, compressible)
-                })?;
-                // M6(LOB) — record the bytes allocated for one externalized chain (raw bytes).
-                self.dml_stats
-                    .record_lob_chain_externalized(bytes.len() as u64);
-                mask[i] = Some(lob);
-                newly_allocated.push(lob);
+                    let bytes = match codec.columns[i].kind {
+                        ColumnKind::VarString => value_to_string_bytes(&values[i]).into(),
+                        ColumnKind::Json => json_coerce_to_jsonb(&values[i])?,
+                        ColumnKind::Geometry => geometry_coerce_to_internal(&values[i])?.into(),
+                        ColumnKind::Vector { dim, datatype } => {
+                            vector_coerce_to_internal(&values[i], datatype, dim)?.into()
+                        }
+                        _ => value_to_bytes(&values[i]).into(),
+                    };
+                    // M5(LOB compression) — text/json/bytes/geometry are compressible; vector
+                    // is already-compact f32 little-endian that lz4 cannot shrink (only adds CPU) → skip.
+                    let compressible = !matches!(codec.columns[i].kind, ColumnKind::Vector { .. });
+                    let lob = self.with_overflow_mut(table_id, |ovf| {
+                        ovf.allocate_chain_compressible(&bytes, compressible)
+                    })?;
+                    // M6(LOB) — record the bytes allocated for one externalized chain (raw bytes).
+                    self.dml_stats
+                        .record_lob_chain_externalized(bytes.len() as u64);
+                    mask[i] = Some(lob);
+                    newly_allocated.push(lob);
+                }
             }
-        }
             Ok(())
         })();
         if let Err(err) = allocation {
@@ -537,7 +682,10 @@ impl Database {
         for values in rows {
             match self.externalize_row_lobs(table_id, codec, values) {
                 Ok(mask) => externals.push(mask),
-                Err(err) => { self.free_external_masks(table_id, &externals); return Err(err); }
+                Err(err) => {
+                    self.free_external_masks(table_id, &externals);
+                    return Err(err);
+                }
             }
         }
         match self.with_heap_mut(table_id, |heap| {
@@ -784,18 +932,44 @@ impl Database {
             }
             self.check_not_null_constraints_batch(&table, &prepared_rows)?;
             self.check_check_constraints_batch(&table, &prepared_rows)?;
+            let scalar_keys = ScalarInsertKeys::try_build(&table, &prepared_rows)?;
             // Hold the unique-key locks before probing: a committed competitor
             // must not invalidate a successful probe before the heap write.
             if need_unique_checks {
-                self.lock_unique_keys_for_rows(txn.txn_id, &table, &prepared_rows)?;
+                if let Some(keys) = scalar_keys.as_ref() {
+                    if !self.insert_locks_covered_by_table(txn.txn_id, table.id) {
+                        let locks = keys
+                            .keys
+                            .chunks(table.indexes.len())
+                            .flat_map(|row_keys| table.indexes.iter().zip(row_keys))
+                            .filter(|(index, key)| {
+                                index.enforces_uniqueness()
+                                    && (index.primary
+                                        || !key.0.iter().any(|part| matches!(part, KeyPart::Null)))
+                            })
+                            .map(|(index, key)| (table.id, index.name.as_str(), key.clone()))
+                            .collect();
+                        self.lock_unique_keys_nonblocking(txn.txn_id, locks)?;
+                    }
+                } else {
+                    self.lock_unique_keys_for_rows(txn.txn_id, &table, &prepared_rows)?;
+                }
             }
             if need_unique_checks && (prepared_rows.len() == 1 || generated_unique_batch) {
                 // A single row cannot duplicate itself. Keep exactly the same
                 // index conflict proof and key locking as the batch path,
                 // without building per-index HashSets and a string-keyed map.
                 {
-                    for index in &unique_indexes {
-                        let key = table.index_key(index, &prepared_rows[0])?;
+                    for (position, index) in table
+                        .indexes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, index)| index.enforces_uniqueness())
+                    {
+                        let key = match scalar_keys.as_ref() {
+                            Some(keys) => keys.key(0, position).clone(),
+                            None => table.index_key(index, &prepared_rows[0])?,
+                        };
                         if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary
                         {
                             continue;
@@ -807,13 +981,16 @@ impl Database {
                             if prepared_rows.len() == 1 {
                                 self.check_unique_constraint(&table, txn, None, index, key)?;
                             } else {
-                                for values in &prepared_rows {
+                                for (row, values) in prepared_rows.iter().enumerate() {
                                     self.check_unique_constraint(
                                         &table,
                                         txn,
                                         None,
                                         index,
-                                        table.index_key(index, values)?,
+                                        match scalar_keys.as_ref() {
+                                            Some(keys) => keys.key(row, position).clone(),
+                                            None => table.index_key(index, values)?,
+                                        },
                                     )?;
                                 }
                             }
@@ -840,6 +1017,7 @@ impl Database {
                         txn,
                         &prepared_rows,
                         &batch_unique_keys,
+                        scalar_keys.as_ref(),
                     )?;
                 }
             }
@@ -874,12 +1052,38 @@ impl Database {
                 return Err(err);
             }
             if has_any_indexes {
-                self.insert_index_batches_deferred_for_rows(
-                    txn.txn_id,
-                    &table,
-                    &prepared_rows,
-                    &inserted,
-                )?;
+                if let Some(keys) = scalar_keys {
+                    let ScalarInsertKeys {
+                        mut keys,
+                        _charge,
+                        index_count,
+                    } = keys;
+                    let start = txn.txn_id as usize % index_count;
+                    for offset in 0..index_count {
+                        let position = (start + offset) % index_count;
+                        let entries = inserted
+                            .iter()
+                            .enumerate()
+                            .map(|(row, row_id)| {
+                                let key = &mut keys[row * index_count + position];
+                                (IndexKey::from(std::mem::take(&mut key.0)), *row_id)
+                            })
+                            .collect();
+                        self.insert_index_batch_deferred_at(
+                            txn.txn_id,
+                            table.id,
+                            &table.indexes[position],
+                            entries,
+                        )?;
+                    }
+                } else {
+                    self.insert_index_batches_deferred_for_rows(
+                        txn.txn_id,
+                        &table,
+                        &prepared_rows,
+                        &inserted,
+                    )?;
+                }
             }
             self.defer_vector_insert_batch(
                 txn.txn_id,
@@ -1000,6 +1204,10 @@ impl Database {
                     }
                 }
                 let routed = table.route_row_to_partition(&values)?;
+                crate::engine::executor::partition_clause::check_partition_write(
+                    table.id,
+                    routed.storage_id,
+                )?;
                 prepared.push(Prepared {
                     orig_idx,
                     storage_id: routed.storage_id,
@@ -1066,6 +1274,7 @@ impl Database {
                     txn,
                     &snapshot_values,
                     batch_unique_keys,
+                    None,
                 )?;
             }
 
@@ -1346,6 +1555,7 @@ impl Database {
                     txn,
                     &prepared_rows,
                     &batch_unique_keys,
+                    None,
                 )?;
             } else {
                 for mut values in rows {
@@ -2991,8 +3201,18 @@ impl Database {
         if txn.txn_id != 0 {
             self.acquire_row_lock_blocking(txn.txn_id, storage_id, row_id, LockMode::Exclusive)?;
         }
-        let Some((header, mut projected_values, stored_count)) = self
-            .read_mvcc_row_columns_with_plan(storage_id, row_id, required_columns, decode_plan)?
+        let Some((header, projected_values, stored_count, patch_source)) = self
+            .read_mvcc_row_columns_for_update(
+                storage_id,
+                row_id,
+                required_columns,
+                decode_plan,
+                if txn.txn_id != 0 {
+                    effective_changed_columns
+                } else {
+                    &[]
+                },
+            )?
         else {
             return Ok(Some(false));
         };
@@ -3001,11 +3221,13 @@ impl Database {
         }
         // A logical None can be a physically reserved zero undo slot. Check
         // the encoded shape rather than rejecting every first UPDATE.
-        if header.undo_ptr.is_none()
+        if patch_source.is_none()
+            && header.undo_ptr.is_none()
             && !self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?
         {
             return Ok(None);
         }
+        let mut projected_values = projected_values;
         Self::backfill_projected_with_defaults(
             &mut projected_values,
             required_columns,
@@ -3094,6 +3316,7 @@ impl Database {
             &current_values,
             effective_changed_columns,
             before_values_sparse.into_vec(),
+            patch_source,
         )?;
         if !patched {
             return self
@@ -4080,6 +4303,7 @@ impl Database {
             new_values,
             changed_cols,
             before_values_sparse,
+            None,
         )
     }
 
@@ -4098,14 +4322,22 @@ impl Database {
         new_values: &[Value],
         changed_cols: &[usize],
         before_values_sparse: Vec<Value>,
+        patch_source: Option<HeapPatchSource>,
     ) -> Result<bool, QueryError> {
         debug_assert_eq!(changed_cols.len(), before_values_sparse.len());
         // Release the heap handle/page guards before reserving or appending
         // undo: preparation must not introduce a heap -> undo lock order.
         let heap = self.heap_handle(storage_id)?;
-        let prepared = heap
-            .read()
-            .prepare_mvcc_patch(row_id, new_values, changed_cols)?;
+        let prepared = {
+            let heap = heap.read();
+            match patch_source {
+                Some(source) => {
+                    debug_assert_eq!(source.row_id, row_id);
+                    source.prepare(&heap.codec, new_values)?
+                }
+                None => heap.prepare_mvcc_patch(row_id, new_values, changed_cols)?,
+            }
+        };
         let Some(prepared) = prepared else {
             return Ok(false);
         };

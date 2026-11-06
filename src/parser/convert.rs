@@ -5142,7 +5142,20 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                 ts.data_type,
                 SqlDataType::Date | SqlDataType::Time(..) | SqlDataType::Datetime(..)
             ) {
-                let (type_name, extra) = convert_cast_data_type(&ts.data_type)?;
+                let (type_name, mut extra) = convert_cast_data_type(&ts.data_type)?;
+                if matches!(
+                    ts.data_type,
+                    SqlDataType::Time(..) | SqlDataType::Datetime(..)
+                ) {
+                    let fsp = s.split_once('.').map_or(0, |(_, fraction)| {
+                        fraction
+                            .bytes()
+                            .take_while(u8::is_ascii_digit)
+                            .count()
+                            .min(6)
+                    });
+                    extra = vec![Expr::Literal(Literal::Int(fsp as i64))];
+                }
                 let mut args = vec![Expr::Literal(Literal::String(s))];
                 args.push(Expr::Literal(Literal::String(type_name)));
                 args.extend(extra);

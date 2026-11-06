@@ -4076,15 +4076,38 @@ impl IndexEntryProjector {
         key: &IndexKey,
         accumulators: &mut [crate::engine::executor::vec::batch::ColumnAccumulator],
     ) {
-        for (((key_pos, data_type), accumulator), _meta) in self
+        use crate::engine::executor::vec::batch::ColumnAccumulator;
+        for ((key_pos, data_type), accumulator) in self
             .key_positions
             .iter()
             .zip(self.data_types.iter())
             .zip(accumulators.iter_mut())
-            .zip(self.metas.iter())
         {
-            let value = key_pos
-                .and_then(|pos| key.0.get(pos))
+            let part = key_pos.and_then(|pos| key.0.get(pos));
+            if matches!(
+                accumulator,
+                ColumnAccumulator::I64 { .. } | ColumnAccumulator::U64 { .. }
+            ) {
+                let integer = match part {
+                    Some(KeyPart::Int(value)) => Some(
+                        if *value < 0 && matches!(accumulator, ColumnAccumulator::U64 { .. }) {
+                            None
+                        } else {
+                            Some(*value)
+                        },
+                    ),
+                    // The typed unsigned lane restores this bit pattern, so
+                    // BIGINT UNSIGNED and BIT(64) keep their complete range.
+                    Some(KeyPart::UInt(value)) => Some(Some(*value as i64)),
+                    Some(KeyPart::Null) | None => Some(None),
+                    _ => None,
+                };
+                if let Some(integer) = integer {
+                    accumulator.push_lossless_i64(integer);
+                    continue;
+                }
+            }
+            let value = part
                 .map(|part| part.to_value(data_type))
                 .unwrap_or(Value::Null);
             accumulator.push(&value);
@@ -5819,7 +5842,7 @@ pub(super) fn execute_vector_index_scan(
     // `examined` counts distinct heap reads against `max_scan_tuples`.
     let mut seen: std::collections::HashSet<(u64, RowId)> = std::collections::HashSet::new();
     let mut examined = 0usize;
-    let exact_fallback = loop {
+    let exact_fallback = 'candidate_search: loop {
         if !is_ivf && candidate_want.saturating_mul(storage_ids.len()) > max_scan {
             break true;
         }
@@ -5856,6 +5879,13 @@ pub(super) fn execute_vector_index_scan(
                 request,
             ) {
                 Ok(result) => result,
+                Err(index_error)
+                    if index_error.is(crate::error::catalog::ER_INDEX_CORRUPT)
+                        && index_error.diagnostic_id()
+                            == Some("MYDB-DIAG-VECTOR-MAINTENANCE-PENDING") =>
+                {
+                    break 'candidate_search true
+                }
                 Err(index_error) => return Err(index_error),
             };
             exact_order &= part_result.exact_order;

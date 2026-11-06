@@ -910,7 +910,7 @@ fn recover_from_wal_with_options(
                     let page_id_u64 = *page_id as u64;
                     let undo_patches: Vec<(usize, Vec<u8>)> = patches
                         .iter()
-                        .map(|p| (p.offset as usize, p.before.clone()))
+                        .map(|p| (p.offset as usize, p.before.to_vec()))
                         .collect();
                     let clr_lsn = log.lock().reserve_lsn()?;
                     redo_heap_update_logical_with_owned(
@@ -2046,7 +2046,7 @@ fn redo_heap_update_logical(
 ) -> Result<(), QueryError> {
     let owned_patches: Vec<(usize, Vec<u8>)> = patches
         .iter()
-        .map(|p| (p.offset as usize, p.after.clone()))
+        .map(|p| (p.offset as usize, p.after.to_vec()))
         .collect();
     redo_heap_update_logical_with_owned(
         data_dir,

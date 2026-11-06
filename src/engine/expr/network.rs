@@ -62,13 +62,19 @@ impl NetworkFunction {
         )
     }
     pub(crate) fn evaluate(self, value: &Value, swap: Option<&Value>) -> Result<Value, QueryError> {
-        if matches!(value, Value::Null) || swap.is_some_and(|v| matches!(v, Value::Null)) {
+        if matches!(value, Value::Null) {
             return Ok(Value::Null);
         }
         match self {
             Self::UuidToBin => {
                 let mut bytes = parse_uuid_bytes(&str_value(value)).ok_or_else(uuid_error)?;
-                if swap.map(int_value).transpose()?.unwrap_or(0) != 0 {
+                if swap
+                    .filter(|value| !matches!(value, Value::Null))
+                    .map(int_value)
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0
+                {
                     swap_uuid_time_parts(&mut bytes);
                 }
                 Ok(Value::Bytes(bytes.to_vec()))
@@ -76,7 +82,13 @@ impl NetworkFunction {
             Self::BinToUuid => {
                 let raw = value_bytes_ref(value);
                 let mut bytes: [u8; 16] = raw.as_ref().try_into().map_err(|_| uuid_error())?;
-                if swap.map(int_value).transpose()?.unwrap_or(0) != 0 {
+                if swap
+                    .filter(|value| !matches!(value, Value::Null))
+                    .map(int_value)
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0
+                {
                     unswap_uuid_time_parts(&mut bytes);
                 }
                 Ok(Value::String(crate::util::uuid::format(&bytes)))

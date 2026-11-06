@@ -70,7 +70,8 @@ pub(crate) struct SessionExprInfo {
     character_set_client: String,
     character_set_connection: String,
     collation_connection: String,
-    user_variables: HashMap<String, Value>,
+    user_variables: crate::engine::user_variables::UserVariables,
+    expression_registry: Option<std::sync::Weak<crate::engine::SessionRegistry>>,
     rls: crate::engine::rls::ContextSnapshot,
     rls_evaluation: Option<crate::engine::rls::EvaluationSnapshot>,
     xml_locals: Option<xml::Locals>,
@@ -220,7 +221,7 @@ pub(crate) fn with_policy_expression_settings<R>(
         .ok_or_else(|| {
             crate::engine::rls::violation("Policy expression has no statement context")
         })?;
-        info.user_variables.clear();
+        info.user_variables = Default::default();
         info.query_attributes.clear();
         settings.apply(&mut info);
         Ok(std::sync::Arc::new(info))
@@ -324,11 +325,11 @@ fn capture_session_expr_info(session: &crate::engine::api::SessionContext) -> Se
 pub(crate) fn capture_external_expr_info(
     session: &crate::engine::api::SessionContext,
 ) -> SessionExprInfo {
-    capture_session_expr_info_with_variables(session, HashMap::new())
+    capture_session_expr_info_with_variables(session, Default::default())
 }
 fn capture_session_expr_info_with_variables(
     session: &crate::engine::api::SessionContext,
-    user_variables: HashMap<String, Value>,
+    user_variables: crate::engine::user_variables::UserVariables,
 ) -> SessionExprInfo {
     let strict_mode = session.temporal_sql_mode_bits & crate::engine::api::TEMPORAL_MODE_STRICT
         != 0
@@ -357,6 +358,7 @@ fn capture_session_expr_info_with_variables(
         character_set_connection: session.character_set_connection.clone(),
         collation_connection: session.collation_connection.clone(),
         user_variables,
+        expression_registry: session.expression_registry.clone(),
         rls: session.rls.snapshot(),
         rls_evaluation: crate::engine::rls::evaluation_snapshot(),
         xml_locals: xml::current_locals(),
@@ -951,9 +953,11 @@ fn assign_session_user_variable(name: &str, value: Value) -> Result<Value, Query
         // valid for the installed scope and only touched on the serial
         // session-owning thread.
         let session = unsafe { &mut *ctx.session.as_ptr() };
-        session.set_user_variable(name, value.clone());
+        session.set_user_variable(name, value.clone())
     });
-    if written.is_none() {
+    if let Some(result) = written {
+        result?;
+    } else {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             "user-variable assignment ':=' in an expression is not supported in this context",
@@ -1481,6 +1485,12 @@ impl SessionView<'_> {
             SessionView::Owned(i) => &i.collation_connection,
         }
     }
+    fn registry(&self) -> Option<std::sync::Arc<crate::engine::SessionRegistry>> {
+        match self {
+            SessionView::Borrowed(session) => session.expression_registry.as_ref()?.upgrade(),
+            SessionView::Owned(info) => info.expression_registry.as_ref()?.upgrade(),
+        }
+    }
     fn user_variable(&self, key: &str) -> Option<Value> {
         match self {
             SessionView::Borrowed(s) => s.user_variables.get(key).cloned(),
@@ -1734,7 +1744,11 @@ fn division_by_zero_value() -> Result<Value, QueryError> {
     let bits = session_temporal_sql_mode_bits();
     let strict = bits & crate::engine::api::TEMPORAL_MODE_STRICT != 0
         || bits & crate::engine::api::TEMPORAL_MODE_EXPLICIT == 0;
-    if DML_EXPRESSION_DEPTH.with(|depth| depth.get() != 0) && strict && session_div_zero_warns() {
+    if (DML_EXPRESSION_DEPTH.with(|depth| depth.get() != 0)
+        || strict_numeric_materialization_active())
+        && strict
+        && session_div_zero_warns()
+    {
         return Err(error(
             crate::error::catalog::ER_DIVISION_BY_ZERO,
             "Division by 0",
@@ -1906,11 +1920,36 @@ pub(crate) fn cast_value_to_date(value: &Value) -> Result<Value, QueryError> {
     }
     let normalized = date_context_colon_value(value);
     let date_input = normalized.as_ref().unwrap_or(value);
+    if normalized.is_none() && matches!(value, Value::Time(_)) {
+        return Ok(warn_invalid_temporal_cast("date", value));
+    }
+    if normalized.is_none() && value_is_stringish(value) {
+        let text = str_value(value);
+        if text.contains(':') && !text.contains([' ', 'T', '-']) {
+            return Ok(warn_invalid_temporal_cast("date", value));
+        }
+    }
     if let Ok(dt) = parse_datetime(date_input) {
         let base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         return Ok(Value::Date(
             dt.date().signed_duration_since(base).num_days() as i32,
         ));
+    }
+    if value_is_stringish(value) {
+        let text = str_value(value);
+        if text.len() > 10 && text.is_char_boundary(10) {
+            let tail = text[10..].trim_start();
+            if !tail.is_empty() && !tail.as_bytes()[0].is_ascii_digit() {
+                if let Ok(days) = crate::storage::parse_date_to_days_bytes(text[..10].as_bytes()) {
+                    crate::engine::api::push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                        format!("Truncated incorrect date value: '{text}'"),
+                    );
+                    return Ok(Value::Date(days));
+                }
+            }
+        }
     }
     if let Some(parts) =
         crate::util::temporal::parse_delimited_datetime_components(&string_value(value))
@@ -3616,7 +3655,10 @@ pub(crate) fn eval_like_values_with_collation(
     if matches!(value, Value::Null) || matches!(pattern, Value::Null) {
         return Value::Null;
     }
-    let binary = matches!(value, Value::Bytes(_)) || matches!(pattern, Value::Bytes(_));
+    let binary = collation.map_or_else(
+        || matches!(value, Value::Bytes(_)) || matches!(pattern, Value::Bytes(_)),
+        |info| info.charset == "binary",
+    );
     let matched = if binary {
         match_like_bytes(&value_bytes_ref(value), &value_bytes_ref(pattern), escape)
     } else {
@@ -5285,7 +5327,11 @@ pub(crate) fn eval_field_values(
         domain = runtime_field_domain(values);
     }
     let strings = domain == FieldComparisonDomain::Strings;
-    let binary = strings && values.iter().any(|value| matches!(value, Value::Bytes(_)));
+    let binary = strings
+        && COMPARE_COLLATION_ID.with(Cell::get).map_or_else(
+            || matches!(values[0], Value::Bytes(_)),
+            |id| id == crate::charset::BINARY_COLLATION_ID,
+        );
     let target_bytes = binary.then(|| value_bytes(&values[0]));
     let numeric_target = if domain == FieldComparisonDomain::Double {
         numeric(&values[0])?
@@ -6169,7 +6215,7 @@ where
                         0
                     };
                     let converted =
-                        parse_time_value_components(&value).map(|(negative, h, m, s, us)| {
+                        parse_time_value_components_inner(&value).map(|(negative, h, m, s, us)| {
                             let magnitude =
                                 (i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s))
                                     .min(TIME_MAX_SECONDS + 1)
@@ -6505,8 +6551,12 @@ where
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
                 let s = string_value(&values[0]);
-                let m = int_value(&values[1])? as usize;
-                let n = int_value(&values[2])? as usize;
+                let m = int_value(&values[1])?;
+                let n = int_value(&values[2])?;
+                if m < 0 || n < 0 {
+                    return Ok(Value::Null);
+                }
+                let (m, n) = (m as usize, n as usize);
                 let masker = values
                     .get(3)
                     .map(string_value)
@@ -6520,8 +6570,12 @@ where
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
                 let s = string_value(&values[0]);
-                let m = int_value(&values[1])? as usize;
-                let n = int_value(&values[2])? as usize;
+                let m = int_value(&values[1])?;
+                let n = int_value(&values[2])?;
+                if m < 0 || n < 0 {
+                    return Ok(Value::Null);
+                }
+                let (m, n) = (m as usize, n as usize);
                 let masker = values
                     .get(3)
                     .map(string_value)
@@ -6550,12 +6604,15 @@ where
             })
         }
         "MASK_SSN" => {
-            // mask_ssn: U.S. SSN (NNN-NN-NNNN) — mask the first 5 chars,
-            // keep last 4. Per MySQL: input shape isn't validated.
+            // Mask the area/group fields while preserving the SSN structure.
             expect_arg_count(name, args, 1)?;
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
                 let s = string_value(&value);
+                if s.chars().count() != 11 {
+                    return Err(crate::error::catalog::ER_CANT_INITIALIZE_UDF
+                        .error("MASK_SSN requires an eleven-character SSN"));
+                }
                 Ok(Value::String(mask_ssn_core(&s)))
             })
         }
@@ -7087,7 +7144,11 @@ where
             let n = if matches!(seed, Value::Null) {
                 0
             } else {
-                int_value(&seed)? as u32
+                let integer = cast_to_integer(&seed, false)?;
+                match integer {
+                    Value::UInt(value) => value as u32,
+                    _ => int_value(&integer)? as u32,
+                }
             };
             let initial = || {
                 let seed1 =
@@ -7390,7 +7451,7 @@ where
             null_or(value, |value| {
                 let day_number = int_value(&value)?;
                 if day_number <= 0 {
-                    return Ok(Value::String("0000-00-00".into()));
+                    return Ok(Value::Date(crate::types::ZERO_DATE));
                 }
                 let offset = if day_number < 60 { 366 } else { 365 };
                 let Some(days_from_ce) = day_number.checked_sub(offset) else {
@@ -7410,14 +7471,7 @@ where
                     );
                     return Ok(Value::Null);
                 }
-                Ok(Value::String({
-                    let mut buffer = [0; 32];
-                    let days = date.num_days_from_ce() - 719_163;
-                    String::from_utf8(
-                        crate::types::write_date_canonical(days, &mut buffer).to_vec(),
-                    )
-                    .expect("canonical calendar date is ASCII")
-                }))
+                Ok(Value::Date(date.num_days_from_ce() - 719_163))
             })
         }
         "TIME" => {
@@ -7864,6 +7918,16 @@ where
                         return Ok(warn_invalid_temporal_cast("time", &Value::Int(result_us)));
                     }
                     let limit = TIME_MAX_SECONDS * 1_000_000;
+                    if result_us.unsigned_abs() > limit as u64 {
+                        crate::engine::api::push_statement_warning(
+                            crate::error::ConditionLevel::Warning,
+                            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                            format!(
+                                "Truncated incorrect time value: '{}'",
+                                Value::Time(result_us).to_display_string()
+                            ),
+                        );
+                    }
                     Ok(Value::Time(result_us.clamp(-limit, limit)))
                 } else {
                     // DATETIME arithmetic: parse base datetime, then add
@@ -7897,7 +7961,8 @@ where
             null_if_any(values, |values| {
                 let period = int_value(&values[0])?;
                 if period == 0 {
-                    return Ok(Value::Int(0));
+                    return Err(crate::error::catalog::ER_WRONG_ARGUMENTS
+                        .error("Incorrect arguments to period_add"));
                 }
                 let (y, m) = checked_period_to_ym(period, "period_add")?;
                 let months_to_add = int_value(&values[1])?;
@@ -7998,24 +8063,26 @@ where
         "SLEEP" => {
             expect_arg_count(name, args, 1)?;
             let value = eval_arg(&args[0])?;
-            if matches!(value, Value::Null) {
+            let seconds = if matches!(value, Value::Null) {
+                -1.0
+            } else {
+                numeric(&value)?
+            };
+            if seconds < 0.0 || !seconds.is_finite() || seconds >= u64::MAX as f64 {
+                let err = crate::error::catalog::ER_WRONG_ARGUMENTS
+                    .error("Incorrect arguments to sleep.");
+                if strict_sql_mode() {
+                    return Err(err);
+                }
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
                     crate::error::catalog::ER_WRONG_ARGUMENTS,
-                    "Incorrect arguments to sleep.",
+                    err.message(),
                 );
+            } else if seconds < 0.00001 {
+                crate::engine::cancel::check_cancelled()?;
             } else {
-                let seconds = numeric(&value)?;
-                if seconds.is_sign_positive() && seconds.is_finite() {
-                    // MySQL's interruptible SLEEP treats sub-10us requests
-                    // as zero waits; preserve cancellation without entering
-                    // the operating-system sleep path for this domain.
-                    if seconds < 0.00001 {
-                        crate::engine::cancel::check_cancelled()?;
-                    } else {
-                        sleep_with_cancel(Duration::from_secs_f64(seconds))?;
-                    }
-                }
+                sleep_with_cancel(Duration::from_secs_f64(seconds))?;
             }
             Ok(Value::Int(0))
         }
@@ -8062,6 +8129,7 @@ where
                 let valid = match &value {
                     Value::Json(_) => true,
                     Value::Bytes(_) => false,
+                    other if !matches!(other, Value::String(_) | Value::SmallString(_)) => false,
                     other => {
                         match crate::engine::json::parse_document(
                             &string_value(other),
@@ -8433,7 +8501,13 @@ where
                     .copied()
                     .filter(|&b| !matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
                     .collect();
-                match base64::engine::general_purpose::STANDARD.decode(&cleaned) {
+                let config = base64::engine::general_purpose::GeneralPurposeConfig::new()
+                    .with_decode_allow_trailing_bits(true);
+                let decoder = base64::engine::general_purpose::GeneralPurpose::new(
+                    &base64::alphabet::STANDARD,
+                    config,
+                );
+                match decoder.decode(&cleaned) {
                     Ok(bytes) => Ok(Value::Bytes(bytes)),
                     Err(_) => Ok(Value::Null),
                 }
@@ -8514,7 +8588,11 @@ where
                 return Ok(Value::Null);
             }
             let bits = to_u64_bitwise(&bit_value)?;
-            let mut out = String::new();
+            let mut out = Vec::new();
+            let mut binary = args
+                .iter()
+                .skip(1)
+                .any(|arg| expr_result_type(arg) == ColumnType::Blob);
             let mut first = true;
             for (idx, expr) in args.iter().skip(1).enumerate() {
                 if idx >= 64 || bits & (1u64 << idx) == 0 {
@@ -8522,7 +8600,8 @@ where
                 }
                 let value = eval_arg(expr)?;
                 if !matches!(value, Value::Null) {
-                    let part = string_value(&value);
+                    binary |= matches!(value, Value::Bytes(_));
+                    let part = value_bytes_ref(&value);
                     let size = out
                         .len()
                         .saturating_add(part.len())
@@ -8531,13 +8610,20 @@ where
                         return Ok(Value::Null);
                     }
                     if !first {
-                        out.push(',');
+                        out.push(b',');
                     }
-                    out.push_str(&part);
+                    out.extend_from_slice(&part);
                     first = false;
                 }
             }
-            Ok(Value::String(out))
+            Ok(if binary {
+                Value::Bytes(out)
+            } else {
+                Value::String(String::from_utf8(out).map_err(|_| {
+                    crate::error::catalog::ER_INVALID_CHARACTER_STRING
+                        .error("invalid MAKE_SET character string")
+                })?)
+            })
         }
         "SOUNDEX" => {
             let value = eval_one(name, args, eval_arg)?;
@@ -8582,6 +8668,9 @@ where
                         crate::error::catalog::ER_WRONG_ARGUMENTS,
                         "Incorrect arguments to regexp_instr: return_option must be 1 or 0.",
                     ));
+                }
+                if expr.is_empty() && pos > 1 {
+                    return Ok(Value::Int(0));
                 }
                 let start_byte = regexp_start_byte(&expr, pos)?;
                 let mut seen = 0;
@@ -9193,7 +9282,6 @@ where
             }
             let mut text: String = string_value(&value).chars().take(length).collect();
             let char_len = text.chars().count();
-            text.extend(std::iter::repeat(' ').take(length - char_len));
             let collation = expression_metadata_collation_id(&args[0])
                 .and_then(crate::charset::resolve_collation_id)
                 .map(|info| info.name.to_string())
@@ -9203,6 +9291,9 @@ where
                         None => crate::charset::DEFAULT_COLLATION.to_string(),
                     })
                 });
+            if crate::charset::resolve_collation(&collation)?.pad_space {
+                text.extend(std::iter::repeat_n(' ', length - char_len));
+            }
             Ok(Value::Bytes(mysql_weight_string(&text, &collation)?))
         }
         // -- date/time extensions --
@@ -9228,10 +9319,30 @@ where
             expect_arg_count(name, args, 2)?;
             let values = eval_args(args, eval_arg)?;
             null_if_any(values, |values| {
-                let (neg, h, m, s, us) = match parse_time_value_components(&values[0]) {
-                    Ok(parts) => parts,
-                    Err(err) => return Ok(warn_invalid_temporal_function("time", &values[0], err)),
-                };
+                let (neg, mut h, mut m, mut s, mut us) =
+                    match parse_time_value_components(&values[0]) {
+                        Ok(parts) => parts,
+                        Err(err) => {
+                            return Ok(warn_invalid_temporal_function("time", &values[0], err))
+                        }
+                    };
+                if (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
+                    + u64::from(us)
+                    > TIME_MAX_SECONDS as u64 * 1_000_000
+                {
+                    h = 838;
+                    m = 59;
+                    s = 59;
+                    us = 0;
+                    crate::engine::api::push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                        format!(
+                            "Truncated incorrect time value: '{}'",
+                            string_value(&values[0])
+                        ),
+                    );
+                }
                 let fmt = string_value(&values[1]);
                 let mut specs = fmt.chars();
                 while let Some(c) = specs.next() {
@@ -9510,24 +9621,61 @@ where
             })))
         }
         "PS_THREAD_ID" => {
-            if args.is_empty() {
-                return Ok(Value::UInt(with_session_view(|view| match view {
-                    Some(v) => v.connection_id() as u64,
-                    None => 1,
-                })));
-            }
             let value = eval_one(name, args, eval_arg)?;
-            null_or(value, |value| Ok(Value::UInt(numeric(&value)? as u64)))
+            null_or(value, |value| {
+                let id = int_value(&value)?;
+                let known = u32::try_from(id).ok().is_some_and(|id| {
+                    with_session_view(|view| {
+                        view.is_some_and(|session| {
+                            session.connection_id() == id
+                                || session
+                                    .registry()
+                                    .is_some_and(|registry| registry.contains_connection(id))
+                        })
+                    }) || STORED_FN_CTX
+                        .with(|context| context.get())
+                        .is_some_and(|context| {
+                            // The installed context owns the registry for this evaluation.
+                            unsafe { context.registry.as_ref() }.contains_connection(id)
+                        })
+                });
+                Ok(if known {
+                    Value::UInt(id as u64)
+                } else {
+                    Value::Null
+                })
+            })
         }
         "PS_THREAD_ACCOUNT" => {
-            expect_min_args(name, args, 0)?;
-            for arg in args {
-                let _ = eval_arg(arg)?;
-            }
-            Ok(with_session_view(|view| match view {
-                Some(v) => Value::String(v.current_user()),
-                None => Value::Null,
-            }))
+            let value = eval_one(name, args, eval_arg)?;
+            null_or(value, |value| {
+                let id = int_value(&value)?;
+                let Some(id) = u32::try_from(id).ok() else {
+                    return Ok(Value::Null);
+                };
+                let account = with_session_view(|view| {
+                    view.and_then(|session| {
+                        session
+                            .registry()
+                            .and_then(|registry| registry.account_for_connection(id))
+                    })
+                })
+                .or_else(|| {
+                    STORED_FN_CTX
+                        .with(|context| context.get())
+                        .and_then(|context| {
+                            // The installed context owns the registry for this evaluation.
+                            unsafe { context.registry.as_ref() }.account_for_connection(id)
+                        })
+                })
+                .or_else(|| {
+                    with_session_view(|view| {
+                        view.filter(|session| session.connection_id() == id)
+                            .map(|session| session.current_user())
+                    })
+                });
+                Ok(account.map(Value::String).unwrap_or(Value::Null))
+            })
         }
         "PS_THREAD_STACK" | "PS_THREAD_TRX_INFO" => {
             for arg in args {
@@ -10818,7 +10966,7 @@ pub(crate) fn eval_greatest_least<F>(
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
-    expect_min_args(name, args, 1)?;
+    expect_min_args(name, args, 2)?;
     let mut values = eval_args(args, eval_arg)?;
     let date_year_domain = values.iter().any(|value| matches!(value, Value::Date(_)))
         && values
@@ -10999,12 +11147,15 @@ pub(crate) fn extract_datetime_part(
             | "MICROSECONDS"
     ) {
         return match parse_time_value_components(value) {
-            Ok((_, h, m, s, us)) => Ok(Value::Int(i64::from(match part.as_str() {
-                "HOUR" | "HOURS" => h,
-                "MINUTE" | "MINUTES" => m,
-                "SECOND" | "SECONDS" => s,
-                _ => us,
-            }))),
+            Ok((negative, h, m, s, us)) => Ok(Value::Int(
+                (if negative { -1 } else { 1 })
+                    * i64::from(match part.as_str() {
+                        "HOUR" | "HOURS" => h,
+                        "MINUTE" | "MINUTES" => m,
+                        "SECOND" | "SECONDS" => s,
+                        _ => us,
+                    }),
+            )),
             Err(err) => Ok(warn_invalid_temporal_function("time", value, err)),
         };
     }
@@ -11945,11 +12096,11 @@ pub(crate) fn eval_repeat_core(value: &Value, n: i64) -> Value {
 /// P2-B1 — mask_inner(str, m, n[, c]): mask the inner characters of
 /// `str`, leaving the first `m` and last `n` characters intact. Per
 /// MySQL: when `m + n >= len(str)` the whole string is returned
-/// untouched. Negative counts coerce to 0.
+/// untouched. Callers reject negative margins before entering this core.
 pub(crate) fn mask_inner_core(s: &str, m: usize, n: usize, masker: char) -> String {
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
-    if m + n >= len {
+    if m.saturating_add(n) >= len {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len());
@@ -11970,7 +12121,7 @@ pub(crate) fn mask_inner_core(s: &str, m: usize, n: usize, masker: char) -> Stri
 pub(crate) fn mask_outer_core(s: &str, m: usize, n: usize, masker: char) -> String {
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
-    if m + n >= len {
+    if m.saturating_add(n) >= len {
         return masker.to_string().repeat(len);
     }
     let mut out = String::with_capacity(s.len());
@@ -12011,27 +12162,10 @@ pub(crate) fn mask_pan_core(s: &str, relaxed: bool) -> String {
     out
 }
 
-/// P2-B1 — mask_ssn implementation. U.S. Social Security Number form
-/// NNN-NN-NNNN. MySQL masks the first 5 visible characters (the area
-/// + group sections) and keeps the last 4 plus structural dashes. We
-/// honour that: anything before the last 4 chars becomes 'X', dashes
-/// included — clients that need the dashes preserved can use
-/// mask_inner directly.
+/// Mask an eleven-character SSN's area/group fields and preserve its suffix.
 pub(crate) fn mask_ssn_core(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    if len <= 4 {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    for (i, ch) in chars.iter().enumerate() {
-        if i >= len - 4 {
-            out.push(*ch);
-        } else {
-            out.push('X');
-        }
-    }
-    out
+    let suffix: String = s.chars().skip(7).collect();
+    format!("XXX-XX-{suffix}")
 }
 
 /// Core of SPACE: negative count → empty string, over-cap → NULL +
@@ -12639,10 +12773,7 @@ fn mysql_date_format_components(
                 let _ = write!(out, "{day}{suffix}");
             }
             '%' => out.push('%'),
-            other => {
-                out.push('%');
-                out.push(other);
-            }
+            other => out.push(other),
         }
     }
     out
@@ -13411,8 +13542,7 @@ fn parse_time_for_comparison(value: &Value) -> Result<i64, QueryError> {
     let (negative, hour, minute, second, micros) = parse_time_value_components(value)?;
     let magnitude = (i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))
         * 1_000_000
-        + i64::from(micros)
-        + i64::from(!value_is_numeric(value) && comparison_fraction_rounds_up(value));
+        + i64::from(micros);
     Ok(if negative { -magnitude } else { magnitude })
 }
 
@@ -13569,10 +13699,7 @@ pub(crate) fn mysql_date_format(dt: &NaiveDateTime, format: &str) -> String {
             }
             'p' => out.push_str(if dt.hour() < 12 { "AM" } else { "PM" }),
             '%' => out.push('%'),
-            other => {
-                out.push('%');
-                out.push(other);
-            }
+            other => out.push(other),
         }
     }
     out
@@ -13988,7 +14115,7 @@ fn month_diff(dt1: NaiveDateTime, dt2: NaiveDateTime) -> i64 {
 /// including `%f` (six-digit microseconds with no leading dot), `%D`
 /// (English ordinal suffix), `%U/%u/%V/%v` (week numbers) and
 /// `%X/%x` (year-of-week). Weekday / month names use the session
-/// `lc_time_names` locale — MySQL matches that.
+/// English names, independently of the output `lc_time_names` locale.
 ///
 /// Returns `None` on any mismatch; the caller renders that as NULL,
 /// matching MySQL's non-STRICT default (`STRICT` mode surfacing is
@@ -13998,7 +14125,7 @@ pub(crate) fn str_to_date_native(input: &str, fmt: &str) -> Option<Value> {
     let input = input.trim();
     let mut ib = input.as_bytes();
     let mut fb = fmt.as_bytes();
-    let locale = session_time_locale();
+    let locale = crate::engine::time_locale::time_locale("en_US");
 
     while !fb.is_empty() {
         if ib.is_empty() {
@@ -14030,6 +14157,9 @@ pub(crate) fn str_to_date_native(input: &str, fmt: &str) -> Option<Value> {
         }
     }
 
+    if b.is_pm.is_some() && b.hour12.is_none() {
+        return None;
+    }
     b.finalize_hour_from_12h();
     if fmt
         .as_bytes()
@@ -14097,7 +14227,9 @@ impl StrToDateBuilder {
     fn materialize(mut self, _locale: &crate::engine::time_locale::TimeLocale) -> Option<Value> {
         // Resolve day_of_year → month/day if year is known.
         if let (Some(y), Some(doy)) = (self.year, self.day_of_year) {
-            let base = chrono::NaiveDate::from_yo_opt(y, doy)?;
+            let base = chrono::NaiveDate::from_ymd_opt(y, 1, 1)?
+                .checked_add_signed(chrono::Duration::days(i64::from(doy) - 1))?;
+            self.year = Some(base.year());
             self.month.get_or_insert(base.month());
             self.day.get_or_insert(base.day());
         }
@@ -14115,6 +14247,7 @@ impl StrToDateBuilder {
                     wd,
                     self.week_sunday_first,
                     self.weekday_sunday_zero,
+                    self.year_of_week.is_some(),
                 ) {
                     self.year = Some(date.year());
                     self.month = Some(date.month());
@@ -14528,6 +14661,7 @@ fn date_from_year_week_weekday(
     weekday: u32,
     week_sunday_first: bool,
     weekday_sunday_zero: bool,
+    strict_week_year: bool,
 ) -> Option<chrono::NaiveDate> {
     use chrono::Datelike;
     let jan1 = chrono::NaiveDate::from_ymd_opt(year, 1, 1)?;
@@ -14550,7 +14684,12 @@ fn date_from_year_week_weekday(
         0 /* Mon */
     };
     // Distance from Jan 1 to first occurrence of `first_week_start_dow`.
-    let offset_to_week_start = (7 + first_week_start_dow as i32 - jan1_dow as i32) % 7;
+    let mut offset_to_week_start = (7 + first_week_start_dow as i32 - jan1_dow as i32) % 7;
+    // Monday-based week one contains January 4 (ISO), rather than
+    // necessarily starting at the first Monday after January 1.
+    if strict_week_year && !week_sunday_first && jan1_dow <= 3 && offset_to_week_start != 0 {
+        offset_to_week_start -= 7;
+    }
     // Distance from that first week-start to target weekday.
     let intra = (7 + target_mon0 as i32 - first_week_start_dow as i32) % 7;
     let total_days = offset_to_week_start as i64 + (week as i64 - 1) * 7 + intra as i64;
@@ -14999,7 +15138,8 @@ fn generate_uuid_v1() -> String {
 
 pub(crate) fn checked_period_to_ym(period: i64, function: &str) -> Result<(i32, u32), QueryError> {
     if period == 0 {
-        return Ok((0, 1));
+        return Err(crate::error::catalog::ER_WRONG_ARGUMENTS
+            .error(format!("Incorrect arguments to {function}")));
     }
     if period < 0 || period > 999_912 {
         return Err(error(
@@ -15159,7 +15299,13 @@ fn function_arg_with_table_octets(
     table: &TableSchema,
     value: Value,
 ) -> Result<Value, QueryError> {
-    if is_charset_octet_function(function_name) {
+    if is_charset_octet_function(function_name)
+        && (!function_name.eq_ignore_ascii_case("CRC32")
+            || matches!(
+                value,
+                Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+            ))
+    {
         if let Some(collation) = expr_collation(expr, table) {
             return value_in_charset_octets(value, collation.charset);
         }
@@ -15264,6 +15410,15 @@ pub(crate) fn eval_regexp_like_values(values: &[Value]) -> Result<Value, QueryEr
     }
     let re = mysql_regex_for_operand(&string_value(&values[1]), values.get(2), false)?;
     let text = string_value(&values[0]);
+    if re.accepts_fast_positive(text.as_bytes()) {
+        if re.is_match_line_free(&text) {
+            return Ok(Value::Int(1));
+        }
+        let _memory = re.search_scope(&text)?;
+        return Ok(Value::Int(
+            (_memory.is_some() && re.is_match_with_admitted_scope(&text)) as i64,
+        ));
+    }
     let _memory = re.search_scope(&text)?;
     Ok(Value::Int(re.is_match(&text) as i64))
 }
@@ -17064,6 +17219,9 @@ where
     match json_value_convert_jsonb(&value, &returning) {
         Ok(value) => Ok(value),
         Err(err) => {
+            if on_error.eq_ignore_ascii_case("ERROR") {
+                return Err(err);
+            }
             crate::engine::api::push_statement_condition(
                 crate::error::ConditionLevel::Warning,
                 &err,
@@ -17231,7 +17389,7 @@ fn json_value_integer(value: Value, unsigned: bool) -> Result<Value, QueryError>
     let value = json_value_numeric_input(value)?;
     crate::util::decimal::checked_integer_text(&value.to_display_string(), unsigned).ok_or_else(
         || {
-            crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST
+            crate::error::catalog::ER_DATA_OUT_OF_RANGE
                 .error("JSON_VALUE integer conversion is out of range")
         },
     )
@@ -18035,9 +18193,7 @@ pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError>
             .expect("validated GTID UUID length");
         let uuid = uuid.map(|byte| byte.to_ascii_lowercase());
         let intervals = set.entry(uuid).or_default();
-        let mut saw_interval = false;
         for interval in parts {
-            saw_interval = true;
             let interval = interval.trim();
             let (start, end) = match interval.split_once('-') {
                 Some((s, e)) => (s.trim().parse::<u64>().ok(), e.trim().parse::<u64>().ok()),
@@ -18047,16 +18203,16 @@ pub(crate) fn parse_gtid_set_uncached(text: &str) -> Result<GtidSet, QueryError>
                 }
             };
             match (start, end) {
-                // MySQL treats an empty/reversed interval (e.g. `3-1`)
-                // as malformed.
-                (Some(s), Some(e)) if s >= 1 && e >= s => intervals.push((s, e)),
+                (Some(s), Some(e)) if s >= 1 && e >= 1 => {
+                    if e >= s {
+                        intervals.push((s, e));
+                    }
+                }
                 _ => return Err(malformed_gtid_set(text)),
             }
         }
-        if !saw_interval {
-            return Err(malformed_gtid_set(text));
-        }
     }
+    set.retain(|_, intervals| !intervals.is_empty());
     // Normalise: sort and merge overlapping / adjacent intervals.
     for intervals in set.values_mut() {
         if intervals.len() <= 1 {
@@ -18554,6 +18710,7 @@ pub(crate) fn expression_metadata_length(expr: &Expr) -> Option<u32> {
             }
             _ => 16,
         },
+        "CONV" => 65,
         "MD5" => 32,
         "SHA" | "SHA1" => 40,
         "SHA2" => match args.get(1) {
@@ -18897,7 +19054,7 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
                 coercibility: 0,
             });
         }
-        if name.eq_ignore_ascii_case("CONVERT_USING") {
+        if name.eq_ignore_ascii_case("CONVERT_USING") || name.eq_ignore_ascii_case("CHAR_USING") {
             let Expr::Literal(Literal::String(charset)) = args.get(1)? else {
                 return None;
             };
@@ -19165,6 +19322,12 @@ where
     let allows_none_derivation =
         operation.eq_ignore_ascii_case("concat") || operation.eq_ignore_ascii_case("concat_ws");
     let field_coercible_literals = operation.eq_ignore_ascii_case("field");
+    if field_coercible_literals {
+        return Ok(operands
+            .clone()
+            .next()
+            .and_then(|expr| expr_collation(expr, table)));
+    }
     // Derive each operand once. Every derivation recurses through the
     // operand's own string arguments, so repeated per-pass derivation would
     // make nested string functions exponential in their nesting depth.
@@ -20438,6 +20601,11 @@ fn function_is_runtime_dependent(upper: &str) -> bool {
             | "LASTVAL"
             | "MYSQL_QUERY_ATTRIBUTE_STRING"
             | "CONNECTION_ID"
+            | "PS_CURRENT_THREAD_ID"
+            | "PS_THREAD_ID"
+            | "PS_THREAD_ACCOUNT"
+            | "PS_THREAD_STACK"
+            | "PS_THREAD_TRX_INFO"
             | "LAST_INSERT_ID"
             | "USER"
             | "RLS_CONTEXT"
@@ -22093,6 +22261,20 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
             }
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
+                if upper == "COLLATE" && args.len() == 2 {
+                    if let Expr::Literal(Literal::String(name)) = &args[1] {
+                        let target = crate::charset::resolve_collation(name)?;
+                        if let Some(source) = expr_collation(&args[0], table) {
+                            if source.charset != target.charset && source.charset != "binary" {
+                                return Err(crate::error::catalog::ER_COLLATION_CHARSET_MISMATCH
+                                    .error(format!(
+                                        "COLLATION '{}' is not valid for CHARACTER SET '{}'",
+                                        name, source.charset
+                                    )));
+                            }
+                        }
+                    }
+                }
                 if matches!(
                     upper.as_str(),
                     "REGEXP_LIKE" | "REGEXP_INSTR" | "REGEXP_SUBSTR" | "REGEXP_REPLACE"
@@ -22359,7 +22541,15 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         | "GROUP_CONCAT"
                         | "GREATEST"
                         | "LEAST"
+                        | "IF"
+                        | "IFNULL"
+                        | "COALESCE"
                 ) {
+                    let args = if upper == "IF" {
+                        &args[1.min(args.len())..]
+                    } else {
+                        args.as_slice()
+                    };
                     let result_collation =
                         aggregate_expr_collations(args.iter(), table, &upper.to_ascii_lowercase())?;
                     if let Some(result_collation) = result_collation {
@@ -22399,6 +22589,11 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                 for condition in conditions {
                     visit(condition, table)?;
                 }
+                aggregate_expr_collations(
+                    results.iter().chain(else_result.as_deref().into_iter()),
+                    table,
+                    "case",
+                )?;
                 for result in results {
                     visit(result, table)?;
                 }
@@ -24584,7 +24779,9 @@ pub(crate) fn reject_strict_numeric_materialization_warnings() -> Result<(), Que
         .into_iter()
         .find(|warning| {
             (warning.is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE)
-                || warning.is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD))
+                || warning.is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD)
+                || (warning.is(crate::error::catalog::ER_DIVISION_BY_ZERO)
+                    && session_div_zero_warns()))
                 && !nonfatal_exact_decimal_literal_warning(warning.message())
         });
     let Some(warning) = warning else {
@@ -27206,7 +27403,11 @@ fn json_path_set(
                             // INSERT append, REPLACE is a no-op (MySQL).
                             _ => {
                                 if mode != "JSON_REPLACE" {
-                                    arr.push(new_val);
+                                    if matches!(segment, JsonPathSegment::IndexFromLast(_)) {
+                                        arr.insert(0, new_val);
+                                    } else {
+                                        arr.push(new_val);
+                                    }
                                 }
                             }
                         }
@@ -27218,7 +27419,13 @@ fn json_path_set(
                             (_, true) => *current = new_val,
                             (_, false) => {
                                 let old = std::mem::replace(current, OwnedJsonb::null());
-                                *current = OwnedJsonb::Array(vec![old, new_val]);
+                                *current = OwnedJsonb::Array(
+                                    if matches!(segment, JsonPathSegment::IndexFromLast(_)) {
+                                        vec![new_val, old]
+                                    } else {
+                                        vec![old, new_val]
+                                    },
+                                );
                             }
                         }
                     }
@@ -27560,10 +27767,14 @@ pub(crate) fn parse_time_value_components(
     value: &Value,
 ) -> Result<(bool, u32, u32, u32, u32), QueryError> {
     let (negative, h, m, s, us) = parse_time_value_components_inner(value)?;
-    if value_is_numeric(value) {
+    let round_up = session_temporal_sql_mode_bits()
+        & crate::engine::api::TEMPORAL_MODE_TIME_TRUNCATE_FRACTIONAL
+        == 0
+        && comparison_fraction_rounds_up(value);
+    if value_is_numeric(value) || round_up {
         let total = (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
             + u64::from(us)
-            + u64::from(comparison_fraction_rounds_up(value));
+            + u64::from(round_up);
         if total > (TIME_MAX_SECONDS * 1_000_000 + 999_999) as u64 {
             return Err(
                 crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error(format!(
@@ -27587,9 +27798,9 @@ fn parse_time_value_components_inner(
     value: &Value,
 ) -> Result<(bool, u32, u32, u32, u32), QueryError> {
     if let Value::Json(bytes) = value {
-        return parse_time_value_components(&Value::String(crate::engine::json::unquote_text(
-            bytes,
-        )));
+        return parse_time_value_components_inner(&Value::String(
+            crate::engine::json::unquote_text(bytes),
+        ));
     }
 
     // Approximate numeric values above the largest compact MySQL datetime
@@ -27703,7 +27914,7 @@ pub(crate) fn format_mysql_time(
             }
             'r' => {
                 let h12 = hour % 12;
-                let am_pm = if hour < 12 { "AM" } else { "PM" };
+                let am_pm = if hour % 24 < 12 { "AM" } else { "PM" };
                 let _ = write!(
                     &mut out,
                     "{:02}:{:02}:{:02} {}",
@@ -27777,8 +27988,16 @@ where
                 // Insert *before* the addressed index (shifting it right),
                 // clamped to append when the index is past the end — matching
                 // MySQL's `$[100]` → append and `$[last]` → before last.
-                let pos =
-                    resolve_dom_index(&last, arr.len()).map_or(arr.len(), |p| p.min(arr.len()));
+                let pos = resolve_dom_index(&last, arr.len()).map_or_else(
+                    || {
+                        if matches!(last, JsonPathSegment::IndexFromLast(_)) {
+                            0
+                        } else {
+                            arr.len()
+                        }
+                    },
+                    |p| p.min(arr.len()),
+                );
                 arr.insert(pos, insert_val);
             }
         }
@@ -28737,7 +28956,7 @@ where
     if matches!(values[0], Value::Null) {
         return Err(invalid_user_lock_name("NULL"));
     }
-    let lock_name = string_value(&values[0]);
+    let lock_name = string_value(&values[0]).to_lowercase();
     if lock_name.is_empty() {
         return Err(invalid_user_lock_name(&lock_name));
     }
@@ -28826,7 +29045,7 @@ where
     if matches!(value, Value::Null) {
         return Err(invalid_user_lock_name("NULL"));
     }
-    let lock_name = string_value(&value);
+    let lock_name = string_value(&value).to_lowercase();
     let connection_id = current_connection_id_for_lock()?;
 
     let (mutex, cv) = user_lock_state();
@@ -28872,7 +29091,7 @@ where
     if matches!(value, Value::Null) {
         return Err(invalid_user_lock_name("NULL"));
     }
-    let lock_name = string_value(&value);
+    let lock_name = string_value(&value).to_lowercase();
     let (mutex, _cv) = user_lock_state();
     let state = mutex.lock().unwrap();
     Ok(Value::Int(if state.locks.contains_key(&lock_name) {
@@ -28895,7 +29114,7 @@ where
     if matches!(value, Value::Null) {
         return Err(invalid_user_lock_name("NULL"));
     }
-    let lock_name = string_value(&value);
+    let lock_name = string_value(&value).to_lowercase();
     let (mutex, _cv) = user_lock_state();
     let state = mutex.lock().unwrap();
     match state.locks.get(&lock_name) {
@@ -28925,9 +29144,9 @@ pub(crate) fn release_all_user_locks(connection_id: u32) -> i64 {
     let mut state = mutex.lock().unwrap();
     let held = state.held.remove(&connection_id).unwrap_or_default();
     let mut count = 0i64;
-    for (lock_name, _) in held {
+    for (lock_name, acquisitions) in held {
         if state.locks.remove(&lock_name).is_some() {
-            count += 1;
+            count = count.saturating_add(acquisitions as i64);
         }
     }
     cv.notify_all();
@@ -29554,6 +29773,11 @@ pub(crate) fn is_charset_octet_function(name: &str) -> bool {
         "HEX",
         "LENGTH",
         "OCTET_LENGTH",
+        "CRC32",
+        "TO_BASE64",
+        "ORD",
+        "ASCII",
+        "COMPRESS",
         "MD5",
         "SHA",
         "SHA1",

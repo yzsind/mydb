@@ -117,8 +117,8 @@ fn mask_ssn_masks_first_five_keeps_last_four() {
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
     let rs = exec(&engine, &mut session, "SELECT MASK_SSN('123-45-6789')").unwrap();
-    // Length 11, last 4 kept → 'XXXXXXX6789'.
-    assert_eq!(one_string(rs), "XXXXXXX6789");
+    // Length 11, last 4 kept → 'XXX-XX-6789'.
+    assert_eq!(one_string(rs), "XXX-XX-6789");
 }
 
 #[test]

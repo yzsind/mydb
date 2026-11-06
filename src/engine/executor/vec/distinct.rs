@@ -68,9 +68,21 @@ fn run_distinct_impl(
         force_spill_after,
     )?;
     let mut rows = Vec::new();
+    let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     while let Some(batch) = output.next_batch()? {
         for row in batch.visible_indices() {
-            rows.push(batch.row(row));
+            let values = batch.row(row);
+            charge.add_force(estimate_row_bytes(&values))?;
+            if rows.len() == rows.capacity() {
+                let additional = rows.capacity().max(16);
+                crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                    &mut rows,
+                    additional,
+                    &mut charge,
+                    "DISTINCT output",
+                )?;
+            }
+            rows.push(values);
         }
     }
     Ok(rows)

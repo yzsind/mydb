@@ -1075,7 +1075,7 @@ fn user_variables_by_thread_rows(
         if wanted_thread.is_some_and(|thread| thread != process.id as u64) {
             continue;
         }
-        for (name, value) in process.user_variables {
+        for (name, value) in process.user_variables.iter() {
             if wanted_variable
                 .as_deref()
                 .is_some_and(|wanted| !wanted.eq_ignore_ascii_case(&name))
@@ -1083,8 +1083,8 @@ fn user_variables_by_thread_rows(
                 continue;
             }
             let bytes = match value {
-                Value::Bytes(bytes) => bytes,
-                Value::String(value) | Value::Decimal(value) => value.into_bytes(),
+                Value::Bytes(bytes) => bytes.clone(),
+                Value::String(value) | Value::Decimal(value) => value.as_bytes().to_vec(),
                 other => other.to_display_string().into_bytes(),
             };
             rows.push(vec![uval(process.id as u64), s(&name), Value::Bytes(bytes)]);

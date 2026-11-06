@@ -8,6 +8,7 @@ pub mod env;
 pub mod exec_permit;
 pub mod fast_hash;
 pub mod io_error;
+pub(crate) mod lock_diagnostics;
 pub mod logging;
 pub mod pad_space;
 pub mod par_sort;

@@ -892,6 +892,17 @@ fn stream_direct_index_sum(
     filter: Option<&Expr>,
     stmt: &Select,
 ) -> Result<Option<Vec<Value>>, QueryError> {
+    stream_direct_index_sum_chunks(db, txn, table, filter, stmt, |visitor| visitor(ids))
+}
+
+fn stream_direct_index_sum_chunks(
+    db: &Database,
+    txn: TxnView,
+    table: &TableSchema,
+    filter: Option<&Expr>,
+    stmt: &Select,
+    mut chunks: impl FnMut(&mut dyn FnMut(&[RowId]) -> Result<(), QueryError>) -> Result<(), QueryError>,
+) -> Result<Option<Vec<Value>>, QueryError> {
     if table.is_partitioned() || !stmt.order_by.is_empty() {
         return Ok(None);
     }
@@ -948,41 +959,57 @@ fn stream_direct_index_sum(
         .position(|candidate| *candidate == column)
         .unwrap();
 
-    let mut sorted_ids = Vec::new();
-    let ordered_ids = if ids.windows(2).all(|pair| pair[0] <= pair[1]) {
-        ids
-    } else {
-        sorted_ids.extend_from_slice(ids);
-        sorted_ids.sort_unstable();
-        sorted_ids.as_slice()
-    };
     let heap = db.cached_heap_handle(table.id)?;
     let mut sum = super::aggregate::NumericAggState::default();
     let mut sum_seen = false;
-    let accepted = db.read_row_columns_many_predicate_first_with_handle(
-        &heap,
-        table,
-        ordered_ids,
-        txn,
-        &columns,
-        &[],
-        |values| {
-            if let Some(filter) = &filter_program {
-                if !filter.eval(values)? {
-                    return Ok(false);
-                }
-            }
-            let value = values.get(sum_slot).unwrap_or(&Value::Null);
-            if !matches!(value, Value::Null) {
-                super::aggregate::accumulate_numeric_state(&mut sum, value)?;
-                sum_seen = true;
-            }
-            // The predicate-first reader materialises output columns only for
-            // accepted rows.  Returning false turns it into a pure visitor.
-            Ok(false)
-        },
+    let mut sorted_ids = smallvec::SmallVec::<[RowId; 128]>::new();
+    let mut sort_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+        0,
     )?;
-    debug_assert!(accepted.is_empty());
+    chunks(&mut |ids| {
+        crate::engine::cancel::check_cancelled()?;
+        let ordered_ids = if ids.windows(2).all(|pair| pair[0] <= pair[1]) {
+            ids
+        } else {
+            sorted_ids.clear();
+            if ids.len() > sorted_ids.capacity() {
+                let bytes = ids.len().saturating_mul(std::mem::size_of::<RowId>());
+                sort_charge.try_grow(bytes.saturating_sub(sort_charge.bytes()))?;
+                sorted_ids.reserve_exact(ids.len());
+                let retained = sorted_ids.capacity() * std::mem::size_of::<RowId>();
+                sort_charge.try_grow(retained.saturating_sub(sort_charge.bytes()))?;
+            }
+            sorted_ids.extend_from_slice(ids);
+            sorted_ids.sort_unstable();
+            sorted_ids.as_slice()
+        };
+        let accepted = db.read_row_columns_many_predicate_first_with_handle(
+            &heap,
+            table,
+            ordered_ids,
+            txn,
+            &columns,
+            &[],
+            |values| {
+                if let Some(filter) = &filter_program {
+                    if !filter.eval(values)? {
+                        return Ok(false);
+                    }
+                }
+                let value = values.get(sum_slot).unwrap_or(&Value::Null);
+                if !matches!(value, Value::Null) {
+                    super::aggregate::accumulate_numeric_state(&mut sum, value)?;
+                    sum_seen = true;
+                }
+                // The predicate-first reader materialises output columns only for
+                // accepted rows.  Returning false turns it into a pure visitor.
+                Ok(false)
+            },
+        )?;
+        debug_assert!(accepted.is_empty());
+        Ok(())
+    })?;
 
     let value = if sum_seen {
         super::aggregate::numeric_state_to_value(&sum)
@@ -2795,6 +2822,144 @@ fn estimated_access_rows_for_scan(plan: &PhysicalPlan) -> f64 {
             _ => return 0.0,
         }
     }
+}
+
+fn prefix_sum_input<'a>(
+    stmt: &Select,
+    plan: &'a PhysicalPlan,
+) -> Option<(
+    &'a PlanTable,
+    &'a IndexSchema,
+    &'a IndexKey,
+    Option<&'a Expr>,
+)> {
+    if stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || stmt.distinct
+        || stmt.lock_clause.is_some()
+        || !fused_single_table_shape_supported(stmt)
+    {
+        return None;
+    }
+    let [SelectItem::Expr {
+        expr:
+            Expr::Function {
+                name,
+                args,
+                distinct: false,
+            },
+        ..
+    }] = stmt.projection.as_slice()
+    else {
+        return None;
+    };
+    let [arg] = args.as_slice() else { return None };
+    if !name.eq_ignore_ascii_case("SUM") {
+        return None;
+    }
+    let mut source = plan;
+    loop {
+        match source {
+            PhysicalPlan::Projection { input, .. } => source = input,
+            PhysicalPlan::HashAggregate {
+                input, group_by, ..
+            } if group_by.is_empty() => source = input,
+            PhysicalPlan::IndexLookup {
+                table,
+                index,
+                key,
+                exact: false,
+                covering: false,
+                filter,
+                ..
+            } if !table.schema.is_partitioned()
+                && index.unique
+                && index.included_columns.is_empty()
+                && !index.has_multi_valued_parts()
+                && !index.is_fulltext()
+                && !index.is_spatial()
+                && !index.is_vector()
+                && index.key_expressions.iter().all(Option::is_none)
+                && !key.0.is_empty()
+                && key.0.len() < index.effective_columns().len()
+                && expr_column_index(arg, &table.schema).is_some() =>
+            {
+                return Some((table, index, key, filter.as_ref()));
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub(crate) fn prefer_streaming_prefix_sum(stmt: &Select, plan: &PhysicalPlan) -> bool {
+    let rows = estimated_access_rows_for_scan(plan);
+    rows.is_finite()
+        && rows > 0.0
+        && rows <= crate::engine::executor::vec::DEFAULT_BATCH_ROWS as f64
+        && prefix_sum_input(stmt, plan).is_some()
+}
+
+/// Use the snapshot-aware cursor and the shared SUM visitor without retaining
+/// the full prefix. Estimates select the low-overhead envelope; chunking keeps
+/// it bounded even if the actual prefix is much larger than its estimate.
+pub(crate) fn execute_streaming_prefix_sum(
+    db: &Arc<Database>,
+    txn: TxnView,
+    stmt: &Select,
+    plan: &PhysicalPlan,
+) -> Result<Option<ResultSet>, QueryError> {
+    if txn.historical {
+        return Ok(None);
+    }
+    let Some((table, index, key, filter)) = prefix_sum_input(stmt, plan) else {
+        return Ok(None);
+    };
+    // Predicate compilation finishes before the closure opens a cursor, so a
+    // declined runtime expression cannot consume input before the fallback.
+    let row = stream_direct_index_sum_chunks(db, txn, &table.schema, filter, stmt, |visitor| {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        const CHUNK_ROWS: usize = 128;
+        let _charge = ControlledMemoryCharge::try_new(
+            ControlledMemoryCategory::StorageScratch,
+            2 * CHUNK_ROWS * std::mem::size_of::<RowId>(),
+        )?;
+        db.check_index_read_view(&table.schema, index, txn)?;
+        let bound = IndexBound {
+            key: key.clone(),
+            inclusive: true,
+        };
+        let mut cursor = db.range_index_snapshot_cursor(
+            &table.schema,
+            index,
+            Some(bound.clone()),
+            Some(bound),
+            txn,
+        )?;
+        loop {
+            crate::engine::cancel::check_cancelled()?;
+            let ids = cursor.next_chunk_row_ids(CHUNK_ROWS)?;
+            if ids.is_empty() {
+                break;
+            }
+            // Charge extra IDs contributed by MVCC repair merging for this
+            // chunk. The visitor retains its own admitted sort scratch.
+            let _repair_scratch = ControlledMemoryCharge::try_new(
+                ControlledMemoryCategory::StorageScratch,
+                ids.len().saturating_sub(CHUNK_ROWS) * std::mem::size_of::<RowId>(),
+            )?;
+            visitor(&ids)?;
+        }
+        Ok(())
+    })?;
+    row.map(|row| {
+        Ok(ResultSet {
+            columns: single_table_result_columns(stmt, &table.schema, table.alias.as_deref())?,
+            rows: vec![row],
+        })
+    })
+    .transpose()
 }
 
 /// The fused row kernel has less fixed cost than constructing a complete

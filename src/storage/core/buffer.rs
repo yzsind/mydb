@@ -292,21 +292,19 @@ fn apply_buffer_file_read_advice(_file: &File) {
     }
 }
 
-/// B3 - upper bound on the number of open file handles cached by the buffer
-/// pool. The cache is never evicted except on DROP/rename, so a long-lived
-/// server that touches many files (rolling partitions, many indexes,
-/// `.hvec` vector files) accumulates one held-open fd + `CachedFile`
-/// per file forever and eventually trips the `nofile` limit (EMFILE). When
-/// the cache grows past this cap a second-chance sweep closes idle handles
-/// (clock bit clear AND no pending fsync). The default is deliberately finite;
-/// `0` explicitly restores the historical unbounded behaviour.
+/// Bound retained file handles while reserving descriptors for other owners.
+/// Pressure syncs make idle handles reclaimable without waiting for checkpoint.
+/// Zero explicitly disables the bound.
 fn file_cache_max() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        env::var("MYDB_BUFFER_POOL_FILE_CACHE_MAX")
+        let configured = env::var("MYDB_BUFFER_POOL_FILE_CACHE_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1024)
+            .unwrap_or(1024);
+        // Linux may retain both buffered and direct-I/O descriptors per entry.
+        let descriptors_per_entry = if cfg!(target_os = "linux") { 2 } else { 1 };
+        crate::platform::file::bounded_file_cache_capacity(configured, 4 * descriptors_per_entry)
     })
 }
 
@@ -620,6 +618,7 @@ impl BufferPool {
             file_generations: RwLock::new(BufferFileGenerationMap::default()),
             next_file_generation: AtomicU64::new(1),
             file_cache: RwLock::new(BufferFileCacheMap::default()),
+            file_cache_reclaim_lock: parking_lot::Mutex::new(()),
             log,
             durability,
             lock_wait,
@@ -1287,6 +1286,39 @@ impl BufferPool {
         true
     }
 
+    /// Reserve deferred WAL protection and mutate through the same residency
+    /// pin. A miss never loads a page or invokes the caller's mutator. Success
+    /// transfers one deferred pin to the WAL publisher; failure or unwinding
+    /// releases only this operation's reservation.
+    fn try_with_deferred_raw_page_mut<T>(
+        self: &Arc<Self>,
+        key: &PageKey,
+        f: impl FnOnce(&mut [u8]) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
+        let Some(pinned) = self.try_pin_resident_page(key)? else {
+            return Ok(None);
+        };
+        struct DeferredReservation<'a> {
+            frame: &'a Frame,
+            published: bool,
+        }
+        impl Drop for DeferredReservation<'_> {
+            fn drop(&mut self) {
+                if !self.published {
+                    self.frame.deferred_pins.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+        pinned.frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+        let mut reservation = DeferredReservation {
+            frame: &pinned.frame,
+            published: false,
+        };
+        let result = self.with_pinned_raw_page_mut(&pinned, 0, f)?;
+        reservation.published = true;
+        Ok(Some(result))
+    }
+
     /// Txn-buffering: the deferred record for `key` has now been appended at
     /// `lsn`. Publish the real WAL LSN (so the WAL-ahead flush gate syncs up to
     /// it) BEFORE releasing the deferred pin, so the page never becomes
@@ -1739,7 +1771,20 @@ impl BufferPool {
         dirty_lsn: u64,
         f: impl FnOnce(&mut [u8]) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
-        let pinned = self.pin_page_with_intent(key.clone(), AccessIntent::Normal)?;
+        let pinned = self.pin_page_with_intent(key, AccessIntent::Normal)?;
+        self.with_pinned_raw_page_mut(&pinned, dirty_lsn, f)
+    }
+
+    /// Use the ordinary raw-image mutation and dirty-publication rules with
+    /// an already acquired pin. No page latch survives this call.
+    fn with_pinned_raw_page_mut<T>(
+        self: &Arc<Self>,
+        pinned: &PinnedFrame,
+        dirty_lsn: u64,
+        f: impl FnOnce(&mut [u8]) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        debug_assert!(Arc::ptr_eq(self, &pinned.pool));
+        let key = &pinned.frame.key;
         let result = {
             let mut bytes = pinned.frame.bytes.write().map_err(|_| {
                 error(
@@ -5856,7 +5901,10 @@ impl BufferPool {
         if self.durability == DurabilityMode::Memory {
             return Ok(());
         }
-        let files = self.cached_files()?;
+        self.sync_cached_file_batch(self.cached_files()?)
+    }
+
+    fn sync_cached_file_batch(&self, files: Vec<Arc<CachedFile>>) -> Result<(), QueryError> {
         #[cfg(target_os = "macos")]
         return self.sync_cached_files_by_device(files);
         #[cfg(not(target_os = "macos"))]
@@ -6140,6 +6188,9 @@ impl BufferPool {
             return Ok(file);
         }
         let wait_started = Instant::now();
+        // Reclaim before open: once descriptors are exhausted, even a
+        // checkpoint may fail before reaching its file-sync phase.
+        self.reclaim_file_handles(file_key, file_cache_max())?;
         // Miss: open the file unlocked so the (potentially blocking)
         // syscall doesn't sit inside the write lock.
         let file = crate::storage::image_io::open_data_file(&file_key.path).map_err(io_err)?;
@@ -6197,6 +6248,68 @@ impl BufferPool {
             Ordering::Relaxed,
         );
         Ok(inserted)
+    }
+
+    fn reclaim_file_handles(
+        &self,
+        keep: &BufferPageFileKey,
+        cap: usize,
+    ) -> Result<(), QueryError> {
+        let cache_error = || {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "buffer pool file cache lock poisoned",
+            )
+        };
+        if cap == 0 || self.file_cache.read().map_err(|_| cache_error())?.len() < cap {
+            return Ok(());
+        }
+        let _reclaim = self.file_cache_reclaim_lock.lock();
+        let candidates = {
+            let mut files = self.file_cache.write().map_err(|_| cache_error())?;
+            let persistent = self.durability != DurabilityMode::Memory;
+            Self::evict_idle_file_handles(&mut files, keep, cap - 1, persistent);
+            if files.len() < cap || !persistent {
+                return Ok(());
+            }
+            // Amortize the full device barrier across a bounded batch. Keep
+            // bindings installed throughout sync so concurrent writers still
+            // publish to the same needs_sync flag and inode.
+            let mut candidates = Vec::new();
+            for second_pass in [false, true] {
+                for (key, file) in files.iter() {
+                    if key == keep || Arc::strong_count(file) != 1 || file.sync_lock.is_locked() {
+                        continue;
+                    }
+                    if !second_pass && file.recently_used.swap(false, Ordering::Relaxed) {
+                        continue;
+                    }
+                    candidates.push((key.clone(), file.clone()));
+                    if candidates.len() == 32 {
+                        break;
+                    }
+                }
+                if !candidates.is_empty() {
+                    break;
+                }
+            }
+            candidates
+        };
+        self.sync_cached_file_batch(candidates.iter().map(|(_, file)| file.clone()).collect())?;
+        let mut files = self.file_cache.write().map_err(|_| cache_error())?;
+        for (key, file) in candidates {
+            // The cache and this candidate must be the only owners. A reader
+            // or writer that joined during sync keeps the binding alive; its
+            // newer dirty publication must also survive the completed barrier.
+            if Arc::strong_count(&file) == 2
+                && !file.needs_sync.load(Ordering::Acquire)
+                && !file.sync_lock.is_locked()
+                && files.get(&key).is_some_and(|current| Arc::ptr_eq(current, &file))
+            {
+                files.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     /// B3 - second-chance sweep that closes idle cached file handles so the
@@ -6275,6 +6388,8 @@ impl BufferPool {
     }
 
     fn lookup_frame(&self, key: &PageKey) -> Result<Option<Arc<Frame>>, QueryError> {
+        #[cfg(test)]
+        deferred_raw_page_tests::record_lookup();
         let shard = self.shards[self.shard_index(key)]
             .frames
             .read()
@@ -10580,7 +10695,12 @@ mod oldest_dirty_tests {
         let pool =
             BufferPool::new_with_options(100, log, DurabilityMode::Strict, Duration::ZERO, 1, 0);
         pool.shutdown_flusher();
-        for _ in 0..4 {pool.log.lock().append(0,WalPayload::CheckpointBegin).unwrap();}
+        for _ in 0..4 {
+            pool.log
+                .lock()
+                .append(0, WalPayload::CheckpointBegin)
+                .unwrap();
+        }
         let file = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
         for page_id in 0..50 {
             pool.store_page(
@@ -10764,7 +10884,12 @@ mod oldest_dirty_tests {
             1,
             0,
         );
-        for _ in 0..4 {pool.log.lock().append(0,WalPayload::CheckpointBegin).unwrap();}
+        for _ in 0..4 {
+            pool.log
+                .lock()
+                .append(0, WalPayload::CheckpointBegin)
+                .unwrap();
+        }
         let file_key = Arc::new(BufferPool::heap_file_key(path.clone(), 1));
         let mut frames = Vec::new();
         for page_id in 0..3 {
@@ -10949,6 +11074,99 @@ mod oldest_dirty_tests {
             .contains(&key));
         pool.enqueue_prefetch_batch(vec![key.clone()], 4);
         assert_eq!(pool.prefetch_queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn file_cache_pressure_preserves_active_handles() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let pool = BufferPool::new_with_options(
+            8,
+            Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap())),
+            DurabilityMode::Strict,
+            Duration::ZERO,
+            1,
+            0,
+        );
+        let active_key = BufferPool::index_file_key(dir.path().join("active.idx"));
+        std::fs::write(&active_key.path, vec![0_u8; PAGE_SIZE]).unwrap();
+        let active = pool.open_cached_file(&active_key).unwrap();
+        let idle_key = BufferPool::index_file_key(dir.path().join("idle.idx"));
+        std::fs::write(&idle_key.path, vec![0_u8; PAGE_SIZE]).unwrap();
+        drop(pool.open_cached_file(&idle_key).unwrap());
+
+        pool.reclaim_file_handles(&idle_key, 1).unwrap();
+        assert!(Arc::ptr_eq(&active, &pool.open_cached_file(&active_key).unwrap()));
+        assert!(active.needs_sync.load(Ordering::Acquire));
+        assert_eq!(pool.file_syncs.load(Ordering::Relaxed), 0);
+
+        drop(active);
+        pool.reclaim_file_handles(&idle_key, 1).unwrap();
+        assert!(!pool.file_cache.read().unwrap().contains_key(&active_key));
+        assert_eq!(pool.file_syncs.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_cache_pressure_sync_failure_keeps_pending_handle() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let pool = BufferPool::new_with_options(
+            8,
+            Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap())),
+            DurabilityMode::Strict,
+            Duration::ZERO,
+            1,
+            0,
+        );
+        let key = BufferPool::index_file_key(dir.path().join("unsyncable.idx"));
+        let file = Arc::new(CachedFile::new(File::open("/dev/null").unwrap(), 0));
+        let pending = Arc::downgrade(&file);
+        pool.file_cache.write().unwrap().insert(key.clone(), file);
+        let keep = BufferPool::index_file_key(dir.path().join("next.idx"));
+
+        assert!(pool.reclaim_file_handles(&keep, 1).is_err());
+        let pending = pending.upgrade().expect("failed sync must keep its descriptor");
+        assert!(pending.needs_sync.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&pending, &pool.file_cache.read().unwrap()[&key]));
+        assert_eq!(pool.file_syncs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn persistent_file_cache_stays_bounded_before_checkpoint() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let cap = file_cache_max();
+        assert!(cap > 0);
+        for durability in [DurabilityMode::Strict, DurabilityMode::Relaxed] {
+            let root = dir.path().join(format!("{durability:?}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let pool = BufferPool::new_with_options(
+                8,
+                Arc::new(parking_lot::Mutex::new(LogManager::open(&root).unwrap())),
+                durability,
+                Duration::ZERO,
+                1,
+                0,
+            );
+            for id in 0..cap + 64 {
+                let path = root.join(format!("{id}.idx"));
+                std::fs::write(&path, vec![0_u8; PAGE_SIZE]).unwrap();
+                let key = BufferPool::index_file_key(path);
+                let file = pool.open_cached_file(&key).unwrap();
+                write_all_at(&file.file, &[42], 0).unwrap();
+                file.mark_needs_sync();
+            }
+            assert!(
+                pool.file_cache.read().unwrap().len() <= cap,
+                "{durability:?} must reclaim unsynced idle descriptors without a checkpoint"
+            );
+            assert!(pool.file_syncs.load(Ordering::Relaxed) > 0);
+            pool.sync_cached_files().unwrap();
+            for id in 0..cap + 64 {
+                assert_eq!(std::fs::read(root.join(format!("{id}.idx"))).unwrap()[0], 42);
+            }
+        }
     }
 
     #[test]
@@ -11537,5 +11755,113 @@ mod round2_buffer_tests {
         assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 1);
         pool.finalize_deferred(&key, 7);
         assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod deferred_raw_page_tests {
+    use super::*;
+
+    thread_local! {
+        static LOOKUPS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn record_lookup() {
+        LOOKUPS.with(|count| {
+            if let Some(current) = count.get() {
+                count.set(Some(current + 1));
+            }
+        });
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<BufferPool>, PageKey, Arc<Frame>) {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("deferred-raw.lob");
+        fs::write(&path, vec![0; PAGE_SIZE]).unwrap();
+        let pool = BufferPool::new_with_options(
+            2,
+            Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            )),
+            DurabilityMode::Memory,
+            Duration::ZERO,
+            1,
+            0,
+        );
+        let key = PageKey {
+            file: Arc::new(BufferPool::overflow_file_key(path, 7)),
+            page_id: 0,
+        };
+        drop(pool.pin_page(key.clone()).unwrap());
+        let frame = pool.lookup_frame(&key).unwrap().unwrap();
+        (dir, pool, key, frame)
+    }
+
+    #[test]
+    fn deferred_mutation_uses_one_lookup_and_blocks_flush_until_publication() {
+        let (_dir, pool, key, frame) = fixture();
+        LOOKUPS.with(|count| count.set(Some(0)));
+        let result = pool.try_with_deferred_raw_page_mut(&key, |bytes| {
+            assert!(frame.deferred_pins.load(Ordering::Acquire) > 0);
+            bytes[128] = 42;
+            Ok(17)
+        });
+        let lookups = LOOKUPS.with(|count| count.replace(None).unwrap());
+        assert_eq!(result.unwrap(), Some(17));
+        assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+        assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 1);
+        assert!(!pool.flush_frame(&frame).unwrap());
+        assert_eq!(fs::read(&key.file.path).unwrap()[128], 0);
+        pool.finalize_deferred(&key, 0);
+        assert!(pool.flush_frame(&frame).unwrap());
+        assert_eq!(fs::read(&key.file.path).unwrap()[128], 42);
+        assert_eq!(
+            lookups, 1,
+            "a resident mutation must reuse its WAL-protection pin"
+        );
+    }
+
+    #[test]
+    fn deferred_mutation_miss_and_eviction_do_not_run_the_mutator() {
+        let (_dir, pool, key, frame) = fixture();
+        let absent = PageKey {
+            file: key.file.clone(),
+            page_id: 1,
+        };
+        for rejected in [&absent, &key] {
+            frame
+                .pin_count
+                .store(BufferPool::EVICTING_PIN, Ordering::Release);
+            let result = pool.try_with_deferred_raw_page_mut::<()>(rejected, |_| {
+                panic!("an unavailable frame must use the caller's eager fallback")
+            });
+            frame.pin_count.store(0, Ordering::Release);
+            assert_eq!(result.unwrap(), None);
+            assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn unwinding_deferred_mutation_releases_its_residency_and_wal_pins() {
+        let (_dir, pool, key, frame) = fixture();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.try_with_deferred_raw_page_mut::<()>(&key, |_| panic!("injected unwind"))
+        }));
+        assert!(result.is_err());
+        assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+        assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_deferred_mutation_preserves_other_transactions_pins() {
+        let (_dir, pool, key, frame) = fixture();
+        assert!(pool.add_deferred_pin(&key));
+        let result = pool.try_with_deferred_raw_page_mut::<()>(&key, |_| {
+            Err(crate::error::catalog::ER_OUTOFMEMORY.error("injected preflight failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+        assert_eq!(frame.deferred_pins.load(Ordering::Acquire), 1);
+        pool.finalize_deferred(&key, 0);
     }
 }

@@ -3352,7 +3352,13 @@ fn coerce_value_with_unsigned(
                         if hours > 838 {
                             temporal_violation(format!("incorrect time value: '{original}'"))?;
                         }
-                        parse_time_to_micros(&normalized)
+                        let parts = crate::util::temporal::parse_time_duration(&normalized).map_err(|_| {
+                            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error("incorrect time value")
+                        })?;
+                        let magnitude = i64::from(parts.hour) * 3_600_000_000
+                            + i64::from(parts.minute) * 60_000_000
+                            + i64::from(parts.second) * 1_000_000 + i64::from(parts.micros);
+                        Ok(if parts.neg { -magnitude } else { magnitude })
                     }) {
                         Ok(micros) => quantize_time_text_micros(micros, &original, *fsp),
                         Err(err)
@@ -3378,7 +3384,11 @@ fn coerce_value_with_unsigned(
             } else {
                 round_time_micros_to_fsp(micros, *fsp)
             };
-            Ok(Value::Time(quantized))
+            let max = (838 * 3600 + 59 * 60 + 59) * 1_000_000i64;
+            if quantized.unsigned_abs() >= (max + 1_000_000) as u64 {
+                temporal_violation("incorrect time value after fractional rounding".to_string())?;
+            }
+            Ok(Value::Time(quantized.clamp(-max, max)))
         }
         DataTypeKind::DateTime { fsp } => {
             warn_deprecated_datetime_delimiter(&value);
