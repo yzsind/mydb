@@ -822,11 +822,21 @@ pub(super) fn stored_view_query(view: &ViewSchema) -> Result<Select, QueryError>
 /// variable number of columns and are left alone (they pick up the
 /// underlying table's names, which is also MySQL's behaviour for views
 /// without an explicit column list).
-fn apply_view_column_aliases(select: &mut Select, columns: &[ViewColumnDef]) {
+fn apply_view_column_aliases(db: &Database, select: &mut Select, columns: &[ViewColumnDef]) {
     if columns.is_empty() || columns.len() != select.projection.len() {
         return;
     }
     use crate::parser::SelectItem as PSelectItem;
+    if select.projection.iter().zip(columns).any(|(item, target)| {
+        matches!(item, PSelectItem::Expr { alias: Some(alias), .. }
+            if !alias.eq_ignore_ascii_case(&target.name))
+    }) {
+        // The explicit view column list renames the public result, while
+        // internal clauses retain the bindings of the original SELECT.
+        crate::planner::resolve_group_by_refs(db, select);
+        crate::planner::resolve_having_aliases(select);
+        crate::planner::resolve_order_by_output_refs(db, select);
+    }
     for (item, target) in select.projection.iter_mut().zip(columns.iter()) {
         if let PSelectItem::Expr { alias, .. } = item {
             *alias = Some(target.name.clone());
@@ -1169,7 +1179,7 @@ pub(super) fn validate_view_definition(
         }
     }
 
-    apply_view_column_aliases(&mut original_select, &columns);
+    apply_view_column_aliases(db, &mut original_select, &columns);
     original_select.no_merge = algorithm.eq_ignore_ascii_case("TEMPTABLE");
 
     // Canonicalize presentation separately from the semantic query. Rendered

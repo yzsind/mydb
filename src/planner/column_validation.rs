@@ -2,6 +2,50 @@
 
 use super::*;
 
+/// A local projection alias is unavailable to window inputs and also prevents
+/// an identically named outer column from being captured. Qualified outer
+/// columns remain valid. Ordinary column validation owns all other errors.
+pub(super) fn validate_window_operand_aliases(
+    expr: &Expr,
+    scope: &ColumnScope<'_>,
+    aliases: &HashSet<String>,
+) -> Result<(), QueryError> {
+    if scope.outer.is_none() || aliases.is_empty() {
+        return Ok(());
+    }
+    crate::parser::visit::try_inspect_value_expr(expr, |node| {
+        if let Expr::Identifier(name) = node {
+            if aliases.contains(&name.to_ascii_lowercase())
+                && scope.column_matches(None, name, true) == 0
+            {
+                return Err(error(
+                    crate::error::catalog::ER_BAD_FIELD_ERROR,
+                    format!("Unknown column '{name}' in window expression"),
+                ));
+            }
+        }
+        Ok(true)
+    })
+}
+
+pub(super) fn validate_window_output_aliases(
+    expr: &Expr,
+    scope: &ColumnScope<'_>,
+    aliases: &HashSet<String>,
+) -> Result<(), QueryError> {
+    if scope.outer.is_none() || aliases.is_empty() {
+        return Ok(());
+    }
+    crate::parser::visit::try_inspect_value_expr(expr, |node| {
+        if matches!(node, Expr::WindowFunction { .. }) {
+            crate::parser::visit::try_for_each_expr_child(node, |operand| {
+                validate_window_operand_aliases(operand, scope, aliases)
+            })?;
+        }
+        Ok(true)
+    })
+}
+
 pub(super) fn validate_expr_columns(
     db: &Database,
     expr: &Expr,

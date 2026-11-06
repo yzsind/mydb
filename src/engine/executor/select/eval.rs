@@ -3571,8 +3571,7 @@ fn bind_correlated_subquery_in_place(
     sub: &mut Select,
     outer_row: &PlanRow,
 ) -> Vec<ValueKey> {
-    let inner_cols = inner_select_columns(db, sub);
-    let inner_tables = inner_select_tables(sub);
+    let (inner_cols, inner_tables) = inner_select_scope(db, sub);
     let (_, bound) = with_outer_bind_collection(|| {
         let _ = substitute_outer_in_select(db, sub, outer_row, &inner_cols, &inner_tables);
     });
@@ -4974,11 +4973,13 @@ fn try_build_cached_subquery_plan(
         return None;
     }
     // Conservative gating: only cache shapes that execute_select itself
-    // routes through the planner path. Derived/CTE/system-table flavours
+    // routes through the planner path. Derived/CTE/system-table/window flavours
     // take separate execution paths that don't accept an externally-built
     // PhysicalPlan, so caching there would be either incorrect or
     // pointless.
-    if subquery.derived.is_some() {
+    if subquery.derived.is_some()
+        || crate::engine::executor::dispatch::select_has_window_functions(subquery)
+    {
         return None;
     }
     if subquery.table.as_deref().is_none() {
@@ -5023,8 +5024,7 @@ fn try_build_cached_subquery_plan(
     }
 
     let mut sub = subquery.clone();
-    let inner_cols = inner_select_columns(db, &sub);
-    let inner_tables = inner_select_tables(&sub);
+    let (inner_cols, inner_tables) = inner_select_scope(db, &sub);
     // A table-less `SELECT *` inside a correlated subquery expands to the
     // outer row. Its width depends on that row, so it cannot be represented
     // by the reusable placeholder plan; use the legacy binder below.
@@ -5252,11 +5252,12 @@ fn next_placeholder_index_in_select(select: &Select) -> usize {
 fn substitute_outer_in_select_placeholders(
     select: &mut Select,
     inner_cols: &HashSet<String>,
-    inner_tables: &HashSet<String>,
+    inner_tables: &InnerSelectTables,
     next_param_index: &mut usize,
     bindings: &mut Vec<OuterBindingSpec>,
 ) -> bool {
     let mut found = false;
+    let output_cols = inner_columns_with_projection_aliases(select, inner_cols);
     for item in &mut select.projection {
         if let SelectItem::Expr { expr, .. } = item {
             found |= substitute_outer_in_expr_placeholders(
@@ -5289,7 +5290,7 @@ fn substitute_outer_in_select_placeholders(
     if let Some(having) = &mut select.having {
         found |= substitute_outer_in_expr_placeholders(
             having,
-            inner_cols,
+            &output_cols,
             inner_tables,
             next_param_index,
             bindings,
@@ -5309,27 +5310,35 @@ fn substitute_outer_in_select_placeholders(
     for expr in &mut select.group_by {
         found |= substitute_outer_in_expr_placeholders(
             expr,
-            inner_cols,
+            &output_cols,
             inner_tables,
             next_param_index,
             bindings,
         );
     }
-    let mut order_cols = inner_cols.clone();
-    order_cols.extend(select.projection.iter().filter_map(|item| match item {
-        SelectItem::Expr {
-            alias: Some(alias), ..
-        } => Some(alias.to_ascii_lowercase()),
-        _ => None,
-    }));
     for order in &mut select.order_by {
         found |= substitute_outer_in_expr_placeholders(
             &mut order.expr,
-            &order_cols,
+            &output_cols,
             inner_tables,
             next_param_index,
             bindings,
         );
+    }
+    for window in &mut select.named_windows {
+        for expr in window
+            .partition_by
+            .iter_mut()
+            .chain(window.order_by.iter_mut().map(|order| &mut order.expr))
+        {
+            found |= substitute_outer_in_expr_placeholders(
+                expr,
+                inner_cols,
+                inner_tables,
+                next_param_index,
+                bindings,
+            );
+        }
     }
     found
 }
@@ -5337,7 +5346,7 @@ fn substitute_outer_in_select_placeholders(
 fn substitute_outer_in_expr_placeholders(
     expr: &mut Expr,
     inner_cols: &HashSet<String>,
-    inner_tables: &HashSet<String>,
+    inner_tables: &InnerSelectTables,
     next_param_index: &mut usize,
     bindings: &mut Vec<OuterBindingSpec>,
 ) -> bool {
@@ -5361,7 +5370,7 @@ fn substitute_outer_in_expr_placeholders(
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let table = parts[parts.len() - 2].clone();
             let col = parts[parts.len() - 1].clone();
-            if !inner_tables.contains(&table.to_ascii_lowercase()) {
+            if !inner_has_qualified_column(inner_tables, &table, &col) {
                 let idx = *next_param_index;
                 *next_param_index += 1;
                 bindings.push(OuterBindingSpec {
@@ -5375,7 +5384,12 @@ fn substitute_outer_in_expr_placeholders(
             }
             false
         }
-        _ if crate::parser::visit::scalar_expr_children(expr) => {
+        _ if crate::parser::visit::scalar_expr_children(expr)
+            || matches!(
+                expr,
+                Expr::Tuple(_) | Expr::GroupKeyRef { .. } | Expr::WindowFunction { .. }
+            ) =>
+        {
             let mut found = false;
             crate::parser::visit::for_each_expr_child_mut(expr, |child| {
                 found |= substitute_outer_in_expr_placeholders(
@@ -5422,98 +5436,154 @@ fn substitute_outer_in_expr_placeholders(
     }
 }
 
-fn inner_select_columns(db: &Arc<Database>, select: &Select) -> HashSet<String> {
-    let mut cols = HashSet::new();
-    let mut tables: Vec<&str> = Vec::new();
-    for table in &select.from {
-        tables.push(table.name.as_str());
-    }
-    for join in &select.joins {
-        tables.push(join.table.name.as_str());
-    }
-    for name in tables {
-        // CTEs win over real tables when the name overlaps; the
-        // outer-correlation rewrite must treat the CTE's projection
-        // columns as belonging to the inner scope, otherwise an inner
-        // reference like `total_revenue` would be re-bound to the
-        // outer row's value of the same name.
-        if let Some(cte) = super::super::cte::lookup_cte(name) {
-            for col in &cte.columns {
-                cols.insert(col.name.to_ascii_lowercase());
-            }
-            continue;
-        }
-        if let Some(def) = crate::engine::information_schema::find_system_table_name(name) {
-            for col in def.columns {
-                cols.insert(col.name.to_ascii_lowercase());
-            }
-        } else if let Ok(schema) = db.table(name) {
-            if !schema.system {
-                cols.insert("rowid".into());
-            }
-            for col in &schema.columns {
-                cols.insert(col.name.to_ascii_lowercase());
-            }
-        }
-    }
-    // A set-operation derived table's output column names are those of its
-    // leftmost SELECT (SQL semantics).
-    for derived in select
-        .derived
-        .iter()
-        .chain(select.joins.iter().filter_map(|join| join.derived.as_ref()))
-        .filter_map(SubQuery::leftmost_select)
-    {
-        if let Ok(names) = planner::query_output_column_names(db, derived) {
-            cols.extend(names.into_iter().map(|name| name.to_ascii_lowercase()));
-        } else {
-            // Correlated nested derived bodies may require an outer scope to
-            // describe wildcards, but explicit output names remain local.
-            for item in &derived.projection {
-                if let SelectItem::Expr { expr, alias } = item {
-                    if let Some(name) = alias.as_deref().or_else(|| expr_column_name(expr)) {
-                        cols.insert(name.to_ascii_lowercase());
-                    }
-                }
-            }
-        }
-    }
-    cols
+/// Retain each source's column ownership: a qualifier alone does not hide an
+/// outer reference when the local source has no column of that name. Catalog
+/// schemas stay shared so wide base tables need no second copy of their names.
+#[derive(Clone)]
+enum InnerSourceColumns {
+    Table(Arc<crate::storage::TableSchema>),
+    Cte(Arc<crate::engine::api::CteResult>),
+    Names(Vec<String>),
 }
 
-fn inner_select_tables(select: &Select) -> HashSet<String> {
-    // SQL scoping: once a source is aliased, the alias is the *only* valid
-    // qualifier — the base table name is hidden (mirrors
-    // `planner::ScopeTable::matches_name`). The correlated-subquery rewrite
-    // uses this set to decide whether a qualified reference is inner (leave
-    // it) or outer (substitute it). If we also registered the base name of
-    // an aliased inner table, a self-correlation like
-    // `SELECT (SELECT COUNT(*) FROM t t2 WHERE t2.id < t.id) FROM t` would
-    // misclassify the outer ref `t.id` as inner — leaving it unsubstituted
-    // so the inner scope (which only knows alias `t2`) rejects it with 1054.
-    let mut names = HashSet::new();
-    for table in &select.from {
-        if let Some(alias) = &table.alias {
-            names.insert(alias.to_ascii_lowercase());
+type InnerSelectTables = Vec<(String, InnerSourceColumns)>;
+
+fn inner_has_qualified_column(tables: &InnerSelectTables, qualifier: &str, column: &str) -> bool {
+    tables.iter().any(|(name, columns)| {
+        name.eq_ignore_ascii_case(qualifier)
+            && match columns {
+                InnerSourceColumns::Table(schema) => {
+                    schema.find_column_index(column).is_some()
+                        || (!schema.system && column.eq_ignore_ascii_case("rowid"))
+                }
+                InnerSourceColumns::Cte(cte) => cte
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(column)),
+                InnerSourceColumns::Names(names) => {
+                    names.iter().any(|name| name.eq_ignore_ascii_case(column))
+                }
+            }
+    })
+}
+
+fn inner_select_scope(db: &Arc<Database>, select: &Select) -> (HashSet<String>, InnerSelectTables) {
+    let mut columns = HashSet::new();
+    let mut tables = Vec::with_capacity(select.from.len() + select.joins.len());
+    for (table, derived) in select
+        .from
+        .iter()
+        .enumerate()
+        .map(|(index, table)| {
+            (
+                table,
+                (index == 0).then_some(select.derived.as_ref()).flatten(),
+            )
+        })
+        .chain(
+            select
+                .joins
+                .iter()
+                .map(|join| (&join.table, join.derived.as_ref())),
+        )
+    {
+        // Derived outputs take precedence over same-named catalog/CTE objects.
+        let source = if let Some(derived) = derived {
+            let mut names = match derived {
+                SubQuery::Select(inner) => planner::query_output_column_names(db, inner),
+                _ => super::describe_subquery_columns(db, derived)
+                    .map(|cols| cols.into_iter().map(|col| col.name).collect()),
+            }
+            .unwrap_or_else(|_| {
+                derived
+                    .leftmost_select()
+                    .map(|inner| {
+                        inner
+                            .projection
+                            .iter()
+                            .filter_map(|item| {
+                                if let SelectItem::Expr { expr, alias } = item {
+                                    alias
+                                        .clone()
+                                        .or_else(|| expr_column_name(expr).map(str::to_owned))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            // Binding/validation reports invalid widths and duplicate aliases.
+            // Never retain the pre-rename names in the local correlation scope.
+            if !table.column_aliases.is_empty() {
+                names.clone_from(&table.column_aliases);
+            }
+            InnerSourceColumns::Names(names)
+        } else if let Some(spec) = table.generate_series.as_deref() {
+            InnerSourceColumns::Names(planner::generate_series_column_names(spec))
+        } else if let Some(cte) = super::super::cte::lookup_cte(&table.name) {
+            InnerSourceColumns::Cte(cte)
+        } else if let Some(def) =
+            crate::engine::information_schema::find_system_table_name(&table.name)
+        {
+            InnerSourceColumns::Names(def.columns.iter().map(|col| col.name.to_owned()).collect())
+        } else if let Ok(schema) = db.table(&table.name) {
+            InnerSourceColumns::Table(schema)
         } else {
-            let last = table.name.rsplit('.').next().unwrap_or(&table.name);
-            names.insert(last.to_ascii_lowercase());
+            InnerSourceColumns::Names(Vec::new())
+        };
+        match &source {
+            InnerSourceColumns::Table(schema) => {
+                if !schema.system {
+                    columns.insert("rowid".into());
+                }
+                columns.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .map(|column| column.name.to_ascii_lowercase()),
+                );
+            }
+            InnerSourceColumns::Cte(cte) => columns.extend(
+                cte.columns
+                    .iter()
+                    .map(|column| column.name.to_ascii_lowercase()),
+            ),
+            InnerSourceColumns::Names(names) => {
+                columns.extend(names.iter().map(|name| name.to_ascii_lowercase()))
+            }
+        }
+        let qualifier = table
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| table.name.rsplit('.').next().unwrap_or(&table.name));
+        tables.push((qualifier.to_owned(), source));
+    }
+    (columns, tables)
+}
+
+/// GROUP BY, HAVING and ORDER BY can bind unqualified projection aliases.
+/// Preserve these names until the planner resolves them using clause-specific
+/// precedence; a same-named outer column must not capture the local alias.
+/// WHERE, JOIN ON and projection expressions still use only source columns.
+fn inner_columns_with_projection_aliases<'a>(
+    select: &Select,
+    inner_cols: &'a HashSet<String>,
+) -> std::borrow::Cow<'a, HashSet<String>> {
+    let mut columns = std::borrow::Cow::Borrowed(inner_cols);
+    for alias in select.projection.iter().filter_map(|item| match item {
+        SelectItem::Expr {
+            alias: Some(alias), ..
+        } => Some(alias),
+        _ => None,
+    }) {
+        let name = alias.to_ascii_lowercase();
+        if !columns.contains(&name) {
+            columns.to_mut().insert(name);
         }
     }
-    for join in &select.joins {
-        if let Some(alias) = &join.table.alias {
-            names.insert(alias.to_ascii_lowercase());
-        } else {
-            let last = join
-                .table
-                .name
-                .rsplit('.')
-                .next()
-                .unwrap_or(&join.table.name);
-            names.insert(last.to_ascii_lowercase());
-        }
-    }
-    names
+    columns
 }
 
 // WITH and set-operation wrappers in expression subqueries are ordinary
@@ -5527,8 +5597,7 @@ fn substitute_outer_in_query<'q>(
     let query = query.into();
     match query {
         crate::parser::QueryMut::Select(select) => {
-            let columns = inner_select_columns(db, select);
-            let tables = inner_select_tables(select);
+            let (columns, tables) = inner_select_scope(db, select);
             substitute_outer_in_select(db, select, outer_row, &columns, &tables)
         }
         // Fusion inputs are independent query scopes. Preserve unresolved
@@ -5562,8 +5631,7 @@ fn substitute_outer_in_derived(
 ) -> bool {
     match sub {
         SubQuery::Select(select) => {
-            let columns = inner_select_columns(db, select);
-            let tables = inner_select_tables(select);
+            let (columns, tables) = inner_select_scope(db, select);
             substitute_outer_in_select(db, select, outer_row, &columns, &tables)
         }
         statement @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
@@ -5577,9 +5645,10 @@ fn substitute_outer_in_select(
     select: &mut Select,
     outer_row: &PlanRow,
     inner_cols: &HashSet<String>,
-    inner_tables: &HashSet<String>,
+    inner_tables: &InnerSelectTables,
 ) -> bool {
     let mut found = false;
+    let output_cols = inner_columns_with_projection_aliases(select, inner_cols);
     if let Some(derived) = &mut select.derived {
         found |= substitute_outer_in_derived(db, derived, outer_row);
     }
@@ -5631,7 +5700,7 @@ fn substitute_outer_in_select(
         found |= substitute_outer_in_expr(db, selection, outer_row, inner_cols, inner_tables);
     }
     if let Some(having) = &mut select.having {
-        found |= substitute_outer_in_expr(db, having, outer_row, inner_cols, inner_tables);
+        found |= substitute_outer_in_expr(db, having, outer_row, &output_cols, inner_tables);
     }
     for join in &mut select.joins {
         if let Some(condition) = &mut join.condition {
@@ -5639,18 +5708,20 @@ fn substitute_outer_in_select(
         }
     }
     for expr in &mut select.group_by {
-        found |= substitute_outer_in_expr(db, expr, outer_row, inner_cols, inner_tables);
+        found |= substitute_outer_in_expr(db, expr, outer_row, &output_cols, inner_tables);
     }
-    let mut order_cols = inner_cols.clone();
-    order_cols.extend(select.projection.iter().filter_map(|item| match item {
-        SelectItem::Expr {
-            alias: Some(alias), ..
-        } => Some(alias.to_ascii_lowercase()),
-        _ => None,
-    }));
     for order in &mut select.order_by {
         found |=
-            substitute_outer_in_expr(db, &mut order.expr, outer_row, &order_cols, inner_tables);
+            substitute_outer_in_expr(db, &mut order.expr, outer_row, &output_cols, inner_tables);
+    }
+    for window in &mut select.named_windows {
+        for expr in window
+            .partition_by
+            .iter_mut()
+            .chain(window.order_by.iter_mut().map(|order| &mut order.expr))
+        {
+            found |= substitute_outer_in_expr(db, expr, outer_row, inner_cols, inner_tables);
+        }
     }
     found
 }
@@ -5685,7 +5756,7 @@ fn substitute_outer_in_expr(
     expr: &mut Expr,
     outer_row: &PlanRow,
     inner_cols: &HashSet<String>,
-    inner_tables: &HashSet<String>,
+    inner_tables: &InnerSelectTables,
 ) -> bool {
     if matches!(expr, Expr::Function { name, .. } if planner::is_aggregate_function(name)) {
         let mut references = 0usize;
@@ -5700,8 +5771,11 @@ fn substitute_outer_in_expr(
                     }
                     Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                         references += 1;
-                        outer_only &=
-                            !inner_tables.contains(&parts[parts.len() - 2].to_ascii_lowercase());
+                        outer_only &= !inner_has_qualified_column(
+                            inner_tables,
+                            &parts[parts.len() - 2],
+                            parts.last().unwrap(),
+                        );
                     }
                     Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
                         outer_only = false;
@@ -5741,7 +5815,7 @@ fn substitute_outer_in_expr(
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let table = &parts[parts.len() - 2];
             let col = &parts[parts.len() - 1];
-            if !inner_tables.contains(&table.to_ascii_lowercase()) {
+            if !inner_has_qualified_column(inner_tables, table, col) {
                 if let Ok(field) = resolve_plan_field(outer_row, Some(table), col) {
                     push_outer_binding(&field.value);
                     *expr = bound_outer_field(field);
@@ -5750,7 +5824,12 @@ fn substitute_outer_in_expr(
             }
             false
         }
-        _ if crate::parser::visit::scalar_expr_children(expr) => {
+        _ if crate::parser::visit::scalar_expr_children(expr)
+            || matches!(
+                expr,
+                Expr::Tuple(_) | Expr::GroupKeyRef { .. } | Expr::WindowFunction { .. }
+            ) =>
+        {
             let mut found = false;
             crate::parser::visit::for_each_expr_child_mut(expr, |child| {
                 found |= substitute_outer_in_expr(db, child, outer_row, inner_cols, inner_tables);
@@ -5809,12 +5888,13 @@ fn substitute_outer_in_nested_select(
     select: &mut Select,
     outer_row: &PlanRow,
     enclosing_cols: &HashSet<String>,
-    enclosing_tables: &HashSet<String>,
+    enclosing_tables: &InnerSelectTables,
 ) -> bool {
+    let (local_cols, local_tables) = inner_select_scope(db, select);
     let mut visible_cols = enclosing_cols.clone();
-    visible_cols.extend(inner_select_columns(db, select));
+    visible_cols.extend(local_cols);
     let mut visible_tables = enclosing_tables.clone();
-    visible_tables.extend(inner_select_tables(select));
+    visible_tables.extend(local_tables);
     substitute_outer_in_select(db, select, outer_row, &visible_cols, &visible_tables)
 }
 

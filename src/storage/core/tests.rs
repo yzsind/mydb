@@ -29280,6 +29280,8 @@ fn in_place_publication_excludes_cold_file_opens() {
     let db = Arc::new(open_relaxed_test_db(dir.path()));
     create_checkpoint_test_table(&db);
     let table = db.table("test.t").unwrap();
+    // Initialize and flush lazy handles as real shadow swaps do before publication.
+    db.flush_online_copy_shadow(&table).unwrap();
     let epoch = db.storage_handle_open_epoch(table.id);
     let (send, recv) = std::sync::mpsc::channel();
     let (ready, waiting) = std::sync::mpsc::channel();
@@ -29305,6 +29307,8 @@ fn in_place_publication_releases_loader_while_waiting_for_readers() {
     let db = Arc::new(open_relaxed_test_db(dir.path()));
     create_checkpoint_test_table(&db);
     let table = db.table("test.t").unwrap();
+    // Initialize and flush lazy handles as real shadow swaps do before publication.
+    db.flush_online_copy_shadow(&table).unwrap();
     let heap = db.heap_handle(table.id).unwrap();
     let reader = heap.read();
     let (waiting, wait) = std::sync::mpsc::channel();
