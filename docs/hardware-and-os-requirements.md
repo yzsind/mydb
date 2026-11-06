@@ -14,7 +14,7 @@ the Visual C++ runtime and Universal CRT.
 ## Operating systems
 
 The table below describes source-build support and platform verification.
-The 1.1.0 release provides portable archives for macOS arm64, Linux x86_64
+The 1.2.0 release provides portable archives for macOS arm64, Linux x86_64
 with glibc 2.17 or newer, and Windows x64. Docker images can be built locally;
 they are not included in the GitHub release. Other source-build targets do
 not imply prebuilt packages are available. See

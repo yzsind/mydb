@@ -174,20 +174,23 @@ fn cancel_copy_at_publish(wait_for_reader: bool) {
             .unwrap()
             .materialize()
             .unwrap();
-        hook.release();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !engine
+        let barrier_wait = engine
             .database()
-            .metadata_lock_snapshot()
-            .iter()
-            .any(|row| row.owner_thread_id == Some(19102) && row.lock_status == "PENDING")
-        {
-            assert!(
-                Instant::now() < deadline,
-                "DDL did not enter the publication wait"
-            );
-            std::thread::yield_now();
-        }
+            .install_online_index_long_lived_wait_test_hook();
+        // Latch arrival without pausing the DDL worker: cancellation must wake
+        // its real wait, rather than merely release a test hook. Long-lived
+        // blockers withdraw PENDING after the initial short fence, so polling
+        // metadata_lock_snapshot can miss the entire observable interval.
+        barrier_wait.release();
+        hook.release();
+        assert!(
+            barrier_wait.wait_until_reached(Duration::from_secs(5)),
+            "DDL did not enter the publication wait"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
     engine.database().cancel_ddl_job(job.job_id).unwrap();
     if !wait_for_reader {

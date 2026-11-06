@@ -892,6 +892,7 @@ fn prepare_window_execution(
         projection: &'a mut Vec<SelectItem>,
         bindings: Vec<(Expr, String)>,
         window_outputs: Vec<String>,
+        allow_window_outputs: bool,
     }
     impl crate::parser::visit::AstVisitorMut for WindowDeps<'_> {
         fn enter_expr(&mut self, expr: &mut Expr) {
@@ -915,7 +916,7 @@ fn prepare_window_execution(
                 return;
             }
             if let Expr::Identifier(name) = expr {
-                if self.window_outputs.iter().any(|a| a == name) {
+                if self.allow_window_outputs && self.window_outputs.iter().any(|a| a == name) {
                     return;
                 }
                 if self
@@ -952,10 +953,14 @@ fn prepare_window_execution(
             .collect(),
         projection: &mut inner_projection,
         window_outputs: window_specs.iter().map(|(a, _)| a.clone()).collect(),
+        allow_window_outputs: false,
     };
     for (_, expr) in &mut window_specs {
         crate::parser::visit::visit_expr_mut(&mut deps, expr);
     }
+    // Window inputs bind source columns, including names shared with a
+    // window's output alias. Only the final projection can read window outputs.
+    deps.allow_window_outputs = true;
     for output in &mut output_template {
         if let OutputCol::Expr { expr, .. } = output {
             crate::parser::visit::visit_expr_mut(&mut deps, expr);

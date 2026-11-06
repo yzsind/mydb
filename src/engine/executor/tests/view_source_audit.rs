@@ -5,6 +5,97 @@ fn setup() -> (tempfile::TempDir, StorageQueryEngine, SessionContext) {
     setup_engine(false)
 }
 
+#[test]
+fn aggregate_view_reused_in_scalar_subquery() {
+    let (_dir, engine, mut session) = setup();
+    for sql in [
+        "CREATE TABLE stock (s_w_id INT, s_i_id INT)",
+        "CREATE TABLE order_line (ol_i_id INT, ol_supply_w_id INT, ol_amount DECIMAL(12,2), ol_delivery_d DATETIME(6))",
+        "CREATE TABLE supplier (su_suppkey INT, su_name VARCHAR(20), su_address VARCHAR(30), su_phone VARCHAR(20))",
+        "INSERT INTO stock VALUES (1,1),(1,2),(1,3)",
+        "INSERT INTO order_line VALUES (1,1,10,'2007-01-02'),(1,1,20,'2007-01-03'),(2,1,30,'2007-01-04'),(3,1,5,'2007-01-05'),(3,1,100,'2007-01-01')",
+        "INSERT INTO supplier VALUES (1,'one','a','111'),(2,'two','b','222'),(3,'three','c','333')",
+        "CREATE VIEW revenue0 (supplier_no, total_revenue) AS SELECT MOD((s_w_id * s_i_id), 10000) AS supplier_no, SUM(ol_amount) AS total_revenue FROM order_line, stock WHERE ol_i_id = s_i_id AND ol_supply_w_id = s_w_id AND ol_delivery_d >= '2007-01-02 00:00:00.000000' GROUP BY supplier_no",
+    ] {
+        exec(&engine, &mut session, sql).expect(sql);
+    }
+    let sql = "SELECT su_suppkey, su_name, su_address, su_phone, total_revenue FROM supplier, revenue0 WHERE su_suppkey = supplier_no AND total_revenue = (SELECT MAX(total_revenue) FROM revenue0) ORDER BY su_suppkey";
+    for _ in 0..2 {
+        let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, sql).expect(sql) else {
+            panic!("expected result set");
+        };
+        let rows: Vec<Vec<String>> = rs
+            .rows
+            .iter()
+            .map(|row| row.iter().map(Value::to_display_string).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1", "one", "a", "111", "30.00"],
+                vec!["2", "two", "b", "222", "30.00"]
+            ]
+        );
+    }
+    for change in [
+        "UPDATE order_line SET ol_amount=NULL",
+        "DELETE FROM order_line",
+    ] {
+        exec(&engine, &mut session, change).expect(change);
+        let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, sql).expect(sql) else {
+            panic!("expected result set");
+        };
+        assert!(rs.rows.is_empty(), "{change}: {:?}", rs.rows);
+    }
+}
+
+#[test]
+fn scalar_subquery_projection_aliases_preserve_local_scope() {
+    for cache in [None, Some("off")] {
+        with_test_env(&[("MYDB_SUBQUERY_PLAN_CACHE", cache)], || {
+            let (_dir, engine, mut session) = setup();
+            for sql in [
+                "CREATE TABLE outer_values (k INT, total INT)",
+                "INSERT INTO outer_values VALUES (0,0),(1,1000)",
+            ] {
+                exec(&engine, &mut session, sql).expect(sql);
+            }
+            for expression in ["MOD(id,2)", "CONCAT('g',id)", "id+10"] {
+                let sql = format!("SELECT o.k, (SELECT COUNT(*) FROM (SELECT {expression} AS k, SUM(val) AS total FROM t GROUP BY k) d) AS n FROM outer_values o ORDER BY o.k");
+                let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, &sql).expect(&sql)
+                else {
+                    panic!("expected result set");
+                };
+                assert_eq!(
+                    rs.rows,
+                    vec![
+                        vec![Value::Int(0), Value::Int(2)],
+                        vec![Value::Int(1), Value::Int(2)]
+                    ],
+                    "{sql}, cache={cache:?}"
+                );
+            }
+            for (body, expected) in [
+                ("SELECT SUM(val) AS total FROM t HAVING total>200", vec![Value::Int(210), Value::Int(210)]),
+                ("SELECT SUM(val) AS total FROM t HAVING total>o.total", vec![Value::Int(210), Value::Null]),
+                ("SELECT COUNT(*) FROM (SELECT MOD(id,2) AS k, SUM(val) AS total FROM t GROUP BY k HAVING total>100) d", vec![Value::Int(1), Value::Int(1)]),
+                ("SELECT COUNT(*) AS total FROM t WHERE total=0", vec![Value::Int(2), Value::Int(0)]),
+                ("SELECT COUNT(*) FROM (SELECT 0 AS id, COUNT(*) AS n FROM t GROUP BY id) d", vec![Value::Int(2), Value::Int(2)]),
+            ] {
+                let sql = format!("SELECT o.k, ({body}) AS result FROM outer_values o ORDER BY o.k");
+                let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, &sql).expect(&sql) else {
+                    panic!("expected result set");
+                };
+                // SUM's exact numeric representation may differ by execution path.
+                assert_eq!(rs.rows.len(), 2, "{sql}, cache={cache:?}");
+                for (row, expected) in rs.rows.iter().zip(expected) {
+                    assert_eq!(row[1].to_display_string(), expected.to_display_string(), "{sql}, cache={cache:?}");
+                }
+            }
+        });
+    }
+}
+
 fn setup_engine(persistent: bool) -> (tempfile::TempDir, StorageQueryEngine, SessionContext) {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = if persistent {

@@ -8,7 +8,7 @@
 
 Let agents manage data flexibly — transactions, analytics, AI model calls and hybrid search through SQL.
 
-[Download](https://github.com/yzsind/mydb/releases/tag/v1.1.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
+[Download](https://github.com/yzsind/mydb/releases/tag/v1.2.0) · [Performance evaluation](#performance-evaluation) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
 </div>
 
@@ -16,7 +16,7 @@ Let agents manage data flexibly — transactions, analytics, AI model calls and 
 
 MyDB is a general-purpose database built in Rust, designed around three directions: **AI agents, high-performance hybrid transactional/analytical processing (HTAP), and MySQL compatibility**. Through a familiar SQL interface, applications and agents can manage business data, evolve table schemas, run real-time analytics, combine keyword and vector retrieval, and call text-generation and embedding services.
 
-MyDB 1.1.0 is a public-preview release intended for feature validation and controlled-environment evaluation. It is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
+MyDB 1.2.0 is a public-preview release intended for feature validation and controlled-environment evaluation. It is not yet a production-grade MySQL replacement, and on-disk formats are not guaranteed to be backward compatible.
 
 | Core capability | What it gives you |
 | --- | --- |
@@ -44,7 +44,7 @@ conditions, and limitations.
 ## Quick Start
 
 Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from the
-[1.1.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.1.0), which also
+[1.2.0 release page](https://github.com/yzsind/mydb/releases/tag/v1.2.0), which also
 includes SHA256 checksums and platform validation details.
 
 ### Run a downloaded binary

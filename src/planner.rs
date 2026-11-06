@@ -1,6 +1,9 @@
 mod column_validation;
 mod rrf;
-use column_validation::{validate_expr_columns, validate_window_frame_columns};
+use column_validation::{
+    validate_expr_columns, validate_window_frame_columns, validate_window_operand_aliases,
+    validate_window_output_aliases,
+};
 mod semi_anti;
 pub(crate) use join_cost::adaptive_candidate_cost;
 pub(crate) use join_cost::reverse_semi_anti_hash_join_eligible;
@@ -4252,6 +4255,7 @@ fn validate_select_in_column_scope(
             SelectItem::QualifiedWildcard(qualifier) => scope.resolve_qualifier(qualifier)?,
             SelectItem::Expr { expr, .. } => {
                 validate_expr_columns(db, expr, &scope, None, true)?;
+                validate_window_output_aliases(expr, scope, &aliases)?;
             }
         }
     }
@@ -4286,9 +4290,11 @@ fn validate_select_in_column_scope(
     for window in &select.named_windows {
         for expr in &window.partition_by {
             validate_expr_columns(db, expr, &scope, None, true)?;
+            validate_window_operand_aliases(expr, scope, &aliases)?;
         }
         for order_by in &window.order_by {
             validate_expr_columns(db, &order_by.expr, &scope, None, true)?;
+            validate_window_operand_aliases(&order_by.expr, scope, &aliases)?;
         }
         if let Some(frame) = &window.frame {
             validate_window_frame_columns(db, frame, &scope)?;
@@ -8955,7 +8961,9 @@ fn cte_col_index(expr: &Expr, columns: &[Column]) -> Option<usize> {
 /// Output column names for a `generate_series(...)` source, in order: the
 /// value column (default `generate_series`) plus an `ordinality` column when
 /// `WITH ORDINALITY` is present. `AS t(...)` aliases override the defaults.
-fn generate_series_column_names(spec: &crate::parser::GenerateSeriesSpec) -> Vec<String> {
+pub(crate) fn generate_series_column_names(
+    spec: &crate::parser::GenerateSeriesSpec,
+) -> Vec<String> {
     let mut names = vec![spec
         .column_aliases
         .first()
@@ -21811,16 +21819,37 @@ fn walk_subquery_expr(select: &Select, f: &mut impl FnMut(&Expr)) {
 /// clauses, while FROM/CTE definitions and window frames remain separate
 /// scopes. The callback controls semantic pruning (aggregate, fulltext, etc.).
 fn inspect_query_value_expr(expr: &Expr, inspect: &mut impl FnMut(&Expr) -> bool) {
-    struct Inspect<'a, F>(&'a mut F, bool);
+    inspect_query_values(expr, inspect, false);
+}
+
+/// Column pruning must retain outer values used anywhere in a nested producer,
+/// including derived/CTE bodies and named window inputs. Keep that ownership
+/// separate from semantic walkers that attribute columns to an enclosing group.
+fn inspect_query_column_dependencies(expr: &Expr, inspect: &mut impl FnMut(&Expr) -> bool) {
+    inspect_query_values(expr, inspect, true);
+}
+
+fn inspect_query_values(
+    expr: &Expr,
+    inspect: &mut impl FnMut(&Expr) -> bool,
+    include_sources: bool,
+) {
+    struct Inspect<'a, F> {
+        inspect: &'a mut F,
+        descend: bool,
+        include_sources: bool,
+    }
     impl<F: FnMut(&Expr) -> bool> crate::parser::visit::AstVisitor for Inspect<'_, F> {
         fn enter_expr(&mut self, expr: &Expr) {
-            self.1 = (self.0)(expr);
+            self.descend = (self.inspect)(expr);
         }
         fn walk_expr_children(&self, _: &Expr) -> bool {
-            self.1
+            self.descend
         }
         fn enter_select(&mut self, select: &Select) {
-            use crate::parser::visit::visit_expr;
+            use crate::parser::visit::{visit_expr, visit_query};
+            // Visit value-bearing clauses directly. Walking every structural
+            // SELECT field adds avoidable work to repeated metadata probes.
             for item in &select.projection {
                 if let SelectItem::Expr { expr, .. } = item {
                     visit_expr(self, expr);
@@ -21840,6 +21869,49 @@ fn inspect_query_value_expr(expr: &Expr, inspect: &mut impl FnMut(&Expr) -> bool
             for order in &select.order_by {
                 visit_expr(self, &order.expr);
             }
+            if self.include_sources {
+                for query in select
+                    .derived
+                    .iter()
+                    .chain(select.joins.iter().filter_map(|join| join.derived.as_ref()))
+                {
+                    visit_query(self, query);
+                }
+                for window in &select.named_windows {
+                    for expr in &window.partition_by {
+                        visit_expr(self, expr);
+                    }
+                    for order in &window.order_by {
+                        visit_expr(self, &order.expr);
+                    }
+                }
+                if let Some(source) = &select.json_table {
+                    visit_expr(self, &source.expr);
+                }
+                if let Some(values) = &select.values {
+                    for row in &values.rows {
+                        for expr in row {
+                            visit_expr(self, expr);
+                        }
+                    }
+                }
+                for table in select
+                    .from
+                    .iter()
+                    .chain(select.joins.iter().map(|join| &join.table))
+                {
+                    if let Some(time) = &table.system_time {
+                        visit_expr(self, &time.expr);
+                    }
+                    if let Some(series) = &table.generate_series {
+                        visit_expr(self, &series.start);
+                        visit_expr(self, &series.stop);
+                        if let Some(step) = &series.step {
+                            visit_expr(self, step);
+                        }
+                    }
+                }
+            }
         }
         fn walk_select_children(&self, _: &Select) -> bool {
             false
@@ -21851,7 +21923,14 @@ fn inspect_query_value_expr(expr: &Expr, inspect: &mut impl FnMut(&Expr) -> bool
             false
         }
     }
-    crate::parser::visit::visit_expr(&mut Inspect(inspect, true), expr);
+    crate::parser::visit::visit_expr(
+        &mut Inspect {
+            inspect,
+            descend: true,
+            include_sources,
+        },
+        expr,
+    );
 }
 
 /// Visit column references that are evaluated outside aggregate arguments.
@@ -25239,7 +25318,7 @@ impl JoinPruneNeed {
     fn add_expr(&mut self, expr: &Expr) {
         // Unlike `walk_expr_for_idents`, descend into row constructors: the
         // executor still reads every column of `(a, b) IN (SELECT ...)`.
-        inspect_query_value_expr(expr, &mut |e| {
+        inspect_query_column_dependencies(expr, &mut |e| {
             self.add_column_ref(e);
             true
         });
@@ -25470,7 +25549,7 @@ fn collect_expr_cte_column_refs(
     cte_column_names: &HashSet<String>,
     out: &mut HashSet<String>,
 ) {
-    inspect_query_value_expr(expr, &mut |expr| {
+    inspect_query_column_dependencies(expr, &mut |expr| {
         match expr {
             Expr::Identifier(c) => {
                 let n = normalize_expr_column(c);
@@ -25710,7 +25789,7 @@ fn collect_expr_columns_by_table(
     tables: &[PlanTable],
     columns: &mut [HashSet<String>],
 ) {
-    inspect_query_value_expr(expr, &mut |expr| {
+    inspect_query_column_dependencies(expr, &mut |expr| {
         match expr {
             Expr::Identifier(name) => {
                 let normalized = normalize_expr_column(name);
@@ -25823,7 +25902,7 @@ fn collect_required_columns(select: &Select, table: &PlanTable) -> HashSet<Strin
 }
 
 fn collect_expr_columns(expr: &Expr, columns: &mut HashSet<String>) {
-    inspect_query_value_expr(expr, &mut |expr| {
+    inspect_query_column_dependencies(expr, &mut |expr| {
         match expr {
             Expr::Identifier(name) => {
                 columns.insert(normalize_expr_column(name));

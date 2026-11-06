@@ -1019,6 +1019,13 @@ impl Database {
         self.online_index_barrier_checked(table, owner, cleanup, mode, || Ok(()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_online_index_long_lived_wait_test_hook(&self) -> Arc<DdlBackfillTestHook> {
+        let hook = Arc::new(DdlBackfillTestHook::new());
+        *self.online_index_long_lived_wait_test_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+
     fn online_index_barrier_checked(
         &self,
         table: &TableSchema,
@@ -1059,6 +1066,13 @@ impl Database {
                         self.wait_for_ddl_signal(Duration::from_millis(10))?;
                         self.mdl.clear_pending_for_owner(owner);
                         self.notify_non_row_lock_waiters();
+                        #[cfg(test)]
+                        {
+                            let hook = self.online_index_long_lived_wait_test_hook.lock().unwrap().take();
+                            if let Some(hook) = hook {
+                                hook.pause();
+                            }
+                        }
                         while self.mdl.has_long_lived_blocker(&key,owner,mode) {
                             if !cleanup {
                                 self.ensure_operational()?;
