@@ -1240,13 +1240,13 @@
             "constant"
           ],
           "setup": [],
-          "sql": "SELECT MASK_SSN('123456789')",
+          "sql": "SELECT MASK_SSN('123-45-6789')",
           "cleanup": [],
           "expected": {
             "status": "ok",
             "rows": [
               [
-                "XXXXX6789"
+                "XXX-XX-6789"
               ]
             ],
             "warning_codes": []
@@ -1260,13 +1260,13 @@
             "status": "ok",
             "rows": [
               [
-                "XXXXX6789"
+                "XXX-XX-6789"
               ]
             ],
             "warning_codes": [],
             "columns": [
               {
-                "name": "MASK_SSN('123456789')",
+                "name": "MASK_SSN('123-45-6789')",
                 "type": "VAR_STRING",
                 "length": 65535,
                 "decimals": 31,

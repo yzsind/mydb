@@ -84,7 +84,12 @@ fn partial_batches_and_spill_replay_cover_all_aggregate_kinds() {
             part.buckets
                 .push(GroupBucket::new(encoded, vec![key], states));
         }
-        batches.push(partition_to_spill_batch(&part, &schema, &[0], &aggs));
+        batches.push(partition_to_spill_batch(
+            &part.buckets,
+            &schema,
+            &[0],
+            &aggs,
+        ));
     }
     let resident = merge_partition_batches(batches.clone(), schema.clone(), &aggs).unwrap();
     // Independent oracle: feed the original inputs directly, bypassing both
@@ -310,7 +315,7 @@ fn mixed_spill_slots_and_fixed_replay_match_original_inputs() {
                         buckets: vec![GroupBucket::new(vec![], vec![Value::Int(1)], partial)],
                         ..Default::default()
                     };
-                    partition_to_spill_batch(&part, &schema, &[0], &aggs)
+                    partition_to_spill_batch(&part.buckets, &schema, &[0], &aggs)
                 })
                 .collect::<Vec<_>>();
             let actual = if fixed {

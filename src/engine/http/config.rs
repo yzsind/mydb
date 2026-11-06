@@ -326,9 +326,6 @@ impl Policy {
         Ok(())
     }
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), QueryError> {
-        let Some(e) = &self.egress else {
-            return Ok(());
-        };
         let ip = match ip {
             IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
             _ => ip,
@@ -360,7 +357,12 @@ impl Policy {
                     || v.segments()[..6] == [0, 0, 0, 0, 0, 0]
             }
         };
-        if restricted && !e.private_destinations.iter().any(|n| n.contains(&ip)) {
+        if restricted
+            && !self
+                .egress
+                .as_ref()
+                .is_some_and(|e| e.private_destinations.iter().any(|n| n.contains(&ip)))
+        {
             return Err(error(
                 "ER_HTTP_EGRESS_DENIED",
                 "HTTP destination IP denied by node policy",

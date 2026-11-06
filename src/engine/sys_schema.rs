@@ -2002,7 +2002,7 @@ fn execute_table_exists(
     };
     match &args[2] {
         Expr::UserVariable(name) => {
-            session.set_user_variable(name, Value::String(exists.to_string()))
+            session.set_user_variable(name, Value::String(exists.to_string()))?
         }
         _ => {
             return Err(error(

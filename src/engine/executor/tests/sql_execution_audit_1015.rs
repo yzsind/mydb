@@ -72,6 +72,13 @@ fn sqlaudit_like_prefix_bounds_match_residual_across_collations() {
         "utf8mb4_0900_ai_ci",
         "utf8mb4_bin",
     ] {
+        let charset = if collation.starts_with("latin1") {
+            "latin1"
+        } else if collation.starts_with("utf8_") {
+            "utf8"
+        } else {
+            "utf8mb4"
+        };
         engine.execute("DROP TABLE IF EXISTS t").unwrap();
         engine
             .execute(&format!(
@@ -80,7 +87,7 @@ fn sqlaudit_like_prefix_bounds_match_residual_across_collations() {
             .unwrap();
         engine.execute("INSERT INTO t VALUES(1,'user123'),(2,'User456'),(3,'zz'),(4,'éx'),(5,'êy'),(6,NULL)").unwrap();
         for pattern in ["user%", "USER%", "zz%", "é%", "u_ser%", "%", "no%"] {
-            let oracle = rows(&engine, &format!("SELECT id FROM t WHERE CONCAT(s,'') COLLATE {collation} LIKE '{pattern}' ORDER BY id"));
+            let oracle = rows(&engine, &format!("SELECT id FROM t WHERE CONCAT(s,CONVERT('' USING {charset})) COLLATE {collation} LIKE '{pattern}' ORDER BY id"));
             for hint in ["", "FORCE INDEX(ix)", "IGNORE INDEX(ix)"] {
                 let sql = format!("SELECT id FROM t {hint} WHERE s LIKE '{pattern}' ORDER BY id");
                 assert_eq!(rows(&engine, &sql), oracle, "{collation}: {sql}");

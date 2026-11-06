@@ -1881,6 +1881,9 @@ pub(super) fn fast_const_decimal_parts(value: &Value) -> Option<(i128, u8)> {
         Value::Int(value) => Some((*value as i128, 0)),
         Value::UInt(value) => Some((*value as i128, 0)),
         Value::DecimalCompact(magnitude, scale) => Some((*magnitude as i128, *scale)),
+        Value::Decimal128(magnitude, scale) => Some((*magnitude, *scale)),
+        Value::DecimalWide(value) => num_traits::ToPrimitive::to_i128(&value.magnitude)
+            .map(|magnitude| (magnitude, value.scale)),
         Value::Decimal(value) | Value::String(value) => {
             crate::util::decimal::parse_exact_decimal_str(value)
         }
@@ -1936,6 +1939,9 @@ pub(super) fn fast_const_for_column(
     if matches!(data_type, DataTypeKind::Timestamp { .. })
         && !matches!(value, Value::Timestamp(_) | Value::Null)
     {
+        return None;
+    }
+    if matches!(value, Value::DecimalWide(_)) && fast_const_decimal_parts(&value).is_none() {
         return None;
     }
     Some(FastConst {

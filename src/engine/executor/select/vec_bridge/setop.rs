@@ -74,9 +74,14 @@ impl SetOpRowPuller<'_> {
                                 SetOpBatchOperator::can_passthrough_field(source, field)
                             });
                         if !passthrough {
-                            *value = SetOpBatchOperator::coerce_value(
+                            *value = crate::engine::executor::dispatch::coerce_setop_value_from(
                                 std::mem::replace(value, Value::Null),
-                                field,
+                                self.source_schema
+                                    .fields()
+                                    .get(column_index)
+                                    .map(|field| &field.source),
+                                field.column_type,
+                                &field.source,
                             )?;
                         }
                     }
@@ -103,6 +108,10 @@ impl SetOpBatchOperator<'_> {
             return source.source.vector_type == target.source.vector_type;
         }
         if source.column_type == target.column_type {
+            if matches!(target.column_type, ColumnType::VarString | ColumnType::Blob) {
+                return (source.source.collation_id == Some(63))
+                    == (target.source.collation_id == Some(63));
+            }
             return true;
         }
         matches!(
@@ -144,14 +153,6 @@ impl SetOpBatchOperator<'_> {
         }
     }
 
-    pub(super) fn coerce_value(value: Value, field: &BatchField) -> Result<Value, QueryError> {
-        crate::engine::executor::dispatch::coerce_setop_value(
-            value,
-            field.column_type,
-            &field.source,
-        )
-    }
-
     /// Whether set-operation metadata unification leaves a physical column
     /// byte-compatible with the output schema. UNION type resolution often
     /// only widens a DECIMAL's declared precision while retaining its scale;
@@ -162,6 +163,15 @@ impl SetOpBatchOperator<'_> {
         source: &BatchField,
         target: &BatchField,
     ) -> bool {
+        if matches!(target.column_type, ColumnType::VarString | ColumnType::Blob) {
+            let binary = target.source.collation_id == Some(63);
+            if matches!(column, ColumnVector::Bytes { .. }) {
+                return binary;
+            }
+            if matches!(column, ColumnVector::Utf8 { .. }) {
+                return !binary;
+            }
+        }
         if matches!(column, ColumnVector::Null { .. })
             || Self::can_passthrough_field(source, target)
         {
@@ -191,7 +201,16 @@ impl SetOpBatchOperator<'_> {
             }
             let mut values = Vec::with_capacity(row_count);
             for row in 0..row_count {
-                values.push(Self::coerce_value(column.value_at(row), field)?);
+                values.push(crate::engine::executor::dispatch::coerce_setop_value_from(
+                    column.value_at(row),
+                    batch
+                        .schema
+                        .fields()
+                        .get(column_index)
+                        .map(|field| &field.source),
+                    field.column_type,
+                    &field.source,
+                )?);
             }
             columns.push(ColumnVector::from_values(values));
         }

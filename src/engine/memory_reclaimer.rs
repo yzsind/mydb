@@ -502,10 +502,12 @@ fn ensure_worker() {
 fn notify() {
     ensure_worker();
     let reclaimer = global();
-    if let Ok(mut state) = reclaimer.state.lock() {
-        if state.record_activity() {
-            reclaimer.wake.notify_one();
-        }
+    let mut state = reclaimer.state.lock().unwrap_or_else(|poisoned| {
+        reclaimer.state.clear_poison();
+        poisoned.into_inner()
+    });
+    if state.record_activity() {
+        reclaimer.wake.notify_one();
     }
 }
 
@@ -933,14 +935,16 @@ fn worker_loop() {
     let reclaimer = global();
     let mut seen_generation = 0u64;
     loop {
-        let Ok(mut state) = reclaimer.state.lock() else {
-            return;
-        };
+        let mut state = reclaimer.state.lock().unwrap_or_else(|poisoned| {
+            reclaimer.state.clear_poison();
+            poisoned.into_inner()
+        });
         while state.generation == seen_generation {
             state.wake_on_activity = true;
-            let Ok(next) = reclaimer.wake.wait(state) else {
-                return;
-            };
+            let next = reclaimer.wake.wait(state).unwrap_or_else(|poisoned| {
+                reclaimer.state.clear_poison();
+                poisoned.into_inner()
+            });
             state = next;
             state.wake_on_activity = false;
         }
@@ -962,17 +966,23 @@ fn worker_loop() {
         }
         try_reclaim();
         for delay in RETRY_DELAYS {
-            let Ok(mut state) = reclaimer.state.lock() else {
-                return;
-            };
+            let mut state = reclaimer.state.lock().unwrap_or_else(|poisoned| {
+                reclaimer.state.clear_poison();
+                poisoned.into_inner()
+            });
             if state.generation != seen_generation {
                 break;
             }
             let generation = state.generation;
             state.wake_on_activity = true;
-            let Ok((mut state, timeout)) = reclaimer.wake.wait_timeout(state, delay) else {
-                return;
-            };
+            let (mut state, timeout) =
+                reclaimer
+                    .wake
+                    .wait_timeout(state, delay)
+                    .unwrap_or_else(|poisoned| {
+                        reclaimer.state.clear_poison();
+                        poisoned.into_inner()
+                    });
             state.wake_on_activity = false;
             let changed = !timeout.timed_out() || state.generation != generation;
             drop(state);
@@ -998,7 +1008,14 @@ fn wait_for_quiet_period<'a>(
         if remaining.is_zero() {
             return Some(state);
         }
-        state = reclaimer.wake.wait_timeout(state, remaining).ok()?.0;
+        state = reclaimer
+            .wake
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| {
+                reclaimer.state.clear_poison();
+                poisoned.into_inner()
+            })
+            .0;
     }
 }
 
@@ -1130,9 +1147,10 @@ fn file_cache_pressure_active(limit: u64, current: u64, requested: u64) -> bool 
     static PAGE_BYTES: OnceLock<u64> = OnceLock::new();
     // Serialize observations, including their counter reads: concurrent
     // samplers must not mistake an older snapshot for a controller reset.
-    let mut history = HISTORY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut history = HISTORY.lock().unwrap_or_else(|poisoned| {
+        HISTORY.clear_poison();
+        poisoned.into_inner()
+    });
     let page_bytes = *PAGE_BYTES.get_or_init(|| {
         // SAFETY: sysconf reads a scalar process property.
         u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096)
@@ -1909,6 +1927,35 @@ mod tests {
         .join()
         .unwrap();
         assert!(!WORKER_RECLAIM_PENDING.with(|pending| pending.get()));
+    }
+
+    #[test]
+    fn audit1106_quiet_wait_recovers_poisoned_state() {
+        let reclaimer = std::sync::Arc::new(Reclaimer {
+            state: Mutex::new(WakeState::new()),
+            wake: Condvar::new(),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let reclaimer = reclaimer.clone();
+            std::thread::spawn(move || {
+                let state = reclaimer.state.lock().unwrap();
+                tx.send(()).unwrap();
+                let state =
+                    wait_for_quiet_period(&reclaimer, state, Duration::from_millis(50)).unwrap();
+                assert_eq!(state.generation, 1);
+            })
+        };
+        rx.recv().unwrap();
+        let poisoned = std::panic::catch_unwind(|| {
+            let mut state = reclaimer.state.lock().unwrap();
+            state.record_activity();
+            panic!("injected wake state poison");
+        });
+        assert!(poisoned.is_err());
+        reclaimer.wake.notify_one();
+        worker.join().unwrap();
+        assert!(!reclaimer.state.is_poisoned());
     }
 
     #[test]

@@ -877,11 +877,16 @@ impl MydbReplManager {
                 )
             })?
             .unwrap_or_default();
-        let progress = if self.receiver_lifecycle.lock().is_running() {
-            self.receiver_progress.lock().clone()
+        let live_progress = self.receiver_progress.lock().clone();
+        let mut progress = if live_progress.applied_lsn > disk_progress.applied_lsn
+            || !live_progress.last_master_uuid.is_empty()
+        {
+            live_progress
         } else {
             disk_progress
         };
+        let db = self.engine.database_for_replication();
+        replica::progress::reconcile_applied(&mut progress, db, &db.wal_log());
         let log = self.engine.database_for_replication().wal_log();
         let local_next_lsn = log.lock().next_lsn();
         let columns = vec![
@@ -1834,7 +1839,7 @@ impl MydbReplManager {
         }
         let deadline = std::time::Instant::now() + wait;
         let db = self.engine.database_for_replication();
-        while db.has_active_backup_conflicts() {
+        while db.has_active_archive_backup_conflicts() {
             session.check_cancelled()?;
             if std::time::Instant::now() >= deadline {
                 return Err(error(

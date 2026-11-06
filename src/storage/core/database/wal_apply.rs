@@ -598,7 +598,8 @@ impl Database {
                                     IsolationLevel::RepeatableRead,
                                 );
                                 if header.is_deleted() && !self.row_version_visible(header, reader)? {
-                                    return Err(error(
+                                    return Err(QueryError::internal_control(
+                                        crate::error::InternalErrorKind::ReplicaSnapshotBlocked,
                                         crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
                                         format!(
                                             "physical replication replay blocked by active snapshot {snapshot_scn}: \

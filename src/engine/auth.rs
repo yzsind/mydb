@@ -2732,7 +2732,7 @@ pub fn verify_auth_response(plugin: &str, stored: &str, password: &[u8], seed: &
     }
     match plugin {
         "mysql_native_password" => verify_mysql_native(stored, password, seed),
-        "caching_sha2_password" => verify_caching_sha2(stored, password, seed),
+        "caching_sha2_password" => false,
         "sha256_password" => verify_sha256_password(stored, password),
         _ => false,
     }
@@ -3592,27 +3592,6 @@ fn verify_mysql_native(stored: &str, token: &[u8], seed: &[u8]) -> bool {
     constant_time_eq(check.as_slice(), stage2.as_slice())
 }
 
-fn verify_caching_sha2(stored: &str, token: &[u8], seed: &[u8]) -> bool {
-    let stored = stored.trim_start_matches("$A$");
-    if token.len() != 32 || stored.len() != 64 {
-        return false;
-    }
-    let Some(stage2) = parse_hex(stored) else {
-        return false;
-    };
-    let mut sha = Sha256::new();
-    sha.update(&stage2);
-    sha.update(seed);
-    let digest = sha.finalize();
-    let stage1: Vec<u8> = token
-        .iter()
-        .zip(digest.iter())
-        .map(|(a, b)| a ^ b)
-        .collect();
-    let check = Sha256::digest(&stage1);
-    constant_time_eq(check.as_slice(), stage2.as_slice())
-}
-
 fn verify_sha256_password(stored: &str, token: &[u8]) -> bool {
     if token.len() > 257 {
         return false;
@@ -4351,7 +4330,8 @@ fn malformed_hex_credentials_are_rejected_without_panicking() {
         &[0; 20],
         &[0; 20],
     ));
-    assert!(!verify_caching_sha2(
+    assert!(!verify_auth_response(
+        "caching_sha2_password",
         &format!("$A${}", "🙂".repeat(16)),
         &[0; 32],
         &[0; 20],

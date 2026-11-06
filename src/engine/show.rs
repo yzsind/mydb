@@ -2996,14 +2996,9 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
     let known_cache_bytes = crate::engine::cache_registry::collect()
         .into_iter()
         .filter(|cache| {
-            matches!(
-                cache.name,
-                "statement_ast"
-                    | "physical_plan"
-                    | "prepared_dml_plan"
-                    | "prepared_dml_batch"
-                    | "col_meta_intern"
-            )
+            cache.memory_accounting
+                == crate::engine::cache_registry::CacheMemoryAccounting::IndependentEstimate
+                && cache.scope == "process"
         })
         .fold(0u128, |sum, cache| {
             sum.saturating_add(cache.bytes.unwrap_or(0) as u128)
@@ -3977,7 +3972,7 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         "buffer_pool_resident_bytes" =>
             ((controlled_categories[0] as u128) .saturating_add(controlled_categories[1] as u128)) .to_string(),
         "tracked_memory_bytes" =>
-            ((controlled_current as u128) .saturating_add(status.undo_resident_bytes as u128) .saturating_add(known_cache_bytes)) .to_string(),
+            ((controlled_current as u128) .saturating_add(known_cache_bytes)) .to_string(),
         "resident_set_peak_bytes" => peak_resident_bytes().to_string(),
         "active_connections" => connection_metrics.active.to_string(),
         "max_connections" => connection_metrics.max_connections.to_string(),
@@ -4203,7 +4198,7 @@ pub(crate) fn show_processlist_result(
             info: Some("SHOW PROCESSLIST".to_string()),
             connection_attrs: std::collections::BTreeMap::new(),
             session_variables: Vec::new(),
-            user_variables: Vec::new(),
+            user_variables: Default::default(),
             autocommit: session.autocommit,
             isolation: session.isolation.as_mysql_name().replace('-', " "),
             prepared_statements: Vec::new(),

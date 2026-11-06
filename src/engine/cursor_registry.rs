@@ -321,8 +321,13 @@ impl CursorRegistry {
         })
     }
 
-    fn unregister(&self, key: CursorKey) {
-        if self.map.lock().remove(&key).is_some() {
+    fn unregister(&self, key: CursorKey, entry: &Arc<CursorEntry>) {
+        let mut map = self.map.lock();
+        if map
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            map.remove(&key);
             self.stats.closed_total.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -402,8 +407,8 @@ impl CursorHandle {
 
 impl Drop for CursorHandle {
     fn drop(&mut self) {
-        if self.entry.is_some() {
-            global().unregister(self.key);
+        if let Some(entry) = self.entry.as_ref() {
+            global().unregister(self.key, entry);
         }
     }
 }
@@ -534,6 +539,36 @@ mod tests {
             column_type: crate::types::ColumnType::LongLong,
             source: Default::default(),
         }
+    }
+
+    #[test]
+    fn audit1106_fetch_huge_count_and_stale_handles_are_safe() {
+        let (registry, _guard) = fresh_registry();
+        named_clear();
+        for count in [1_000_000_000_000_000, u64::MAX] {
+            named_open(
+                900,
+                "huge".into(),
+                Arc::from("SELECT 1"),
+                vec![make_column()],
+                Box::new(CountingCursor { next: 1, limit: 1 }),
+            )
+            .unwrap();
+            let result = named_fetch(900, "huge", count).unwrap();
+            assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+            assert!(result.exhausted);
+            named_close(900, "huge").unwrap();
+        }
+        let key = CursorKey {
+            connection_id: 900,
+            statement_id: 1,
+        };
+        let old = registry.try_register(key, Arc::from("old"), 1).unwrap();
+        let new = registry.try_register(key, Arc::from("new"), 1).unwrap();
+        drop(old);
+        assert_eq!(registry.active_count(), 1);
+        drop(new);
+        assert_eq!(registry.active_count(), 0);
     }
 
     #[test]
@@ -840,8 +875,18 @@ pub fn named_fetch(
     };
     let columns = entry.columns.clone();
     let mut state = entry.state.lock();
-    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(count as usize);
+    // A FETCH count is an upper bound, not an allocation estimate. In
+    // particular, a one-row cursor must accept even u64::MAX safely.
+    let mut rows: Vec<Vec<Value>> = Vec::new();
     while (rows.len() as u64) < count {
+        if rows.len() == rows.capacity() && !state.exhausted {
+            let additional = rows.capacity().max(16).min(1024);
+            crate::engine::executor::mem_budget::try_reserve_vec_exact(
+                &mut rows,
+                additional,
+                "named cursor FETCH",
+            )?;
+        }
         if let Some(row) = state.lookahead.take() {
             rows.push(row);
             continue;

@@ -105,3 +105,5 @@ pub use system::{normalize_sql, StubQueryEngine};
 pub fn initialize_server_status_clock() {
     status_counters::initialize_server_clock();
 }
+
+pub mod user_variables;

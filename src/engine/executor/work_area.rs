@@ -61,10 +61,10 @@ pub fn set_work_area_oversubscribe_pct(value: u32) -> Result<(), crate::types::Q
     Ok(())
 }
 
-/// Which tier the arbiter chose for a handle. Used by spec-aware
-/// operators (e.g. Sort) to decide algorithmic shape: Optimal → keep
-/// fully in-memory; OnePass → reserve grace buffer; Min → multi-pass
-/// spill from the first row.
+/// Initial pressure class recorded when a handle is registered. These
+/// counters describe admission conditions, not the operator's eventual
+/// algorithm or number of spill passes. Operators consume SpillHint and
+/// GrantResize as their allocation and spill control signals.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GrantTier {
     Optimal,
@@ -565,6 +565,7 @@ impl WorkAreaHandle {
             }
             return SpillHint::Spill;
         }
+        self.spill_requested.store(false, Ordering::Release);
         SpillHint::Continue
     }
 
@@ -711,6 +712,17 @@ mod tests {
         // Pre-fill 95 % → min.
         assert!(m.try_add_allocated(150 * 1024));
         assert_eq!(m.select_tier(), GrantTier::Min);
+    }
+
+    #[test]
+    fn audit1106_successful_charge_clears_initial_spill_request() {
+        let manager = fresh_manager(4 * 1024 * 1024);
+        assert!(manager.try_add_allocated(manager.target_bytes()));
+        let handle = WorkAreaHandle::register_with(manager.clone());
+        assert!(handle.must_spill());
+        manager.sub_allocated(manager.target_bytes());
+        assert_eq!(handle.try_charge(1024), SpillHint::Continue);
+        assert!(!handle.must_spill());
     }
 
     #[test]

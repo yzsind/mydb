@@ -2314,7 +2314,8 @@ pub struct SessionContext {
     pub ssl_version: Option<String>,
     pub x509_subject: Option<String>,
     pub x509_issuer: Option<String>,
-    pub user_variables: HashMap<String, Value>,
+    pub user_variables: super::user_variables::UserVariables,
+    pub(crate) expression_registry: Option<std::sync::Weak<super::SessionRegistry>>,
     pub(crate) xml_parameter_binding: usize,
     pub(crate) xml_parameter_types: Option<Arc<Vec<crate::engine::expr::xml::ParameterType>>>,
     /// Cached performance_schema variable rows only need rebuilding after a
@@ -3241,7 +3242,8 @@ impl SessionContext {
             ssl_version: None,
             x509_subject: None,
             x509_issuer: None,
-            user_variables: HashMap::new(),
+            user_variables: super::user_variables::UserVariables::default(),
+            expression_registry: None,
             xml_parameter_binding: 0,
             xml_parameter_types: None,
             pfs_variables_dirty: true,
@@ -3559,10 +3561,11 @@ impl SessionContext {
         );
     }
 
-    pub fn set_user_variable(&mut self, name: &str, value: Value) {
+    pub fn set_user_variable(&mut self, name: &str, value: Value) -> Result<(), QueryError> {
         self.user_variables
-            .insert(normalize_user_variable_name(name), value);
+            .insert(normalize_user_variable_name(name), value)?;
         self.mark_pfs_variables_dirty();
+        Ok(())
     }
 
     pub(crate) fn mark_pfs_variables_dirty(&mut self) {

@@ -758,7 +758,7 @@ pub(crate) struct ChargedCteRows {
 pub(crate) fn spilled_cte_read_all(
     spill: &crate::engine::api::CteSpillFile,
 ) -> Result<ChargedCteRows, QueryError> {
-    let mut out = Vec::with_capacity(spill.row_count.min(1 << 20));
+    let mut out = Vec::new();
     let mut charge = match crate::engine::executor::mem_budget::current_budget() {
         Some(budget) => Some(crate::engine::executor::mem_budget::OwnedMemCharge::new(
             budget, 0,
@@ -771,6 +771,17 @@ pub(crate) fn spilled_cte_read_all(
                 charge.add(crate::engine::executor::mem_budget::estimate_row_bytes(
                     &row,
                 ))?;
+            }
+            if out.len() == out.capacity() {
+                let additional = out.capacity().max(16);
+                if let Some(charge) = charge.as_mut() {
+                    charge.add(additional.saturating_mul(std::mem::size_of::<Vec<Value>>()))?;
+                }
+                crate::engine::executor::mem_budget::try_reserve_vec_exact(
+                    &mut out,
+                    additional,
+                    "CTE row collection",
+                )?;
             }
             out.push(row);
         }

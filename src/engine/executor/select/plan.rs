@@ -88,7 +88,7 @@ thread_local! {
     /// their charge behind and the budget monotonically climbs even
     /// though only one intermediate is live at a time (the false-1037
     /// bug on tiny TPC-DS data).
-    static MATERIALIZATION_CHARGE_STACK: std::cell::RefCell<Vec<crate::engine::executor::mem_budget::ScopedCharge>> =
+    static MATERIALIZATION_CHARGE_STACK: std::cell::RefCell<Vec<MaterializationChargeFrame>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Prevents the post-probe reader from opening another worker fan-out
     /// inside an already partitioned INLJ outer worker.
@@ -146,14 +146,46 @@ pub(in crate::engine::executor) fn current_rollup_window_topk_hint() -> Option<R
 /// `Vec<PlanRow>` (or runs worker threads that do); all
 /// [`charge_transient_materialization`] charges issued while it is live
 /// are released when it drops.
+/// Reserve bounded chunks so per-row accounting stays local on the hot path.
+/// Unused admission is at most one chunk per active frame and is released
+/// with its owner. A tight hard limit can still admit the exact next row.
+struct MaterializationChargeFrame {
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+    used: usize,
+}
+impl MaterializationChargeFrame {
+    fn new() -> Self {
+        Self {
+            charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+            used: 0,
+        }
+    }
+    fn add(&mut self, bytes: usize) -> Result<(), QueryError> {
+        let used = self.used.checked_add(bytes).ok_or_else(|| {
+            crate::engine::executor::mem_budget::allocation_error("materialization byte overflow")
+        })?;
+        let needed = used.saturating_sub(self.charge.charged());
+        if needed > 0 {
+            let extra = needed.max(64 * 1024);
+            if extra == needed || self.charge.add_force_recoverable(extra).is_err() {
+                self.charge.add_force(needed)?;
+            }
+        }
+        self.used = used;
+        Ok(())
+    }
+    fn absorb(&mut self, charge: &mut crate::engine::executor::mem_budget::ScopedCharge) {
+        self.used = self.used.saturating_add(charge.charged());
+        self.charge.absorb(charge);
+    }
+}
+
 struct MaterializationChargeScope;
 
 impl MaterializationChargeScope {
     fn enter() -> Self {
-        MATERIALIZATION_CHARGE_STACK.with(|s| {
-            s.borrow_mut()
-                .push(crate::engine::executor::mem_budget::ScopedCharge::new(0))
-        });
+        MATERIALIZATION_CHARGE_STACK
+            .with(|s| s.borrow_mut().push(MaterializationChargeFrame::new()));
         MaterializationChargeScope
     }
 }
@@ -1919,6 +1951,10 @@ fn push_generate_series_row(
         None => true,
     };
     if keep {
+        charge_transient_materialization(estimate_row_bytes(&plan_row) as usize)?;
+        out.try_reserve(1).map_err(|_| {
+            crate::engine::executor::mem_budget::allocation_error("series plan rows")
+        })?;
         out.push(plan_row);
     }
     Ok(())
@@ -2945,6 +2981,10 @@ pub(super) fn execute_plan_rows_inner(
             let mut input = open_cte_scan_stream(plan)?;
             let mut rows = Vec::new();
             while let Some(row) = input.next()? {
+                charge_transient_materialization(estimate_row_bytes(&row) as usize)?;
+                rows.try_reserve(1).map_err(|_| {
+                    crate::engine::executor::mem_budget::allocation_error("CTE plan rows")
+                })?;
                 rows.push(row);
             }
             Ok(rows)
@@ -5821,3 +5861,30 @@ fn record_adaptive_choice(chosen: AdaptiveJoinChoice, preferred: AdaptiveJoinCho
 
 #[cfg(test)]
 mod compiled_fast_path_tests;
+
+#[cfg(test)]
+mod audit1106_materialization_tests {
+    use super::*;
+    #[test]
+    fn audit1106_nested_materialization_admission_is_bounded_and_released() {
+        use crate::engine::executor::mem_budget::{self, MemBudget};
+        let budget = Arc::new(MemBudget::new(1024));
+        mem_budget::with_query_budget(budget.clone(), || {
+            {
+                let _outer = MaterializationChargeScope::enter();
+                for _ in 0..1000 {
+                    charge_transient_materialization(100).unwrap();
+                }
+                let outer = budget.used();
+                assert!((100_000..=100_000 + 64 * 1024).contains(&outer));
+                {
+                    let _inner = MaterializationChargeScope::enter();
+                    charge_transient_materialization(100).unwrap();
+                    assert!(budget.used() > outer);
+                }
+                assert_eq!(budget.used(), outer);
+            }
+            assert_eq!(budget.used(), 0);
+        });
+    }
+}

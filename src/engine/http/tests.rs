@@ -66,7 +66,16 @@ fn http_explicit_egress_checks_origin_port_and_mapped_ipv6() {
         assert!(p.check_ip(s.parse().unwrap()).is_err(), "{s}");
     }
     let p = config::Policy::default();
-    assert!(p.check_ip("169.254.169.254".parse().unwrap()).is_ok());
+    for ip in [
+        "169.254.169.254",
+        "127.0.0.1",
+        "10.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+    ] {
+        assert!(p.check_ip(ip.parse().unwrap()).is_err(), "{ip}");
+    }
+    assert!(p.check_ip("8.8.8.8".parse().unwrap()).is_ok());
 }
 #[test]
 fn http_limits_are_strict_and_call_limits_only_tighten() {

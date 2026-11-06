@@ -22,7 +22,7 @@ fn property(kind: &ast::ClassAsciiKind) -> Option<&'static str> {
         Space => r"\p{White_Space}",
         Upper => r"\p{Uppercase}",
         Word => r"\w",
-        Xdigit => r"0-9A-Fa-f\p{Nd}",
+        Xdigit => r"0-9A-Fa-fＡ-Ｆａ-ｆ\p{Nd}",
     })
 }
 fn class_set(set: &mut ClassSet) {

@@ -28,7 +28,9 @@ pub(super) use views::{
     rewrite_insert_through_view, rewrite_update_through_view,
 };
 mod setop;
-pub(in crate::engine::executor) use setop::{coerce_setop_value, set_row_key};
+pub(in crate::engine::executor) use setop::{
+    coerce_setop_value, coerce_setop_value_from, set_row_key,
+};
 pub(crate) use setop::{
     combine_set_rows_spillable_charged, combine_set_sources_spillable,
     unify_setop_declared_column_metadata, IncrementalSetOutput,
@@ -7820,7 +7822,7 @@ pub(super) fn execute_qualified_statement(
                         crate::engine::expr::eval_const(&assignments[0].value)
                     })
                 })?;
-                session.set_user_variable(assignments[0].name.trim_start_matches('@'), value);
+                session.set_user_variable(assignments[0].name.trim_start_matches('@'), value)?;
                 return Ok(QueryResponse::Ok);
             }
             if assignments
@@ -10399,7 +10401,7 @@ fn execute_select_into_vars(
         ));
     }
     for (name, value) in targets.iter().zip(row.into_iter()) {
-        session.set_user_variable(name, value);
+        session.set_user_variable(name, value)?;
     }
     Ok(QueryResponse::Ok)
 }

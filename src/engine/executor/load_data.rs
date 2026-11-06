@@ -1010,7 +1010,7 @@ fn bind_target(
                 None => Value::Null,
                 Some(bytes) => str_to_string_value(&decode_field_text(&bytes, charset)?),
             };
-            session.set_user_variable(name, value);
+            session.set_user_variable(name, value)?;
         }
     }
     Ok(())

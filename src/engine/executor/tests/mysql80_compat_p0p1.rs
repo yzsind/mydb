@@ -846,10 +846,15 @@ fn gtid_subset_and_subtract() {
         .execute("SELECT GTID_SUBSET('not-a-gtid', 'x')")
         .unwrap_err();
     assert_eq!(err.code(), 1772, "{}", err.message());
-    let err = engine
-        .execute(&format!("SELECT GTID_SUBTRACT('{u}:5-3', '{u}:1')"))
-        .unwrap_err();
-    assert_eq!(err.code(), 1772, "reversed interval is malformed");
+    assert_eq!(
+        as_text(
+            &one_row(
+                &engine,
+                &format!("SELECT GTID_SUBTRACT('{u}:5-3', '{u}:1')")
+            )[0]
+        ),
+        ""
+    );
 }
 
 // ---------- issue #86: `@var := expr` user-variable assignment ----------

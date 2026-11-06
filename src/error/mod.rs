@@ -240,6 +240,7 @@ pub(crate) enum InternalErrorKind {
     VectorHashJoinFallback,
     ReplicaPoisonFrame,
     ReplicaApplyFailure,
+    ReplicaSnapshotBlocked,
     ReplicaHandshakeRejected,
 }
 

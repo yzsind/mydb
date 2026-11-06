@@ -913,22 +913,38 @@ pub(crate) fn register(reg: &mut Registry) {
             Ok(())
         },
     ));
-    reg.register(SysVar::session_backed(
-        SysVarDef::new(
-            "lc_time_names",
-            Scope::Both,
-            DataType::String { max_len: Some(64) },
+    reg.register(
+        SysVar::session_backed(
+            SysVarDef::new(
+                "lc_time_names",
+                Scope::Both,
+                DataType::String { max_len: Some(64) },
+            )
+            .with_doc("Locale for day/month names."),
+            |ctx| match ctx.session {
+                Some(s) => SysVarValue::String(s.sysvars.lc_time_names.clone()),
+                None => SysVarValue::String("en_US".to_string()),
+            },
+            |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
+                let raw = v.to_display_string();
+                ctx.session.sysvars.lc_time_names =
+                    crate::engine::time_locale::canonical_time_locale(&raw)
+                        .ok_or_else(|| {
+                            crate::error::catalog::ER_UNKNOWN_LOCALE
+                                .error(format!("Unknown locale: '{raw}'"))
+                        })?
+                        .to_owned();
+                Ok(())
+            },
         )
-        .with_doc("Locale for day/month names."),
-        |ctx| match ctx.session {
-            Some(s) => SysVarValue::String(s.sysvars.lc_time_names.clone()),
-            None => SysVarValue::String("en_US".to_string()),
-        },
-        |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            ctx.session.sysvars.lc_time_names = v.to_display_string();
+        .with_validation(|_, value| {
+            let raw = value.to_display_string();
+            crate::engine::time_locale::canonical_time_locale(&raw).ok_or_else(|| {
+                crate::error::catalog::ER_UNKNOWN_LOCALE.error(format!("Unknown locale: '{raw}'"))
+            })?;
             Ok(())
-        },
-    ));
+        }),
+    );
     reg.register(SysVar::const_read_only(
         SysVarDef::new(
             "lc_messages_dir",

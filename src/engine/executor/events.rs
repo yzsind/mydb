@@ -190,10 +190,15 @@ impl EventWorkerPool {
         for index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
             let worker_inner = Arc::clone(&inner);
+            let env = crate::util::env::override_snapshot();
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("mydb-event-worker-{index}"))
-                    .spawn(move || event_worker_loop(worker_inner, receiver))
+                    .spawn(move || {
+                        crate::util::env::with_override_snapshot(env, || {
+                            event_worker_loop(worker_inner, receiver)
+                        })
+                    })
                     .expect("failed to spawn event scheduler worker"),
             );
         }
@@ -400,9 +405,10 @@ impl EventSchedulerHandle {
         register_scheduler(&inner);
 
         let worker = Arc::clone(&inner);
+        let env = crate::util::env::override_snapshot();
         let worker = std::thread::Builder::new()
             .name("mydb-event-scheduler".to_string())
-            .spawn(move || run_scheduler(worker))
+            .spawn(move || crate::util::env::with_override_snapshot(env, || run_scheduler(worker)))
             .expect("failed to spawn event scheduler thread");
         EventSchedulerHandle {
             inner,

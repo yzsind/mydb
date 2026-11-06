@@ -37,6 +37,9 @@ pub(crate) struct Regex {
     fast: regex::Regex,
     lines: Option<LineProgram>,
     unix: bool,
+    can_fold: bool,
+    fold_ascii: bool,
+    line_assertions: bool,
 }
 
 impl Regex {
@@ -49,7 +52,9 @@ impl Regex {
         unix: bool,
         anchors: bool,
     ) -> Result<Self, String> {
-        let lines = anchors.then(|| LineProgram {
+        let can_fold = insensitive || (nfa_pattern.contains("(?") && nfa_pattern.contains('i'));
+        let fold_ascii = can_fold && fold::pattern_expanding(nfa_pattern);
+        let lines = (anchors || can_fold).then(|| LineProgram {
             pattern: nfa_pattern.to_owned(),
             insensitive,
             multiline,
@@ -57,7 +62,14 @@ impl Regex {
             compiled: OnceLock::new(),
             initialize: parking_lot::Mutex::new(()),
         });
-        Ok(Self { fast, lines, unix })
+        Ok(Self {
+            fast,
+            lines,
+            unix,
+            can_fold,
+            fold_ascii,
+            line_assertions: anchors,
+        })
     }
     pub(crate) fn extra_bytes(&self) -> usize {
         self.lines
@@ -74,7 +86,14 @@ impl Regex {
         self.fast.captures_len()
     }
     pub(crate) fn line_free(&self, bytes: &[u8]) -> bool {
-        self.lines.is_none()
+        if self.can_fold
+            && (self.fold_ascii
+                || (fold::may_expand(bytes)
+                    && std::str::from_utf8(bytes).is_ok_and(fold::expanding)))
+        {
+            return false;
+        }
+        !self.line_assertions
             || !possible_line(bytes)
             || (memchr::memchr3(b'\n', b'\r', 0x0b, bytes).is_none()
                 && (memchr::memchr3(0x0c, 0xc2, 0xe2, bytes).is_none()
@@ -86,6 +105,16 @@ impl Regex {
     }
     fn needs_lines(&self, s: &str) -> bool {
         !self.line_free(s.as_bytes())
+    }
+    #[inline]
+    pub(crate) fn accepts_fast_positive(&self, bytes: &[u8]) -> bool {
+        !self.line_assertions || !possible_line(bytes)
+    }
+    pub(crate) fn is_match_after_fast_reject(&self, text: &str) -> bool {
+        self.needs_lines(text) && self.slow_captures(text, 0).is_some()
+    }
+    pub(crate) fn is_match_with_admitted_scope(&self, text: &str) -> bool {
+        self.slow_captures(text, 0).is_some()
     }
     pub(crate) fn is_match_line_free(&self, s: &str) -> bool {
         self.fast.is_match(s)
@@ -178,13 +207,13 @@ impl Regex {
         }
     }
     fn slow_captures(&self, s: &str, start: usize) -> Option<SmallVec<[Option<usize>; 8]>> {
-        let nfa = &self
+        let program = self
             .lines
             .as_ref()?
             .compiled
             .get()
-            .expect("SQL search scope initializes the line program")
-            .nfa;
+            .expect("SQL search scope initializes the line program");
+        let nfa = &program.nfa;
         let states = nfa.states();
         let slots = self.captures_len() * 2;
         // A bounded number of states is visited at each byte, independent of
@@ -199,12 +228,17 @@ impl Regex {
             if best.is_none() && s.is_char_boundary(at) {
                 roots.push(Thread {
                     id: nfa.start_anchored(),
+                    resume_at: at,
                     slots: smallvec::smallvec![None;slots],
                 });
             }
             seen.fill(false);
             ready.clear();
             for root in roots.drain(..) {
+                if root.resume_at > at {
+                    ready.push(root);
+                    continue;
+                }
                 stack.push(root);
                 while let Some(mut thread) = stack.pop() {
                     if seen[thread.id.as_usize()] {
@@ -218,15 +252,42 @@ impl Regex {
                                 stack.push(thread);
                             }
                         }
-                        State::Capture { slot, next, .. } => {
-                            thread.slots[slot.as_usize()] = Some(at);
-                            thread.id = *next;
-                            stack.push(thread);
+                        State::Capture {
+                            slot,
+                            group_index,
+                            next,
+                            ..
+                        } => {
+                            let group = group_index.as_usize();
+                            if let Some(literal) = program.fold_groups.get(group).copied().flatten()
+                            {
+                                if slot.as_usize() % 2 == 0 {
+                                    if let Some(end) =
+                                        fold::match_at(s, at, &program.fold_literals[literal])
+                                    {
+                                        thread.id = program.fold_next[thread.id.as_usize()];
+                                        thread.resume_at = end;
+                                        ready.push(thread);
+                                    }
+                                } else {
+                                    thread.id = *next;
+                                    stack.push(thread);
+                                }
+                            } else {
+                                if let Some(original) =
+                                    program.capture_map.get(group).copied().flatten()
+                                {
+                                    thread.slots[original * 2 + slot.as_usize() % 2] = Some(at);
+                                }
+                                thread.id = *next;
+                                stack.push(thread);
+                            }
                         }
                         State::Union { alternates } => {
                             for &id in alternates.iter().rev() {
                                 stack.push(Thread {
                                     id,
+                                    resume_at: at,
                                     slots: thread.slots.clone(),
                                 });
                             }
@@ -234,6 +295,7 @@ impl Regex {
                         State::BinaryUnion { alt1, alt2 } => {
                             stack.push(Thread {
                                 id: *alt2,
+                                resume_at: at,
                                 slots: thread.slots.clone(),
                             });
                             thread.id = *alt1;
@@ -245,6 +307,10 @@ impl Regex {
                 }
             }
             for mut thread in ready.drain(..) {
+                if thread.resume_at > at {
+                    roots.push(thread);
+                    continue;
+                }
                 let next = match &states[thread.id.as_usize()] {
                     State::Match { .. } => {
                         best = Some(thread.slots);
@@ -259,6 +325,7 @@ impl Regex {
                 };
                 if let Some(id) = next {
                     thread.id = id;
+                    thread.resume_at = at + 1;
                     roots.push(thread);
                 }
             }
@@ -283,6 +350,10 @@ struct LineProgram {
 #[derive(Debug)]
 struct CompiledLines {
     nfa: NFA,
+    capture_map: Vec<Option<usize>>,
+    fold_groups: Vec<Option<usize>>,
+    fold_literals: Vec<String>,
+    fold_next: Vec<StateID>,
     _memory: ControlledMemoryCharge,
 }
 impl LineProgram {
@@ -305,11 +376,81 @@ impl LineProgram {
                     .multi_line(self.multiline)
                     .dot_matches_new_line(self.dotall),
             );
-            let nfa = compiler.build(&self.pattern).map_err(|_| {
+            let fold =
+                fold::prepare(&self.pattern, self.insensitive).expect("validated regex syntax");
+            let nfa = compiler.build(&fold.pattern).map_err(|_| {
                 crate::error::catalog::ER_REGEXP_INTERNAL_ERROR
                     .error("regular expression exceeded the implementation resource limit")
             })?;
-            let actual = nfa.memory_usage();
+            // Repetition expansion can duplicate a capture marker. Resolve its
+            // matching end from each start state, never by group number alone.
+            let mut fold_next = vec![StateID::ZERO; nfa.states().len()];
+            for (id, state) in nfa.states().iter().enumerate() {
+                let State::Capture {
+                    group_index,
+                    slot,
+                    next,
+                    ..
+                } = state
+                else {
+                    continue;
+                };
+                if slot.as_usize() % 2 != 0
+                    || fold
+                        .groups
+                        .get(group_index.as_usize())
+                        .copied()
+                        .flatten()
+                        .is_none()
+                {
+                    continue;
+                }
+                let mut pending = vec![*next];
+                let mut visited = vec![false; nfa.states().len()];
+                while let Some(at) = pending.pop() {
+                    if std::mem::replace(&mut visited[at.as_usize()], true) {
+                        continue;
+                    }
+                    match &nfa.states()[at.as_usize()] {
+                        State::Capture {
+                            group_index: end_group,
+                            slot: end_slot,
+                            next,
+                            ..
+                        } if end_group == group_index
+                            && end_slot.as_usize() == slot.as_usize() + 1 =>
+                        {
+                            fold_next[id] = *next;
+                            break;
+                        }
+                        State::Capture { next, .. } | State::Look { next, .. } => {
+                            pending.push(*next)
+                        }
+                        State::ByteRange { trans } => pending.push(trans.next),
+                        State::Sparse(trans) => {
+                            pending.extend(trans.transitions.iter().map(|trans| trans.next))
+                        }
+                        State::Dense(trans) => pending.extend(trans.transitions.iter().copied()),
+                        State::Union { alternates } => pending.extend(alternates.iter().copied()),
+                        State::BinaryUnion { alt1, alt2 } => {
+                            pending.push(*alt1);
+                            pending.push(*alt2);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let actual = nfa
+                .memory_usage()
+                .saturating_add(fold.captures.capacity() * std::mem::size_of::<Option<usize>>())
+                .saturating_add(fold.groups.capacity() * std::mem::size_of::<Option<usize>>())
+                .saturating_add(
+                    fold.literals
+                        .iter()
+                        .map(|text| text.capacity() + std::mem::size_of::<String>())
+                        .sum::<usize>(),
+                )
+                .saturating_add(fold_next.capacity() * std::mem::size_of::<StateID>());
             if actual > memory.bytes() {
                 memory.try_grow(actual - memory.bytes())?;
             } else {
@@ -317,6 +458,10 @@ impl LineProgram {
             }
             let _ = self.compiled.set(CompiledLines {
                 nfa,
+                capture_map: fold.captures,
+                fold_groups: fold.groups,
+                fold_literals: fold.literals,
+                fold_next,
                 _memory: memory,
             });
         }
@@ -330,6 +475,7 @@ impl LineProgram {
 #[derive(Clone)]
 struct Thread {
     id: StateID,
+    resume_at: usize,
     slots: SmallVec<[Option<usize>; 8]>,
 }
 fn line_len(s: &str, at: usize, unix: bool) -> Option<usize> {
@@ -495,6 +641,7 @@ impl<'a> Iterator for Matches<'_, 'a> {
     }
 }
 
+mod fold;
 mod translate;
 pub(crate) use translate::translate;
 

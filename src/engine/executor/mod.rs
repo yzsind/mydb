@@ -2970,6 +2970,16 @@ pub(crate) fn prepared_sparse_batch_hits() -> u64 {
 }
 
 impl StorageQueryEngine {
+    fn attach_expression_registry(&self, session: &mut SessionContext) {
+        if session
+            .expression_registry
+            .as_ref()
+            .is_none_or(|registry| registry.as_ptr() != Arc::as_ptr(&self.registry))
+        {
+            session.expression_registry = Some(Arc::downgrade(&self.registry));
+        }
+    }
+
     fn execute_with_operation(
         &self,
         session: &mut SessionContext,
@@ -2979,6 +2989,7 @@ impl StorageQueryEngine {
             &mut SessionContext,
         ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata),
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
@@ -4344,6 +4355,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Arc<Statement>,
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
@@ -4493,6 +4505,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Statement,
     ) -> Option<Result<QueryResponse, QueryError>> {
+        self.attach_expression_registry(session);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
@@ -4614,6 +4627,7 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
+        self.attach_expression_registry(session);
         if !matches!(parsed.as_ref(), Statement::Select(_)) {
             return None;
         }
@@ -4852,6 +4866,7 @@ impl QueryEngine for StorageQueryEngine {
         params: Vec<Value>,
         shape_sql: Arc<str>,
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
@@ -4925,6 +4940,7 @@ impl StorageQueryEngine {
         statement: Statement,
         digest_sql: Option<String>,
     ) -> Result<QueryResponse, QueryError> {
+        self.attach_expression_registry(session);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         if let Err(err) = session.check_cancelled() {
             return Err(err);

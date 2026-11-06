@@ -2699,7 +2699,7 @@ impl OutBinding {
     ) -> Result<(), QueryError> {
         match self {
             OutBinding::UserVariable(name) => {
-                session.set_user_variable(name, value);
+                session.set_user_variable(name, value)?;
                 Ok(())
             }
             OutBinding::Local(name) => {
@@ -4819,7 +4819,7 @@ fn assign_target(
             }
             locals.insert(key, value);
         }
-        RoutineTarget::UserVariable(name) => session.set_user_variable(name, value),
+        RoutineTarget::UserVariable(name) => session.set_user_variable(name, value)?,
     }
     Ok(())
 }

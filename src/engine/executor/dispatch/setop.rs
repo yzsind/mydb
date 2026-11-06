@@ -370,6 +370,31 @@ pub(crate) fn unify_setop_declared_column_metadata(
 
 /// Normalize a row payload to the already-resolved UNION domain. Shared by
 /// native batches and spill-aware CTE concatenation.
+pub(in crate::engine::executor) fn coerce_setop_value_from(
+    mut value: Value,
+    source: Option<&crate::types::ColumnSource>,
+    column_type: ColumnType,
+    target: &crate::types::ColumnSource,
+) -> Result<Value, QueryError> {
+    if matches!(column_type, ColumnType::VarString | ColumnType::Blob) {
+        if target.collation_id == Some(crate::charset::BINARY_COLLATION_ID) {
+            if let Some(info) = source
+                .and_then(|source| source.collation_id)
+                .and_then(crate::charset::resolve_collation_id)
+            {
+                value = crate::engine::expr::value_in_charset_octets(value, info.charset)?;
+            }
+        } else if let Value::Bytes(bytes) = &value {
+            let charset = target
+                .collation_id
+                .and_then(crate::charset::resolve_collation_id)
+                .map_or("utf8mb4", |info| info.charset);
+            value = Value::String(crate::charset::decode_bytes(charset, bytes)?);
+        }
+    }
+    coerce_setop_value(value, column_type, target)
+}
+
 pub(in crate::engine::executor) fn coerce_setop_value(
     value: Value,
     column_type: ColumnType,
@@ -459,6 +484,16 @@ fn unify_setop_numeric_columns(
     // Aggregate every branch's declared domain before looking at rows. Empty
     // branches, branch execution order, and cache hits therefore cannot alter
     // the output descriptor. This is the same algebra used by CASE/IF.
+    let left_sources: Vec<_> = left
+        .columns
+        .iter()
+        .map(|column| column.source.clone())
+        .collect();
+    let right_sources: Vec<_> = right
+        .columns
+        .iter()
+        .map(|column| column.source.clone())
+        .collect();
     unify_setop_declared_column_metadata(&mut left.columns, &mut right.columns)?;
     let is_integer = |column_type: ColumnType| {
         matches!(
@@ -487,15 +522,19 @@ fn unify_setop_numeric_columns(
             continue;
         }
         if matches!(left_type, ColumnType::VarString | ColumnType::Blob) {
-            let binary = left.columns[i].source.collation_id == Some(63);
-            for row in left.rows.iter_mut().chain(right.rows.iter_mut()) {
-                if let Some(value) = row.get_mut(i) {
-                    if !matches!(value, Value::Null) {
-                        *value = if binary {
-                            Value::Bytes(crate::engine::expr::value_bytes(value))
-                        } else {
-                            Value::String(crate::engine::expr::string_value(value))
-                        };
+            for (rows, source) in [
+                (&mut left.rows, &left_sources[i]),
+                (&mut right.rows, &right_sources[i]),
+            ] {
+                for row in rows.iter_mut() {
+                    if let Some(value) = row.get_mut(i) {
+                        let original = std::mem::replace(value, Value::Null);
+                        *value = coerce_setop_value_from(
+                            original,
+                            Some(source),
+                            left_type,
+                            &left.columns[i].source,
+                        )?;
                     }
                 }
             }
@@ -1102,6 +1141,18 @@ pub(in crate::engine::executor) fn set_row_key(
 ) -> SetRowKey {
     let mut key = SetRowKey::new();
     for (index, value) in row.iter().enumerate() {
+        if collations.get(index) == Some(&Some(crate::charset::BINARY_COLLATION_ID))
+            && matches!(
+                value,
+                Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+            )
+        {
+            let bytes = crate::engine::expr::value_bytes_ref(value);
+            key.push(4);
+            key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            key.extend_from_slice(&bytes);
+            continue;
+        }
         let text = match value {
             Value::String(text) => Some(text.as_str()),
             Value::SmallString(bytes) => std::str::from_utf8(bytes.as_slice()).ok(),

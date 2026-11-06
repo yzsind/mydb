@@ -7345,14 +7345,24 @@ impl HashAggregateCore {
             .clone()
             .expect("spill called on HashAgg without a spill schema");
         let part = std::mem::take(&mut self.partitions[pidx]);
-        let batch = partition_to_spill_batch(&part, &spill_schema, &self.group_columns, &self.aggs);
-
-        if let Some(shared) = &self.shared_spill {
-            let (bytes, first_file_write) = shared.append(pidx, &batch)?;
-            self.spill_bytes_total = self.spill_bytes_total.saturating_add(bytes);
-            self.shared_spilled_partitions[pidx] = true;
-            if first_file_write {
-                self.next_segment_id = self.next_segment_id.saturating_add(1);
+        if let Some(shared) = self.shared_spill.clone() {
+            let mut start = 0;
+            while start < part.buckets.len() {
+                let (end, _charge) =
+                    spill_partition_chunk(&part.buckets, start, spill_schema.len())?;
+                let batch = partition_to_spill_batch(
+                    &part.buckets[start..end],
+                    &spill_schema,
+                    &self.group_columns,
+                    &self.aggs,
+                );
+                let (bytes, first_file_write) = shared.append(pidx, &batch)?;
+                self.spill_bytes_total = self.spill_bytes_total.saturating_add(bytes);
+                self.shared_spilled_partitions[pidx] = true;
+                if first_file_write {
+                    self.next_segment_id = self.next_segment_id.saturating_add(1);
+                }
+                start = end;
             }
             return Ok(());
         }
@@ -7379,7 +7389,18 @@ impl HashAggregateCore {
                 capacity,
             )?
         };
-        spill::write_batch(&mut w, &batch)?;
+        let mut start = 0;
+        while start < part.buckets.len() {
+            let (end, _charge) = spill_partition_chunk(&part.buckets, start, spill_schema.len())?;
+            let batch = partition_to_spill_batch(
+                &part.buckets[start..end],
+                &spill_schema,
+                &self.group_columns,
+                &self.aggs,
+            );
+            spill::write_batch(&mut w, &batch)?;
+            start = end;
+        }
         let bytes = w.finish()?;
         self.spill_bytes_total = self.spill_bytes_total.saturating_add(bytes);
         if first_write {
@@ -9360,18 +9381,54 @@ fn decode_distinct_bytes_into(dst: &mut AggState, bytes: &[u8]) -> Result<(), Qu
     Ok(())
 }
 
+/// Bound the temporary copy independently of the resident partition grant.
+fn spill_partition_chunk(
+    buckets: &[GroupBucket],
+    start: usize,
+    columns: usize,
+) -> Result<
+    (
+        usize,
+        crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    ),
+    QueryError,
+> {
+    use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+    crate::engine::cancel::check_cancelled()?;
+    let mut end = (start + DEFAULT_BATCH_ROWS.min(1024)).min(buckets.len());
+    loop {
+        let bytes = buckets[start..end]
+            .iter()
+            .fold(0usize, |sum, bucket| {
+                sum.saturating_add(bucket.dynamic_bytes())
+            })
+            .saturating_add(
+                (end - start)
+                    .saturating_mul(columns)
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_mul(2);
+        match ControlledMemoryCharge::try_new_recoverable(ControlledMemoryCategory::Executor, bytes)
+        {
+            Ok(charge) => return Ok((end, charge)),
+            Err(_) if end - start > 1 => end = start + (end - start) / 2,
+            Err(err) => return Err(crate::engine::executor::mem_budget::terminal_oom(err)),
+        }
+    }
+}
+
 fn partition_to_spill_batch(
-    part: &Partition,
+    buckets: &[GroupBucket],
     schema: &Arc<BatchSchema>,
     group_cols: &[usize],
     aggs: &[AggregateSpec],
 ) -> Batch {
     let layout = SpillLayout::new(group_cols.len(), aggs);
     debug_assert_eq!(layout.width, schema.len());
-    let n = part.buckets.len();
+    let n = buckets.len();
     let total_cols = schema.fields().len();
     let mut col_values: Vec<Vec<Value>> = (0..total_cols).map(|_| Vec::with_capacity(n)).collect();
-    for bucket in &part.buckets {
+    for bucket in buckets {
         for (i, _) in group_cols.iter().enumerate() {
             col_values[i].push(bucket.key_values[i].clone());
         }

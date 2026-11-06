@@ -867,8 +867,7 @@ pub(in crate::engine::executor::select) fn execute_topwindow(
         .len()
         .saturating_mul(order_by.len().max(1))
         .saturating_mul(std::mem::size_of::<Value>());
-    crate::engine::executor::mem_budget::try_charge(key_charge_bytes)?;
-    let _key_charge = crate::engine::executor::mem_budget::ScopedCharge::new(key_charge_bytes);
+    let _key_charge = crate::engine::executor::mem_budget::force_charge_scoped(key_charge_bytes)?;
 
     let mut entries = Vec::with_capacity(rows.len());
     for (ordinal, row) in rows.into_iter().enumerate() {

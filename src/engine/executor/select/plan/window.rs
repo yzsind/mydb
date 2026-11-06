@@ -519,7 +519,7 @@ pub(in crate::engine::executor::select) fn execute_window_agg(
                             .borrow_mut()
                             .last_mut()
                             .expect("window scope")
-                            .add_force(values_bytes - inline_bytes)
+                            .add(values_bytes - inline_bytes)
                     })?;
                 }
                 window_values[w_idx] = values;

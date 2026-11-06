@@ -378,13 +378,34 @@ where
                     precision,
                     mut scale,
                 } => {
-                    if let Some(Expr::Literal(Literal::Int(d))) = args.get(1) {
-                        scale = if *d <= 0 {
+                    let old_scale = scale;
+                    let decimals = args
+                        .get(1)
+                        .and_then(|arg| match arg {
+                            Expr::Literal(Literal::Int(d)) => Some(*d),
+                            Expr::Unary {
+                                op: crate::parser::UnaryOp::Neg,
+                                expr,
+                            } => match expr.as_ref() {
+                                Expr::Literal(Literal::Int(d)) => d.checked_neg(),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .or_else(|| (args.len() == 1).then_some(0));
+                    if let Some(d) = decimals {
+                        scale = if d <= 0 {
                             0
                         } else {
-                            scale.min((*d).min(i64::from(u8::MAX)) as u8)
+                            scale.min(d.min(i64::from(u8::MAX)) as u8)
                         };
                     }
+                    let carry = u8::from(upper.as_str() == "ROUND" && scale < old_scale);
+                    let precision = precision
+                        .saturating_sub(old_scale)
+                        .saturating_add(scale)
+                        .saturating_add(carry)
+                        .max(1);
                     ColumnType::Decimal { precision, scale }
                 }
                 integer if is_integer_column_type(integer) => ColumnType::LongLong,

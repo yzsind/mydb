@@ -164,6 +164,13 @@ parsed statement cache remains enabled. The parameter is read at process startup
 which suits differential verification or serves as a temporary escape hatch for
 plan cache failures; it does not affect SQL semantics.
 
+Parsed-statement and shared SELECT plan caches also have independent byte
+admission ceilings: each is sized at 1% of the startup working-set target,
+clamped to 1–64 MiB. Byte pressure evicts cached entries; an entry larger than
+its cache ceiling executes normally without being retained. Byte estimates
+include AST payloads and compiled-plan structures, so entry-count caps cannot
+retain an unbounded number of large SQL statements.
+
 Automatic checkpoints are triggered by `MYDB_CHECKPOINT_INTERVAL_MS` or
 `MYDB_CHECKPOINT_WAL_BYTES`. Setting the interval to zero disables only the
 periodic time trigger; WAL-size and explicit checkpoints remain enabled.
@@ -1568,3 +1575,11 @@ format, TLS requirements, local policy, model DDL, SQL semantics, and recovery.
 HTTP client SQL functions are enabled by default and require `HTTP_USE`. See
 [HTTP SQL Functions](http.md#node-configuration) for the `http_*` startup options,
 node egress policy, private CA bindings, account quotas, and runtime controls.
+
+### Date name locales
+
+`lc_time_names` supports `en_US`, `de_DE`, `fr_FR`, `es_ES`, `it_IT`,
+`pt_BR`, `zh_CN`, `ja_JP`, and `ko_KR`. Unsupported names return error 1649;
+assignments never silently fall back to English. It controls date name output.
+`STR_TO_DATE` recognizes English month and weekday names independently of this
+output setting, matching MySQL 8.0.

@@ -81,7 +81,7 @@ pub(super) fn evaluate(
             && data
                 .iter()
                 .enumerate()
-                .any(|(row, v)| !column.is_null(row) && v.unsigned_abs() > 3_020_399_999_999)
+                .any(|(row, v)| !column.is_null(row) && v.unsigned_abs() > 3_020_399_000_000)
         {
             return None;
         }

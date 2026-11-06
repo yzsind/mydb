@@ -1075,12 +1075,7 @@ where
         .into_iter()
         .map(|row| (row.name.to_string(), row.value))
         .collect();
-        let user_variables = self
-            .context
-            .user_variables
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
+        let user_variables = self.context.user_variables.clone();
         handle.publish_pfs_variables(
             session_variables,
             user_variables,
@@ -3734,6 +3729,14 @@ where
                 )))
                 .await;
         }
+        if self.context.auth_sandbox && !is_password_change_statement(sql.as_str(), &self.context) {
+            return self
+                .write_query_response(Err(error(
+                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
+                    "You must reset your password using ALTER USER before executing this statement",
+                )))
+                .await;
+        }
         // PROCESSLIST is an operational escape hatch. Running this tiny,
         // read-only registry snapshot through the blocking executor pool can
         // make it unobservable precisely when every worker is occupied by a
@@ -3753,14 +3756,6 @@ where
         }
         self.engine
             .log_general_event(&self.context, "Query", sql.as_str());
-        if self.context.auth_sandbox && !is_password_change_statement(sql.as_str()) {
-            return self
-                .write_query_response(Err(error(
-                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
-                    "You must reset your password using ALTER USER before executing this statement",
-                )))
-                .await;
-        }
         match ddl_cache_scope(sql.as_str(), lex_mode) {
             DdlCacheScope::None => {}
             // Prepared handles have a lifetime independent from DDL and
@@ -4066,16 +4061,8 @@ where
             .split_ascii_whitespace()
             .next()
             .is_some_and(|keyword| keyword.eq_ignore_ascii_case("USE"));
-        let pw_check_prefix: Option<String> = if needs_password_check {
-            // is_password_change_statement only inspects the first few
-            // tokens. Capture a prefix that's safely longer than the
-            // longest matched form (`set password` / `alter user …
-            // identified …`) so the post-call check sees enough.
-            let prefix_len = sql.len().min(128);
-            Some(sql[..prefix_len].to_string())
-        } else {
-            None
-        };
+        let changes_own_password =
+            needs_password_check && is_password_change_statement(&sql, &self.context);
         if needs_txn_admission || looks_like_text_dml_candidate(sql.as_str(), lex_mode) {
             self.acquire_txn_admission().await;
         }
@@ -4120,12 +4107,7 @@ where
         if result.is_ok() && selects_database {
             self.process_database = Some(self.context.current_database.clone());
         }
-        if result.is_ok()
-            && needs_password_check
-            && pw_check_prefix
-                .as_deref()
-                .is_some_and(is_password_change_statement)
-        {
+        if result.is_ok() && needs_password_check && changes_own_password {
             self.context.auth_sandbox = false;
             self.context.password_expired = false;
         }
@@ -4603,6 +4585,17 @@ where
                 return Ok(());
             }
         };
+        if self.context.auth_sandbox && !is_password_change_statement(&sql, &self.context) {
+            self.write_error_packet(
+                self.command_response_sequence,
+                &error(
+                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
+                    "You must reset your password using ALTER USER before executing this statement",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         self.engine
             .log_general_event(&self.context, "Prepare", sql.as_str());
         let mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode);
@@ -4960,6 +4953,15 @@ where
                     .await?;
                 return Ok(());
             };
+            if self.context.auth_sandbox
+                && !is_password_change_statement(&prepared.sql, &self.context)
+            {
+                self.write_error_packet(self.command_response_sequence, &error(
+                    crate::error::catalog::ER_MUST_CHANGE_PASSWORD,
+                    "You must reset your password using ALTER USER before executing this statement",
+                )).await?;
+                return Ok(());
+            }
             if let Some(err) = &prepared.long_data_error {
                 self.prepared_execute_failed = true;
                 self.codec
@@ -5491,6 +5493,17 @@ where
         statement_id: Option<u32>,
         result: Result<QueryResponse, crate::types::QueryError>,
     ) -> io::Result<()> {
+        if result.is_ok()
+            && self.context.auth_sandbox
+            && statement_id.is_some_and(|id| {
+                self.prepared.get(&id).is_some_and(|prepared| {
+                    is_password_change_statement(&prepared.sql, &self.context)
+                })
+            })
+        {
+            self.context.auth_sandbox = false;
+            self.context.password_expired = false;
+        }
         let original = self.command_response_sequence;
         if let Some(sequence) = self.routine_response_sequence.take() {
             self.command_response_sequence = sequence;
@@ -10076,25 +10089,53 @@ fn parse_semi_sync_ack_frames(buf: &mut Vec<u8>) -> (Vec<(u64, String)>, Option<
     (acks, last_seq)
 }
 
-fn is_password_change_statement(sql: &str) -> bool {
-    // Cheap byte-prefix sniff: only proceed with the (allocating) normalize
-    // when the statement plausibly starts with `SET` or `ALTER`. Bulk-INSERT
-    // / SELECT / DML never start with either, so this short-circuits
-    // without touching a 500KB body.
-    let trimmed = sql.trim_start();
-    let prefix = trimmed.as_bytes();
-    let starts_with_set = prefix.len() >= 4
-        && prefix[..3].eq_ignore_ascii_case(b"set")
-        && matches!(prefix[3], b' ' | b'\t' | b'\r' | b'\n');
-    let starts_with_alter = prefix.len() >= 6
-        && prefix[..5].eq_ignore_ascii_case(b"alter")
-        && matches!(prefix[5], b' ' | b'\t' | b'\r' | b'\n');
-    if !starts_with_set && !starts_with_alter {
-        return false;
+#[test]
+fn audit1106_password_sandbox_parses_exact_self_change() {
+    let mut session = SessionContext::default();
+    for sql in [
+        "SELECT 1",
+        "SHOW PROCESSLIST",
+        "ALTER USER CURRENT_USER() ATTRIBUTE '{\"a\":\" identified \"}'",
+        "SET PASSWORD='x'; SELECT 1",
+        "ALTER USER other@'%' IDENTIFIED BY 'x'",
+    ] {
+        assert!(!is_password_change_statement(sql, &session), "{sql}");
     }
-    let normalized = crate::engine::system::normalize_sql(sql);
-    normalized.starts_with("set password")
-        || (normalized.starts_with("alter user ") && normalized.contains(" identified "))
+    for sql in [
+        "SET PASSWORD='x'",
+        "/* comment */ ALTER USER CURRENT_USER() IDENTIFIED BY 'x'",
+        "ALTER USER CURRENT_USER() IDENTIFIED BY '密码'",
+        "ALTER USER CURRENT_USER() IDENTIFIED BY RANDOM PASSWORD",
+    ] {
+        assert!(is_password_change_statement(sql, &session), "{sql}");
+    }
+    session.sql_mode = "NO_BACKSLASH_ESCAPES".into();
+    assert!(is_password_change_statement(r"SET PASSWORD='x\'", &session));
+}
+
+fn is_password_change_statement(sql: &str, session: &SessionContext) -> bool {
+    let _mode = crate::parser::ParserSqlModeGuard::activate(
+        crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode),
+    );
+    let Ok(statements) = crate::parser::parse_statements(sql) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+    let is_self = |account: &crate::parser::AccountIdent| {
+        account.user == session.authenticated_as.user
+            && account.host == session.authenticated_as.host
+    };
+    match statement {
+        Statement::SetPassword { account, .. } => account.as_ref().is_none_or(is_self),
+        Statement::AlterUser(user) => {
+            (user.current_user || is_self(&user.account))
+                && (user.password.is_some() || user.random_password)
+                && user.password_expired != Some(true)
+        }
+        _ => false,
+    }
 }
 
 /// How a DDL-looking COM_QUERY affects the SQL caches.
@@ -12162,7 +12203,8 @@ mod tests {
         ctx.set_user_variable(
             "@master_heartbeat_period",
             crate::types::Value::UInt(100_000_000),
-        );
+        )
+        .unwrap();
         assert_eq!(
             heartbeat_interval_from_session(&ctx),
             std::time::Duration::from_millis(100)

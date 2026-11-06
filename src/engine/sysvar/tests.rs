@@ -31,7 +31,9 @@ fn pfs_variable_snapshot_dirty_tracking_is_mutation_driven() {
     assert!(session.pfs_variables_dirty);
     session.mark_pfs_variables_published();
 
-    session.set_user_variable("answer", crate::types::Value::Int(42));
+    session
+        .set_user_variable("answer", crate::types::Value::Int(42))
+        .unwrap();
     assert!(session.pfs_variables_need_publish());
     session.mark_pfs_variables_published();
 

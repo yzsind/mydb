@@ -3300,6 +3300,7 @@ enum ExprNode {
         expr: Box<ExprNode>,
         list: Vec<ExprNode>,
         negated: bool,
+        collation_id: Option<u16>,
     },
     InConstSet {
         expr: Box<ExprNode>,
@@ -4644,9 +4645,22 @@ fn try_compile_in_const_set(
         .iter()
         .map(const_compile_value)
         .collect::<Option<Vec<_>>>();
-    let Some(values) = values else {
+    let Some(mut values) = values else {
         return Ok(None);
     };
+    if let Some(info) = collation_id
+        .and_then(crate::charset::resolve_collation_id)
+        .filter(|info| info.charset != "binary")
+    {
+        for value in &mut values {
+            if let Value::Bytes(bytes) = value {
+                *value = Value::String(
+                    crate::charset::decode_bytes(info.charset, bytes)
+                        .map_err(|_| CompileError::Unsupported)?,
+                );
+            }
+        }
+    }
     let has_null = values.iter().any(|value| matches!(value, Value::Null));
     let hash_class = if values.len() >= MIN_HASH_LIST_LEN {
         common_in_hash_class(&values)
@@ -5755,13 +5769,18 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     && list.iter().all(|item| {
                         matches!(
                             const_compile_value(item),
-                            Some(Value::String(_) | Value::SmallString(_) | Value::Null)
+                            Some(
+                                Value::String(_)
+                                    | Value::SmallString(_)
+                                    | Value::Bytes(_)
+                                    | Value::Null
+                            )
                         )
                     });
             if nondefault && !bound_text_set {
                 return Err(CompileError::Unsupported);
             }
-            let set_collation = if nondefault {
+            let set_collation = if nondefault || bound_text_set {
                 effective_collation
             } else {
                 None
@@ -5793,6 +5812,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     .map(|item| compile_node(item, schema))
                     .collect::<Result<Vec<_>, _>>()?,
                 negated: *negated,
+                collation_id: effective_collation,
             })
         }
         Expr::Between {
@@ -6437,6 +6457,7 @@ fn fold_constants(node: ExprNode) -> ExprNode {
             expr,
             list,
             negated,
+            collation_id,
         } => {
             let expr = Box::new(fold_constants(*expr));
             let list: Vec<ExprNode> = list.into_iter().map(fold_constants).collect();
@@ -6445,6 +6466,7 @@ fn fold_constants(node: ExprNode) -> ExprNode {
                 expr,
                 list,
                 negated,
+                collation_id,
             };
             if all_const {
                 if let Some(v) = try_eval_const_node(&node) {
@@ -6559,11 +6581,13 @@ fn fold_constants(node: ExprNode) -> ExprNode {
                     // Recover the value operand's collation stashed at
                     // compile time so the late-fold plan agrees with
                     // the compile-time-const plan (B1).
-                    let info = if matches!(pat_value, Value::Bytes(_)) {
-                        crate::charset::resolve_collation_id(63)
-                    } else {
-                        collation_id.and_then(crate::charset::resolve_collation_id)
-                    };
+                    let info = collation_id
+                        .and_then(crate::charset::resolve_collation_id)
+                        .or_else(|| {
+                            matches!(pat_value, Value::Bytes(_))
+                                .then(|| crate::charset::resolve_collation_id(63))
+                                .flatten()
+                        });
                     let plan = classify_like_plan(&pat_str, escape_char, info);
                     return ExprNode::LikeConst {
                         expr,
@@ -6828,7 +6852,8 @@ impl ExprNode {
                 expr,
                 list,
                 negated,
-            } => eval_in_list_node(expr, list, *negated, row, scratch),
+                collation_id,
+            } => eval_in_list_node(expr, list, *negated, *collation_id, row, scratch),
             ExprNode::InConstSet {
                 expr,
                 values,
@@ -7113,15 +7138,18 @@ fn eval_in_list_node(
     expr: &ExprNode,
     list: &[ExprNode],
     negated: bool,
+    collation_id: Option<u16>,
     row: &dyn RowSource,
     scratch: &mut EvalScratch,
 ) -> Result<Value, QueryError> {
     let value = expr.eval(row, scratch)?;
     let mut iter = list.iter();
     let eval = || {
-        crate::engine::expr::eval_in_list(value, negated, || match iter.next() {
-            Some(item) => Ok(Some(item.eval(row, scratch)?)),
-            None => Ok(None),
+        crate::engine::expr::with_compare_collation(collation_id, || {
+            crate::engine::expr::eval_in_list(value, negated, || match iter.next() {
+                Some(item) => Ok(Some(item.eval(row, scratch)?)),
+                None => Ok(None),
+            })
         })
     };
     if list.iter().all(is_const_node) {

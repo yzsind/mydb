@@ -101,7 +101,7 @@ impl DateFormatPlan {
                     out.push(':');
                     number(out, second, 2);
                     if spec == 'r' {
-                        out.push_str(if hour < 12 { " AM" } else { " PM" });
+                        out.push_str(if hour % 24 < 12 { " AM" } else { " PM" });
                     }
                 }
                 'p' => out.push_str(if hour % 24 < 12 { "AM" } else { "PM" }),
@@ -154,7 +154,7 @@ impl DateFormatPlan {
                     out.push(':');
                     number(out, second, 2);
                     if spec == 'r' {
-                        out.push_str(if hour < 12 { " AM" } else { " PM" });
+                        out.push_str(if hour % 24 < 12 { " AM" } else { " PM" });
                     }
                 }
                 'D' => {
@@ -185,10 +185,7 @@ impl DateFormatPlan {
                     }
                 }
                 '%' => out.push('%'),
-                other => {
-                    out.push('%');
-                    out.push(other);
-                }
+                other => out.push(other),
             }
         }
     }

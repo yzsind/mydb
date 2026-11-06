@@ -1451,9 +1451,11 @@ mod online_apply {
             replica_db.replica_applied_lsn() < reclaimed_lsn,
             "conflicting reclaim must not advance the applied watermark"
         );
+        tokio::time::sleep(Duration::from_millis(700)).await;
         assert!(
             lifecycle.is_running(),
-            "snapshot conflict must remain retryable"
+            "snapshot conflict must remain retryable beyond the poison threshold: {}",
+            status.lock()
         );
         let session = Arc::clone(&reader);
         let replica = Arc::clone(&replica_engine);
@@ -2005,6 +2007,67 @@ mod lifecycle_tests {
             crate::repl::role::load(dir.path()).unwrap().unwrap().role,
             Role::Replica
         );
+    }
+
+    #[test]
+    fn audit1106_write_fence_preserves_prepared_xa_and_stopped_status() {
+        let dir = TempDir::new_in("/tmp/mydb").unwrap();
+        let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
+        manager.role_state.lock().unwrap().role = Role::Master;
+        let mut session = crate::engine::SessionContext::default();
+        for sql in [
+            "CREATE TABLE xa_fence(id INT)",
+            "XA START 'stable'",
+            "INSERT INTO xa_fence VALUES(1)",
+            "XA END 'stable'",
+            "XA PREPARE 'stable'",
+        ] {
+            manager
+                .engine
+                .execute_with_session(&mut session, sql)
+                .unwrap();
+        }
+        manager
+            .handle_stop_master_writes("STOP MASTER WRITES WAIT 1", &session)
+            .unwrap();
+        let QueryResponse::ResultSet(recovered) = manager.engine.execute("XA RECOVER").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(recovered.rows.len(), 1);
+        manager.handle_resume_master_writes().unwrap();
+        manager.engine.execute("XA COMMIT 'stable'").unwrap();
+        let QueryResponse::ResultSet(rows) =
+            manager.engine.execute("SELECT id FROM xa_fence").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(rows.rows, vec![vec![Value::Int(1)]]);
+        *manager.receiver_progress.lock() = ReplicaProgress {
+            received_lsn: 99,
+            durable_lsn: 98,
+            applied_lsn: 97,
+            durable_applied_lsn: 96,
+            ..Default::default()
+        };
+        crate::repl::replica::progress::save_progress(
+            dir.path(),
+            &ReplicaProgress {
+                received_lsn: 5,
+                applied_lsn: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let QueryResponse::ResultSet(status) = manager.show_replica_status().unwrap() else {
+            panic!()
+        };
+        let received = status
+            .columns
+            .iter()
+            .position(|column| column.name == "Received_LSN")
+            .unwrap();
+        assert_eq!(status.rows[0][received], Value::UInt(99));
     }
 
     #[test]

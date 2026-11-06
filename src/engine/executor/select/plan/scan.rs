@@ -4076,15 +4076,38 @@ impl IndexEntryProjector {
         key: &IndexKey,
         accumulators: &mut [crate::engine::executor::vec::batch::ColumnAccumulator],
     ) {
-        for (((key_pos, data_type), accumulator), _meta) in self
+        use crate::engine::executor::vec::batch::ColumnAccumulator;
+        for ((key_pos, data_type), accumulator) in self
             .key_positions
             .iter()
             .zip(self.data_types.iter())
             .zip(accumulators.iter_mut())
-            .zip(self.metas.iter())
         {
-            let value = key_pos
-                .and_then(|pos| key.0.get(pos))
+            let part = key_pos.and_then(|pos| key.0.get(pos));
+            if matches!(
+                accumulator,
+                ColumnAccumulator::I64 { .. } | ColumnAccumulator::U64 { .. }
+            ) {
+                let integer = match part {
+                    Some(KeyPart::Int(value)) => Some(
+                        if *value < 0 && matches!(accumulator, ColumnAccumulator::U64 { .. }) {
+                            None
+                        } else {
+                            Some(*value)
+                        },
+                    ),
+                    // The typed unsigned lane restores this bit pattern, so
+                    // BIGINT UNSIGNED and BIT(64) keep their complete range.
+                    Some(KeyPart::UInt(value)) => Some(Some(*value as i64)),
+                    Some(KeyPart::Null) | None => Some(None),
+                    _ => None,
+                };
+                if let Some(integer) = integer {
+                    accumulator.push_lossless_i64(integer);
+                    continue;
+                }
+            }
+            let value = part
                 .map(|part| part.to_value(data_type))
                 .unwrap_or(Value::Null);
             accumulator.push(&value);
