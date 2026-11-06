@@ -1152,6 +1152,7 @@ pub struct Database {
     /// from the candidate generator. Entries are keyed by transaction and
     /// pruned against the undo chain on savepoint rollback.
     pending_vector_deletes: Mutex<HashMap<u64, Vec<PendingVectorMutation>>>,
+    pending_heap_shrinks: Arc<HeapShrinkRegistry>,
     /// Transactions between `prepare_pending_vector_commit` and the end of
     /// `apply_pending_vector_deletes`: their rows may already be visible
     /// while the shared graph lacks them, so KNN merges exactly these (plus
@@ -3587,6 +3588,8 @@ struct BufferPool {
     /// Only first-touch misses take the write lock (with a
     /// double-check to avoid duplicate inserts on the race).
     file_cache: RwLock<BufferFileCacheMap>,
+    /// Serializes pressure syncs without holding the file-cache latch over I/O.
+    file_cache_reclaim_lock: parking_lot::Mutex<()>,
     log: Arc<crate::wal::LogMutex>,
     durability: DurabilityMode,
     lock_wait: Duration,
@@ -4722,6 +4725,7 @@ pub(crate) struct HeapFile {
     /// without needing the file-wide write lock.
     durability: std::sync::atomic::AtomicU8,
     update_reserve_bytes: usize,
+    pending_shrinks: Option<Arc<HeapShrinkRegistry>>,
     /// Live page count — concurrent inserts read and CAS this. File
     /// extension serialised separately via `extend_mutex` so two
     /// allocators don't race on `set_len`.

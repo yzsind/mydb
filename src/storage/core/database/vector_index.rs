@@ -763,6 +763,9 @@ impl Database {
                 self.durability_mode(),
                 self.buffer_pool.clone(),
             )?);
+            if self.physical_replica_mode() {
+                file.disable_navigation_mapping();
+            }
             file.check_identity(
                 physical_owner,
                 table.active_generation.max(1),
@@ -777,8 +780,7 @@ impl Database {
             if (!file.is_finalized() || !file.meta().query_ready)
                 && !self.vector_recovery_active.load(Ordering::Acquire)
             {
-                return Err(error(crate::error::catalog::ER_GET_ERRNO,
-                    format!("native vector index has unfinished WAL maintenance: {} finalized={} query_ready={} coverage={}", file.persistent_path().display(), file.is_finalized(), file.meta().query_ready, file.meta().coverage_scn)));
+                return Err(vector::persistence::unfinished_maintenance());
             }
             match index.vector_algo() {
                 VectorAlgo::Hnsw => {
@@ -1355,10 +1357,7 @@ impl Database {
             if (!file.is_finalized() || !file.meta().query_ready)
                 && !self.vector_recovery_active.load(Ordering::Acquire)
             {
-                return Err(error(
-                    crate::error::catalog::ER_INDEX_CORRUPT,
-                    "persistent vector index has unfinished maintenance",
-                ));
+                return Err(vector::persistence::unfinished_maintenance());
             }
             file
         };
@@ -3320,7 +3319,10 @@ impl Database {
     /// the executor (`execute_vector_index_scan`) calls this once per
     /// partition storage id and merges the results.
     pub(crate) fn vector_index_open_cursor(
-        &self, table: &TableSchema, index: &IndexSchema, storage_id: u64,
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        storage_id: u64,
         query: &crate::vector::VectorValue,
         selection: Option<Arc<crate::engine::vector::selection::RowSelection>>,
     ) -> Result<crate::engine::vector::cursor::VectorSearchCursor, QueryError> {
@@ -3335,13 +3337,18 @@ impl Database {
     }
 
     pub(crate) fn vector_index_cursor_next(
-        &self, table: &TableSchema, index: &IndexSchema,
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
         cursor: &mut crate::engine::vector::cursor::VectorSearchCursor,
-        effort: usize, limit: usize,
+        effort: usize,
+        limit: usize,
     ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
         let _lease = self.acquire_vector_read(table.id)?;
         let current = self.vector_graph_get_or_build_for_partition(table, index, cursor.sid)?;
-        if !Arc::ptr_eq(&current, &cursor.graph) { return Ok(None); }
+        if !Arc::ptr_eq(&current, &cursor.graph) {
+            return Ok(None);
+        }
         drop(_lease);
         cursor.next_batch(effort, limit)
     }

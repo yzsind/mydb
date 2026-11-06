@@ -4214,6 +4214,17 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        if table.is_partitioned() && !index.is_vector() {
+            for storage_id in table.storage_ids() {
+                let mut leaf = table.clone();
+                leaf.id = storage_id;
+                leaf.active_generation = self.storage_generation(storage_id);
+                leaf.partitioning = None;
+                leaf.build_column_index();
+                self.rebuild_index_with_options(&leaf, index, options)?;
+            }
+            return Ok(());
+        }
         // Pin the explicitly typed backend while a private/temporary candidate
         // is not yet visible in the catalog used by cold handle resolution.
         let _spatial_build_handle = if index.is_spatial() {
@@ -4365,6 +4376,17 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        if table.is_partitioned() && !index.is_vector() {
+            for storage_id in table.storage_ids() {
+                let mut leaf = table.clone();
+                leaf.id = storage_id;
+                leaf.active_generation = self.storage_generation(storage_id);
+                leaf.partitioning = None;
+                leaf.build_column_index();
+                self.rebuild_index_offline_bulk_with_options(&leaf, index, options)?;
+            }
+            return Ok(());
+        }
         if index.index_type.eq_ignore_ascii_case("BTREE") {
             INDEX_BUILD_REQUESTED_WORKERS.fetch_add(
                 options.requested_degree.min(u64::MAX as usize) as u64,

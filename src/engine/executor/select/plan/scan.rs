@@ -5819,7 +5819,7 @@ pub(super) fn execute_vector_index_scan(
     // `examined` counts distinct heap reads against `max_scan_tuples`.
     let mut seen: std::collections::HashSet<(u64, RowId)> = std::collections::HashSet::new();
     let mut examined = 0usize;
-    let exact_fallback = loop {
+    let exact_fallback = 'candidate_search: loop {
         if !is_ivf && candidate_want.saturating_mul(storage_ids.len()) > max_scan {
             break true;
         }
@@ -5856,6 +5856,13 @@ pub(super) fn execute_vector_index_scan(
                 request,
             ) {
                 Ok(result) => result,
+                Err(index_error)
+                    if index_error.is(crate::error::catalog::ER_INDEX_CORRUPT)
+                        && index_error.diagnostic_id()
+                            == Some("MYDB-DIAG-VECTOR-MAINTENANCE-PENDING") =>
+                {
+                    break 'candidate_search true
+                }
                 Err(index_error) => return Err(index_error),
             };
             exact_order &= part_result.exact_order;

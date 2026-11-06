@@ -85,6 +85,7 @@ pub struct BaseBackupSnapshot {
 struct BackupFreezeGuard<'a> {
     manager: Option<std::sync::Arc<crate::repl::MydbReplManager>>,
     capture_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    capture_draining: &'a std::sync::atomic::AtomicBool,
     capture_floor: &'a std::sync::atomic::AtomicU64,
 }
 
@@ -94,6 +95,7 @@ impl Drop for BackupFreezeGuard<'_> {
             manager.backup_capture_frozen.store(false, Ordering::SeqCst);
         }
         self.capture_floor.store(0, Ordering::Release);
+        self.capture_draining.store(false, Ordering::SeqCst);
         self.capture_active.store(false, Ordering::Release);
     }
 }
@@ -189,6 +191,18 @@ pub async fn stream_base_backup<W>(
 where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
+    stream_base_backup_with_chunk_bytes(writer, db, data_dir, CHUNK_BYTES).await
+}
+
+pub(crate) async fn stream_base_backup_with_chunk_bytes<W>(
+    writer: &mut BufWriter<W>,
+    db: &Database,
+    data_dir: &Path,
+    chunk_bytes: usize,
+) -> Result<BaseBackupSnapshot, QueryError>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
     let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
     let logical_capture = logical_gate.try_write_arc().ok_or_else(|| {
         error(
@@ -196,14 +210,6 @@ where
             "base backup capture deferred: logical applier is completing a transaction",
         )
     })?;
-    // Do not freeze a busy master while waiting for a long transaction.
-    // The storage admission barrier also covers logical replication writers.
-    if db.has_active_backup_conflicts() {
-        return Err(error(
-            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-            "base backup capture deferred: active source writers; retry after they drain",
-        ));
-    }
     db.capture
         .active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -215,14 +221,35 @@ where
         })?;
     let manager =
         crate::repl::global_manager().filter(|manager| manager.role() == crate::repl::Role::Master);
-    if let Some(manager) = &manager {
-        manager.backup_capture_frozen.store(true, Ordering::SeqCst);
-    }
+    db.capture.draining.store(true, Ordering::SeqCst);
     let freeze_guard = BackupFreezeGuard {
         manager,
         capture_active: std::sync::Arc::clone(&db.capture.active),
+        capture_draining: &db.capture.draining,
         capture_floor: &db.capture.capture_floor,
     };
+    let drain_timeout = crate::util::env::var("MYDB_REPL_BASE_BACKUP_DRAIN_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3000);
+    let drain_deadline = std::time::Instant::now() + Duration::from_millis(drain_timeout);
+    loop {
+        if db.xa_status_counters().0 > 0 {
+            return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                "native base backup cannot capture XA PREPARED branches; resolve them with XA COMMIT or XA ROLLBACK before seeding"));
+        }
+        if !db.has_active_backup_conflicts() && db.capture.admissions.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= drain_deadline {
+            return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                format!("base backup drain timed out after {drain_timeout}ms; active source writers remain; finish transactions or increase MYDB_REPL_BASE_BACKUP_DRAIN_MS")));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if let Some(manager) = &freeze_guard.manager {
+        manager.backup_capture_frozen.store(true, Ordering::SeqCst);
+    }
     let admission_freeze = db.capture.freeze();
     if db.has_active_backup_conflicts() || db.capture.admissions.load(Ordering::SeqCst) != 0 {
         return Err(error(
@@ -306,7 +333,7 @@ where
         backup_lsn,
         files: manifest,
     });
-    protocol::write_frame_async(writer, &start)
+    write_backup_frame(writer, &start, Duration::from_secs(60))
         .await
         .map_err(io_err)?;
 
@@ -314,7 +341,7 @@ where
     //    finishes with an `eof: true` chunk so the replica can close
     //    out its output handle deterministically (even for empty
     //    files, which would otherwise have no chunks at all).
-    let mut read_buf = vec![0u8; CHUNK_BYTES];
+    let mut read_buf = vec![0u8; chunk_bytes.clamp(1, CHUNK_BYTES)];
     for (path, entry) in opened {
         let mut file = tokio::fs::File::open(path).await.map_err(io_err)?;
         let mut offset: u64 = 0;
@@ -352,7 +379,7 @@ where
                 eof,
                 sha256: checksum,
             });
-            protocol::write_frame_async(writer, &chunk)
+            write_backup_frame(writer, &chunk, Duration::from_secs(60))
                 .await
                 .map_err(io_err)?;
             offset = next_offset;
@@ -363,11 +390,28 @@ where
     }
 
     let end = Message::BaseBackupEnd(BaseBackupEnd { backup_lsn });
-    protocol::write_frame_async(writer, &end)
+    write_backup_frame(writer, &end, Duration::from_secs(60))
         .await
         .map_err(io_err)?;
-    writer.flush().await.map_err(io_err)?;
     Ok(BaseBackupSnapshot { backup_lsn })
+}
+
+async fn write_backup_frame<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut BufWriter<W>,
+    message: &Message,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        protocol::write_frame_async(writer, message).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "base backup frame write timed out",
+        )
+    })?
 }
 
 /// Recursively walk `dir`, emitting one manifest entry per regular file.
@@ -595,6 +639,12 @@ pub(crate) async fn perform_base_backup_into_with_config(
         CHUNK_BYTES.saturating_mul(2),
     )?;
     recover_interrupted_install(data_dir)?;
+    let staging = backup_staging_path(data_dir, replica_uuid)?;
+    remove_path(&staging).map_err(io_err)?;
+    let _staging_cleanup = BackupStagingCleanup {
+        path: staging.clone(),
+        data_dir: data_dir.to_path_buf(),
+    };
     let master_host = master_host.trim_matches(['[', ']']);
     let addr = crate::repl::format_endpoint(master_host, master_port);
     let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
@@ -686,6 +736,12 @@ pub(crate) async fn perform_base_backup_into_with_config(
     // protocol violation.
     let start: BaseBackupStart = match read_backup_frame(&mut reader).await {
         Ok(Message::BaseBackupStart(s)) => s,
+        Ok(Message::Close(close)) => {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                close.reason,
+            ))
+        }
         Ok(other) => {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -730,10 +786,6 @@ pub(crate) async fn perform_base_backup_into_with_config(
                 ),
             ));
         }
-    }
-    let staging = backup_staging_path(data_dir, replica_uuid)?;
-    if staging.exists() {
-        remove_path(&staging).map_err(io_err)?;
     }
     fs::create_dir_all(&staging).map_err(io_err)?;
     let mut expected = std::collections::BTreeMap::<String, (u64, u64, bool)>::new();
@@ -1002,23 +1054,32 @@ const INSTALL_TARGETS: &[&str] = &[
     "system/replication/role.json",
 ];
 
+struct BackupStagingCleanup {
+    path: PathBuf,
+    data_dir: PathBuf,
+}
+impl Drop for BackupStagingCleanup {
+    fn drop(&mut self) {
+        // A failed install may still need the staging tree to roll back.
+        if !journal_path(&self.data_dir).exists() {
+            if let Err(err) = remove_path(&self.path) {
+                crate::util::logging::log_message(format_args!(
+                    "base backup staging cleanup {}: {err}",
+                    self.path.display()
+                ));
+            }
+        }
+    }
+}
+
 fn backup_staging_path(data_dir: &Path, replica_uuid: &str) -> Result<PathBuf, QueryError> {
-    let parent = data_dir.parent().ok_or_else(|| {
-        error(
-            crate::error::catalog::ER_GET_ERRNO,
-            "base backup data directory has no parent",
-        )
-    })?;
-    let name = data_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "base backup data directory name is not valid UTF-8",
-            )
-        })?;
-    Ok(parent.join(format!(".{name}.native-repl-stage-{replica_uuid}")))
+    if uuid_string_to_bytes(replica_uuid).is_none() {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_VALUE,
+            "base backup replica UUID is invalid",
+        ));
+    }
+    Ok(data_dir.join(format!(".native-repl-stage-{replica_uuid}")))
 }
 
 #[cfg(unix)]
@@ -1263,6 +1324,7 @@ fn io_err(err: std::io::Error) -> QueryError {
         err,
         crate::error::catalog::ER_GET_ERRNO,
     )
+    .map_message(|_| format!("base backup io: {detail}"))
 }
 
 #[cfg(test)]
@@ -1583,4 +1645,50 @@ mod release_audit_tests {
         assert!(!root.join(".base-backup-abandoned.snapshot").exists());
         assert!(root.join("role.json").exists());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn release1106_backup_stage_is_on_data_filesystem() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let stage = backup_staging_path(dir.path(), "00112233-4455-6677-8899-aabbccddeeff").unwrap();
+    assert_eq!(stage.parent(), Some(dir.path()));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn release1106_stalled_backup_write_times_out() {
+    let (writer, _reader) = tokio::io::duplex(1);
+    let mut writer = BufWriter::new(writer);
+    let err = write_backup_frame(
+        &mut writer,
+        &Message::BaseBackupEnd(BaseBackupEnd { backup_lsn: 1 }),
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn release1106_failed_backup_cleans_stage_before_connecting() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let uuid = "00112233-4455-6677-8899-aabbccddeeff";
+    let stage = backup_staging_path(dir.path(), uuid).unwrap();
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("partial"), [0; 1024]).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    assert!(perform_base_backup_into_with_config(
+        "127.0.0.1",
+        port,
+        uuid,
+        dir.path(),
+        crate::repl::config::ReplConfig::test_defaults()
+    )
+    .await
+    .is_err());
+    assert!(!stage.exists());
 }

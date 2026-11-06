@@ -731,7 +731,11 @@ fn decode_heap_forwarding_stub(input: &[u8]) -> Result<Option<RowId>, QueryError
     if input.first().copied() != Some(HEAP_FORWARDING_STUB_VERSION) {
         return Ok(None);
     }
-    if input.len() != HEAP_FORWARDING_STUB_LEN {
+    if input.len() < HEAP_FORWARDING_STUB_LEN
+        || input[HEAP_FORWARDING_STUB_LEN..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "corrupt heap forwarding stub",

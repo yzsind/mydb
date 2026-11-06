@@ -842,10 +842,10 @@ fn prepare_create_table_schema(
 
         // Expression positions contain canonical SQL, not identifiers.
         let mut parser_key_expressions = index.key_expressions;
-        parser_key_expressions.resize(index.columns.len(),None);
+        parser_key_expressions.resize(index.columns.len(), None);
         parser_key_expressions.truncate(index.columns.len());
         let mut parser_key_expression_multi_valued = index.key_expression_multi_valued;
-        parser_key_expression_multi_valued.resize(index.columns.len(),false);
+        parser_key_expression_multi_valued.resize(index.columns.len(), false);
         parser_key_expression_multi_valued.truncate(index.columns.len());
         let columns = index
             .columns
@@ -2109,6 +2109,10 @@ impl Database {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
             self.forget_zone_map(sid)?;
+            self.buffer_pool
+                .discard_pages_for_path(&self.table_path(sid))?;
+            self.buffer_pool
+                .discard_pages_for_path(&self.overflow_path(sid))?;
             self.create_temp_empty_file(self.table_path(sid))?;
             self.remove_temp_file(self.overflow_path(sid))?;
             for index in &table.indexes {
@@ -4460,7 +4464,8 @@ impl Database {
         // Cache eviction leaves a lightweight object header in the
         // compatibility catalog. Materialize the immutable descriptor before
         // phase 1 validates columns and index metadata under the table MDL.
-        let table = self.table_by_key(&key)
+        let table = self
+            .table_by_key(&key)
             .ok_or_else(|| ddl_table_not_found(&table_name))?;
         validate_add_index_backend(&table, &index)?;
         drop(table);
@@ -12052,7 +12057,7 @@ impl Database {
             )
         })?;
         if part.method.is_hash_like() {
-            return Err(error(crate::error::catalog::ER_ONLY_ON_RANGE_LIST_PARTITION,
+            return Err(error(crate::error::catalog::ER_PARTITION_WRONG_VALUES_ERROR,
                 "ADD PARTITION is not allowed on HASH/KEY partitioned tables; use COALESCE PARTITION instead",
             ));
         }
@@ -12084,7 +12089,7 @@ impl Database {
         if part.method.is_range()
             && part.partitions.iter().any(|p| {
                 matches!(&p.bounds, crate::storage::PartitionBounds::RangeLessThan(v)
-                    if v.iter().any(|l| l.is_max_value()))
+                    if v.first().is_some_and(|l| l.is_max_value()))
             })
         {
             return Err(error(
@@ -12154,7 +12159,42 @@ impl Database {
                     "too many partitions",
                 )
             })?;
-        let def = partition_def_from_info(part, Some(new_count as u32), Vec::new())?;
+        if new_count > MYSQL80_MAX_PARTITIONS {
+            return Err(error(
+                crate::error::catalog::ER_TOO_MANY_PARTITIONS_ERROR,
+                "Too many partitions",
+            ));
+        }
+        let mut items = part
+            .partitions
+            .iter()
+            .map(|partition| crate::parser_partition::PartitionItemDef {
+                name: partition.name.clone(),
+                bounds: crate::parser_partition::PartitionBoundsDef::Hash,
+                comment: partition.comment.clone(),
+                options: Default::default(),
+                subpartitions: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut suffix = part.partitions.len();
+        while items.len() < new_count {
+            let name = format!("p{suffix}");
+            suffix += 1;
+            if items
+                .iter()
+                .any(|item| item.name.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            items.push(crate::parser_partition::PartitionItemDef {
+                name,
+                bounds: crate::parser_partition::PartitionBoundsDef::Hash,
+                comment: String::new(),
+                options: Default::default(),
+                subpartitions: Vec::new(),
+            });
+        }
+        let def = partition_def_from_info(part, Some(new_count as u32), items)?;
         self.repartition_table(table_name, def, cutover)
     }
 
@@ -12835,7 +12875,7 @@ impl Database {
         })?;
         if other_table.is_partitioned() {
             return Err(error(
-                crate::error::catalog::ER_PARTITION_EXCHANGE_TEMP_TABLE,
+                crate::error::catalog::ER_PARTITION_EXCHANGE_PART_TABLE,
                 "EXCHANGE PARTITION cannot target a partitioned table",
             ));
         }
@@ -13986,8 +14026,8 @@ pub(crate) fn build_partition_info_from_def(
                         ));
                     }
                     let has_max = lits
-                        .iter()
-                        .any(|l| matches!(l, PartitionLiteralDef::MaxValue));
+                        .first()
+                        .is_some_and(|l| matches!(l, PartitionLiteralDef::MaxValue));
                     if seen_max {
                         return Err(error(
                             crate::error::catalog::ER_PARTITION_MAXVALUE_ERROR,

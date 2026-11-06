@@ -78,3 +78,38 @@ pub(super) fn assert_insert_partition_allowed(
         "Found a row not matching the given partition set",
     ))
 }
+
+thread_local! {
+    static WRITE_PARTITIONS: std::cell::RefCell<Option<(u64, Vec<u64>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A table-specific write contract, independent of optimizer scan pruning.
+/// Validate stored values after coercion, defaults and AUTO_INCREMENT.
+pub(crate) struct PartitionWriteGuard(Option<(u64, Vec<u64>)>);
+impl PartitionWriteGuard {
+    pub(crate) fn enter(table: u64, allowed: Vec<u64>) -> Self {
+        Self(WRITE_PARTITIONS.with(|state| state.replace(Some((table, allowed)))))
+    }
+}
+impl Drop for PartitionWriteGuard {
+    fn drop(&mut self) {
+        WRITE_PARTITIONS.with(|state| *state.borrow_mut() = self.0.take());
+    }
+}
+pub(crate) fn check_partition_write(table: u64, storage: u64) -> Result<(), QueryError> {
+    WRITE_PARTITIONS.with(|state| match state.borrow().as_ref() {
+        Some((target, allowed)) if *target == table => {
+            assert_insert_partition_allowed(allowed, storage)
+        }
+        _ => Ok(()),
+    })
+}
+
+pub(crate) fn has_partition_write_constraint(table: u64) -> bool {
+    WRITE_PARTITIONS.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| *target == table)
+    })
+}

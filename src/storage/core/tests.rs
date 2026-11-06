@@ -9040,7 +9040,8 @@ fn vanished_txn_wal_buffer_returns_payload_for_eager_fallback() {
 fn online_apply_txn_batch_uses_distinct_logical_lsns() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_relaxed_test_db(dir.path());
-    let relative = "schemas/test/tables/apply_lsn__999__data.heap";
+    // This fixture exercises generic data pages, not heap allocation metadata.
+    let relative = "system/tmp/apply_lsn.page";
 
     let mut first = Page::new();
     assert_eq!(first.insert(b"first"), Some(0));
@@ -29365,4 +29366,72 @@ fn private_heap_page_builder_matches_canonical_page_images_and_row_ids() {
     }
     let invalid = vec![0; max + 1];
     assert!(HeapFile::prepare_shadow_payload_batch_direct(19, &[&invalid]).is_err());
+}
+
+#[test]
+fn release1106_heap_meta_redo_allocates_extent_before_online_open() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.create_table(
+        "test.extent",
+        vec![checkpoint_test_pk_column()],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let table = db.table("test.extent").unwrap();
+    db.flush_dirty_data().unwrap();
+    let path = db.table_path(table.id);
+    let after = encode_heap_meta(&path, 8);
+    let lsn = db.wal_log().lock().next_lsn() + 100;
+    db.apply_wal_record(&WalRecord {
+        source_time_us: 0,
+        lsn,
+        txn_id: 0,
+        prev_txn_lsn: 0,
+        payload: WalPayload::full_page_image(db.relative_path(&path), 0, after),
+    })
+    .unwrap();
+    assert_eq!(
+        db.with_heap_read(table.id, |heap| heap.page_count())
+            .unwrap(),
+        8
+    );
+    assert!(std::fs::metadata(path).unwrap().len() >= 8 * PAGE_SIZE as u64);
+}
+
+#[test]
+fn release1106_replica_vector_journal_does_not_retain_transaction_payloads() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let bytes = VectorRecoveryMutation::encode_batch(&[VectorRecoveryMutation {
+        table_id: 1,
+        storage_id: 1,
+        generation: 1,
+        index_id: 1,
+        row_id: RowId {
+            page_id: 1,
+            slot_id: 0,
+        },
+        value: None,
+    }])
+    .unwrap();
+    crate::engine::executor::mem_budget::with_test_effective_memory_limit(32 * 1024 * 1024, || {
+        for lsn in 1..=100_000 {
+            db.note_replica_vector_record(&WalRecord {
+                source_time_us: 0,
+                lsn,
+                txn_id: 7,
+                prev_txn_lsn: 0,
+                payload: WalPayload::VectorIndexBatch {
+                    bytes: bytes.clone(),
+                },
+            })
+            .unwrap();
+        }
+    });
+    assert_eq!(
+        db.replica_vector_state.lock().transactions[&7].first_lsn,
+        Some(1)
+    );
 }

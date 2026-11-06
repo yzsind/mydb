@@ -963,6 +963,8 @@ pub(crate) fn execute_compiled_select(
     stmt: &Select,
     compiled: &crate::engine::cache::CompiledSelectPlan,
 ) -> Result<QueryResponse, QueryError> {
+    let _caller_partition_scope =
+        crate::engine::executor::partition_router::suspend_pruned_partitions();
     let sample_context = super::sampling::preflight(db, stmt)?;
     let _sample_scope = sample_context.map(|context| super::sampling::enter(Some(context)));
     let _read_schema = crate::storage::read_schema::ReadSchemaScope::enter(

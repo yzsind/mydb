@@ -4641,19 +4641,19 @@ fn ivf_replica_wal_dml_refreshes_warm_directory() {
             .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=2)")
             .unwrap();
     }
+    let master = open_strict_test_engine(source.path());
+    master.checkpoint().unwrap();
     copy_tree(source.path(), target.path());
     let mut role = crate::repl::role::RoleState::new_standalone();
     role.demote_to_replica("127.0.0.1:1".into());
     crate::repl::role::save(target.path(), &role).unwrap();
-    let master = open_strict_test_engine(source.path());
     let replica = open_strict_test_engine(target.path());
     replica.database().set_physical_replica_mode(true).unwrap();
     let sql = "SELECT /*+ IVF_NPROBE(2) */ id FROM items ORDER BY DISTANCE(emb,'[0,0,0]') LIMIT 1";
     assert_eq!(id_list(&replica, sql), vec![1]);
-    // Mirror the applier's real WAL projection, without TCP timing in the test.
-    let mut next_lsn = crate::wal::LogManager::scan(source.path())
-        .unwrap()
-        .next_lsn;
+    // Mirror the applier's durable WAL-before-data contract, including source
+    // startup records after the copied baseline, without TCP timing.
+    let mut next_lsn = replica.database().wal_log().lock().next_lsn();
     for (dml, expected) in [
         ("INSERT INTO items VALUES (4,'[0,0,0]')", 4),
         ("UPDATE items SET emb='[40,0,0]' WHERE id=4", 1),
@@ -4662,6 +4662,26 @@ fn ivf_replica_wal_dml_refreshes_warm_directory() {
         master.execute(dml).unwrap();
         master.database().wal_log().lock().flush().unwrap();
         let scan = crate::wal::LogManager::scan(source.path()).unwrap();
+        let mut reader =
+            crate::wal::WalReader::open(&master.database().wal_log(), next_lsn).unwrap();
+        while let Some(chunk) = reader.next_chunk(scan.next_lsn - 1, 1024 * 1024).unwrap() {
+            let mut offset = 0;
+            while offset < chunk.bytes.len() {
+                let frame =
+                    crate::wal::decode_frame_for_replication(&chunk.bytes[offset..]).unwrap();
+                replica
+                    .database()
+                    .wal_log()
+                    .lock()
+                    .append_replication_frame(
+                        &chunk.bytes[offset..offset + frame.frame_len],
+                        &frame,
+                    )
+                    .unwrap();
+                offset += frame.frame_len;
+            }
+        }
+        replica.database().wal_log().lock().flush().unwrap();
         for record in scan.records.iter().filter(|r| r.lsn >= next_lsn) {
             replica.database().apply_wal_record(record).unwrap();
         }
@@ -5570,4 +5590,102 @@ fn vector_indexes_reject_retired_algorithm_in_all_ddl_forms() {
     engine
         .execute("CREATE INDEX native ON retired_algorithm(v) USING IVF WITH (nlist=1)")
         .unwrap();
+}
+
+#[test]
+fn release1106_unfinished_vector_maintenance_uses_exact_heap_results() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE vm(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO vm VALUES(1,'[1,1,1,1]'),(2,'[2,2,2,2]')")
+        .unwrap();
+    engine
+        .execute("CREATE INDEX vi ON vm(v) USING HNSW WITH(m=4,ef_construction=32)")
+        .unwrap();
+    let table = engine.database().table("vm").unwrap();
+    let index = table.indexes.iter().find(|i| i.is_vector()).unwrap();
+    let graph = engine
+        .database()
+        .vector_graph_get_or_build(&table, index)
+        .unwrap();
+    let crate::engine::vector::graph::VectorGraph::Paged(paged) = graph.as_ref() else {
+        panic!()
+    };
+    paged.file().invalidate_build(0).unwrap();
+    engine.database().evict_table_vector_graphs(table.id);
+    let sql = "SELECT id FROM vm ORDER BY DISTANCE(v,'[1,1,1,1]') LIMIT 2";
+    assert!(explain_mentions_vector_index(&engine, sql));
+    assert_eq!(id_list(&engine, sql), vec![1, 2]);
+}
+
+#[test]
+fn release1106_fulltext_scores_survive_checkpoint_and_reopen() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let expected;
+    {
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE ft_score(id INT PRIMARY KEY,txt TEXT,FULLTEXT INDEX ft(txt))")
+            .unwrap();
+        engine.execute("INSERT INTO ft_score VALUES(1,'apple banana'),(2,'apple cherry'),(3,'banana cherry'),(4,'cherry')").unwrap();
+        engine.execute("ANALYZE TABLE ft_score").unwrap();
+        engine
+            .execute(
+                "INSERT INTO ft_score VALUES(5,'orange'),(6,'orange'),(7,'orange'),(8,'orange')",
+            )
+            .unwrap();
+        expected = rows(
+            &engine,
+            "SELECT id,MATCH(txt) AGAINST('apple') FROM ft_score WHERE id<=2 ORDER BY id",
+        );
+        engine.checkpoint().unwrap();
+    }
+    let reopened = open_strict_test_engine(dir.path());
+    assert_eq!(
+        rows(
+            &reopened,
+            "SELECT id,MATCH(txt) AGAINST('apple') FROM ft_score WHERE id<=2 ORDER BY id"
+        ),
+        expected
+    );
+}
+
+#[test]
+fn release1106_vector_startup_removes_unpublished_generation_files() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    {
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE orphan_v(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO orphan_v VALUES(1,'[1,1,1,1]')")
+            .unwrap();
+        engine
+            .execute("CREATE INDEX vi ON orphan_v(v) USING HNSW WITH(m=4,ef_construction=32)")
+            .unwrap();
+        engine.checkpoint().unwrap();
+    }
+    let orphan = dir
+        .path()
+        .join("objects/indexes/999999/1/999.vector/100.hvec");
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, vec![0; 16384]).unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    assert!(!orphan.exists());
+    assert_eq!(
+        id_list(
+            &engine,
+            "SELECT id FROM orphan_v ORDER BY DISTANCE(v,'[1,1,1,1]') LIMIT 1"
+        ),
+        vec![1]
+    );
 }

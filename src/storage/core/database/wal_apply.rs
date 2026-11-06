@@ -645,6 +645,8 @@ impl Database {
                 if Self::path_is_index_file(path) {
                     return Ok(());
                 }
+                heap_redo.files.remove(path);
+                self.extend_replayed_heap_metadata(path, *page_id, after)?;
                 redo_page_update(&self.data_dir, path, *page_id, lsn, after)?;
                 self.note_dd_touch_if_needed(path, txn_id);
                 self.invalidate_buffer_pool_path(path)?;
@@ -654,11 +656,14 @@ impl Database {
                     return Ok(());
                 }
                 let after = crate::wal::wal_full_page_image_after(&record.payload)?;
+                heap_redo.files.remove(path);
+                self.extend_replayed_heap_metadata(path, *page_id, &after)?;
                 redo_page_update(&self.data_dir, path, *page_id, lsn, &after)?;
                 self.note_dd_touch_if_needed(path, txn_id);
                 self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::PageDelta { path, .. } => {
+                heap_redo.files.remove(path);
                 if Self::path_is_index_file(path) {
                     return Ok(());
                 }
@@ -671,6 +676,8 @@ impl Database {
                     return Ok(());
                 }
                 let (_, after) = crate::wal::wal_compressed_page_update_images(&record.payload)?;
+                heap_redo.files.remove(path);
+                self.extend_replayed_heap_metadata(path, *page_id, &after)?;
                 redo_page_update(&self.data_dir, path, *page_id, lsn, &after)?;
                 self.note_dd_touch_if_needed(path, txn_id);
                 self.invalidate_buffer_pool_path(path)?;
@@ -808,6 +815,7 @@ impl Database {
                 self.invalidate_buffer_pool_path(path)?;
             }
             WalPayload::FileExtend { path, new_len, .. } => {
+                heap_redo.files.remove(path);
                 let target = self.data_dir.join(path);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -908,6 +916,38 @@ impl Database {
                 .or_default()
                 .dd_touched = true;
         }
+    }
+
+    fn extend_replayed_heap_metadata(
+        &self,
+        path: &str,
+        page_id: u64,
+        after: &[u8],
+    ) -> Result<(), QueryError> {
+        if page_id != 0 || Self::parse_heap_table_id(path).is_none() {
+            return Ok(());
+        }
+        let absolute = self.data_dir.join(path);
+        let pages = decode_heap_meta(after, &page_owner(&absolute))?;
+        let length = pages.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "heap redo allocation overflow",
+            )
+        })?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(absolute)
+            .map_err(io_err)?;
+        // Publish allocation only after its physical extent exists. Readers
+        // may safely see zero pages until the uncommitted row redo follows.
+        if file.metadata().map_err(io_err)?.len() < length {
+            file.set_len(length).map_err(io_err)?;
+        }
+        Ok(())
     }
 
     /// Per-page pool invalidation for the hot heap apply path. The

@@ -1,3 +1,31 @@
+// Transaction-local shrink reservations keep page capacity independent of
+// transaction WAL publication order. Only the uncommon variable-width shrink
+// path allocates bookkeeping; fixed-width updates retain their existing path.
+#[derive(Debug, Default)]
+struct PendingHeapShrinks {
+    rows: HashMap<(u64, RowId), usize>,
+    charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+}
+
+#[derive(Debug, Default)]
+struct HeapShrinkRegistry {
+    active: AtomicBool,
+    transactions: parking_lot::Mutex<HashMap<u64, PendingHeapShrinks>>,
+}
+
+impl HeapShrinkRegistry {
+    fn remove(&self, txn_id: u64) -> Option<PendingHeapShrinks> {
+        if !self.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut transactions = self.transactions.lock();
+        let pending = transactions.remove(&txn_id);
+        self.active
+            .store(!transactions.is_empty(), Ordering::Release);
+        pending
+    }
+}
+
 // Differential benchmark oracle; absent from production builds.
 #[cfg(test)]
 fn serial_insert_lock_oracle() -> bool {
@@ -817,6 +845,7 @@ impl HeapFile {
             table_id,
             durability: std::sync::atomic::AtomicU8::new(durability_to_u8(durability)),
             update_reserve_bytes: update_reserve_bytes.min(MAX_HEAP_UPDATE_RESERVE_BYTES),
+            pending_shrinks: None,
             page_count: std::sync::atomic::AtomicU64::new(page_count),
             file_key,
             buffer_pool,
@@ -5343,15 +5372,101 @@ impl HeapFile {
         Ok(())
     }
 
+    fn reserve_heap_shrink(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        before_len: usize,
+        payload: &mut Vec<u8>,
+    ) -> Result<(), QueryError> {
+        if txn_id == 0 || self.durability() == DurabilityMode::Memory {
+            return Ok(());
+        }
+        let Some(registry) = &self.pending_shrinks else {
+            return Ok(());
+        };
+        if payload.len() >= before_len && !registry.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Never return uncommitted bytes to another row: its committed WAL
+        // may precede this transaction's shrink, including after a crash.
+        let key = (self.table_id, row_id);
+        let mut pending = registry.transactions.lock();
+        if payload.len() >= before_len {
+            if let Some(txn) = pending.get_mut(&txn_id) {
+                if let Some(length) = txn.rows.get_mut(&key) {
+                    *length = payload.len();
+                }
+            }
+            return Ok(());
+        }
+        // Publish before fallible admission so rollback also removes an empty
+        // entry left by a rejected first reservation.
+        registry.active.store(true, Ordering::Release);
+        let txn = pending.entry(txn_id).or_default();
+        if !txn.rows.contains_key(&key) {
+            use crate::engine::executor::mem_budget::{
+                ControlledMemoryCategory, ControlledMemoryCharge,
+            };
+            match &mut txn.charge {
+                Some(charge) => charge.try_grow(128)?,
+                None => {
+                    txn.charge = Some(ControlledMemoryCharge::try_new(
+                        ControlledMemoryCategory::StorageScratch,
+                        128,
+                    )?)
+                }
+            }
+        }
+        txn.rows.insert(key, payload.len());
+        payload.resize(before_len, 0);
+        Ok(())
+    }
+
+    fn trim_committed_heap_slot(
+        &self,
+        row_id: RowId,
+        desired_len: usize,
+    ) -> Result<(), QueryError> {
+        let _page_guard = self
+            .page_latch(row_id.page_id as u64)
+            .lock()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+        let Some(before) = self.with_page(row_id.page_id as u64, |page| {
+            Ok(page.payload(row_id.slot_id as usize)?.map(<[u8]>::to_vec))
+        })?
+        else {
+            return Ok(());
+        };
+        if desired_len >= before.len() {
+            return Ok(());
+        }
+        if before[desired_len..].iter().any(|byte| *byte != 0) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "heap shrink reservation no longer matches the row",
+            ));
+        }
+        // The transaction retains row locks until this redo-only shrink has
+        // been logged. A later writer can reuse capacity only after its WAL.
+        let payload = before[..desired_len].to_vec();
+        self.write_heap_update_raw_logged(0, row_id, before, payload, HeapUpdatePlan::InPlace, None)
+    }
+
     fn write_heap_update_logged(
         &self,
         txn_id: u64,
         row_id: RowId,
         before: Vec<u8>,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
         mut page: Page,
         undo_lsn: Option<u64>,
     ) -> Result<(), QueryError> {
+        let canonical_len = payload.len();
+        self.reserve_heap_shrink(txn_id, row_id, before.len(), &mut payload)?;
+        if payload.len() != canonical_len {
+            page.update(row_id.slot_id, &payload)?;
+        }
         self.maybe_emit_heap_fpi(row_id.page_id)?;
         let lsn = if self.durability() == DurabilityMode::Memory {
             0
@@ -5385,10 +5500,11 @@ impl HeapFile {
         txn_id: u64,
         row_id: RowId,
         before: Vec<u8>,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
         plan: HeapUpdatePlan,
         undo_lsn: Option<u64>,
     ) -> Result<(), QueryError> {
+        self.reserve_heap_shrink(txn_id, row_id, before.len(), &mut payload)?;
         let _scratch_charge = if plan == HeapUpdatePlan::Compact {
             Some(
                 crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(

@@ -249,13 +249,24 @@ impl Database {
             return Ok(());
         }
         let mut committed = HashMap::new();
-        for record in records
-            .records()
-            .only(&[crate::wal::WalRecordType::CommitTxn])
-        {
+        let mut unfinished = BTreeSet::new();
+        for record in records.records().only(&[
+            crate::wal::WalRecordType::CommitTxn,
+            crate::wal::WalRecordType::VectorIndexBatch,
+            crate::wal::WalRecordType::VectorIndexComplete,
+        ]) {
             let record = record?;
-            if let WalPayload::CommitTxn { commit_scn, .. } = record.payload {
-                committed.insert(record.txn_id, (commit_scn, record.lsn));
+            match record.payload {
+                WalPayload::CommitTxn { commit_scn, .. } => {
+                    committed.insert(record.txn_id, (commit_scn, record.lsn));
+                }
+                WalPayload::VectorIndexBatch { .. } => {
+                    unfinished.insert(record.txn_id);
+                }
+                WalPayload::VectorIndexComplete { txn_id, .. } => {
+                    unfinished.remove(&txn_id);
+                }
+                _ => {}
             }
         }
         self.vector_recovery_active.store(true, Ordering::Release);
@@ -365,6 +376,21 @@ impl Database {
                     }
                     _ => {}
                 }
+            }
+            drop(graphs);
+            // Complete the source-side commit protocol after recovering every
+            // logical delta and finalizing its physical pages. Replicas need
+            // this durable boundary even when the source crashed after COMMIT.
+            let mut completed = false;
+            for txn_id in unfinished {
+                if let Some(&(commit_scn, _)) = committed.get(&txn_id) {
+                    self.append_wal(0, WalPayload::VectorIndexComplete { txn_id, commit_scn })?;
+                    self.vector_pending_wal.lock().remove(&txn_id);
+                    completed = true;
+                }
+            }
+            if completed {
+                self.log.lock().flush()?;
             }
             Ok(())
         })();

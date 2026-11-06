@@ -65,6 +65,7 @@ pub(crate) mod cte;
 pub(crate) mod cte_store;
 mod ddl_deprecation;
 mod dispatch;
+pub(crate) use dispatch::statement_writes_only_temp_tables;
 pub(crate) mod row_spool;
 mod stream_mdl;
 pub(crate) use dispatch::{

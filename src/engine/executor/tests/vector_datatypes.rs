@@ -11,6 +11,53 @@ fn scalar(engine: &StorageQueryEngine, sql: &str) -> String {
 }
 
 #[test]
+fn release1106_vector_load_is_query_ready_and_recovers_all_element_types() {
+    for backend in ["paged", "memory"] {
+        let _env = HnswEnv::set(&[
+            ("MYDB_VECTOR_STORAGE", backend),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+            ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+        ]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("vectors.tsv");
+        let input = (1..=2048)
+            .map(|id| {
+                let n = id % 100 + 1;
+                format!("{id}\t[{n},{n},{n},{n}]\n")
+            })
+            .collect::<String>();
+        std::fs::write(&path, input).unwrap();
+        let check = |engine: &StorageQueryEngine| {
+            for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
+                let sql = format!("SELECT DISTANCE(v,'[50,50,50,50]') FROM load_{datatype} ORDER BY DISTANCE(v,'[50,50,50,50]') LIMIT 1");
+                assert_eq!(scalar(engine, &sql), "0", "{backend}/{datatype}");
+                assert_eq!(
+                    scalar(engine, &format!("SELECT COUNT(*) FROM load_{datatype}")),
+                    "2048"
+                );
+            }
+        };
+        {
+            let engine = open_strict_test_engine(dir.path());
+            for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8"] {
+                engine.execute(&format!("CREATE TABLE load_{datatype}(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)")).unwrap();
+                engine.execute(&format!("CREATE INDEX vi ON load_{datatype}(v) USING HNSW WITH(m=4,ef_construction=32)")).unwrap();
+                engine
+                    .execute(&format!(
+                        "LOAD DATA INFILE '{}' INTO TABLE load_{datatype}",
+                        crate::util::file::sql_path(&path)
+                    ))
+                    .unwrap();
+            }
+            check(&engine);
+            engine.checkpoint().unwrap();
+        }
+        let engine = open_strict_test_engine(dir.path());
+        check(&engine);
+    }
+}
+
+#[test]
 fn vector_datatypes_sql_storage_and_functions() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_strict_test_engine(dir.path());
@@ -1209,6 +1256,33 @@ fn vector_index_crash_replays_committed_deltas_without_heap_builds() {
                 }
                 let scans = crate::storage::Database::vector_build_heap_scans_for_test();
                 let engine = open_strict_test_engine(dir.path());
+                if phase == 1 {
+                    engine.database().wal_log().lock().flush().unwrap();
+                    let scan = crate::wal::LogManager::scan(dir.path()).unwrap();
+                    let mut batches = std::collections::BTreeSet::new();
+                    let mut commits = std::collections::BTreeSet::new();
+                    let mut complete = std::collections::BTreeSet::new();
+                    for record in &scan.records {
+                        match record.payload {
+                            crate::wal::WalPayload::VectorIndexBatch { .. } => {
+                                batches.insert(record.txn_id);
+                            }
+                            crate::wal::WalPayload::CommitTxn { .. } => {
+                                commits.insert(record.txn_id);
+                            }
+                            crate::wal::WalPayload::VectorIndexComplete { txn_id, .. } => {
+                                complete.insert(txn_id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    for id in batches.intersection(&commits) {
+                        assert!(
+                            complete.contains(id),
+                            "recovered source must complete committed vector txn {id}"
+                        );
+                    }
+                }
                 let query = crate::engine::vector::codec::parse_text("[0,0,0,0]").unwrap();
                 for (i, case @ (_, algorithm, _)) in CASES.iter().enumerate() {
                     let name = table_name(case);

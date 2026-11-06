@@ -41,11 +41,14 @@ fn stable_missing_index_id(name: &str) -> u64 {
 fn object_handle_cache_max() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        crate::util::env::var("MYDB_OBJECT_HANDLE_CACHE_MAX")
+        let configured = crate::util::env::var("MYDB_OBJECT_HANDLE_CACHE_MAX")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(512)
-            .max(32)
+            .max(32);
+        // Heap, index and overflow owners have separate caches. Leave room
+        // for buffer-pool descriptors, WAL, undo, sockets and transient opens.
+        crate::platform::file::bounded_file_cache_capacity(configured, 16)
     })
 }
 
@@ -867,6 +870,7 @@ impl Database {
             )?;
             // Setup can still fail before cache installation. A speculative
             // loser never owns shared frames, including on its error path.
+            heap_file.pending_shrinks = Some(self.pending_heap_shrinks.clone());
             heap_file.retain_buffered_pages_on_drop();
             // Attach an off-page LOB reader for tables that can externalize
             // (any string/binary column). Lazy: the overflow handle does not

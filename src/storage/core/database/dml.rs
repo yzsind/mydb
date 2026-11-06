@@ -1198,6 +1198,10 @@ impl Database {
                     }
                 }
                 let routed = table.route_row_to_partition(&values)?;
+                crate::engine::executor::partition_clause::check_partition_write(
+                    table.id,
+                    routed.storage_id,
+                )?;
                 prepared.push(Prepared {
                     orig_idx,
                     storage_id: routed.storage_id,

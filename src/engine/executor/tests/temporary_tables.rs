@@ -1684,3 +1684,172 @@ fn temporary_audit_quota_during_index_growth_keeps_previous_commits() {
         .execute_with_session(&mut session, "INSERT INTO growing VALUES(1,'reused')")
         .unwrap();
 }
+
+#[test]
+fn release1106_temporary_lob_quota_truncate_resets_all_pages() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    session.temp_quota = Arc::new(crate::storage::temp_quota::SessionTempQuota::new(
+        4,
+        98304,
+        1024 * 1024,
+    ));
+    engine
+        .execute_with_session(
+            &mut session,
+            "CREATE TEMPORARY TABLE q(id INT, payload LONGTEXT)",
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute_with_session(&mut session, "INSERT INTO q VALUES(0,REPEAT('x',200000))")
+            .unwrap_err()
+            .code(),
+        1114
+    );
+    engine
+        .execute_with_session(&mut session, "TRUNCATE TABLE q")
+        .unwrap();
+    engine
+        .execute_with_session(&mut session, "INSERT INTO q VALUES(1,REPEAT('y',30000))")
+        .unwrap();
+    assert_eq!(
+        first_int(
+            engine
+                .execute_with_session(&mut session, "SELECT LENGTH(payload) FROM q")
+                .unwrap()
+        ),
+        30000
+    );
+}
+
+#[test]
+fn release1106_temporary_read_only_writes_rollback_without_persistent_writes() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE TABLE permanent_t(id INT)",
+        "CREATE TEMPORARY TABLE q(id INT)",
+        "SET TRANSACTION READ ONLY",
+        "BEGIN",
+        "INSERT INTO q VALUES(1)",
+        "UPDATE q SET id=2",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    assert_eq!(
+        first_int(
+            engine
+                .execute_with_session(&mut session, "SELECT id FROM q")
+                .unwrap()
+        ),
+        2
+    );
+    assert_eq!(
+        engine
+            .execute_with_session(&mut session, "INSERT INTO permanent_t VALUES(1)")
+            .unwrap_err()
+            .code(),
+        1792
+    );
+    engine
+        .execute_with_session(&mut session, "ROLLBACK")
+        .unwrap();
+    assert_eq!(
+        first_int(
+            engine
+                .execute_with_session(&mut session, "SELECT COUNT(*) FROM q")
+                .unwrap()
+        ),
+        0
+    );
+}
+
+#[test]
+fn release1106_temporary_info_has_distinct_unsigned_ids() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE TEMPORARY TABLE a(id INT)",
+        "CREATE TEMPORARY TABLE b(id INT)",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    let rows = result_rows(
+        engine
+            .execute_with_session(
+                &mut session,
+                "SELECT TABLE_ID FROM information_schema.INNODB_TEMP_TABLE_INFO ORDER BY NAME",
+            )
+            .unwrap(),
+    );
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0][0], rows[1][0]);
+    assert!(matches!(rows[0][0], Value::UInt(_)));
+}
+
+#[test]
+fn release1106_temporary_ftwrl_exempts_only_temporary_targets() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    let mut other = SessionContext::default();
+    other.connection_id = 2002;
+    other.sysvars.lock_wait_timeout = Some(1);
+    engine
+        .execute_with_session(&mut other, "CREATE TEMPORARY TABLE q3(id INT)")
+        .unwrap();
+    for sql in [
+        "CREATE TABLE permanent_t(id INT)",
+        "CREATE TEMPORARY TABLE q(id INT)",
+        "FLUSH TABLES WITH READ LOCK",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    let result = (|| {
+        for sql in [
+            "CREATE TEMPORARY TABLE q4(id INT)",
+            "INSERT INTO q3 VALUES(1)",
+            "UPDATE q3 SET id=2",
+            "DROP TEMPORARY TABLE q4",
+        ] {
+            engine.execute_with_session(&mut other, sql)?;
+        }
+        for sql in [
+            "INSERT INTO q VALUES(1)",
+            "CREATE TEMPORARY TABLE q2(id INT)",
+            "DROP TEMPORARY TABLE q2",
+            "INSERT INTO q SELECT id FROM permanent_t",
+        ] {
+            engine.execute_with_session(&mut session, sql)?;
+        }
+        assert_eq!(
+            engine
+                .execute_with_session(&mut session, "DROP TABLE permanent_t, q")
+                .unwrap_err()
+                .code(),
+            1223
+        );
+        Ok::<_, QueryError>(())
+    })();
+    engine
+        .execute_with_session(&mut session, "UNLOCK TABLES")
+        .unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn release1106_temporary_internal_database_name_is_reserved() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    assert_eq!(
+        engine
+            .execute("CREATE DATABASE __mydb_temp")
+            .unwrap_err()
+            .code(),
+        1102
+    );
+}

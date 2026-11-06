@@ -2842,3 +2842,70 @@ fn jepsen_unique_string_key_reuse_preserves_rc_and_rr_reads() {
         engine.execute_with_session(session, "COMMIT").unwrap();
     }
 }
+
+#[test]
+fn release1106_heap_shrink_never_lends_uncommitted_page_capacity() {
+    for rollback in [false, true] {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_strict_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE space_t(id INT PRIMARY KEY,pad VARCHAR(16000))")
+            .unwrap();
+        let values = (1..=2000)
+            .map(|id| format!("({id},REPEAT('x',1000))"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO space_t VALUES {values}"))
+            .unwrap();
+        engine.checkpoint().unwrap();
+        let baseline_lsn = engine
+            .database_for_replication()
+            .wal_log()
+            .lock()
+            .last_lsn();
+        let replica_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        crate::util::file::copy_fixture_tree(dir.path(), replica_dir.path()).unwrap();
+        let mut a = SessionContext::default();
+        let mut b = SessionContext::default();
+        engine.execute_with_session(&mut a, "BEGIN").unwrap();
+        engine
+            .execute_with_session(&mut a, "UPDATE space_t SET pad='' WHERE id=2")
+            .unwrap();
+        engine.execute_with_session(&mut b, "BEGIN").unwrap();
+        engine
+            .execute_with_session(&mut b, "UPDATE space_t SET pad=REPEAT('y',3000) WHERE id=3")
+            .unwrap();
+        engine.execute_with_session(&mut b, "COMMIT").unwrap();
+        engine
+            .execute_with_session(&mut a, if rollback { "ROLLBACK" } else { "COMMIT" })
+            .unwrap();
+        // Reapply the complete WAL into a fresh physical snapshot, including
+        // the row migration needed when the source reservation is retained.
+        let db = engine.database_for_replication();
+        db.wal_log().lock().flush().unwrap();
+        let scan = crate::wal::LogManager::scan(dir.path()).unwrap();
+        let replica = open_strict_test_engine(replica_dir.path());
+        for record in scan
+            .records
+            .iter()
+            .filter(|record| record.lsn > baseline_lsn)
+        {
+            replica
+                .database_for_replication()
+                .apply_wal_record(record)
+                .unwrap();
+        }
+        let actual = super::support::query_rows(
+            &replica,
+            "SELECT id,LENGTH(pad) FROM space_t WHERE id IN(2,3) ORDER BY id",
+        );
+        assert_eq!(
+            actual,
+            vec![
+                vec![Value::Int(2), Value::Int(if rollback { 1000 } else { 0 })],
+                vec![Value::Int(3), Value::Int(3000)]
+            ]
+        );
+    }
+}

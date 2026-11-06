@@ -170,7 +170,7 @@ pub async fn run_sender(
     if req.protocol_version != PROTOCOL_VERSION {
         let source = source_wire_state(&env);
         let ack = HandshakeAck {
-            heartbeat_ms: 1000,
+            heartbeat_ms: env.config.heartbeat.as_millis().min(u64::MAX as u128) as u64,
             master_uuid: env.master_uuid,
             current_lsn: 0,
             durable_lsn: 0,
@@ -272,7 +272,7 @@ pub async fn run_sender(
         )
     };
     let ack = HandshakeAck {
-        heartbeat_ms: 1000,
+        heartbeat_ms: env.config.heartbeat.as_millis().min(u64::MAX as u128) as u64,
         master_uuid: env.master_uuid,
         current_lsn,
         durable_lsn: env.log.lock().durable_lsn(),
@@ -372,11 +372,28 @@ pub async fn run_sender(
             .data_dir
             .as_ref()
             .expect("needs_base_backup gated by data_dir Some");
-        match crate::repl::base_backup::stream_base_backup(&mut writer, db, data_dir).await {
+        match crate::repl::base_backup::stream_base_backup_with_chunk_bytes(
+            &mut writer,
+            db,
+            data_dir,
+            env.config
+                .chunk_bytes
+                .min(req.max_chunk_bytes.max(1) as usize),
+        )
+        .await
+        {
             Ok(snapshot) => {
                 effective_start_lsn = snapshot.backup_lsn.saturating_add(1);
             }
             Err(err) => {
+                let close = Message::Close(Close {
+                    reason: err.message().to_string(),
+                });
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    protocol::write_frame_async(&mut writer, &close).await?;
+                    writer.flush().await
+                })
+                .await;
                 return Err(err);
             }
         }
@@ -412,6 +429,11 @@ pub async fn run_sender(
             "mydb-repl master: slot persist after seed failed for {replica_uuid}: {}",
             e.message()
         ));
+    }
+    // Bootstrap installs the seed then reconnects with its durable progress.
+    // Its completed transfer is not a broken steady-state WAL connection.
+    if needs_base_backup {
+        return Ok(());
     }
     let effective_req = Handshake {
         requested_start_lsn: effective_start_lsn,

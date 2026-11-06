@@ -358,6 +358,14 @@ pub(super) fn execute_insert(
     } else {
         super::partition_clause::resolve_partition_clause(db, &stmt.table, &stmt.partitions)?
     };
+    let _partition_write = partition_filter
+        .as_ref()
+        .map(|allowed| {
+            db.table(&stmt.table).map(|table| {
+                super::partition_clause::PartitionWriteGuard::enter(table.id, allowed.clone())
+            })
+        })
+        .transpose()?;
     // Take ownership of `source` separately so the rest of `stmt`
     // (table name, columns, conflict flags) stays available to the
     // per-chunk dispatch helper below.
@@ -383,9 +391,6 @@ pub(super) fn execute_insert(
                 )?;
             }
             let records = rows.len() as u64;
-            if let Some(allowed) = &partition_filter {
-                filter_insert_partition_set(db, &stmt, allowed, &mut rows)?;
-            }
             let ctx = InsertChunkCtx::compute(db, session, &stmt);
             let resp = dispatch_insert_chunk(db, session, txn, &stmt, &ctx, rows, registry)?;
             finalize_insert_info(records, false);
@@ -443,6 +448,14 @@ pub(super) fn execute_insert_borrowed(
     } else {
         super::partition_clause::resolve_partition_clause(db, &stmt.table, &stmt.partitions)?
     };
+    let _partition_write = partition_filter
+        .as_ref()
+        .map(|allowed| {
+            db.table(&stmt.table).map(|table| {
+                super::partition_clause::PartitionWriteGuard::enter(table.id, allowed.clone())
+            })
+        })
+        .transpose()?;
     match &stmt.source {
         InsertSource::Values(expr_rows) => {
             if expr_rows
@@ -479,9 +492,6 @@ pub(super) fn execute_insert_borrowed(
                 )?;
             }
             let records = rows.len() as u64;
-            if let Some(allowed) = &partition_filter {
-                filter_insert_partition_set(db, &stmt, allowed, &mut rows)?;
-            }
             let ctx = InsertChunkCtx::compute(db, session, stmt);
             let resp = dispatch_insert_chunk(db, session, txn, stmt, &ctx, rows, registry)?;
             finalize_insert_info(records, false);
@@ -508,89 +518,6 @@ pub(super) fn execute_insert_borrowed(
             Ok(Some(resp))
         }
     }
-}
-
-/// M5.C2 — assert every row in `rows` routes to a partition whose
-/// `storage_id` is in `allowed`. Called from the executor *before* handing
-/// rows to the storage layer so the failure happens at the same parse-time
-/// step a real RANGE/LIST mismatch would, and so the row never lands on
-/// disk only to be rolled back.
-fn validate_insert_partition_set(
-    db: &Arc<Database>,
-    table_name: &str,
-    allowed: &[u64],
-    rows: &[Vec<Value>],
-) -> Result<(), QueryError> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let table = db.table(table_name)?;
-    if !table.is_partitioned() {
-        // resolve_partition_clause already errored on this; the check is
-        // re-asserted defensively in case the catalog changed between
-        // resolve and validate.
-        return Ok(());
-    }
-    for row in rows {
-        let routed = table.route_row_to_partition(row)?;
-        super::partition_clause::assert_insert_partition_allowed(allowed, routed.storage_id)?;
-    }
-    Ok(())
-}
-
-/// Validate routed physical rows, preserving IGNORE row skipping and diagnostics.
-fn filter_insert_partition_set(
-    db: &Arc<Database>,
-    stmt: &Insert,
-    allowed: &[u64],
-    rows: &mut Vec<Vec<Value>>,
-) -> Result<(), QueryError> {
-    let table = db.table(&stmt.table)?;
-    let indexes = insert_column_indexes(&table, stmt.columns.as_deref())?;
-    let template: Vec<_> = table.columns.iter().map(resolve_column_default).collect();
-    let mut failure = None;
-    rows.retain(|row| {
-        if failure.is_some() {
-            return true;
-        }
-        let result = (|| {
-            if row.len() != indexes.len() {
-                return Err(error(
-                    crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                    "column count does not match value count",
-                ));
-            }
-            let mut physical = template.clone();
-            for (&idx, value) in indexes.iter().zip(row) {
-                physical[idx] = value.clone();
-            }
-            let routed = table.route_row_to_partition(&physical)?;
-            super::partition_clause::assert_insert_partition_allowed(allowed, routed.storage_id)
-        })();
-        match result {
-            Ok(()) => true,
-            Err(err)
-                if stmt.ignore
-                    && err.is_any(&[
-                        crate::error::catalog::ER_NO_PARTITION_FOR_GIVEN_VALUE,
-                        crate::error::catalog::ER_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
-                    ]) =>
-            {
-                crate::engine::api::push_statement_condition(
-                    crate::error::ConditionLevel::Warning,
-                    &err,
-                );
-                crate::engine::api::add_insert_duplicates(1);
-                db.dml_stats().record_ignore_warning();
-                false
-            }
-            Err(err) => {
-                failure = Some(err);
-                true
-            }
-        }
-    });
-    failure.map_or(Ok(()), Err)
 }
 
 /// Apply a single (possibly partial) batch of rows through the same
@@ -1181,9 +1108,6 @@ fn execute_insert_from_select_stream(
                             &mut rows,
                             stmt.ignore,
                         )?;
-                        if let Some(allowed) = &partition_filter {
-                            filter_insert_partition_set(db, stmt, allowed, &mut rows)?;
-                        }
                         match dispatch_insert_chunk(
                             db, session, txn, &row_stmt, &ctx, rows, registry,
                         )? {
@@ -1221,9 +1145,6 @@ fn execute_insert_from_select_stream(
                     stmt.ignore,
                 )?;
                 total_records = total_records.saturating_add(chunk_rows.len() as u64);
-                if let Some(allowed) = &partition_filter {
-                    filter_insert_partition_set(db, stmt, allowed, &mut chunk_rows)?;
-                }
                 let response =
                     dispatch_insert_chunk(db, session, txn, stmt, &ctx, chunk_rows, registry)?;
                 match response {
@@ -1451,7 +1372,7 @@ fn execute_insert_from_select_parallel(
     _session: &mut SessionContext,
     txn: TxnView,
     table_name: &str,
-    partition_filter: Option<&[u64]>,
+    _partition_filter: Option<&[u64]>,
     select: crate::parser::QueryExpr,
     registry: &SessionRegistry,
     degree: usize,
@@ -1565,9 +1486,6 @@ fn execute_insert_from_select_parallel(
             INSERT_SELECT_CHUNK_ROWS,
             |mut chunk_rows| {
                 encode_insert_select_binary_sources(&mut chunk_rows, &binary_sources)?;
-                if let Some(allowed) = partition_filter {
-                    validate_insert_partition_set(db, table_name, allowed, &chunk_rows)?;
-                }
                 total_records = total_records.saturating_add(chunk_rows.len() as u64);
                 let mut pending = chunk_rows;
                 loop {

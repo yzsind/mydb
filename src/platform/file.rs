@@ -10,6 +10,61 @@ pub(crate) use std::fs::{File, OpenOptions};
 #[cfg(windows)]
 pub(crate) use windows::{File, OpenOptions};
 
+/// Bound a descriptor cache to a share of the process capacity. Zero keeps
+/// the caller's explicit unbounded setting. Detection runs only at cache setup.
+pub(crate) fn bounded_file_cache_capacity(configured: usize, share_divisor: usize) -> usize {
+    if configured == 0 {
+        return 0;
+    }
+    process_file_capacity().map_or(configured, |limit| {
+        configured.min((limit / share_divisor.max(1)).max(1))
+    })
+}
+
+#[cfg(unix)]
+fn process_file_capacity() -> Option<usize> {
+    static CAPACITY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        let mut resource = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit initializes a correctly sized output object.
+        let capacity = (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, resource.as_mut_ptr()) }
+            == 0)
+            .then(|| unsafe { resource.assume_init() }.rlim_cur)
+            .and_then(|limit| usize::try_from(limit).ok());
+        #[cfg(target_os = "macos")]
+        let capacity = {
+            // Darwin may enforce a lower per-process kernel ceiling even
+            // when the inherited RLIMIT_NOFILE advertises a larger value.
+            let mut kernel_limit = 0_i32;
+            let mut size = std::mem::size_of_val(&kernel_limit);
+            // SAFETY: the name is NUL-terminated and both output pointers
+            // reference correctly sized live objects; no setting is changed.
+            if unsafe {
+                libc::sysctlbyname(
+                    c"kern.maxfilesperproc".as_ptr(),
+                    (&mut kernel_limit as *mut i32).cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } == 0
+                && kernel_limit > 0
+            {
+                let kernel_limit = kernel_limit as usize;
+                Some(capacity.map_or(kernel_limit, |limit| limit.min(kernel_limit)))
+            } else {
+                capacity
+            }
+        };
+        capacity
+    })
+}
+
+#[cfg(not(unix))]
+fn process_file_capacity() -> Option<usize> {
+    None
+}
+
 /// Mark a scratch file as sparse before writing its first high-offset slot.
 pub(crate) fn make_sparse(file: &std::fs::File) -> std::io::Result<()> {
     #[cfg(windows)]

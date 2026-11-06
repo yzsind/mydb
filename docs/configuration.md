@@ -239,10 +239,14 @@ explicitly to override the default. This value does not open files in advance an
 is not a file cache capacity.
 
 `buffer_pool_file_cache_max` defaults to `1024` and bounds the number of file
-handles the buffer pool keeps long term; above the limit, idle handles are
-reclaimed with second chance. Under strict/relaxed durability, handles with
-pending fsync writes are kept until the sync completes, so the limit may be
-exceeded briefly; `0` explicitly disables the limit. Checkpoints in both modes
+handles the buffer pool keeps long term. The effective capacity is capped to a
+quarter of the process descriptor capacity, accounting for the extra direct-I/O
+descriptor on Linux and Darwin's kernel ceiling. Idle handles are reclaimed with
+second chance before opening another file; under strict/relaxed durability,
+pressure syncs pending writes in bounded batches before releasing descriptors,
+without depending on checkpoint progress. Active handles can temporarily exceed
+the limit; `0` explicitly disables the limit. Object handle caches also reserve
+descriptor headroom. Checkpoints in both modes
 sync written-back data files before releasing WAL; when history retention is
 enabled, undo history is synced as well, and replica restartpoints always sync
 undo. Outside of checkpoints, relaxed mode keeps its original weaker durability

@@ -6779,7 +6779,7 @@ fn innodb_temp_table_info_rows(db: &Database) -> Vec<Vec<Value>> {
                 let table = db.table(&temp.internal_key).ok()?;
                 let (_, name) = split_table_name(DEFAULT_DATABASE, visible_name);
                 Some(vec![
-                    Value::Int(saturating_i64(table.id)),
+                    Value::UInt(table.id),
                     s(&name),
                     Value::Int(table.iter_visible_columns().count() as i64),
                     Value::Int(table.id.min(u64::from(u32::MAX)) as i64),

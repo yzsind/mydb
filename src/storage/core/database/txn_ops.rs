@@ -3290,6 +3290,16 @@ impl Database {
         // errors until lock and frontier cleanup is complete, and include all
         // required maintenance WAL in the response durability barrier.
         let mut index_error = self.apply_pending_vector_deletes(txn_id, commit_scn).err();
+        let has_heap_shrinks = match self.finish_pending_heap_shrinks(txn_id) {
+            Ok(changed) => changed,
+            Err(err) => {
+                self.quarantine_mvcc(format!("committed heap shrink failed: {}", err.message()));
+                if index_error.is_none() {
+                    index_error = Some(err);
+                }
+                true
+            }
+        };
         // Early lock release, now on the separate `lock_manager` latch: drop the
         // `txns` write lock first (order txns → lock_manager), then release this
         // txn's row/unique locks — still BEFORE the durability fsync below.
@@ -3316,7 +3326,7 @@ impl Database {
         if has_vector_pending && index_error.is_none() {
             index_error = self.ensure_operational().err();
         }
-        let durability_lsn = if has_vector_pending {
+        let durability_lsn = if has_vector_pending || has_heap_shrinks {
             commit_lsn.max(self.log.lock().next_lsn().saturating_sub(1))
         } else {
             commit_lsn
@@ -3339,6 +3349,18 @@ impl Database {
             binlog_semi_sync_target,
             finished: false,
         })
+    }
+
+    fn finish_pending_heap_shrinks(&self, txn_id: u64) -> Result<bool, QueryError> {
+        let Some(pending) = self.pending_heap_shrinks.remove(txn_id) else {
+            return Ok(false);
+        };
+        for ((storage_id, row_id), desired_len) in &pending.rows {
+            self.with_heap_mut(*storage_id, |heap| {
+                heap.trim_committed_heap_slot(*row_id, *desired_len)
+            })?;
+        }
+        Ok(!pending.rows.is_empty())
     }
 
     /// Make a source-ordered set of previously prepared commits durable with
@@ -4690,7 +4712,7 @@ impl Database {
             .transactions
             .values()
             .filter(|txn| txn.completing)
-            .flat_map(|txn| txn.records.first().map(|record| record.lsn))
+            .filter_map(|txn| txn.first_lsn)
             .min();
         let vector_covered =
             applied_lsn.min(completing_floor.unwrap_or(u64::MAX).saturating_sub(1));
@@ -6294,6 +6316,7 @@ impl Database {
     }
 
     fn rollback_txn_inner(&self, txn_id: u64) -> Result<(), QueryError> {
+        self.pending_heap_shrinks.remove(txn_id);
         // Handler_rollback: single funnel for every rollback path.
         crate::engine::status_counters::record_handler_rollback();
         self.discard_pending_live_row_deltas(txn_id);
@@ -6523,6 +6546,7 @@ impl Database {
         if unchanged {
             return Ok(());
         }
+        self.pending_heap_shrinks.remove(txn_id);
         self.flush_txn_wal_buffer(txn_id, None)?;
         let boundary = savepoint
             .wal_boundary

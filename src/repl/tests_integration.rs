@@ -145,6 +145,7 @@ async fn audit_fragmented_ack_survives_heartbeat_ticks() {
         panic!()
     };
     assert!(ack.accepted, "{}", ack.reason);
+    assert_eq!(ack.heartbeat_ms, 10);
     let mut bytes = Vec::new();
     protocol::write_frame(
         &mut bytes,
@@ -1834,7 +1835,7 @@ mod lifecycle_tests {
         let result =
             crate::repl::base_backup::stream_base_backup(&mut writer, db, dir.path()).await;
         assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(6));
         assert!(!db.capture.frozen.load(std::sync::atomic::Ordering::Acquire));
         assert!(!db.capture.active.load(std::sync::atomic::Ordering::Acquire));
         engine
@@ -2782,4 +2783,39 @@ mod base_backup_tests {
         assert_eq!(err.code(), 1235);
         service.shutdown().await;
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn release1106_backup_drains_an_existing_writer() {
+    let dir = fresh_database_tempdir();
+    let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+    engine
+        .execute("CREATE TABLE drain_t(id INT PRIMARY KEY)")
+        .unwrap();
+    let mut session = crate::engine::SessionContext::default();
+    engine.execute_with_session(&mut session, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut session, "INSERT INTO drain_t VALUES(1)")
+        .unwrap();
+    let writer = engine.clone();
+    let completion = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        writer
+            .execute_with_session(&mut session, "INSERT INTO drain_t VALUES(2)")
+            .unwrap();
+        writer.execute_with_session(&mut session, "COMMIT").unwrap();
+    });
+    let mut sink = tokio::io::BufWriter::new(tokio::io::sink());
+    let result = crate::repl::base_backup::stream_base_backup(
+        &mut sink,
+        engine.database_for_replication(),
+        dir.path(),
+    )
+    .await;
+    completion.await.unwrap();
+    result.unwrap();
+    let db = engine.database_for_replication();
+    assert!(!db.capture.active.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!db.capture.frozen.load(std::sync::atomic::Ordering::Acquire));
 }

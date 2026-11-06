@@ -2315,6 +2315,12 @@ impl UndoManager {
             // A network chunk may contain many ordered frames. Retire its
             // contiguous prefix before treating this as a reorder overflow.
             self.drain_replicated_pending_frames()?;
+            if self.check_replicated_frame_admission(undo_id, len).is_err() {
+                // A complete WAL frame remains usable when a source crash
+                // loses its unlogged physical predecessor. Persist bounded
+                // batches with source-id aliases instead of waiting forever.
+                self.persist_replicated_frames_for_promotion()?;
+            }
             self.check_replicated_frame_admission(undo_id, len)?;
         }
         Ok(())
@@ -2600,6 +2606,7 @@ impl UndoManager {
         // below so the files and the live id space agree; otherwise a
         // fresh append would allocate the same ptr as a WAL-recovered
         // record and collide.
+        let mut published_ends = vec![(0u32, 0u64); undo.write_shards.len()];
         let mut repair_frames: Vec<(u64, usize)> = Vec::new();
         let mut repair_locator_charge =
             crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
@@ -2610,6 +2617,20 @@ impl UndoManager {
             if let Some(record) = wal_records.undo_record(record_index)? {
                 let undo_id = &record.undo_id;
                 let bytes = record.bytes.as_ref();
+                let segment = undo_ptr_segment(*undo_id);
+                if let Some((highest, end)) =
+                    published_ends.get_mut(shard_of_segment(segment) as usize)
+                {
+                    let frame_end = undo_ptr_offset(*undo_id)
+                        .saturating_add(UNDO_FRAME_HEADER_LEN as u64)
+                        .saturating_add(bytes.len() as u64);
+                    if segment > *highest {
+                        *highest = segment;
+                        *end = frame_end;
+                    } else if segment == *highest {
+                        *end = (*end).max(frame_end);
+                    }
+                }
                 let mut undo_record = if let Some(retained) = retained_txn_ids {
                     let mut metadata = decode_undo_record_metadata(bytes)?;
                     let retained_payload = retained.contains(&metadata.txn_id);
@@ -2703,6 +2724,27 @@ impl UndoManager {
             }
         }
         if retained_txn_ids.is_some() {
+            // Even obsolete WAL frames reserve their original identities.
+            // A lost undo tail may leave only a segment header on disk; do
+            // not allocate from its beginning after filtering those frames.
+            for (lane, (published_segment, published_end)) in published_ends.into_iter().enumerate()
+            {
+                let mut shard = undo.write_shards[lane].lock();
+                if published_segment > shard.active_segment_id
+                    || (published_segment == shard.active_segment_id
+                        && shard.active_offset < published_end)
+                {
+                    shard.next_seg_seq = shard.next_seg_seq.max(published_segment >> SHARD_BITS);
+                    shard.rotate()?;
+                    shard.flush_all()?;
+                    let path = shard.segment_path(shard.active_segment_id)?;
+                    crate::platform::fs::sync_file_at(shard.active_file.as_ref().unwrap(), &path)
+                        .map_err(io_err)?;
+                    crate::platform::fs::sync_path(path.parent().unwrap()).map_err(io_err)?;
+                    undo.segment_file_bytes
+                        .insert(shard.active_segment_id, shard.active_offset);
+                }
+            }
             undo.reclaim_empty_segments_after_recovery()?;
         }
         // Eagerly ensure every shard has an open active segment file so
@@ -5640,9 +5682,8 @@ impl UndoManager {
     }
 
     /// Reclaim segments made empty by startup filtering. Non-active segments
-    /// can be unlinked outright. The newest segment in each write shard stays
-    /// as that shard's allocation anchor, but when it has no retained records
-    /// its obsolete frames are truncated back to the durable 32-byte header.
+    /// can be unlinked outright. Empty active segments rotate to a durable new
+    /// allocation anchor before reclaim, so restart never reuses published ids.
     fn reclaim_empty_segments_after_recovery(&mut self) -> Result<(), QueryError> {
         #[cfg(target_os = "macos")]
         let mut sync_batch = crate::platform::fs::DeviceSyncBatch::new();
@@ -5663,7 +5704,27 @@ impl UndoManager {
             if old_len <= UNDO_SEGMENT_HEADER_LEN {
                 continue;
             }
+            // A replica may still have this process's old frames on disk.
+            // Reusing offsets in the same segment would alias their undo ids.
+            // Publish a fresh allocation anchor before reclaiming the old one.
+            if let Some(shard) = self.write_shards.get(shard_of_segment(segment_id) as usize) {
+                let mut shard = shard.lock();
+                if shard.active_segment_id == segment_id {
+                    shard.rotate()?;
+                    shard.flush_all()?;
+                    let next_path = self.segment_path(shard.active_segment_id)?;
+                    let next_file = OpenOptions::new()
+                        .write(true)
+                        .open(&next_path)
+                        .map_err(io_err)?;
+                    crate::platform::fs::sync_file_at(&next_file, &next_path).map_err(io_err)?;
+                    crate::platform::fs::sync_path(next_path.parent().unwrap()).map_err(io_err)?;
+                    self.segment_file_bytes
+                        .insert(shard.active_segment_id, shard.active_offset);
+                }
+            }
             let path = self.segment_path(segment_id)?;
+            self.invalidate_segment_reader(segment_id);
             let file = OpenOptions::new().write(true).open(&path).map_err(io_err)?;
             file.set_len(UNDO_SEGMENT_HEADER_LEN).map_err(io_err)?;
             #[cfg(target_os = "macos")]
@@ -5675,14 +5736,6 @@ impl UndoManager {
             self.reclaimed_bytes = self
                 .reclaimed_bytes
                 .saturating_add(old_len.saturating_sub(UNDO_SEGMENT_HEADER_LEN));
-            if let Some(shard) = self.write_shards.get(shard_of_segment(segment_id) as usize) {
-                let mut shard = shard.lock();
-                if shard.active_segment_id == segment_id {
-                    shard.active_offset = UNDO_SEGMENT_HEADER_LEN;
-                    shard.buffer_start = UNDO_SEGMENT_HEADER_LEN;
-                    shard.tail_buffer.clear();
-                }
-            }
         }
         #[cfg(target_os = "macos")]
         sync_batch.finish().map_err(io_err)?;

@@ -77,6 +77,7 @@ pub(in crate::engine::executor) fn enforce_session_write_access(
         return Ok(());
     }
     if transaction_read_only
+        && !statement_writes_only_temp_tables(session, statement)
         && crate::statement_effects::is_read_only_transaction_forbidden(statement)
     {
         return Err(error(

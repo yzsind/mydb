@@ -1101,7 +1101,8 @@ fn expect_punct(t: &mut Tokeniser<'_>, expected: Tok) -> Result<(), crate::parse
 fn parse_unsigned_int(t: &mut Tokeniser<'_>) -> Result<u32, crate::parser::ParseError> {
     match t.next()? {
         Tok::Number(n) => n
-            .parse::<u32>()
+            .parse::<u64>()
+            .map(|value| value.min(u32::MAX as u64) as u32)
             .map_err(|_| crate::parser::ParseError::at_zero(format!("invalid integer `{}`", n))),
         other => Err(crate::parser::ParseError::at_zero(format!(
             "expected unsigned integer, got {:?}",

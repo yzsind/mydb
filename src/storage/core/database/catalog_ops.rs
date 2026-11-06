@@ -136,6 +136,12 @@ impl Database {
         default_collation: Option<&str>,
     ) -> Result<(), QueryError> {
         let key = normalize_name(name);
+        if key == "__mydb_temp" {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_DB_NAME,
+                "Database name '__mydb_temp' is reserved for session temporary tables",
+            ));
+        }
         let collation_info = default_collation
             .map(crate::charset::resolve_collation)
             .transpose()?;

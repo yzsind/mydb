@@ -93,6 +93,15 @@ impl Database {
         changed_columns: Option<&[usize]>,
         released_keys: Option<&[crate::util::fast_hash::AhHashSet<RowId>]>,
     ) -> Result<(), QueryError> {
+        if table.is_partitioned()
+            && crate::engine::executor::partition_clause::has_partition_write_constraint(table.id)
+        {
+            let routed = table.route_row_to_partition(new_values)?;
+            crate::engine::executor::partition_clause::check_partition_write(
+                table.id,
+                routed.storage_id,
+            )?;
+        }
         self.check_updated_not_null_constraints(table, new_values, changed_columns)?;
         self.check_check_constraints(table, new_values, changed_columns)?;
         self.lock_changed_unique_keys_for_update(

@@ -1046,6 +1046,16 @@ static OPTION_SPECS: &[OptionSpec] = &[
         OptionKind::Bytes
     ),
     spec!(
+        "repl_bootstrap_max_attempts",
+        "MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS",
+        OptionKind::U32
+    ),
+    spec!(
+        "repl_base_backup_drain_ms",
+        "MYDB_REPL_BASE_BACKUP_DRAIN_MS",
+        OptionKind::U64
+    ),
+    spec!(
         "repl_base_backup_disk_reserve_pct",
         "MYDB_REPL_BASE_BACKUP_DISK_RESERVE_PCT",
         OptionKind::U64

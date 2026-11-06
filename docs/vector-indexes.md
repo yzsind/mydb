@@ -210,6 +210,10 @@ persisted structure and trained model and completes committed changes from
 WAL; it does not scan the heap to reconstruct a missing or damaged index.
 Missing files, invalid identities, checksum failures and maintenance failures
 return explicit errors. Storage failures do not select an exact-query fallback.
+An index whose durable maintenance boundary is still pending can temporarily
+use an exact MVCC heap scan. This narrow fallback does not clear failure fences
+or hide corrupt files. LOAD DATA into an indexed vector table uses the same
+transactional batch maintenance and recovery journal as INSERT.
 
 Resident structures use immutable snapshot generations and an atomic manifest;
 paged structures retain their source page identities and WAL ordering. A

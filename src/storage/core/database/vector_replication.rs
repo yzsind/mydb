@@ -9,7 +9,7 @@ struct ReplicaVectorState {
 }
 #[derive(Debug, Default)]
 struct ReplicaVectorTxn {
-    records: Vec<WalRecord>,
+    first_lsn: Option<u64>,
     tables: BTreeSet<u64>,
     completing: bool,
     charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
@@ -83,18 +83,17 @@ impl Database {
     }
 
     fn note_replica_vector_record(&self, record: &WalRecord) -> Result<(), QueryError> {
-        let (parent, tables, bytes) = match &record.payload {
+        let (parent, tables) = match &record.payload {
             WalPayload::VectorIndexBatch { bytes } => (
                 record.txn_id,
                 VectorRecoveryMutation::decode_batch(bytes)?
                     .into_iter()
                     .map(|entry| entry.table_id)
                     .collect::<BTreeSet<_>>(),
-                bytes.len(),
             ),
             WalPayload::VectorIndexModel { bytes } => {
                 let mut reader = vector::persistence::Reader::new(bytes, 6)?;
-                (reader.u64()?, BTreeSet::from([reader.u64()?]), bytes.len())
+                (reader.u64()?, BTreeSet::from([reader.u64()?]))
             }
             _ => return Err(vector::persistence::corrupt()),
         };
@@ -103,9 +102,7 @@ impl Database {
         }
         let mut state = self.replica_vector_state.lock();
         let txn = state.transactions.entry(parent).or_default();
-        let bytes = bytes
-            .checked_add(256)
-            .ok_or_else(vector::persistence::corrupt)?;
+        let bytes = tables.difference(&txn.tables).count().saturating_mul(256);
         if let Some(charge) = txn.charge.as_mut() {
             charge.try_grow_recoverable(bytes)?;
         } else {
@@ -117,7 +114,7 @@ impl Database {
             );
         }
         txn.tables.extend(tables);
-        txn.records.push(record.clone());
+        txn.first_lsn.get_or_insert(record.lsn);
         self.vector_pending_wal
             .lock()
             .entry(parent)
@@ -135,9 +132,71 @@ impl Database {
         self.wait_for_vector_readers(&mut state, &tables, std::time::Duration::from_secs(30))
     }
 
+    fn visit_replica_vector_wal(
+        &self,
+        first_lsn: u64,
+        parent: u64,
+        mut visit: impl FnMut(&WalPayload) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        fn walk(
+            payload: &WalPayload,
+            txn_id: u64,
+            parent: u64,
+            visit: &mut impl FnMut(&WalPayload) -> Result<(), QueryError>,
+            matches: &mut usize,
+        ) -> Result<(), QueryError> {
+            match payload {
+                WalPayload::TxnBatch { records } => {
+                    for payload in records {
+                        walk(payload, txn_id, parent, visit, matches)?;
+                    }
+                }
+                WalPayload::VectorIndexBatch { .. } if txn_id == parent => {
+                    visit(payload)?;
+                    *matches += 1;
+                }
+                WalPayload::VectorIndexModel { bytes } => {
+                    let mut reader = vector::persistence::Reader::new(bytes, 6)?;
+                    if reader.u64()? == parent {
+                        visit(payload)?;
+                        *matches += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        let mut reader = crate::wal::WalReader::open(&self.log, first_lsn)
+            .map_err(crate::repl::replica::applier::overlap_read_error)?;
+        let high = self.log.lock().last_lsn();
+        let mut matches = 0;
+        while let Some(chunk) = reader
+            .next_chunk(high, 1024 * 1024)
+            .map_err(crate::repl::replica::applier::overlap_read_error)?
+        {
+            let mut offset = 0;
+            while offset < chunk.bytes.len() {
+                let frame = crate::wal::decode_frame_for_replication(&chunk.bytes[offset..])?;
+                walk(
+                    &frame.payload,
+                    frame.header.txn_id,
+                    parent,
+                    &mut visit,
+                    &mut matches,
+                )?;
+                offset += frame.frame_len;
+            }
+        }
+        if matches == 0 {
+            return Err(vector::persistence::corrupt());
+        }
+        Ok(())
+    }
+
     fn complete_replica_vector_transaction(&self, txn_id: u64, scn: u64) -> Result<(), QueryError> {
-        // Move records out while preserving the read fence on every error.
-        let records = {
+        // WAL already owns the payloads. Retain only the pinned starting LSN
+        // and stream them at completion, independent of transaction size.
+        let first_lsn = {
             let mut state = self.replica_vector_state.lock();
             let Some(txn) = state.transactions.get_mut(&txn_id) else {
                 return Ok(());
@@ -145,14 +204,14 @@ impl Database {
             if !txn.completing {
                 return Err(vector::persistence::corrupt());
             }
-            std::mem::take(&mut txn.records)
+            txn.first_lsn.ok_or_else(vector::persistence::corrupt)?
         };
         let result = (|| -> Result<(), QueryError> {
             // Paged directories reflect the source's completed physical pages.
             // Resident structures apply the same durable logical changes.
             let mut reloaded = HashSet::new();
-            for record in &records {
-                match &record.payload {
+            self.visit_replica_vector_wal(first_lsn, txn_id, |payload| {
+                match payload {
                     WalPayload::VectorIndexBatch { bytes } => {
                         for mutation in VectorRecoveryMutation::decode_batch(bytes)? {
                             let Some(table) = self.table_by_id_checked(mutation.table_id)? else {
@@ -196,21 +255,12 @@ impl Database {
                     WalPayload::VectorIndexModel { .. } => {}
                     _ => return Err(vector::persistence::corrupt()),
                 }
-            }
+                Ok(())
+            })?;
             self.vector_snapshot_floor.fetch_max(scn, Ordering::AcqRel);
             Ok(())
         })();
-        if let Err(err) = result {
-            if let Some(txn) = self
-                .replica_vector_state
-                .lock()
-                .transactions
-                .get_mut(&txn_id)
-            {
-                txn.records = records;
-            }
-            return Err(err);
-        }
+        result?;
         self.replica_vector_state
             .lock()
             .transactions

@@ -121,22 +121,15 @@ pub fn with_pruned_partitions<F, T>(storage_ids: Vec<u64>, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let prev = PRUNED_PARTITIONS.with(|cell| {
-        let previous = cell.borrow().clone();
-        let effective = match previous.as_ref() {
-            Some(outer) => storage_ids
-                .into_iter()
-                .filter(|storage_id| outer.contains(storage_id))
-                .collect(),
-            None => storage_ids,
-        };
-        cell.replace(Some(effective))
+    let effective = PRUNED_PARTITIONS.with(|cell| match cell.borrow().as_ref() {
+        Some(outer) => storage_ids
+            .into_iter()
+            .filter(|id| outer.contains(id))
+            .collect(),
+        None => storage_ids,
     });
-    let result = f();
-    PRUNED_PARTITIONS.with(|cell| {
-        *cell.borrow_mut() = prev;
-    });
-    result
+    let _scope = push_pruned_partitions(effective);
+    f()
 }
 
 /// Snapshot the currently-active pruned partition set. Used by the

@@ -21,6 +21,10 @@ use crate::types::QueryError;
 
 pub const SLOTS_DIR: &str = "system/replication/slots";
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SlotStatus {
@@ -62,8 +66,8 @@ pub struct SlotState {
     /// must leave the semi-sync quorum immediately.
     #[serde(default)]
     pub connected: bool,
-    /// In-flight base backup owns a retention lease until streaming starts.
-    #[serde(skip)]
+    /// A bounded seed lease survives restart; it never supplies quorum ACKs.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub seeding: bool,
 }
 
@@ -911,4 +915,20 @@ mod tests {
         let _ = SlotRegistry::open(dir.path()).unwrap();
         assert!(!slots_dir.join("a.slot.tmp").exists());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn release1106_seed_lease_survives_restart_without_live_quorum() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let mut registry = SlotRegistry::open(dir.path()).unwrap();
+    let slot = registry.create_or_get("replica", 1000);
+    slot.state.lock().seeding = true;
+    registry.persist_all().unwrap();
+    drop(registry);
+    let reopened = SlotRegistry::open(dir.path()).unwrap();
+    let state = reopened.get("replica").unwrap().snapshot();
+    assert!(state.seeding);
+    assert!(!state.connected);
+    assert_eq!(state.confirmed_acked_lsn, 0);
 }

@@ -642,3 +642,66 @@ fn audit1028_keyless_update_ignores_tombstones_and_virtual_placeholders() {
         ]]
     );
 }
+
+#[test]
+fn release1106_partitioned_row_apply_preserves_physical_identity() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = StorageQueryEngine::open(dir.path()).unwrap();
+    for (table, key) in [("keyed", "PRIMARY KEY"), ("keyless", "")] {
+        engine
+            .execute(&format!(
+                "CREATE TABLE {table}(id INT {key}, v INT) PARTITION BY HASH(id) PARTITIONS 2"
+            ))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "INSERT INTO {table} VALUES(1,10),(2,20),(3,30),(4,40)"
+            ))
+            .unwrap();
+        let db = engine.database_for_replication();
+        for id in [1, 2, 3, 4] {
+            let txn = db.begin_txn().unwrap();
+            apply_update_rows(
+                db,
+                txn,
+                "test",
+                table,
+                &[RowUpdate {
+                    before: vec![Value::Int(id), Value::Int(id * 10)],
+                    after: vec![Value::Int(id), Value::Int(id * 100)],
+                }],
+            )
+            .unwrap();
+            db.commit_txn(txn.txn_id).unwrap();
+        }
+        let rows = match engine
+            .execute(&format!("SELECT id,v FROM {table} ORDER BY id"))
+            .unwrap()
+        {
+            QueryResponse::ResultSet(rs) => rs.rows,
+            _ => panic!(),
+        };
+        assert_eq!(
+            rows,
+            (1..=4)
+                .map(|id| vec![Value::Int(id), Value::Int(id * 100)])
+                .collect::<Vec<_>>()
+        );
+        for id in [1, 2, 3, 4] {
+            let txn = db.begin_txn().unwrap();
+            apply_delete_rows(
+                db,
+                txn,
+                "test",
+                table,
+                &[vec![Value::Int(id), Value::Int(id * 100)]],
+            )
+            .unwrap();
+            db.commit_txn(txn.txn_id).unwrap();
+        }
+        assert!(db
+            .scan_rows(&format!("test.{table}"), db.begin_txn().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+}

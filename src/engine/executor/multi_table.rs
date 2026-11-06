@@ -922,6 +922,12 @@ pub(super) fn execute_multi_update(
         let old_values = update.old;
         let mut new_values = update.new;
         let schema = ctx.participants[p_idx].schema.clone();
+        let _partition_write = super::partition_clause::resolve_partition_clause(
+            db,
+            &ctx.participants[p_idx].storage_key,
+            &ctx.participants[p_idx].partitions,
+        )?
+        .map(|allowed| super::partition_clause::PartitionWriteGuard::enter(schema.id, allowed));
         let on_update = super::dml::on_update_timestamp_columns(&schema, &update.user_columns);
         super::dml::apply_on_update_timestamps(&schema, &mut new_values, &on_update);
         let mut write_columns = update.user_columns.clone();
