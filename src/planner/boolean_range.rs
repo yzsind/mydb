@@ -46,7 +46,7 @@ fn cmp_bound(a: &IndexBound, b: &IndexBound, lower: bool) -> Option<Ordering> {
         if a == b {
             continue;
         }
-        if matches!(a, KeyPart::Param { .. }) || matches!(b, KeyPart::Param { .. }) {
+        if a.is_deferred() || b.is_deferred() {
             return None;
         }
         let cmp = a.cmp(b);

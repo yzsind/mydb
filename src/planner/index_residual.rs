@@ -287,6 +287,7 @@ fn covered(
         && !lower.is_some_and(|k| match k {
             KeyPart::Null => false,
             KeyPart::Param { idx, target } => exact_param(*idx, *target),
+            KeyPart::Statement { .. } => false,
             _ => true,
         })
     {
@@ -296,18 +297,14 @@ fn covered(
         low.is_some_and(|b| {
             b.key.0.len() == pos + 1
                 && ((b.key.0[pos] == key && (!strict || !b.inclusive))
-                    || (!matches!(b.key.0[pos], KeyPart::Param { .. })
-                        && !matches!(key, KeyPart::Param { .. })
-                        && b.key.0[pos] > key))
+                    || (!b.key.0[pos].is_deferred() && !key.is_deferred() && b.key.0[pos] > key))
         })
     };
     let upper_ok = |strict: bool| {
         high.is_some_and(|b| {
             b.key.0.len() == pos + 1
                 && ((b.key.0[pos] == key && (!strict || !b.inclusive))
-                    || (!matches!(b.key.0[pos], KeyPart::Param { .. })
-                        && !matches!(key, KeyPart::Param { .. })
-                        && b.key.0[pos] < key))
+                    || (!b.key.0[pos].is_deferred() && !key.is_deferred() && b.key.0[pos] < key))
         })
     };
     match op {

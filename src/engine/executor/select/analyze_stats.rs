@@ -124,7 +124,50 @@ impl StatsSource {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SampleRuntimeStats {
+    pub sequential_percent: bool,
+    pub root_pages: u64,
+    pub root_checks: u64,
+    pub nonempty_pages: u64,
+    pub visible_roots: u64,
+    pub rounds: u64,
+    pub decoded_rows: u64,
+    pub directory_peak_bytes: u64,
+    pub spill_bytes: u64,
+    pub workers: u32,
+}
+
+pub(super) fn add_sample_runtime_key(key: PlanNodeId, work: SampleRuntimeStats) {
+    STATS_COLLECTOR.with(|cell| {
+        if let Some(collector) = cell.borrow().as_ref() {
+            if let Ok(mut map) = collector.stats.lock() {
+                let node = map.entry(key).or_default();
+                node.peak_memory_bytes = node.peak_memory_bytes.max(work.directory_peak_bytes);
+                node.spill_bytes += work.spill_bytes;
+                if work.spill_bytes > 0 {
+                    node.spill_reason.get_or_insert("memory_limit");
+                }
+                let stats = &mut node.sample;
+                let entry = stats.get_or_insert_with(SampleRuntimeStats::default);
+                entry.sequential_percent |= work.sequential_percent;
+                entry.root_pages += work.root_pages;
+                entry.root_checks += work.root_checks;
+                entry.nonempty_pages += work.nonempty_pages;
+                entry.visible_roots += work.visible_roots;
+                entry.rounds = entry.rounds.max(work.rounds);
+                entry.decoded_rows += work.decoded_rows;
+                entry.directory_peak_bytes =
+                    entry.directory_peak_bytes.max(work.directory_peak_bytes);
+                entry.spill_bytes += work.spill_bytes;
+                entry.workers = entry.workers.max(work.workers);
+            }
+        }
+    });
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct NodeStats {
+    pub sample: Option<SampleRuntimeStats>,
     pub rowid_access: bool,
     pub rowid_candidates: u64,
     pub rowid_unique_candidates: u64,
@@ -2058,6 +2101,10 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                 if value > 0 {
                     suffix.push_str(&format!(" {name}={value}"));
                 }
+            }
+            if let Some(work) = s.sample {
+                suffix.push_str(&format!(" sampler={} sample_pages={} sample_nonempty_pages={} sample_root_checks={} sample_visible_candidates={} sample_rounds={} sample_decoded_rows={} sample_workers={} sample_directory_peak_bytes={}",
+                    if work.sequential_percent {"row_percent_scan"} else {"block_round_row"},work.root_pages,work.nonempty_pages,work.root_checks,work.visible_roots,work.rounds,work.decoded_rows,work.workers,work.directory_peak_bytes));
             }
             if s.peak_memory_bytes > 0 {
                 suffix.push_str(&format!(" peak_mem={}", s.peak_memory_bytes));

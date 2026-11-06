@@ -1905,6 +1905,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
             result
         }
         Expr::Function { name, args, .. } => {
+            if name.eq_ignore_ascii_case("RLS_CONTEXT") {
+                let mut result = fixed_string_result(None, true);
+                result.collation_id = Some(46);
+                result.coercibility = 2;
+                return result;
+            }
             if let Some(descriptor) = crate::engine::expr::resolved_stored_function_type(name) {
                 return descriptor;
             }

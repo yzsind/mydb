@@ -215,6 +215,32 @@ fn expand_view_body(
     context.active_roles = security.active_roles;
     super::super::routines::bind_view_stored_functions(db, &context, &mut expanded)?;
     expand_views_in_select(db, &context, &mut expanded, depth + 1, trail)?;
+    // Keep identity local to this reference: a table-wide override would also
+    // authorize a sibling direct reference or another view of the same table.
+    struct Protected<'a> {
+        db: &'a Database,
+        found: bool,
+    }
+    impl crate::parser::visit::AstVisitor for Protected<'_> {
+        fn enter_select(&mut self, query: &Select) {
+            self.found |= query
+                .from
+                .iter()
+                .chain(query.joins.iter().map(|j| &j.table))
+                .any(|table| {
+                    self.db.table(&table.name).is_ok_and(|schema| {
+                        crate::engine::rls::statement_security_enabled(self.db, &schema)
+                            .unwrap_or(true)
+                    })
+                });
+        }
+    }
+    let mut protected = Protected { db, found: false };
+    crate::parser::visit::visit_select(&mut protected, &expanded);
+    if protected.found {
+        expanded.rls_security_context = Some(Arc::new(context.authorization_context()));
+        expanded.no_merge = true;
+    }
     compact_expanded_view_body(&mut expanded)?;
     trail.remove(&trail_key(view));
     Ok(expanded)
@@ -757,6 +783,8 @@ fn wrap_view_query(query: crate::parser::QueryExpr) -> Select {
         return *select;
     }
     Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Wildcard],
         table: Some("__view_query".to_owned()),
         from: vec![TableRef {
@@ -1226,7 +1254,7 @@ fn reject_view_temp_table_refs(
     collect_select_table_uses(select, false, &Default::default(), &mut uses);
     if uses
         .iter()
-        .any(|usage| session.has_temp_table(&usage.table))
+        .any(|usage| super::is_session_temp_table_ref(session, &usage.table))
     {
         return Err(error(
             crate::error::catalog::ER_VIEW_SELECT_TMPTABLE,
@@ -1954,30 +1982,8 @@ fn view_security_schema(security: RoutineSecurity) -> RoutineSecuritySchema {
     }
 }
 
-fn ensure_view_definer_exists(
-    db: &Arc<Database>,
-    options: &MaterializedViewOptions,
-) -> Result<(), QueryError> {
-    let definer = AccountKey::new(&options.definer_user, &options.definer_host);
-    let exists = db.with_auth_catalog(|auth| auth.accounts.contains_key(&account_id(&definer)))?;
-    if exists {
-        Ok(())
-    } else {
-        Err(error(
-            crate::error::catalog::ER_NO_SUCH_USER,
-            format!(
-                "The user specified as a definer ({}) does not exist",
-                definer.display()
-            ),
-        ))
-    }
-}
-
-/// P3.2 — CREATE/ALTER VIEW variant of [`ensure_view_definer_exists`]: a
-/// missing definer account produces warning 1449 instead of an error, so the
-/// view is still created. MySQL allows defining a view whose DEFINER does not
-/// yet exist (e.g. restoring a dump before the users are created); the error
-/// only surfaces when the view is later read under DEFINER security.
+/// A missing definer at DDL time produces a warning. Execution validates
+/// the account against the statement's captured authorization catalog.
 pub(super) fn warn_if_view_definer_missing(
     db: &Arc<Database>,
     options: &MaterializedViewOptions,
@@ -2223,17 +2229,17 @@ pub(super) fn effective_view_security_account(
     inherited_invoker: Option<&crate::engine::auth::AuthorizationContext>,
 ) -> Result<crate::engine::auth::AuthorizationContext, QueryError> {
     if view.security_type == RoutineSecuritySchema::Definer {
-        ensure_view_definer_exists(
-            db,
-            &MaterializedViewOptions {
-                algorithm: view.algorithm.clone(),
-                definer_user: view.definer_user.clone(),
-                definer_host: view.definer_host.clone(),
-                security_type: view.security_type.clone(),
-            },
-        )?;
-        let auth = db.auth_catalog();
+        let auth = crate::engine::rls::authorization_snapshot(db);
         let account = AccountKey::new(&view.definer_user, &view.definer_host);
+        if !auth.accounts.contains_key(&account_id(&account)) {
+            return Err(error(
+                crate::error::catalog::ER_NO_SUCH_USER,
+                format!(
+                    "The user specified as a definer ({}) does not exist",
+                    account.display()
+                ),
+            ));
+        }
         Ok(crate::engine::auth::AuthorizationContext {
             active_roles: auth.login_active_roles(&account).into(),
             authenticated_as: account,

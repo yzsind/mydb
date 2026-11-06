@@ -1839,6 +1839,24 @@ impl Database {
         candidate.default_roles.begin_mutation();
         candidate.restrictions.begin_mutation();
         f(&mut candidate)?;
+        for change in snapshot.accounts.diff(&candidate.accounts) {
+            if let imbl::ordmap::DiffItem::Remove(_, account) = change {
+                for key in snapshot.api_keys_for(&account.key) {
+                    if candidate.api_keys.get(&key.id).is_some_and(|k| !candidate.accounts.contains_key(&crate::engine::auth::account_id(&k.owner))) { candidate.api_keys.remove(&key.id); }
+                }
+            }
+        }
+        let retired: Vec<_> = snapshot.accounts.iter().filter(|(key, _)| !candidate.accounts.contains_key(*key)).map(|(_, account)| account.key.clone()).collect();
+        if !retired.is_empty() {
+            let keys: Vec<_> = self.catalog_read()?.tables.values().filter(|t| t.row_security.version != 0).map(|t| t.qualified_name()).collect();
+            for key in keys {
+                let table = self.table(&key)?;
+                if table.row_security.policies.iter().any(|p| p.roles.iter().any(|role| retired.contains(role))) {
+                    return Err(crate::engine::rls::violation("Cannot retire an account or role referenced by a row security policy"));
+                }
+            }
+        }
+
         let model_ids: Vec<_> = candidate
             .grants
             .iter()

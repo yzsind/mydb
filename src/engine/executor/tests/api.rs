@@ -3806,6 +3806,8 @@ fn prepared_limit_offset_and_dml_order_limit_execute() {
         .unwrap();
 
     let select = Statement::Select(Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Expr {
             expr: Expr::Identifier("id".into()),
             alias: None,

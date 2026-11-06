@@ -31,6 +31,43 @@ const SOURCES: &[&str] = &[
 ];
 
 #[test]
+fn temporal_comparison_cached_text_shapes_keep_literal_errors() {
+    with_test_env(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
+        for data_type in ["DATE", "DATETIME(6)", "TIMESTAMP(6)"] {
+            let (_dir, engine, mut session) = fixture(data_type);
+            for empty in [false, true] {
+                if empty {
+                    engine
+                        .execute_with_session(&mut session, "DELETE FROM dates")
+                        .unwrap();
+                }
+                for predicate in ["d = 'not-a-date'", "d IN ('2024-03-01','not-a-date')"] {
+                    let sql = format!("SELECT COUNT(*) FROM dates WHERE {predicate}");
+                    let err = engine.execute_with_session(&mut session, &sql).unwrap_err();
+                    assert_eq!(err.code(), 1525, "{data_type}; empty={empty}; {sql}");
+                    let (statement, params, shape) =
+                        QueryEngine::cached_text_statement(&engine, &session, &sql)
+                            .expect("the parser must have published the literal shape");
+                    for _ in 0..3 {
+                        let err = QueryEngine::execute_parsed_with_params(
+                            &engine,
+                            &mut session,
+                            &sql,
+                            statement.clone(),
+                            params.clone(),
+                            shape.clone(),
+                        )
+                        .and_then(QueryResponse::materialize)
+                        .unwrap_err();
+                        assert_eq!(err.code(), 1525, "{data_type}; empty={empty}; {sql}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn temporal_comparison_invalid_literals_are_plan_independent() {
     for auto in ["off", "select"] {
         with_test_env(&[("MYDB_AUTO_PARAMETERIZE", Some(auto))], || {

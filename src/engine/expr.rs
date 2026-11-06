@@ -72,6 +72,8 @@ pub(crate) struct SessionExprInfo {
     collation_connection: String,
     user_variables: crate::engine::user_variables::UserVariables,
     expression_registry: Option<std::sync::Weak<crate::engine::SessionRegistry>>,
+    rls: crate::engine::rls::ContextSnapshot,
+    rls_evaluation: Option<crate::engine::rls::EvaluationSnapshot>,
     xml_locals: Option<xml::Locals>,
     xml_parameter_binding: usize,
     xml_parameter_types: Option<std::sync::Arc<Vec<xml::ParameterType>>>,
@@ -94,6 +96,137 @@ pub(crate) struct SessionExprInfo {
     field_numeric_materialization: bool,
     strict_numeric_materialization: bool,
     rand_state: std::sync::Arc<parking_lot::Mutex<(u64, u64)>>,
+}
+
+/// Persisted expression semantics, independent of the caller's identity,
+/// tenant values, statement clock and transaction read view.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct PolicyExpressionSettings {
+    sql_mode: String,
+    temporal_sql_mode_bits: u16,
+    character_set_client: String,
+    character_set_connection: String,
+    collation_connection: String,
+    div_precision_increment: u8,
+    time_zone: String,
+    lc_time_names: String,
+    default_week_format: u32,
+    block_encryption_mode: String,
+    explicit_defaults_for_timestamp: bool,
+}
+impl PolicyExpressionSettings {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + 32
+            + self.sql_mode.capacity()
+            + self.character_set_client.capacity()
+            + self.character_set_connection.capacity()
+            + self.collation_connection.capacity()
+            + self.time_zone.capacity()
+            + self.lc_time_names.capacity()
+            + self.block_encryption_mode.capacity()
+    }
+    pub(crate) fn capture(session: &crate::engine::api::SessionContext) -> Self {
+        Self {
+            sql_mode: session.sql_mode.clone(),
+            temporal_sql_mode_bits: session.temporal_sql_mode_bits,
+            character_set_client: session.character_set_client.clone(),
+            character_set_connection: session.character_set_connection.clone(),
+            collation_connection: session.collation_connection.clone(),
+            div_precision_increment: session.sysvars.div_precision_increment.min(30) as u8,
+            time_zone: session.sysvars.time_zone.clone(),
+            lc_time_names: session.sysvars.lc_time_names.clone(),
+            default_week_format: session.sysvars.default_week_format as u32,
+            block_encryption_mode: session.sysvars.block_encryption_mode.clone(),
+            explicit_defaults_for_timestamp: session.sysvars.explicit_defaults_for_timestamp,
+        }
+    }
+    pub(crate) fn matches_session(&self, session: &crate::engine::api::SessionContext) -> bool {
+        self.sql_mode == session.sql_mode
+            && self.temporal_sql_mode_bits == session.temporal_sql_mode_bits
+            && self.character_set_client == session.character_set_client
+            && self.character_set_connection == session.character_set_connection
+            && self.collation_connection == session.collation_connection
+            && self.div_precision_increment == session.sysvars.div_precision_increment.min(30) as u8
+            && self.time_zone == session.sysvars.time_zone
+            && self.lc_time_names == session.sysvars.lc_time_names
+            && self.default_week_format == session.sysvars.default_week_format as u32
+            && self.block_encryption_mode == session.sysvars.block_encryption_mode
+            && self.explicit_defaults_for_timestamp
+                == session.sysvars.explicit_defaults_for_timestamp
+    }
+    pub(crate) fn matches_current(&self) -> bool {
+        with_session_view(|view| match view {
+            Some(SessionView::Borrowed(session)) => self.matches_session(session),
+            Some(SessionView::Owned(info)) => {
+                self.sql_mode == info.sql_mode
+                    && self.temporal_sql_mode_bits == info.temporal_sql_mode_bits
+                    && self.character_set_client == info.character_set_client
+                    && self.character_set_connection == info.character_set_connection
+                    && self.collation_connection == info.collation_connection
+                    && self.div_precision_increment == info.div_precision_increment
+                    && self.time_zone == info.time_zone
+                    && self.lc_time_names == info.lc_time_names
+                    && self.default_week_format == info.default_week_format
+                    && self.block_encryption_mode == info.block_encryption_mode
+                    && self.explicit_defaults_for_timestamp == info.explicit_defaults_for_timestamp
+            }
+            None => false,
+        })
+    }
+    fn apply(&self, info: &mut SessionExprInfo) {
+        info.sql_mode = self.sql_mode.clone();
+        info.temporal_sql_mode_bits = self.temporal_sql_mode_bits;
+        info.character_set_client = self.character_set_client.clone();
+        info.character_set_connection = self.character_set_connection.clone();
+        info.collation_connection = self.collation_connection.clone();
+        info.div_precision_increment = self.div_precision_increment;
+        info.time_zone = self.time_zone.clone();
+        info.lc_time_names = self.lc_time_names.clone();
+        info.default_week_format = self.default_week_format;
+        info.block_encryption_mode = self.block_encryption_mode.clone();
+        info.explicit_defaults_for_timestamp = self.explicit_defaults_for_timestamp;
+        let strict = self.temporal_sql_mode_bits & crate::engine::api::TEMPORAL_MODE_STRICT != 0
+            || self.temporal_sql_mode_bits & crate::engine::api::TEMPORAL_MODE_EXPLICIT == 0;
+        info.strict_numeric_materialization = STRICT_NUMERIC_MATERIALIZATION
+            .with(std::cell::Cell::get)
+            || (DML_EXPRESSION_DEPTH.with(|depth| depth.get() != 0) && strict);
+    }
+}
+
+pub(crate) fn with_policy_query_settings<R>(
+    settings: &PolicyExpressionSettings,
+    f: impl FnOnce() -> Result<R, QueryError>,
+) -> Result<R, QueryError> {
+    if settings.matches_current() {
+        return f();
+    }
+    let encoded = serde_json::to_string(settings)
+        .map_err(|_| crate::engine::rls::violation("Cannot encode policy expression settings"))?;
+    with_policy_expression_settings(&encoded, f)?
+}
+
+pub(crate) fn with_policy_expression_settings<R>(
+    encoded: &str,
+    f: impl FnOnce() -> R,
+) -> Result<R, QueryError> {
+    let info = crate::engine::rls::policy_expression_info(encoded, || {
+        let settings: PolicyExpressionSettings = serde_json::from_str(encoded)
+            .map_err(|_| crate::engine::rls::violation("Invalid policy expression settings"))?;
+        let mut info = with_session_view(|view| match view {
+            Some(SessionView::Borrowed(session)) => Some(capture_external_expr_info(session)),
+            Some(SessionView::Owned(info)) => Some(info.clone()),
+            None => None,
+        })
+        .ok_or_else(|| {
+            crate::engine::rls::violation("Policy expression has no statement context")
+        })?;
+        info.user_variables = Default::default();
+        info.query_attributes.clear();
+        settings.apply(&mut info);
+        Ok(std::sync::Arc::new(info))
+    })?;
+    Ok(with_session_expr_info_snapshot_arc(info, f))
 }
 
 #[cfg(test)]
@@ -149,7 +282,7 @@ mod math_result_type_tests {
 thread_local! {
     static SESSION_CTX_PTR: Cell<Option<NonNull<crate::engine::api::SessionContext>>> =
         const { Cell::new(None) };
-    static SESSION_INFO_OWNED: std::cell::RefCell<Option<SessionExprInfo>> =
+    static SESSION_INFO_OWNED: std::cell::RefCell<Option<std::sync::Arc<SessionExprInfo>>> =
         const { std::cell::RefCell::new(None) };
     /// Startup-only `max_digest_length` is modeled as a scoped override for
     /// in-process server instances. Production uses the default; MTR may
@@ -226,6 +359,8 @@ fn capture_session_expr_info_with_variables(
         collation_connection: session.collation_connection.clone(),
         user_variables,
         expression_registry: session.expression_registry.clone(),
+        rls: session.rls.snapshot(),
+        rls_evaluation: crate::engine::rls::evaluation_snapshot(),
         xml_locals: xml::current_locals(),
         xml_parameter_binding: session.xml_parameter_binding,
         xml_parameter_types: session.xml_parameter_types.clone(),
@@ -279,6 +414,7 @@ pub(crate) fn with_session_expr_info<R>(
     let ptr = NonNull::from(session);
     let prev = SESSION_CTX_PTR.with(|c| c.replace(Some(ptr)));
     let _guard = PtrGuard { prev };
+    let _security = crate::engine::rls::EvaluationScope::enter();
     f()
 }
 
@@ -310,6 +446,7 @@ pub(crate) unsafe fn with_session_expr_info_raw<R>(
     }
     let prev = SESSION_CTX_PTR.with(|c| c.replace(Some(session)));
     let _guard = PtrGuard { prev };
+    let _security = crate::engine::rls::EvaluationScope::enter();
     f()
 }
 
@@ -317,11 +454,19 @@ pub(crate) fn with_session_expr_info_snapshot<R>(
     info: SessionExprInfo,
     f: impl FnOnce() -> R,
 ) -> R {
+    with_session_expr_info_snapshot_arc(std::sync::Arc::new(info), f)
+}
+fn with_session_expr_info_snapshot_arc<R>(
+    info: std::sync::Arc<SessionExprInfo>,
+    f: impl FnOnce() -> R,
+) -> R {
     let _xml_locals = xml::enter_locals(info.xml_locals.clone());
     let _statement_now = crate::engine::api::StatementNowScope::enter(info.statement_now_micros);
+    let _security =
+        crate::engine::rls::EvaluationScope::enter_snapshot(info.rls_evaluation.as_ref());
     struct SnapshotGuard {
         prev_ptr: Option<NonNull<crate::engine::api::SessionContext>>,
-        prev_owned: Option<SessionExprInfo>,
+        prev_owned: Option<std::sync::Arc<SessionExprInfo>>,
     }
     impl Drop for SnapshotGuard {
         fn drop(&mut self) {
@@ -366,7 +511,7 @@ fn with_session_view<R>(f: impl FnOnce(Option<SessionView<'_>>) -> R) -> R {
     } else {
         SESSION_INFO_OWNED.with(|cell| {
             let borrow = cell.borrow();
-            f(borrow.as_ref().map(SessionView::Owned))
+            f(borrow.as_deref().map(SessionView::Owned))
         })
     }
 }
@@ -388,6 +533,46 @@ pub(crate) fn current_authorization_context(
             info.current_user_is_system,
         )),
         None => None,
+    })
+}
+
+/// A view query uses its own effective identity while retaining the original
+/// connection's tenant values, read view and all other expression settings.
+pub(crate) fn with_row_security_identity<R>(
+    context: &crate::engine::auth::AuthorizationContext,
+    f: impl FnOnce() -> Result<R, QueryError>,
+) -> Result<R, QueryError> {
+    let mut info = current_session_expr_info()
+        .ok_or_else(|| crate::engine::rls::violation("Security view has no statement context"))?;
+    info.authorization_context = context.clone();
+    info.current_user = context.authenticated_as.current_user_value();
+    info.current_role = if context.active_roles.is_empty() {
+        "NONE".into()
+    } else {
+        context
+            .active_roles
+            .iter()
+            .map(|role| role.role_sql_name())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // A DEFINER identity never inherits the caller's internal system marker.
+    info.current_user_is_system = false;
+    with_session_expr_info_snapshot(info, f)
+}
+
+pub(crate) fn row_security_enabled() -> bool {
+    with_session_view(|view| match view {
+        Some(SessionView::Borrowed(s)) => s.rls.enabled,
+        Some(SessionView::Owned(s)) => s.rls.enabled,
+        None => true,
+    })
+}
+pub(crate) fn row_security_context(key: &str) -> Value {
+    with_session_view(|view| match view {
+        Some(SessionView::Borrowed(s)) => s.rls.value(key),
+        Some(SessionView::Owned(s)) => s.rls.value(key),
+        None => Value::Null,
     })
 }
 
@@ -558,6 +743,17 @@ struct StoredFnCtx {
     db: NonNull<std::sync::Arc<crate::storage::Database>>,
     session: NonNull<crate::engine::api::SessionContext>,
     registry: NonNull<crate::engine::session_registry::SessionRegistry>,
+}
+
+/// Clone the statement-owned handle only for policy subquery execution.
+pub(crate) fn row_security_database() -> Option<std::sync::Arc<crate::storage::Database>> {
+    STORED_FN_CTX
+        .with(|ctx| ctx.get())
+        .map(|ctx| {
+            // SAFETY: the stored-function RAII scope pins the Arc for this call.
+            unsafe { ctx.db.as_ref().clone() }
+        })
+        .or_else(|| crate::engine::rls::current_statement_view().map(|(db, _)| db))
 }
 
 /// RAII guard restoring the previous stored-function context on drop.
@@ -747,6 +943,11 @@ pub(crate) fn resolved_stored_function_type(
 /// `sql_mentions_user_var_assign` guard), so the `&mut` re-borrow is sound and
 /// the write is immediately visible to later reads on the same thread.
 fn assign_session_user_variable(name: &str, value: Value) -> Result<Value, QueryError> {
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy cannot assign session variables",
+        ));
+    }
     let written = STORED_FN_CTX.with(|c| c.get()).map(|ctx| {
         // SAFETY: same invariant as `eval_stored_function` — the pointer is
         // valid for the installed scope and only touched on the serial
@@ -776,35 +977,52 @@ fn eval_stored_function(name: &str, arg_values: Vec<Value>) -> Option<Result<Val
         let registry = unsafe { ctx.registry.as_ref() };
         let resolved = RESOLVED_STORED_FUNCTIONS
             .with(|functions| functions.borrow().get(&name.to_ascii_lowercase()).cloned());
-        match resolved {
-            Some(routine) => {
-                let saved = routine.view_context.as_ref().map(|context| {
-                    (
-                        std::mem::replace(
-                            &mut session.authenticated_as,
-                            context.authenticated_as.clone(),
-                        ),
-                        std::mem::replace(&mut session.active_roles, context.active_roles.clone()),
-                    )
-                });
-                let result = crate::engine::executor::routines::eval_stored_function_resolved(
-                    db,
-                    session,
-                    &routine.routine,
-                    &routine.program,
-                    arg_values,
-                    registry,
-                );
-                if let Some((account, roles)) = saved {
-                    session.authenticated_as = account;
-                    session.active_roles = roles;
-                }
-                result
-            }
+        let context = resolved
+            .as_ref()
+            .and_then(|routine| routine.view_context.clone())
+            .or_else(|| {
+                crate::engine::rls::policy_active()
+                    .then(current_authorization_context)
+                    .flatten()
+                    .map(|(context, _)| context)
+            });
+        let saved = context.as_ref().map(|context| {
+            (
+                std::mem::replace(
+                    &mut session.authenticated_as,
+                    context.authenticated_as.clone(),
+                ),
+                std::mem::replace(&mut session.active_roles, context.active_roles.clone()),
+            )
+        });
+        let session_ptr = NonNull::from(&*session);
+        let needs_borrowed_scope = SESSION_CTX_PTR.with(|pointer| pointer.get().is_none());
+        let evaluate = || match resolved {
+            Some(routine) => crate::engine::executor::routines::eval_stored_function_resolved(
+                db,
+                session,
+                &routine.routine,
+                &routine.program,
+                arg_values,
+                registry,
+            ),
             None => crate::engine::executor::routines::eval_stored_function_row(
                 db, session, name, arg_values, registry,
             ),
+        };
+        let result = if needs_borrowed_scope {
+            // A policy/view snapshot must yield to the routine's own mutable
+            // DEFINER and creation-time settings while its body executes.
+            // SAFETY: the installed stored-function capability pins session.
+            unsafe { with_session_expr_info_raw(session_ptr, evaluate) }
+        } else {
+            evaluate()
+        };
+        if let Some((account, roles)) = saved {
+            session.authenticated_as = account;
+            session.active_roles = roles;
         }
+        result
     })
 }
 
@@ -992,6 +1210,11 @@ fn authorize_sequence_value(
 
 /// `nextval('seq')` — advance and return the next value; non-transactional.
 pub(crate) fn eval_nextval(name: &str) -> Result<Value, QueryError> {
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy cannot modify sequences",
+        ));
+    }
     with_seq_ctx(|db, session| {
         let _write = db.acquire_sequence_write_lease()?;
         authorize_sequence_value(db, session, name, true)?;
@@ -1128,6 +1351,11 @@ pub(crate) fn eval_lastval() -> Result<Value, QueryError> {
 
 /// `setval('seq', value [, is_called])` — non-transactional counter reset.
 pub(crate) fn eval_setval(name: &str, value: i64, is_called: bool) -> Result<Value, QueryError> {
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy cannot modify sequences",
+        ));
+    }
     crate::engine::cancel::check_cancelled()?;
     with_seq_ctx(|db, session| {
         let _write = db.acquire_sequence_write_lease()?;
@@ -1998,7 +2226,13 @@ pub(crate) fn current_session_expr_info() -> Option<SessionExprInfo> {
         // SAFETY: same as `with_session_view`.
         Some(capture_session_expr_info(unsafe { ptr.as_ref() }))
     } else {
-        SESSION_INFO_OWNED.with(|cell| cell.borrow().clone())
+        SESSION_INFO_OWNED
+            .with(|cell| cell.borrow().as_deref().cloned())
+            .map(|mut info| {
+                info.rls_evaluation =
+                    crate::engine::rls::evaluation_snapshot().or(info.rls_evaluation);
+                info
+            })
     }
 }
 
@@ -2043,6 +2277,15 @@ pub(crate) fn xml_parameter_type(index: usize) -> Option<xml::ParameterType> {
     })
 }
 
+pub(crate) fn checked_session_user_variable(name: &str) -> Result<Value, QueryError> {
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy functions cannot read mutable session variables",
+        ));
+    }
+    Ok(session_user_variable(name).unwrap_or(Value::Null))
+}
+
 pub(crate) fn session_user_variable(name: &str) -> Option<Value> {
     let key = crate::engine::api::normalize_user_variable_name(name);
     with_session_view(|view| view.and_then(|v| v.user_variable(&key)))
@@ -2058,6 +2301,11 @@ pub(crate) fn eval_system_variable(
     name: &str,
     db: Option<&crate::storage::Database>,
 ) -> Result<Value, QueryError> {
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy functions cannot read mutable system variables",
+        ));
+    }
     with_active_session(|session| {
         let session = session.ok_or_else(|| {
             error(
@@ -3878,7 +4126,7 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                 "parameter is not bound",
             )
         }),
-        Expr::UserVariable(name) => Ok(session_user_variable(name).unwrap_or(Value::Null)),
+        Expr::UserVariable(name) => checked_session_user_variable(name),
         Expr::SystemVariable { scope, name } => eval_system_variable(*scope, name, None),
         Expr::Unary {
             op: UnaryOp::Neg,
@@ -4213,7 +4461,7 @@ fn eval_expr_legacy_inner(
             }
             Ok(values[table.column_index(parts.last().unwrap())?].clone())
         }
-        Expr::UserVariable(name) => Ok(session_user_variable(name).unwrap_or(Value::Null)),
+        Expr::UserVariable(name) => checked_session_user_variable(name),
         Expr::SystemVariable { scope, name } => eval_system_variable(*scope, name, None),
         Expr::Literal(lit) => Ok(literal_value(lit)),
         Expr::BoundValue(value) => Ok(value.clone()),
@@ -5151,6 +5399,26 @@ pub(crate) fn eval_function<F>(name: &str, args: &[Expr], eval_arg: F) -> Result
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
+    if crate::engine::rls::policy_active()
+        && (crate::engine::http::is_function(name)
+            || [
+                "GET_LOCK",
+                "RELEASE_LOCK",
+                "RELEASE_ALL_LOCKS",
+                "SLEEP",
+                "BENCHMARK",
+                "LOAD_FILE",
+                "NEXTVAL",
+                "SETVAL",
+            ]
+            .iter()
+            .any(|f| name.eq_ignore_ascii_case(f))
+            || name.eq_ignore_ascii_case("LAST_INSERT_ID") && !args.is_empty())
+    {
+        return Err(crate::engine::rls::violation(
+            "Row security policies cannot execute side-effecting functions",
+        ));
+    }
     if name.eq_ignore_ascii_case("FIELD") {
         let no_column = |_: &Expr| None;
         let no_placeholder = |_: usize| None;
@@ -5321,6 +5589,26 @@ where
                 Some(v) => v.user(),
                 None => "root@localhost".to_string(),
             })))
+        }
+        "__MYDB_RLS_GUARD" => {
+            expect_arg_count(name, args, 2)?;
+            let id = uint_value(&eval_arg(&args[0])?)?;
+            let _guard = crate::engine::rls::PolicyScope::enter(id)?;
+            eval_arg(&args[1])
+        }
+        "__MYDB_RLS_SETTINGS" => {
+            expect_arg_count(name, args, 2)?;
+            let Expr::Literal(Literal::String(encoded)) = &args[0] else {
+                return Err(crate::engine::rls::violation(
+                    "Invalid policy expression settings",
+                ));
+            };
+            with_policy_expression_settings(encoded, || eval_arg(&args[1]))?
+        }
+        "RLS_CONTEXT" => {
+            expect_arg_count(name, args, 1)?;
+            let key = eval_arg(&args[0])?;
+            Ok(row_security_context(&string_value(&key)))
         }
         "CURRENT_USER" => {
             expect_arg_count(name, args, 0)?;
@@ -18722,6 +19010,13 @@ pub(crate) fn expr_collation(expr: &Expr, table: &TableSchema) -> Option<ExprCol
 
 fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollation> {
     if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("RLS_CONTEXT") {
+            return Some(ExprCollation {
+                charset: "utf8mb4",
+                collation_id: 46,
+                coercibility: 2,
+            });
+        }
         if name.eq_ignore_ascii_case("CAST")
             && cast_target_name(args).is_some_and(|target| target.eq_ignore_ascii_case("BINARY"))
         {
@@ -20313,6 +20608,7 @@ fn function_is_runtime_dependent(upper: &str) -> bool {
             | "PS_THREAD_TRX_INFO"
             | "LAST_INSERT_ID"
             | "USER"
+            | "RLS_CONTEXT"
             | "CURRENT_USER"
             | "SESSION_USER"
             | "CURRENT_ROLE"
@@ -20825,6 +21121,13 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
         } => {
             fold_constant_subexprs_inner(e);
             fold_constant_subexprs_inner(pattern);
+        }
+        Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("__MYDB_RLS_SETTINGS") => {
+            if let [Expr::Literal(Literal::String(encoded)), inner] = args.as_mut_slice() {
+                let _ = with_policy_expression_settings(encoded, || {
+                    fold_constant_subexprs_inner(inner)
+                });
+            }
         }
         Expr::Function { args, .. } => {
             for arg in args {
@@ -29619,16 +29922,23 @@ pub(crate) fn with_saved_expr_info<R>(
     struct Restore<'a> {
         target: &'a mut Option<SessionExprInfo>,
         ptr: Option<NonNull<crate::engine::api::SessionContext>>,
-        previous: Option<SessionExprInfo>,
+        previous: Option<std::sync::Arc<SessionExprInfo>>,
     }
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
             SESSION_CTX_PTR.with(|c| c.set(self.ptr));
-            SESSION_INFO_OWNED.with(|c| *self.target = c.replace(self.previous.take()));
+            SESSION_INFO_OWNED.with(|c| {
+                *self.target = c.replace(self.previous.take()).map(|info| {
+                    std::sync::Arc::try_unwrap(info).unwrap_or_else(|info| info.as_ref().clone())
+                })
+            });
         }
     }
+    let _security = crate::engine::rls::EvaluationScope::enter_snapshot(
+        info.as_ref().and_then(|info| info.rls_evaluation.as_ref()),
+    );
     let ptr = SESSION_CTX_PTR.with(|c| c.replace(None));
-    let previous = SESSION_INFO_OWNED.with(|c| c.replace(info.take()));
+    let previous = SESSION_INFO_OWNED.with(|c| c.replace(info.take().map(std::sync::Arc::new)));
     let _restore = Restore {
         target: info,
         ptr,

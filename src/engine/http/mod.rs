@@ -1,6 +1,7 @@
 //! Bounded HTTP SQL effects, independent of AI model execution.
 mod config;
 mod json;
+pub(crate) use json::parse_json as parse_strict_json;
 mod request;
 mod runtime;
 mod scope;
@@ -110,6 +111,11 @@ pub(crate) fn authorize(
     ctx: &crate::engine::auth::AuthorizationContext,
     privilege: &str,
 ) -> Result<(), QueryError> {
+    if crate::engine::rls::policy_active() {
+        return Err(crate::engine::rls::violation(
+            "Policy cannot perform external HTTP calls",
+        ));
+    }
     use crate::engine::auth::{Privilege, PrivilegeScope, RequiredPrivilege};
     if !db.auth_catalog().account_has_privilege(
         ctx,

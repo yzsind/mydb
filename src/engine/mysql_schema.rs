@@ -1107,6 +1107,7 @@ pub(crate) const MYSQL_DEFS: &[SystemTableDef] = &[
 ];
 
 pub(crate) const HIDDEN_DD_TABLES: &[&str] = &[
+    "api_keys",
     "schemata",
     "tables",
     "table_stats",
@@ -1118,6 +1119,8 @@ pub(crate) const HIDDEN_DD_TABLES: &[&str] = &[
     "indexes",
     "index_column_usage",
     "check_constraints",
+    "row_security_policies",
+    "row_security_dependencies",
     "views",
     "view_table_usage",
     "routines",

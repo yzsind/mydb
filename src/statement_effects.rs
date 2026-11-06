@@ -87,6 +87,19 @@ pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
     match statement {
         S::AlterSystemReloadHttpConfig => READ_ONLY,
         S::ShowHttpStatus => READ_ONLY,
+        S::RowSecurity(command) => match command {
+            crate::parser::rls::RlsStatement::SetContext { .. }
+            | crate::parser::rls::RlsStatement::ResetContext { .. }
+            | crate::parser::rls::RlsStatement::Show { .. } => READ_ONLY,
+            _ => CATALOG_DDL,
+        },
+        S::ApiKey(command) => {
+            if command.is_read() {
+                READ_ONLY
+            } else {
+                CATALOG_NONDISPATCH
+            }
+        }
         S::Ai(command) => {
             if matches!(command.action.as_str(), "show" | "show_create" | "reload") {
                 READ_ONLY

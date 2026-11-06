@@ -116,6 +116,7 @@ pub(in crate::engine::executor::select) fn projected_schema_view(
         primary_publication_job_id: schema.primary_publication_job_id,
         column_name_map: name_map,
         column_id_map: id_map,
+        row_security: crate::engine::rls::RowSecurity::empty(),
         row_codec: Default::default(),
         partitioning: None,
         pctfree: schema.pctfree,
@@ -1918,6 +1919,12 @@ pub(super) fn compare_decimal_parts(
 }
 
 pub(super) fn const_expr_value(expr: &Expr) -> Option<Value> {
+    // These programs belong to an opened scan, not the shared physical plan.
+    // Capture stable context operands once before page callbacks or batch
+    // loops, just as placeholder values are captured for each execution.
+    if let Some(value) = crate::storage::schema::StatementValue::for_expression(expr) {
+        return value.evaluate().ok();
+    }
     crate::engine::expr::expr_literal_value(expr)
 }
 

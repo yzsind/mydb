@@ -24,6 +24,7 @@ fn duplicate_entry_error(table: &TableSchema, index: &IndexSchema, key: &IndexKe
             KeyPart::Float32(value) => crate::storage::core::f32_from_order_u32(*value).to_string(),
             KeyPart::Float64(value) => crate::storage::core::f64_from_order_u64(*value).to_string(),
             KeyPart::Param { idx, .. } => format!("?{idx}"),
+            KeyPart::Statement { value, .. } => crate::parser::expr_to_sql(value.expression()),
         })
         .collect::<Vec<_>>()
         .join("-");
@@ -46,6 +47,7 @@ impl Database {
         current: Option<RowId>,
         values: &[Value],
     ) -> Result<(), QueryError> {
+        crate::engine::rls::check_row(self, txn, table, crate::parser::rls::Command::Insert, true, values)?;
         self.check_not_null_constraints(table, values)?;
         self.check_check_constraints(table, values, None)?;
         self.lock_unique_keys_for_values(txn.txn_id, table, values)?;

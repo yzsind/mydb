@@ -5,7 +5,9 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Statement {
+    ApiKey(crate::engine::access_keys::Command),
     Ai(crate::engine::ai::sql::AiStatement),
+    RowSecurity(rls::RlsStatement),
     /// `START TRANSACTION`/`BEGIN` with the MySQL 8.0 characteristic list.
     /// `read_only`: `None` = session default access mode, `Some(true)` =
     /// `READ ONLY`, `Some(false)` = `READ WRITE`. `consistent_snapshot` =
@@ -2383,6 +2385,8 @@ impl QueryExpr {
             Self::Select(select) => Statement::Select(*select),
             Self::SetOp(set) => Statement::SetOperation(*set),
             Self::Rrf(rrf) => Statement::Select(Select {
+                rls_security_context: None,
+                rls_expression_settings: None,
                 projection: vec![SelectItem::Wildcard],
                 table: Some("$rrf".into()),
                 from: vec![TableRef {
@@ -2431,6 +2435,15 @@ impl TryFrom<Statement> for QueryExpr {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Select {
+    /// Internal identity of an expanded security view. Never accepted from a
+    /// serialized/user query; each view reference is rebound during expansion.
+    #[serde(skip)]
+    pub rls_security_context: Option<std::sync::Arc<crate::engine::auth::AuthorizationContext>>,
+    /// Creation-time semantics of a policy's internal query. Rebound from
+    /// policy metadata and never accepted from serialized/user queries.
+    #[serde(skip)]
+    pub rls_expression_settings:
+        Option<std::sync::Arc<crate::engine::expr::PolicyExpressionSettings>>,
     pub projection: Vec<SelectItem>,
     pub table: Option<String>,
     pub from: Vec<TableRef>,

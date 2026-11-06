@@ -837,6 +837,7 @@ pub struct BinlogSourceManager {
 #[derive(Debug, Default)]
 pub struct DumpRegistry {
     entries: std::collections::BTreeMap<u32, RegisteredReplica>,
+    cancellations: HashMap<u32, Arc<Notify>>,
     /// Monotonic counter used to disambiguate two replicas that share the same
     /// `server_id` — the guard tracks its own registration id so Drop only
     /// removes the entry that this guard owns.
@@ -878,7 +879,7 @@ impl DumpRegistry {
         self.next_regid = self.next_regid.wrapping_add(1);
         let regid = self.next_regid.max(1);
         info.regid = regid;
-        // Production registration rejects duplicate server IDs under this lock.
+        // The registration generation protects a replacement from stale Drop.
         self.entries.insert(info.server_id, info);
         regid
     }
@@ -886,6 +887,7 @@ impl DumpRegistry {
         if let Some(entry) = self.entries.get(&server_id) {
             if entry.regid == regid {
                 self.entries.remove(&server_id);
+                self.cancellations.remove(&server_id);
             }
         }
     }
@@ -900,6 +902,13 @@ pub struct RegisteredReplicaGuard {
     manager: std::sync::Arc<BinlogSourceManager>,
     server_id: u32,
     regid: u64,
+    cancelled: Arc<Notify>,
+}
+
+impl RegisteredReplicaGuard {
+    pub(crate) fn cancellation(&self) -> Arc<Notify> {
+        self.cancelled.clone()
+    }
 }
 
 pub(crate) struct BinlogDumpLease(Arc<BinlogSourceManager>);
@@ -1252,6 +1261,7 @@ fn binlog_op_nested_bytes(op: &BinlogTxnOp) -> usize {
 #[derive(Debug, Clone)]
 struct BinlogTable {
     table_id: u64,
+    rows_flags: u16,
     database: String,
     name: String,
     columns: Vec<BinlogColumn>,
@@ -1731,12 +1741,25 @@ pub fn binary_logs() -> Result<Vec<BinaryLogInfo>, QueryError> {
 
 pub fn variables_snapshot() -> Vec<(&'static str, String)> {
     let config = config_snapshot();
-    let (gtid_executed, gtid_purged) = manager()
+    let (mut gtid_executed, gtid_purged) = manager()
         .map(|manager| {
             let state = manager.state.lock();
             (state.gtid_executed.clone(), state.gtid_purged.clone())
         })
         .unwrap_or_default();
+    if let Some(replication) = crate::replication::global_manager() {
+        match replication.executed_gtid_set() {
+            Ok(executed) => {
+                gtid_executed = crate::gtid::format_gtid_interval_map(
+                    &crate::gtid::parse_gtid_interval_map(&format!("{gtid_executed},{executed}")),
+                );
+            }
+            Err(err) => crate::util::logging::log_message(format_args!(
+                "read global replication GTIDs failed: {}",
+                err.message()
+            )),
+        }
+    }
     vec![
         ("log_bin", if enabled() { "ON" } else { "OFF" }.to_string()),
         ("binlog_format", "ROW".to_string()),
@@ -2894,17 +2917,17 @@ impl BinlogSourceManager {
     ) -> Result<RegisteredReplicaGuard, QueryError> {
         let server_id = info.server_id;
         let mut registry = self.dump_registry.lock();
-        if registry.entries.contains_key(&server_id) {
-            return Err(error(
-                crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
-                format!("replica server_id {server_id} is already registered"),
-            ));
+        let cancelled = Arc::new(Notify::new());
+        if let Some(previous) = registry.cancellations.insert(server_id, cancelled.clone()) {
+            // notify_one retains a permit if the old dump is not polling yet.
+            previous.notify_one();
         }
         let regid = registry.insert(info);
         Ok(RegisteredReplicaGuard {
             manager: self.clone(),
             server_id,
             regid,
+            cancelled,
         })
     }
 
@@ -4985,6 +5008,11 @@ fn binlog_table_from_schema(schema: &TableSchema) -> Result<BinlogTable, QueryEr
         .collect::<Result<Vec<_>, QueryError>>()?;
     Ok(BinlogTable {
         table_id,
+        rows_flags: if crate::storage::fk_checks_enabled() {
+            0
+        } else {
+            0x0002
+        },
         database: schema.database.clone(),
         name: schema.name.clone(),
         columns,
@@ -5152,6 +5180,8 @@ fn encode_format_description_event(config: &BinlogConfig, start_pos: u64) -> Vec
     set_post_header_len(&mut post_header, PREVIOUS_GTIDS_EVENT, 0);
     payload.extend_from_slice(&post_header);
     payload.push(config.checksum.descriptor_byte());
+    // FDE itself carries a checksum even when subsequent events use NONE.
+    // MySQL readers locate its algorithm descriptor five bytes from the end.
     encode_event(config, FORMAT_DESCRIPTION_EVENT, start_pos, &payload, true)
 }
 
@@ -5600,7 +5630,7 @@ fn rows_payload_prefix(table: &BinlogTable, update: bool) -> Vec<u8> {
     let mut payload = Vec::new();
     write_u48_le(&mut payload, table.table_id);
     // Patched to STMT_END_F on the final chunk only.
-    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&table.rows_flags.to_le_bytes());
     payload.extend_from_slice(&2u16.to_le_bytes());
     write_lenenc_int(&mut payload, table.columns.len() as u64);
     let columns_bitmap = all_columns_bitmap(table.columns.len());
@@ -5681,7 +5711,7 @@ fn encode_rows_payloads(
     }
     chunks.push(current);
     if let Some(last) = chunks.last_mut() {
-        last[6..8].copy_from_slice(&1u16.to_le_bytes());
+        last[6..8].copy_from_slice(&(table.rows_flags | 1).to_le_bytes());
     }
     Ok(chunks)
 }
@@ -7144,6 +7174,7 @@ fn env_value_truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    include!("binlog/release_audit_tests.rs");
     #[test]
     fn release_format_binlog_rejects_future_manifest_without_rewriting() {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
@@ -7537,6 +7568,7 @@ mod tests {
             mysql_table_options: Vec::new(),
             column_name_map: Default::default(),
             column_id_map: Default::default(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Default::default(),
         };
         table.build_column_index();
@@ -8522,7 +8554,10 @@ mod tests {
         );
         let guard = manager.register_replica(semi_sync_replica(9)).unwrap();
         manager.semi_sync_mark_replica(9);
-        assert!(manager.register_replica(semi_sync_replica(9)).is_err());
+        let replacement = manager.register_replica(semi_sync_replica(9)).unwrap();
+        assert_ne!(guard.regid, replacement.regid);
+        drop(guard);
+        assert_eq!(manager.registered_replicas().len(), 1);
         manager.semi_sync.enabled.store(true, Ordering::Relaxed);
         manager.semi_sync.timeout_ms.store(30, Ordering::Relaxed);
         assert_eq!(
@@ -8541,7 +8576,7 @@ mod tests {
             manager.semi_sync_wait("binlog.000001", 200),
             SemiSyncOutcome::Acked
         );
-        drop(guard);
+        drop(replacement);
         assert!(manager.registered_replicas().is_empty());
     }
 

@@ -2651,6 +2651,15 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
     needs_image: bool,
     returning: &mut super::returning::ReturningCollector,
 ) -> Result<(bool, u64), QueryError> {
+    let _security = crate::engine::rls::StrictOldScope::enter();
+    crate::engine::rls::check_row(
+        db,
+        txn,
+        table,
+        crate::parser::rls::Command::Insert,
+        true,
+        proposed,
+    )?;
     let changed_columns = odku_changed_columns(table, updates)?;
     let on_update = super::dml::on_update_timestamp_columns(table, &changed_columns);
     let mut write_columns = changed_columns.clone();
@@ -2784,29 +2793,34 @@ fn replace_insert_row<const TRIGGERS: bool>(
     values: &[Value],
     retry: bool,
 ) -> Result<(crate::storage::InsertRowsResult, u64), QueryError> {
+    let _security = crate::engine::rls::StrictOldScope::enter();
     let _partition = replace_partition_guard(table, values)?;
     let mut deleted = 0u64;
     let mut attempt = 0;
     loop {
         for row_id in find_all_conflicting_row_ids(db, txn, table, values)? {
             crate::engine::cancel::check_cancelled()?;
-            let old = if TRIGGERS {
+            let mut old = None;
+            let removed = if TRIGGERS {
                 let sid = if table.is_partitioned() {
                     table.route_row_to_partition(values)?.storage_id
                 } else {
                     table.id
                 };
-                db.lock_row_for_update_at(txn, table, sid, row_id)?;
-                let Some(row) = db.dml_candidate_row_for_write(table, row_id, txn)? else {
-                    continue;
-                };
-                let hook = hooks.as_mut().expect("trigger context");
-                fire_before_delete(db, hook.session, table, row.values.clone(), hook.registry)?;
-                Some(row.values)
+                // The storage callback follows lock acquisition and the
+                // caller's old-row RLS check. A hidden row must never reach
+                // a trigger, even if its transactional writes would roll back.
+                db.delete_row_by_id_at_if(txn, table, sid, row_id, |current| {
+                    let hook = hooks.as_mut().expect("trigger context");
+                    let values = current.to_vec();
+                    fire_before_delete(db, hook.session, table, values.clone(), hook.registry)?;
+                    old = Some(values);
+                    Ok(true)
+                })?
             } else {
-                None
+                db.delete_row_by_id(txn, table, row_id)?
             };
-            if db.delete_row_by_id(txn, table, row_id)? {
+            if removed {
                 if TRIGGERS {
                     let hook = hooks.as_mut().expect("trigger context");
                     fire_after_delete(db, hook.session, table, old.unwrap(), hook.registry)?;

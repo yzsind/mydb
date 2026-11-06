@@ -196,6 +196,12 @@ verification details, Windows limitations, and distribution scope.
 
 ![MyDB architecture: protocol, SQL engine, unified memory management, storage engine, transactions, backup and recovery, primary-replica HA, sessions, security, and metadata; highlighting the optimizer, executor, heap tables, Zone Map, HNSW, online DDL, unified memory management, and directly queryable backups](assets/mydb-architecture.svg)
 
+## REST SQL
+
+An optional [REST SQL API](docs/rest-api.md) accepts parameterized SQL over HTTPS, supports persistent transactions and NDJSON streaming, and shares MySQL account permissions. Accounts can create, list, retrieve, and revoke API keys through TLS MySQL SQL. Each account supports 1024 keys; keys never expire unless an expiration is specified.
+
+The optional [MCP Server](docs/mcp.md) provides native AI client tools over the same HTTP listener.
+
 ## Built for AI Agents
 
 An agent's data needs change with every task: add a column, build an index, write embeddings, then join retrieval results back to business data. MyDB combines transactional data, retrieval, and SQL access to external models for retrieval-augmented generation (RAG), knowledge bases, and persistent agent memory.

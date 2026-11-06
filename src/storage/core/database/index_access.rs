@@ -28,7 +28,7 @@ fn resolve_index_key(index: &IndexSchema, key: IndexKey) -> Result<(IndexKey, bo
     let mut parts = smallvec::SmallVec::<[KeyPart; 4]>::with_capacity(key.0.len());
     let mut unsatisfiable = false;
     for (pos, part) in key.0.into_iter().enumerate() {
-        let was_param = matches!(part, KeyPart::Param { .. });
+        let was_param = part.is_deferred();
         let mut resolved = part.resolve_param()?;
         // A parameter that binds to NULL makes this non-null-safe index
         // predicate UNKNOWN for every stored entry — the access is

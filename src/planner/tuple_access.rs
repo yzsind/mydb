@@ -30,6 +30,11 @@ pub(super) fn key_part(
         return None;
     }
     let constraint = expr_to_plan_constraint(value)?;
+    // Tuple endpoints require lossless conversion for every suffix component.
+    // Keep the scalar deferred-index lane until that proof covers this shape.
+    if matches!(&constraint, PlanConstraintValue::Statement(_)) {
+        return None;
+    }
     let target = target_for_index_column(table, index, pos);
     if !write_in_lookup_preserves_comparison(target, std::slice::from_ref(&constraint)) {
         return None;
@@ -37,6 +42,7 @@ pub(super) fn key_part(
     let runtime = match &constraint {
         PlanConstraintValue::Concrete(v) => v.clone(),
         PlanConstraintValue::Param(i) => crate::engine::params::current_param(*i)?,
+        PlanConstraintValue::Statement(_) => unreachable!("handled above"),
     };
     if let PlanConstraintValue::Param(idx) = constraint {
         // Cache keys distinguish signedness/sign and native temporal lanes.
@@ -112,6 +118,7 @@ fn equality_part(
     let expr = match eq.get(&normalize_expr_column(name))? {
         PlanConstraintValue::Concrete(v) => Expr::BoundValue(v.clone()),
         PlanConstraintValue::Param(i) => Expr::Placeholder(*i),
+        PlanConstraintValue::Statement(value) => value.expression().clone(),
     };
     key_part(table, index, pos, &expr)
 }
@@ -364,7 +371,7 @@ pub(super) fn candidates(
                                 .0
                                 .iter()
                                 .chain(&next.key.0)
-                                .all(|p| !matches!(p, KeyPart::Param { .. })) =>
+                                .all(|p| !p.is_deferred()) =>
                     {
                         let cmp = next.key.cmp(&old.key);
                         if (lower && cmp.is_gt()) || (!lower && cmp.is_lt()) {

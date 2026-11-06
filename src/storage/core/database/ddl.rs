@@ -453,6 +453,7 @@ impl LikeSchemaParts {
             primary_publication_job_id: 0,
             column_name_map: Default::default(),
             column_id_map: std::collections::HashMap::new(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Default::default(),
             partitioning,
             pctfree: self.pctfree,
@@ -1236,6 +1237,7 @@ impl PreparedCreateTableSchema {
             primary_publication_job_id: 0,
             column_name_map: Default::default(),
             column_id_map: std::collections::HashMap::new(),
+            row_security: crate::engine::rls::RowSecurity::empty(),
             row_codec: Default::default(),
             partitioning: None,
             pctfree: self.pctfree.unwrap_or(0).min(50),
@@ -1713,10 +1715,8 @@ impl Database {
         table_name: &str,
     ) -> Result<LikeSchemaParts, QueryError> {
         let mut columns = source
-            .columns
-            .iter()
-            .filter(|column| column.state == ColumnState::Public)
-            .cloned()
+            .iter_visible_columns()
+            .map(|(_, column)| column.clone())
             .collect::<Vec<_>>();
         if columns.is_empty() {
             return Err(error(
@@ -1889,6 +1889,7 @@ impl Database {
             current_unix_ms(),
         );
         table.build_column_index();
+        table.row_security = crate::engine::rls::copied_security(source, &table)?;
         validate_auto_increment_schema(&table)?;
         let has_auto_increment = table.auto_increment_column_index().is_some();
         {
@@ -1987,6 +1988,11 @@ impl Database {
         quota: &Arc<crate::storage::temp_quota::SessionTempQuota>,
         source: &TableSchema,
     ) -> Result<String, QueryError> {
+        if source.row_security.version != 0 {
+            return Err(crate::engine::rls::violation(
+                "CREATE TEMPORARY TABLE LIKE cannot copy row security policies",
+            ));
+        }
         let (database, table_name) = split_table_name(DEFAULT_DATABASE, visible_name);
         check_table_ddl_writable(&database)?;
         validate_mysql_identifier(&table_name)?;
@@ -2154,6 +2160,9 @@ impl Database {
             refresh_page_checksum(image);
         }
         crate::storage::temp_quota::reserve_extent(path, page_count * PAGE_SIZE as u64)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(io_err)?;
+        }
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -9896,6 +9905,33 @@ impl Database {
     /// pristine. Physical paths and handles retain their immutable object IDs;
     /// a logical rename never moves files or flushes unrelated dirty data.
     pub fn rename_tables_atomic(&self, pairs: &[(String, String)]) -> Result<(), QueryError> {
+        // Validate the whole rename graph before changing any name. Policies
+        // bind dependencies by object identity and SQL name; renaming a
+        // dependency without rewriting its expressions would strand readers.
+        let renamed_ids: HashSet<_> = pairs
+            .iter()
+            .filter_map(|(name, _)| self.table(name).ok().map(|table| table.object_id))
+            .collect();
+        let policy_tables: Vec<_> = self
+            .catalog_read()?
+            .tables
+            .values()
+            .filter(|table| table.row_security.version != 0)
+            .map(|table| table.qualified_name())
+            .collect();
+        for name in policy_tables {
+            let table = self.table(&name)?;
+            if table.row_security.policies.iter().any(|policy| {
+                policy
+                    .table_dependencies
+                    .iter()
+                    .any(|(id, _)| renamed_ids.contains(id))
+            }) {
+                return Err(error(crate::error::catalog::ER_ROW_SECURITY_POLICY,
+                    "Table is referenced by a row security policy; alter or drop dependent policies before renaming",
+                ));
+            }
+        }
         let mut definitions = Vec::new();
         let mut seen = HashSet::new();
         for (name, _) in pairs {
@@ -12853,20 +12889,18 @@ impl Database {
             let (odb, oname) = split_table_name(&database, other_table_name);
             table_key(&odb, &oname)
         };
-        let (table, other_table) = {
-            let catalog = self.catalog_read()?;
-            let table = catalog
-                .tables
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| ddl_table_not_found(&table_name))?;
-            let other = catalog
-                .tables
-                .get(&other_key)
-                .cloned()
-                .ok_or_else(|| ddl_table_not_found(&other_table_name))?;
-            (table, other)
-        };
+        // Physical exchange needs complete descriptors, including indexes and
+        // row layouts; a reclaimable catalog header is not a schema proof.
+        let table = self.table(&key)?;
+        let other_table = self.table(&other_key)?;
+        for participant in [&table, &other_table] {
+            let allowed = crate::engine::rls::trusted_internal()
+                    || crate::engine::expr::current_authorization_context().is_some_and(|(context, internal)|
+                        crate::engine::rls::can_bypass(&crate::engine::rls::authorization_snapshot(self), &context, internal));
+            if !allowed && crate::engine::rls::statement_security_enabled(self, participant)? {
+                    return Err(crate::engine::rls::violation("EXCHANGE PARTITION requires SUPER or BYPASS_RLS for both protected participants"));
+            }
+        }
         let part = table.partitioning.as_ref().ok_or_else(|| {
             error(
                 crate::error::catalog::ER_PARTITION_MGMT_ON_NONPARTITIONED,
@@ -12951,6 +12985,11 @@ impl Database {
                     ),
                 ));
             }
+        }
+        if table.active_layout_id != other_table.active_layout_id
+            || table.row_layouts != other_table.row_layouts {
+            return Err(error(crate::error::catalog::ER_TABLES_DIFFERENT_METADATA,
+                "EXCHANGE PARTITION requires identical physical row layouts"));
         }
         // EXCHANGE moves rows in both directions without evaluating CHECKs.
         // Names and declaration order do not affect enforcement, while the
@@ -13139,6 +13178,12 @@ impl Database {
         // without this the un-written LOB pages would be lost and the swapped
         // `.lob` file would read back a corrupt/incomplete chain.
         self.flush_dirty_data()?;
+        if self.config.durability == DurabilityMode::Memory {
+            // Memory flush intentionally does nothing. Before retiring its
+            // resident handles, materialize only the exchanged file images.
+            self.materialize_exchange_memory_files(partition_storage_id, &table)?;
+            self.materialize_exchange_memory_files(other_table.id, &other_table)?;
+        }
         // Heap-cache entries are keyed by storage_id; the next access
         // must reopen via the new path that the rename installs.
         self.remove_heap_cache_entry(partition_storage_id)?;
@@ -13191,17 +13236,24 @@ impl Database {
             .iter()
             .map(|i| (i.name.clone(), self.index_path(other_table.id, &i.name)))
             .collect();
-        // Swap storage_ids in the catalog. The partition entry takes
-        // the unpartitioned table's id, and the unpartitioned table's
-        // (id, object_id) become the partition's old id.
+        // Swap storage_ids in the catalog. Logical object_id remains stable
+        // for sequence ownership and policy dependencies across the exchange.
         {
             let mut catalog = self.catalog_write()?;
+            for (key, expected) in [(&key, &table), (&other_key, &other_table)] {
+                if !catalog.tables.get(key).is_some_and(|current|
+                    current.id == expected.id && current.schema_version == expected.schema_version) {
+                    return Err(error(crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                        "EXCHANGE PARTITION participant changed; retry"));
+                }
+            }
             let table_arc = catalog.tables.get_mut(&key).ok_or_else(|| {
                 error(
                     crate::error::catalog::ER_NO_SUCH_TABLE,
                     format!("table '{table_name}'"),
                 )
             })?;
+            *table_arc = table.clone();
             let table_mut = Arc::make_mut(table_arc);
             let part_mut = table_mut.partitioning.as_mut().unwrap();
             if let Some(sub_idx) = subpart_idx {
@@ -13244,9 +13296,9 @@ impl Database {
                     format!("table '{other_table_name}'"),
                 )
             })?;
+            *other_arc = other_table.clone();
             let other_mut = Arc::make_mut(other_arc);
             other_mut.id = partition_storage_id;
-            other_mut.object_id = partition_storage_id;
             other_mut.stats.partition_stats.clear();
             if let Some(stats) = outgoing_partition_stats {
                 other_mut.stats.row_count = stats.row_count;
@@ -13443,7 +13495,46 @@ impl Database {
         // the next lookup to reopen the sidecar at its post-swap path.
         self.forget_zone_map(partition_storage_id)?;
         self.forget_zone_map(other_table.id)?;
+        if self.config.durability == DurabilityMode::Memory {
+            // Derived summaries were not flushed in Memory mode. An absent
+            // summary is conservative; an old empty summary could hide rows.
+            for sid in [partition_storage_id, other_table.id] {
+                let path = self.zone_map_file_path(sid);
+                match fs::remove_file(&path) {
+                    Ok(()) => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(io_err(error)),
+                }
+            }
+        }
         self.remove_partition_reorg_journal(&journal_path)?;
+        Ok(())
+    }
+
+    /// Bounded handoff of WAL-free heap, overflow and index pages before a
+    /// physical owner/path change. Ordinary Memory commits remain RAM-only.
+    fn materialize_exchange_memory_files(&self, sid: u64, table: &TableSchema) -> Result<(), QueryError> {
+        self.with_heap_read(sid, |heap| self.flush_temp_snapshot_pages(
+            &heap.path, heap.file_key.clone(), heap.page_count()?, None)).map_err(|error| {
+                let message = format!("EXCHANGE heap handoff {}: {error}", self.table_path(sid).display());
+                error.with_message(message)
+            })?;
+        if self.overflow_path(sid).exists() {
+            self.with_overflow_read(sid, |lob| self.flush_temp_snapshot_pages(
+                &lob.path, lob.file_key.clone(), lob.page_count, None))?;
+        }
+        for index in &table.indexes {
+            self.with_index_read(sid, &index.name, |index| {
+                if let Some(spatial) = &index.spatial {
+                    return self.flush_temp_snapshot_pages(&index.path, index.file_key.clone(), spatial.count_pages(), None);
+                }
+                let meta = index.meta_state.lock().meta.clone();
+                self.flush_temp_snapshot_pages(&index.path, index.file_key.clone(), meta.next_page_id, Some(encode_index_meta(&meta)))
+            }).map_err(|error| {
+                let message = format!("EXCHANGE index handoff {}: {error}", self.index_path(sid, &index.name).display());
+                error.with_message(message)
+            })?;
+        }
         Ok(())
     }
 

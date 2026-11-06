@@ -410,6 +410,7 @@ fn capture_database(
             "final capture barrier exceeded its configured budget after synchronous handoff",
         ));
     }
+    let rest_key_ids = db.auth_catalog().api_key_master_ids().cloned().collect();
     drop(final_freeze);
     capture_stats.insert(
         "final_freeze_us".into(),
@@ -471,6 +472,7 @@ fn capture_database(
         completed_unix_ms: now,
         final_barrier_ms,
         capture_stats,
+        rest_key_ids,
         ai_key_ids: db
             .ai_catalog()?
             .encryption_key_ids

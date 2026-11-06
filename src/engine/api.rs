@@ -1607,6 +1607,10 @@ pub enum PreparedSelectMemoState {
 ///     trick as `PreparedSelectMemo`).
 #[derive(Debug)]
 pub struct PreparedDmlPlan {
+    /// Preserve the unmodified SQL for security/schema rebinds. Cached
+    /// predicates belong to one captured identity and must never be replayed.
+    pub(crate) original_statement: Arc<Statement>,
+    pub(crate) rls_bound: bool,
     pub(crate) semantics: crate::engine::cache::PlanSemantics,
     pub(crate) optimizer_switch: Arc<str>,
     pub(crate) statement: Arc<Statement>,
@@ -1758,6 +1762,17 @@ pub struct DmlStatementResult {
 }
 
 pub trait QueryEngine: Send + Sync + 'static {
+    fn authenticate_api_key(
+        &self,
+        _token: &str,
+        _request: &AuthRequest<'_>,
+    ) -> Result<(String, AuthOutcome), QueryError> {
+        Err(crate::error::catalog::ER_ACCESS_DENIED_ERROR
+            .error("API key authentication is unavailable"))
+    }
+    fn api_key_is_valid(&self, _id: &str, _owner: &AccountKey) -> bool {
+        false
+    }
     /// Conservative catalog-aware scheduling hint, never an execution step.
     fn sql_may_call_http(&self, sql: &str) -> bool {
         crate::engine::http::mentions(sql)
@@ -2074,6 +2089,13 @@ pub trait QueryEngine: Send + Sync + 'static {
         self.execute_load_data_statement(session, statement)
     }
 
+    /// Roll back a server-owned transaction after an execution failure. Cleanup
+    /// must remain possible after credentials or privileges have been revoked.
+    /// This entry point never executes caller-supplied SQL.
+    fn rollback_session_for_cleanup(&self, session: &mut SessionContext) -> Result<(), QueryError> {
+        self.execute(session, "ROLLBACK").map(|_| ())
+    }
+
     fn close_session(&self, _session: &mut SessionContext) -> Result<(), QueryError> {
         Ok(())
     }
@@ -2274,8 +2296,16 @@ impl std::ops::Deref for SqlPreparedStatements {
     }
 }
 
+/// Immutable authentication provenance shared by REST session snapshots.
+#[derive(Debug)]
+pub(crate) struct RestSessionIdentity {
+    pub key_id: String,
+    pub owner: AccountKey,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionContext {
+    pub rls: super::rls::SessionContext,
     pub autocommit: bool,
     pub isolation: IsolationLevel,
     pub next_txn_isolation: Option<IsolationLevel>,
@@ -2296,6 +2326,9 @@ pub struct SessionContext {
     pub account_locked: bool,
     pub auth_sandbox: bool,
     pub auth_factors_done: u8,
+    /// Immutable transport provenance; SQL DEFINER contexts cannot replace it.
+    pub(crate) mysql_authenticated: bool,
+    pub(crate) rest_identity: Option<Arc<RestSessionIdentity>>,
     pub account_limits: ResourceLimits,
     pub current_user_is_system: bool,
     /// True only for server-created recovery/apply/maintenance contexts.
@@ -3216,6 +3249,7 @@ impl SessionContext {
             parse_temporal_sql_mode_bits(&sql_mode) | TEMPORAL_MODE_EXPLICIT;
         let sysvars = SessionSysVarState::default();
         Self {
+            rls: super::rls::SessionContext::default(),
             autocommit: true,
             isolation: global_transaction_isolation(),
             next_txn_isolation: None,
@@ -3232,6 +3266,8 @@ impl SessionContext {
             account_locked: false,
             auth_sandbox: false,
             auth_factors_done: 0,
+            mysql_authenticated: false,
+            rest_identity: None,
             account_limits: ResourceLimits::default(),
             current_user_is_system: false,
             internal_system_session: false,
@@ -3336,6 +3372,8 @@ impl SessionContext {
         fresh.account_locked = self.account_locked;
         fresh.auth_sandbox = self.auth_sandbox;
         fresh.auth_factors_done = self.auth_factors_done;
+        fresh.mysql_authenticated = self.mysql_authenticated;
+        fresh.rest_identity = self.rest_identity.clone();
         fresh.account_limits = self.account_limits.clone();
         fresh.current_user_is_system = self.current_user_is_system;
         fresh.internal_system_session = self.internal_system_session;

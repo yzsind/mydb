@@ -61,9 +61,14 @@ pub(in crate::engine::executor) fn with_subquery_context_ctes<R>(
         cache: RefCell::new(EvalQueryContext::default()),
     });
     let prev = SUBQUERY_CTX.with(|c| c.borrow_mut().replace(frame));
-    let result = f();
-    SUBQUERY_CTX.with(|c| *c.borrow_mut() = prev);
-    result
+    struct Restore(Option<Rc<SubqueryFrame>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SUBQUERY_CTX.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(prev);
+    f()
 }
 
 fn current_subquery_frame() -> Option<Rc<SubqueryFrame>> {
@@ -131,6 +136,8 @@ pub(in crate::engine::executor) fn eval_contextual_subquery_expr(
         // Unlike a subquery inside an ordinary SELECT, routine control-flow
         // expressions have no enclosing statement privilege check.
         let access = Statement::Select(Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             projection: vec![SelectItem::Expr {
                 expr: expr.clone(),
                 alias: None,
@@ -944,9 +951,7 @@ fn eval_plan_expr_legacy_inner(expr: &Expr, row: &PlanRow) -> Result<Value, Quer
                 "parameter is not bound",
             )
         }),
-        Expr::UserVariable(name) => {
-            Ok(crate::engine::expr::session_user_variable(name).unwrap_or(Value::Null))
-        }
+        Expr::UserVariable(name) => crate::engine::expr::checked_session_user_variable(name),
         Expr::SystemVariable { scope, name } => {
             crate::engine::expr::eval_system_variable(*scope, name, None)
         }

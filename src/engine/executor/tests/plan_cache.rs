@@ -626,20 +626,24 @@ fn b2_plan_cache_partitions_by_time_zone() {
 
 #[test]
 fn type_affecting_session_variables_are_part_of_plan_semantics() {
+    std::fs::create_dir_all("/tmp/mydb/rls/tests").unwrap();
+    let _dir = tempfile::tempdir_in("/tmp/mydb/rls/tests").unwrap();
+    let engine = open_test_engine(_dir.path());
+    let db = engine.db_handle();
     let base = SessionContext::default();
     let mut changed_div = base.clone();
     changed_div.sysvars.div_precision_increment = 9;
     assert_ne!(
-        super::super::plan_semantics(&base),
-        super::super::plan_semantics(&changed_div),
+        super::super::plan_semantics(&db, &base),
+        super::super::plan_semantics(&db, &changed_div),
         "AVG and decimal division metadata must be rebound"
     );
 
     let mut changed_group_concat = base.clone();
     changed_group_concat.group_concat_max_len = 512;
     assert_ne!(
-        super::super::plan_semantics(&base),
-        super::super::plan_semantics(&changed_group_concat),
+        super::super::plan_semantics(&db, &base),
+        super::super::plan_semantics(&db, &changed_group_concat),
         "GROUP_CONCAT VARCHAR/BLOB metadata must be rebound"
     );
 }

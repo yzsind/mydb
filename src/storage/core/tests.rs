@@ -565,6 +565,72 @@ fn character_coercion_preserves_unicode_width_padding_and_truncation() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn database_fixtures_initialize_open_files_limit() {
+    use crate::engine::StorageQueryEngine;
+    use std::os::unix::process::CommandExt;
+    use std::{env, io};
+
+    const CHILD: &str = "MYDB_TEST_LOW_NOFILE_CHILD";
+    const REQUESTED: libc::rlim_t = 4096;
+
+    fn limits() -> libc::rlimit {
+        let mut limits = std::mem::MaybeUninit::uninit();
+        // SAFETY: getrlimit initializes a valid rlimit on success.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) },
+            0
+        );
+        unsafe { limits.assume_init() }
+    }
+
+    if env::var_os(CHILD).is_some() {
+        let before = limits();
+        assert_eq!(before.rlim_cur, before.rlim_max.min(256));
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        let after = limits();
+        assert!(after.rlim_cur >= before.rlim_max.min(REQUESTED));
+        assert_eq!(after.rlim_max, before.rlim_max);
+        engine.shutdown().unwrap();
+        return;
+    }
+
+    // Isolate the low inherited limit from concurrent cargo test workers.
+    let mut command = std::process::Command::new(env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "storage::core::tests::database_fixtures_initialize_open_files_limit",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("MYDB_OPEN_FILES_LIMIT", REQUESTED.to_string());
+    // SAFETY: the child only calls async-signal-safe rlimit syscalls before exec.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = std::mem::MaybeUninit::uninit();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut limit = limit.assume_init();
+            limit.rlim_cur = limit.rlim_max.min(256);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "low-nofile fixture failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn fresh_catalog_empty_index_root_is_durable_before_open_returns() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
@@ -26949,6 +27015,109 @@ fn replica_savepoint_stream_keeps_committed_before_images() {
     source
         .execute_with_session(&mut writer, "ROLLBACK")
         .unwrap();
+}
+
+#[test]
+fn rls_replica_replays_exchange_with_cold_policy_descriptors() {
+    use crate::engine::StorageQueryEngine;
+
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    let master_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let replica_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+    for sql in [
+        "CREATE TABLE part(id INT PRIMARY KEY,tenant INT) PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN MAXVALUE)",
+        "CREATE TABLE stage(id INT PRIMARY KEY,tenant INT)",
+        "INSERT INTO stage VALUES(1,1),(2,2)",
+        "ALTER TABLE part ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE stage ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY tenant ON part USING(tenant=1)",
+        "CREATE POLICY tenant ON stage USING(tenant=2)",
+        "ALTER POLICY tenant ON stage USING(tenant=2) WITH CHECK(tenant=2)",
+    ] {
+        master.execute(sql).unwrap();
+    }
+    let source = master.database_for_replication();
+    source.checkpoint().unwrap();
+    copy_tree(master_dir.path(), replica_dir.path());
+    let mut role = crate::repl::role::RoleState::new_standalone();
+    role.role = crate::repl::role::Role::Replica;
+    crate::repl::role::save(replica_dir.path(), &role).unwrap();
+    let mut start = source.wal_log().lock().next_lsn();
+    for phase in 0..3 {
+        // Reopening leaves only compact headers, including a policy version
+        // marker with no payload. Replay must retain the old DD snapshot.
+        let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+        let target = replica.database_for_replication().clone();
+        assert!(target.catalog.read().unwrap().tables["test.stage"]
+            .columns
+            .is_empty());
+        let captured = target.row_security_catalog_snapshot();
+        let previous_stage = source.table("test.stage").unwrap();
+        if phase == 1 {
+            master
+                .execute("ALTER POLICY tenant ON stage USING(tenant=1) WITH CHECK(tenant=1)")
+                .unwrap();
+        }
+        master
+            .execute("ALTER TABLE part EXCHANGE PARTITION p0 WITH TABLE stage")
+            .unwrap();
+        let log = source.wal_log();
+        let safe = log.lock().next_lsn() - 1;
+        crate::wal::LogManager::sync_durable_to(&log, safe).unwrap();
+        let mut applier = crate::repl::replica::applier::Applier::with_database(
+            replica_dir.path(),
+            target.wal_log(),
+            target.clone(),
+            crate::repl::replica::progress::ReplicaProgress::default(),
+        );
+        let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+        while let Some(chunk) = reader.next_chunk(safe, 1 << 20).unwrap() {
+            applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+        }
+        for name in ["test.part", "test.stage"] {
+            let expected = source.table(name).unwrap();
+            let actual = target.table(name).unwrap();
+            assert_eq!(actual.object_id, expected.object_id, "phase={phase} {name}");
+            assert_eq!(actual.id, expected.id, "phase={phase} {name}");
+            assert_eq!(
+                serde_json::to_value(&actual.row_security).unwrap(),
+                serde_json::to_value(&expected.row_security).unwrap(),
+                "phase={phase} {name}"
+            );
+            let resolved = target
+                .row_security_catalog_snapshot()
+                .resolve(&actual, |_, _| {
+                    panic!("full descriptor should resolve without I/O")
+                })
+                .unwrap();
+            assert_eq!(resolved.version, expected.row_security.version);
+        }
+        let mut cold_stage = target.table("test.stage").unwrap().as_ref().clone();
+        cold_stage.columns.clear();
+        let retained = captured
+            .resolve(&cold_stage, |_, _| {
+                panic!("retired logical versions cannot depend on a moved DD key")
+            })
+            .unwrap();
+        assert_eq!(retained.policies, previous_stage.row_security.policies);
+        let last = target.wal_log().lock().next_lsn() - 1;
+        crate::wal::LogManager::sync_durable_to(&target.wal_log(), last).unwrap();
+        target.flush_dirty_data().unwrap();
+        start = safe + 1;
+    }
 }
 
 #[test]

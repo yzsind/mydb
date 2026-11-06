@@ -3947,6 +3947,66 @@ impl HeapFile {
         Ok(())
     }
 
+    /// Visit root identities and MVCC headers without parsing value layouts.
+    /// Forwarding is resolved after releasing the anchor page latch; pieces
+    /// are never exposed as independent roots.
+    fn scan_root_headers_range<F>(
+        &self,
+        page_lo: u64,
+        page_hi: u64,
+        policy: ScanCachePolicy,
+        mut visit: F,
+    ) -> Result<(), QueryError>
+    where
+        F: FnMut(RowId, RowHeader) -> Result<(), QueryError>,
+    {
+        let page_count = self.page_count()?;
+        let mut forwarding = Vec::new();
+        let mut charge = crate::engine::executor::mem_budget::ScopedCharge::for_budget(None);
+        let mut horizon=0;
+        let scan_end=page_hi.min(page_count);
+        for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
+            if page_hi.saturating_sub(page_lo)>1 {
+                self.prefetch_after(page_id,scan_end,&mut horizon);
+            }
+            crate::engine::cancel::check_cancelled()?;
+            self.with_scan_page(page_id, page_count, policy, |page| {
+                for slot_id in 0..page.slot_count() {
+                    if slot_id % 256 == 0 {
+                        crate::engine::cancel::check_cancelled()?;
+                    }
+                    let Some(payload) = page.payload(slot_id)? else {
+                        continue;
+                    };
+                    let row_id = RowId::new(page_id as u32, slot_id as u16);
+                    match decode_heap_payload_header(payload)? {
+                        HeapPayloadHeader::Row(header) => visit(row_id, header)?,
+                        HeapPayloadHeader::Forward => {
+                            if forwarding.len() == forwarding.capacity() {
+                                if forwarding.capacity() == 0 {
+                                    charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+                                }
+                                crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                                    &mut forwarding, 32, &mut charge, "root scan forwarding",
+                                )?;
+                            }
+                            forwarding.push(row_id);
+                        }
+                        HeapPayloadHeader::RowPiece => {}
+                    }
+                }
+                Ok(())
+            })?;
+            for row_id in forwarding.drain(..) {
+                crate::engine::cancel::check_cancelled()?;
+                if let Some((header, _, _)) = self.read_mvcc_columns_following(row_id, &[], 0)? {
+                    visit(row_id, header)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Column-projected variant of `scan_mvcc_pages_range_until`. Used
     /// by the parallel sequential scan's projected path so each worker
     /// only decodes the requested columns from its assigned page range.

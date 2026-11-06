@@ -1,7 +1,7 @@
 //! MySQL uses OpenSSL names in account TLS requirements and session status.
 use tokio_rustls::rustls::CipherSuite;
 
-pub(super) fn cipher_name(suite: CipherSuite) -> String {
+pub(crate) fn cipher_name(suite: CipherSuite) -> String {
     use CipherSuite::*;
     match suite {
         TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256",
@@ -18,7 +18,7 @@ pub(super) fn cipher_name(suite: CipherSuite) -> String {
     .to_string()
 }
 
-pub(super) fn distinguished_name(name: &x509_parser::x509::X509Name<'_>) -> String {
+pub(crate) fn distinguished_name(name: &x509_parser::x509::X509Name<'_>) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     for rdn in name.iter_rdn() {

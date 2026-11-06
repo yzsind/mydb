@@ -1583,3 +1583,38 @@ node egress policy, private CA bindings, account quotas, and runtime controls.
 assignments never silently fall back to English. It controls date name output.
 `STR_TO_DATE` recognizes English month and weekday names independently of this
 output setting, matching MySQL 8.0.
+
+## REST SQL listener
+
+The shared REST SQL/MCP listener is disabled by default and shares the SQL engine and
+account resource limits with MySQL. See [REST SQL API](rest-api.md) for
+credentials, full key retrieval, transactions, result formats and recovery.
+All options below also support CLI `--rest-...` and `MYDB_REST_*` variables.
+The listener starts when either `rest_enabled` or `mcp_enabled` is ON; REST
+and MCP routes are enabled independently. The `rest_*` listener, TLS, SQL
+session and memory settings below apply to both protocols. See [MCP Server](mcp.md)
+for the `/mcp` endpoint, authentication and `mcp_*` limits.
+
+| Option | Default |
+| --- | --- |
+| `rest_enabled` | `OFF` |
+| `rest_host`, `rest_port` | `127.0.0.1`, `8739` |
+| `rest_tls_mode` | `required`; `disabled` requires loopback |
+| `rest_ssl_cert`, `rest_ssl_key` | Unset; supply both or neither |
+| `rest_max_connections` | `512` |
+| `rest_max_sessions` | `256`; also subject to SQL connection limits |
+| `rest_max_inflight` | `64` |
+| `rest_max_request_bytes` | `8388608` |
+| `rest_max_header_bytes` | `16384` |
+| `rest_max_json_response_bytes` | `16777216` |
+| `rest_memory_limit_mb` | `128` |
+| `rest_default_timeout_ms`, `rest_max_timeout_ms` | `30000`, `300000` |
+| `rest_session_idle_timeout_ms` | `300000` |
+| `rest_transaction_idle_timeout_ms` | `60000` |
+| `rest_previous_keys_file` | Unset; old master-key keyring for rotation |
+
+API keys default to no expiration and have a fixed limit of 1024 records per
+account. Complete keys can be retrieved through TLS MySQL `SHOW API KEY`.
+The master key is environment-only `MYDB_REST_ENCRYPT_KEY` or the independently
+managed `<data_dir>/rest-keys.mydb`. Master-key values cannot be supplied in
+ordinary startup configuration or command-line arguments.

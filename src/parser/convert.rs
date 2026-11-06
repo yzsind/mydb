@@ -2486,6 +2486,8 @@ fn convert_set_expr_checked(
                 generate_series: None,
             };
             let mut select = Select {
+                rls_security_context: None,
+                rls_expression_settings: None,
                 projection: vec![SelectItem::Wildcard],
                 ..Select::default()
             };
@@ -2548,6 +2550,8 @@ fn convert_values_query(
         .map(|idx| format!("column_{idx}"))
         .collect();
     Ok(Statement::Select(Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Wildcard],
         values: Some(ValuesSource { rows, columns }),
         order_by,
@@ -2823,6 +2827,8 @@ fn convert_select(
         }
     }
     Ok(Statement::Select(Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection,
         table,
         from,
@@ -6441,6 +6447,8 @@ fn convert_table_factor(
                 columns: convert_json_table_columns(columns)?,
             };
             let select = Select {
+                rls_security_context: None,
+                rls_expression_settings: None,
                 projection: vec![SelectItem::Wildcard],
                 json_table: Some(source),
                 ..Select::default()
@@ -6479,6 +6487,8 @@ fn convert_table_factor(
             let (base, base_derived, _base_lateral, joins) =
                 convert_table_with_joins(table_with_joins)?;
             let nested = Select {
+                rls_security_context: None,
+                rls_expression_settings: None,
                 projection: vec![SelectItem::Wildcard],
                 table: Some(base.name.clone()),
                 from: vec![base],
@@ -7808,6 +7818,8 @@ fn apply_tail_modifiers(
         let query = QueryExpr::try_from(stmt)?;
         let name = extensions::register(sql, extensions::Extension::QueryTail);
         return Ok(Statement::Select(Select {
+            rls_security_context: None,
+            rls_expression_settings: None,
             projection: vec![SelectItem::Wildcard],
             table: Some(name.clone()),
             from: vec![TableRef {
@@ -7856,6 +7868,8 @@ fn apply_tail_modifiers(
 /// derived set operation.
 fn wrap_setop_as_derived_select(set_op: QueryExpr) -> Select {
     Select {
+        rls_security_context: None,
+        rls_expression_settings: None,
         projection: vec![SelectItem::Wildcard],
         derived: Some(set_op),
         ..Select::default()
@@ -9317,6 +9331,8 @@ fn parse_projection_fragment(sql: &str) -> Result<Vec<SelectItem>, ParseError> {
     // Accepting a SELECT tail here would silently truncate source such as
     // `1, 2`, `1 FROM t` or `1 WHERE false` to the first expression.
     let Select {
+        rls_security_context: _,
+        rls_expression_settings: _,
         projection,
         table,
         from,

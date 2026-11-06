@@ -31,6 +31,19 @@ pub(super) fn qualify_statement_tables<'q>(
 ) -> Result<(), QueryError> {
     let statement = statement.into();
     match statement {
+        crate::parser::QueryMut::Other(Statement::RowSecurity(command)) => {
+            use crate::parser::rls::RlsStatement;
+            match command {
+                RlsStatement::Create { table, .. }
+                | RlsStatement::Alter { table, .. }
+                | RlsStatement::Drop { table, .. }
+                | RlsStatement::Enable { table, .. }
+                | RlsStatement::Show { table, .. } => {
+                    *table = qualify_persistent_table_name(session, table)
+                }
+                _ => {}
+            }
+        }
         crate::parser::QueryMut::Other(Statement::Insert(stmt)) => {
             stmt.table = qualify_table_name(session, &stmt.table);
             match &mut stmt.source {
@@ -50,6 +63,18 @@ pub(super) fn qualify_statement_tables<'q>(
             }
         }
         crate::parser::QueryMut::Select(stmt) => qualify_select_tables(db, session, stmt)?,
+        crate::parser::QueryMut::Other(
+            Statement::CreateTableAsSelect { query, .. }
+            | Statement::CreateView { query, .. }
+            | Statement::AlterView { query, .. },
+        ) => {
+            qualify_statement_tables(db, session, query)?;
+        }
+        crate::parser::QueryMut::Other(Statement::Do(expressions)) => {
+            for expr in expressions {
+                qualify_expr_tables(db, session, expr)?;
+            }
+        }
         crate::parser::QueryMut::Other(Statement::Update(stmt)) => {
             stmt.table = qualify_table_name(session, &stmt.table);
             for join in &mut stmt.joins {
@@ -160,11 +185,19 @@ pub(super) fn qualify_select_tables(
             continue;
         }
         if super::cte::has_cte(&table.name) {
+            if table.sample.is_some() {
+                return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("TABLESAMPLE requires a user base table"));
+            }
             continue;
         }
         table.name = qualify_table_name(session, &table.name);
     }
     for join in &mut stmt.joins {
+        if join.table.sample.is_some() && super::cte::has_cte(&join.table.name) {
+            return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                .error("TABLESAMPLE requires a user base table"));
+        }
         if join.derived.is_none() && !super::cte::has_cte(&join.table.name) {
             join.table.name = qualify_table_name(session, &join.table.name);
         }

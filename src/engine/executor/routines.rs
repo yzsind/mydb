@@ -388,7 +388,24 @@ pub(super) fn resolve_stored_functions(
         return Ok(StoredFunctionResolution::default());
     }
     let mut resolution = StoredFunctionResolution::default();
+    let policy_expressions = super::rls::policy_function_expressions(db, session, statement);
     resolve_statement_functions(db, session, statement, registry, &mut resolution)?;
+    for mut expression in policy_expressions {
+        let mut policy_resolution = StoredFunctionResolution::default();
+        resolve_expr_functions(
+            db,
+            session,
+            &mut expression,
+            registry,
+            &mut policy_resolution,
+        )?;
+        if policy_resolution.tables.values().any(|write| *write) {
+            return Err(crate::engine::rls::violation(
+                "Policy functions cannot write or lock database rows",
+            ));
+        }
+        resolution.merge(policy_resolution);
+    }
     Ok(resolution)
 }
 
@@ -397,20 +414,22 @@ pub(super) fn resolve_stored_functions(
 /// back to the full dispatcher, including functions in predicates/subqueries.
 pub(super) fn statement_references_stored_function(
     db: &Database,
-    current_database: &str,
+    session: &SessionContext,
     statement: &crate::parser::Statement,
 ) -> bool {
+    let current_database = &session.current_database;
     db.has_stored_functions()
-        && crate::parser::collect_statement_function_names(statement)
-            .iter()
-            .any(|name| {
-                (name.contains('.')
-                    || (!crate::engine::cbo::function_cost::is_known_builtin_function(name)
-                        && !crate::planner::is_aggregate_function(name)))
-                    && db
-                        .routine_definition(current_database, RoutineKindSchema::Function, name)
-                        .is_some()
-            })
+        && (!super::rls::policy_function_expressions(db, session, statement).is_empty()
+            || crate::parser::collect_statement_function_names(statement)
+                .iter()
+                .any(|name| {
+                    (name.contains('.')
+                        || (!crate::engine::cbo::function_cost::is_known_builtin_function(name)
+                            && !crate::planner::is_aggregate_function(name)))
+                        && db
+                            .routine_definition(current_database, RoutineKindSchema::Function, name)
+                            .is_some()
+                }))
 }
 
 /// Cheap source-free SELECT guard used by the protocol inline executor.
@@ -2636,11 +2655,11 @@ fn enter_definer_security(
     host: &str,
 ) -> Result<(), QueryError> {
     let definer = AccountKey::new(user, host);
-    let active_roles = db.with_auth_catalog(|auth| {
-        auth.accounts
-            .contains_key(&account_id(&definer))
-            .then(|| auth.login_active_roles(&definer))
-    })?;
+    let auth = crate::engine::rls::authorization_snapshot(db);
+    let active_roles = auth
+        .accounts
+        .contains_key(&account_id(&definer))
+        .then(|| auth.login_active_roles(&definer));
     let Some(active_roles) = active_roles else {
         return Err(error(
             crate::error::catalog::ER_NO_SUCH_USER,
@@ -2670,6 +2689,11 @@ impl OutBinding {
     ) -> Result<Value, QueryError> {
         match self {
             OutBinding::UserVariable(name) => {
+                if crate::engine::rls::policy_active() {
+                    return Err(crate::engine::rls::violation(
+                        "Policy functions cannot read mutable session variables",
+                    ));
+                }
                 Ok(session.user_variable(name).cloned().unwrap_or(Value::Null))
             }
             OutBinding::Local(name) => caller_locals
@@ -2699,6 +2723,11 @@ impl OutBinding {
     ) -> Result<(), QueryError> {
         match self {
             OutBinding::UserVariable(name) => {
+                if crate::engine::rls::policy_active() {
+                    return Err(crate::engine::rls::violation(
+                        "Policy functions cannot assign session variables",
+                    ));
+                }
                 session.set_user_variable(name, value)?;
                 Ok(())
             }
@@ -4819,7 +4848,15 @@ fn assign_target(
             }
             locals.insert(key, value);
         }
-        RoutineTarget::UserVariable(name) => session.set_user_variable(name, value)?,
+        RoutineTarget::UserVariable(name) => {
+            if crate::engine::rls::policy_active() {
+                return Err(crate::engine::rls::violation(
+                    "Policy functions cannot assign session variables",
+                )
+                .into());
+            }
+            session.set_user_variable(name, value)?;
+        }
     }
     Ok(())
 }
@@ -4959,6 +4996,11 @@ fn read_target(
             })
         }
         RoutineTarget::UserVariable(name) => {
+            if crate::engine::rls::policy_active() {
+                return Err(crate::engine::rls::violation(
+                    "Policy functions cannot read mutable session variables",
+                ));
+            }
             Ok(session.user_variable(name).cloned().unwrap_or(Value::Null))
         }
     }
@@ -5011,7 +5053,14 @@ fn eval_routine_expr(
                 )
             })
         }
-        Expr::UserVariable(name) => Ok(session.user_variable(name).cloned().unwrap_or(Value::Null)),
+        Expr::UserVariable(name) => {
+            if crate::engine::rls::policy_active() {
+                return Err(crate::engine::rls::violation(
+                    "Policy functions cannot read mutable session variables",
+                ));
+            }
+            Ok(session.user_variable(name).cloned().unwrap_or(Value::Null))
+        }
         Expr::SystemVariable { scope, name } => eval_system_variable(*scope, name, None),
         Expr::Literal(lit) => Ok(literal_value(lit)),
         Expr::BoundValue(value) => Ok(value.clone()),

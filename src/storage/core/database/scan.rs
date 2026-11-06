@@ -1,4 +1,25 @@
+/// Per-worker root reader bound to one statement view. Cache policy and
+/// visibility memo outlive individual random-page tasks. Heap handles use a
+/// bounded cache and retain the same snapshot semantics as ordinary MRR.
+pub(crate) struct VisibleRootScanScratch {
+    txn: TxnView,
+    policy: ScanCachePolicy,
+    visibility: ScanVisibilityCache,
+    heaps: [Option<(u64, HeapHandle)>; 8],
+    deferred: Vec<RowId>,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
 impl Database {
+    pub(crate) fn visible_root_scan_scratch(
+        &self, table:&TableSchema, txn:TxnView,
+    ) -> Result<VisibleRootScanScratch,QueryError> {
+        self.check_primary_read_view(table,txn)?;
+        Ok(VisibleRootScanScratch {txn,policy:self.scan_cache_policy_for_table(table)?,
+            visibility:ScanVisibilityCache::new(),heaps:std::array::from_fn(|_|None),
+            deferred:Vec::new(),charge:crate::engine::executor::mem_budget::ScopedCharge::new(0)})
+    }
+
     fn scan_cache_policy_for_storage_ids(
         &self,
         storage_ids: &[u64],
@@ -539,6 +560,61 @@ impl Database {
                 self.read_row_columns_at(storage_id, table_schema, row_id, txn, columns)?
             {
                 visit(row_id, &values)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enumerate visible root identities without decoding user columns. The
+    /// identity predicate is independent of visibility and may reject roots
+    /// before transaction/undo lookup (e.g. seeded percentage sampling).
+    #[cfg(test)]
+    pub(crate) fn scan_visible_root_ids<F,K>(
+        &self, table:&TableSchema,storage_id:u64,txn:TxnView,page_lo:u64,page_hi:u64,keep:K,visit:F,
+    ) -> Result<(),QueryError>
+    where K:FnMut(RowId)->bool,F:FnMut(RowId)->Result<(),QueryError> {
+        let mut scratch=self.visible_root_scan_scratch(table,txn)?;
+        self.scan_visible_root_ids_with_scratch(table,storage_id,page_lo,page_hi,&mut scratch,keep,visit)
+    }
+
+    pub(crate) fn scan_visible_root_ids_with_scratch<F,K>(
+        &self,table:&TableSchema,storage_id:u64,page_lo:u64,page_hi:u64,
+        scratch:&mut VisibleRootScanScratch,mut keep:K,mut visit:F,
+    ) -> Result<(),QueryError>
+    where K:FnMut(RowId)->bool,F:FnMut(RowId)->Result<(),QueryError> {
+        let txn=scratch.txn;
+        self.check_primary_read_view(table,txn)?;
+        let policy=scratch.policy;
+        let index=(storage_id.wrapping_mul(0x9e3779b97f4a7c15)>>61) as usize;
+        if scratch.heaps[index].as_ref().is_none_or(|(id,_)| *id!=storage_id) {
+            scratch.heaps[index]=Some((storage_id,self.cached_heap_handle(storage_id)?));
+        }
+        let heap=&scratch.heaps[index].as_ref().unwrap().1;
+        let cache=&mut scratch.visibility;
+        let deferred=&mut scratch.deferred;
+        let charge=&mut scratch.charge;
+        deferred.clear();
+        let examined=crate::engine::perf_events::RowsExaminedBatch::new();
+        {
+            let heap=heap.read();
+            heap.with_lob(|| heap.scan_root_headers_range(page_lo,page_hi,policy,|row_id,header| {
+                if !keep(row_id) {return Ok(());}
+                if self.row_version_visible_cached(cache,header,txn)? {
+                    if !header.is_deleted() {examined.add(1);visit(row_id)?;}
+                } else {
+                    if deferred.len()==deferred.capacity() {
+                        crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                            deferred,32,charge,"root scan historical identities")?;
+                    }
+                    deferred.push(row_id);
+                }
+                Ok(())
+            }))?;
+        }
+        for row_id in deferred.drain(..) {
+            crate::engine::cancel::check_cancelled()?;
+            if self.read_row_columns_at(storage_id,table,row_id,txn,&[])?.is_some() {
+                examined.add(1);visit(row_id)?;
             }
         }
         Ok(())

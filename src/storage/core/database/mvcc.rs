@@ -751,6 +751,11 @@ impl Database {
         txn: TxnView,
         table_id: u64,
     ) -> Result<(), QueryError> {
+        if crate::engine::rls::policy_active() {
+            return Err(crate::engine::rls::violation(
+                "Policy functions cannot modify database rows",
+            ));
+        }
         if is_temp_table_id(table_id) {
             return Ok(());
         }

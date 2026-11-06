@@ -81,6 +81,15 @@ pub(crate) fn reset_query_globals_for_mtr() {
 }
 
 pub(crate) fn register(reg: &mut Registry) {
+    reg.register(SysVar::settable(
+        SysVarDef::new("row_security", Scope::Session, DataType::Bool)
+            .with_doc("Apply row security; OFF errors unless the effective identity bypasses RLS."),
+        |ctx| SysVarValue::Bool(ctx.session.map_or(true, |s| s.rls.enabled)),
+        |ctx, value| {
+            ctx.session.rls.enabled = value.as_bool().unwrap();
+            Ok(())
+        },
+    ));
     // INFORMATION_SCHEMA reads storage-engine metadata on every query, without
     // a separate expiry cache. Its age is therefore already within this limit,
     // including zero; keep that cheap direct-read path for every setting.

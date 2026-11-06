@@ -589,6 +589,12 @@ fn parse_statement_source(
     sql: &str,
     lex_mode: crate::sql_lex::SqlLexMode,
 ) -> Result<Statement, ParseError> {
+    if let Some(result) = crate::engine::access_keys::parse(sql) {
+        return result;
+    }
+    if let Some(result) = super::rls::parse(sql) {
+        return result;
+    }
     if let Some(result) = crate::engine::ai::sql::parse(sql) {
         return result;
     }

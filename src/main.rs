@@ -156,6 +156,28 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     // Reserve the socket before bootstrap or recovery can modify the directory.
     let listener = mydb::mysql::server::bind_listener(addr)?;
     let addr = listener.local_addr()?;
+    let rest_config = mydb::rest::RestConfig::from_startup()?;
+    let mcp_config = mydb::mcp::McpConfig::from_startup()?;
+    let http_enabled = rest_config.enabled || mcp_config.enabled;
+    let rest_listener = if http_enabled {
+        Some(mydb::mysql::server::bind_listener(rest_config.addr)?)
+    } else {
+        None
+    };
+    let rest_tls = if http_enabled && rest_config.tls {
+        let paths = rest_config
+            .cert
+            .as_deref()
+            .zip(rest_config.key.as_deref())
+            .or_else(|| config.ssl_cert.as_deref().zip(config.ssl_key.as_deref()));
+        let acceptor = load_or_generate_tls_acceptor(paths)?.expect("TLS acceptor");
+        let mut tls = (**acceptor.config()).clone();
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls)))
+    } else {
+        None
+    };
+
     let log_config = QueryLogConfig::with_slow_sql_threshold_ms(config.slow_sql_ms);
     let registry = Arc::new(SessionRegistry::new());
     let repository = startup_config::var_os("MYDB_BACKUP_REPOSITORY").map(PathBuf::from);
@@ -268,6 +290,21 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
         (SslMode::Auto, true) => "enabled (configured certificate)",
         (SslMode::Auto, false) => "enabled (ephemeral self-signed certificate)",
     };
+    let rest_task = if let Some(listener) = rest_listener {
+        mydb::rest::validate_credentials(&engine).map_err(startup_error)?;
+        let server =
+            mydb::rest::RestServer::new(rest_config, engine.clone(), registry.clone(), rest_tls)
+                .with_mcp(mcp_config);
+        log_message(format_args!(
+            "mydb HTTP SQL/MCP listening on {}",
+            listener.local_addr()?
+        ));
+        Some(tokio::spawn(async move {
+            server.run_with_listener(listener).await
+        }))
+    } else {
+        None
+    };
     let server = MysqlServer::with_tls(addr, engine, tls_acceptor, registry);
 
     log_message(format_args!("\n{MYDB_BANNER}"));
@@ -276,7 +313,12 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
         config.slow_sql_ms,
         if config.binlog.enabled { "ON" } else { "OFF" },
     ));
-    server.run_with_listener(listener).await
+    let result = server.run_with_listener(listener).await;
+    if let Some(task) = rest_task {
+        task.await
+            .map_err(|_| std::io::Error::other("REST listener task failed"))??;
+    }
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +399,16 @@ fn print_help() {
          \x20 --slow-sql-ms MS               Legacy slow SQL threshold\n\
          \x20 --ssl-mode auto|disabled       TLS advertisement mode\n\
          \x20 --ssl-cert PATH --ssl-key PATH Configured TLS certificate and key\n\
+         \nMCP server (shared REST HTTP listener):\n\
+         \x20 --mcp-enabled ON|OFF           Enable /mcp (default OFF)\n\
+         \x20 --mcp-max-inflight N           MCP SQL concurrency (default 16)\n\
+         \x20 --mcp-max-result-rows N        Result row ceiling (default 1000)\n\
+         \x20 --mcp-max-result-bytes N       Response ceiling (default 1048576)\n\
+         \x20 --mcp-allowed-origins JSON     Exact HTTP origins (default [])\n\
+         \nREST SQL server:\n\
+         \x20 --rest-enabled ON|OFF          Enable REST SQL (default OFF)\n\
+         \x20 --rest-host IP --rest-port N    REST address (default 127.0.0.1:8739)\n\
+         \x20 --rest-tls-mode required|disabled  HTTPS by default; plaintext loopback only\n\
          \nHTTP SQL calls:\n\
          \x20 --http-enabled ON|OFF          Enable HTTP SQL calls (default ON)\n\
          \x20 --http-local-config PATH       Optional node egress/CA/account policy\n\

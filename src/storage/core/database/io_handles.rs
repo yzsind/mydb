@@ -331,6 +331,7 @@ impl Database {
             triggers: load(DD_TRIGGERS)?,
             events: load(DD_EVENTS)?,
             users: load(DD_USERS)?,
+            api_keys: load(crate::storage::data_dictionary::DD_API_KEYS)?,
             grants: load(DD_GLOBAL_PRIVILEGES)?,
             role_edges: load(DD_ROLE_EDGES)?,
             dd_properties: load(DD_DD_PROPERTIES)?,
@@ -434,7 +435,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn diagnostic_catalog_snapshot_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
+            catalog_from_dd_rows, DdRowSet, DD_ROW_SECURITY_POLICIES, DD_ROW_SECURITY_DEPENDENCIES, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
             DD_COLUMN_STATS, DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
             DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
             DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
@@ -448,6 +449,8 @@ impl Database {
             indexes: load(DD_INDEXES)?,
             index_column_usage: load(DD_INDEX_COLUMN_USAGE)?,
             check_constraints: load(DD_CHECK_CONSTRAINTS)?,
+            row_security_policies: load(DD_ROW_SECURITY_POLICIES)?,
+            row_security_dependencies: load(DD_ROW_SECURITY_DEPENDENCIES)?,
             foreign_keys: load(DD_FOREIGN_KEYS)?,
             foreign_key_column_usage: load(DD_FOREIGN_KEY_COLUMN_USAGE)?,
             views: load(DD_VIEWS)?,
@@ -455,6 +458,7 @@ impl Database {
             triggers: load(DD_TRIGGERS)?,
             events: load(DD_EVENTS)?,
             users: load(DD_USERS)?,
+            api_keys: load(crate::storage::data_dictionary::DD_API_KEYS)?,
             grants: load(DD_GLOBAL_PRIVILEGES)?,
             role_edges: load(DD_ROLE_EDGES)?,
             dd_properties: load(DD_DD_PROPERTIES)?,
@@ -485,6 +489,7 @@ impl Database {
             triggers: self.scan_dd_table(DD_TRIGGERS)?,
             events: self.scan_dd_table(DD_EVENTS)?,
             users: self.scan_dd_table(DD_USERS)?,
+            api_keys: self.scan_dd_table(crate::storage::data_dictionary::DD_API_KEYS)?,
             grants: self.scan_dd_table(DD_GLOBAL_PRIVILEGES)?,
             role_edges: self.scan_dd_table(DD_ROLE_EDGES)?,
             restrictions: self.scan_dd_table(DD_RESTRICTIONS)?,

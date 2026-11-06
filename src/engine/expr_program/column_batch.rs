@@ -526,6 +526,18 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
             && !semantics.unsigned_subtraction =>
         {
             let (l, r) = (contract(left, schema)?, contract(right, schema)?);
+            let exact_integer = |domain| {
+                matches!(
+                    domain,
+                    Domain::Integer(..) | Domain::Unsigned | Domain::Null
+                )
+            };
+            if comparison(*op) && exact_integer(l.domain) && exact_integer(r.domain) {
+                return Some(Contract {
+                    domain: Domain::Integer(0, 1),
+                    parallel: l.parallel && r.parallel,
+                });
+            }
             let (Domain::Integer(a, b), Domain::Integer(c, d)) = (l.domain, r.domain) else {
                 let nonnegative = |domain| {
                     matches!(domain, Domain::Unsigned | Domain::Null)
@@ -1478,8 +1490,42 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
         ExprNode::Binary {
             left, op, right, ..
         } => {
+            // A direct column and a diagnostic-free statement scalar need
+            // no broadcast allocation. Bind in SQL operand order and retain
+            // the column's validity bitmap, including out-of-domain values.
+            if comparison(*op) {
+                if matches!(left.as_ref(), ExprNode::Column(_)) {
+                    if let Some(value) = integer_statement_scalar(right) {
+                        return compare_integer_scalar(
+                            operand(left, batch)?.as_ref(),
+                            value,
+                            *op,
+                            false,
+                            rows,
+                        );
+                    }
+                } else if matches!(right.as_ref(), ExprNode::Column(_)) {
+                    if let Some(value) = integer_statement_scalar(left) {
+                        return compare_integer_scalar(
+                            operand(right, batch)?.as_ref(),
+                            value,
+                            *op,
+                            true,
+                            rows,
+                        );
+                    }
+                }
+            }
             let left_column = operand(left, batch)?;
             let right_column = operand(right, batch)?;
+            if comparison(*op)
+                && !matches!(
+                    (left_column.as_ref(), right_column.as_ref()),
+                    (ColumnVector::I64 { .. }, ColumnVector::I64 { .. })
+                )
+            {
+                return compare_integer_columns(&left_column, &right_column, *op, rows);
+            }
             let (
                 ColumnVector::I64 {
                     data: left,
@@ -1697,6 +1743,153 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
         }
         _ => None,
     }
+}
+
+/// Only immutable, diagnostic-free scalars enter this lane. Unknown or
+/// warning-producing casts keep the ordinary ordered evaluator.
+fn integer_statement_scalar(node: &ExprNode) -> Option<Option<i128>> {
+    let value = match node {
+        ExprNode::Const(value) => value.clone(),
+        _ => SessionRead::bind(node)?.value,
+    };
+    match value {
+        Value::Null => Some(None),
+        Value::Int(value) => Some(Some(i128::from(value))),
+        Value::UInt(value) => Some(Some(i128::from(value))),
+        _ => None,
+    }
+}
+
+fn compare_integer_scalar(
+    column: &ColumnVector,
+    scalar: Option<i128>,
+    op: BinaryOp,
+    reverse: bool,
+    rows: usize,
+) -> Option<ColumnVector> {
+    let op = if reverse {
+        match op {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::LtEq => BinaryOp::GtEq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::GtEq => BinaryOp::LtEq,
+            other => other,
+        }
+    } else {
+        op
+    };
+    if !matches!(
+        column,
+        ColumnVector::I64 { .. } | ColumnVector::U64 { .. } | ColumnVector::Null { .. }
+    ) {
+        return None;
+    }
+    let Some(scalar) = scalar else {
+        return Some(ColumnVector::Null { len: rows });
+    };
+    fn lane<T: Copy + PartialOrd>(data: &[T], scalar: T, op: BinaryOp) -> Option<Vec<i64>> {
+        let mut out = Vec::with_capacity(data.len());
+        // Chunk boundaries retain cancellation without a branch per value.
+        for chunk in data.chunks(4096) {
+            crate::engine::cancel::check_cancelled().ok()?;
+            match op {
+                BinaryOp::Eq => out.extend(chunk.iter().map(|value| i64::from(*value == scalar))),
+                BinaryOp::NotEq => {
+                    out.extend(chunk.iter().map(|value| i64::from(*value != scalar)))
+                }
+                BinaryOp::Lt => out.extend(chunk.iter().map(|value| i64::from(*value < scalar))),
+                BinaryOp::LtEq => out.extend(chunk.iter().map(|value| i64::from(*value <= scalar))),
+                BinaryOp::Gt => out.extend(chunk.iter().map(|value| i64::from(*value > scalar))),
+                BinaryOp::GtEq => out.extend(chunk.iter().map(|value| i64::from(*value >= scalar))),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    let constant = |less: bool| {
+        let value = match op {
+            BinaryOp::Eq => false,
+            BinaryOp::NotEq => true,
+            BinaryOp::Lt | BinaryOp::LtEq => less,
+            BinaryOp::Gt | BinaryOp::GtEq => !less,
+            _ => return None,
+        };
+        Some(vec![i64::from(value); rows])
+    };
+    let (data, nulls) = match column {
+        ColumnVector::I64 { data, nulls } => (
+            if let Ok(scalar) = i64::try_from(scalar) {
+                lane(data, scalar, op)?
+            } else {
+                constant(scalar > i128::from(i64::MAX))?
+            },
+            nulls.clone(),
+        ),
+        ColumnVector::U64 { data, nulls } => (
+            if let Ok(scalar) = u64::try_from(scalar) {
+                lane(data, scalar, op)?
+            } else {
+                constant(scalar > i128::from(u64::MAX))?
+            },
+            nulls.clone(),
+        ),
+        ColumnVector::Null { .. } => return Some(ColumnVector::Null { len: rows }),
+        _ => return None,
+    };
+    Some(ColumnVector::I64 { data, nulls })
+}
+
+/// Compare exact signed/unsigned lanes without a DOUBLE conversion or a
+/// wrapping cast. Both operands have already been evaluated in SQL order.
+fn compare_integer_columns(
+    left: &ColumnVector,
+    right: &ColumnVector,
+    op: BinaryOp,
+    rows: usize,
+) -> Option<ColumnVector> {
+    let valid = |column: &ColumnVector| {
+        matches!(
+            column,
+            ColumnVector::I64 { .. } | ColumnVector::U64 { .. } | ColumnVector::Null { .. }
+        )
+    };
+    if !valid(left) || !valid(right) {
+        return None;
+    }
+    if matches!(left, ColumnVector::Null { .. }) || matches!(right, ColumnVector::Null { .. }) {
+        return Some(ColumnVector::Null { len: rows });
+    }
+    let value = |column: &ColumnVector, row| match column {
+        ColumnVector::I64 { data, .. } => data[row] as i128,
+        ColumnVector::U64 { data, .. } => data[row] as i128,
+        _ => unreachable!(),
+    };
+    let mut data = Vec::with_capacity(rows);
+    let mut nulls = Bitmap::new_all_valid(rows);
+    for row in 0..rows {
+        if row & 63 == 0 {
+            crate::engine::cancel::check_cancelled().ok()?;
+        }
+        if left.is_null(row) || right.is_null(row) {
+            nulls.set(row, false);
+            data.push(0);
+            continue;
+        }
+        let (a, b) = (value(left, row), value(right, row));
+        data.push(i64::from(match op {
+            BinaryOp::Eq => a == b,
+            BinaryOp::NotEq => a != b,
+            BinaryOp::Lt => a < b,
+            BinaryOp::LtEq => a <= b,
+            BinaryOp::Gt => a > b,
+            BinaryOp::GtEq => a >= b,
+            _ => return None,
+        }));
+    }
+    Some(ColumnVector::I64 {
+        data,
+        nulls: Some(nulls),
+    })
 }
 
 // A signed integer comparison never converts through DOUBLE or text.

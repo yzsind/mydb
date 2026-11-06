@@ -29,7 +29,9 @@
 /// v67: object-scoped, typed binary optimizer statistics.
 /// v68: functional-index result collations and corrected numeric key domains.
 /// v69: stable table-local SQL ROWID tags on physical partition leaves.
-pub const CATALOG_VERSION: u32 = 69;
+/// v70: row security table metadata and policies.
+/// v71: recoverable REST API key credential dictionary.
+pub const CATALOG_VERSION: u32 = 71;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.

@@ -273,12 +273,14 @@ pub(crate) trait AstVisitorMut {
 mod walk;
 walk::define_walk!(mutable, AstVisitorMut, [mut], iter_mut, from_mut);
 walk::define_walk!(immutable, AstVisitor, [], iter, from_ref);
+pub(crate) use immutable::walk_delete as visit_delete;
 pub(crate) use immutable::walk_expr as visit_expr;
 pub(crate) use immutable::walk_query as visit_query;
 pub(crate) use immutable::walk_routine_statements as visit_routine_statements;
 pub(crate) use immutable::walk_select as visit_select;
 pub(crate) use immutable::walk_set_operation as visit_set_operation;
 pub(crate) use immutable::walk_statement as visit_statement;
+pub(crate) use immutable::walk_update as visit_update;
 pub(crate) use mutable::walk_expr as visit_expr_mut;
 pub(crate) use mutable::walk_query as visit_query_mut;
 pub(crate) use mutable::walk_select as visit_select_mut;

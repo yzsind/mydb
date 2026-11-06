@@ -1,3 +1,4 @@
+pub mod access_keys;
 pub(crate) mod ai;
 pub mod api;
 mod async_row_wait;
@@ -10,9 +11,11 @@ pub mod cache;
 pub mod cache_registry;
 pub(crate) mod cancel;
 pub mod cbo;
+pub(crate) mod credential_crypto;
 pub mod cursor_registry;
 pub(crate) mod executor;
 pub(crate) mod http;
+pub mod rls;
 pub use executor::mem_budget::controlled_memory_snapshot;
 pub mod vector_maintenance;
 pub mod zone_map_maintenance;

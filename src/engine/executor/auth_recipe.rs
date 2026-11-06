@@ -24,6 +24,7 @@ pub(super) struct BoundAccessRecipe {
     reads: BTreeMap<Object, BTreeSet<String>>,
     available: BTreeMap<Object, BTreeSet<String>>,
     writes: BTreeMap<(Privilege, Object), BTreeSet<String>>,
+    root_reads: Option<BTreeSet<usize>>,
 }
 struct Binder<'a> {
     db: &'a Database,
@@ -45,7 +46,7 @@ impl BoundAccessRecipe {
             statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         ) {
-            return Self::build_dml(db, session, statement);
+            return Self::build_dml(db, session, statement, false);
         }
         if let Statement::CreateView { query, .. } | Statement::AlterView { query, .. } = statement
         {
@@ -101,8 +102,23 @@ impl BoundAccessRecipe {
             )
             .collect()
     }
-    fn build_dml(db: &Database, session: &SessionContext, statement: &Statement) -> Option<Self> {
+    pub(super) fn dml_read_references(
+        db: &Database,
+        session: &SessionContext,
+        statement: &Statement,
+    ) -> Option<BTreeSet<usize>> {
+        Self::build_dml(db, session, statement, true)?.root_reads
+    }
+    fn build_dml(
+        db: &Database,
+        session: &SessionContext,
+        statement: &Statement,
+        track_reads: bool,
+    ) -> Option<Self> {
         let mut binder = Binder::new(db, session);
+        if track_reads {
+            binder.recipe.root_reads = Some(BTreeSet::new());
+        }
         let mut select = Select::default();
         let (table, alias, joins, returning) = match statement {
             Statement::Update(u) => (
@@ -382,6 +398,7 @@ impl<'a> Binder<'a> {
                 reads: BTreeMap::new(),
                 available: BTreeMap::new(),
                 writes: BTreeMap::new(),
+                root_reads: None,
             },
             complete: true,
             root_bindings: None,
@@ -596,6 +613,11 @@ impl Binder<'_> {
                         continue;
                     }
                     if let Some(object) = &binding.object {
+                        if depth == 0 {
+                            if let Some(reads) = &mut self.recipe.root_reads {
+                                reads.insert(index);
+                            }
+                        }
                         self.recipe
                             .reads
                             .entry(object.clone())

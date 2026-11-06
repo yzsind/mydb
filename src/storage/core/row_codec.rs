@@ -2743,7 +2743,7 @@ macro_rules! row_value_section {
     }};
 }
 
-fn decode_row_schema_ext_for_layout(
+pub(super) fn decode_row_schema_ext_for_layout(
     input: &[u8],
     codec: &RowCodec,
     layout_id: u32,

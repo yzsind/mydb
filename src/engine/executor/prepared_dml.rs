@@ -291,8 +291,7 @@ fn compile_prepared_dml_in_context(
     {
         return None;
     }
-    if super::routines::statement_references_stored_function(db, &session.current_database, parsed)
-    {
+    if super::routines::statement_references_stored_function(db, session, parsed) {
         return None;
     }
     if statement_refs_temp_table(session, parsed) {
@@ -348,6 +347,49 @@ fn compile_prepared_dml_in_context(
         Statement::Select(_) => {}
         _ => return None,
     }
+    let original_statement = Arc::clone(parsed);
+    let rls_bound = crate::engine::rls::might_require_binding(db, &table);
+    let security_statement = if rls_bound {
+        let mut secured = parsed.as_ref().clone();
+        match &mut secured {
+            Statement::Update(u) => {
+                let read = super::rls::update_requires_read(db, session, u, &table);
+                u.selection = super::rls::dml_filter(
+                    db,
+                    &table,
+                    crate::parser::rls::Command::Update,
+                    read,
+                    u.selection.take(),
+                )
+                .ok()?;
+            }
+            Statement::Delete(d) => {
+                d.selection = super::rls::dml_filter(
+                    db,
+                    &table,
+                    crate::parser::rls::Command::Delete,
+                    d.selection.is_some(),
+                    d.selection.take(),
+                )
+                .ok()?
+            }
+            Statement::Select(s) => {
+                s.selection = super::rls::dml_filter(
+                    db,
+                    &table,
+                    crate::parser::rls::Command::Update,
+                    true,
+                    s.selection.take(),
+                )
+                .ok()?;
+            }
+            _ => {}
+        }
+        Some(Arc::new(secured))
+    } else {
+        None
+    };
+    let parsed = security_statement.as_ref().unwrap_or(parsed);
     let enum_statement = table
         .columns
         .iter()
@@ -382,7 +424,9 @@ fn compile_prepared_dml_in_context(
     let mdl_requests = prepared_statement_mdl_requests(db, session, parsed);
     db.record_prepared_dml_compile();
     Some(PreparedDmlPlan {
-        semantics: super::plan_semantics(session),
+        original_statement,
+        rls_bound,
+        semantics: super::plan_semantics(db, session),
         optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
         statement: Arc::clone(parsed),
         epoch,
@@ -419,7 +463,7 @@ pub(super) fn memo_is_valid(
     // validation must leave a different epoch for the under-MDL check.
     let catalog_epoch = db.catalog_publication_epoch();
     let valid =
-        super::compiled_select::semantics_match(&dp.semantics, &dp.optimizer_switch, session)
+        super::compiled_select::semantics_match(db, &dp.semantics, &dp.optimizer_switch, session)
             && dp.epoch == current_epoch
             && dp.cbo_epoch == crate::engine::cbo::cbo_epoch()
             && db.table_key_identity_version_matches(
@@ -498,6 +542,17 @@ pub(super) fn execute_prepared_dml_plan(
     connection_id: u64,
 ) -> Result<QueryResponse, QueryError> {
     let _rowid_demand = crate::storage::rowid::DemandScope::enter(&dp.statement);
+    if dp.rls_bound
+        && !super::compiled_select::semantics_match(
+            db,
+            &dp.semantics,
+            &dp.optimizer_switch,
+            session,
+        )
+    {
+        return Err(crate::error::catalog::ER_NEED_REPREPARE
+            .error("prepared DML security identity changed before statement execution"));
+    }
     authorize_prepared_dml(db, session, dp)?;
     let mdl_guard = acquire_prepared_statement_mdl(db, session, &dp.statement, &dp.mdl_requests)?;
     // The optimistic cache validation ran before MDL acquisition. A DDL may
@@ -763,6 +818,12 @@ pub(super) fn execute_homogeneous_point_update_batch(
         return Ok(None);
     }
     let table = &point.table;
+    if dp.rls_bound {
+        // A grouped physical rewrite has no boundary at which to adopt the
+        // next logical statement's privileges after a lock wait. Keep each
+        // protected child on its cached point/sparse executor instead.
+        return Ok(None);
+    }
     if table.is_partitioned()
         || !update.affected_indexes.is_empty()
         || !update.on_update_columns.is_empty()

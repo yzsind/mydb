@@ -98,8 +98,7 @@ pub(super) fn compile_uncached_prepared_select(
     crate::engine::cache::CompiledSelectPlan,
 )> {
     let select = eligible_select(parsed)?;
-    if super::routines::statement_references_stored_function(db, &session.current_database, parsed)
-    {
+    if super::routines::statement_references_stored_function(db, session, parsed) {
         return None;
     }
     if statement_refs_temp_table(session, parsed) {
@@ -152,7 +151,7 @@ pub(super) fn compile_uncached_prepared_select(
         select: Arc::clone(&normalized),
         deps,
         object_deps,
-        semantics: super::plan_semantics(session),
+        semantics: super::plan_semantics(db, session),
         optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
         required_privileges,
         mdl_requests,
@@ -182,17 +181,20 @@ pub(super) fn uncached_template_is_valid(
     template: &PreparedSelectTemplate,
     session: &SessionContext,
 ) -> bool {
-    semantics_match(&template.semantics, &template.optimizer_switch, session)
+    semantics_match(db, &template.semantics, &template.optimizer_switch, session)
         && plan_deps_match_catalog(db, &template.deps)
         && plan_object_deps_match_catalog(db, &template.object_deps)
 }
 
 pub(super) fn semantics_match(
+    db: &Database,
     semantics: &crate::engine::cache::PlanSemantics,
     optimizer_switch: &str,
     session: &SessionContext,
 ) -> bool {
-    semantics.sql_mode_fingerprint == crate::binlog::sql_mode_str_to_bits(&session.sql_mode)
+    semantics.rls_authorization.as_deref()
+        == Some(crate::engine::rls::session_signature(db, session).as_ref())
+        && semantics.sql_mode_fingerprint == crate::binlog::sql_mode_str_to_bits(&session.sql_mode)
         && optimizer_switch == session.sysvars.optimizer_switch
         && semantics.sql_select_limit == session.sysvars.sql_select_limit
         && semantics.use_invisible_indexes == session.sysvars.use_invisible_indexes
@@ -256,7 +258,7 @@ pub(super) fn compile_prepared_select_from_memo(
 ) -> Option<PreparedSelectMemo> {
     let previous = previous.filter(|memo| {
         memo_catalog_is_valid(db, memo, plan_cache.current_epoch())
-            && semantics_match(&memo.semantics, &memo.optimizer_switch, session)
+            && semantics_match(db, &memo.semantics, &memo.optimizer_switch, session)
             && memo.authorization_account == session.authenticated_as
     });
     let (normalized, structural_fingerprint) = if let Some(previous) = previous {
@@ -271,11 +273,7 @@ pub(super) fn compile_prepared_select_from_memo(
         )
     } else {
         let select = eligible_select(parsed)?;
-        if super::routines::statement_references_stored_function(
-            db,
-            &session.current_database,
-            parsed,
-        ) {
+        if super::routines::statement_references_stored_function(db, session, parsed) {
             return None;
         }
         // Temp tables get re-qualified per execute; keep them out of the
@@ -313,7 +311,7 @@ pub(super) fn compile_prepared_select_from_memo(
     let key = crate::engine::cache::StatementKey {
         sql: Arc::from(typed_fingerprint),
         database: Arc::from(session.current_database.as_str()),
-        semantics: super::plan_semantics(session),
+        semantics: super::plan_semantics(db, session),
     };
     let compiled = if let Some(compiled) =
         plan_cache.get_select(&key, &normalized, |deps, objects| {
@@ -358,7 +356,7 @@ pub(super) fn compile_prepared_select_from_memo(
         parameter_plan_signature.push_str(&selectivity);
     }
     Some(PreparedSelectMemo {
-        semantics: super::plan_semantics(session),
+        semantics: super::plan_semantics(db, session),
         optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
         compiled,
         presentation_select: normalized,
@@ -401,7 +399,7 @@ pub(super) fn reusable_memo(
 ) -> Option<Arc<PreparedSelectMemo>> {
     let mut selectivity = None;
     let valid = |memo: &PreparedSelectMemo, selectivity: &mut Option<String>| {
-        semantics_match(&memo.semantics, &memo.optimizer_switch, session)
+        semantics_match(db, &memo.semantics, &memo.optimizer_switch, session)
             && memo_catalog_is_valid(db, memo, current_epoch)
             && current_parameter_signature_matches(db, memo, params, selectivity)
     };
