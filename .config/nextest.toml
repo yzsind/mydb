@@ -55,9 +55,18 @@ priority = 80
 filter = 'test(/engine::executor::tests::function_compat::/)'
 threads-required = 2
 
+# This large repository's cleanup contends with short fixtures' metadata
+# operations. Queue it after the main workload without reserving extra slots.
+[[profile.default.overrides]]
+filter = 'test(release_audit_reconciles_more_than_1024_unacknowledged_ranges)'
+priority = -10
+
 [[profile.default.overrides]]
 filter = 'test(/(^(storage|backup|repl)::|engine::executor::(load_data::tests|tests::(online_ddl|optimize_online|ddl_hardening|partitioning|vector_type|metadata_audit|xa))::)/)'
 test-group = 'persistence'
+# Start bounded durable work early so short tests fill the remaining slots
+# instead of leaving an I/O-only tail after all other categories finish.
+priority = 10
 
 # Wall-clock performance assertions need uncontended nextest process slots.
 # Preserve the speedup threshold while avoiding a vector/row timing comparison

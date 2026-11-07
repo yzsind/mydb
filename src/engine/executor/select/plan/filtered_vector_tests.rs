@@ -16,7 +16,7 @@ fn rows(engine: &StorageQueryEngine, sql: &str) -> Vec<Vec<Value>> {
         _ => panic!("result set required: {sql}"),
     }
 }
-fn setup(engine: &StorageQueryEngine, datatype: &str, algo: &str) {
+fn setup_rows(engine: &StorageQueryEngine, datatype: &str) {
     engine.execute(&format!("CREATE TABLE items(id INT PRIMARY KEY,tenant INT,body VARCHAR(100),v VECTOR(4,{datatype}) NOT NULL,KEY it(tenant))")).unwrap();
     for start in (0..512).step_by(64) {
         let values = (start..start + 64)
@@ -34,6 +34,10 @@ fn setup(engine: &StorageQueryEngine, datatype: &str, algo: &str) {
             .execute(&format!("INSERT INTO items VALUES {values}"))
             .unwrap();
     }
+}
+
+fn setup(engine: &StorageQueryEngine, datatype: &str, algo: &str) {
+    setup_rows(engine, datatype);
     let options = if algo == "HNSW" {
         "m=8,ef_construction=64"
     } else {
@@ -593,11 +597,13 @@ fn filtered_vector_partition_pruning_parallel_merge_and_snapshots_match_oracle()
 #[test]
 fn filtered_vector_quantized_metrics_and_binary_filters_match_exact_distances() {
     for algo in ["HNSW", "IVF"] {
+        // The query matrix has immutable input. Each combination builds and
+        // drops its own index over the same rows, preserving all model and
+        // distance checks without rebuilding an unused default index first.
+        let (_dir, engine) = open();
+        setup_rows(&engine, "FLOAT32");
         for metric in ["l2", "cosine", "dot"] {
             for quantization in ["none", "sq8", "sq4", "pq", "bq"] {
-                let (_dir, engine) = open();
-                setup(&engine, "FLOAT32", algo);
-                engine.execute("DROP INDEX vx ON items").unwrap();
                 let algorithm = if algo == "HNSW" {
                     "m=8,ef_construction=64"
                 } else {
@@ -630,6 +636,7 @@ fn filtered_vector_quantized_metrics_and_binary_filters_match_exact_distances() 
                     rows(&engine, &oracle),
                     "{algo} {metric} {quantization}"
                 );
+                engine.execute("DROP INDEX vx ON items").unwrap();
             }
         }
         let (_dir, engine) = open();

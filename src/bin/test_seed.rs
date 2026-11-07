@@ -54,6 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &memory_catalog,
         serde_json::to_vec(&engine.db_handle().catalog())?,
     )?;
+    #[cfg(test)]
+    let empty_indexes = engine
+        .db_handle()
+        .empty_dictionary_seed_indexes()
+        .map_err(query_error)?;
     engine.shutdown().map_err(query_error)?;
     drop(engine);
 
@@ -62,13 +67,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::remove_dir_all(seed_dir.join("system/logs"));
     let _ = fs::remove_file(seed_dir.join("system/mydb.lock"));
 
-    // Memory indexes are initialized in the buffer pool and never read these
-    // disk images. Keep the dictionary heaps/WAL, but avoid cloning and later
-    // unlinking dozens of unused indexes and their nested directories per test.
+    // Keep all heap allocation metadata and populated dictionary indexes.
+    // Empty indexes can be initialized in private memory before readers start.
     let memory_seed_dir = seed_dir.parent().unwrap().join("memory-seed");
     copy_seed_tree(&seed_dir, &memory_seed_dir)?;
-    // Dictionary indexes are needed for authoritative upserts even when
-    // transaction WAL is disabled in the cloned fixture.
+    #[cfg(test)]
+    compact_memory_seed(&memory_seed_dir, &empty_indexes)?;
     // Memory fixtures reconstruct undo and temporal state from WAL and do
     // not read the persistent undo segments or temporal ledgers. Avoid
     // cloning and unlinking these unused files in every isolated fixture.
@@ -156,6 +160,38 @@ fn copy_seed_tree(source: &Path, destination: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn compact_memory_seed(
+    root: &Path,
+    empty_indexes: &[(u64, Vec<PathBuf>)],
+) -> io::Result<()> {
+    let catalog = root.join("system/catalog");
+    let tables: Vec<_> = empty_indexes.iter().map(|(id, _)| *id).collect();
+    for relative in empty_indexes.iter().flat_map(|(_, paths)| paths) {
+        let path = root.join(relative);
+        fs::remove_file(&path)?;
+        let mut parent = path.parent();
+        while let Some(directory) = parent.filter(|directory| *directory != catalog) {
+            match fs::remove_dir(directory) {
+                Ok(()) => parent = directory.parent(),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    break
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    fs::write(
+        root.join(".mydb-test-empty-dd.json"),
+        serde_json::to_vec(&tables)?,
+    )
 }
 
 fn query_error(error: mydb::types::QueryError) -> io::Error {
