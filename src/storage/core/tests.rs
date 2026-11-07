@@ -27536,6 +27536,93 @@ fn failed_dictionary_index_is_rebuilt_before_startup_property_lookup() {
 }
 
 #[test]
+fn compact_memory_seed_preserves_dictionary_rows_roots_and_private_mutations() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let source = root.path().join("source");
+    let strict = test_storage_config(DurabilityMode::Strict, true);
+    let seed = crate::util::env::with_vars(&[("MYDB_TEST_DISABLE_SEED", Some("1"))], || {
+        Database::open_with_config(&source, strict.clone()).unwrap()
+    });
+    seed.checkpoint().unwrap();
+    seed.checkpoint().unwrap();
+    drop(seed);
+    let seed = Database::open_with_config(&source, strict).unwrap();
+    let catalog = serde_json::to_value(seed.catalog()).unwrap();
+    let catalog_path = root.path().join("catalog.json");
+    fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let expected: Vec<_> = crate::storage::data_dictionary::dd_tables()
+        .iter()
+        .map(|table| (table.id, seed.scan_dd_table(table.id).unwrap()))
+        .collect();
+    let empty_indexes = seed.empty_dictionary_seed_indexes().unwrap();
+    assert!(!empty_indexes.is_empty());
+    drop(seed);
+    let compact = root.path().join("compact");
+    crate::util::file::copy_fixture_tree(&source, &compact).unwrap();
+    crate::test_seed_setup::compact_memory_seed(&compact, &empty_indexes).unwrap();
+    assert!(empty_indexes
+        .iter()
+        .flat_map(|(_, paths)| paths)
+        .all(|path| !compact.join(path).exists()));
+    let memory = test_storage_config(DurabilityMode::Memory, false);
+    for cached in [true, false] {
+        crate::util::env::with_vars(
+            &[
+                ("MYDB_TEST_DISABLE_SEED", None),
+                ("MYDB_TEST_MEMORY_SEED_DIR", Some(compact.to_str().unwrap())),
+                (
+                    "MYDB_TEST_MEMORY_CATALOG",
+                    cached.then(|| catalog_path.to_str().unwrap()),
+                ),
+            ],
+            || {
+                for clone in 0..2 {
+                    let db = Database::open_with_config(
+                        root.path().join(format!("private-{cached}-{clone}")),
+                        memory.clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(serde_json::to_value(db.catalog()).unwrap(), catalog);
+                    for (id, rows) in &expected {
+                        assert_eq!(&db.scan_dd_table(*id).unwrap(), rows);
+                        let table = crate::storage::data_dictionary::dd_table_schema(*id).unwrap();
+                        for index in &table.indexes {
+                            db.with_index_read(*id, &index.name, |file| {
+                                file.validate_structure()?;
+                                assert_eq!(file.entries()?.len(), rows.len());
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                    }
+                    let before = db
+                        .scan_dd_table(crate::storage::data_dictionary::DD_TABLES)
+                        .unwrap()
+                        .len();
+                    db.create_table(
+                        "private_only",
+                        vec![checkpoint_test_pk_column()],
+                        vec!["id".into()],
+                        vec![],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        db.scan_dd_table(crate::storage::data_dictionary::DD_TABLES)
+                            .unwrap()
+                            .len(),
+                        before + 1
+                    );
+                }
+            },
+        );
+    }
+    assert!(empty_indexes
+        .iter()
+        .flat_map(|(_, paths)| paths)
+        .all(|path| !compact.join(path).exists()));
+}
+
+#[test]
 fn memory_catalog_seed_matches_heap_loading_and_remains_private() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");

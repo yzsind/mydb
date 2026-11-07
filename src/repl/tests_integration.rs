@@ -32,6 +32,16 @@ fn fresh_database_tempdir() -> TempDir {
     dir
 }
 
+fn fresh_master_engine() -> (Arc<crate::engine::StorageQueryEngine>, TempDir) {
+    let dir = fresh_database_tempdir();
+    // Bootstrap a private fixture with real WAL starting at LSN 1. Complete
+    // its device barrier before exposing it to a sender, backup or test DML.
+    let sync = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+    let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+    sync.finish().unwrap();
+    (engine, dir)
+}
+
 async fn initialize_replica_fixture(
     master: std::net::SocketAddr,
     dir: &std::path::Path,
@@ -614,15 +624,7 @@ mod online_apply {
     /// engine's underlying WAL log. Returns the engine, its data dir
     /// guard, and the service.
     async fn build_master_engine() -> (Arc<StorageQueryEngine>, TempDir, MasterService) {
-        let dir = fresh_database_tempdir();
-        let engine = Arc::new(
-            StorageQueryEngine::open_full(
-                dir.path().to_path_buf(),
-                QueryLogConfig::default(),
-                Arc::new(SessionRegistry::new()),
-            )
-            .expect("open master engine"),
-        );
+        let (engine, dir) = fresh_master_engine();
         let db = engine.database_for_replication().clone();
         let log = db.wal_log();
         let slots = Arc::new(PlMutex::new(SlotRegistry::open(dir.path()).unwrap()));
@@ -2169,15 +2171,7 @@ mod lifecycle_tests {
     }
 
     async fn build_master_with_engine() -> (Arc<StorageQueryEngine>, TempDir, MasterService) {
-        let dir = fresh_database_tempdir();
-        let engine = Arc::new(
-            StorageQueryEngine::open_full(
-                dir.path().to_path_buf(),
-                QueryLogConfig::default(),
-                Arc::new(SessionRegistry::new()),
-            )
-            .expect("open master engine"),
-        );
+        let (engine, dir) = fresh_master_engine();
         let db = engine.database_for_replication().clone();
         let log = db.wal_log();
         let slots = Arc::new(PlMutex::new(SlotRegistry::open(dir.path()).unwrap()));
@@ -2371,15 +2365,7 @@ mod base_backup_tests {
     /// Bring up a master with a full `Database` bound to the
     /// `MasterServiceInit` so base backup is actually supported.
     async fn build_master_with_base_backup() -> (Arc<StorageQueryEngine>, TempDir, MasterService) {
-        let dir = fresh_database_tempdir();
-        let engine = Arc::new(
-            StorageQueryEngine::open_full(
-                dir.path().to_path_buf(),
-                QueryLogConfig::default(),
-                Arc::new(SessionRegistry::new()),
-            )
-            .expect("open master engine"),
-        );
+        let (engine, dir) = fresh_master_engine();
         let db = engine.database_for_replication().clone();
         let log = db.wal_log();
         let slots = Arc::new(PlMutex::new(SlotRegistry::open(dir.path()).unwrap()));
@@ -2851,8 +2837,7 @@ mod base_backup_tests {
 #[cfg(test)]
 #[tokio::test]
 async fn release1106_backup_drains_an_existing_writer() {
-    let dir = fresh_database_tempdir();
-    let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+    let (engine, dir) = fresh_master_engine();
     engine
         .execute("CREATE TABLE drain_t(id INT PRIMARY KEY)")
         .unwrap();

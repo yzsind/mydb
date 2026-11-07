@@ -16,7 +16,6 @@ static TEST_ALLOCATOR: crate::util::mapped_alloc::MappedSystem =
 #[cfg(test)]
 extern crate self as mydb;
 #[cfg(test)]
-#[path = "bin/test_seed.rs"]
 mod test_seed_setup;
 
 pub mod backup;
