@@ -294,7 +294,11 @@ impl TableStats {
                 .map(|(k, v)| 64 + std::mem::size_of::<T>() + k.capacity() + v.heap_bytes())
                 .sum()
         }
-        map(&self.columns)
+        self.definition_bindings
+            .iter()
+            .map(|(key, value)| 64 + key.capacity() + value.capacity())
+            .sum::<usize>()
+            + map(&self.columns)
             + map(&self.indexes)
             + map(&self.explicit_histograms)
             + self

@@ -46,7 +46,12 @@ pub fn pushdown_derived_predicates(select: &mut Select) -> usize {
     // Handle FROM derived. Only an ordinary SELECT derived table is eligible
     // for predicate pushdown; a set-operation derived table is left untouched.
     if let Some(inner) = select.derived.as_ref().and_then(SubQuery::as_select) {
-        if !derived_pushdown_safe(inner) {
+        if !derived_pushdown_safe(inner)
+            || select
+                .joins
+                .iter()
+                .any(|join| matches!(join.join_type, JoinType::Right | JoinType::Full))
+        {
             return 0;
         }
         let alias_map = build_alias_map(inner);
@@ -112,6 +117,10 @@ pub fn pushdown_derived_predicates(select: &mut Select) -> usize {
         let mut pushdown: Vec<Expr> = Vec::new();
         let mut having_pushdown: Vec<Expr> = Vec::new();
         for conj in conjuncts {
+            if !repeatable_aggregate_filter(&conj) {
+                keep.push(conj);
+                continue;
+            }
             if let Some(rewritten) = alias_map
                 .as_ref()
                 .and_then(|map| rewrite_for_pushdown(&conj, &derived_alias, map))

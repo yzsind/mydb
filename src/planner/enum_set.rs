@@ -543,6 +543,16 @@ pub(super) fn enum_set_cmp_replacement(
     args.push(Expr::Literal(crate::parser::Literal::String(
         cmp_op_token(effective_op).to_string(),
     )));
+    if !entry.is_set {
+        args.push(Expr::Literal(crate::parser::Literal::UInt(u64::from(
+            crate::charset::collation_id(
+                entry
+                    .collation
+                    .as_deref()
+                    .unwrap_or(crate::charset::DEFAULT_COLLATION),
+            ),
+        ))));
+    }
     args.extend(
         entry
             .values

@@ -596,6 +596,7 @@ fn decimal_fact_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         fk_referenced_by: Vec::new(),
         stats: TableStats {
+            definition_bindings: Default::default(),
             analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count: 0,
@@ -1633,6 +1634,7 @@ fn compiled_predicate_handles_expression_in_const_set() {
         foreign_keys: Vec::new(),
         fk_referenced_by: Vec::new(),
         stats: TableStats {
+            definition_bindings: Default::default(),
             analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count: 0,

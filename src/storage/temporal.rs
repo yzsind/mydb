@@ -1560,13 +1560,20 @@ fn load_ledger(path: &Path) -> Result<(TimelineState, bool), QueryError> {
         }
         Err(err) => return Err(ledger_io_error(path, err)),
     };
-    if !temporal_header_valid(path, &bytes, LEDGER_MAGIC, LEDGER_VERSION)?
-        || (bytes.len() - HEADER_LEN) % RECORD_LEN != 0
-    {
+    if !temporal_header_valid(path, &bytes, LEDGER_MAGIC, LEDGER_VERSION)? {
         return Err(ledger_error(
             path,
             "invalid header or truncated fixed-width record",
         ));
+    }
+    // An incomplete append is recoverable from WAL. Complete records remain
+    // checksum-validated so media corruption is never mistaken for a torn tail.
+    let torn_tail = (bytes.len() - HEADER_LEN) % RECORD_LEN != 0;
+    if torn_tail {
+        eprintln!(
+            "Recovering incomplete commit ledger tail: {}",
+            path.display()
+        );
     }
     let mut state = TimelineState::default();
     for chunk in bytes[HEADER_LEN..].chunks_exact(RECORD_LEN) {
@@ -1596,7 +1603,7 @@ fn load_ledger(path: &Path) -> Result<(TimelineState, bool), QueryError> {
         state.by_scn.push(entry);
         state.persisted_txns.insert(entry.txn_id);
     }
-    Ok((state, false))
+    Ok((state, torn_tail))
 }
 
 fn encode_record(entry: CommitLedgerEntry) -> [u8; RECORD_LEN] {
@@ -1824,6 +1831,27 @@ mod tests {
         assert_eq!(repaired.history.read().unwrap().batches.len(), 3);
         assert!(!repaired.history_index_degraded());
         drop(repaired);
+        // Every incomplete final append must be reconstructed from WAL,
+        // including the valid ledger prefix and temporal baseline.
+        let complete_ledger = fs::read(&ledger).unwrap();
+        for missing in 1..RECORD_LEN {
+            fs::write(&ledger, &complete_ledger[..complete_ledger.len() - missing]).unwrap();
+            let reopened =
+                TemporalHistory::open(dir.path(), DurabilityMode::Strict, wal.as_slice()).unwrap();
+            assert_eq!(reopened.txn_commit(2).unwrap().commit_unix_us, 200);
+            assert_eq!(reopened.baseline().unwrap().available_unix_us, 1);
+            drop(reopened);
+            assert_eq!(fs::read(&ledger).unwrap(), complete_ledger);
+        }
+        // Complete records with invalid checksums are not torn appends.
+        for offset in [HEADER_LEN + 1, complete_ledger.len() - 6] {
+            let mut damaged = complete_ledger.clone();
+            damaged[offset] ^= 1;
+            fs::write(&ledger, damaged).unwrap();
+            assert!(
+                TemporalHistory::open(dir.path(), DurabilityMode::Strict, wal.as_slice()).is_err()
+            );
+        }
         // Corruption of the authoritative ledger remains fail-closed.
         fs::write(&ledger, b"torn").unwrap();
         assert!(TemporalHistory::open(dir.path(), DurabilityMode::Strict, wal.as_slice()).is_err());

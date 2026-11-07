@@ -75,3 +75,47 @@ pub(crate) fn select_scope(
     }
     scope
 }
+
+/// Grouping/deduplication may replace an equality comparison only when both
+/// keys inhabit the same comparison domain. Unknown expressions stay on Apply.
+pub(crate) fn column_comparison_domain(
+    db: &crate::storage::Database,
+    sources: &[crate::parser::TableRef],
+    expr: &crate::parser::Expr,
+) -> Option<crate::storage::ParamTarget> {
+    use crate::parser::Expr;
+    let (qualifier, name) = match expr {
+        Expr::Identifier(name) => (None, name),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            (Some(&parts[parts.len() - 2]), parts.last()?)
+        }
+        _ => return None,
+    };
+    let mut domains = sources.iter().filter_map(|source| {
+        if qualifier.is_some_and(|q| {
+            !source
+                .alias
+                .as_ref()
+                .unwrap_or(&source.name)
+                .eq_ignore_ascii_case(q)
+                && (source.alias.is_some()
+                    || !source
+                        .name
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&source.name)
+                        .eq_ignore_ascii_case(q))
+        }) {
+            return None;
+        }
+        let schema = db.table(&source.name).ok()?;
+        let column = &schema.columns[schema.column_index(name).ok()?];
+        Some(crate::storage::ParamTarget::for_column_with_collation(
+            &column.data_type,
+            column.unsigned,
+            column.collation.as_deref().or(Some(&schema.collation)),
+        ))
+    });
+    let domain = domains.next()?;
+    domains.next().is_none().then_some(domain)
+}

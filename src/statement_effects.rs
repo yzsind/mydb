@@ -207,6 +207,15 @@ pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
             }
         }
 
+        S::XaStart { .. }
+        | S::XaEnd { .. }
+        | S::XaPrepare { .. }
+        | S::XaCommit { .. }
+        | S::XaRollback { .. } => StatementEffects {
+            replica_forbidden: true,
+            ..READ_ONLY
+        },
+
         S::Begin { .. }
         | S::Commit { .. }
         | S::Rollback { .. }
@@ -279,11 +288,6 @@ pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
         | S::Noop { .. }
         | S::Do(_)
         | S::MultiStatement { .. }
-        | S::XaStart { .. }
-        | S::XaEnd { .. }
-        | S::XaPrepare { .. }
-        | S::XaCommit { .. }
-        | S::XaRollback { .. }
         | S::XaRecover { .. }
         | S::FetchSqlCursor { .. }
         | S::CloseSqlCursor { .. }
@@ -412,6 +416,11 @@ pub(crate) fn is_replica_forbidden(statement: &Statement) -> bool {
 /// Keep replica admission separate: replicas still reject locking reads.
 pub(crate) fn is_read_only_transaction_forbidden(statement: &Statement) -> bool {
     match statement {
+        Statement::XaStart { .. }
+        | Statement::XaEnd { .. }
+        | Statement::XaPrepare { .. }
+        | Statement::XaCommit { .. }
+        | Statement::XaRollback { .. } => false,
         Statement::Select(_) | Statement::SetOperation(_) | Statement::WithCte(_) => {
             query_read_only_transaction_forbidden(statement.into())
         }
@@ -441,6 +450,27 @@ pub(crate) fn is_ddl_kind(kind: &str) -> bool {
 mod tests {
     use super::*;
     use crate::parser::parse_statement;
+
+    #[test]
+    fn report1107_xa_mutations_are_rejected_by_replica_guards() {
+        for sql in [
+            "XA START 'x'",
+            "XA END 'x'",
+            "XA PREPARE 'x'",
+            "XA COMMIT 'x'",
+            "XA ROLLBACK 'x'",
+        ] {
+            let statement = parse_statement(sql).unwrap();
+            assert!(is_replica_forbidden(&statement), "{sql}");
+            assert!(
+                !statement_effects(&statement).requires_implicit_commit,
+                "{sql}"
+            );
+        }
+        assert!(!is_replica_forbidden(
+            &parse_statement("XA RECOVER").unwrap()
+        ));
+    }
 
     #[test]
     fn canonical_classifier_covers_high_risk_statement_families() {

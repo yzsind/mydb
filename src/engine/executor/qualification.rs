@@ -21,7 +21,7 @@ pub(crate) fn qualify_table_name(session: &SessionContext, name: &str) -> String
 
 pub(crate) fn qualify_persistent_table_name(session: &SessionContext, name: &str) -> String {
     let (database, table) = split_table_name(&session.current_database, name);
-    format!("{database}.{table}")
+    crate::storage::table_key(&database, &table)
 }
 
 pub(super) fn qualify_statement_tables<'q>(

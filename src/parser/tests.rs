@@ -5586,7 +5586,10 @@ fn enum_set_legacy_hex_members_and_binary_attribute_are_normalized() {
         table.columns[0].default,
         Some(Expr::Literal(Literal::HexBytes(ref bytes))) if bytes == &[0xe4]
     ));
-    assert_eq!(table.columns[1].collation.as_deref(), Some("binary"));
+    assert_eq!(
+        table.columns[1].collation.as_deref(),
+        Some(BINARY_ATTRIBUTE_COLLATION)
+    );
 
     let Statement::AlterTable(alter) =
         parse_statement("ALTER TABLE t ADD COLUMN e ENUM(0xFFFF)").unwrap()
@@ -6141,13 +6144,17 @@ fn expression_fragment_consumes_exactly_one_expression() {
 #[test]
 fn admin_grammar_preserves_quoted_names_and_consumes_the_tail() {
     assert_eq!(
-        parse_statement("ANALYZE TABLE `a,b`, `s`.`t.u`").unwrap(),
+        parse_statement("ANALYZE TABLE `a,b`, `s`.`t u`").unwrap(),
         Statement::AnalyzeTable {
-            tables: vec!["a,b".to_string(), "s.t.u".to_string()],
+            tables: vec!["a,b".to_string(), "s.t u".to_string()],
             partitions: None,
             histogram: None,
         }
     );
+    assert!(matches!(
+        parse_statement("ANALYZE TABLE `s`.`t.u`"),
+        Ok(Statement::Unsupported { .. }) | Err(_)
+    ));
     assert!(matches!(
         parse_statement("CREATE RESOURCE GROUP rg TYPE=USER BOGUS"),
         Ok(Statement::Unsupported { .. })

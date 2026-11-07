@@ -1362,6 +1362,21 @@ impl TableSchema {
     /// Idempotent: subsequent calls observe the already-populated fields
     /// and only refresh the lookup maps.
     pub fn build_column_index(&mut self) {
+        for index in &mut self.indexes {
+            if let Some(meta) = &mut index.fulltext {
+                if meta.collation_id.is_some() {
+                    if let Some(column) = index.columns.first().and_then(|name| {
+                        self.columns
+                            .iter()
+                            .find(|column| column.name.eq_ignore_ascii_case(name))
+                    }) {
+                        meta.collation_id = Some(crate::charset::collation_id(
+                            column.collation.as_deref().unwrap_or(&self.collation),
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(partitioning) = &mut self.partitioning {
             // DDL validation rejects duplicate tags and exhausted tag space.
             let _ = partitioning.assign_rowid_tags();
@@ -1927,6 +1942,76 @@ impl TableSchema {
         // Structural DDL may replace a column while retaining its name.
         // Never publish a histogram sampled from the previous definition.
         self.stats.explicit_histograms.clear();
+        let bindings = self.statistics_definition_bindings();
+        let previous = &self.stats.definition_bindings;
+        let retained = |kind: &str, name: &str| {
+            let key = format!("{kind}:{}", normalize_name(name));
+            bindings
+                .get(&key)
+                .is_some_and(|current| previous.get(&key) == Some(current))
+        };
+        let columns_unchanged = self.stats.columns.keys().all(|name| retained("c", name));
+        self.stats.columns.retain(|name, _| retained("c", name));
+        self.stats.indexes.retain(|name, _| retained("i", name));
+        for stats in self.stats.partition_stats.values_mut() {
+            stats.columns.retain(|name, _| retained("c", name));
+            stats.indexes.retain(|name, _| retained("i", name));
+        }
+        if !columns_unchanged {
+            self.stats.conditional_key_domains.clear();
+            self.stats.multi_column_stats.clear();
+        }
+        self.stats.definition_bindings = bindings;
+    }
+
+    pub(crate) fn bind_statistics_definitions(&mut self) {
+        self.stats.definition_bindings = self.statistics_definition_bindings();
+    }
+
+    fn statistics_definition_bindings(&self) -> BTreeMap<String, Vec<u8>> {
+        let mut bindings = BTreeMap::new();
+        if self.stats.columns.is_empty()
+            && self.stats.indexes.is_empty()
+            && self
+                .stats
+                .partition_stats
+                .values()
+                .all(|stats| stats.columns.is_empty() && stats.indexes.is_empty())
+        {
+            return bindings;
+        }
+
+        for column in &self.columns {
+            let definition = (
+                &column.column_id,
+                &column.data_type,
+                column.unsigned,
+                &column.collation,
+                &column.generated_expr,
+            );
+            if let Ok(bytes) = serde_json::to_vec(&definition) {
+                bindings.insert(format!("c:{}", normalize_name(&column.name)), bytes);
+            }
+        }
+        for index in &self.indexes {
+            let columns: Vec<_> = index
+                .columns
+                .iter()
+                .map(|name| bindings.get(&format!("c:{}", normalize_name(name))))
+                .collect();
+            let definition = (
+                index.index_id,
+                &columns,
+                &index.columns,
+                &index.key_expressions,
+                &index.column_prefix_lengths,
+                &index.column_directions,
+            );
+            if let Ok(bytes) = serde_json::to_vec(&definition) {
+                bindings.insert(format!("i:{}", normalize_name(&index.name)), bytes);
+            }
+        }
+        bindings
     }
 
     pub fn bump_schema_version_without_system_time_epoch(&mut self) {
@@ -2269,6 +2354,9 @@ pub struct IndexSchema {
 /// query). All fields are `Option` with `#[serde(default)]` — old indexes deserialize to `None` and use global defaults (old behavior preserved); new indexes always record their rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FulltextMeta {
+    /// Comparison collation captured with the posting format at index build.
+    #[serde(default)]
+    pub collation_id: Option<u16>,
     /// MySQL `WITH PARSER` name: empty = default whitespace/punctuation tokenizer, `"ngram"` = the ngram tokenizer.
     #[serde(default)]
     pub parser: String,
@@ -6158,12 +6246,16 @@ fn validate_functional_index_expression(expr: &Expr, source: &str) -> Result<(),
             format!("functional index expression `{source}` cannot use GROUPING()"),
         )),
         Expr::Function { name, .. } => {
-            if is_nondeterministic_function(name) {
-                return Err(error(crate::error::catalog::ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT,
-                        format!(
-                            "functional index expression `{source}` uses nondeterministic function {name}()"
-                        ),
-                    ));
+            if is_nondeterministic_function(name)
+                || name.contains('.')
+                || !crate::engine::cbo::function_cost::is_known_builtin_function(name)
+            {
+                return Err(error(
+                    crate::error::catalog::ER_FUNCTIONAL_INDEX_FUNCTION_IS_NOT_ALLOWED,
+                    format!(
+                        "functional index expression `{source}` uses disallowed function {name}()"
+                    ),
+                ));
             }
             if is_aggregate_function_name(name) {
                 return Err(error(
@@ -6206,6 +6298,29 @@ pub(crate) fn is_nondeterministic_function(name: &str) -> bool {
             | "LAST_INSERT_ID"
             | "SLEEP"
             | "LOAD_FILE"
+            | "UTC_TIMESTAMP"
+            | "UTC_DATE"
+            | "UTC_TIME"
+            | "RANDOM_BYTES"
+            | "CURRENT_ROLE"
+            | "ROW_COUNT"
+            | "FOUND_ROWS"
+            | "GET_LOCK"
+            | "RELEASE_LOCK"
+            | "RELEASE_ALL_LOCKS"
+            | "IS_FREE_LOCK"
+            | "IS_USED_LOCK"
+            | "BENCHMARK"
+            | "SYSTEM_USER"
+            | "PS_CURRENT_THREAD_ID"
+            | "SOURCE_POS_WAIT"
+            | "MASTER_POS_WAIT"
+            | "WAIT_FOR_EXECUTED_GTID_SET"
+            | "NEXTVAL"
+            | "CURRVAL"
+            | "LASTVAL"
+            | "SETVAL"
+            | "__SET_USER_VAR"
     )
 }
 
@@ -6398,25 +6513,18 @@ fn is_null_preserving_function(name: &str) -> bool {
         // String: pure transforms
         "LOWER" | "UPPER" | "LCASE" | "UCASE" | "TRIM" | "LTRIM" | "RTRIM"
             | "SUBSTRING" | "SUBSTR" | "LEFT" | "RIGHT" | "REVERSE"
-            | "LPAD" | "RPAD" | "REPEAT" | "SPACE" | "QUOTE" | "REPLACE"
+            | "QUOTE" | "REPLACE"
             | "CONCAT" | "CONCAT_WS"
             | "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
             | "OCTET_LENGTH" | "BIT_LENGTH"
             | "LOCATE" | "INSTR" | "POSITION" | "ASCII" | "ORD"
-            | "HEX" | "UNHEX" | "BIN" | "OCT" | "CONV"
+            | "HEX" | "BIN" | "OCT"
             // Numeric
             | "ABS" | "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "TRUNCATE"
-            | "SIGN" | "POW" | "POWER" | "SQRT" | "EXP" | "LN"
-            | "LOG" | "LOG2" | "LOG10" | "PI"
+            | "SIGN"
+            | "PI"
             | "DEGREES" | "RADIANS"
-            | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "COT"
-            // Date/time
-            | "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "DAYOFWEEK"
-            | "DAYOFYEAR" | "WEEKDAY" | "WEEK" | "WEEKOFYEAR" | "QUARTER"
-            | "HOUR" | "MINUTE" | "SECOND" | "DATEDIFF" | "TIMESTAMPDIFF"
-            | "DATE_FORMAT" | "DATE" | "TIME" | "TO_DAYS" | "TIME_TO_SEC"
-            | "EXTRACT" | "FROM_UNIXTIME" | "MAKEDATE" | "MAKETIME"
-            | "DAYNAME" | "MONTHNAME"
+            | "SIN" | "COS" | "TAN" | "ATAN" | "ATAN2"
     )
 }
 

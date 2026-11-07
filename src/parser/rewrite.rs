@@ -1857,7 +1857,7 @@ pub(super) fn rewrite_enum_set_legacy_literals(sql: &str) -> std::borrow::Cow<'_
         }
         if is_word_at(sql, &upper, attribute, "BINARY") {
             out.push_str(&sql[index..attribute]);
-            out.push_str("COLLATE binary");
+            out.push_str("COLLATE __MYDB_BINARY_ATTRIBUTE");
             index = attribute + "BINARY".len();
             changed = true;
         }

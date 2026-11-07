@@ -138,7 +138,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             default_collation,
             ..
         } => Ok(Statement::CreateDatabase {
-            name: object_name_to_string(db_name)?,
+            name: database_object_name(db_name)?,
             if_not_exists,
             default_charset,
             default_collation,
@@ -182,7 +182,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             ObjectType::Database | ObjectType::Schema if names.len() == 1 => {
                 let mut names = names;
                 Ok(Statement::DropDatabase {
-                    name: object_name_to_string(names.remove(0))?,
+                    name: database_object_name(names.remove(0))?,
                     if_exists,
                 })
             }
@@ -766,7 +766,7 @@ fn convert_explain_format(format: Option<AnalyzeFormatKind>) -> Option<ExplainFo
 
 fn convert_use(use_expr: Use) -> Result<Statement, ParseError> {
     let name = match use_expr {
-        Use::Database(name) | Use::Schema(name) | Use::Object(name) => object_name_to_string(name)?,
+        Use::Database(name) | Use::Schema(name) | Use::Object(name) => database_object_name(name)?,
         Use::Default => "test".to_string(),
         _ => {
             return parse_error_from_sql_span(
@@ -2743,7 +2743,11 @@ fn convert_select(
     for (internal, sql_item) in projection.iter_mut().zip(select.projection.iter()) {
         if let SelectItem::Expr { expr, alias } = internal {
             if alias.is_none()
-                && crate::engine::expr::expr_name(expr) == "expr"
+                && (crate::engine::expr::expr_name(expr) == "expr"
+                    || matches!(
+                        expr,
+                        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_))
+                    ))
                 && !parser_fragment_mode()
             {
                 if let SqlSelectItem::UnnamedExpr(sql_expr) = sql_item {
@@ -9265,8 +9269,18 @@ fn object_name_to_qualified(name: ObjectName) -> Result<QualifiedName, ParseErro
     QualifiedName::new(database, object).map_err(parse_error_at_zero)
 }
 
+fn database_object_name(name: ObjectName) -> Result<String, ParseError> {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(identifier)] => Ok(identifier.value.clone()),
+        _ => Err(parse_error_at_zero("expected one database identifier")),
+    }
+}
+
 fn object_name_to_string(name: impl std::borrow::Borrow<ObjectName>) -> Result<String, ParseError> {
     join_name_parts(name.borrow().0.iter().map(|part| match part {
+        ObjectNamePart::Identifier(ident) if ident.value.contains('.') => Err(parse_error_at_zero(
+            "Dots inside quoted object identifiers are not supported",
+        )),
         ObjectNamePart::Identifier(ident) => Ok(ident.value.as_str()),
         ObjectNamePart::Function(_) => parse_error_from_sql_span(
             sqlparser::tokenizer::Span::empty(),

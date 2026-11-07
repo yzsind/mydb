@@ -1982,7 +1982,20 @@ fn catalog_from_dd_rows_with_auth(
         }
         validate_persisted_layouts(&table)?;
         table.build_column_index();
-        table.stats = super::stats_store::load(set, &table)?;
+        table.stats = match super::stats_store::load(set, &table) {
+            Ok(stats) => stats,
+            Err(err) if err.message() == "corrupt optimizer statistics object" => {
+                eprintln!(
+                    "Discarding corrupt optimizer statistics for {}.{}: {err}",
+                    table.database, table.name
+                );
+                let mut stats = super::stats::TableStats::empty();
+                stats.analyzed_at_unix_ms = None;
+                stats
+            }
+            Err(err) => return Err(err),
+        };
+        table.bind_statistics_definitions();
         tables.insert(table_key(&database, &name), Arc::new(table));
     }
 
@@ -2813,12 +2826,38 @@ mod tests {
     }
 
     #[test]
+    fn report1107_corrupt_optional_statistics_do_not_hide_table_schema() {
+        let catalog = sample_catalog();
+        let mut rows = catalog_to_dd_rows(&catalog).unwrap();
+        let table_id = catalog.tables["test.t"].id;
+        let column_id = catalog.tables["test.t"].columns[0].column_id;
+        rows.column_stats.push(vec![
+            Value::UInt(table_id),
+            Value::UInt(0),
+            Value::UInt(column_id as u64),
+            Value::UInt(1),
+            Value::UInt(0),
+            Value::UInt(1),
+            Value::Null,
+            Value::Bytes(b"damaged statistics".to_vec()),
+        ]);
+        let rebuilt = catalog_from_dd_rows(&rows).unwrap();
+        assert_eq!(
+            rebuilt.tables["test.t"].columns.len(),
+            catalog.tables["test.t"].columns.len()
+        );
+        assert!(rebuilt.tables["test.t"].stats.columns.is_empty());
+        assert!(rebuilt.tables["test.t"].stats.analyzed_at_unix_ms.is_none());
+    }
+
+    #[test]
     fn audit_fulltext_config_roundtrip() {
         let mut catalog = sample_catalog();
         let table = std::sync::Arc::make_mut(catalog.tables.get_mut("test.t").unwrap());
         let idx = &mut table.indexes[1];
         idx.index_type = "FULLTEXT".into();
         idx.fulltext = Some(crate::storage::schema::FulltextMeta {
+            collation_id: None,
             parser: "ngram".into(),
             ngram_size: Some(2),
             min_token_size: Some(4),

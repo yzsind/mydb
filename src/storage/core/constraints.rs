@@ -5001,9 +5001,14 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
         }
         (None, None) => None,
     };
-    if let (Some(charset), Some(collation)) = (&charset, &collation) {
-        crate::charset::validate_charset_collation_pair(charset, collation)?;
+    if !binary_attribute {
+        if let (Some(charset), Some(collation)) = (&charset, &collation) {
+            crate::charset::validate_charset_collation_pair(charset, collation)?;
+        }
     }
+    // Before table defaults resolve the marker, member/default validation
+    // still needs binary equality, rather than the server's default collation.
+    let validation_collation = if binary_attribute { Some("binary") } else { collation.as_deref() };
     // MySQL forbids a *literal* DEFAULT on BLOB/TEXT/GEOMETRY/JSON columns;
     // 8.0.13+ allows only the expression form `DEFAULT (<expr>)`. In strict
     // mode this is ER 1101. In explicitly non-strict mode MySQL creates the
@@ -5162,10 +5167,10 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
     // at INSERT / on-disk encode time.
     match &data_type {
         DataTypeKind::Enum { values } => {
-            validate_enum_set_members(&column.name, values, false, collation.as_deref())?;
+            validate_enum_set_members(&column.name, values, false, validation_collation)?;
         }
         DataTypeKind::Set { values } => {
-            validate_enum_set_members(&column.name, values, true, collation.as_deref())?;
+            validate_enum_set_members(&column.name, values, true, validation_collation)?;
         }
         _ => {}
     }
@@ -5176,7 +5181,7 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
         if let Some(literal) = &default {
             if !matches!(literal, Value::Null) {
                 if let Some(err) =
-                    enum_set_default_error(&column.name, &data_type, literal, collation.as_deref())
+                    enum_set_default_error(&column.name, &data_type, literal, validation_collation)
                 {
                     return Err(err);
                 }

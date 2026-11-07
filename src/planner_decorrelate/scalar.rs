@@ -164,6 +164,19 @@ fn try_rewrite_scalar(state: &mut RewriteState, expr: &mut Expr) -> bool {
     if info.equality_pairs.is_empty() {
         return false;
     }
+    let inner_sources = collect_outer_base_sources(sub_box);
+    if !info.equality_pairs.iter().all(|pair| {
+        let outer_expr = match &pair.outer.qualifier {
+            Some(q) => Expr::CompoundIdentifier(vec![q.clone(), pair.outer.column.clone()]),
+            None => Expr::Identifier(pair.outer.column.clone()),
+        };
+        let inner = super::column_comparison_domain(state.db, &inner_sources, &pair.inner_expr);
+        inner.is_some()
+            && inner == super::column_comparison_domain(state.db, &state.outer_sources, &outer_expr)
+    }) {
+        return false;
+    }
+
     if sub_box.projection.len() != 1 {
         return false;
     }
@@ -893,6 +906,10 @@ fn is_decorrelatable_inner(expr: &Expr, saw_aggregate: bool) -> bool {
             // already rejected by `info.aggregate_in_projection`, but
             // be defensive.
             !saw_aggregate
+                && !matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                )
         }
         Expr::Binary { left, op, right } => {
             use crate::parser::BinaryOp::*;

@@ -1087,6 +1087,10 @@ fn prepare_create_table_schema(
         let fulltext = index.index_type.eq_ignore_ascii_case("FULLTEXT").then(|| {
             let mut metadata = crate::storage::FulltextMeta {
                 parser: index.fulltext_parser.clone(),
+                collation_id: columns.first().and_then(|name| column_schemas.iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(name)))
+                    .and_then(|column| column.collation.as_deref())
+                    .map(crate::charset::collation_id),
                 ..Default::default()
             };
             crate::storage::fulltext::snapshot_tokenizer_config_into(&mut metadata);
@@ -4477,6 +4481,12 @@ impl Database {
             .table_by_key(&key)
             .ok_or_else(|| ddl_table_not_found(&table_name))?;
         validate_add_index_backend(&table, &index)?;
+        if index.is_fulltext() {
+            let collation = index.columns.first().and_then(|name| table.column_index(name).ok())
+                .and_then(|position| table.columns[position].collation.as_deref())
+                .unwrap_or(&table.collation);
+            index.fulltext.get_or_insert_with(Default::default).collation_id = Some(crate::charset::collation_id(collation));
+        }
         drop(table);
         let existing_table = {
             let catalog = self.catalog_read()?;

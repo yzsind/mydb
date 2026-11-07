@@ -9470,6 +9470,54 @@ mod tests {
     }
 
     #[test]
+    fn report1107_partial_detached_write_failure_blocks_every_later_barrier() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut manager = LogManager::open(dir.path()).unwrap();
+        manager.set_write_buffer_enabled(true).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(manager));
+        let acknowledged = log
+            .lock()
+            .append(1, WalPayload::BeginTxn { start_scn: 1 })
+            .unwrap();
+        LogManager::sync_durable_to(&log, acknowledged).unwrap();
+        let failed = log
+            .lock()
+            .append(2, WalPayload::BeginTxn { start_scn: 2 })
+            .unwrap();
+        let mut detached = log.lock().detach_pending_write().unwrap().unwrap();
+        write_all_at(
+            &detached.file,
+            &detached.bytes[..detached.bytes.len() / 2],
+            detached.offset,
+        )
+        .unwrap();
+        // Keep the real file, but make pwrite fail after its prefix reached disk.
+        let path = log.lock().active_info.path.clone();
+        detached.file = Arc::new(File::open(path).unwrap());
+        let failure = detached.write().unwrap_err();
+        log.lock().recycle_detached_write(detached);
+        assert!(LogManager::sync_durable_to(&log, failed).is_err());
+        for txn in 3..8 {
+            let append = log
+                .lock()
+                .append(txn, WalPayload::BeginTxn { start_scn: txn });
+            if let Ok(lsn) = append {
+                assert_eq!(
+                    LogManager::sync_durable_to(&log, lsn)
+                        .unwrap_err()
+                        .message(),
+                    failure.message()
+                );
+            }
+            assert_eq!(log.lock().durable_lsn(), acknowledged);
+        }
+        drop(log);
+        let scan = LogManager::scan(dir.path()).unwrap();
+        assert!(scan.records.iter().any(|record| record.lsn == acknowledged));
+        assert!(!scan.records.iter().any(|record| record.lsn >= failed));
+    }
+
+    #[test]
     fn abandoned_detached_wal_write_never_publishes_durability() {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         let mut manager = LogManager::open(dir.path()).unwrap();

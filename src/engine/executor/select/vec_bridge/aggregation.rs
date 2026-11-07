@@ -1046,6 +1046,16 @@ pub(in crate::engine::executor::select) fn decimal_value_at_scale(
             Err(_) => Value::Decimal128(magnitude, scale),
         }
     }
+    fn bounded_scale(text: &str, requested: u8) -> u8 {
+        let integer = text
+            .trim_start_matches(['-', '+'])
+            .split('.')
+            .next()
+            .unwrap_or("");
+        let digits = integer.trim_start_matches('0').len().max(1);
+        let words = usize::from(crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION) / 9;
+        requested.min((words.saturating_sub(digits.div_ceil(9)) * 9) as u8)
+    }
     match value {
         Value::Null => Value::Null,
         Value::DecimalCompact(magnitude, scale) => {
@@ -1058,17 +1068,18 @@ pub(in crate::engine::executor::select) fn decimal_value_at_scale(
                 .map(|magnitude| from_magnitude(magnitude, target_scale))
                 .unwrap_or(Value::Decimal128(magnitude, scale))
         }
-        Value::DecimalWide(value) => crate::util::decimal::rescale_decimal_big_str(
-            &Value::DecimalWide(value.clone()).to_display_string(),
-            target_scale,
+        Value::DecimalWide(value) => {
+            let text = Value::DecimalWide(value.clone()).to_display_string();
+            crate::util::decimal::rescale_decimal_big_str(&text, bounded_scale(&text, target_scale))
+                .map(Value::Decimal)
+                .unwrap_or(Value::DecimalWide(value))
+        }
+        Value::Decimal(value) => crate::util::decimal::rescale_decimal_big_str(
+            &value,
+            bounded_scale(&value, target_scale),
         )
         .map(Value::Decimal)
-        .unwrap_or(Value::DecimalWide(value)),
-        Value::Decimal(value) => {
-            crate::util::decimal::rescale_decimal_big_str(&value, target_scale)
-                .map(Value::Decimal)
-                .unwrap_or(Value::Decimal(value))
-        }
+        .unwrap_or(Value::Decimal(value)),
         Value::Int(value) => crate::util::decimal::pow10_i128(u32::from(target_scale))
             .and_then(|factor| i128::from(value).checked_mul(factor))
             .map(|magnitude| from_magnitude(magnitude, target_scale))

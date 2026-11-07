@@ -5626,6 +5626,8 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
                 let right_tables = collect_physical_plan_tables(&right);
                 let plan_tables = collect_physical_plan_tables(&head);
                 let residual_condition = extract_residual_predicates_for_inner_join_edge(
+                    select,
+                    idx,
                     join.join_type,
                     &mut residual_predicates,
                     &plan_tables,
@@ -5652,6 +5654,8 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
             let right_tables = collect_physical_plan_tables(&right);
             let plan_tables = collect_physical_plan_tables(&head);
             let residual_condition = extract_residual_predicates_for_inner_join_edge(
+                select,
+                idx,
                 join.join_type,
                 &mut residual_predicates,
                 &plan_tables,
@@ -5909,6 +5913,15 @@ fn try_plan_left_join_is_null(
     Ok(Some(finish_plan(db, ctx, select, plan)?))
 }
 
+/// Whether a later join can replace this prefix with a NULL-supplied row.
+pub(crate) fn join_prefix_can_be_null_extended(select: &Select, join_idx: usize) -> bool {
+    select
+        .joins
+        .iter()
+        .skip(join_idx + 1)
+        .any(|join| matches!(join.join_type, JoinType::Right | JoinType::Full))
+}
+
 fn try_plan_leading_inner_join_island(
     ctx: &crate::engine::cbo::CboContext,
     select: &Select,
@@ -5935,10 +5948,12 @@ fn try_plan_leading_inner_join_island(
             split_conjuncts(&condition, &mut cross_preds);
         }
     }
-    cross_preds.extend(drain_join_predicates_for_tables(
-        residual_predicates,
-        island_tables,
-    ));
+    if !join_prefix_can_be_null_extended(select, leading_inner_joins - 1) {
+        cross_preds.extend(drain_join_predicates_for_tables(
+            residual_predicates,
+            island_tables,
+        ));
+    }
 
     let mut plan = plan_inner_join_island(ctx, island_scans, cross_preds, select);
     for (idx, right) in scans.into_iter().enumerate().skip(island_len) {
@@ -5947,6 +5962,8 @@ fn try_plan_leading_inner_join_island(
         let right_tables = collect_physical_plan_tables(&right);
         let plan_tables = collect_physical_plan_tables(&plan);
         let residual_condition = extract_residual_predicates_for_inner_join_edge(
+            select,
+            join_idx,
             join.join_type,
             residual_predicates,
             &plan_tables,
@@ -5961,12 +5978,17 @@ fn try_plan_leading_inner_join_island(
 }
 
 fn extract_residual_predicates_for_inner_join_edge(
+    select: &Select,
+    join_idx: usize,
     join_type: JoinType,
     residual_predicates: &mut Vec<Expr>,
     left_tables: &[PlanTable],
     right_tables: &[PlanTable],
 ) -> Option<Expr> {
-    if !matches!(join_type, JoinType::Inner | JoinType::Cross) || residual_predicates.is_empty() {
+    if join_prefix_can_be_null_extended(select, join_idx)
+        || !matches!(join_type, JoinType::Inner | JoinType::Cross)
+        || residual_predicates.is_empty()
+    {
         return None;
     }
 
@@ -20883,34 +20905,40 @@ pub(crate) fn expr_is_deterministic(expr: &Expr) -> bool {
                     return Err(());
                 }
                 let upper = name.to_ascii_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "RAND"
-                        | "SYSDATE"
-                        | "NOW"
-                        | "CURRENT_TIMESTAMP"
-                        | "LOCALTIME"
-                        | "LOCALTIMESTAMP"
-                        | "CURDATE"
-                        | "CURRENT_DATE"
-                        | "CURTIME"
-                        | "CURRENT_TIME"
-                        | "UUID"
-                        | "UUID_SHORT"
-                        | "RANDOM_BYTES"
-                        | "CONNECTION_ID"
-                        | "LAST_INSERT_ID"
-                        | "SLEEP"
-                        | "USER"
-                        | "CURRENT_USER"
-                        | "SESSION_USER"
-                        | "CURRENT_ROLE"
-                        | "NEXTVAL"
-                        | "CURRVAL"
-                        | "LASTVAL"
-                        | "SETVAL"
-                        | "__SET_USER_VAR"
-                ) {
+                if crate::storage::schema::is_nondeterministic_function(name)
+                    || name.contains('.')
+                    || !(crate::engine::cbo::function_cost::is_known_builtin_function(name)
+                        || crate::parser::is_aggregate_function(name)
+                        || crate::parser::IntrinsicFunction::from_name(name).is_some())
+                    || matches!(
+                        upper.as_str(),
+                        "RAND"
+                            | "SYSDATE"
+                            | "NOW"
+                            | "CURRENT_TIMESTAMP"
+                            | "LOCALTIME"
+                            | "LOCALTIMESTAMP"
+                            | "CURDATE"
+                            | "CURRENT_DATE"
+                            | "CURTIME"
+                            | "CURRENT_TIME"
+                            | "UUID"
+                            | "UUID_SHORT"
+                            | "RANDOM_BYTES"
+                            | "CONNECTION_ID"
+                            | "LAST_INSERT_ID"
+                            | "SLEEP"
+                            | "USER"
+                            | "CURRENT_USER"
+                            | "SESSION_USER"
+                            | "CURRENT_ROLE"
+                            | "NEXTVAL"
+                            | "CURRVAL"
+                            | "LASTVAL"
+                            | "SETVAL"
+                            | "__SET_USER_VAR"
+                    )
+                {
                     return Err(());
                 }
             }
@@ -22965,7 +22993,9 @@ fn expr_literal_value(expr: &Expr) -> Option<Value> {
                         }
                 ) =>
         {
-            expr_literal_value(&args[0])
+            // Apply CAST before choosing the index comparison domain.
+            expr_literal_value(&args[0])?;
+            crate::engine::expr::eval_const(expr).ok()
         }
         // TPC-H queries frequently bound ranges with
         // `DATE 'x' + INTERVAL 'n' MONTH` etc. The parser rewrites
@@ -22980,7 +23010,7 @@ fn expr_literal_value(expr: &Expr) -> Option<Value> {
             let date = expr_literal_value(&args[0])?;
             let (n, unit) = interval_components(&args[1])?;
             let signed = if name.eq_ignore_ascii_case("DATE_SUB") {
-                -n
+                n.checked_neg()?
             } else {
                 n
             };
@@ -22999,7 +23029,7 @@ fn interval_components(expr: &Expr) -> Option<(i64, String)> {
     }
     let n = match expr_literal_value(&args[0])? {
         Value::Int(v) => v,
-        Value::UInt(v) => v as i64,
+        Value::UInt(v) => i64::try_from(v).ok()?,
         Value::String(s) => s.trim().parse::<i64>().ok()?,
         _ => return None,
     };
@@ -23017,8 +23047,8 @@ fn apply_date_interval(date: &Value, n: i64, unit: &str) -> Option<Value> {
     };
     let parsed = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
     let result = match unit.to_ascii_uppercase().as_str() {
-        "DAY" | "DAYS" => parsed.checked_add_signed(chrono::Duration::days(n))?,
-        "WEEK" | "WEEKS" => parsed.checked_add_signed(chrono::Duration::weeks(n))?,
+        "DAY" | "DAYS" => parsed.checked_add_signed(chrono::Duration::try_days(n)?)?,
+        "WEEK" | "WEEKS" => parsed.checked_add_signed(chrono::Duration::try_weeks(n)?)?,
         "MONTH" | "MONTHS" => add_months(parsed, n)?,
         "YEAR" | "YEARS" => add_months(parsed, n.checked_mul(12)?)?,
         _ => return None,
@@ -23028,7 +23058,7 @@ fn apply_date_interval(date: &Value, n: i64, unit: &str) -> Option<Value> {
 
 fn add_months(date: chrono::NaiveDate, n: i64) -> Option<chrono::NaiveDate> {
     use chrono::Datelike;
-    let total = date.year() as i64 * 12 + (date.month() as i64 - 1) + n;
+    let total = (date.year() as i64 * 12 + (date.month() as i64 - 1)).checked_add(n)?;
     let new_year = i32::try_from(total.div_euclid(12)).ok()?;
     let new_month = total.rem_euclid(12) as u32 + 1;
     let day = date.day();
@@ -23728,8 +23758,8 @@ fn propagate_equivalence_constraints(db: &Database, select: &mut Select) {
     // WHERE-level analysis; OUTER JOINs are excluded because an ON-side
     // value can't be assumed to hold for the preserved side's rows.
     let mut join_conjunct_storage: Vec<Vec<Expr>> = Vec::new();
-    for join in &select.joins {
-        if join.join_type != JoinType::Inner {
+    for (index, join) in select.joins.iter().enumerate() {
+        if join.join_type != JoinType::Inner || join_prefix_can_be_null_extended(select, index) {
             continue;
         }
         let mut tmp = Vec::new();
@@ -23978,73 +24008,24 @@ fn normalize_expr_checked(expr: Expr) -> Expr {
 
 fn recurse_normalize_children(expr: Expr) -> Expr {
     match expr {
-        Expr::Unary { op, expr } => Expr::Unary {
-            op,
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => Expr::Unary {
+            op: UnaryOp::Not,
             expr: Box::new(normalize_expr(*expr)),
         },
-        Expr::Binary { left, op, right } => Expr::Binary {
+        Expr::Binary {
+            left,
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            right,
+        } => Expr::Binary {
             left: Box::new(normalize_expr(*left)),
             op,
             right: Box::new(normalize_expr(*right)),
         },
-        Expr::IsNull(e) => Expr::IsNull(Box::new(normalize_expr(*e))),
-        Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(normalize_expr(*e))),
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => Expr::InList {
-            expr: Box::new(normalize_expr(*expr)),
-            list: list.into_iter().map(normalize_expr).collect(),
-            negated,
-        },
-        Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => Expr::Between {
-            expr: Box::new(normalize_expr(*expr)),
-            low: Box::new(normalize_expr(*low)),
-            high: Box::new(normalize_expr(*high)),
-            negated,
-        },
-        Expr::Like {
-            expr,
-            pattern,
-            negated,
-            escape_char,
-        } => Expr::Like {
-            expr: Box::new(normalize_expr(*expr)),
-            pattern: Box::new(normalize_expr(*pattern)),
-            negated,
-            escape_char,
-        },
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => Expr::Case {
-            operand: operand.map(|e| Box::new(normalize_expr(*e))),
-            conditions: conditions
-                .into_vec()
-                .into_iter()
-                .map(normalize_expr)
-                .collect(),
-            results: results.into_iter().map(normalize_expr).collect(),
-            else_result: else_result.map(|e| Box::new(normalize_expr(*e))),
-        },
-        Expr::Function {
-            name,
-            args,
-            distinct,
-        } => Expr::Function {
-            name,
-            args: args.into_iter().map(normalize_expr).collect(),
-            distinct,
-        },
-        // Subqueries, placeholders, identifiers, literals: leave intact.
+        // Comparisons, arithmetic and function arguments consume SQL values.
+        // Replacing a boolean result with its truthy input changes those values.
         other => other,
     }
 }

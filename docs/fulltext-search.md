@@ -39,8 +39,9 @@ backfills, and memory-only builds keep their existing execution strategies.
 ## Search modes
 
 Natural-language mode returns the union of indexed query terms. Repeated query
-terms contribute once. The default parser lowercases Unicode text, splits at
-non-alphanumeric boundaries while retaining underscores, and applies token
+terms contribute once. The default parser splits Unicode text at
+non-alphanumeric boundaries while retaining underscores, normalizes terms
+using the indexed column's collation, and applies token
 length and stopword filtering. Default minimum/maximum token lengths are
 3/84 characters, and the built-in English stopword list is enabled.
 
@@ -104,8 +105,9 @@ large corpus changes to refresh these estimates.
 Scores do not promise numeric equality with MySQL. Ordinary index statistics
 and posting document frequencies are not fully versioned; concurrent corpus
 changes can affect ranking even when a document's visible text stays the same.
-Token normalization currently uses Unicode lowercasing and does not implement
-every SQL collation's accent and case rules.
+Term equality uses the indexed column's collation, including case and accent
+sensitivity. Index construction, writes, natural-language searches, boolean
+terms, phrases, and wildcard prefixes share the same normalization rules.
 
 The `MYDB_FT_MIN_TOKEN_SIZE`, `MYDB_FT_MAX_TOKEN_SIZE`, `MYDB_FT_NGRAM_SIZE`,
 `MYDB_FT_STOPWORDS`, `MYDB_FT_POSITIONS`, and `MYDB_FT_POSITION_GAP` process

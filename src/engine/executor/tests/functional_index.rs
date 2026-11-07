@@ -261,10 +261,10 @@ fn nondeterministic_function_rejected() {
     let err = engine
         .execute("CREATE INDEX idx_bad ON t ((NOW()))")
         .unwrap_err();
-    assert!(
-        err.message().to_lowercase().contains("nondeterministic")
-            || err.message().to_lowercase().contains("does not reference"),
-        "expected rejection, got {err:?}",
+    assert_eq!(
+        err.code(),
+        3758,
+        "expected disallowed-function rejection: {err:?}"
     );
 }
 

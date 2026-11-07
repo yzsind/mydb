@@ -99,7 +99,7 @@ production-grade MySQL replacement.
 
 - **InnoDB-style table options** (`ROW_FORMAT` / `STATS_*` / `KEY_BLOCK_SIZE` / `MAX_ROWS` …): △ **accepted + persisted + echoed + physically ignored**. The `Row_Format` column of `SHOW TABLE STATUS` is backfilled from the persisted option (no longer hardcoded).
 - **CTAS** (`CREATE [TEMPORARY] TABLE [IF NOT EXISTS] [(columns/constraints)] ... AS SELECT`): ✅ full target-table options/partitioning are never lost; inferred columns stay faithful to catalog origin and outer-join nullability follows the join shape; persistent tables/temporary tables, declared columns, IGNORE/REPLACE, CTEs/set operations/derived tables load in unified chunks, and CTAS no longer actively materializes the entire result (query operators themselves may still materialize); unknown string upper bounds use the full LOB range. Persistent CTAS achieves crash atomicity via intent + deferred DD generation, and binlog puts the parsed CREATE and WRITE_ROWS into the same GTID/XID transaction.
-- **Naming and size limits**: table/column identifiers and indexes declared in CREATE/ALTER TABLE are validated up to 64 characters (errno 1059); standalone CREATE INDEX currently has no equivalent index-name length guard. Tables have at most 1017 live columns (errno 1117). Tables, views, and sequences share one relational-name namespace, and concurrent CREATEs are double-checked under the catalog write lock. See [limits and enforcement gaps](limits.md).
+- **Naming and size limits**: table/column identifiers and indexes declared in CREATE/ALTER TABLE are validated up to 64 characters (errno 1059); standalone CREATE INDEX currently has no equivalent index-name length guard. Tables have at most 1017 live columns (errno 1117). Tables, views, and sequences share one relational-name namespace, and concurrent CREATEs are double-checked under the catalog write lock. See [limits and enforcement gaps](limits.md). Quoted table-name components containing a dot, including dotted schema components in qualified table references, are explicitly rejected to avoid ambiguous binding. Database names remain available to structured namespaces such as AI models.
 - **Generated columns** (`GENERATED ALWAYS AS`, VIRTUAL / STORED): ✅
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
 - **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
@@ -169,8 +169,9 @@ occurrences, and prepared `AGAINST(?)` all retain full boolean semantics.
 
 Partitioned and historical FULLTEXT reads use visible-text heap oracles rather
 than current inverted postings. They preserve document identity and historical
-membership at the cost of a corpus scan. BM25 scores and normalization do not
-promise full MySQL ranking/collation equivalence; see
+membership at the cost of a corpus scan. Token equality follows the indexed
+column's collation, including case and accent sensitivity. BM25 scores do not
+promise numeric equality with MySQL; see
 [Full-Text Search](fulltext-search.md) for operators, configuration, and limits.
 
 Immutable backup queries support FULLTEXT filtering and score projection using
@@ -269,7 +270,7 @@ for syntax and operational limits.
 | CHAR/VARCHAR, BINARY/VARBINARY | ✅ | Character sets, collations, PAD SPACE/NO PAD, and the column `BINARY` attribute participate in comparisons and indexes |
 | TEXT/BLOB four tiers | ✅ | LOBs can be externalized with optional LZ4; the physical format is not InnoDB |
 | DATE/TIME/DATETIME/TIMESTAMP/YEAR | ✅/◑ | fsp 0–6, sql_mode, named time zones; TIMESTAMP extends through 9999-12-31 23:59:59.999999 UTC |
-| ENUM/SET/BIT | ✅ | Enum ordinals, SET bitmasks, and binary bit aggregates are supported |
+| ENUM/SET/BIT | ✅ | Enum ordinals, SET bitmasks, and binary bit aggregates are supported; ENUM/SET `BINARY` selects the effective character set's binary collation |
 | JSON | ✅/◑ | Binary JSONB, JSON_TABLE/MVI/functions; the internal format is not identical to InnoDB binary JSON |
 | GEOMETRY family | ◑ | SRID+WKB, common functions, and spatial indexes work; see GIS boundaries |
 | VECTOR(n) | ➕ | MySQL 8.0.46 Community Server has no equivalent type |

@@ -110,7 +110,7 @@ pub(crate) fn propagate_sideways_dimension_filters(db: &Database, select: &mut S
         }
         if aliases.len() == 1 {
             let alias = aliases.iter().next().unwrap().clone();
-            if !sip_expr_has_subquery(c) {
+            if !sip_expr_has_subquery(c) && expr_is_deterministic(c) {
                 // Skip pure col=col self-equalities (e.g. `a.x = a.x`).
                 let is_self_eq = matches!(
                     c,

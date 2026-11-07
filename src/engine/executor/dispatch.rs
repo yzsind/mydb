@@ -9579,16 +9579,14 @@ pub(super) fn execute_qualified_statement(
             // didn't supply one. `u64::MAX` is the registry's sentinel
             // for "no cap" so we skip the rewrite in that common case
             // to avoid touching the plan-cache key needlessly.
-            // P2-C3 SQL_CALC_FOUND_ROWS: snapshot the user-supplied
-            // LIMIT/OFFSET *before* the implicit `sql_select_limit` injection
-            // below, so the strip-limit pre-pass strips only the real user
-            // window and reports the true pre-LIMIT total via `FOUND_ROWS()`.
+            // Count the unlimited input, but return the effective client
+            // window, including an implicit session limit.
+            apply_sql_select_limit(session, &mut stmt);
             let calc_window = if stmt.sql_calc_found_rows {
                 Some((stmt.limit.clone(), stmt.offset.clone()))
             } else {
                 None
             };
-            apply_sql_select_limit(session, &mut stmt);
             if calc_window.is_some() {
                 // MySQL 8.0.17 deprecation warning for the modifier itself.
                 crate::engine::api::push_statement_warning(

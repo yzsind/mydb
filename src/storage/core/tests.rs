@@ -26065,6 +26065,10 @@ fn fulltext_unicode_prefix_generic_matches_fast_path() {
     db.commit_txn(txn.txn_id).unwrap();
     let table = db.table("test.docs").unwrap();
     let index = table.indexes.iter().find(|i| i.name == "ft").unwrap();
+    let tokenizer =
+        crate::storage::fulltext::build_tokenizer_from_meta(index.fulltext.as_ref().unwrap());
+    let prefix = tokenizer.normalize_word("丿");
+    let token = tokenizer.normalize_word("丿甲乙");
     let txn = db.begin_txn().unwrap();
     for pending in [false, true] {
         if pending {
@@ -26072,9 +26076,11 @@ fn fulltext_unicode_prefix_generic_matches_fast_path() {
         } else {
             db.index_repair_version.fetch_and(!1, Ordering::Release);
         }
-        let batches = db.fulltext_scan_prefix(&table, index, "丿", txn).unwrap();
+        let batches = db
+            .fulltext_scan_prefix(&table, index, &prefix, txn)
+            .unwrap();
         assert_eq!(batches.len(), 1, "pending={pending}");
-        assert_eq!(batches[0].0, "丿甲乙");
+        assert_eq!(batches[0].0, token);
         assert_eq!(batches[0].1.postings.len(), 1);
     }
     db.index_repair_version.fetch_and(!1, Ordering::Release);

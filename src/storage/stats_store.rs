@@ -143,6 +143,14 @@ fn objects(
         let Ok(id) = index_id(table, name) else {
             continue;
         };
+        if table
+            .indexes
+            .iter()
+            .find(|index| index.index_id == id)
+            .is_none_or(|index| stat.prefix_distinct_counts.len() > index.columns.len())
+        {
+            continue;
+        }
         set.index_stats.push(vec![
             u(table.id),
             u(scope),

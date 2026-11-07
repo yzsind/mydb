@@ -5542,13 +5542,7 @@ where
                 _ => false,
             };
             if matches!(escape_value, Value::Null) {
-                // An empty scalar subquery in ESCAPE position supplies no
-                // character, and MySQL falls back to the default backslash.
-                // An explicit `ESCAPE NULL` remains SQL NULL.
-                if matches!(&args[2], Expr::Subquery(_)) {
-                    return Ok(eval_like_values(&value, &pattern, negated, Some('\\')));
-                }
-                return Ok(Value::Null);
+                return Ok(eval_like_values(&value, &pattern, negated, Some('\\')));
             }
             let escape_text = string_value(&escape_value);
             let mut chars = escape_text.chars();
@@ -12393,6 +12387,10 @@ pub(crate) fn eval_enum_set_comparison_values(
     values: &[Value],
 ) -> Result<Value, QueryError> {
     let op = string_value(&values[2]);
+    let (collation, member_start) = match (upper, values.get(3)) {
+        ("__ENUM_CMP", Some(Value::UInt(id))) => (u16::try_from(*id).ok(), 4),
+        _ => (None, 3),
+    };
     let col_null = matches!(values[0], Value::Null);
     let operand_null = matches!(values[1], Value::Null);
     if op == "<=>" {
@@ -12409,7 +12407,8 @@ pub(crate) fn eval_enum_set_comparison_values(
             Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
         )
     {
-        let cmp = compare_values(&values[0], &values[1])?;
+        let cmp =
+            with_optional_compare_collation(collation, || compare_values(&values[0], &values[1]))?;
         let matched = match op.as_str() {
             "=" | "<=>" => cmp == Ordering::Equal,
             "<>" => cmp != Ordering::Equal,
@@ -12421,7 +12420,7 @@ pub(crate) fn eval_enum_set_comparison_values(
         };
         return Ok(Value::Int(matched as i64));
     }
-    let variants = &values[3..];
+    let variants = &values[member_start..];
     let (lhs, rhs) = if upper == "__ENUM_CMP" {
         let lhs = enum_ordinal_of(&values[0], variants, true) as f64;
         let rhs = match &values[1] {
@@ -12477,6 +12476,14 @@ fn enum_ordinal_of(target: &Value, variants: &[Value], stored_column: bool) -> i
         if !declared_empty {
             return 0;
         }
+    }
+    // Stored members are canonical; case-distinct declarations must retain
+    // their own ordinals even when the connection collation is insensitive.
+    if let Some(index) = variants
+        .iter()
+        .position(|value| string_value(value) == target_text)
+    {
+        return (index + 1) as i64;
     }
     for (i, v) in variants.iter().enumerate() {
         if default_strings_equal(&string_value(v), &target_text) {

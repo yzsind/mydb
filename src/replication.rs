@@ -2751,7 +2751,7 @@ impl ChannelRunner {
             });
         }
 
-        let (file, pos) = self.start_position(cfg, &mut conn)?;
+        let (file, pos) = self.start_position(cfg)?;
         {
             let mut durable = self
                 .runtime
@@ -3098,11 +3098,7 @@ impl ChannelRunner {
         Ok(())
     }
 
-    fn start_position(
-        &self,
-        cfg: &ReplicationChannelConfig,
-        conn: &mut mysql::Conn,
-    ) -> Result<(String, u64), QueryError> {
+    fn start_position(&self, cfg: &ReplicationChannelConfig) -> Result<(String, u64), QueryError> {
         // Prefer the last *committed* transaction boundary for a reconnect:
         // resuming from the per-event `status.source_log_pos` (which advances
         // mid-transaction) would ask the source to re-stream from inside a
@@ -3122,32 +3118,9 @@ impl ChannelRunner {
         if !cfg.source_log_file.is_empty() {
             return Ok((cfg.source_log_file.clone(), cfg.source_log_pos.max(4)));
         }
-        let row = conn
-            .query_first::<mysql::Row, _>("SHOW BINARY LOG STATUS")
-            .or_else(|_| conn.query_first::<mysql::Row, _>("SHOW MASTER STATUS"))
-            .map_err(|err| {
-                error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!(
-                        "cannot discover source binary log status: {}",
-                        source_error_message(&err)
-                    ),
-                )
-            })?
-            .ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    "source did not return binary log status; is log_bin enabled?",
-                )
-            })?;
-        let file = row.get::<String, _>(0).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "source binary log status has no file column",
-            )
-        })?;
-        let pos = row.get::<u64, _>(1).unwrap_or(4).max(4);
-        Ok((file, pos))
+        // An empty filename asks the source for its first available binlog.
+        // Discovering its current end would silently skip preexisting data.
+        Ok((String::new(), cfg.source_log_pos.max(4)))
     }
 
     fn build_binlog_request(
@@ -9204,6 +9177,27 @@ mod tests {
         });
         let runner = ChannelRunner::new(dir.to_path_buf(), engine, Arc::clone(&runtime));
         (runtime, runner)
+    }
+
+    #[test]
+    fn report1107_replication_default_position_never_discovers_source_end() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let (runtime, runner) = make_split_runner(dir.path(), engine);
+        let mut config = ReplicationChannelConfig::default();
+        *runtime.status.lock().unwrap() = ReplicationStatus::from_config(&config, dir.path());
+        assert_eq!(runner.start_position(&config).unwrap(), (String::new(), 4));
+        config.source_log_file = "source.000002".into();
+        config.source_log_pos = 123;
+        assert_eq!(
+            runner.start_position(&config).unwrap(),
+            ("source.000002".into(), 123)
+        );
+        *runtime.io_committed_pos.lock().unwrap() = Some(("source.000003".into(), 456));
+        assert_eq!(
+            runner.start_position(&config).unwrap(),
+            ("source.000003".into(), 456)
+        );
     }
 
     #[test]

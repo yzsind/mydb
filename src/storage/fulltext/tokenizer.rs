@@ -3,7 +3,7 @@
 //! The inverted index reuses the B-tree: the tokenizer splits a row of text into tokens, each encoded
 //! into an index key (`KeyPart::String(token)`) that with the row's row_id forms an inverted item.
 //! **The indexing side and the query side must use the same tokenizer and the same normalization
-//! rules**, otherwise matches are missed (false negatives) — the most common and most insidious full-text bug; all tokens are lowercased here.
+//! rules**, otherwise matches are missed (false negatives). Normalization follows the persisted column collation.
 //!
 //! Two tokenizers, matching MySQL 8.0:
 //! - [`DefaultTokenizer`]: splits on Unicode non-alphanumeric boundaries, subject to min/max token size
@@ -47,6 +47,7 @@ pub struct TokenizerConfig {
     pub ngram_size: usize,
     /// Whether default stopword filtering is enabled.
     pub use_stopwords: bool,
+    pub preserve_case: bool,
 }
 
 impl TokenizerConfig {
@@ -57,6 +58,7 @@ impl TokenizerConfig {
             max_token_size: parse_env_usize("MYDB_FT_MAX_TOKEN_SIZE", 84).max(1),
             ngram_size: parse_env_usize("MYDB_FT_NGRAM_SIZE", 2).max(1),
             use_stopwords: parse_env_bool("MYDB_FT_STOPWORDS", true),
+            preserve_case: false,
         }
     }
 }
@@ -77,6 +79,10 @@ fn parse_env_usize(key: &str, default: usize) -> usize {
 /// Full-text tokenizer. `tokenize` returns a **normalized (lowercased) and filtered** token sequence,
 /// **preserving duplicates and order**: duplicates feed document-length / term-frequency statistics; the indexing side deduplicates before writing inverted items.
 pub trait Tokenizer: Send + Sync {
+    /// Normalize an unfiltered prefix without applying token-size limits.
+    fn normalize_word(&self, word: &str) -> String {
+        word.chars().flat_map(char::to_lowercase).collect()
+    }
     /// Split a piece of text into normalized tokens (duplicates included, order preserved).
     fn tokenize(&self, text: &str) -> Vec<String>;
     /// Unfiltered words for exact phrase verification. Ngram tokenizers retain
@@ -156,13 +162,25 @@ pub fn build_tokenizer_from_meta(
             .map(|n| (n as usize).max(1))
             .unwrap_or(global.ngram_size),
         use_stopwords: meta.use_stopwords.unwrap_or(global.use_stopwords),
+        preserve_case: meta
+            .collation_id
+            .and_then(crate::charset::resolve_collation_id)
+            .is_some_and(|collation| collation.case_sensitive || collation.binary),
     };
-    match meta.parser.as_str() {
-        "ngram" => {
-            let n = cfg.ngram_size;
-            Box::new(NgramTokenizer { n, cfg })
-        }
+    let tokenizer: Box<dyn Tokenizer> = match meta.parser.as_str() {
+        "ngram" => Box::new(NgramTokenizer {
+            n: cfg.ngram_size,
+            cfg,
+        }),
         _ => Box::new(DefaultTokenizer { cfg }),
+    };
+    match meta.collation_id {
+        Some(collation_id) => Box::new(CollatedTokenizer {
+            tokenizer,
+            collation_id,
+            ascii: ascii_weight_alphabet(collation_id),
+        }),
+        None => tokenizer,
     }
 }
 
@@ -201,42 +219,32 @@ pub struct DefaultTokenizer {
     cfg: TokenizerConfig,
 }
 
-impl DefaultTokenizer {
-    fn flush(&self, cur: &mut String, out: &mut Vec<String>) {
-        if cur.is_empty() {
-            return;
-        }
-        let token = std::mem::take(cur);
-        let len = token.chars().count();
-        if len >= self.cfg.min_token_size
-            && len <= self.cfg.max_token_size
-            && !is_stopword(&self.cfg, &token)
-        {
-            out.push(token);
+impl Tokenizer for DefaultTokenizer {
+    fn normalize_word(&self, word: &str) -> String {
+        if self.cfg.preserve_case {
+            word.to_string()
+        } else {
+            word.chars().flat_map(char::to_lowercase).collect()
         }
     }
-}
-
-impl Tokenizer for DefaultTokenizer {
     fn tokenize(&self, text: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut cur = String::new();
-        for ch in text.chars() {
-            // `_` is treated as an in-word character (underscores fold into the token, as in MySQL).
-            if ch.is_alphanumeric() || ch == '_' {
-                cur.extend(ch.to_lowercase());
-            } else {
-                self.flush(&mut cur, &mut out);
-            }
-        }
-        self.flush(&mut cur, &mut out);
-        out
+        self.positioned_tokens(text)
+            .0
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect()
     }
 
     fn raw_tokens(&self, text: &str) -> Vec<String> {
         text.split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|s| !s.is_empty())
-            .map(str::to_lowercase)
+            .map(|word| {
+                if self.cfg.preserve_case {
+                    word.to_string()
+                } else {
+                    word.chars().flat_map(char::to_lowercase).collect()
+                }
+            })
             .collect()
     }
 
@@ -264,13 +272,17 @@ impl Tokenizer for DefaultTokenizer {
                 if word.len() < self.cfg.min_token_size || word.len() > self.cfg.max_token_size {
                     continue;
                 }
-                if word.bytes().any(|b| b.is_ascii_uppercase()) {
+                if !self.cfg.preserve_case && word.bytes().any(|b| b.is_ascii_uppercase()) {
                     Cow::Owned(word.to_ascii_lowercase())
                 } else {
                     Cow::Borrowed(word)
                 }
             } else {
-                Cow::Owned(word.to_lowercase())
+                if self.cfg.preserve_case {
+                    Cow::Borrowed(word)
+                } else {
+                    Cow::Owned(word.chars().flat_map(char::to_lowercase).collect())
+                }
             };
             let len = if token.is_ascii() {
                 token.len()
@@ -289,6 +301,135 @@ impl Tokenizer for DefaultTokenizer {
 
     fn parser_name(&self) -> &'static str {
         ""
+    }
+}
+
+/// Keep ordinary ASCII terms readable and compact while encoding other
+/// comparison weights injectively. Prefixes end at complete weight units.
+struct AsciiWeightAlphabet {
+    single: [Option<char>; 256],
+    pairs: std::collections::HashMap<[u8; 2], char>,
+    triples: std::collections::HashMap<[u8; 3], char>,
+}
+fn ascii_weight_alphabet(id: u16) -> std::sync::Arc<AsciiWeightAlphabet> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    static CACHE: OnceLock<Mutex<HashMap<u16, Arc<AsciiWeightAlphabet>>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    Arc::clone(cache.entry(id).or_insert_with(|| {
+        let mut alphabet = AsciiWeightAlphabet {
+            single: [None; 256],
+            pairs: HashMap::new(),
+            triples: HashMap::new(),
+        };
+        for byte in (b'a'..=b'z')
+            .chain(b'A'..=b'Z')
+            .chain(b'0'..=b'9')
+            .chain([b'_'])
+        {
+            let mut weight = Vec::new();
+            crate::charset::collation_search_key_by_id_into(
+                id,
+                &char::from(byte).to_string(),
+                &mut weight,
+            );
+            match weight.as_slice() {
+                [a] => {
+                    alphabet.single[usize::from(*a)].get_or_insert(char::from(byte));
+                }
+                [a, b] => {
+                    alphabet.pairs.entry([*a, *b]).or_insert(char::from(byte));
+                }
+                [a, b, c] => {
+                    alphabet
+                        .triples
+                        .entry([*a, *b, *c])
+                        .or_insert(char::from(byte));
+                }
+                _ => {}
+            }
+        }
+        Arc::new(alphabet)
+    }))
+}
+struct CollatedTokenizer {
+    tokenizer: Box<dyn Tokenizer>,
+    collation_id: u16,
+    ascii: std::sync::Arc<AsciiWeightAlphabet>,
+}
+impl CollatedTokenizer {
+    fn normalize(&self, token: &str) -> String {
+        if crate::charset::resolve_collation_id(self.collation_id).is_some_and(|info| info.binary) {
+            return token.to_string();
+        }
+        let mut bytes = Vec::new();
+        crate::charset::collation_search_key_by_id_into(self.collation_id, token, &mut bytes);
+        let mut output = String::with_capacity(token.len());
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if let Some(ch) = self.ascii.single[usize::from(bytes[offset])] {
+                output.push(ch);
+                offset += 1;
+            } else if let Some(ch) = bytes
+                .get(offset..offset + 2)
+                .and_then(|pair| self.ascii.pairs.get(&[pair[0], pair[1]]))
+            {
+                output.push(*ch);
+                offset += 2;
+            } else if let Some(ch) = bytes
+                .get(offset..offset + 3)
+                .and_then(|triple| self.ascii.triples.get(&[triple[0], triple[1], triple[2]]))
+            {
+                output.push(*ch);
+                offset += 3;
+            } else {
+                output.push(char::from_u32(0xe000 + u32::from(bytes[offset])).unwrap());
+                offset += 1;
+            }
+        }
+        output
+    }
+}
+impl Tokenizer for CollatedTokenizer {
+    fn normalize_word(&self, word: &str) -> String {
+        self.normalize(&self.tokenizer.normalize_word(word))
+    }
+    fn tokenize(&self, text: &str) -> Vec<String> {
+        self.tokenizer
+            .tokenize(text)
+            .into_iter()
+            .map(|token| self.normalize(&token))
+            .collect()
+    }
+    fn raw_tokens(&self, text: &str) -> Vec<String> {
+        self.tokenizer
+            .raw_tokens(text)
+            .into_iter()
+            .map(|token| self.normalize(&token))
+            .collect()
+    }
+    fn positioned_tokens(&self, text: &str) -> (Vec<(String, u64)>, u64) {
+        let (tokens, extent) = self.tokenizer.positioned_tokens(text);
+        (
+            tokens
+                .into_iter()
+                .map(|(token, pos)| (self.normalize(&token), pos))
+                .collect(),
+            extent,
+        )
+    }
+    fn visit_positioned_tokens<'a>(
+        &self,
+        text: &'a str,
+        visit: &mut dyn FnMut(std::borrow::Cow<'a, str>, u64),
+    ) -> u64 {
+        self.tokenizer
+            .visit_positioned_tokens(text, &mut |token, position| {
+                visit(std::borrow::Cow::Owned(self.normalize(&token)), position)
+            })
+    }
+    fn parser_name(&self) -> &'static str {
+        self.tokenizer.parser_name()
     }
 }
 
@@ -315,13 +456,24 @@ impl NgramTokenizer {
 }
 
 impl Tokenizer for NgramTokenizer {
+    fn normalize_word(&self, word: &str) -> String {
+        if self.cfg.preserve_case {
+            word.to_string()
+        } else {
+            word.chars().flat_map(char::to_lowercase).collect()
+        }
+    }
     fn tokenize(&self, text: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut seg: Vec<char> = Vec::new();
         for ch in text.chars() {
             if ch.is_alphanumeric() {
                 // to_lowercase may yield multiple chars; append them one by one (ASCII / CJK are usually 1:1).
-                seg.extend(ch.to_lowercase());
+                if self.cfg.preserve_case {
+                    seg.push(ch);
+                } else {
+                    seg.extend(ch.to_lowercase());
+                }
             } else {
                 self.emit_ngrams(&seg, &mut out);
                 seg.clear();
@@ -347,6 +499,7 @@ mod tests {
                 max_token_size: 84,
                 ngram_size: 2,
                 use_stopwords: true,
+                preserve_case: false,
             },
         }
     }
@@ -359,6 +512,7 @@ mod tests {
                 max_token_size: 84,
                 ngram_size: n,
                 use_stopwords: false,
+                preserve_case: false,
             },
         }
     }
