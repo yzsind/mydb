@@ -12,7 +12,19 @@ use std::path::{Path, PathBuf};
 
 use mydb::engine::StorageQueryEngine;
 
+type EmptyDictionaryIndexes = Vec<(u64, Vec<PathBuf>)>;
+
+#[allow(dead_code)] // Also included as a module by the library test harness.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    prepare_seed(|_| Ok(Vec::new()))
+}
+
+// The library test harness supplies its private dictionary inspection hook.
+// Standalone tool targets link the normal library, even with cfg(test).
+pub(crate) fn prepare_seed<F>(empty_dictionary_indexes: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(&StorageQueryEngine) -> Result<EmptyDictionaryIndexes, mydb::types::QueryError>,
+{
     let nextest_env = env::var_os("NEXTEST_ENV").ok_or("NEXTEST_ENV is not set")?;
     let run_id = env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "manual".to_string());
     let root = seed_store_root()?;
@@ -54,11 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &memory_catalog,
         serde_json::to_vec(&engine.db_handle().catalog())?,
     )?;
-    #[cfg(test)]
-    let empty_indexes = engine
-        .db_handle()
-        .empty_dictionary_seed_indexes()
-        .map_err(query_error)?;
+    let empty_indexes = empty_dictionary_indexes(&engine).map_err(query_error)?;
     engine.shutdown().map_err(query_error)?;
     drop(engine);
 
@@ -71,8 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Empty indexes can be initialized in private memory before readers start.
     let memory_seed_dir = seed_dir.parent().unwrap().join("memory-seed");
     copy_seed_tree(&seed_dir, &memory_seed_dir)?;
-    #[cfg(test)]
-    compact_memory_seed(&memory_seed_dir, &empty_indexes)?;
+    if !empty_indexes.is_empty() {
+        compact_memory_seed(&memory_seed_dir, &empty_indexes)?;
+    }
     // Memory fixtures reconstruct undo and temporal state from WAL and do
     // not read the persistent undo segments or temporal ledgers. Avoid
     // cloning and unlinking these unused files in every isolated fixture.
@@ -162,7 +171,6 @@ fn copy_seed_tree(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn compact_memory_seed(
     root: &Path,
     empty_indexes: &[(u64, Vec<PathBuf>)],
@@ -216,11 +224,4 @@ fn append_nextest_env(path: &Path, key: &str, value: &Path) -> io::Result<()> {
 fn append_nextest_value(path: &Path, key: &str, value: &str) -> io::Result<()> {
     let mut file = fs::OpenOptions::new().append(true).open(path)?;
     writeln!(file, "{key}={value}")
-}
-
-#[cfg(test)]
-#[test]
-#[ignore = "fixture generator invoked explicitly by the nextest setup script"]
-fn prepare_nextest_seed() {
-    main().expect("prepare nextest database fixtures");
 }
