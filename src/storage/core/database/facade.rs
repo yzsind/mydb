@@ -1000,6 +1000,9 @@ impl Database {
             } else {
                 db.load_or_bootstrap_catalog()?;
             }
+            if seeded_test_directory && db.config.durability == DurabilityMode::Memory {
+                db.initialize_compact_test_seed_indexes()?;
+            }
         }
         #[cfg(not(test))]
         db.load_or_bootstrap_catalog()?;
@@ -1293,6 +1296,51 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn stop_buffer_pool_io_for_test(&self) {
         self.buffer_pool.shutdown_flusher();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_dictionary_seed_indexes(
+        &self,
+    ) -> Result<Vec<(u64, Vec<PathBuf>)>, QueryError> {
+        let mut tables = Vec::new();
+        for table in crate::storage::data_dictionary::dd_tables() {
+            if !self.scan_dd_table(table.id)?.is_empty() {
+                continue;
+            }
+            let paths = table
+                .indexes
+                .iter()
+                .map(|index| {
+                    self.index_path_for_table_schema(table, table.id, &index.name)
+                        .strip_prefix(self.data_dir())
+                        .unwrap()
+                        .to_path_buf()
+                })
+                .collect();
+            tables.push((table.id, paths));
+        }
+        Ok(tables)
+    }
+
+    #[cfg(test)]
+    fn initialize_compact_test_seed_indexes(&self) -> Result<(), QueryError> {
+        let bytes = match fs::read(self.data_dir().join(".mydb-test-empty-dd.json")) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(io_err(err)),
+        };
+        let tables: Vec<u64> =
+            serde_json::from_slice(&bytes).map_err(|err| io_err(std::io::Error::other(err)))?;
+        // Publish every empty dictionary root before concurrent readers start.
+        // Memory B-trees retain their private pages without backing files.
+        for id in tables {
+            let table = crate::storage::data_dictionary::dd_table_schema(id)
+                .ok_or_else(|| io_err(std::io::Error::other("invalid test seed dictionary id")))?;
+            for index in &table.indexes {
+                self.with_index_read(id, &index.name, |_| Ok(()))?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]

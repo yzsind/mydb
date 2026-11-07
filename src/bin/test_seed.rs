@@ -12,7 +12,19 @@ use std::path::{Path, PathBuf};
 
 use mydb::engine::StorageQueryEngine;
 
+type EmptyDictionaryIndexes = Vec<(u64, Vec<PathBuf>)>;
+
+#[allow(dead_code)] // Also included as a module by the library test harness.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    prepare_seed(|_| Ok(Vec::new()))
+}
+
+// The library test harness supplies its private dictionary inspection hook.
+// Standalone tool targets link the normal library, even with cfg(test).
+pub(crate) fn prepare_seed<F>(empty_dictionary_indexes: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(&StorageQueryEngine) -> Result<EmptyDictionaryIndexes, mydb::types::QueryError>,
+{
     let nextest_env = env::var_os("NEXTEST_ENV").ok_or("NEXTEST_ENV is not set")?;
     let run_id = env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "manual".to_string());
     let root = seed_store_root()?;
@@ -54,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &memory_catalog,
         serde_json::to_vec(&engine.db_handle().catalog())?,
     )?;
+    let empty_indexes = empty_dictionary_indexes(&engine).map_err(query_error)?;
     engine.shutdown().map_err(query_error)?;
     drop(engine);
 
@@ -62,13 +75,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::remove_dir_all(seed_dir.join("system/logs"));
     let _ = fs::remove_file(seed_dir.join("system/mydb.lock"));
 
-    // Memory indexes are initialized in the buffer pool and never read these
-    // disk images. Keep the dictionary heaps/WAL, but avoid cloning and later
-    // unlinking dozens of unused indexes and their nested directories per test.
+    // Keep all heap allocation metadata and populated dictionary indexes.
+    // Empty indexes can be initialized in private memory before readers start.
     let memory_seed_dir = seed_dir.parent().unwrap().join("memory-seed");
     copy_seed_tree(&seed_dir, &memory_seed_dir)?;
-    // Dictionary indexes are needed for authoritative upserts even when
-    // transaction WAL is disabled in the cloned fixture.
+    if !empty_indexes.is_empty() {
+        compact_memory_seed(&memory_seed_dir, &empty_indexes)?;
+    }
     // Memory fixtures reconstruct undo and temporal state from WAL and do
     // not read the persistent undo segments or temporal ledgers. Avoid
     // cloning and unlinking these unused files in every isolated fixture.
@@ -158,6 +171,37 @@ fn copy_seed_tree(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn compact_memory_seed(
+    root: &Path,
+    empty_indexes: &[(u64, Vec<PathBuf>)],
+) -> io::Result<()> {
+    let catalog = root.join("system/catalog");
+    let tables: Vec<_> = empty_indexes.iter().map(|(id, _)| *id).collect();
+    for relative in empty_indexes.iter().flat_map(|(_, paths)| paths) {
+        let path = root.join(relative);
+        fs::remove_file(&path)?;
+        let mut parent = path.parent();
+        while let Some(directory) = parent.filter(|directory| *directory != catalog) {
+            match fs::remove_dir(directory) {
+                Ok(()) => parent = directory.parent(),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    break
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    fs::write(
+        root.join(".mydb-test-empty-dd.json"),
+        serde_json::to_vec(&tables)?,
+    )
+}
+
 fn query_error(error: mydb::types::QueryError) -> io::Error {
     io::Error::other(format!("MySQL error {}: {}", error.code(), error.message()))
 }
@@ -180,11 +224,4 @@ fn append_nextest_env(path: &Path, key: &str, value: &Path) -> io::Result<()> {
 fn append_nextest_value(path: &Path, key: &str, value: &str) -> io::Result<()> {
     let mut file = fs::OpenOptions::new().append(true).open(path)?;
     writeln!(file, "{key}={value}")
-}
-
-#[cfg(test)]
-#[test]
-#[ignore = "fixture generator invoked explicitly by the nextest setup script"]
-fn prepare_nextest_seed() {
-    main().expect("prepare nextest database fixtures");
 }
