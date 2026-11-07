@@ -2698,6 +2698,8 @@ pub struct SessionSysVarState {
     pub default_week_format: u64,
     /// `lc_messages` / `lc_time_names` — localisation.
     pub lc_messages: String,
+    /// Per-session values of advisory integer compatibility settings.
+    pub advisory_uints: std::collections::HashMap<&'static str, u64>,
     pub lc_time_names: String,
     /// `collation_database` is mirrored above; keep `collation_server`
     /// as a session override of the global (mostly cosmetic).
@@ -2847,6 +2849,7 @@ impl Default for SessionSysVarState {
                 crate::engine::sysvar::builtin::charset::global_block_encryption_mode(),
             default_week_format: 0,
             lc_messages: "en_US".to_string(),
+            advisory_uints: Default::default(),
             lc_time_names: "en_US".to_string(),
             collation_server: server_collation.to_string(),
             character_set_server: server_charset.to_string(),

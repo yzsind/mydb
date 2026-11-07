@@ -181,6 +181,7 @@ pub struct Session<E: QueryEngine> {
     /// True after an account connection quota has been charged. Every exit
     /// path must clear it through engine session cleanup exactly once.
     authenticated: bool,
+    audit_connected: bool,
     /// Configured ordinary-connection limit when this session occupied one of
     /// the administrator-reserved slots. Authentication must require
     /// CONNECTION_ADMIN before the final handshake OK is sent.
@@ -582,6 +583,14 @@ impl<E: QueryEngine> Drop for Session<E> {
             }
         }
         self.recover_parked_context();
+        if self.audit_connected {
+            crate::engine::audit_log::record_disconnect(
+                &self.context.user,
+                &self.context.host,
+                self.connection_id,
+            );
+            self.audit_connected = false;
+        }
         if std::thread::panicking() {
             if self.authenticated {
                 crate::mysql::connection_manager::record_aborted_client();
@@ -1315,6 +1324,7 @@ where
             kill_flag: Arc::new(AtomicBool::new(false)),
             capabilities: NegotiatedCapabilities::default(),
             authenticated: false,
+            audit_connected: false,
             admin_connection_limit: None,
             normal_close: false,
             context: Box::new(context),
@@ -1378,7 +1388,16 @@ where
         } } => result,
         };
         match handshake_result {
-            Ok(()) => record_handshake_success(),
+            Ok(()) => {
+                record_handshake_success();
+                crate::engine::audit_log::record_connect(
+                    &self.context.user,
+                    &self.context.host,
+                    self.connection_id,
+                    None,
+                );
+                self.audit_connected = true;
+            }
             Err(err) => {
                 record_handshake_failure();
                 if self.authenticated {
@@ -1652,6 +1671,12 @@ where
                 ) {
                     Ok(collation) => collation,
                     Err(err) => {
+                        crate::engine::audit_log::record_connect(
+                            &handshake.username,
+                            &self.peer_addr.ip().to_string(),
+                            self.connection_id,
+                            Some(&err),
+                        );
                         self.write_error_packet(response.sequence_id.wrapping_add(1), &err)
                             .await?;
                         return Err(io::Error::new(io::ErrorKind::InvalidData, err.message()));
@@ -1735,6 +1760,12 @@ where
                 {
                     Ok(outcome) => outcome,
                     Err(err) => {
+                        crate::engine::audit_log::record_connect(
+                            &handshake.username,
+                            &client_host,
+                            self.connection_id,
+                            Some(&err),
+                        );
                         self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
                             .await?;
                         return Err(io::Error::new(

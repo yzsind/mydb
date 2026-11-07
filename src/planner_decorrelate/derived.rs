@@ -954,6 +954,13 @@ fn projection_has_window(items: &[SelectItem]) -> bool {
 /// predicate on `key` can be pushed below the aggregate even though the
 /// aggregate output itself cannot.
 fn build_alias_map(inner: &Select) -> Option<HashMap<String, Expr>> {
+    // Superaggregate rows are created after WHERE. A group-key predicate
+    // cannot be removed from the outer query when those rows are possible.
+    if inner.group_by_modifier != crate::parser::GroupByModifier::None
+        || !inner.grouping_sets.is_empty()
+    {
+        return None;
+    }
     let group_keys: Vec<String> = inner
         .group_by
         .iter()

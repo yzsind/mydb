@@ -1156,14 +1156,21 @@ fn routine_stmt_has_return(stmt: &RoutineStmt) -> bool {
 
 fn validate_function_stmt(stmt: &RoutineStmt) -> Result<(), QueryError> {
     match stmt {
-        RoutineStmt::Sql(sql) if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") => {
-            Err(error(
-                crate::error::catalog::ER_SP_NO_RETSET,
-                "Not allowed to return a result set from a function",
-            ))
-        }
         RoutineStmt::Sql(sql) => {
             let statement = parse_statement(sql).map_err(|err| err.spec.error(err.message))?;
+            let mut body = &statement;
+            while let crate::parser::Statement::WithCte(with) = body {
+                body = &with.body;
+            }
+            if matches!(
+                body,
+                crate::parser::Statement::Select(_) | crate::parser::Statement::SetOperation(_)
+            ) {
+                return Err(error(
+                    crate::error::catalog::ER_SP_NO_RETSET,
+                    "Not allowed to return a result set from a function",
+                ));
+            }
             reject_restricted_sql_statement(&SessionContext::default(), &statement, None)
                 .map_err(|err| err.query_error())?;
             let upper = sql.trim_start().to_ascii_uppercase();

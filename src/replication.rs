@@ -2857,6 +2857,7 @@ impl ChannelRunner {
             )
         })?
         else {
+            mark_io_error_fatal();
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!("unsupported unknown binlog event at {current_file}:{progress_pos}"),
@@ -3087,6 +3088,7 @@ impl ChannelRunner {
                     ),
                     _ => ("binlog event", ""),
                 };
+                mark_io_error_fatal();
                 return Err(error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
                     format!("{kind} is not supported by mydb replication{hint}"),
@@ -9144,6 +9146,32 @@ mod tests {
                 ..ReplicationFlushPolicy::default()
             },
         )
+    }
+
+    #[test]
+    fn final_1107_unsupported_source_event_is_fatal() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let (_, runner) = make_split_runner(dir.path(), engine);
+        let bytes = test_event_bytes(
+            EventType::INTVAR_EVENT,
+            100,
+            vec![1, 1, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let mut reader = EventStreamReader::new(BinlogVersion::Version4);
+        let event = reader.read(&bytes[..]).unwrap().unwrap();
+        take_io_error_fatal();
+        let err = runner
+            .handle_source_event(
+                &event,
+                &mut "bin.000001".to_string(),
+                100,
+                &mut HashMap::new(),
+                &mut TxnBuffer::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), 1235);
+        assert!(take_io_error_fatal());
     }
 
     fn make_split_runner_with_policy(

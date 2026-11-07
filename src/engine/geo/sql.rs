@@ -1827,10 +1827,52 @@ fn is_simple(geom: &Geom) -> bool {
             true
         }
         Geom::LineString(cs) => line_is_simple(cs),
-        Geom::MultiLineString(ls) => ls.iter().all(|l| line_is_simple(l)),
-        // Polygons are assumed simple (full OGC validity is ST_IsValid's job);
-        // a richer check is a future improvement.
-        _ => true,
+        Geom::MultiLineString(ls) => {
+            if !ls.iter().all(|line| line_is_simple(line)) {
+                return false;
+            }
+            use geo::{coordinate_position::CoordPos, dimensions::Dimensions, Relate};
+            let lines: Vec<_> = ls
+                .iter()
+                .map(|line| super::relate::topology_geometry(&Geom::LineString(line.clone())))
+                .collect();
+            for (i, a) in lines.iter().enumerate() {
+                for b in &lines[i + 1..] {
+                    let matrix = a.relate(b);
+                    for (left, right) in [
+                        (CoordPos::Inside, CoordPos::Inside),
+                        (CoordPos::Inside, CoordPos::OnBoundary),
+                        (CoordPos::OnBoundary, CoordPos::Inside),
+                    ] {
+                        if matrix.get(left, right) != Dimensions::Empty {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        Geom::GeometryCollection(geometries) => {
+            if !geometries.iter().all(is_simple) {
+                return false;
+            }
+            use geo::Relate;
+            let geometries: Vec<_> = geometries
+                .iter()
+                .map(super::relate::topology_geometry)
+                .collect();
+            for (i, a) in geometries.iter().enumerate() {
+                for b in &geometries[i + 1..] {
+                    let matrix = a.relate(b);
+                    if !matrix.is_disjoint() && !matrix.is_touches() {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        // Polygon simplicity is separate from validity, matching MySQL.
+        Geom::Polygon(_) | Geom::MultiPolygon(_) => true,
     }
 }
 

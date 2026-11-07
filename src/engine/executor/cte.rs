@@ -7348,6 +7348,14 @@ fn collect_used_stmt<'q>(
 }
 
 fn collect_used_select(s: &Select, aliases: &[String], used: &mut UsedCols) {
+    for window in &s.named_windows {
+        for expr in &window.partition_by {
+            collect_used_expr(expr, aliases, used);
+        }
+        for order in &window.order_by {
+            collect_used_expr(&order.expr, aliases, used);
+        }
+    }
     for item in &s.projection {
         match item {
             // A bare `*` expands only over the current SELECT scope. A
@@ -7451,7 +7459,6 @@ fn collect_used_expr(expr: &Expr, aliases: &[String], used: &mut UsedCols) {
                     }
                     return false;
                 }
-                Expr::WindowFunction { .. } => return false,
                 _ => {}
             }
             true

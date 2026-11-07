@@ -1123,9 +1123,21 @@ fn local_ms_to_utc_ms(local_ms: u64, time_zone: &str) -> u64 {
     let tz = time_zone.trim();
     let utc_secs =
         if tz.is_empty() || tz.eq_ignore_ascii_case("SYSTEM") || tz.eq_ignore_ascii_case("LOCAL") {
-            use chrono::{Local, Offset};
-            let off = Local::now().offset().fix().local_minus_utc() as i64;
-            local_secs - off
+            if let Some(zone) = crate::engine::tz::find_system_zone() {
+                zone.utc_from_local(local_secs)
+            } else {
+                use chrono::Local;
+                let local = Utc
+                    .timestamp_opt(local_secs, 0)
+                    .single()
+                    .unwrap()
+                    .naive_utc();
+                Local
+                    .from_local_datetime(&local)
+                    .earliest()
+                    .map(|time| time.timestamp())
+                    .unwrap_or(local_secs)
+            }
         } else if tz.eq_ignore_ascii_case("UTC") || tz.eq_ignore_ascii_case("GMT") {
             local_secs
         } else if let Some(off) = parse_fixed_offset_secs(tz) {
@@ -1550,9 +1562,16 @@ fn utc_ms_to_local_ms(utc_ms: u64, time_zone: &str) -> u64 {
     let tz = time_zone.trim();
     let local_secs =
         if tz.is_empty() || tz.eq_ignore_ascii_case("SYSTEM") || tz.eq_ignore_ascii_case("LOCAL") {
-            use chrono::{Local, Offset};
-            let off = Local::now().offset().fix().local_minus_utc() as i64;
-            utc_secs + off
+            if let Some(zone) = crate::engine::tz::find_system_zone() {
+                utc_secs + zone.offset_at_utc(utc_secs) as i64
+            } else {
+                use chrono::Local;
+                Local
+                    .timestamp_opt(utc_secs, 0)
+                    .single()
+                    .map(|time| utc_secs + time.offset().local_minus_utc() as i64)
+                    .unwrap_or(utc_secs)
+            }
         } else if tz.eq_ignore_ascii_case("UTC") || tz.eq_ignore_ascii_case("GMT") {
             utc_secs
         } else if let Some(off) = parse_fixed_offset_secs(tz) {
@@ -1796,6 +1815,18 @@ pub fn format_ms_as_datetime(ms: u64) -> String {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn final_1107_system_event_timezone_uses_scheduled_instant() {
+        let Some(zone) = crate::engine::tz::find_system_zone() else {
+            return;
+        };
+        for local in [1_704_110_400_000u64, 1_719_835_200_000] {
+            let expected = zone.utc_from_local((local / 1000) as i64) as u64 * 1000;
+            assert_eq!(local_ms_to_utc_ms(local, "SYSTEM"), expected);
+            assert_eq!(utc_ms_to_local_ms(expected, "SYSTEM"), local);
+        }
+    }
 
     #[test]
     fn audit_event_invocations_refresh_clock_and_restore_explicit_empty_mode() {

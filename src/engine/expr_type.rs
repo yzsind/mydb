@@ -2871,6 +2871,13 @@ pub(crate) fn normalize_equality_key_exprs(
         }
         // A date/datetime compared with a number reads the number as a
         // compact `YYYYMMDD[hhmmss[.ffffff]]` value (`101` is 2000-01-01).
+        (K::Temporal { kind: T::Time, .. }, other) | (other, K::Temporal { kind: T::Time, .. })
+            if numeric(other) =>
+        {
+            // TIME compares numerically as signed HHMMSS.ffffff, not as its
+            // internal microsecond count. Keep fractional digits exact.
+            Some(("DECIMAL", vec![65, 6]))
+        }
         (K::Temporal { kind, .. }, K::Integer { .. } | K::Decimal { .. } | K::Float { .. })
         | (K::Integer { .. } | K::Decimal { .. } | K::Float { .. }, K::Temporal { kind, .. })
             if matches!(kind, T::Date | T::DateTime | T::Timestamp) =>

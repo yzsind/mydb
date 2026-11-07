@@ -919,9 +919,9 @@ pub(super) fn execute_multi_update(
     )?;
 
     // Collect SET assignments per target participant.
-    let mut assignments_per_participant: BTreeMap<usize, Vec<(usize, BoundMultiExpr)>> =
+    let mut assignments_per_participant: BTreeMap<usize, Vec<(usize, usize, BoundMultiExpr)>> =
         BTreeMap::new();
-    for assignment in &stmt.assignments {
+    for (order, assignment) in stmt.assignments.iter().enumerate() {
         let combined_idx = match &assignment.table_qualifier {
             Some(qual) => ctx.resolve_qualified(qual, &assignment.column)?,
             None => ctx.resolve_unqualified(&assignment.column)?,
@@ -942,6 +942,7 @@ pub(super) fn execute_multi_update(
         }
         assignments_per_participant.entry(p_idx).or_default().push((
             col_idx,
+            order,
             ctx.bind(db, session, &assignment.value, Some(combined_idx))?,
         ));
     }
@@ -996,7 +997,7 @@ pub(super) fn execute_multi_update(
         old: Vec<Value>,
         new: Vec<Value>,
         user_columns: Vec<usize>,
-        column_owners: Vec<usize>,
+        column_assignment_order: Vec<usize>,
     }
     let mut planned: HashMap<(u64, RowId), PlannedUpdate> = HashMap::new();
     enumerate_joined(
@@ -1020,22 +1021,22 @@ pub(super) fn execute_multi_update(
                         old: row.values.clone(),
                         new: row.values.clone(),
                         user_columns: Vec::new(),
-                        column_owners: Vec::new(),
+                        column_assignment_order: Vec::new(),
                     });
                 if entry.aliases.contains(&p_idx) {
                     continue;
                 }
                 entry.aliases.push(p_idx);
                 entry.participant = entry.participant.min(p_idx);
-                for (col_idx, expr) in assignments {
+                for (col_idx, order, expr) in assignments {
                     if let Some(pos) = entry.user_columns.iter().position(|col| col == col_idx) {
-                        if entry.column_owners[pos] < p_idx {
+                        if entry.column_assignment_order[pos] > *order {
                             continue;
                         }
-                        entry.column_owners[pos] = p_idx;
+                        entry.column_assignment_order[pos] = *order;
                     } else {
                         entry.user_columns.push(*col_idx);
-                        entry.column_owners.push(p_idx);
+                        entry.column_assignment_order.push(*order);
                     }
                     let value = eval_in_context(expr, &ctx, combined)?;
                     entry.new[*col_idx] = crate::engine::expr::contextual_numeric_literal(

@@ -204,6 +204,21 @@ fn try_rewrite_scalar(state: &mut RewriteState, expr: &mut Expr) -> bool {
         Some(r) => r,
         None => return false,
     };
+    // A source may already have been lowered to a synthetic CTE relation
+    // whose output names are unavailable to the syntactic scope collector.
+    // Never publish a standalone aggregate with unresolved residual outer
+    // references; the Apply evaluator can still bind the original subquery.
+    if rewrite
+        .derived_join
+        .derived
+        .as_ref()
+        .and_then(SubQuery::as_select)
+        .is_none_or(|body| {
+            crate::planner::validate_select_column_references(state.db, body).is_err()
+        })
+    {
+        return false;
+    }
     add_outer_key_domain(state, &info.equality_pairs, id, &mut rewrite.derived_join);
     *expr = if state.aggregate_replacements {
         Expr::Function {

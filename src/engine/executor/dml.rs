@@ -529,15 +529,7 @@ pub(super) fn execute_update(
             &outer_tname,
             &table.columns,
         );
-        if let Some((_, existing, existing_corr)) = updates
-            .iter_mut()
-            .find(|(existing_idx, _, _)| *existing_idx == idx)
-        {
-            *existing = assignment.value;
-            *existing_corr = correlated;
-        } else {
-            updates.push((idx, assignment.value, correlated));
-        }
+        updates.push((idx, assignment.value, correlated));
     }
     // No-op detection compares only the *user-set* columns: an
     // `ON UPDATE CURRENT_TIMESTAMP` column always differs (fresh NOW() vs
@@ -1021,14 +1013,7 @@ pub(super) fn execute_update_borrowed_simple(
         if !changed_column_indexes.contains(&idx) {
             changed_column_indexes.push(idx);
         }
-        if let Some((_, existing)) = updates
-            .iter_mut()
-            .find(|(existing_idx, _)| *existing_idx == idx)
-        {
-            *existing = &assignment.value;
-        } else {
-            updates.push((idx, &assignment.value));
-        }
+        updates.push((idx, &assignment.value));
     }
     // B7 — snapshot the user-set columns BEFORE appending the auto
     // `ON UPDATE CURRENT_TIMESTAMP` columns. No-op detection must compare

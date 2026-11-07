@@ -2,6 +2,7 @@ mod ai;
 mod collated_constant_in;
 mod critical_audit;
 mod ddl_lock_contract;
+mod final_release_audit_1107;
 mod fresh_release_audit;
 mod function_runtime_fixes;
 mod github_release_audit;

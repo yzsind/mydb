@@ -1980,11 +1980,19 @@ pub struct ParsedQueryAttributes<'a> {
 /// get to force a giant up-front allocation that the subsequent reads
 /// (which run out of payload bytes and error) would never have filled.
 const MAX_PARAM_PREALLOC: usize = 4096;
+// Prepared statement placeholder counts are encoded as u16. Apply the same
+// resource bound to attribute-bearing commands before allocating any slots.
+const MAX_COMMAND_PARAMETERS: usize = u16::MAX as usize;
 
 pub fn parse_query_attributes(payload: &[u8]) -> Result<ParsedQueryAttributes<'_>, String> {
     let mut cursor = Cursor::new(payload);
     let parameter_count = usize::try_from(cursor.read_lenenc_int()?)
         .map_err(|_| "parameter count exceeds address space".to_string())?;
+    if parameter_count > MAX_COMMAND_PARAMETERS {
+        return Err(format!(
+            "COM_QUERY parameter count exceeds {MAX_COMMAND_PARAMETERS}"
+        ));
+    }
     let parameter_set_count = cursor.read_lenenc_int()?;
     if parameter_set_count != 1 {
         return Err(format!(
@@ -1998,7 +2006,7 @@ pub fn parse_query_attributes(payload: &[u8]) -> Result<ParsedQueryAttributes<'_
         });
     }
     let null_bitmap_len = parameter_count.div_ceil(8);
-    let null_bitmap = cursor.read_bytes(null_bitmap_len)?.to_vec();
+    let null_bitmap = cursor.read_bytes(null_bitmap_len)?;
     let new_params_bind_flag = cursor.read_u8()?;
     // COM_QUERY with parameter_count > 0 spec requires new_params_bind_flag = 1
     // and the type loop to be present; there is no cached-types path
@@ -2185,6 +2193,11 @@ pub fn parse_stmt_execute_params(
     } else {
         param_count
     };
+    if effective_param_count > MAX_COMMAND_PARAMETERS || param_count > MAX_COMMAND_PARAMETERS {
+        return Err(format!(
+            "COM_STMT_EXECUTE parameter count exceeds {MAX_COMMAND_PARAMETERS}"
+        ));
+    }
     if effective_param_count < param_count {
         return Err(format!(
             "COM_STMT_EXECUTE supplied {effective_param_count} parameters for {param_count} placeholders"
@@ -3351,6 +3364,35 @@ mod tests {
             let mut execute = vec![0, 0, 0, 0, 8, 1, 0, 0, 0];
             write_lenenc_int(&mut execute, count);
             assert!(parse_stmt_execute_params(&execute, 1, None, None, true).is_err());
+        }
+    }
+
+    #[test]
+    fn final_1107_parameter_limit_precedes_parameter_allocation() {
+        for count in [65_535u64, 65_536, 5_000_000] {
+            let mut query = Vec::new();
+            write_lenenc_int(&mut query, count);
+            query.push(1);
+            query.resize(query.len() + (count as usize).div_ceil(8), 0xff);
+            query.push(1);
+            for _ in 0..count {
+                query.extend_from_slice(&[MYSQL_TYPE_VAR_STRING, 0, 0]);
+            }
+            query.extend_from_slice(b"SELECT 1");
+            let parsed = parse_query_attributes(&query);
+            if count == 65_535 {
+                assert_eq!(parsed.unwrap().attributes.len(), 65_535);
+            } else {
+                assert!(parsed.err().unwrap().contains("exceeds 65535"));
+            }
+            let mut execute = vec![1, 0, 0, 0, 8, 1, 0, 0, 0];
+            write_lenenc_int(&mut execute, count);
+            if count > 65_535 {
+                assert!(parse_stmt_execute_params(&execute, 0, None, None, true)
+                    .err()
+                    .unwrap()
+                    .contains("exceeds 65535"));
+            }
         }
     }
 

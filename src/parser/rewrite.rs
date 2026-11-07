@@ -2708,24 +2708,11 @@ pub(super) fn rewrite_empty_insert_rows(sql: &str) -> std::borrow::Cow<'_, str> 
     while let Some((idx, ch)) = chars.next() {
         match ch {
             '\'' | '"' | '`' => {
-                let quote = ch;
-                out.push(quote);
+                let end = quoted_span_end(sql.as_bytes(), idx);
+                out.push_str(&sql[idx..end]);
                 prev_ident = false;
-                while let Some((_, c)) = chars.next() {
-                    out.push(c);
-                    if c == quote {
-                        if matches!(chars.peek(), Some((_, q)) if *q == quote) {
-                            out.push(quote);
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                    if c == '\\' {
-                        if let Some((_, esc)) = chars.next() {
-                            out.push(esc);
-                        }
-                    }
+                while chars.peek().is_some_and(|(index, _)| *index < end) {
+                    chars.next();
                 }
             }
             '(' if depth == 0 => {
@@ -2869,24 +2856,11 @@ pub(super) fn rewrite_comma_update_targets(sql: &str) -> std::borrow::Cow<'_, st
         }
         match ch {
             '\'' | '"' | '`' => {
-                let quote = ch;
-                out.push(quote);
+                let end = quoted_span_end(sql.as_bytes(), idx);
+                out.push_str(&sql[idx..end]);
                 prev_ident = false;
-                while let Some((_, c)) = chars.next() {
-                    out.push(c);
-                    if c == quote {
-                        if matches!(chars.peek(), Some((_, q)) if *q == quote) {
-                            out.push(quote);
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                    if c == '\\' {
-                        if let Some((_, esc)) = chars.next() {
-                            out.push(esc);
-                        }
-                    }
+                while chars.peek().is_some_and(|(index, _)| *index < end) {
+                    chars.next();
                 }
             }
             '(' => {

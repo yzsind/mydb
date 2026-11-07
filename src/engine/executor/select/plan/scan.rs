@@ -3073,7 +3073,11 @@ pub(super) fn filtered_index_min_max_value(
     )?;
     Ok(rows
         .first()
-        .and_then(|row| row.fields.get(col_idx))
+        .and_then(|row| {
+            row.fields
+                .iter()
+                .find(|field| field.column.eq_ignore_ascii_case(col))
+        })
         .map(|field| field.value.clone())
         .unwrap_or(Value::Null))
 }

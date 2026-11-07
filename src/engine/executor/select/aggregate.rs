@@ -1512,16 +1512,41 @@ pub(crate) fn finalize_avg_value(state: &NumericAggState, n: u64) -> Value {
     if let NumericAggState::Exact(acc) = state {
         if let Some(total) = acc.exact_value() {
             let incr = crate::engine::expr::session_div_precision_increment();
-            let target_scale = (acc.scale as u32 + incr as u32)
+            let mut target_scale = (acc.scale as u32 + incr as u32)
                 .min(crate::util::decimal::MAX_DECIMAL_SCALE as u32)
                 as u8;
+            let mut rounding = crate::util::decimal::DecimalRoundingMode::HalfAwayFromZero;
+            if let crate::util::decimal::ExactDecimal::Big(magnitude, scale) = &total {
+                // A cheap upper bound avoids extra division/string work for
+                // wide inputs whose integer and guard digits already fit.
+                let integer_bound = (magnitude.bits().saturating_mul(30_103) / 100_000 + 1)
+                    .saturating_sub(u64::from(*scale));
+                let words = u64::from(crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION) / 9;
+                if integer_bound.div_ceil(9) + (u64::from(target_scale) + 1).div_ceil(9) > words {
+                    use num_traits::Signed;
+                    // Reserve complete integer words before fractional words.
+                    // With no guard word left, MySQL truncates at the boundary.
+                    let divisor = num_bigint::BigInt::from(n)
+                        * num_bigint::BigInt::from(10u8).pow(u32::from(*scale));
+                    let integer_digits = (magnitude.abs() / divisor).to_str_radix(10).len();
+                    let fractional_capacity =
+                        (words as usize).saturating_sub(integer_digits.div_ceil(9)) * 9;
+                    if usize::from(target_scale) >= fractional_capacity {
+                        target_scale = fractional_capacity as u8;
+                        rounding = crate::util::decimal::DecimalRoundingMode::Truncate;
+                    }
+                }
+            }
             let divisor = crate::util::decimal::ExactDecimal::from_big(n.into(), 0);
             let context = crate::util::decimal::DecimalContext {
-                result: Some(crate::util::decimal::DecimalResultSpec::new(
-                    65,
-                    target_scale,
-                )),
+                // AVG can retain 65 integer digits plus its extra fractional
+                // scale. Do not apply a persisted-column precision cap here.
+                result: Some(crate::util::decimal::DecimalResultSpec {
+                    precision: crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
+                    scale: target_scale,
+                }),
                 div_precision_increment: incr,
+                rounding,
                 ..Default::default()
             };
             if let Ok(Some(result)) = crate::util::decimal::exact_binary(

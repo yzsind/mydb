@@ -518,12 +518,16 @@ pub fn apply_persisted_on_startup(db: &Database) {
     for entry in entries {
         let raw = SysVarValue::String(entry.value.clone());
         if let Err(err) = registry().write(&entry.name, SetScope::Global, &mut sys, Some(db), raw) {
-            eprintln!(
-                "mydb: failed to apply persisted variable '{name}' = {val:?}: {err}",
-                name = entry.name,
-                val = entry.value,
-                err = err.message(),
+            // Values and coercion diagnostics may contain credentials. Keep
+            // startup failures observable without copying them into logs.
+            let message = format!(
+                "failed to apply persisted variable '{}': error {} ({})",
+                entry.name,
+                err.code(),
+                err.sql_state(),
             );
+            crate::engine::logging::record_error_log_line("ERROR", "Sysvar", &message);
+            crate::util::logging::log_message(message);
         } else {
             registry().startup_provenance(
                 &entry.name,

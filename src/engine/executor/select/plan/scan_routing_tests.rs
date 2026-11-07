@@ -3,6 +3,42 @@ use crate::engine::executor::partition_router;
 use crate::storage::{IsolationLevel, PartitionPruningPlan};
 
 #[test]
+fn final_1107_filtered_min_max_uses_visible_column_layout() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+        dir.path(),
+        crate::engine::executor::tests::memory_test_storage_config(),
+    )
+    .unwrap();
+    for sql in [
+        "CREATE TABLE t(id INT PRIMARY KEY,gone INT,v INT,keep INT,KEY vi(v))",
+        "INSERT INTO t VALUES(1,999,10,1),(2,999,30,1)",
+        "ALTER TABLE t DROP COLUMN gone,ALGORITHM=INSTANT",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let db = engine.db_for_tests();
+    let table = table(db, "t");
+    let index = table
+        .schema
+        .indexes
+        .iter()
+        .find(|i| i.name == "vi")
+        .unwrap();
+    let txn = TxnView::read_only(db.visible_scn(), IsolationLevel::ReadCommitted);
+    let filter = crate::parser::parse_expr_fragment("keep>0").unwrap();
+    for (reverse, expected) in [(false, 10), (true, 30)] {
+        assert_eq!(
+            scan::filtered_index_min_max_value(
+                db, txn, &table, index, None, None, &filter, "v", reverse
+            )
+            .unwrap(),
+            Value::Int(expected)
+        );
+    }
+}
+
+#[test]
 fn native_hash_join_construction_keeps_build_open_for_parent_filters() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();

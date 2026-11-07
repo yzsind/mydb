@@ -123,6 +123,108 @@ use super::stream::{BatchOperator, BatchProperties};
 pub const NUM_PARTITIONS: usize = 64;
 const PARTITION_MASK: u64 = (NUM_PARTITIONS as u64) - 1;
 
+// A compact prefix may already have spilled. Keep its radix domain when a
+// later batch requires canonical keys, so equal groups still meet on replay.
+enum CompactPartitionHash {
+    Fixed(usize),
+    Zero,
+    Dictionary(Vec<DictionaryHashKind>),
+}
+
+enum DictionaryHashKind {
+    Text,
+    Signed,
+    Unsigned,
+    Date,
+    Bool,
+}
+
+impl CompactPartitionHash {
+    fn hash(&self, key: &[u8]) -> u64 {
+        self.try_hash(key)
+            .unwrap_or_else(|| super::key_encode::fxhash(key))
+    }
+
+    fn try_hash(&self, key: &[u8]) -> Option<u64> {
+        let mut pos = 0;
+        let mut component = || {
+            let start = pos;
+            let tag = *key.get(pos)?;
+            pos += 1;
+            match tag {
+                0 => {}
+                1 => pos += 16,
+                3 => {
+                    let len = u32::from_le_bytes(key.get(pos..pos + 4)?.try_into().ok()?) as usize;
+                    pos += 4 + len;
+                }
+                _ => return None,
+            }
+            Some((tag, key.get(start..pos)?))
+        };
+        match self {
+            Self::Zero => Some(0),
+            Self::Fixed(count) => {
+                let mut values = smallvec::SmallVec::<[i64; 8]>::new();
+                let mut nulls = 0;
+                for index in 0..*count {
+                    let (tag, bytes) = component()?;
+                    values.push(if tag == 0 {
+                        nulls |= 1 << index;
+                        0
+                    } else if tag == 1 {
+                        i64::try_from(i128::from_le_bytes(bytes[1..].try_into().ok()?)).ok()?
+                    } else {
+                        return None;
+                    });
+                }
+                Some(FixedWidthStateArena::hash_key(&values, nulls))
+            }
+            Self::Dictionary(kinds) => {
+                let mut hash = 0;
+                let mut first = 0;
+                for (index, kind) in kinds.iter().enumerate() {
+                    let (tag, bytes) = component()?;
+                    let part = if tag == 0 {
+                        0x9e37_79b9_7f4a_7c15
+                    } else {
+                        match kind {
+                            DictionaryHashKind::Text if tag == 3 => {
+                                super::key_encode::fxhash(bytes)
+                            }
+                            _ if tag == 1 => {
+                                let value = i128::from_le_bytes(bytes[1..].try_into().ok()?);
+                                let raw = match kind {
+                                    DictionaryHashKind::Signed => {
+                                        i64::try_from(value).ok()? as u64 as u128
+                                    }
+                                    DictionaryHashKind::Unsigned => {
+                                        u64::try_from(value).ok()? as u128
+                                    }
+                                    DictionaryHashKind::Date => {
+                                        i32::try_from(value).ok()? as u32 as u128
+                                    }
+                                    DictionaryHashKind::Bool if value == 0 || value == 1 => {
+                                        value as u128
+                                    }
+                                    _ => return None,
+                                };
+                                fx_mix_u128(raw)
+                            }
+                            _ => return None,
+                        }
+                    };
+                    if index == 0 {
+                        first = part;
+                    }
+                    hash = fx_mix_u128(u128::from(hash) ^ (u128::from(part) << 64) ^ index as u128);
+                }
+                Some(if kinds.len() == 1 { first } else { hash })
+            }
+        }
+    }
+}
+
 /// Cheap sufficient (not necessary) equality check for two rows in the same
 /// typed column.  This is used only to reuse the already-resolved bucket for
 /// adjacent equal GROUP BY keys.  Returning `false` merely falls back to the
@@ -1263,6 +1365,40 @@ fn dictionary_primitive_sample_distinct(source: &DictionaryColumnSource, batch: 
 }
 
 impl DictionaryGroupEncoder {
+    fn accepts_batch_lanes(&self, batch: &Batch) -> bool {
+        self.columns.iter().all(|key| match &key.source {
+            DictionaryColumnSource::Utf8 { column, .. } => {
+                matches!(batch.columns()[*column], ColumnVector::Utf8 { .. })
+            }
+            DictionaryColumnSource::I64 { column, .. } => {
+                matches!(batch.columns()[*column], ColumnVector::I64 { .. })
+            }
+            DictionaryColumnSource::U64 { column, .. } => {
+                matches!(batch.columns()[*column], ColumnVector::U64 { .. })
+            }
+            DictionaryColumnSource::Date32 { column, .. } => {
+                matches!(batch.columns()[*column], ColumnVector::Date32 { .. })
+            }
+            DictionaryColumnSource::Bool { column } => {
+                matches!(batch.columns()[*column], ColumnVector::Bool { .. })
+            }
+        })
+    }
+
+    fn count_partition_hash(&self) -> CompactPartitionHash {
+        CompactPartitionHash::Dictionary(
+            self.columns
+                .iter()
+                .map(|key| match key.source {
+                    DictionaryColumnSource::Utf8 { .. } => DictionaryHashKind::Text,
+                    DictionaryColumnSource::I64 { .. } => DictionaryHashKind::Signed,
+                    DictionaryColumnSource::U64 { .. } => DictionaryHashKind::Unsigned,
+                    DictionaryColumnSource::Date32 { .. } => DictionaryHashKind::Date,
+                    DictionaryColumnSource::Bool { .. } => DictionaryHashKind::Bool,
+                })
+                .collect(),
+        )
+    }
     #[inline]
     fn try_build(group_columns: &[usize], batch: &Batch) -> Option<Self> {
         Self::try_build_impl(group_columns, batch, false)
@@ -5270,6 +5406,7 @@ pub struct HashAggregateCore {
 
     // ---- Spill-related state ----
     input_schema: Option<Arc<BatchSchema>>,
+    compact_partition_hash: Option<CompactPartitionHash>,
     spill_schema: Option<Arc<BatchSchema>>,
     mem_budget: Option<Arc<MemBudget>>,
     /// PGA-style work-area handle. Drives the spill decision in
@@ -6006,6 +6143,7 @@ impl HashAggregateCore {
             group_key_program: None,
             partitions,
             input_schema: None,
+            compact_partition_hash: None,
             spill_schema: None,
             mem_budget: None,
             // `new` cannot spill safely because it has no query owner/root.
@@ -6381,7 +6519,41 @@ impl HashAggregateCore {
                                 && arena.decimal_state_columns[0].is_some();
                     }
                 }
+                if let Some(arena) = self.fixed_width.as_ref() {
+                    self.compact_partition_hash = Some(if arena.defer_i64_decimal_dedup {
+                        CompactPartitionHash::Zero
+                    } else {
+                        CompactPartitionHash::Fixed(arena.key_kinds.len())
+                    });
+                }
             }
+        }
+        if self.fixed_width.as_ref().is_some_and(|arena| {
+            self.group_columns
+                .iter()
+                .zip(&arena.key_kinds)
+                .any(|(&column, &kind)| {
+                    !matches!(batch.columns()[column], ColumnVector::Null { .. })
+                        && CompactKeyKind::from_column(&batch.columns()[column]) != Some(kind)
+                })
+        }) {
+            // Preserve the completed prefix before changing layouts. Check
+            // once per batch so no row can be applied twice during fallback.
+            if let Some(arena) = self.fixed_width.as_mut() {
+                arena.materialize_compressed_i64_decimal_runs();
+                if matches!(
+                    self.compact_partition_hash,
+                    Some(CompactPartitionHash::Zero)
+                ) {
+                    arena.hashes.fill(0);
+                    for groups in &mut arena.partition_groups {
+                        groups.clear();
+                    }
+                    arena.partition_groups[0].extend(0..arena.hashes.len() as u32);
+                }
+            }
+            self.do_spill_fixed_width()?;
+            self.fixed_width = None;
         }
         if let Some(fixed_width) = self.fixed_width.as_mut() {
             fixed_width.consume_batch(&self.group_columns, &self.aggs, batch)?;
@@ -6389,6 +6561,15 @@ impl HashAggregateCore {
         }
 
         let visible_rows = batch.visible_rows();
+        if self.dictionary_count.is_some()
+            && self
+                .dictionary_encoder
+                .as_ref()
+                .is_some_and(|encoder| !encoder.accepts_batch_lanes(batch))
+        {
+            self.do_spill_dictionary_count()?;
+            self.dictionary_probed = true;
+        }
         if self
             .dictionary_count
             .as_ref()
@@ -6489,6 +6670,8 @@ impl HashAggregateCore {
                         partition.float_sum = Some(Vec::with_capacity(partition.keys.capacity()));
                     }
                 }
+                self.compact_partition_hash =
+                    (!numeric_sum).then(|| encoder.count_partition_hash());
                 self.dictionary_count = Some(arena);
             }
         }
@@ -6560,6 +6743,14 @@ impl HashAggregateCore {
         batch: &Batch,
         scalar_mode: bool,
     ) -> Result<(), QueryError> {
+        if self.compact_partition_hash.is_some() {
+            self.dense_i64_probed = true;
+            self.dense_i64_lookup = None;
+            self.packed64_probed = true;
+            self.packed64_encoder = None;
+            self.dictionary_probed = true;
+            self.dictionary_encoder = None;
+        }
         let visible_rows = batch.visible_rows();
         // Two-phase GROUP BY: first map every visible row to its
         // (partition, bucket); then group rows by destination bucket and
@@ -6725,7 +6916,10 @@ impl HashAggregateCore {
                     .as_ref()
                     .expect("input schema compiles the canonical group-key program")
                     .encode_row(batch, r, &mut self.row_key_buf);
-                let h = super::key_encode::fxhash(&self.row_key_buf);
+                let h = self.compact_partition_hash.as_ref().map_or_else(
+                    || super::key_encode::fxhash(&self.row_key_buf),
+                    |domain| domain.hash(&self.row_key_buf),
+                );
                 // Implicit single group (empty GROUP BY reached with a
                 // selection mask) must land in partition 0, matching the
                 // selection-free fast path and the consume_row paths —

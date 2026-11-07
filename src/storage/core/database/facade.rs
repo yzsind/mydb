@@ -595,9 +595,9 @@ impl Database {
         undo.set_mem_cache_limit_bytes(runtime_config.undo_mem_cache_limit_bytes);
         undo.set_txn_max_bytes(runtime_config.undo_txn_max_bytes);
         undo.set_retention_guarantee(runtime_config.undo_retention_guarantee);
-        // Pin the WAL flush method before the first sync. Strict mode on
-        // macOS resolves to F_FULLFSYNC (true power-loss durability);
-        // MYDB_WAL_SYNC_METHOD / the mydb_wal_sync_method sysvar override.
+        // Pin the WAL flush method before the first sync. macOS defaults to
+        // fsync; true power-loss durability requires explicit fullfsync via
+        // MYDB_WAL_SYNC_METHOD / the mydb_wal_sync_method sysvar.
         crate::wal::configure_wal_sync_method(config.durability == DurabilityMode::Strict);
         let (log, log_state_atomics) = {
             let mut log = LogManager::open_from_replay(&data_dir, &scan)?;

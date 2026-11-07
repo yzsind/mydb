@@ -357,7 +357,15 @@ pub(super) fn rollback_session_txn(
     db: &Arc<Database>,
     session: &mut SessionContext,
 ) -> Result<(), QueryError> {
-    if let Some(txn_id) = session.current_txn {
+    // XA END detaches the branch. A session can then own both an idle XA
+    // transaction and a separate current transaction; roll back both before
+    // releasing the XA reservation or clearing its session binding.
+    let detached_xa = session
+        .xa_branch
+        .as_ref()
+        .map(|branch| branch.txn_id)
+        .filter(|txn_id| Some(*txn_id) != session.current_txn);
+    for txn_id in [session.current_txn, detached_xa].into_iter().flatten() {
         if db.is_txn_active(txn_id) {
             match db.rollback_txn(txn_id) {
                 Ok(()) => {}
@@ -368,6 +376,9 @@ pub(super) fn rollback_session_txn(
     }
     session.rls.finish_transaction();
     rollback_temp_journal_to(db, session, 0)?;
+    if let Some(branch) = session.xa_branch.take() {
+        db.release_xa(&branch.xid, branch.txn_id);
+    }
     if session.created_temp_table_not_rollbackable {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
@@ -1159,7 +1170,7 @@ pub(super) fn xa_start(
 }
 
 pub(super) fn xa_end(
-    _db: &Arc<Database>,
+    db: &Arc<Database>,
     session: &mut SessionContext,
     xid: Xid,
 ) -> Result<(), QueryError> {
@@ -1175,7 +1186,10 @@ pub(super) fn xa_end(
             "XAER_NOTA: XID does not match the session's active XA branch",
         ));
     }
-    if branch.state != XaBranchState::Active {
+    if branch.state != XaBranchState::Active
+        || session.current_txn != Some(branch.txn_id)
+        || !db.is_txn_active(branch.txn_id)
+    {
         return Err(xa_err(
             crate::error::catalog::ER_XAER_RMFAIL,
             "XAER_RMFAIL: XA branch is not in the ACTIVE state",

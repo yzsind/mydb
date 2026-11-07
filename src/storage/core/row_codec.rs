@@ -4162,23 +4162,7 @@ fn put_fixed_through_sink<S: RowDecodeSink>(
         OP_YEAR => sink.put_year(dest, bytes[0]),
         OP_TIME => sink.put_time(dest, read_signed_le_width(bytes)? * temporal_quantum(scale)),
         OP_DATETIME => sink.put_datetime(dest, decode_datetime_micros(bytes, scale)?),
-        OP_TIMESTAMP => {
-            let width = bytes.len();
-            let mut buf = [0u8; 8];
-            buf[..width].copy_from_slice(bytes);
-            if bytes[width - 1] & 0x80 != 0 {
-                for byte in &mut buf[width..] {
-                    *byte = 0xff;
-                }
-            }
-            let stored = i64::from_le_bytes(buf);
-            let micros = if stored == signed_min_for_width(width) {
-                ZERO_DATETIME_SENTINEL
-            } else {
-                stored * temporal_quantum(scale)
-            };
-            sink.put_timestamp(dest, micros);
-        }
+        OP_TIMESTAMP => sink.put_timestamp(dest, decode_datetime_micros(bytes, scale)?),
         OP_FIXED_BYTES => sink.put_bytes(dest, bytes),
         OP_VECTOR_FIXED => sink.put_vector(dest, bytes),
         _ => sink.put_null(dest),
@@ -4861,16 +4845,7 @@ fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, Query
             read_signed_le_width(input)? * temporal_quantum(*fsp),
         )),
         ColumnKind::DateTime { fsp } => Ok(Value::DateTime(decode_datetime_micros(input, *fsp)?)),
-        ColumnKind::Timestamp { fsp } => {
-            let stored = read_signed_le_width(input)?;
-            Ok(Value::Timestamp(
-                if stored == signed_min_for_width(input.len()) {
-                    ZERO_DATETIME_SENTINEL
-                } else {
-                    stored * temporal_quantum(*fsp)
-                },
-            ))
-        }
+        ColumnKind::Timestamp { fsp } => Ok(Value::Timestamp(decode_datetime_micros(input, *fsp)?)),
         ColumnKind::Year => Ok(Value::Year(input[0])),
         ColumnKind::FixedBytes { .. } => Ok(Value::Bytes(input.to_vec())),
         ColumnKind::Bit { .. } => {
@@ -6899,6 +6874,17 @@ pub(crate) fn test_default_codec() -> std::sync::Arc<RowCodec> {
 #[cfg(test)]
 mod row_codec_tests {
     use super::*;
+
+    #[test]
+    fn final_1107_tagged_timestamp_fixed_codec_roundtrip() {
+        for fsp in 0..=6 {
+            let kind=ColumnKind::Timestamp {fsp};
+            let value=Value::Timestamp(crate::types::encode_tagged_datetime(2024,0,0,0,0,0,0).unwrap());
+            let mut bytes=vec![0;fixed_width_for_kind(&kind).unwrap()];
+            encode_fixed_for_kind(&kind,&value,&mut bytes).unwrap();
+            assert_eq!(decode_fixed_for_kind(&kind,&bytes).unwrap(),value,"fsp={fsp}");
+        }
+    }
 
     fn round_trip(values: Vec<Value>) {
         let mut buf = Vec::new();

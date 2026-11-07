@@ -6388,14 +6388,13 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
                 warn_load_empty_number();
                 return checked_signed_load_value(0, *min, *max, column);
             }
-            if let Some(dot) = trimmed.find('.') {
-                if let Ok(f) = trimmed.parse::<f64>() {
-                    let _ = dot;
-                    if f.fract() != 0.0 {
-                        warn_load_decimal_scale();
-                    }
-                    return checked_signed_load_value(f as i64, *min, *max, column);
-                }
+            if trimmed.contains(['.', 'e', 'E']) {
+                let rounded = crate::util::decimal::rescale_decimal_big_str(trimmed, 0)
+                    .ok_or_else(|| load_out_of_range(column))?;
+                let value = rounded
+                    .parse::<i64>()
+                    .map_err(|_| load_out_of_range(column))?;
+                return checked_signed_load_value(value, *min, *max, column);
             }
             let value = trimmed.parse::<i64>().map_err(|_| {
                 error(
@@ -6414,6 +6413,14 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
             if trimmed.is_empty() {
                 warn_load_empty_number();
                 return checked_unsigned_load_value(0, *max, column);
+            }
+            if trimmed.contains(['.', 'e', 'E']) {
+                let rounded = crate::util::decimal::rescale_decimal_big_str(trimmed, 0)
+                    .ok_or_else(|| load_out_of_range(column))?;
+                let value = rounded
+                    .parse::<u64>()
+                    .map_err(|_| load_out_of_range(column))?;
+                return checked_unsigned_load_value(value, *max, column);
             }
             let value = trimmed.parse::<u64>().map_err(|_| {
                 error(

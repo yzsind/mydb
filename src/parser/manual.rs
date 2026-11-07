@@ -1584,13 +1584,20 @@ impl<'a> LoadDataParser<'a> {
         if self.peek_byte() == Some(b'`') {
             self.pos += 1;
             let start = self.pos;
-            while self.pos < self.bytes.len() && self.bytes[self.pos] != b'`' {
+            while self.pos < self.bytes.len() {
+                if self.bytes[self.pos] == b'`' {
+                    if self.bytes.get(self.pos + 1) == Some(&b'`') {
+                        self.pos += 2;
+                        continue;
+                    }
+                    break;
+                }
                 self.pos += 1;
             }
             if self.pos >= self.bytes.len() {
                 return Err("unterminated backtick identifier".to_string());
             }
-            let name = self.sql[start..self.pos].to_string();
+            let name = self.sql[start..self.pos].replace("``", "`");
             self.pos += 1;
             Ok(name)
         } else {

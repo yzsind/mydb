@@ -192,9 +192,9 @@ impl Iterator for SqlSegments<'_> {
                 }
                 self.pos += 1;
                 if quote == b'`' || (quote == b'"' && self.mode.ansi_quotes) {
-                    if let Some(offset) = memchr::memchr(0, &self.bytes[start..self.pos]) {
+                    if memchr::memchr(0, &self.bytes[start..self.pos]).is_some() {
                         return Some(Err(SqlLexError {
-                            offset: start + offset,
+                            offset: start,
                             message: "NUL is not allowed in an SQL identifier",
                         }));
                     }

@@ -918,7 +918,11 @@ pub(crate) fn register(reg: &mut Registry) {
             None => SysVarValue::String("en_US".to_string()),
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            ctx.session.sysvars.lc_messages = v.to_display_string();
+            if !v.to_display_string().eq_ignore_ascii_case("en_US") {
+                return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("mydb currently supports only lc_messages='en_US'"));
+            }
+            ctx.session.sysvars.lc_messages = "en_US".to_string();
             Ok(())
         },
     ));
@@ -1291,27 +1295,7 @@ fn register_settable_uint(
     _max: i64,
     doc: &'static str,
 ) {
-    // Standalone (no backing storage) variable that round-trips. Used for
-    // MySQL-compat knobs mydb honours conceptually but doesn't gate on.
-    // The default is whatever MySQL exposes; we return 0 if unset because
-    // these are advisory tuning knobs.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    static CELLS: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<&'static str, &'static AtomicU64>>,
-    > = OnceLock::new();
-    let cells = CELLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let cell: &'static AtomicU64 = {
-        let mut g = cells.lock().expect("cells lock");
-        if let Some(c) = g.get(name) {
-            c
-        } else {
-            let leaked: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-            g.insert(name, leaked);
-            leaked
-        }
-    };
-    reg.register(SysVar::settable(
+    reg.register(SysVar::session_backed(
         SysVarDef::new(
             name,
             scope,
@@ -1321,9 +1305,18 @@ fn register_settable_uint(
             },
         )
         .with_doc(doc),
-        move |_ctx| SysVarValue::UInt(cell.load(Ordering::Relaxed)),
-        move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            cell.store(v.as_u64().unwrap_or(0), Ordering::Relaxed);
+        move |ctx| {
+            SysVarValue::UInt(
+                ctx.session
+                    .and_then(|s| s.sysvars.advisory_uints.get(name).copied())
+                    .unwrap_or(0),
+            )
+        },
+        move |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
+            ctx.session
+                .sysvars
+                .advisory_uints
+                .insert(name, v.as_u64().unwrap_or(0));
             Ok(())
         },
     ));

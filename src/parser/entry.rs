@@ -404,8 +404,8 @@ pub(crate) fn split_query_statements(
             // already valid prefix (which may contain executable comments).
             let prefix =
                 crate::sql_lex::PreparedSql::new(&sql[..err.offset], mode, MYSQL_VERSION_ID)
-                    .expect("lexically valid prefix")
-                    .into_effective();
+                    .map(|prefix| prefix.into_effective())
+                    .unwrap_or_else(|_| std::borrow::Cow::Borrowed(&sql[..err.offset]));
             std::borrow::Cow::Owned(format!("{}{}", prefix, &sql[err.offset..]))
         });
     let base = effective.as_ptr() as usize;

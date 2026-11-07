@@ -2717,6 +2717,16 @@ fn rounded_integer_assignment_text(
 
 fn integer_assignment_text(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
     match value {
+        Value::Json(json) => {
+            let scalar = crate::engine::json::JsonbRef::new(json).ok()?;
+            if let Some(text) = scalar.as_str() {
+                Some(std::borrow::Cow::Owned(text.to_string()))
+            } else if scalar.as_u64().is_some() || scalar.as_i64().is_some() || scalar.as_f64().is_some() {
+                Some(std::borrow::Cow::Owned(crate::engine::json::to_text(json)))
+            } else {
+                None
+            }
+        }
         Value::String(text) | Value::Decimal(text) => {
             Some(std::borrow::Cow::Borrowed(text.as_str()))
         }
@@ -4789,8 +4799,28 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
             ));
         }
     }
-    if column.default.as_ref().is_some_and(|expr| crate::parser::visit::any_expr(expr, |node| matches!(node, crate::parser::Expr::Function {name,..} if crate::engine::http::is_function(name) || (name != crate::parser::DEFAULT_EXPR_SENTINEL && !crate::engine::cbo::function_cost::is_known_builtin_function(name))))) {
+    if column.default.as_ref().is_some_and(|expr| crate::parser::visit::any_expr(expr, |node| matches!(node, crate::parser::Expr::Function {name,..} if crate::engine::http::is_function(name)))) {
         return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP calls are forbidden in column defaults"));
+    }
+    if let Some(expr) = &column.default {
+        let mut disallowed = None;
+        crate::parser::visit::any_expr(expr, |node| {
+            if let crate::parser::Expr::Function { name, .. } = node {
+                if name != crate::parser::DEFAULT_EXPR_SENTINEL
+                    && !crate::engine::cbo::function_cost::is_known_builtin_function(name)
+                {
+                    disallowed = Some(name.clone());
+                    return true;
+                }
+            }
+            false
+        });
+        if let Some(name) = disallowed {
+            return Err(error(
+                crate::error::catalog::ER_DEFAULT_VAL_GENERATED_NAMED_FUNCTION_IS_NOT_ALLOWED,
+                format!("Default value expression of column '{}' contains a disallowed function: {name}.", column.name),
+            ));
+        }
     }
     if let Some(crate::parser::Expr::Function { name, args, .. }) = column.default.as_ref() {
         if name == crate::parser::DEFAULT_EXPR_SENTINEL
