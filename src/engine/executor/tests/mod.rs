@@ -14,6 +14,7 @@ mod release_audit_1022;
 mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;
+mod routine_handler_continuation;
 mod sql_execution_audit_1015;
 mod sql_execution_audit_1027;
 mod sql_execution_fixes;

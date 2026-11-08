@@ -753,6 +753,7 @@ fn validate_routine_structure(
     let mut declaration_phase = 0u8;
     let mut variables = BTreeSet::new();
     let mut conditions = inherited_conditions.clone();
+    let mut local_conditions = BTreeSet::new();
     let mut cursors = BTreeSet::new();
     let mut handler_conditions = BTreeSet::new();
     for stmt in statements {
@@ -782,7 +783,7 @@ fn validate_routine_structure(
             }
             RoutineStmt::DeclareCondition { name, condition } => {
                 let key = normalize_local(name);
-                if conditions.contains_key(&key) {
+                if !local_conditions.insert(key.clone()) {
                     return Err(error(
                         crate::error::catalog::ER_SP_DUP_COND,
                         format!("Duplicate condition: {name}"),
@@ -1753,6 +1754,11 @@ struct RoutineFrame {
     /// block exits so its handler can run.
     active_handler_scopes: usize,
     outer_handlers: Vec<Vec<HandlerDecl>>,
+    lexical_scopes: Vec<RoutineLexicalScope>,
+    /// A condition escaping a handler cannot re-enter that handler's scope
+    /// while the interpreter unwinds through the suspended inner blocks.
+    handler_scope_limit: Option<usize>,
+    handled_warning_ranges: Vec<std::ops::Range<usize>>,
     /// Rows affected by the most recent body statement, for
     /// `GET DIAGNOSTICS ... = ROW_COUNT`.
     diag_row_count: i64,
@@ -1853,6 +1859,87 @@ struct HandlerDecl {
     action: RoutineHandlerAction,
     conditions: Vec<RoutineCondition>,
     statement: RoutineStmt,
+    lexical_depth: usize,
+}
+
+#[derive(Debug)]
+struct RoutineLexicalScope {
+    locals: Vec<(String, Option<Value>, Option<(DataTypeKind, bool)>)>,
+    conditions: Vec<(String, Option<RoutineCondition>)>,
+    cursors: Vec<(String, Option<CursorState>)>,
+}
+
+impl RoutineLexicalScope {
+    fn restore(self, frame: &mut RoutineFrame) {
+        fn entry<T>(map: &mut HashMap<String, T>, key: String, saved: Option<T>) {
+            if let Some(value) = saved {
+                map.insert(key, value);
+            } else {
+                map.remove(&key);
+            }
+        }
+        for (key, value, kind) in self.locals {
+            entry(&mut frame.locals, key.clone(), value);
+            entry(&mut frame.local_types, key, kind);
+        }
+        for (key, value) in self.conditions {
+            entry(&mut frame.conditions, key, value);
+        }
+        for (key, value) in self.cursors {
+            entry(&mut frame.cursors, key, value);
+        }
+    }
+
+    /// Swapping suspends a child scope without destroying its cursor or local
+    /// state. Swapping back also retains changes made to shadowed outer locals.
+    fn swap(&mut self, frame: &mut RoutineFrame) {
+        fn entry<T>(map: &mut HashMap<String, T>, key: &str, saved: &mut Option<T>) {
+            let current = map.remove(key);
+            if let Some(value) = saved.take() {
+                map.insert(key.to_string(), value);
+            }
+            *saved = current;
+        }
+        for (key, value, kind) in &mut self.locals {
+            entry(&mut frame.locals, key, value);
+            entry(&mut frame.local_types, key, kind);
+        }
+        for (key, value) in &mut self.conditions {
+            entry(&mut frame.conditions, key, value);
+        }
+        for (key, value) in &mut self.cursors {
+            entry(&mut frame.cursors, key, value);
+        }
+    }
+}
+
+impl RoutineFrame {
+    fn mark_handled_warnings(&mut self, mut start: usize, mut end: usize) {
+        if start >= end {
+            return;
+        }
+        // Nested compound statements may cover a previously handled range.
+        // Merge intervals so loops with handled warnings retain bounded state.
+        while self
+            .handled_warning_ranges
+            .last()
+            .is_some_and(|range| range.end >= start)
+        {
+            let range = self.handled_warning_ranges.pop().unwrap();
+            start = start.min(range.start);
+            end = end.max(range.end);
+        }
+        self.handled_warning_ranges.push(start..end);
+    }
+
+    fn warning_was_handled(&self, index: usize) -> bool {
+        let next = self
+            .handled_warning_ranges
+            .partition_point(|range| range.end <= index);
+        self.handled_warning_ranges
+            .get(next)
+            .is_some_and(|range| range.start <= index)
+    }
 }
 
 #[derive(Debug)]
@@ -2197,6 +2284,9 @@ fn execute_routine_inner(
         block_depth: 0,
         active_handler_scopes: 0,
         outer_handlers: Vec::new(),
+        lexical_scopes: Vec::new(),
+        handler_scope_limit: None,
+        handled_warning_ranges: Vec::new(),
         diag_row_count: 0,
         diag_conditions: Vec::new(),
         allow_result_sets: capabilities.allow_result_sets && !is_function,
@@ -2459,6 +2549,9 @@ fn execute_trigger_body_inner(
         block_depth: 0,
         active_handler_scopes: 0,
         outer_handlers: Vec::new(),
+        lexical_scopes: Vec::new(),
+        handler_scope_limit: None,
+        handled_warning_ranges: Vec::new(),
         diag_row_count: 0,
         diag_conditions: Vec::new(),
         allow_result_sets: false,
@@ -2809,8 +2902,21 @@ fn exec_block_inner(
             } => {
                 handlers.push(HandlerDecl {
                     action: *action,
-                    conditions: conditions.clone(),
+                    // Capture named conditions in the declaration scope; an
+                    // inner block may later declare the same condition name.
+                    conditions: conditions
+                        .iter()
+                        .map(|condition| match condition {
+                            RoutineCondition::Named(name) => frame
+                                .conditions
+                                .get(&normalize_local(name))
+                                .unwrap_or(condition)
+                                .clone(),
+                            other => other.clone(),
+                        })
+                        .collect(),
                     statement: (**statement).clone(),
+                    lexical_depth: frame.lexical_scopes.len(),
                 });
                 Ok(RoutineControl::None)
             }
@@ -2832,8 +2938,10 @@ fn exec_block_inner(
             let warnings = crate::engine::api::statement_warnings_snapshot();
             let new_warnings = warnings
                 .iter()
+                .enumerate()
                 .skip(warning_start.min(warnings.len()))
-                .cloned()
+                .filter(|(index, _)| !frame.warning_was_handled(*index))
+                .map(|(_, warning)| warning.clone())
                 .collect::<Vec<_>>();
             // Diagnostics retrieval and lexical declarations do not replace
             // the current area. A compound block retains its last statement's
@@ -2871,14 +2979,7 @@ fn exec_block_inner(
                     .with_condition_information(warning.condition_information());
                     let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
                     if find_matching_handler(frame, &handlers, &warning).is_some()
-                        || frame.outer_handlers.iter().any(|scope| {
-                            scope.iter().any(|handler| {
-                                handler
-                                    .conditions
-                                    .iter()
-                                    .any(|condition| condition_matches(frame, condition, &warning))
-                            })
-                        })
+                        || find_outer_handler(frame, &warning).is_some()
                     {
                         result = Err(warning);
                         break;
@@ -2902,50 +3003,21 @@ fn exec_block_inner(
                         &err.query_error(),
                     )];
                 }
-                if let Some(handler) = find_matching_handler(frame, &handlers, &err) {
-                    let previous_handler_error = frame.active_handler_error.replace(err.clone());
-                    // SHOW WARNINGS / SHOW ERRORS inside a handler reads the
-                    // current session diagnostics area. Nested routine
-                    // statements bypass the top-level begin/finish boundary,
-                    // so expose the handled condition explicitly for the
-                    // handler lifetime and restore the caller's area after it
-                    // completes. GET [STACKED] DIAGNOSTICS continues to use
-                    // `active_handler_error` as its lossless source.
-                    let previous_handler_diagnostics = std::mem::replace(
-                        &mut session.warnings,
-                        vec![crate::engine::api::SqlWarning::from_error(
-                            if matches!(err, RoutineExecError::Warning(_, _)) {
-                                crate::error::ConditionLevel::Warning
-                            } else {
-                                crate::error::ConditionLevel::Error
-                            },
-                            &err.query_error(),
-                        )]
-                        .into(),
+                if let Some(handler) = find_matching_handler(frame, &handlers, &err).filter(|_| {
+                    frame
+                        .handler_scope_limit
+                        .is_none_or(|limit| frame.outer_handlers.len() < limit)
+                }) {
+                    frame.mark_handled_warnings(
+                        warning_start,
+                        crate::engine::api::statement_warning_count(),
                     );
                     let handler_result =
-                        exec_stmt(db, session, frame, registry, &handler.statement);
-                    session.warnings = previous_handler_diagnostics;
-                    frame.active_handler_error = previous_handler_error;
-                    let handler_result = match handler_result {
-                        Err(warning @ RoutineExecError::Warning(_, _)) => {
-                            // RESIGNAL without a new SQLSTATE retains warning
-                            // severity. Let an outer handler catch it; otherwise
-                            // retain the diagnostic and finish this handler.
-                            if frame.outer_handlers.iter().any(|scope| {
-                                find_matching_handler(frame, scope, &warning).is_some()
-                            }) {
-                                return Err(warning);
-                            }
-                            crate::engine::api::push_statement_condition(
-                                crate::error::ConditionLevel::Warning,
-                                &warning.query_error(),
-                            );
-                            RoutineControl::None
-                        }
-                        other => other?,
-                    };
-                    crate::engine::perf_errors::record_handled(session, &err.query_error());
+                        exec_handler(db, session, frame, registry, &handler, &err)?;
+                    frame.mark_handled_warnings(
+                        warning_start,
+                        crate::engine::api::statement_warning_count(),
+                    );
                     match handler_result {
                         RoutineControl::None => match handler.action {
                             RoutineHandlerAction::Continue => continue,
@@ -2959,16 +3031,21 @@ fn exec_block_inner(
                         },
                         control => return Ok(control),
                     }
+                } else if let Some(result) =
+                    exec_outer_continue_handler(db, session, frame, registry, &err, warning_start)
+                {
+                    match result? {
+                        RoutineControl::None => continue,
+                        control => return Ok(control),
+                    }
                 } else if matches!(err, RoutineExecError::Warning(_, _))
-                    && !frame
-                        .outer_handlers
-                        .iter()
-                        .any(|scope| find_matching_handler(frame, scope, &err).is_some())
+                    && find_outer_handler(frame, &err).is_none()
                 {
                     crate::engine::api::push_statement_condition(
                         crate::error::ConditionLevel::Warning,
                         &err.query_error(),
                     );
+                    frame.handler_scope_limit = None;
                     continue;
                 } else if is_root {
                     match &err {
@@ -2986,6 +3063,7 @@ fn exec_block_inner(
                                     warning,
                                 );
                             }
+                            frame.handler_scope_limit = None;
                             continue;
                         }
                         _ => return Err(err),
@@ -2997,6 +3075,108 @@ fn exec_block_inner(
         }
     }
     Ok(RoutineControl::None)
+}
+
+/// Find the nearest eligible declaration scope before comparing specificity.
+fn find_outer_handler(
+    frame: &RoutineFrame,
+    err: &RoutineExecError,
+) -> Option<(usize, HandlerDecl)> {
+    let limit = frame
+        .handler_scope_limit
+        .unwrap_or(frame.outer_handlers.len());
+    frame
+        .outer_handlers
+        .iter()
+        .enumerate()
+        .take(limit)
+        .rev()
+        .find_map(|(index, scope)| {
+            find_matching_handler(frame, scope, err).map(|handler| (index, handler))
+        })
+}
+
+fn exec_handler(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    frame: &mut RoutineFrame,
+    registry: &SessionRegistry,
+    handler: &HandlerDecl,
+    err: &RoutineExecError,
+) -> Result<RoutineControl, RoutineExecError> {
+    let scope_index = frame.outer_handlers.len();
+    frame.handler_scope_limit = None;
+    let previous_error = frame.active_handler_error.replace(err.clone());
+    let previous_diagnostics = std::mem::replace(
+        &mut session.warnings,
+        vec![crate::engine::api::SqlWarning::from_error(
+            if matches!(err, RoutineExecError::Warning(_, _)) {
+                crate::error::ConditionLevel::Warning
+            } else {
+                crate::error::ConditionLevel::Error
+            },
+            &err.query_error(),
+        )]
+        .into(),
+    );
+    // A scalar handler statement needs the same condition dispatch as a
+    // compound handler, including CONTINUE after a handled RESIGNAL.
+    let result = exec_block(
+        db,
+        session,
+        frame,
+        registry,
+        std::slice::from_ref(&handler.statement),
+    );
+    session.warnings = previous_diagnostics;
+    frame.active_handler_error = previous_error;
+    if result.is_err() {
+        frame.handler_scope_limit = Some(
+            frame
+                .handler_scope_limit
+                .map_or(scope_index, |limit| limit.min(scope_index)),
+        );
+    } else {
+        frame.handler_scope_limit = None;
+        crate::engine::perf_errors::record_handled(session, &err.query_error());
+    }
+    result
+}
+
+/// Run an ancestor CONTINUE handler without unwinding the failing statement.
+/// EXIT handlers still unwind to their declaration block through the normal
+/// error path, preserving their existing boundary and label semantics.
+fn exec_outer_continue_handler(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    frame: &mut RoutineFrame,
+    registry: &SessionRegistry,
+    err: &RoutineExecError,
+    warning_start: usize,
+) -> Option<Result<RoutineControl, RoutineExecError>> {
+    let (index, handler) = find_outer_handler(frame, err)?;
+    if !matches!(handler.action, RoutineHandlerAction::Continue) {
+        return None;
+    }
+    frame.mark_handled_warnings(warning_start, crate::engine::api::statement_warning_count());
+    let mut scopes = frame.lexical_scopes.split_off(handler.lexical_depth);
+    for scope in scopes.iter_mut().rev() {
+        scope.swap(frame);
+    }
+    let suspended_handlers = frame.outer_handlers.split_off(index);
+    let active_scopes = frame.active_handler_scopes;
+    frame.active_handler_scopes = active_scopes.saturating_sub(suspended_handlers.len());
+    let result = exec_handler(db, session, frame, registry, &handler, err);
+    frame.active_handler_scopes = active_scopes;
+    frame.outer_handlers.extend(suspended_handlers);
+    for scope in &mut scopes {
+        scope.swap(frame);
+    }
+    frame.lexical_scopes.extend(scopes);
+    if result.is_ok() {
+        frame.mark_handled_warnings(warning_start, crate::engine::api::statement_warning_count());
+    }
+    Some(result)
 }
 
 /// Execute a BEGIN/END block with MySQL lexical declaration scope.
@@ -3069,47 +3249,18 @@ fn exec_scoped_block(
         .map(|key| (key.clone(), frame.cursors.remove(key)))
         .collect::<Vec<_>>();
 
+    frame.lexical_scopes.push(RoutineLexicalScope {
+        locals: saved_locals,
+        conditions: saved_conditions,
+        cursors: saved_cursors,
+    });
     let result = exec_block(db, session, frame, registry, statements);
+    frame
+        .lexical_scopes
+        .pop()
+        .expect("active lexical scope")
+        .restore(frame);
 
-    for (key, value, data_type) in saved_locals {
-        match value {
-            Some(value) => {
-                frame.locals.insert(key.clone(), value);
-            }
-            None => {
-                frame.locals.remove(&key);
-            }
-        }
-        match data_type {
-            Some(data_type) => {
-                frame.local_types.insert(key, data_type);
-            }
-            None => {
-                frame.local_types.remove(&key);
-            }
-        }
-    }
-    for (key, condition) in saved_conditions {
-        match condition {
-            Some(condition) => {
-                frame.conditions.insert(key, condition);
-            }
-            None => {
-                frame.conditions.remove(&key);
-            }
-        }
-    }
-    for (key, cursor) in saved_cursors {
-        frame.cursors.remove(&key);
-        match cursor {
-            Some(cursor) => {
-                frame.cursors.insert(key, cursor);
-            }
-            None => {
-                frame.cursors.remove(&key);
-            }
-        }
-    }
     result
 }
 
