@@ -3345,23 +3345,20 @@ fn coerce_value_with_unsigned(
             Ok(Value::Date(days))
         }
         DataTypeKind::Time { fsp } => {
+            let max = (838 * 3600 + 59 * 60 + 59) * 1_000_000i64;
             let micros = match value {
-                Value::Time(t) => t,
+                Value::Time(t) => {
+                    if t.unsigned_abs() > max as u64 {
+                        temporal_violation("incorrect time value: out of range".to_string())?;
+                    }
+                    t.clamp(-max, max)
+                }
                 other => {
                     let original = value_to_coercion_string(&other)?;
                     match coerce_to_time_string(other).and_then(|normalized| {
                         // Normalization has already parsed compact dates/day
-                        // prefixes. Check its duration before the codec clamps
-                        // it; do not reparse every TIME through chrono.
-                        let hours = normalized
-                            .trim_start_matches('-')
-                            .split(':')
-                            .next()
-                            .and_then(|hours| hours.parse::<u64>().ok())
-                            .unwrap_or(0);
-                        if hours > 838 {
-                            temporal_violation(format!("incorrect time value: '{original}'"))?;
-                        }
+                        // prefixes. Preserve the duration until the range check
+                        // below, before the codec clamps or quantizes it.
                         let parts = crate::util::temporal::parse_time_duration(&normalized).map_err(|_| {
                             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error("incorrect time value")
                         })?;
@@ -3370,7 +3367,20 @@ fn coerce_value_with_unsigned(
                             + i64::from(parts.second) * 1_000_000 + i64::from(parts.micros);
                         Ok(if parts.neg { -magnitude } else { magnitude })
                     }) {
-                        Ok(micros) => quantize_time_text_micros(micros, &original, *fsp),
+                        Ok(micros) => {
+                            // Validate before rounding/truncating to the column's
+                            // precision; quantization must not hide overflow.
+                            if micros.unsigned_abs() > max as u64
+                                || (micros.unsigned_abs() == max as u64
+                                    && quantize_time_text_micros(micros, &original, 6)
+                                        .unsigned_abs() > max as u64)
+                            {
+                                temporal_violation(format!("incorrect time value: '{original}'"))?;
+                                micros.clamp(-max, max)
+                            } else {
+                                quantize_time_text_micros(micros, &original, *fsp)
+                            }
+                        }
                         Err(err)
                             if err.is_any(&[
                                 crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
@@ -3394,8 +3404,7 @@ fn coerce_value_with_unsigned(
             } else {
                 round_time_micros_to_fsp(micros, *fsp)
             };
-            let max = (838 * 3600 + 59 * 60 + 59) * 1_000_000i64;
-            if quantized.unsigned_abs() >= (max + 1_000_000) as u64 {
+            if quantized.unsigned_abs() > max as u64 {
                 temporal_violation("incorrect time value after fractional rounding".to_string())?;
             }
             Ok(Value::Time(quantized.clamp(-max, max)))

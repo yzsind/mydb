@@ -7580,11 +7580,18 @@ fn apply_sql_prepared_result_columns(
                     column.name.clone_from(&prepared.name);
                     continue;
                 }
-                // Bound arithmetic strings can resolve to exact DECIMAL at
-                // EXECUTE time. Do not overwrite that precision with the
-                // unbound PREPARE fallback DOUBLE descriptor.
-                if matches!(column.column_type, crate::types::ColumnType::Decimal { .. })
-                    && matches!(prepared.column_type, crate::types::ColumnType::Double)
+                // Bound arithmetic can resolve to an exact numeric domain at
+                // EXECUTE time. Keep its type, precision and signedness instead
+                // of the unbound PREPARE fallback DOUBLE descriptor.
+                if matches!(
+                    column.column_type,
+                    crate::types::ColumnType::Tiny
+                        | crate::types::ColumnType::Short
+                        | crate::types::ColumnType::MediumInt
+                        | crate::types::ColumnType::Long
+                        | crate::types::ColumnType::LongLong
+                        | crate::types::ColumnType::Decimal { .. }
+                ) && matches!(prepared.column_type, crate::types::ColumnType::Double)
                 {
                     continue;
                 }

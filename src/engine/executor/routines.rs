@@ -2849,35 +2849,40 @@ fn exec_block_inner(
             ) {
                 frame.diag_conditions = new_warnings.clone();
             }
-            if let Some(warning) = new_warnings
-                .iter()
-                .rev()
-                .find(|warning| warning.level() == crate::error::ConditionLevel::Warning)
-            {
-                let err = QueryError::user_defined(
-                    warning.code(),
-                    warning.sql_state().as_str(),
-                    warning.message(),
-                )
-                .map_err(|invalid| {
-                    RoutineExecError::Query(error(
-                        crate::error::catalog::ER_WRONG_VALUE,
-                        format!("invalid warning condition: {invalid}"),
-                    ))
-                })?
-                .with_condition_information(warning.condition_information());
-                let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
-                if find_matching_handler(frame, &handlers, &warning).is_some()
-                    || frame.outer_handlers.iter().any(|scope| {
-                        scope.iter().any(|handler| {
-                            handler
-                                .conditions
-                                .iter()
-                                .any(|condition| condition_matches(frame, condition, &warning))
-                        })
-                    })
+            let has_handlers =
+                !handlers.is_empty() || frame.outer_handlers.iter().any(|scope| !scope.is_empty());
+            if has_handlers {
+                for warning in new_warnings
+                    .iter()
+                    .rev()
+                    .filter(|warning| warning.level() == crate::error::ConditionLevel::Warning)
                 {
-                    result = Err(warning);
+                    let err = QueryError::user_defined(
+                        warning.code(),
+                        warning.sql_state().as_str(),
+                        warning.message(),
+                    )
+                    .map_err(|invalid| {
+                        RoutineExecError::Query(error(
+                            crate::error::catalog::ER_WRONG_VALUE,
+                            format!("invalid warning condition: {invalid}"),
+                        ))
+                    })?
+                    .with_condition_information(warning.condition_information());
+                    let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
+                    if find_matching_handler(frame, &handlers, &warning).is_some()
+                        || frame.outer_handlers.iter().any(|scope| {
+                            scope.iter().any(|handler| {
+                                handler
+                                    .conditions
+                                    .iter()
+                                    .any(|condition| condition_matches(frame, condition, &warning))
+                            })
+                        })
+                    {
+                        result = Err(warning);
+                        break;
+                    }
                 }
             }
         }
@@ -2909,7 +2914,11 @@ fn exec_block_inner(
                     let previous_handler_diagnostics = std::mem::replace(
                         &mut session.warnings,
                         vec![crate::engine::api::SqlWarning::from_error(
-                            crate::error::ConditionLevel::Error,
+                            if matches!(err, RoutineExecError::Warning(_, _)) {
+                                crate::error::ConditionLevel::Warning
+                            } else {
+                                crate::error::ConditionLevel::Error
+                            },
                             &err.query_error(),
                         )]
                         .into(),
@@ -2918,7 +2927,24 @@ fn exec_block_inner(
                         exec_stmt(db, session, frame, registry, &handler.statement);
                     session.warnings = previous_handler_diagnostics;
                     frame.active_handler_error = previous_handler_error;
-                    let handler_result = handler_result?;
+                    let handler_result = match handler_result {
+                        Err(warning @ RoutineExecError::Warning(_, _)) => {
+                            // RESIGNAL without a new SQLSTATE retains warning
+                            // severity. Let an outer handler catch it; otherwise
+                            // retain the diagnostic and finish this handler.
+                            if frame.outer_handlers.iter().any(|scope| {
+                                find_matching_handler(frame, scope, &warning).is_some()
+                            }) {
+                                return Err(warning);
+                            }
+                            crate::engine::api::push_statement_condition(
+                                crate::error::ConditionLevel::Warning,
+                                &warning.query_error(),
+                            );
+                            RoutineControl::None
+                        }
+                        other => other?,
+                    };
                     crate::engine::perf_errors::record_handled(session, &err.query_error());
                     match handler_result {
                         RoutineControl::None => match handler.action {
@@ -2933,6 +2959,17 @@ fn exec_block_inner(
                         },
                         control => return Ok(control),
                     }
+                } else if matches!(err, RoutineExecError::Warning(_, _))
+                    && !frame
+                        .outer_handlers
+                        .iter()
+                        .any(|scope| find_matching_handler(frame, scope, &err).is_some())
+                {
+                    crate::engine::api::push_statement_condition(
+                        crate::error::ConditionLevel::Warning,
+                        &err.query_error(),
+                    );
+                    continue;
                 } else if is_root {
                     match &err {
                         RoutineExecError::Warning(_, _) => continue,
@@ -3527,10 +3564,16 @@ fn exec_stmt(
                 information,
                 active_error.condition_information(),
             )?);
+            let retain_warning =
+                resolved.is_none() && matches!(active, RoutineExecError::Warning(_, _));
             let condition = resolved
                 .map(|(condition, _)| condition)
                 .unwrap_or_else(|| active.condition());
-            Err(RoutineExecError::Condition(condition, err))
+            if retain_warning {
+                Err(RoutineExecError::Warning(condition, err))
+            } else {
+                Err(RoutineExecError::Condition(condition, err))
+            }
         }
         RoutineStmt::Call(call) => {
             let inherited_capabilities = RoutineCapabilities::from_frame(frame);
@@ -4753,9 +4796,15 @@ fn condition_matches(
     let query = err.query_error();
     match resolved {
         RoutineCondition::SqlException => {
-            !query.sql_state().starts_with("01") && !query.sql_state().starts_with("02")
+            !matches!(err, RoutineExecError::Warning(_, _))
+                && !query.sql_state().starts_with("01")
+                && !query.sql_state().starts_with("02")
         }
-        RoutineCondition::SqlWarning => query.sql_state().starts_with("01"),
+        // Warning severity is independent of the nominal SQLSTATE class
+        // (for example, truncation warnings retain SQLSTATE 22007).
+        RoutineCondition::SqlWarning => {
+            matches!(err, RoutineExecError::Warning(_, _)) || query.sql_state().starts_with("01")
+        }
         RoutineCondition::NotFound => query.sql_state().starts_with("02"),
         RoutineCondition::MysqlError(code) => query.code() == *code,
         RoutineCondition::SqlState(state) => query.sql_state().eq_ignore_ascii_case(state),

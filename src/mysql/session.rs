@@ -12353,6 +12353,40 @@ mod tests {
     }
 
     #[test]
+    fn release_followup_fallback_binding_preserves_non_utf8_bytes() {
+        for no_backslash_escapes in [false, true] {
+            let mode = crate::sql_lex::SqlLexMode {
+                no_backslash_escapes,
+                ..Default::default()
+            };
+            let bound = bind_sql_params(
+                "SELECT HEX(?)",
+                &[StmtParamValue::Bytes(vec![0xff, 0, 0xfe, 39, 92])],
+                mode,
+            )
+            .unwrap();
+            let bits = if no_backslash_escapes {
+                crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES
+            } else {
+                0
+            };
+            let _mode = crate::parser::ParserSqlModeGuard::activate(bits);
+            let Statement::Select(select) = crate::parser::parse_statement(&bound).unwrap() else {
+                panic!()
+            };
+            let crate::parser::SelectItem::Expr { expr, .. } = &select.projection[0] else {
+                panic!()
+            };
+            assert_eq!(
+                crate::engine::expr::eval_const(expr)
+                    .unwrap()
+                    .to_display_string(),
+                "FF00FE275C"
+            );
+        }
+    }
+
+    #[test]
     fn fallback_binding_uses_the_same_comment_scanner() {
         let mode = crate::sql_lex::SqlLexMode::default();
         let prepared = crate::sql_lex::PreparedSql::new(

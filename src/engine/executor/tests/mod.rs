@@ -11,6 +11,7 @@ mod http;
 mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;
+mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;
 mod sql_execution_audit_1015;

@@ -2505,9 +2505,22 @@ pub fn stmt_param_to_sql(value: &StmtParamValue, no_backslash_escapes: bool) -> 
             let mut buf = ryu::Buffer::new();
             crate::types::ryu_to_mysql_text(buf.format(*value), || value.to_string()).into_owned()
         }
-        StmtParamValue::Bytes(value) => {
-            quote_sql_string(&String::from_utf8_lossy(value), no_backslash_escapes)
-        }
+        StmtParamValue::Bytes(value) => match std::str::from_utf8(value) {
+            Ok(text) => quote_sql_string(text, no_backslash_escapes),
+            Err(_) => {
+                // The text fallback must preserve arbitrary binary parameters.
+                // Hex literals are lossless in either SQL escaping mode.
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                let mut out = String::with_capacity(value.len() * 2 + 3);
+                out.push_str("X'");
+                for byte in value {
+                    out.push(HEX[(byte >> 4) as usize] as char);
+                    out.push(HEX[(byte & 15) as usize] as char);
+                }
+                out.push('\'');
+                out
+            }
+        },
         StmtParamValue::String(value) => quote_sql_string(value, no_backslash_escapes),
         // SQL literal-rewriting path only used for unrecognised
         // statements (rare). Emit the canonical decimal form.

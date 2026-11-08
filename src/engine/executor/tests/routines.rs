@@ -2829,7 +2829,7 @@ fn audit_unhandled_coercion_warnings_continue_in_original_block() {
             &format!(
                 "CREATE PROCEDURE {name}(OUT got INT) BEGIN
           DECLARE x INT;
-          DECLARE {action} HANDLER FOR SQLEXCEPTION SET got=7;
+          DECLARE {action} HANDLER FOR SQLWARNING SET got=7;
           SET x=99999999999; SET got=got+1;
         END"
             ),
