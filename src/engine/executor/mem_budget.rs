@@ -2199,15 +2199,24 @@ thread_local! {
 /// thread-local and must be entered and dropped within one Future::poll.
 /// It deliberately does not install a query budget or hide a SQL-owned one.
 pub struct ReclaimDatabaseScope {
-    previous: Option<Weak<crate::storage::Database>>,
+    previous: Option<Option<Weak<crate::storage::Database>>>,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl ReclaimDatabaseScope {
     pub(crate) fn enter(database: &Arc<crate::storage::Database>) -> Self {
         Self {
-            previous: CURRENT_RECLAIM_DATABASE
-                .with(|current| current.replace(Some(Arc::downgrade(database)))),
+            previous: CURRENT_RECLAIM_DATABASE.with(|current| {
+                if current
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|owner| std::ptr::eq(owner.as_ptr(), Arc::as_ptr(database)))
+                {
+                    None
+                } else {
+                    Some(current.replace(Some(Arc::downgrade(database))))
+                }
+            }),
             _not_send: std::marker::PhantomData,
         }
     }
@@ -2215,7 +2224,9 @@ impl ReclaimDatabaseScope {
 
 impl Drop for ReclaimDatabaseScope {
     fn drop(&mut self) {
-        CURRENT_RECLAIM_DATABASE.with(|current| *current.borrow_mut() = self.previous.take());
+        if let Some(previous) = self.previous.take() {
+            CURRENT_RECLAIM_DATABASE.with(|current| *current.borrow_mut() = previous);
+        }
     }
 }
 
@@ -2926,6 +2937,38 @@ mod tests {
         })
         .join()
         .unwrap();
+        assert!(current_reclaim_database().is_none());
+    }
+
+    #[test]
+    fn nested_reclaim_scopes_reuse_owner_and_restore_different_databases() {
+        let a_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let b_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let a = Arc::new(crate::storage::Database::open(a_dir.path()).unwrap());
+        let b = Arc::new(crate::storage::Database::open(b_dir.path()).unwrap());
+        assert!(current_reclaim_database().is_none());
+        {
+            let _outer = ReclaimDatabaseScope::enter(&a);
+            let owners = Arc::weak_count(&a);
+            {
+                let _same = ReclaimDatabaseScope::enter(&a);
+                assert_eq!(Arc::weak_count(&a), owners);
+                assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &a));
+                {
+                    let _other = ReclaimDatabaseScope::enter(&b);
+                    assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &b));
+                    let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _nested_a = ReclaimDatabaseScope::enter(&a);
+                        assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &a));
+                        panic!("database scope unwind");
+                    }));
+                    assert!(error.is_err());
+                    assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &b));
+                }
+                assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &a));
+            }
+            assert_eq!(Arc::weak_count(&a), owners);
+        }
         assert!(current_reclaim_database().is_none());
     }
 

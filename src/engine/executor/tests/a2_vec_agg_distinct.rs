@@ -230,3 +230,28 @@ fn p0_2_vec_group_by_string_matches_row_default_collation() {
     );
     assert_eq!(out[0][0], Value::Int(3000));
 }
+
+#[test]
+fn computed_count_distinct_keeps_integer_precision_in_mixed_aggregates() {
+    let (_dir, engine) = engine_with(&[
+        "CREATE TABLE t(g INT, v BIGINT)",
+        "INSERT INTO t VALUES (1,9007199254740992),(1,9007199254740993),(1,9007199254740992),(2,NULL)",
+    ]);
+    for mode in [VecMode::Off, VecMode::On] {
+        for suffix in ["", ",GROUP_CONCAT(v ORDER BY v)"] {
+            let sql = format!("SELECT g,COUNT(DISTINCT MOD(v,9223372036854775807)){suffix} FROM t GROUP BY g ORDER BY g");
+            let rows = with_vec_mode(mode, || rows_of(&engine, &sql));
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0][1],
+                Value::Int(2),
+                "exact values must not collapse above 2^53: {sql}"
+            );
+            assert_eq!(
+                rows[1][1],
+                Value::Int(0),
+                "NULL is excluded from COUNT DISTINCT"
+            );
+        }
+    }
+}

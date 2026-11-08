@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::engine::api::{QueryResponse, ResultSet};
 use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 use crate::parser::Statement;
+use crate::storage::image::validate_restore_path;
 use crate::storage::{error, Database, DurabilityMode, StartupValidationMode, StorageConfig};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
@@ -1442,48 +1443,6 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, QueryError> {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/"))
-}
-
-fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
-    let path = Path::new(relative);
-    if relative.split('/').count() > 64
-        || relative.is_empty()
-        || relative.len() > 4096
-        || relative.contains(['\\', ':', '\0'])
-        || relative
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(backup_err(format!("unsafe backup path '{relative}'")));
-    }
-    let allowed = relative.starts_with("schemas/")
-        || relative.starts_with("objects/")
-        || relative.starts_with("system/catalog/")
-        || relative.starts_with("system/undo/")
-        || relative.starts_with("system/object-owners/")
-        || relative.starts_with("system/xa-binlog/")
-        || relative.starts_with("system/wal/")
-        || matches!(
-            relative,
-            "system/commit-ledger.v1"
-                | "system/commit-clock.v1"
-                | "system/storage.control"
-                | "system/history-index.v1"
-                | "system/tablespaces.json"
-                | "system/zone-map-checkpoint.manifest"
-                | "system/vector-purges.v1"
-                | "system/vector-maintenance.jobs"
-        );
-    if !allowed {
-        return Err(backup_err(format!(
-            "backup path '{relative}' is outside the persistent restore set"
-        )));
-    }
-    Ok(())
 }
 
 fn confirm_immutable(path: &Path) -> Result<(), QueryError> {

@@ -995,6 +995,7 @@ pub(crate) fn execute_compiled_select(
     stmt: &Select,
     compiled: &crate::engine::cache::CompiledSelectPlan,
 ) -> Result<QueryResponse, QueryError> {
+    compiled.validate_limit_parameters()?;
     let _caller_partition_scope =
         crate::engine::executor::partition_router::suspend_pruned_partitions();
     let sample_context = super::sampling::preflight(db, stmt)?;

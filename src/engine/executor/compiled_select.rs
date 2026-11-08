@@ -192,8 +192,10 @@ pub(super) fn semantics_match(
     optimizer_switch: &str,
     session: &SessionContext,
 ) -> bool {
-    semantics.rls_authorization.as_deref()
-        == Some(crate::engine::rls::session_signature(db, session).as_ref())
+    semantics
+        .rls_authorization
+        .as_ref()
+        .is_some_and(|identity| identity.matches_session(db, session))
         && semantics.sql_mode_fingerprint == crate::binlog::sql_mode_str_to_bits(&session.sql_mode)
         && optimizer_switch == session.sysvars.optimizer_switch
         && semantics.sql_select_limit == session.sysvars.sql_select_limit

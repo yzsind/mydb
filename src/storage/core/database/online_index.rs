@@ -621,6 +621,7 @@ impl Database {
                 for target in &mut targets {
                     let file = target.file.take().unwrap();
                     let mut cache = self.index_cache.write();
+                    self.invalidate_storage_handle_open_epoch(target.table.id);
                     let name = if target.index.primary {
                         "PRIMARY"
                     } else {

@@ -919,14 +919,13 @@ fn env_value(name: &str) -> Result<String, std::env::VarError> {
 }
 
 fn parse_bool(raw: &str) -> Result<bool, QueryError> {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "1" | "ON" | "TRUE" | "YES" => Ok(true),
-        "0" | "OFF" | "FALSE" | "NO" => Ok(false),
-        other => Err(error(
+    crate::util::env::parse_bool(raw).ok_or_else(|| {
+        let other = raw.trim().to_ascii_uppercase();
+        error(
             crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
             format!("incorrect boolean value: '{other}'"),
-        )),
-    }
+        )
+    })
 }
 
 fn parse_seconds_duration(raw: &str) -> Result<Duration, QueryError> {
@@ -1278,5 +1277,36 @@ mod file_output_tests {
                 service.flush(FlushLogKind::All).unwrap();
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod boolean_contract_tests {
+    use super::*;
+    #[test]
+    fn logging_boolean_spelling_and_error_text_are_preserved() {
+        for (raw, value) in [
+            ("1", true),
+            (" on ", true),
+            ("TRUE", true),
+            ("Yes", true),
+            ("0", false),
+            ("off", false),
+            (" False ", false),
+            ("NO", false),
+        ] {
+            assert_eq!(parse_bool(raw).unwrap(), value);
+        }
+        for raw in ["y", "n", "maybe", "2", "ßy", ""] {
+            let error = parse_bool(raw).unwrap_err();
+            assert!(error.is(crate::error::catalog::ER_WRONG_VALUE_FOR_VAR));
+            assert_eq!(
+                error.message(),
+                format!(
+                    "incorrect boolean value: '{}'",
+                    raw.trim().to_ascii_uppercase()
+                )
+            );
+        }
     }
 }

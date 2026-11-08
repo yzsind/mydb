@@ -5397,6 +5397,79 @@ pub struct AggMetrics {
     pub distinct_spill_bytes: u64,
 }
 
+impl AggMetrics {
+    pub(crate) fn record_expression_rows(&mut self, computed: bool, native: bool) {
+        if !computed {
+            return;
+        }
+        self.expression_mode = Some(if self.fallback_aggregate_rows > 0 {
+            "scalar"
+        } else if !native {
+            "legacy_escape"
+        } else {
+            "compiled"
+        });
+        if native {
+            self.native_expression_rows = self.native_aggregate_rows;
+            self.fallback_expression_rows = self.fallback_aggregate_rows;
+        } else {
+            self.native_expression_rows = 0;
+            self.fallback_expression_rows = self
+                .native_aggregate_rows
+                .saturating_add(self.fallback_aggregate_rows);
+        }
+    }
+}
+
+/// Canonical group and aggregate metadata for serial and parallel execution.
+#[inline]
+pub(crate) fn aggregate_output_schema(
+    input_schema: Option<&BatchSchema>,
+    group_columns: &[usize],
+    aggs: &[AggregateSpec],
+) -> Arc<BatchSchema> {
+    let mut fields: Vec<BatchField> = Vec::with_capacity(group_columns.len() + aggs.len());
+    if let Some(input) = input_schema {
+        for &g in group_columns {
+            fields.push(input.fields()[g].clone());
+        }
+    } else {
+        for (i, _) in group_columns.iter().enumerate() {
+            fields.push(BatchField {
+                table: String::new(),
+                alias: None,
+                name: format!("g{i}"),
+                column_type: ColumnType::VarString,
+                source: Default::default(),
+            });
+        }
+    }
+    for (i, spec) in aggs.iter().enumerate() {
+        let input_field = input_schema.and_then(|schema| schema.fields().get(spec.input_column));
+        let column_type = spec
+            .func
+            .result_type(input_field.map(|field| field.column_type));
+        let mut source = if matches!(spec.func, AggregateKind::Min | AggregateKind::Max) {
+            input_field
+                .map(|field| field.source.clone().nullable_aggregate())
+                .unwrap_or_default()
+        } else {
+            crate::types::ColumnSource::default()
+        };
+        if spec.func.is_bit() {
+            source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+        }
+        fields.push(BatchField {
+            table: "__agg".into(),
+            alias: None,
+            name: format!("a{i}"),
+            column_type,
+            source,
+        });
+    }
+    Arc::new(BatchSchema::new(fields))
+}
+
 pub struct HashAggregateCore {
     group_columns: Vec<usize>,
     aggs: Vec<AggregateSpec>,
@@ -7605,53 +7678,9 @@ impl HashAggregateCore {
     }
 
     /// Build the output BatchSchema (group cols + finalized agg cols).
-    /// Cached on the operator so `finalize_stream` and external callers
-    /// (e.g. vec_bridge → downstream operator) see the same shape.
+    /// Shares the metadata contract with parallel bridge preparation.
     pub fn output_schema(&self) -> Arc<BatchSchema> {
-        let mut fields: Vec<BatchField> =
-            Vec::with_capacity(self.group_columns.len() + self.aggs.len());
-        if let Some(input) = &self.input_schema {
-            for &g in &self.group_columns {
-                fields.push(input.fields()[g].clone());
-            }
-        } else {
-            for (i, _) in self.group_columns.iter().enumerate() {
-                fields.push(BatchField {
-                    table: String::new(),
-                    alias: None,
-                    name: format!("g{i}"),
-                    column_type: ColumnType::VarString,
-                    source: Default::default(),
-                });
-            }
-        }
-        for (i, spec) in self.aggs.iter().enumerate() {
-            let input_field = self
-                .input_schema
-                .as_ref()
-                .and_then(|schema| schema.fields().get(spec.input_column));
-            let column_type = spec
-                .func
-                .result_type(input_field.map(|field| field.column_type));
-            let mut source = if matches!(spec.func, AggregateKind::Min | AggregateKind::Max) {
-                input_field
-                    .map(|field| field.source.clone().nullable_aggregate())
-                    .unwrap_or_default()
-            } else {
-                crate::types::ColumnSource::default()
-            };
-            if spec.func.is_bit() {
-                source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
-            }
-            fields.push(BatchField {
-                table: "__agg".into(),
-                alias: None,
-                name: format!("a{i}"),
-                column_type,
-                source,
-            });
-        }
-        Arc::new(BatchSchema::new(fields))
+        aggregate_output_schema(self.input_schema.as_deref(), &self.group_columns, &self.aggs)
     }
 
     /// Streaming counterpart to `finalize` — returns a `BatchOperator` that

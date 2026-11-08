@@ -2082,6 +2082,10 @@ impl BufferPool {
         self.pin_page_with_intent(key, AccessIntent::Normal)
     }
 
+    fn pin_page_ref(self: &Arc<Self>, key: PageKeyRef<'_>) -> Result<PinnedFrame, QueryError> {
+        self.pin_page_with_intent_ref(key, AccessIntent::Normal)
+    }
+
     /// An optional navigation cache must not hold ancestor pins across page
     /// admission or I/O waits. Claim an already resident, ready frame only;
     /// a racing eviction/load is a cache miss, never a new page allocation.
@@ -2129,7 +2133,20 @@ impl BufferPool {
         key: PageKey,
         intent: AccessIntent,
     ) -> Result<PinnedFrame, QueryError> {
-        self.pin_page_with_candidate(key, intent, None)
+        self.pin_page_with_intent_ref(key.borrowed(), intent)
+    }
+
+    fn pin_page_with_intent_ref(
+        self: &Arc<Self>,
+        key: PageKeyRef<'_>,
+        intent: AccessIntent,
+    ) -> Result<PinnedFrame, QueryError> {
+        let frame = self.pin_frame_with_candidate(key, intent, None)?;
+        Ok(PinnedFrame {
+            pool: Arc::clone(self),
+            frame,
+            intent,
+        })
     }
 
     /// A weak hint owns no page bytes and never pins a page between calls.
@@ -2139,9 +2156,9 @@ impl BufferPool {
     fn pin_page_with_hint(
         self: &Arc<Self>,
         key: PageKey,
-        hint: &parking_lot::RwLock<std::sync::Weak<Frame>>,
+        hint: &AtomicFrameHint,
     ) -> Result<PinnedFrame, QueryError> {
-        let frame = self.pin_frame_with_hint(key, hint)?;
+        let frame = self.pin_frame_with_hint(key.borrowed(), hint)?;
         Ok(PinnedFrame {
             pool: Arc::clone(self),
             frame,
@@ -2151,40 +2168,81 @@ impl BufferPool {
 
     fn pin_frame_with_hint(
         self: &Arc<Self>,
-        key: PageKey,
-        hint: &parking_lot::RwLock<std::sync::Weak<Frame>>,
+        key: PageKeyRef<'_>,
+        hint: &AtomicFrameHint,
     ) -> Result<Arc<Frame>, QueryError> {
-        let candidate = hint.read().upgrade().filter(|frame| {
-            frame.key.page_id == key.page_id
-                && (Arc::ptr_eq(&frame.key.file, &key.file) || frame.key.file == key.file)
-                && frame.is_ready()
-        });
+        let candidate = hint
+            .load()
+            .as_ref()
+            .and_then(|hint| hint.frame.upgrade())
+            .filter(|frame| {
+                frame.key.page_id == key.page_id
+                    && hashbrown::Equivalent::equivalent(&key, &frame.key)
+                    && frame.is_ready()
+            });
         let prior = candidate.as_ref().map(Arc::as_ptr);
         let pinned = self.pin_frame_with_candidate(key, AccessIntent::Normal, candidate)?;
         if prior != Some(Arc::as_ptr(&pinned)) {
-            *hint.write() = Arc::downgrade(&pinned);
+            // Metadata admission can run reclaim callbacks. An unwind must
+            // release the pin until ownership transfers back to the caller.
+            struct PendingPin<'a> {
+                pool: &'a BufferPool,
+                frame: &'a Frame,
+                armed: bool,
+            }
+            impl Drop for PendingPin<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.frame.unpin();
+                        self.pool.notify_frame_waiters();
+                    }
+                }
+            }
+            let mut pending = PendingPin {
+                pool: self,
+                frame: &pinned,
+                armed: true,
+            };
+            use crate::engine::executor::mem_budget::{
+                ControlledMemoryCategory, ControlledMemoryCharge,
+            };
+            // Include the retired frame allocation retained by its weak owner.
+            let bytes = std::mem::size_of::<FrameHint>()
+                .saturating_add(std::mem::size_of::<Frame>())
+                .saturating_add(
+                    std::mem::align_of::<FrameHint>().max(2 * std::mem::size_of::<usize>()),
+                )
+                .saturating_add(
+                    std::mem::align_of::<Frame>().max(2 * std::mem::size_of::<usize>()),
+                );
+            let replacement = ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::SystemMetadata,
+                bytes,
+            )
+            .map(|memory| {
+                Arc::new(FrameHint {
+                    frame: Arc::downgrade(&pinned),
+                    _memory: memory,
+                })
+            });
+            hint.store(replacement);
+            pending.armed = false;
         }
         Ok(pinned)
-    }
-
-    fn pin_page_with_candidate(
-        self: &Arc<Self>,
-        key: PageKey,
-        intent: AccessIntent,
-        candidate: Option<Arc<Frame>>,
-    ) -> Result<PinnedFrame, QueryError> {
-        let frame = self.pin_frame_with_candidate(key, intent, candidate)?;
-        Ok(PinnedFrame {
-            pool: Arc::clone(self),
-            frame,
-            intent,
-        })
     }
 
     /// The caller's borrow keeps the pool alive; only the frame needs shared
     /// ownership. Pin acquisition, replacement policy and wakeups are identical
     /// to the owning guard, including on cold loads and errors.
+    #[cfg(test)]
     fn pin_page_borrowed(self: &Arc<Self>, key: PageKey) -> Result<PinnedFrame<&Self>, QueryError> {
+        self.pin_page_borrowed_ref(key.borrowed())
+    }
+
+    fn pin_page_borrowed_ref(
+        self: &Arc<Self>,
+        key: PageKeyRef<'_>,
+    ) -> Result<PinnedFrame<&Self>, QueryError> {
         let frame = self.pin_frame_with_candidate(key, AccessIntent::Normal, None)?;
         Ok(PinnedFrame {
             pool: self.as_ref(),
@@ -2195,15 +2253,15 @@ impl BufferPool {
 
     fn pin_frame_with_candidate(
         self: &Arc<Self>,
-        key: PageKey,
+        key: PageKeyRef<'_>,
         intent: AccessIntent,
         mut candidate: Option<Arc<Frame>>,
     ) -> Result<Arc<Frame>, QueryError> {
-        let shard_idx = self.shard_index(&key);
+        let shard_idx = self.shard_index_ref(key);
         loop {
             let frame = match candidate.take() {
                 Some(frame) => Some(frame),
-                None => self.lookup_frame(&key)?,
+                None => self.lookup_frame_ref(key)?,
             };
             if let Some(frame) = frame {
                 if self.try_pin_existing(&frame, intent) {
@@ -2278,6 +2336,7 @@ impl BufferPool {
             }
 
             self.ensure_capacity_for_insert(self.lock_wait)?;
+            let key = key.into_owned();
             // One map lookup serves both the pre-load generation stamp
             // and the post-load re-check below.
             let generation_cell = self.file_generation_cell(&key.file)?;
@@ -2714,13 +2773,23 @@ impl BufferPool {
     /// raw image. Header/checksum validation is cached by dirty epoch, so the
     /// steady-state lookup parses only the requested slot metadata and never
     /// allocates a 16 KiB `Page` copy.
+    #[cfg(test)]
     fn with_cached_heap_view<T>(
         &self,
         key: &PageKey,
         verified_checksums: Option<&VerifiedDirectHeapChecksums>,
         f: impl FnOnce(Option<HeapPageView<'_>>) -> Result<T, QueryError>,
     ) -> Result<Option<T>, QueryError> {
-        let Some(frame) = self.lookup_frame(key)? else {
+        self.with_cached_heap_view_ref(key.borrowed(), verified_checksums, f)
+    }
+
+    fn with_cached_heap_view_ref<T>(
+        &self,
+        key: PageKeyRef<'_>,
+        verified_checksums: Option<&VerifiedDirectHeapChecksums>,
+        f: impl FnOnce(Option<HeapPageView<'_>>) -> Result<T, QueryError>,
+    ) -> Result<Option<T>, QueryError> {
+        let Some(frame) = self.lookup_frame_ref(key)? else {
             return Ok(None);
         };
         if !self.try_pin_existing(&frame, AccessIntent::Normal) {
@@ -6250,11 +6319,7 @@ impl BufferPool {
         Ok(inserted)
     }
 
-    fn reclaim_file_handles(
-        &self,
-        keep: &BufferPageFileKey,
-        cap: usize,
-    ) -> Result<(), QueryError> {
+    fn reclaim_file_handles(&self, keep: &BufferPageFileKey, cap: usize) -> Result<(), QueryError> {
         let cache_error = || {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -6304,7 +6369,9 @@ impl BufferPool {
             if Arc::strong_count(&file) == 2
                 && !file.needs_sync.load(Ordering::Acquire)
                 && !file.sync_lock.is_locked()
-                && files.get(&key).is_some_and(|current| Arc::ptr_eq(current, &file))
+                && files
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &file))
             {
                 files.remove(&key);
             }
@@ -6388,9 +6455,13 @@ impl BufferPool {
     }
 
     fn lookup_frame(&self, key: &PageKey) -> Result<Option<Arc<Frame>>, QueryError> {
+        self.lookup_frame_ref(key.borrowed())
+    }
+
+    fn lookup_frame_ref(&self, key: PageKeyRef<'_>) -> Result<Option<Arc<Frame>>, QueryError> {
         #[cfg(test)]
         deferred_raw_page_tests::record_lookup();
-        let shard = self.shards[self.shard_index(key)]
+        let shard = self.shards[self.shard_index_ref(key)]
             .frames
             .read()
             .map_err(|_| {
@@ -6399,7 +6470,7 @@ impl BufferPool {
                     "buffer pool shard lock poisoned",
                 )
             })?;
-        Ok(shard.get(key).cloned())
+        Ok(shard.get(&key).cloned())
     }
 
     /// Metadata-only per-file residency, without cloning one Arc for every
@@ -7705,6 +7776,10 @@ impl BufferPool {
     }
 
     fn shard_index(&self, key: &PageKey) -> usize {
+        self.shard_index_ref(key.borrowed())
+    }
+
+    fn shard_index_ref(&self, key: PageKeyRef<'_>) -> usize {
         let h = key.file.hash ^ key.page_id.wrapping_mul(0x9e3779b97f4a7c15);
         (h as usize) & (self.shards.len() - 1)
     }
@@ -10492,7 +10567,7 @@ mod oldest_dirty_tests {
             file: Arc::clone(&file),
             page_id: 0,
         };
-        let hint = parking_lot::RwLock::new(std::sync::Weak::new());
+        let hint = AtomicFrameHint::empty();
         let first = pool.pin_page_with_hint(key.clone(), &hint).unwrap();
         let old_frame = Arc::clone(&first.frame);
         drop(first);
@@ -10513,7 +10588,11 @@ mod oldest_dirty_tests {
         drop(old_frame);
         drop(reloaded);
         pool.discard_file(&file).unwrap();
-        assert!(hint.read().upgrade().is_none());
+        assert!(hint
+            .load()
+            .as_ref()
+            .and_then(|hint| hint.frame.upgrade())
+            .is_none());
     }
 
     #[test]
@@ -11082,7 +11161,9 @@ mod oldest_dirty_tests {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let pool = BufferPool::new_with_options(
             8,
-            Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap())),
+            Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            )),
             DurabilityMode::Strict,
             Duration::ZERO,
             1,
@@ -11096,7 +11177,10 @@ mod oldest_dirty_tests {
         drop(pool.open_cached_file(&idle_key).unwrap());
 
         pool.reclaim_file_handles(&idle_key, 1).unwrap();
-        assert!(Arc::ptr_eq(&active, &pool.open_cached_file(&active_key).unwrap()));
+        assert!(Arc::ptr_eq(
+            &active,
+            &pool.open_cached_file(&active_key).unwrap()
+        ));
         assert!(active.needs_sync.load(Ordering::Acquire));
         assert_eq!(pool.file_syncs.load(Ordering::Relaxed), 0);
 
@@ -11113,7 +11197,9 @@ mod oldest_dirty_tests {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let pool = BufferPool::new_with_options(
             8,
-            Arc::new(parking_lot::Mutex::new(LogManager::open(dir.path()).unwrap())),
+            Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            )),
             DurabilityMode::Strict,
             Duration::ZERO,
             1,
@@ -11126,9 +11212,14 @@ mod oldest_dirty_tests {
         let keep = BufferPool::index_file_key(dir.path().join("next.idx"));
 
         assert!(pool.reclaim_file_handles(&keep, 1).is_err());
-        let pending = pending.upgrade().expect("failed sync must keep its descriptor");
+        let pending = pending
+            .upgrade()
+            .expect("failed sync must keep its descriptor");
         assert!(pending.needs_sync.load(Ordering::Acquire));
-        assert!(Arc::ptr_eq(&pending, &pool.file_cache.read().unwrap()[&key]));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &pool.file_cache.read().unwrap()[&key]
+        ));
         assert_eq!(pool.file_syncs.load(Ordering::Relaxed), 0);
     }
 
@@ -11164,7 +11255,10 @@ mod oldest_dirty_tests {
             assert!(pool.file_syncs.load(Ordering::Relaxed) > 0);
             pool.sync_cached_files().unwrap();
             for id in 0..cap + 64 {
-                assert_eq!(std::fs::read(root.join(format!("{id}.idx"))).unwrap()[0], 42);
+                assert_eq!(
+                    std::fs::read(root.join(format!("{id}.idx"))).unwrap()[0],
+                    42
+                );
             }
         }
     }

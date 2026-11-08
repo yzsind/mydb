@@ -938,33 +938,7 @@ impl LazyValueRowWriterPool {
     }
 
     pub(crate) fn append(&mut self, partition: usize, row: &[Value]) -> Result<(), QueryError> {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.slots[partition].is_none() {
-            if self.slots.iter().filter(|slot| slot.is_some()).count() >= self.max_open {
-                let evict = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, slot)| slot.as_ref().map(|(_, epoch)| (idx, *epoch)))
-                    .min_by_key(|(_, epoch)| *epoch)
-                    .map(|(idx, _)| idx)
-                    .expect("open writer count is non-zero");
-                if let Some((writer, _)) = self.slots[evict].take() {
-                    self.bytes = self.bytes.saturating_add(writer.finish()?);
-                }
-            }
-            let writer = ValueRowWriter::open_append_with_writer_count(
-                &self.paths[partition],
-                self.ncols,
-                self.charger.clone(),
-                self.buffer_writer_count,
-            )?;
-            self.opens = self.opens.saturating_add(1);
-            self.slots[partition] = Some((writer, self.epoch));
-        }
-        let (writer, used) = self.slots[partition].as_mut().expect("writer was opened");
-        *used = self.epoch;
-        writer.append(row)
+        self.writer_for_partition(partition)?.append(row)
     }
 
     pub(crate) fn append_batch_row(
@@ -973,6 +947,12 @@ impl LazyValueRowWriterPool {
         batch: &Batch,
         row: usize,
     ) -> Result<(), QueryError> {
+        self.writer_for_partition(partition)?.append_batch_row(batch, row)
+    }
+
+    // Preserve the original per-row call boundary for both append formats.
+    #[inline(always)]
+    fn writer_for_partition(&mut self, partition: usize) -> Result<&mut ValueRowWriter, QueryError> {
         self.epoch = self.epoch.wrapping_add(1);
         if self.slots[partition].is_none() {
             if self.slots.iter().filter(|slot| slot.is_some()).count() >= self.max_open {
@@ -999,7 +979,7 @@ impl LazyValueRowWriterPool {
         }
         let (writer, used) = self.slots[partition].as_mut().expect("writer was opened");
         *used = self.epoch;
-        writer.append_batch_row(batch, row)
+        Ok(writer)
     }
 
     pub(crate) fn finish(mut self) -> Result<u64, QueryError> {
@@ -1679,5 +1659,140 @@ mod spill_contract_regressions {
             assert!(ValueRowReader::open(&path, dir.charger()).is_err());
             assert!(PartitionReader::open(&path, dir.charger(), 1).is_err());
         }
+    }
+}
+
+
+#[cfg(test)]
+mod writer_pool_refactor_tests {
+    use super::*;
+    use crate::engine::executor::vec::schema::{BatchField, BatchSchema};
+
+    #[test]
+    fn mixed_value_and_batch_appends_share_lru_and_reopen_in_order() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let tmp = SpillTmpDir::create(root.path()).unwrap();
+        let before = crate::engine::executor::spill_quota::active_spill_files();
+        let mut pool = LazyValueRowWriterPool::new(tmp.path(), "mixed", 3, 2, tmp.charger(), 2);
+        let rows = vec![
+            vec![Value::Int(-7), Value::String("汉🙂".into())],
+            vec![Value::Null, Value::Bytes(vec![0, 255])],
+            vec![Value::UInt(u64::MAX), Value::DecimalCompact(1234, 2)],
+        ];
+        let fields = (0..2)
+            .map(|i| BatchField {
+                table: String::new(),
+                alias: None,
+                name: format!("c{i}"),
+                column_type: ColumnType::VarString,
+                source: Default::default(),
+            })
+            .collect();
+        let batch = Batch::new(
+            std::sync::Arc::new(BatchSchema::new(fields)),
+            (0..2)
+                .map(|column| {
+                    ColumnVector::from_values(rows.iter().map(|row| row[column].clone()).collect())
+                })
+                .collect(),
+        );
+        pool.append(0, &rows[0]).unwrap();
+        pool.append_batch_row(1, &batch, 1).unwrap();
+        pool.append_batch_row(0, &batch, 2).unwrap();
+        pool.append(2, &rows[1]).unwrap();
+        pool.append(1, &rows[2]).unwrap();
+        assert_eq!(
+            pool.opens(),
+            4,
+            "batch reuse must refresh the same LRU epoch"
+        );
+        assert!(crate::engine::executor::spill_quota::active_spill_files() <= before + 2);
+        assert!(pool.finish().unwrap() > 0);
+        assert_eq!(
+            crate::engine::executor::spill_quota::active_spill_files(),
+            before
+        );
+        for (partition, expected) in [
+            vec![rows[0].clone(), rows[2].clone()],
+            vec![rows[1].clone(), rows[2].clone()],
+            vec![rows[1].clone()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut reader = ValueRowReader::open(
+                &tmp.path().join(format!("mixed-{partition}")),
+                tmp.charger(),
+            )
+            .unwrap()
+            .unwrap();
+            for row in expected {
+                assert_eq!(reader.next().unwrap(), Some(row));
+            }
+            assert_eq!(reader.next().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn writer_open_failure_and_invalid_row_release_descriptors() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let tmp = SpillTmpDir::create(root.path()).unwrap();
+        let before = crate::engine::executor::spill_quota::active_spill_files();
+        let mut pool = LazyValueRowWriterPool::new(tmp.path(), "retry", 2, 1, tmp.charger(), 1);
+        pool.append(0, &[Value::Int(1)]).unwrap();
+        let blocked = tmp.path().join("retry-1");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(pool.append(1, &[Value::Int(2)]).is_err());
+        assert_eq!(pool.opens(), 1);
+        assert_eq!(
+            crate::engine::executor::spill_quota::active_spill_files(),
+            before
+        );
+        std::fs::remove_dir(&blocked).unwrap();
+        pool.append(1, &[Value::Int(2)]).unwrap();
+        assert!(pool.append(1, &[]).is_err());
+        pool.append(0, &[Value::Int(3)]).unwrap();
+        pool.finish().unwrap();
+        assert_eq!(
+            crate::engine::executor::spill_quota::active_spill_files(),
+            before
+        );
+        for (partition, expected) in [(0, vec![1, 3]), (1, vec![2])] {
+            let mut reader = ValueRowReader::open(
+                &tmp.path().join(format!("retry-{partition}")),
+                tmp.charger(),
+            )
+            .unwrap()
+            .unwrap();
+            for value in expected {
+                assert_eq!(reader.next().unwrap(), Some(vec![Value::Int(value)]));
+            }
+            assert_eq!(reader.next().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn writer_finish_failure_stops_eviction_before_opening_next_partition() {
+        use crate::engine::executor::spill_quota;
+        struct LimitGuard(u64);
+        impl Drop for LimitGuard {
+            fn drop(&mut self) {
+                spill_quota::set_global_limit_bytes(self.0);
+            }
+        }
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let tmp = SpillTmpDir::create(root.path()).unwrap();
+        let before = spill_quota::active_spill_files();
+        let mut pool = LazyValueRowWriterPool::new(tmp.path(), "flush", 2, 1, tmp.charger(), 1);
+        pool.append(0, &[Value::Int(1)]).unwrap();
+        let limit = LimitGuard(spill_quota::global_limit_bytes());
+        spill_quota::set_global_limit_bytes(1);
+        let error = pool.append(1, &[Value::Int(2)]).unwrap_err();
+        assert_eq!(error.code(), 1041);
+        assert_eq!(pool.opens(), 1);
+        assert!(!tmp.path().join("flush-1").exists());
+        assert_eq!(spill_quota::active_spill_files(), before);
+        drop(limit);
+        drop(pool);
     }
 }

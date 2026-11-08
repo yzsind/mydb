@@ -681,12 +681,10 @@ where
     global().spawn_affine(affinity, f)
 }
 
-/// Submit statement work for a client session. A request worker that owns
-/// only this session has nothing else to drive while the session waits, so
-/// the work runs right here (with the same panic containment as a pool task)
-/// instead of costing a cross-thread hand-off and two wakeups. Otherwise it
-/// goes to the blocking pool so a long statement cannot stall sibling
-/// connections sharing the worker.
+/// Submit statement work for a client session. Only a process-wide sole
+/// connection may use the synchronous shortcut. Multi-session workloads keep
+/// potentially blocking work on the independent pool so every reactor can
+/// continue driving cancellation and lock-releasing requests.
 pub fn spawn_session<F, T>(affinity: Option<&Affinity>, f: F) -> BlockingHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,

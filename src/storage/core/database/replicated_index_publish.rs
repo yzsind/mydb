@@ -104,8 +104,9 @@ impl Database {
         // A cold handle must still resolve every candidate index identity.
         for (_, table) in tables {
             if let Some(table) = table {
-                if let Some(old) = old_tables.iter().find(|old| old.id == table.id
-                    && old.active_generation != table.active_generation) {
+                if let Some(old) = old_tables.iter().find(|old| {
+                    old.id == table.id && old.active_generation != table.active_generation
+                }) {
                     for id in old.storage_ids() {
                         self.remove_heap_cache_entry(id)?;
                         self.remove_overflow_cache_entry(id)?;
@@ -138,6 +139,7 @@ impl Database {
                     }) {
                         if !old_name.eq_ignore_ascii_case(&index.name) {
                             let mut cache = self.index_cache.write();
+                            self.invalidate_storage_handle_open_epoch(id);
                             if let Some(handle) = cache.remove(&(id, normalize_name(old_name))) {
                                 cache.insert((id, normalize_name(&index.name)), handle);
                             }
@@ -181,8 +183,9 @@ impl Database {
                             self.buffer_pool.clone(),
                         )?;
                         file.flush()?;
-                        self.index_cache.write().insert(
-                            (id, normalize_name(&index.name)),
+                        self.publish_index_handle(
+                            id,
+                            &index.name,
                             Arc::new(parking_lot::RwLock::new(file)),
                         );
                     } else {

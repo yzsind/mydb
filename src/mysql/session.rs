@@ -53,6 +53,36 @@ use crate::util::logging::log_message;
 mod routine_results;
 pub(crate) mod tls_names;
 
+// Keep common metadata setup in the caller's async frame and field borrows.
+macro_rules! begin_streaming_result {
+    ($session:ident, $result:ident, $encoding:expr, $server_status:expr, $first_sequence_id:expr) => {{
+        let encoding = $encoding.with_vector_text($session.context.vector_result_format_text);
+        if let std::borrow::Cow::Owned(columns) = crate::mysql::protocol::vector_text_result_columns(
+            &$result.columns,
+            matches!(encoding, StreamRowEncoding::VectorText(_)),
+        ) {
+            $result.columns = columns;
+        }
+        let client_capabilities = $session.client_capabilities();
+        let kill_notify = $session.handle.as_ref().map(Arc::clone);
+        let fallback_collation = $session.result_fallback_collation_id();
+        let mut batch = $session.codec.batch_writer(&mut $session.stream);
+        let sequence_id = write_result_set_header_batched(
+            &mut batch,
+            &$result.columns,
+            client_capabilities,
+            $session.context.resultset_metadata_full,
+            fallback_collation,
+            $server_status,
+            $first_sequence_id,
+        )
+        .await?;
+        batch.flush().await?;
+        batch.begin_streaming_rows();
+        (encoding, client_capabilities, kill_notify, batch, sequence_id)
+    }};
+}
+
 async fn local_infile_cancelled(
     handle: Option<&SessionHandle>,
     token: Option<&crate::engine::cancel::QueryCancelToken>,
@@ -5962,36 +5992,8 @@ where
         first_sequence_id: u8,
         encoding: StreamRowEncoding,
     ) -> io::Result<u8> {
-        let encoding = encoding.with_vector_text(self.context.vector_result_format_text);
-        if let std::borrow::Cow::Owned(columns) = crate::mysql::protocol::vector_text_result_columns(
-            &result.columns,
-            matches!(encoding, StreamRowEncoding::VectorText(_)),
-        ) {
-            result.columns = columns;
-        }
-        let client_capabilities = self.client_capabilities();
-        // Clone the session handle up front so the per-row `select!`
-        // below can race the write against `KILL [CONNECTION|QUERY]`
-        // without re-borrowing `self`. The handle's `Notify` is woken
-        // by `kill_connection` / `cancel_query`, so a KILL that lands
-        // while a slow client is gluing up TCP backpressure aborts the
-        // stream immediately instead of waiting for the row count to
-        // drain naturally.
-        let kill_notify = self.handle.as_ref().map(Arc::clone);
-        let fallback_collation = self.result_fallback_collation_id();
-        let mut batch = self.codec.batch_writer(&mut self.stream);
-        let mut sequence_id = write_result_set_header_batched(
-            &mut batch,
-            &result.columns,
-            client_capabilities,
-            self.context.resultset_metadata_full,
-            fallback_collation,
-            server_status,
-            first_sequence_id,
-        )
-        .await?;
-        batch.flush().await?;
-        batch.begin_streaming_rows();
+        let (encoding, client_capabilities, kill_notify, mut batch, mut sequence_id) =
+            begin_streaming_result!(self, result, encoding, server_status, first_sequence_id);
 
         let mut row_payload = Vec::new();
         let mut sent_rows = 0_u64;
@@ -6066,29 +6068,8 @@ where
         first_sequence_id: u8,
         encoding: StreamRowEncoding,
     ) -> io::Result<u8> {
-        let encoding = encoding.with_vector_text(self.context.vector_result_format_text);
-        if let std::borrow::Cow::Owned(columns) = crate::mysql::protocol::vector_text_result_columns(
-            &result.columns,
-            matches!(encoding, StreamRowEncoding::VectorText(_)),
-        ) {
-            result.columns = columns;
-        }
-        let client_capabilities = self.client_capabilities();
-        let kill_notify = self.handle.as_ref().map(Arc::clone);
-        let fallback_collation = self.result_fallback_collation_id();
-        let mut batch = self.codec.batch_writer(&mut self.stream);
-        let mut sequence_id = write_result_set_header_batched(
-            &mut batch,
-            &result.columns,
-            client_capabilities,
-            self.context.resultset_metadata_full,
-            fallback_collation,
-            server_status,
-            first_sequence_id,
-        )
-        .await?;
-        batch.flush().await?;
-        batch.begin_streaming_rows();
+        let (encoding, client_capabilities, kill_notify, mut batch, mut sequence_id) =
+            begin_streaming_result!(self, result, encoding, server_status, first_sequence_id);
 
         let mut sent_rows = 0_u64;
 
@@ -14798,3 +14779,7 @@ mod release_audit_sql_tests {
         assert!(decode_session_sql(&session, b"SELECT `\xff`").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "session/stream_header_contract_tests.rs"]
+mod stream_header_contract_tests;

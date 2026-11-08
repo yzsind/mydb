@@ -449,3 +449,99 @@ fn ai_audit_teredo_policy() {
         .check_ip("2001::1".parse().unwrap())
         .is_ok());
 }
+
+
+#[test]
+fn strict_json_domains_preserve_values_errors_and_budget_order() {
+    use std::cell::Cell;
+    let http = crate::engine::http::parse_strict_json;
+    for input in [
+        "null",
+        "true",
+        "false",
+        "-9223372036854775808",
+        "18446744073709551615",
+        "1.25e-200",
+        r#"{"汉🙂":[null,false,-1,2.5,"[{}]\\\""]}"#,
+        r#"[{},[],{"nested":{"a":1}}]"#,
+    ] {
+        let expected: serde_json::Value = serde_json::from_str(input).unwrap();
+        assert_eq!(parse_json(input, input.len()).unwrap(), expected, "{input}");
+        assert_eq!(http(input, input.len()).unwrap(), expected, "{input}");
+    }
+    for (input, max, message) in [
+        ("{}", 1, "JSON exceeds byte limit"),
+        ("[", 1, "invalid JSON, duplicate key or unsupported value"),
+        (
+            r#"{"a":1,"\u0061":2}"#,
+            100,
+            "invalid JSON, duplicate key or unsupported value",
+        ),
+        (
+            r#"{"x":{"a":1,"a":2}}"#,
+            100,
+            "invalid JSON, duplicate key or unsupported value",
+        ),
+        ("{} {}", 100, "trailing JSON data"),
+        ("null false", 100, "trailing JSON data"),
+        (
+            "1e999",
+            100,
+            "invalid JSON, duplicate key or unsupported value",
+        ),
+        (
+            r#""\uD800""#,
+            100,
+            "invalid JSON, duplicate key or unsupported value",
+        ),
+    ] {
+        let ai_error = parse_json(input, max).unwrap_err();
+        let http_error = http(input, max).unwrap_err();
+        assert!(ai_error.is(crate::error::catalog::ER_AI_INVALID_ARGUMENT));
+        assert!(http_error.is(crate::error::catalog::ER_HTTP_INVALID_ARGUMENT));
+        assert_eq!(
+            ai_error.message(),
+            format!("ER_AI_INVALID_ARGUMENT: {message}"),
+            "{input}"
+        );
+        assert_eq!(
+            http_error.message(),
+            format!("ER_HTTP_INVALID_ARGUMENT: {message}"),
+            "{input}"
+        );
+    }
+    for depth in [31, 32, 33] {
+        let input = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        assert_eq!(parse_json(&input, input.len()).is_ok(), depth <= 32);
+        assert_eq!(http(&input, input.len()).is_ok(), depth <= 32);
+    }
+    for (input, expected) in [("null", 176), ("{}", 680), ("[]", 168)] {
+        let reserved = Cell::new(0);
+        parse_json_budgeted(input, input.len(), |bytes| {
+            reserved.set(bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(reserved.get(), expected);
+    }
+    let deep = format!("{}0{}", "[".repeat(33), "]".repeat(33));
+    for (input, max) in [("{}", 1), (deep.as_str(), deep.len())] {
+        let called = Cell::new(false);
+        assert!(parse_json_budgeted(input, max, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(!called.get(), "lexical rejection must precede reservation");
+    }
+    // A failed reservation must win over DOM errors, including duplicate keys.
+    let called = Cell::new(0);
+    let error = parse_json_budgeted(r#"{"a":1,"a":2}"#, 100, |_| {
+        called.set(called.get() + 1);
+        Err(crate::error::catalog::ER_AI_BUDGET_EXCEEDED.error("reservation rejected"))
+    })
+    .unwrap_err();
+    assert_eq!(called.get(), 1);
+    assert!(error.is(crate::error::catalog::ER_AI_BUDGET_EXCEEDED));
+    assert_eq!(error.message(), "reservation rejected");
+}

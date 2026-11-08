@@ -2380,8 +2380,9 @@ impl DdlCopyIndexBuilders {
         };
         file.flush()?;
         if publish_cache {
-            db.index_cache.write().insert(
-                (table.id, normalize_name(&plan.index.name)),
+            db.publish_index_handle(
+                table.id,
+                &plan.index.name,
                 Arc::new(parking_lot::RwLock::new(file)),
             );
             Ok(None)

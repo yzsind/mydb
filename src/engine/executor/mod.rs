@@ -5160,7 +5160,7 @@ impl StorageQueryEngine {
                 }
                 // Compiled plans bypass execute_select, including its registry scope.
                 // A business-table plan can still scan system tables in joins/subqueries.
-                select::with_session_registry((*self.registry).clone(), || {
+                select::with_shared_session_registry(&self.registry, || {
                     run(session, txn, connection_id)
                 })
             })

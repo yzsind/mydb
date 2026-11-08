@@ -482,3 +482,61 @@ fn shared_prepared_range_metadata_keeps_current_table_alias() {
         assert_eq!(result.rows, vec![vec![Value::String("visible".into())]]);
     }
 }
+
+#[test]
+fn cached_range_prefix_sort_preserves_unicode_collisions_multikey_and_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE recipe_prefix (id INT PRIMARY KEY,c VARCHAR(120) COLLATE utf8mb4_0900_ai_ci,d DECIMAL(12,2))").unwrap();
+    let values = (1..=2200)
+        .map(|id| {
+            let text = match id % 8 {
+                0 => "NULL",
+                1 => "'abcdefgh汉字'",
+                2 => "'abcdefgh中文'",
+                3 => "'é'",
+                4 => "'é'",
+                5 => "'ABC'",
+                6 => "'abc'",
+                _ => "''",
+            };
+            format!("({id},{text},{id}.25)")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO recipe_prefix VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE recipe_prefix").unwrap();
+    for (projection, order, limit) in [
+        ("c,id", "c,id DESC", ""),
+        ("d,id,c", "c DESC NULLS FIRST,id", ""),
+        ("c,id", "c,id DESC", " LIMIT 71 OFFSET 3"),
+    ] {
+        let sql = format!("SELECT {projection} FROM recipe_prefix FORCE INDEX(PRIMARY) WHERE id BETWEEN ? AND ? ORDER BY {order}{limit}");
+        let mut session = SessionContext::default();
+        let parsed = engine.prepare_cached(&mut session, &sql, 2).unwrap();
+        let mut state = PreparedSelectMemoState::default();
+        for (low, high) in [(1, 128), (50, 250), (4, 8)] {
+            let response = with_shared_result_metadata(|| {
+                engine.execute_prepared_select(
+                    &mut session,
+                    &mut state,
+                    &parsed,
+                    &sql,
+                    &[Value::Int(low), Value::Int(high)],
+                )
+            })
+            .unwrap()
+            .unwrap();
+            if limit.is_empty() {
+                assert!(matches!(response, QueryResponse::SharedResultSet(_)));
+            }
+            let actual = owned_result(response);
+            let oracle = format!("SELECT {projection} FROM recipe_prefix IGNORE INDEX(PRIMARY) WHERE id BETWEEN {low} AND {high} ORDER BY {order}{limit}");
+            let expected = owned_result(engine.execute(&oracle).unwrap());
+            assert_eq!(actual.rows, expected.rows, "{sql}: {low}..{high}");
+            assert_eq!(actual.columns, expected.columns);
+        }
+    }
+}

@@ -23,7 +23,7 @@ pub(super) fn execute_create_trigger(
             validate_trigger_columns(&mut def.body.statements, &table, def.event, def.timing)?
         }
         // Let catalog validation distinguish a missing table from a view.
-        Err(error) if error.code() == 1146 => {}
+        Err(error) if error.is(crate::error::catalog::ER_NO_SUCH_TABLE) => {}
         Err(error) => return Err(error),
     }
     // B3 — setting DEFINER to another account requires SET_USER_ID/SUPER.

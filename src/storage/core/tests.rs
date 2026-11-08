@@ -1,5 +1,7 @@
 use super::*;
 
+include!("storage_handle_memo_tests.rs");
+
 #[test]
 fn memory_index_mutations_do_not_reencode_resident_leaf_for_each_entry() {
     for kind in 0..8 {
@@ -807,7 +809,15 @@ fn delayed_heap_open_is_not_invalidated_by_unrelated_table_copy() {
     for id in 10000..11000 {
         drop(db.storage_handle_open_epoch(id));
     }
-    assert!(db.storage_handle_open_epochs.lock().unwrap().len() < 130);
+    {
+        let registry = db.storage_handle_open_epochs.lock().unwrap();
+        let retired = registry
+            .epochs
+            .values()
+            .filter(|epoch| epoch.strong_count() == 0)
+            .count();
+        assert!(retired <= 128, "retired open-epoch history must stay bounded");
+    }
     engine.shutdown().unwrap();
 }
 

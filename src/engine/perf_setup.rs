@@ -1237,14 +1237,13 @@ fn parse_bool_assignment(expr: &Expr) -> Result<bool, QueryError> {
 }
 
 fn parse_bool_str(raw: &str) -> Result<bool, QueryError> {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "YES" | "1" | "ON" | "TRUE" | "Y" => Ok(true),
-        "NO" | "0" | "OFF" | "FALSE" | "N" => Ok(false),
-        other => Err(error(
+    crate::util::env::parse_bool_with_short(raw).ok_or_else(|| {
+        let other = raw.trim().to_ascii_uppercase();
+        error(
             crate::error::catalog::ER_WRONG_VALUE,
             format!("Incorrect value '{other}' (expected YES or NO)"),
-        )),
-    }
+        )
+    })
 }
 
 fn immutable_column(name: &str) -> QueryError {
@@ -1337,5 +1336,34 @@ mod audit_tests {
                 .code(),
             1054
         );
+    }
+}
+
+#[cfg(test)]
+mod boolean_contract_tests {
+    use super::*;
+    #[test]
+    fn performance_schema_keeps_short_boolean_forms_and_diagnostics() {
+        for (raw, value) in [
+            ("y", true),
+            ("Y", true),
+            (" n ", false),
+            ("N", false),
+            ("TRUE", true),
+            ("\u{2003}off\u{a0}", false),
+        ] {
+            assert_eq!(parse_bool_str(raw).unwrap(), value);
+        }
+        for raw in ["maybe", "2", "ßy", ""] {
+            let error = parse_bool_str(raw).unwrap_err();
+            assert!(error.is(crate::error::catalog::ER_WRONG_VALUE));
+            assert_eq!(
+                error.message(),
+                format!(
+                    "Incorrect value '{}' (expected YES or NO)",
+                    raw.trim().to_ascii_uppercase()
+                )
+            );
+        }
     }
 }

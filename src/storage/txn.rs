@@ -997,13 +997,16 @@ impl IndexRepairState {
         out
     }
 
-    /// Collect suspect rows without copying retired index keys or sorting
-    /// candidates whose key/writer metadata the visibility shortcut never uses.
+    /// Collect suspect rows within a candidate-sized work budget. Count
+    /// registrations, not distinct rows: repeated versions of one key must
+    /// not turn a bounded read into a scan of the entire retirement history.
+    /// `None` asks the caller to validate its candidates exactly instead.
     pub(crate) fn suspect_rows(
         &self,
         table_id: u64,
         index_name: &str,
-    ) -> std::collections::HashSet<RowId> {
+        max_entries: usize,
+    ) -> Option<std::collections::HashSet<RowId>> {
         let start = IndexRepairKey {
             table_id,
             index_name: normalize_name(index_name),
@@ -1011,15 +1014,22 @@ impl IndexRepairState {
         };
         let first = Self::index_shard_start(table_id, &start.index_name);
         let mut rows = std::collections::HashSet::new();
+        let mut examined = 0usize;
         for shard in &self.entry_shards[first..first + Self::SHARDS_PER_INDEX] {
             let shard = shard.read();
             for (_, entries) in shard.range(&start..).take_while(|(key, _)| {
                 key.table_id == table_id && key.index_name == start.index_name
             }) {
-                rows.extend(entries.iter().map(|entry| entry.row_id));
+                for entry in entries {
+                    if examined == max_entries {
+                        return None;
+                    }
+                    examined += 1;
+                    rows.insert(entry.row_id);
+                }
             }
         }
-        rows
+        Some(rows)
     }
 
     /// Retired entries for one exact logical index key.
@@ -6004,7 +6014,10 @@ mod group_commit_tests {
                 assert_eq!(range.len(), 4);
                 let expected: std::collections::HashSet<_> =
                     range.iter().map(|entry| entry.row_id).collect();
-                assert_eq!(txns.index_repairs.suspect_rows(table_id, index), expected);
+                assert_eq!(
+                    txns.index_repairs.suspect_rows(table_id, index, usize::MAX),
+                    Some(expected)
+                );
                 for entry in range {
                     let exact = txns
                         .index_repairs
@@ -6015,7 +6028,106 @@ mod group_commit_tests {
             }
         }
         txns.clear_index_repairs(1);
-        assert!(txns.index_repairs.suspect_rows(1, "primary").is_empty());
+        assert_eq!(
+            txns.index_repairs.suspect_rows(1, "primary", 0),
+            Some(std::collections::HashSet::new())
+        );
+    }
+
+    #[test]
+    fn index_repair_suspect_budget_counts_versions_and_multikey_retirements() {
+        for single_key in [false, true] {
+            let mut txns = TransactionManager::default();
+            txns.begin_with_id(1, 0, false, true, 1).unwrap();
+            let row = RowId::new(1, 3);
+            let head = txns.active_slot(1).unwrap().undo_head.clone();
+            txns.index_repairs
+                .register(
+                    1,
+                    (0..128).map(|number| {
+                        (
+                            IndexRepairKey {
+                                table_id: 7,
+                                index_name: "secondary".into(),
+                                key: IndexKey::from(vec![crate::storage::KeyPart::Int(number)]),
+                            },
+                            row,
+                            single_key,
+                        )
+                    }),
+                    &head,
+                    &txns.index_repair_epochs,
+                    &txns.index_repair_version,
+                )
+                .unwrap();
+            for budget in [0, 1, 64, 127] {
+                assert!(txns
+                    .index_repairs
+                    .suspect_rows(7, "SECONDARY", budget)
+                    .is_none());
+            }
+            assert_eq!(
+                txns.index_repairs.suspect_rows(7, "secondary", 128),
+                Some(std::collections::HashSet::from([row]))
+            );
+            assert_eq!(
+                txns.index_repairs.suspect_rows(8, "secondary", 0),
+                Some(std::collections::HashSet::new())
+            );
+            txns.clear_index_repairs(1);
+            assert_eq!(
+                txns.index_repairs.suspect_rows(7, "secondary", 0),
+                Some(std::collections::HashSet::new())
+            );
+        }
+    }
+
+    #[test]
+    fn index_repair_equal_prefix_bounds_match_generic_key_parts() {
+        use crate::storage::KeyPart;
+        let mut txns = TransactionManager::default();
+        txns.begin_with_id(1, 0, false, true, 1).unwrap();
+        let prefixes = vec![
+            KeyPart::Null,
+            KeyPart::Int(-7),
+            KeyPart::UInt(u64::MAX),
+            KeyPart::Decimal {
+                value: 12345,
+                scale: 2,
+            },
+            KeyPart::Date(20000),
+            KeyPart::Bytes(vec![0, 0xff]),
+            KeyPart::String("é界".into()),
+        ];
+        for (slot, prefix) in prefixes.iter().enumerate() {
+            for suffix in [0, 1] {
+                let key = IndexRepairKey {
+                    table_id: 1,
+                    index_name: "composite".into(),
+                    key: IndexKey::from(vec![prefix.clone(), KeyPart::Int(suffix)]),
+                };
+                txns.register_index_repairs(1, [key], RowId::new(slot as u32 + 1, suffix as u16))
+                    .unwrap();
+            }
+        }
+        for (slot, prefix) in prefixes.into_iter().enumerate() {
+            let bound = IndexBound {
+                key: IndexKey::from(vec![prefix]),
+                inclusive: true,
+            };
+            let mut visited = 0;
+            let entries =
+                txns.index_repairs
+                    .candidates(1, "COMPOSITE", Some(&bound), Some(&bound), |_| {
+                        visited += 1;
+                        true
+                    });
+            assert_eq!(visited, 2, "only the requested tuple prefix is visited");
+            assert_eq!(entries.len(), 2);
+            assert!(entries
+                .iter()
+                .all(|entry| entry.row_id.page_id == slot as u32 + 1));
+        }
     }
 
     #[test]

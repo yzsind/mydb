@@ -1913,8 +1913,8 @@ impl HeapFile {
         }
         Ok(self
             .buffer_pool
-            .with_cached_heap_view(
-                &self.page_key(row_id.page_id as u64),
+            .with_cached_heap_view_ref(
+                self.page_key_ref(row_id.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
                     let Some(page) = page else {
@@ -1958,8 +1958,8 @@ impl HeapFile {
             }
             return Ok(());
         }
-        let cached = self.buffer_pool.with_cached_heap_view(
-            &self.page_key(page_id as u64),
+        let cached = self.buffer_pool.with_cached_heap_view_ref(
+            self.page_key_ref(page_id as u64),
             self.verified_direct_checksums.as_ref(),
             |page| {
                 out.reserve(row_ids.len());
@@ -2002,8 +2002,8 @@ impl HeapFile {
         }
         Ok(self
             .buffer_pool
-            .with_cached_heap_view(
-                &self.page_key(row_id.page_id as u64),
+            .with_cached_heap_view_ref(
+                self.page_key_ref(row_id.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
                     let Some(page) = page else {
@@ -2078,8 +2078,8 @@ impl HeapFile {
         }
         Ok(self
             .buffer_pool
-            .with_cached_heap_view(
-                &self.page_key(row_id.page_id as u64),
+            .with_cached_heap_view_ref(
+                self.page_key_ref(row_id.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
                     let Some(page) = page else {
@@ -2193,7 +2193,7 @@ impl HeapFile {
         let mut forwarding = Vec::new();
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(first.page_id as u64), AccessIntent::Probe)?;
+            .pin_page_with_intent_ref(self.page_key_ref(first.page_id as u64), AccessIntent::Probe)?;
         pinned.with_heap_raw_bytes_cached(self.verified_direct_checksums.as_ref(), |page| {
             let Some(page) = page else {
                 return Ok(());
@@ -2521,8 +2521,8 @@ impl HeapFile {
             // Ordered loading is only useful after a cache miss; applying it
             // to every hot probe repeats page lookup/pin/recency work and
             // demotes pages that concurrent OLTP queries keep reusing.
-            let cached = self.buffer_pool.with_cached_heap_view(
-                &self.page_key(first.page_id as u64),
+            let cached = self.buffer_pool.with_cached_heap_view_ref(
+                self.page_key_ref(first.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 &mut consume_page,
             )?;
@@ -2537,8 +2537,8 @@ impl HeapFile {
                     }
                     loaded_through = target;
                 }
-                let pinned = self.buffer_pool.pin_page_with_intent(
-                    self.page_key(first.page_id as u64),
+                let pinned = self.buffer_pool.pin_page_with_intent_ref(
+                    self.page_key_ref(first.page_id as u64),
                     AccessIntent::Probe,
                 )?;
                 pinned.with_heap_raw_bytes_cached(
@@ -2606,8 +2606,8 @@ impl HeapFile {
                 start = end;
                 continue;
             }
-            let cached = self.buffer_pool.with_cached_heap_view(
-                &self.page_key(first.page_id as u64),
+            let cached = self.buffer_pool.with_cached_heap_view_ref(
+                self.page_key_ref(first.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
                     let Some(page) = page else {
@@ -2676,8 +2676,8 @@ impl HeapFile {
                 start = end;
                 continue;
             }
-            let consumed = self.buffer_pool.with_cached_heap_view(
-                &self.page_key(first.page_id as u64),
+            let consumed = self.buffer_pool.with_cached_heap_view_ref(
+                self.page_key_ref(first.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
                 |page| {
                     let Some(page) = page else {
@@ -3568,7 +3568,7 @@ impl HeapFile {
             };
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), intent)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), intent)?;
             let stop = scan_mvcc_heap_page!(self, pinned, page_id, visit)?;
             if stop {
                 return Ok(());
@@ -3615,7 +3615,7 @@ impl HeapFile {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
             let stop = self.with_heap_scan_page(&pinned, |page, start_slot, follow| {
                 let Some(page) = page else {
                     return Ok(HeapScanPageResult::Done(false));
@@ -3680,7 +3680,7 @@ impl HeapFile {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
             let stop = self.with_heap_scan_page(&pinned, |page, start_slot, follow| {
                 let Some(page) = page else {
                     return Ok(HeapScanPageResult::Done(false));
@@ -3739,7 +3739,7 @@ impl HeapFile {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), policy.access_intent())?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), policy.access_intent())?;
             let stop = scan_mvcc_heap_page!(self, pinned, page_id, visit)?;
             if stop {
                 return Ok(());
@@ -4456,7 +4456,7 @@ impl HeapFile {
                 if coherent {
                     // Online scans need a latched image even for a cold page:
                     // a concurrent flusher can otherwise race a direct pread.
-                    let pinned = self.buffer_pool.pin_page(self.page_key(page_id))?;
+                    let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
                     self.buffer_pool
                         .with_finalized_frame_bytes(&pinned.frame, |bytes| {
                             assert_eq!(bytes.len(), PAGE_SIZE);
@@ -4846,7 +4846,7 @@ impl HeapFile {
     ) -> Result<T, QueryError> {
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(page_id), AccessIntent::Normal)?;
+            .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Normal)?;
         pinned.with_heap_raw_bytes_cached(self.verified_direct_checksums.as_ref(), |page| {
             let page = page
                 .ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"))?;
@@ -4871,7 +4871,7 @@ impl HeapFile {
     ) -> Result<Page, QueryError> {
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(page_id), intent)?;
+            .pin_page_with_intent_ref(self.page_key_ref(page_id), intent)?;
         pinned.with_heap_page(|page| Ok(page.clone()))
     }
 
@@ -4884,7 +4884,7 @@ impl HeapFile {
     ) -> Result<T, QueryError> {
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(page_id), policy.access_intent())?;
+            .pin_page_with_intent_ref(self.page_key_ref(page_id), policy.access_intent())?;
         pinned.with_heap_raw_bytes_cached(self.verified_direct_checksums.as_ref(), |page| {
             f(HeapPageRead::Raw(page))
         })
@@ -4961,6 +4961,13 @@ impl HeapFile {
             .prefetch_base_pages()
             .saturating_mul(self.buffer_pool.io_threads)
             .max(1)
+    }
+
+    fn page_key_ref(&self, page_id: u64) -> PageKeyRef<'_> {
+        PageKeyRef {
+            file: &self.file_key,
+            page_id,
+        }
     }
 
     fn page_key(&self, page_id: u64) -> PageKey {

@@ -3117,3 +3117,67 @@ fn native_cursor_finish_rechecks_worker_cancellation_and_deadline() {
         assert!(cursor.worker.is_none());
     }
 }
+
+#[test]
+fn count_distinct_computed_numeric_input_stays_native_and_exact() {
+    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let db = Arc::new(Database::open(root.path()).unwrap());
+    let input = PhysicalPlan::ValuesScan {
+        rows: [9007199254740992_i64, 9007199254740993, 9007199254740992]
+            .into_iter()
+            .map(|value| {
+                vec![
+                    Expr::Literal(Literal::Int(1)),
+                    Expr::Literal(Literal::Int(value)),
+                ]
+            })
+            .chain(std::iter::once(vec![
+                Expr::Literal(Literal::Int(2)),
+                Expr::Literal(Literal::Null),
+            ]))
+            .collect(),
+        columns: ["g", "v"]
+            .into_iter()
+            .map(|name| crate::types::Column {
+                name: name.into(),
+                column_type: ColumnType::LongLong,
+                source: Default::default(),
+            })
+            .collect(),
+        filter: None,
+        estimated_rows: 4.0,
+        cost: Default::default(),
+    };
+    let groups = [Expr::Identifier("g".into())];
+    let aggregates =
+        [
+            crate::parser::parse_expr_fragment("COUNT(DISTINCT MOD(v,9223372036854775807))")
+                .unwrap(),
+        ];
+    let txn = TxnView::read_only(0, crate::storage::IsolationLevel::ReadCommitted);
+    crate::engine::executor::vec::config::with_vec_mode(
+        crate::engine::executor::vec::config::VecMode::On,
+        || {
+            let mut result =
+                build_vec_hash_agg_stream(&db, txn, &input, &groups, None, &aggregates)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                result.metrics.fallback_aggregate_rows, 0,
+                "COUNT does not coerce its input to approximate numeric"
+            );
+            let mut rows = Vec::new();
+            while let Some(batch) = result.stream.next_batch().unwrap() {
+                rows.extend(batch.visible_indices().map(|row| batch.row(row)));
+            }
+            rows.sort_by_key(|row| row[0].to_display_string());
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Int(1), Value::Int(2)],
+                    vec![Value::Int(2), Value::Int(0)]
+                ]
+            );
+        },
+    );
+}

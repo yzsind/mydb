@@ -48,6 +48,153 @@ fn fixture_with_durability(
 }
 
 #[test]
+fn rls_plan_identity_validation_preserves_alternating_parameter_signatures() {
+    let (_dir, engine, session) = fixture();
+    let db = engine.db_handle();
+    let domains = vec![
+        Value::Null,
+        Value::Int(-1),
+        Value::UInt(u64::MAX),
+        Value::Float(1.5),
+        Value::Double(2.5),
+        Value::Decimal("3.50".into()),
+        Value::Bytes(vec![0xff]),
+        Value::String("text".into()),
+        Value::SmallString(smallvec::smallvec![b'x']),
+        Value::DecimalCompact(350, 2),
+        Value::Decimal128(i128::MAX, 10),
+        Value::DecimalWide(Box::new(crate::types::DecimalWide {
+            magnitude: num_bigint::BigInt::from(i128::MAX),
+            scale: 10,
+        })),
+        Value::Date(1),
+        Value::Time(-1),
+        Value::DateTime(1),
+        Value::Timestamp(1),
+        Value::Year(126),
+        Value::Json(vec![]),
+        Value::Geometry(vec![]),
+        Value::Vector(crate::vector::VectorValue::new(
+            crate::vector::VectorDataType::Float32,
+            1,
+            1.0_f32.to_le_bytes().to_vec(),
+        )),
+    ];
+    let empty = crate::engine::rls::session_signature(&db, &session);
+    for value in domains {
+        let params = [value];
+        let identity = crate::engine::params::with_params_slice(&params, || {
+            crate::engine::rls::session_signature(&db, &session)
+        });
+        assert!(!identity.matches_session(&db, &session));
+        // Checking another handle must leave the connection's cached signature
+        // intact, including when the parameter count or runtime lane changes.
+        assert!(empty.matches_session(&db, &session));
+        crate::engine::params::with_params_slice(&params, || {
+            assert!(identity.matches_session(&db, &session));
+            assert!(!empty.matches_session(&db, &session));
+            assert!(Arc::ptr_eq(
+                &identity,
+                &crate::engine::rls::session_signature(&db, &session)
+            ));
+        });
+    }
+    let params = [Value::Int(1), Value::UInt(2)];
+    let identity = crate::engine::params::with_params_slice(&params, || {
+        crate::engine::rls::session_signature(&db, &session)
+    });
+    for (params, expected) in [
+        (vec![Value::Int(9), Value::UInt(10)], true),
+        (vec![Value::UInt(2), Value::Int(1)], false),
+        (vec![Value::Int(1)], false),
+        (vec![Value::Int(1), Value::UInt(2), Value::Null], false),
+    ] {
+        crate::engine::params::with_params_slice(&params, || {
+            assert_eq!(identity.matches_session(&db, &session), expected);
+            assert_eq!(
+                identity.as_ref() == crate::engine::rls::session_signature(&db, &session).as_ref(),
+                expected
+            );
+        });
+    }
+}
+
+#[test]
+fn rls_plan_identity_validation_matches_session_signature_invalidation() {
+    let (_dir, engine, session) = fixture();
+    let db = engine.db_handle();
+    let identity = crate::engine::rls::session_signature(&db, &session);
+    let mutations: &[fn(&mut SessionContext)] = &[
+        |s| s.authenticated_as = AccountKey::new("alice", "%"),
+        |s| {
+            s.active_roles.insert(AccountKey::new("reader", "%"));
+        },
+        |s| s.internal_system_session = !s.internal_system_session,
+        |s| s.rls.enabled = !s.rls.enabled,
+        |s| s.sql_mode.push_str(",ANSI_QUOTES"),
+        |s| s.temporal_sql_mode_bits ^= 1,
+        |s| s.character_set_client = "latin1".into(),
+        |s| s.character_set_connection = "latin1".into(),
+        |s| s.collation_connection = "latin1_bin".into(),
+        |s| s.sysvars.div_precision_increment = 7,
+        |s| s.sysvars.time_zone = "+08:00".into(),
+        |s| s.sysvars.lc_time_names = "zh_CN".into(),
+        |s| s.sysvars.default_week_format = 3,
+        |s| s.sysvars.block_encryption_mode = "aes-256-cbc".into(),
+        |s| s.sysvars.explicit_defaults_for_timestamp = !s.sysvars.explicit_defaults_for_timestamp,
+    ];
+    for mutation in mutations {
+        let mut changed = session.clone();
+        mutation(&mut changed);
+        assert!(!identity.matches_session(&db, &changed));
+        assert_ne!(
+            identity,
+            crate::engine::rls::session_signature(&db, &changed)
+        );
+        assert!(identity.matches_session(&db, &session));
+    }
+    {
+        let _trusted = crate::engine::rls::TrustedInternalScope::enter();
+        assert!(!identity.matches_session(&db, &session));
+        assert_ne!(
+            identity,
+            crate::engine::rls::session_signature(&db, &session)
+        );
+    }
+    assert!(identity.matches_session(&db, &session));
+}
+
+#[test]
+fn rls_plan_identity_validation_observes_statement_catalog_boundaries() {
+    let (_dir, engine, mut root) = fixture();
+    let alice = user("alice", 2);
+    let db = engine.db_handle();
+    let identity = {
+        let _statement = crate::engine::rls::EvaluationScope::enter_statement(&db);
+        let identity = crate::engine::rls::session_signature(&db, &alice);
+        engine
+            .execute_with_session(&mut root, "GRANT SUPER ON *.* TO alice")
+            .unwrap();
+        assert!(identity.matches_session(&db, &alice));
+        identity
+    };
+    assert!(!identity.matches_session(&db, &alice));
+    let identity = {
+        let _statement = crate::engine::rls::EvaluationScope::enter_statement(&db);
+        let identity = crate::engine::rls::session_signature(&db, &alice);
+        engine
+            .execute_with_session(
+                &mut root,
+                "CREATE POLICY tenant ON secured USING(tenant_id=1)",
+            )
+            .unwrap();
+        assert!(identity.matches_session(&db, &alice));
+        identity
+    };
+    assert!(!identity.matches_session(&db, &alice));
+}
+
+#[test]
 fn rls_policy_storage_relocation_retains_the_same_logical_version() {
     let (_dir, engine, mut root) = fixture();
     engine

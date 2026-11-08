@@ -3447,7 +3447,14 @@ pub(crate) fn execute_compact_range_recipe(
                 .find(|order| *order != std::cmp::Ordering::Equal)
                 .unwrap_or(std::cmp::Ordering::Equal)
         };
-        rows.sort_unstable_by(|a, b| compare(a, b));
+        if !crate::engine::executor::sort::try_sort_by_string_prefix(
+            &mut rows,
+            input.sort_fields[0],
+            |row| &row[input.order_slots[0]],
+            |left, right| compare(left, right),
+        ) {
+            rows.sort_unstable_by(|a, b| compare(a, b));
+        }
         if input.dedup {
             rows.dedup_by(|a, b| compare(a, b) == std::cmp::Ordering::Equal);
         }

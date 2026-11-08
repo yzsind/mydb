@@ -6470,34 +6470,8 @@ fn format_plan_json_node(
             possible_keys,
             degree,
             ..
-        } => {
-            let name = table_display_name(table);
-            let prefix_len = crate::planner::explain_access::range_prefix_len(index, low, high);
-            let kl = table.schema.index_key_len(index, prefix_len);
-            json_table_header(
-                out,
-                &indent,
-                "parallel_index",
-                &name,
-                table,
-                filter.as_ref(),
-                "index",
-            );
-            out.push_str(&format!("{indent}  \"workers\": {degree},\n"));
-            json_possible_keys(out, possible_keys, &indent);
-            out.push_str(&format!(
-                "{indent}  \"key\": \"{key_name}\",\n",
-                key_name = index.name
-            ));
-            out.push_str(&format!("{indent}  \"key_length\": \"{kl}\",\n"));
-            json_scan_estimates(out, &indent, table, filter, *access_rows, *estimated_rows);
-            out.push_str(&format!("{indent}  \"using_index\": true,\n"));
-            if let Some(condition) = index_range_condition(index, low, high) {
-                json_string_field(out, &indent, "index_condition", &condition);
-            }
-            json_scan_footer(out, &indent, plan, filter.as_ref(), stats);
         }
-        planner::PhysicalPlan::ParallelIndexRangeScan {
+        | planner::PhysicalPlan::ParallelIndexRangeScan {
             table,
             index,
             low,
@@ -6508,17 +6482,23 @@ fn format_plan_json_node(
             degree,
             ..
         } => {
+            let covering = matches!(plan, planner::PhysicalPlan::ParallelIndexFastScan { .. });
+            let (kind, access_type) = if covering {
+                ("parallel_index", "index")
+            } else {
+                ("parallel_range", "range")
+            };
             let name = table_display_name(table);
             let prefix_len = crate::planner::explain_access::range_prefix_len(index, low, high);
             let kl = table.schema.index_key_len(index, prefix_len);
             json_table_header(
                 out,
                 &indent,
-                "parallel_range",
+                kind,
                 &name,
                 table,
                 filter.as_ref(),
-                "range",
+                access_type,
             );
             out.push_str(&format!("{indent}  \"workers\": {degree},\n"));
             json_possible_keys(out, possible_keys, &indent);
@@ -6528,6 +6508,9 @@ fn format_plan_json_node(
             ));
             out.push_str(&format!("{indent}  \"key_length\": \"{kl}\",\n"));
             json_scan_estimates(out, &indent, table, filter, *access_rows, *estimated_rows);
+            if covering {
+                out.push_str(&format!("{indent}  \"using_index\": true,\n"));
+            }
             if let Some(condition) = index_range_condition(index, low, high) {
                 json_string_field(out, &indent, "index_condition", &condition);
             }

@@ -20,6 +20,9 @@ mod row_schema;
 mod shared_aggregate;
 
 #[cfg(test)]
+mod context_scope_tests;
+
+#[cfg(test)]
 pub(crate) static SHARED_DERIVED_AGGREGATE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) mod simple;
@@ -38,22 +41,53 @@ use std::collections::hash_map::Entry;
 
 thread_local! {
     static FORCE_STREAMING_RESPONSE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static CURRENT_SESSION_REGISTRY: std::cell::RefCell<Option<SessionRegistry>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_SESSION_REGISTRY: std::cell::RefCell<Option<ScopedSessionRegistry>> = const { std::cell::RefCell::new(None) };
+}
+
+enum ScopedSessionRegistry {
+    Owned(SessionRegistry),
+    Shared(Arc<SessionRegistry>),
 }
 
 pub(in crate::engine::executor) fn current_session_registry() -> Option<SessionRegistry> {
-    CURRENT_SESSION_REGISTRY.with(|registry| registry.borrow().clone())
+    CURRENT_SESSION_REGISTRY.with(|registry| {
+        registry.borrow().as_ref().map(|registry| match registry {
+            ScopedSessionRegistry::Owned(registry) => registry.clone(),
+            ScopedSessionRegistry::Shared(registry) => registry.as_ref().clone(),
+        })
+    })
 }
 
 pub(in crate::engine::executor) fn with_session_registry<R>(
     registry: SessionRegistry,
     f: impl FnOnce() -> R,
 ) -> R {
+    with_registry_scope(ScopedSessionRegistry::Owned(registry), f)
+}
+
+pub(in crate::engine::executor) fn with_shared_session_registry<R>(
+    registry: &Arc<SessionRegistry>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let installed = CURRENT_SESSION_REGISTRY.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|current| {
+            matches!(current, ScopedSessionRegistry::Shared(current) if Arc::ptr_eq(current, registry))
+        })
+    });
+    if installed {
+        return f();
+    }
+    // Keep the registry object alive instead of cloning every globally
+    // shared field just to install an execution-local lookup context.
+    with_registry_scope(ScopedSessionRegistry::Shared(Arc::clone(registry)), f)
+}
+
+fn with_registry_scope<R>(registry: ScopedSessionRegistry, f: impl FnOnce() -> R) -> R {
     CURRENT_SESSION_REGISTRY.with(|slot| {
         let previous = slot.replace(Some(registry));
         struct Restore<'a>(
-            &'a std::cell::RefCell<Option<SessionRegistry>>,
-            Option<SessionRegistry>,
+            &'a std::cell::RefCell<Option<ScopedSessionRegistry>>,
+            Option<ScopedSessionRegistry>,
         );
         impl Drop for Restore<'_> {
             fn drop(&mut self) {

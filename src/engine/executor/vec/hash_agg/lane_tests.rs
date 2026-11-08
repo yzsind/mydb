@@ -191,6 +191,7 @@ fn final_1107_dictionary_group_lane_drift_preserves_prefix() {
 
 #[test]
 fn final_1107_fixed_width_group_lane_drift_preserves_prefix() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let schema = Arc::new(BatchSchema::new(vec![
         BatchField {
             table: "t".into(),
@@ -212,13 +213,18 @@ fn final_1107_fixed_width_group_lane_drift_preserves_prefix() {
     ]));
     for generic in [false, true] {
         for func in [AggregateKind::CountStar, AggregateKind::Sum] {
-            let mut core = HashAggregateCore::new(
+            // Lane drift spills the completed prefix even without memory pressure.
+            // Keep that I/O inside this fixture, independent of MYDB_DATA_DIR.
+            let mut core = HashAggregateCore::with_budget(
                 vec![0],
                 vec![AggregateSpec {
                     comparison_collation: None,
                     func,
                     input_column: 1,
                 }],
+                schema.clone(),
+                Arc::new(MemBudget::new(128 * 1024 * 1024)),
+                root.path(),
             );
             let first = Batch::new(
                 schema.clone(),
@@ -244,7 +250,21 @@ fn final_1107_fixed_width_group_lane_drift_preserves_prefix() {
                 ],
             );
             core.consume_batch(&second).unwrap();
+            let spill_path = core.spill_dir.as_ref().map(|dir| dir.path().to_path_buf());
+            if generic {
+                let path = spill_path
+                    .as_ref()
+                    .expect("lane drift must spill its prefix");
+                assert!(path.starts_with(root.path()));
+                assert!(core.metrics().did_spill);
+            }
             let mut rows = core.finalize().unwrap();
+            if let Some(path) = spill_path {
+                assert!(
+                    !path.exists(),
+                    "finalization must remove the private spill directory"
+                );
+            }
             rows.sort_by_key(|r| r[0].to_display_string());
             let rows: Vec<Vec<String>> = rows
                 .iter()

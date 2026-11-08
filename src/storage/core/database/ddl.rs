@@ -5355,7 +5355,13 @@ impl Database {
                 self.drop_vector_graph(snapshot.id, &old.name);
             }
         }
-        self.index_cache.write().extend(built_indexes);
+        {
+            let mut cache = self.index_cache.write();
+            for ((id, _), _) in &built_indexes {
+                self.invalidate_storage_handle_open_epoch(*id);
+            }
+            cache.extend(built_indexes);
+        }
         self.mark_table_stats_stale(&key, 0)?;
         Ok(())
     }

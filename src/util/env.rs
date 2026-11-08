@@ -22,6 +22,20 @@ pub(crate) fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
+/// Recognize the base spellings plus explicit single-letter Y/N forms.
+pub(crate) fn parse_bool_with_short(raw: &str) -> Option<bool> {
+    parse_bool(raw).or_else(|| {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("y") {
+            Some(true)
+        } else if raw.eq_ignore_ascii_case("n") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn flag(name: &str, default: bool) -> bool {
     var(name)
         .map(|raw| parse_bool(&raw).unwrap_or(false))
@@ -174,4 +188,24 @@ pub(crate) fn is_disabled(key: &str) -> bool {
         var(key).unwrap_or_default().to_ascii_lowercase().as_str(),
         "off" | "0" | "false" | "no"
     )
+}
+
+#[cfg(test)]
+mod short_boolean_contract_tests {
+    use super::*;
+    #[test]
+    fn short_boolean_forms_do_not_expand_base_flag_policy() {
+        for (raw, expected) in [
+            ("Y", true),
+            (" y ", true),
+            ("N", false),
+            ("\u{2003}n\u{a0}", false),
+        ] {
+            assert_eq!(parse_bool(raw), None);
+            assert_eq!(parse_bool_with_short(raw), Some(expected));
+        }
+        for raw in ["", "yy", "2", "+1", "ßy", "true!", "ON\0"] {
+            assert_eq!(parse_bool_with_short(raw), None);
+        }
+    }
 }

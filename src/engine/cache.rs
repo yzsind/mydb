@@ -1153,6 +1153,9 @@ pub struct CompiledSelectPlan {
     pub executable: Arc<CompiledOperator>,
     pub(crate) compact_range:
         Option<Arc<crate::engine::executor::select::simple::CompactRangeRecipe>>,
+    /// Includes nested SELECTs and counts eliminated by physical planning.
+    /// Validate new bindings without walking the AST on each cache hit.
+    limit_parameters: SmallVec<[usize; 2]>,
     pub deps: SmallVec<[PlanDep; 4]>,
     /// Views expanded into this plan; validated against the live catalog on
     /// lookup so ALTER / DROP VIEW invalidates exactly these plans.
@@ -1203,6 +1206,24 @@ impl CompiledSelectPlan {
                 matches!(node, crate::parser::Expr::Subquery(_))
             })
         });
+        struct LimitParameters(SmallVec<[usize; 2]>);
+        impl crate::parser::visit::AstVisitor for LimitParameters {
+            fn enter_select(&mut self, select: &Select) {
+                for value in [select.limit.as_ref(), select.offset.as_ref()] {
+                    if let Some(
+                        crate::parser::LimitValue::Placeholder(index)
+                        | crate::parser::LimitValue::OffsetCommaPlaceholder(index),
+                    ) = value
+                    {
+                        self.0.push(*index);
+                    }
+                }
+            }
+        }
+        let mut limits = LimitParameters(SmallVec::new());
+        crate::parser::visit::visit_select(&mut limits, &semantic_select);
+        limits.0.sort_unstable();
+        limits.0.dedup();
         Self {
             execution_class: SelectExecutionClass::from_select(&semantic_select),
             batch_route,
@@ -1216,6 +1237,7 @@ impl CompiledSelectPlan {
                 &semantic_select,
                 &physical,
             ),
+            limit_parameters: limits.0,
             semantic_select,
             physical,
             deps,
@@ -1229,6 +1251,20 @@ impl CompiledSelectPlan {
             hits: AtomicU64::new(0),
             _cache_bytes: None,
         }
+    }
+
+    pub(crate) fn validate_limit_parameters(&self) -> Result<(), crate::types::QueryError> {
+        for &index in &self.limit_parameters {
+            if !crate::engine::params::has_active_param(index) {
+                return Err(
+                    crate::error::catalog::ER_WRONG_ARGUMENTS.error("parameter is not bound")
+                );
+            }
+            crate::engine::params::validate_limit(Some(&crate::parser::LimitValue::Placeholder(
+                index,
+            )))?;
+        }
+        Ok(())
     }
 
     pub fn initialize_execution_envelope(

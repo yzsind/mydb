@@ -873,43 +873,81 @@ pub struct PlanIdentity {
     expression_settings: Arc<crate::engine::expr::PolicyExpressionSettings>,
 }
 
-pub fn session_signature(
-    db: &Database,
-    session: &crate::engine::api::SessionContext,
-) -> Arc<PlanIdentity> {
-    let auth = authorization_snapshot(db);
-    let generation = EXECUTION
-        .with(|state| {
-            state.borrow().as_ref().and_then(|s| {
-                s.snapshot
-                    .auth
-                    .get()
-                    .map(|(_, _, generation, _)| *generation)
+/// Statement-bound catalog/settings state shared by identity construction and
+/// validation. Keep validation independent of the connection's last signature:
+/// alternating prepared handles can retain different parameter domains.
+struct PlanIdentityEnvironment {
+    generation: u64,
+    auth_epoch: u64,
+    security_epoch: u64,
+    policy: crate::engine::auth::PolicySnapshot,
+    trusted: bool,
+}
+
+impl PlanIdentityEnvironment {
+    fn capture(db: &Database) -> Self {
+        let auth = authorization_snapshot(db);
+        let generation = EXECUTION
+            .with(|state| {
+                state.borrow().as_ref().and_then(|s| {
+                    s.snapshot
+                        .auth
+                        .get()
+                        .map(|(_, _, generation, _)| *generation)
+                })
             })
-        })
-        .unwrap_or_else(crate::engine::auth::authorization_generation);
-    let security_epoch = statement_catalog(db).map_or(0, |catalog| catalog.epoch);
-    let policy = crate::engine::auth::PolicySnapshot::capture();
-    let trusted = trusted_internal();
-    let mut cached = session.rls.identity.borrow_mut();
-    if let Some(identity) = cached.as_ref() {
-        if identity.account == session.authenticated_as
-            && identity.roles.iter().eq(session.active_roles.iter())
-            && identity.generation == generation
-            && identity.auth_epoch == auth.epoch
-            && identity.security_epoch == security_epoch
-            && identity.policy == policy
-            && identity.internal == session.internal_system_session
-            && identity.trusted == trusted
-            && identity.enabled == session.rls.enabled
-            && identity.expression_settings.matches_session(session)
+            .unwrap_or_else(crate::engine::auth::authorization_generation);
+        Self {
+            generation,
+            auth_epoch: auth.epoch,
+            security_epoch: statement_catalog(db).map_or(0, |catalog| catalog.epoch),
+            policy: crate::engine::auth::PolicySnapshot::capture(),
+            trusted: trusted_internal(),
+        }
+    }
+}
+
+impl PlanIdentity {
+    pub(crate) fn matches_session(
+        &self,
+        db: &Database,
+        session: &crate::engine::api::SessionContext,
+    ) -> bool {
+        self.matches_environment(session, &PlanIdentityEnvironment::capture(db))
+    }
+
+    fn matches_environment(
+        &self,
+        session: &crate::engine::api::SessionContext,
+        environment: &PlanIdentityEnvironment,
+    ) -> bool {
+        self.account == session.authenticated_as
+            && self.roles.iter().eq(session.active_roles.iter())
+            && self.generation == environment.generation
+            && self.auth_epoch == environment.auth_epoch
+            && self.security_epoch == environment.security_epoch
+            && self.policy == environment.policy
+            && self.internal == session.internal_system_session
+            && self.trusted == environment.trusted
+            && self.enabled == session.rls.enabled
+            && self.expression_settings.matches_session(session)
             && crate::engine::params::with_current_params(|params, _| {
-                identity.parameter_domains.iter().copied().eq(params
+                self.parameter_domains.iter().copied().eq(params
                     .unwrap_or_default()
                     .iter()
                     .map(std::mem::discriminant))
             })
-        {
+    }
+}
+
+pub fn session_signature(
+    db: &Database,
+    session: &crate::engine::api::SessionContext,
+) -> Arc<PlanIdentity> {
+    let environment = PlanIdentityEnvironment::capture(db);
+    let mut cached = session.rls.identity.borrow_mut();
+    if let Some(identity) = cached.as_ref() {
+        if identity.matches_environment(session, &environment) {
             return identity.clone();
         }
     }
@@ -923,12 +961,12 @@ pub fn session_signature(
     let identity = Arc::new(PlanIdentity {
         account: session.authenticated_as.clone(),
         roles: session.active_roles.iter().cloned().collect(),
-        generation,
-        auth_epoch: auth.epoch,
-        security_epoch,
-        policy,
+        generation: environment.generation,
+        auth_epoch: environment.auth_epoch,
+        security_epoch: environment.security_epoch,
+        policy: environment.policy,
         internal: session.internal_system_session,
-        trusted,
+        trusted: environment.trusted,
         enabled: session.rls.enabled,
         parameter_domains,
         expression_settings: Arc::new(crate::engine::expr::PolicyExpressionSettings::capture(

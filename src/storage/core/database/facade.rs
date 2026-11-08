@@ -767,7 +767,7 @@ impl Database {
             foreground_bulk_ddl_active: AtomicU64::new(0),
             analyze_scan_active: AtomicU64::new(0),
             heap_cache: parking_lot::RwLock::new(Default::default()),
-            storage_handle_open_epochs: Mutex::new(HashMap::new()),
+            storage_handle_open_epochs: Mutex::new(StorageHandleEpochRegistry::default()),
             index_cache: parking_lot::RwLock::new(Default::default()),
             overflow_cache: parking_lot::RwLock::new(Default::default()),
             zone_map_gate: parking_lot::RwLock::new(()),

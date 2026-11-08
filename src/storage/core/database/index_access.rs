@@ -1347,17 +1347,21 @@ impl Database {
         prefix: &IndexKey,
         txn: TxnView,
     ) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
-        self.check_index_read_view(table, index, txn)?;
-        debug_assert!(!txn.historical);
-        let mut entries = Vec::new();
-        self.add_index_visibility_repair_entries(table, index, txn, &mut entries, |candidate| {
-            index_key_starts_with(candidate, prefix)
-        })?;
-        entries.sort_unstable_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
-        });
-        entries.dedup();
-        Ok(entries)
+        // Equal inclusive tuple-prefix bounds cover exactly this prefix,
+        // without first walking retirements belonging to the rest of the
+        // index. Reuse the same bound resolution and MVCC merge as the
+        // physical ordered cursor, including NULL and collated key parts.
+        let bound = IndexBound {
+            key: prefix.clone(),
+            inclusive: true,
+        };
+        self.range_index_visibility_repair_entries(
+            table,
+            index,
+            Some(bound.clone()),
+            Some(bound),
+            txn,
+        )
     }
 
     /// Snapshot MVCC compensation entries inside one ordered range. Native
